@@ -237,6 +237,46 @@ describe("createSenderAuthorizer", () => {
     expect(authorizer.authorize(input())).toEqual({ outcome: "allow", reason: "allow_all" });
   });
 
+  it("reactivates a stopped authorizer on a valid rebind and keeps replaced/invalid terminal", () => {
+    const authorizer = createSenderAuthorizer({
+      policy: parseConfigSenderPolicy({ allowedUsers: [SENDER] }),
+      receivingAccountIdHex: OWNER,
+    });
+    expect(authorizer.authorize(input())).toEqual({ outcome: "allow", reason: "allowlist" });
+    authorizer.setLifecycle("stopped");
+    expect(authorizer.authorize(input())).toEqual({
+      outcome: "deny",
+      reason: "lifecycle_stopped",
+    });
+    expect(authorizer.bindReceivingAccount(OWNER)).toBe(true);
+    expect(authorizer.lifecycle()).toBe("active");
+    expect(authorizer.authorize(input())).toEqual({ outcome: "allow", reason: "allowlist" });
+    expect(authorizer.authorize(input({ mapped: OTHER, sender: actor(OTHER) }))).toEqual({
+      outcome: "deny",
+      reason: "sender_not_allowed",
+    });
+
+    authorizer.setLifecycle("replaced");
+    expect(authorizer.bindReceivingAccount(OWNER)).toBe(true);
+    expect(authorizer.lifecycle()).toBe("replaced");
+    expect(authorizer.authorize(input())).toEqual({
+      outcome: "deny",
+      reason: "lifecycle_replaced",
+    });
+
+    const invalid = createSenderAuthorizer({
+      policy: parseConfigSenderPolicy({ allowedUsers: ["nope"] }),
+      receivingAccountIdHex: OWNER,
+    });
+    expect(invalid.lifecycle()).toBe("invalid");
+    expect(invalid.bindReceivingAccount(OWNER)).toBe(true);
+    expect(invalid.lifecycle()).toBe("invalid");
+    expect(invalid.authorize(input())).toEqual({
+      outcome: "deny",
+      reason: "lifecycle_invalid",
+    });
+  });
+
   it("does not authorize when the common authorizer is missing", () => {
     expect(authorizeInboundSender(null, input())).toEqual({
       outcome: "deny",

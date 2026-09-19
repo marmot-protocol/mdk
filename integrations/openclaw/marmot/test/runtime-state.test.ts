@@ -10,9 +10,11 @@ import {
   markMarmotInboundStarting,
   markMarmotInboundStopped,
   markMarmotOutboundSent,
+  markMarmotSenderAuthorizerLifecycle,
   markMarmotSenderPolicyResult,
   marmotAllowlistPolicyState,
   marmotInboundRuntimeSnapshot,
+  marmotSenderAuthorizerLifecycle,
   marmotSenderPolicyState,
   MARMOT_ALLOWLIST_SYNC_FAILED,
   MARMOT_SENDER_POLICY_MISSING,
@@ -173,6 +175,28 @@ describe("per-account composed readiness", () => {
       lastError: "marmot_sender_policy_invalid",
     });
     expect(JSON.stringify(marmotInboundRuntimeSnapshot("work"))).not.toContain("aa".repeat(32));
+  });
+
+  it("does not report connected while the bound authorizer lifecycle is stopped", () => {
+    beginMarmotAccountLifecycle("work");
+    markMarmotAllowlistSyncResult("work", { state: "reconciled" });
+    markMarmotSenderPolicyResult("work", { state: "allowlist", allowedUserCount: 1 });
+    markMarmotSenderAuthorizerLifecycle("work", "stopped");
+    markMarmotInboundStarting("work");
+    markMarmotInboundReady("work");
+    expect(marmotSenderAuthorizerLifecycle("work")).toBe("stopped");
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      running: true,
+      connected: false,
+      lastError: null,
+    });
+
+    markMarmotSenderAuthorizerLifecycle("work", "active");
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      running: true,
+      connected: true,
+      lastError: null,
+    });
   });
 
   it("ignores a stale setup failure after the current generation is acknowledged", () => {

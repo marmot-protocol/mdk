@@ -9,6 +9,7 @@ import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers"
 import {
   senderPolicyErrorCode,
   senderPolicyIsReady,
+  type SenderAuthorizerLifecycle,
   type SenderPolicyReadinessState,
   type SenderPolicyResolution,
 } from "./sender-policy.js";
@@ -44,6 +45,7 @@ interface AccountLiveFacts {
   policy: MarmotAllowlistPolicyState;
   senderPolicy: MarmotSenderPolicyState;
   senderPolicyAllowedUserCount: number;
+  senderAuthorizerLifecycle: SenderAuthorizerLifecycle;
   reconnectAttempts: number;
   lastStartAt: number | null;
   lastStopAt: number | null;
@@ -71,6 +73,7 @@ function emptyFacts(
     policy,
     senderPolicy,
     senderPolicyAllowedUserCount: 0,
+    senderAuthorizerLifecycle: "pending",
     reconnectAttempts: 0,
     lastStartAt: null,
     lastStopAt: null,
@@ -80,11 +83,12 @@ function emptyFacts(
 function project(facts: AccountLiveFacts): ChannelAccountSnapshot {
   const welcomerReady = facts.policy === "unmanaged" || facts.policy === "reconciled";
   const senderReady = senderPolicyIsReady(facts.senderPolicy);
+  const authorizerReady = facts.senderAuthorizerLifecycle === "active";
   const senderError = senderPolicyErrorCode(facts.senderPolicy);
   return {
     accountId: facts.accountId,
     running: facts.running,
-    connected: facts.inboundAcknowledged && welcomerReady && senderReady,
+    connected: facts.inboundAcknowledged && welcomerReady && senderReady && authorizerReady,
     reconnectAttempts: facts.reconnectAttempts,
     lastStartAt: facts.lastStartAt,
     lastStopAt: facts.lastStopAt,
@@ -135,6 +139,19 @@ export function markMarmotSenderPolicyResult(
   });
 }
 
+export function markMarmotSenderAuthorizerLifecycle(
+  accountId: string | null | undefined,
+  lifecycle: SenderAuthorizerLifecycle,
+): ChannelAccountSnapshot {
+  const nextAccountId = accountIdOrDefault(accountId);
+  const prev = live.get(nextAccountId) ?? emptyFacts(nextAccountId, "unmanaged", "pending");
+  return write({
+    ...prev,
+    accountId: nextAccountId,
+    senderAuthorizerLifecycle: lifecycle,
+  });
+}
+
 export function markMarmotAllowlistSyncResult(
   accountId: string | null | undefined,
   result: MarmotAllowlistSyncResult,
@@ -166,6 +183,7 @@ export function markMarmotInboundStarting(accountId?: string | null): ChannelAcc
     policy: prev?.policy ?? "unmanaged",
     senderPolicy: prev?.senderPolicy ?? "pending",
     senderPolicyAllowedUserCount: prev?.senderPolicyAllowedUserCount ?? 0,
+    senderAuthorizerLifecycle: prev?.senderAuthorizerLifecycle ?? "pending",
     reconnectAttempts: sameAccount ? (prev.reconnectAttempts ?? 0) : 0,
     lastStartAt: sameAccount && prev.lastStartAt ? prev.lastStartAt : Date.now(),
     lastStopAt: null,
@@ -184,6 +202,10 @@ export function markMarmotInboundReady(accountId?: string | null): ChannelAccoun
     ...prev,
     inboundAcknowledged: true,
     inboundError: null,
+    // First successful ack may promote a still-pending gate. Stopped, replaced,
+    // and invalid authorizers stay terminal so a stale retry cannot look healthy.
+    senderAuthorizerLifecycle:
+      prev.senderAuthorizerLifecycle === "pending" ? "active" : prev.senderAuthorizerLifecycle,
     lastStartAt: prev.lastStartAt ?? Date.now(),
     lastStopAt: null,
   });
@@ -283,6 +305,12 @@ export function marmotSenderPolicyState(
   accountId?: string | null,
 ): MarmotSenderPolicyState | null {
   return live.get(accountIdOrDefault(accountId))?.senderPolicy ?? null;
+}
+
+export function marmotSenderAuthorizerLifecycle(
+  accountId?: string | null,
+): SenderAuthorizerLifecycle | null {
+  return live.get(accountIdOrDefault(accountId))?.senderAuthorizerLifecycle ?? null;
 }
 
 export function resetMarmotInboundRuntimeForTests(): void {

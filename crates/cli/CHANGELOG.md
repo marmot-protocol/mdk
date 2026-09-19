@@ -17,6 +17,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   `MARMOT_ALLOWED_USERS` / `MARMOT_ALLOW_ALL_USERS` environment fallback.
   `dm.allowFrom` remains welcomer/invite admission only. Missing or invalid
   sender policy is fail-closed and is not reported as a healthy channel.
+  A transient inbound setup failure no longer leaves the shared sender
+  authorizer stopped across the gateway retry, and host-supplied status
+  snapshots cannot report connected while that policy is unenforceable.
 
 ## [0.10.2] - 2026-09-19
 

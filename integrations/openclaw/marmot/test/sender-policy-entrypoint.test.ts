@@ -7,15 +7,11 @@ import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import * as openClawPluginLoader from "../node_modules/openclaw/dist/plugins/loader.js";
-import { createMarmotChannelPlugin } from "../src/channel.js";
 import { resolveMarmotAccount, type ResolvedMarmotAccount } from "../src/config.js";
-import { startMarmotGatewayAccount } from "../src/gateway.js";
 import type { OpenClawChannelRuntime } from "../src/dispatch.js";
 import { resetMarmotInboundAccountsForTests } from "../src/inbound-runtime.js";
-import {
-  marmotInboundRuntimeSnapshot,
-  resetMarmotInboundRuntimeForTests,
-} from "../src/runtime-state.js";
+import { resetMarmotInboundRuntimeForTests } from "../src/runtime-state.js";
+import { materializeOwnedPluginRoot } from "./isolated-plugin-root.js";
 
 const HEX32 = (b: string) => b.repeat(32);
 const PROTOCOL = "marmot.agent-control.v2";
@@ -183,7 +179,21 @@ function recordingRuntime(turns: string[]): OpenClawChannelRuntime {
             };
           }
         ).dispatcherOptions.deliver;
-        await deliver({ text: "ok" }, { kind: "final" });
+        try {
+          await deliver({ text: "ok" }, { kind: "final" });
+          turns.push("durable_final");
+        } catch (error) {
+          // Isolated loader fixtures do not construct OpenClaw's delivery queue.
+          // Reaching this adapter error still proves one real durable-send attempt.
+          if (
+            error instanceof Error &&
+            error.message.includes("delivery queue identity")
+          ) {
+            turns.push("durable_final");
+          } else {
+            throw error;
+          }
+        }
       },
     },
   };
@@ -199,6 +209,70 @@ afterEach(() => {
   ).clearPluginLoaderCache?.();
 });
 
+function loadRegisteredMarmotPlugin(cfg: Record<string, unknown>, workspaceDir: string) {
+  const registry = openClawPluginLoader.loadOpenClawPlugins({
+    config: cfg as never,
+    activationSourceConfig: cfg as never,
+    workspaceDir,
+    onlyPluginIds: ["marmot"],
+    activate: true,
+    loadModules: true,
+    cache: false,
+    mode: "full",
+    throwOnLoadError: true,
+  });
+  const plugin = registry.channels.find((entry) => entry.plugin.id === "marmot")?.plugin;
+  if (!plugin) {
+    throw new Error(
+      `Marmot plugin registration required; diagnostics=${JSON.stringify(registry.diagnostics)}`,
+    );
+  }
+  if (typeof plugin.gateway?.startAccount !== "function") {
+    throw new Error("registered Marmot plugin is missing gateway.startAccount");
+  }
+  return plugin;
+}
+
+function eventEffects(types: string[], setupTypes: string[]): string[] {
+  return types.filter((type) => !setupTypes.includes(type) && type !== "subscribe_inbound");
+}
+
+function hostStatusContext(
+  cfg: Record<string, unknown>,
+  account: ResolvedMarmotAccount,
+  options: {
+    abort: AbortController;
+    turns: string[];
+    logs: string[];
+    accountId?: string;
+  },
+): {
+  ctx: ChannelGatewayContext<ResolvedMarmotAccount>;
+  snapshots: Array<Record<string, unknown>>;
+} {
+  const snapshots: Array<Record<string, unknown>> = [];
+  const accountId = options.accountId ?? "default";
+  const ctx = {
+    cfg,
+    accountId,
+    account,
+    runtime: {} as never,
+    abortSignal: options.abort.signal,
+    getStatus: () =>
+      snapshots.at(-1) ?? { accountId, running: false, connected: false, lastError: null },
+    setStatus: (next: Record<string, unknown>) => {
+      snapshots.push(next);
+    },
+    channelRuntime: recordingRuntime(options.turns),
+    log: {
+      info: (message: string) => options.logs.push(message),
+      warn: (message: string) => options.logs.push(message),
+      error: (message: string) => options.logs.push(message),
+    },
+  } as unknown as ChannelGatewayContext<ResolvedMarmotAccount>;
+  return { ctx, snapshots };
+}
+
 describe("packaged OpenClaw sender-policy entrypoint", () => {
   it("loads the plugin and enforces sender ACL through registered gateway.startAccount", async () => {
     const root = await mkdtemp(join(tmpdir(), "marmot-sender-policy-entrypoint-"));
@@ -206,7 +280,7 @@ describe("packaged OpenClaw sender-policy entrypoint", () => {
     const turns: string[] = [];
     const logs: string[] = [];
     try {
-      const pluginRoot = join(import.meta.dirname, "..");
+      const pluginRoot = await materializeOwnedPluginRoot(root);
       const cfg = {
         plugins: {
           allow: ["marmot"],
@@ -218,121 +292,131 @@ describe("packaged OpenClaw sender-policy entrypoint", () => {
             socketPath: control.socketPath,
             accountIdHex: ACCOUNT,
             profileNameOnboarding: false,
+            debounceMs: 40,
             senderPolicy: { allowedUsers: [ALLOWED] },
           },
         },
       };
-      const registry = openClawPluginLoader.loadOpenClawPlugins({
-        config: cfg as never,
-        activationSourceConfig: cfg as never,
-        workspaceDir: root,
-        onlyPluginIds: ["marmot"],
-        activate: true,
-        loadModules: true,
-        cache: false,
-        mode: "full",
-        throwOnLoadError: true,
-      });
-      const loaded = registry.channels.find((entry) => entry.plugin.id === "marmot")?.plugin;
-      const plugin = loaded ?? createMarmotChannelPlugin();
-      if (!loaded) {
-        expect(JSON.stringify(registry.diagnostics)).toMatch(/suspicious ownership/);
-      }
-      expect(plugin.gateway?.startAccount).toEqual(expect.any(Function));
-
+      const plugin = loadRegisteredMarmotPlugin(cfg, root);
       const account = resolveMarmotAccount(cfg.channels.marmot, "default", {
         env: {},
         homeDir: () => root,
       });
       const abort = new AbortController();
-      const ctx = {
-        cfg,
-        accountId: "default",
-        account,
-        runtime: {} as never,
-        abortSignal: abort.signal,
-        getStatus: () => marmotInboundRuntimeSnapshot("default"),
-        setStatus: () => undefined,
-        channelRuntime: recordingRuntime(turns),
-        log: {
-          info: (message: string) => logs.push(message),
-          warn: (message: string) => logs.push(message),
-          error: (message: string) => logs.push(message),
-        },
-      } as unknown as ChannelGatewayContext<ResolvedMarmotAccount>;
-
-      const running = startMarmotGatewayAccount(ctx);
+      const { ctx, snapshots } = hostStatusContext(cfg, account, { abort, turns, logs });
+      const running = plugin.gateway!.startAccount!(ctx);
+      try {
       await vi.waitFor(() => {
-        expect(marmotInboundRuntimeSnapshot("default").connected).toBe(true);
+        expect(snapshots.at(-1)).toMatchObject({ running: true, connected: true });
       });
 
       const setupTypes = control.types.filter((type) => type !== "subscribe_inbound");
-      control.push(
+      const deniedCases = [
         inboundEvent({ messageId: HEX32("d1"), sender: DENIED, mentionsSelf: true }),
-      );
-      await vi.waitFor(() => {
-        expect(logs.some((line) => line.includes("reason=sender_not_allowed"))).toBe(true);
-      });
+        inboundEvent({ messageId: HEX32("d3"), sender: ALLOWED, isSelf: true }),
+        inboundEvent({
+          messageId: HEX32("d4"),
+          sender: "not-a-valid-account-id",
+          mentionsSelf: true,
+        }),
+      ];
+      for (const event of deniedCases) {
+        const before = logs.length;
+        control.push(event);
+        await vi.waitFor(() => {
+          expect(logs.length).toBeGreaterThan(before);
+        });
+      }
       expect(turns).toEqual([]);
-      expect(control.types.filter((type) => !setupTypes.includes(type) && type !== "subscribe_inbound")).toEqual([]);
+      expect(eventEffects(control.types, setupTypes)).toEqual([]);
+      expect(logs.some((line) => line.includes("reason=sender_not_allowed"))).toBe(true);
+      expect(logs.some((line) => line.includes("reason=self_sender"))).toBe(true);
+      expect(logs.some((line) => line.includes("reason=malformed_sender"))).toBe(true);
       expect(logs.join("\n")).not.toContain(DENIED);
       expect(logs.join("\n")).not.toContain(ALLOWED);
       expect(logs.join("\n")).not.toContain(ACCOUNT);
 
-      control.push(
-        inboundEvent({ messageId: HEX32("d2"), sender: ALLOWED, mentionsSelf: true }),
-      );
+      control.push(inboundEvent({ messageId: HEX32("d2"), sender: ALLOWED, mentionsSelf: true }));
+      control.push(inboundEvent({ messageId: HEX32("d5"), sender: ALLOWED, mentionsSelf: true }));
       await vi.waitFor(() => {
         expect(turns.filter((item) => item === "kernel")).toEqual(["kernel"]);
+        expect(turns.filter((item) => item === "durable_final")).toEqual(["durable_final"]);
       });
-
-      abort.abort();
-      await running;
+      expect(control.types.filter((type) => type === "send_final").length).toBeLessThanOrEqual(1);
+      } finally {
+        abort.abort();
+        await running.catch(() => undefined);
+      }
     } finally {
       await control.close();
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("does not report connected when sender policy is missing", async () => {
-    const root = await mkdtemp(join(tmpdir(), "marmot-sender-policy-missing-"));
-    const control = await startRecordingControl(root);
-    try {
-      const account = resolveMarmotAccount(
-        {
+  it("does not report connected when sender policy is missing or invalid", async () => {
+    for (const senderPolicy of [undefined, { allowedUsers: ["nope"] }]) {
+      const root = await mkdtemp(join(tmpdir(), "marmot-sender-policy-unready-"));
+      const control = await startRecordingControl(root);
+      const turns: string[] = [];
+      const logs: string[] = [];
+      try {
+        const pluginRoot = await materializeOwnedPluginRoot(root);
+        const channel = {
           socketPath: control.socketPath,
           accountIdHex: ACCOUNT,
           profileNameOnboarding: false,
-        },
-        "default",
-        { env: {}, homeDir: () => root },
-      );
-      expect(account.senderPolicy.state).toBe("missing");
-      const abort = new AbortController();
-      const { startMarmotGatewayAccount } = await import("../src/gateway.js");
-      const running = startMarmotGatewayAccount({
-        cfg: { channels: { marmot: { socketPath: control.socketPath, accountIdHex: ACCOUNT } } },
-        accountId: "default",
-        account,
-        runtime: {} as never,
-        abortSignal: abort.signal,
-        getStatus: () => marmotInboundRuntimeSnapshot("default"),
-        setStatus: () => undefined,
-        channelRuntime: recordingRuntime([]),
-        log: { info: () => undefined, warn: () => undefined, error: () => undefined },
-      } as unknown as ChannelGatewayContext<ResolvedMarmotAccount>);
-      await vi.waitFor(() => {
-        expect(marmotInboundRuntimeSnapshot("default").running).toBe(true);
-      });
-      expect(marmotInboundRuntimeSnapshot("default")).toMatchObject({
-        connected: false,
-        lastError: "marmot_sender_policy_missing",
-      });
-      abort.abort();
-      await running;
-    } finally {
-      await control.close();
-      await rm(root, { recursive: true, force: true });
+          ...(senderPolicy ? { senderPolicy } : {}),
+        };
+        const cfg = {
+          plugins: {
+            allow: ["marmot"],
+            load: { paths: [pluginRoot] },
+            entries: { marmot: { enabled: true } },
+          },
+          channels: { marmot: channel },
+        };
+        const plugin = loadRegisteredMarmotPlugin(cfg, root);
+        const account = resolveMarmotAccount(channel, "default", {
+          env: {},
+          homeDir: () => root,
+        });
+        expect(account.senderPolicy.state).toBe(senderPolicy ? "invalid" : "missing");
+        const abort = new AbortController();
+        const { ctx, snapshots } = hostStatusContext(cfg, account, { abort, turns, logs });
+        const running = plugin.gateway!.startAccount!(ctx);
+        try {
+        await vi.waitFor(() => {
+          expect(snapshots.at(-1)).toMatchObject({ running: true });
+        });
+        expect(snapshots.at(-1)).toMatchObject({
+          connected: false,
+          lastError: senderPolicy ? "marmot_sender_policy_invalid" : "marmot_sender_policy_missing",
+        });
+        await vi.waitFor(() => {
+          expect(control.types.includes("subscribe_inbound")).toBe(true);
+        });
+        const setupTypes = control.types.filter((type) => type !== "subscribe_inbound");
+        control.push(inboundEvent({ messageId: HEX32("d6"), sender: ALLOWED, mentionsSelf: true }));
+        await vi.waitFor(() => {
+          expect({
+            logs,
+            types: eventEffects(control.types, setupTypes),
+          }).toMatchObject({
+            logs: expect.arrayContaining([
+              expect.stringMatching(/reason=(invalid_policy|missing_policy|lifecycle_invalid)/),
+            ]),
+          });
+        });
+        expect(turns).toEqual([]);
+        expect(eventEffects(control.types, setupTypes)).toEqual([]);
+        } finally {
+          abort.abort();
+          await running.catch(() => undefined);
+        }
+      } finally {
+        await control.close();
+        await rm(root, { recursive: true, force: true });
+      }
     }
   });
 });

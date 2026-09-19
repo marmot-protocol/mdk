@@ -355,11 +355,19 @@ export function createSenderAuthorizer(options: {
       const parsed = envelopeAccountId(accountIdHex);
       if (parsed === null) {
         bound = null;
-        lifecycle = "unbound";
+        if (lifecycle !== "replaced" && lifecycle !== "invalid") {
+          lifecycle = "unbound";
+        }
         return false;
       }
       bound = parsed;
-      if (lifecycle === "unbound" || lifecycle === "pending") {
+      // A successful rebind in the current account lifecycle may recover from
+      // a transient setup stop. Replaced/invalid generations stay terminal so
+      // stale queued work cannot regain admission.
+      if (lifecycle === "replaced" || lifecycle === "invalid") {
+        return true;
+      }
+      if (lifecycle === "unbound" || lifecycle === "pending" || lifecycle === "stopped") {
         lifecycle = options.policy.state === "invalid" ? "invalid" : "active";
       }
       return true;

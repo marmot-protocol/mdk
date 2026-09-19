@@ -42,6 +42,7 @@ import {
   markMarmotInboundSetupFailed,
   markMarmotInboundStarting,
   markMarmotInboundStopped,
+  markMarmotSenderAuthorizerLifecycle,
   markMarmotSenderPolicyResult,
   marmotInboundRuntimeSnapshot,
   type MarmotAllowlistSyncResult,
@@ -314,9 +315,11 @@ export function startMarmotInbound(
     }
     if (mode === "setup-failed") {
       authorizer?.setLifecycle("stopped");
+      markMarmotSenderAuthorizerLifecycle(statusAccountId, "stopped");
       markMarmotInboundSetupFailed(statusAccountId);
     } else {
       authorizer?.setLifecycle("stopped");
+      markMarmotSenderAuthorizerLifecycle(statusAccountId, "stopped");
       markMarmotInboundStopped(statusAccountId);
     }
     publishStatus();
@@ -384,10 +387,15 @@ export function startMarmotInbound(
       failSetup();
       return;
     }
-    if (authorizer.lifecycle() === "unbound" || authorizer.lifecycle() === "pending") {
+    if (
+      authorizer.lifecycle() === "unbound" ||
+      authorizer.lifecycle() === "pending" ||
+      authorizer.lifecycle() === "stopped"
+    ) {
       authorizer.setLifecycle(resolved.senderPolicy.state === "invalid" ? "invalid" : "active");
     }
     markMarmotSenderPolicyResult(statusAccountId, authorizer.policy);
+    markMarmotSenderAuthorizerLifecycle(statusAccountId, authorizer.lifecycle());
     publishStatus();
     let readyLogged = false;
     const pendingAmbient = new Map<string, MarmotAmbientEvent[]>();
@@ -445,6 +453,10 @@ export function startMarmotInbound(
     const handleInbound = async (
       message: MarmotInboundMessage,
     ): Promise<MarmotInboundCompletionOutcome> => {
+      if (stopping || !ownsReservation()) {
+        api.logger.info("marmot: inbound sender denied (reason=lifecycle_stopped)");
+        return "denied";
+      }
       const authorization = authorizeInboundSender(
         authorizer,
         senderAuthorizationInputFromMessage(message),

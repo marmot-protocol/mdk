@@ -21,6 +21,7 @@ import {
   DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
   markMarmotAllowlistSyncResult,
   markMarmotInboundStopped,
+  markMarmotSenderAuthorizerLifecycle,
   markMarmotSenderPolicyResult,
   marmotInboundRuntimeSnapshot,
 } from "./runtime-state.js";
@@ -213,6 +214,7 @@ export async function startMarmotGatewayAccount(
   const cancelRetries = (): void => {
     closed = true;
     authorizer.setLifecycle("replaced");
+    markMarmotSenderAuthorizerLifecycle(ctx.accountId, "replaced");
     if (lane.generation === generation) {
       lane.generation += 1;
     }

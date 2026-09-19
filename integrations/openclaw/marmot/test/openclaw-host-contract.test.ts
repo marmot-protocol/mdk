@@ -31,6 +31,7 @@ import {
 } from "../src/inbound-runtime.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
 import { resetMarmotInboundRuntimeForTests } from "../src/runtime-state.js";
+import { materializeOwnedPluginRoot } from "./isolated-plugin-root.js";
 import { testAllowlistAuthorizer, testInboundActor } from "./sender-policy-fixtures.js";
 
 const HEX32 = (byte: string): string => byte.repeat(32);
@@ -146,16 +147,10 @@ async function closeServer(server: Server): Promise<void> {
   });
 }
 
-type PublicSendResult = RecordedControlSend | { skipped: "ownership" };
-
-function isRecordedControlSend(result: PublicSendResult): result is RecordedControlSend {
-  return !("skipped" in result);
-}
-
 /** Run the installed generic message action through the loaded Marmot plugin. */
 async function runPublicSend(
   buildParams: (workspaceDir: string) => Promise<Record<string, unknown>>,
-): Promise<PublicSendResult> {
+): Promise<RecordedControlSend> {
   const root = await mkdtemp(join(tmpdir(), "marmot-host-media-contract-"));
   const workspaceDir = join(root, "workspace");
   const outboundMediaDir = join(root, "outbound-media");
@@ -167,7 +162,7 @@ async function runPublicSend(
     await mkdir(workspaceDir, { recursive: true, mode: 0o700 });
     process.env.MARMOT_OUTBOUND_MEDIA_DIR = outboundMediaDir;
     server = await startControlServer(socketPath, recorded);
-    const pluginRoot = join(import.meta.dirname, "..");
+    const pluginRoot = await materializeOwnedPluginRoot(root);
     const cfg = {
       plugins: {
         allow: ["marmot"],
@@ -199,9 +194,9 @@ async function runPublicSend(
     });
     const loadedIds = registry.channels.map((entry) => entry.plugin.id);
     if (!loadedIds.includes("marmot")) {
-      const diagnostics = JSON.stringify(registry.diagnostics);
-      expect(diagnostics).toMatch(/suspicious ownership/);
-      return { skipped: "ownership" as const };
+      throw new Error(
+        `Marmot plugin registration required; diagnostics=${JSON.stringify(registry.diagnostics)}`,
+      );
     }
     await runMessageAction({
       cfg,
@@ -259,9 +254,6 @@ describe("installed OpenClaw inbound host contract", () => {
         media: imagePath,
       };
     });
-    if (!isRecordedControlSend(sent)) {
-      return;
-    }
 
     expect(sent.stagedBytes).toEqual(imageBytes);
     expect(sent.request).toMatchObject({
@@ -283,9 +275,6 @@ describe("installed OpenClaw inbound host contract", () => {
       filename: "from-buffer.png",
       contentType: "image/png",
     }));
-    if (!isRecordedControlSend(sent)) {
-      return;
-    }
 
     expect(sent.stagedBytes).toEqual(imageBytes);
     expect(sent.request).toMatchObject({
@@ -305,9 +294,6 @@ describe("installed OpenClaw inbound host contract", () => {
         message: "durable text",
         bestEffort: false,
       }));
-      if (!isRecordedControlSend(sent)) {
-        return;
-      }
 
       expect(sent.request).toMatchObject({
         type: "send_final",

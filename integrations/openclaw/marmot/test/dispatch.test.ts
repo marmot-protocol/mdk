@@ -807,14 +807,14 @@ describe("createMarmotInboundDispatcher activation cache", () => {
       mentionsSelf: true,
       messageIdHex: HEX32("02"),
     });
+    // A dispatcher is bound to one receiving account; a mismatched account id
+    // is denied before group-info lookup.
     await dispatch({
       ...baseMessage,
       accountIdHex: otherAccount,
       mentionsSelf: true,
       messageIdHex: HEX32("03"),
     });
-    // A dispatcher is bound to one receiving account; a mismatched account id
-    // is denied before group-info lookup.
     await dispatch({
       ...baseMessage,
       groupIdHex: mls16,
