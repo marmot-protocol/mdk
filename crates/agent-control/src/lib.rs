@@ -5,6 +5,7 @@ mod diagnostics;
 pub use diagnostics::{
     AgentControlAccountSelection, AgentControlDiagnosticHome, AgentControlDiagnosticKeyPackage,
     AgentControlDiagnosticRelays, AgentControlDiagnosticReplay, AgentControlDiagnosticStatus,
+    AgentControlKeyPackageAvailability, AgentControlReplayState,
 };
 
 use serde::de::DeserializeOwned;
@@ -1881,7 +1882,7 @@ mod tests {
             welcomer_count: 1,
             allow_any: false,
             key_package: crate::AgentControlDiagnosticKeyPackage {
-                availability: "present".to_owned(),
+                availability: crate::AgentControlKeyPackageAvailability::Present,
                 phase: Some("complete".to_owned()),
                 present: true,
                 expired: Some(false),
@@ -1896,13 +1897,12 @@ mod tests {
                 disconnected: 0,
             },
             replay: crate::AgentControlDiagnosticReplay {
-                state: "idle".to_owned(),
+                state: crate::AgentControlReplayState::Idle,
                 last_reason: None,
                 success_count: 3,
                 failure_count: 0,
                 resync_count: 0,
                 cancelled_count: 0,
-                error_count: 0,
             },
             home: crate::AgentControlDiagnosticHome {
                 requested: true,
@@ -1930,6 +1930,10 @@ mod tests {
                 "diagnostic report leaked {forbidden}"
             );
         }
+        let wire: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(wire["report"]["key_package"]["availability"], "present");
+        assert_eq!(wire["report"]["replay"]["state"], "idle");
+        assert!(wire["report"]["replay"].get("error_count").is_none());
         let decoded: AgentControlResponse = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, AgentControlResponse::DiagnosticStatus { report });
     }

@@ -101,7 +101,6 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     else:
         auth_token, auth_error = diag.resolve_auth_token(
             extra,
-            token=args.auth_token,
             token_file=args.auth_token_file,
             env_values=effective_env,
         )
@@ -135,7 +134,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
 
     if "MARMOT_AGENT_SOCKET" in unsupported_keys:
         checks.append(diag.check(
-            "socket.control", owner="hermes_config", provenance="observed",
+            "socket.control", owner="installer", provenance="observed",
             status="unknown", code="unsupported",
         ))
     else:
@@ -200,7 +199,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
     if connector_attempted:
-        checks.extend(_connector_checks(connector, home_route, account_hex, binary_version, account_mode))
+        checks.extend(_connector_checks(connector, home_route, binary_version))
     if time.monotonic() < deadline:
         live = asyncio.run(
             diag.read_plugin_status(
@@ -310,7 +309,7 @@ def _service_checks(
             status, code = "fatal", "invalid"
         elif active == "active":
             status, code = "healthy", "running"
-        elif active == "inactive":
+        elif active in {"inactive", "failed", "deactivating"}:
             status, code = "fatal", "stopped"
         else:
             status, code = "unknown", "unknown"
@@ -467,22 +466,6 @@ def _file_checks(
     return checks
 
 
-def _configured_home_route(
-    extra: dict[str, Any],
-    override: Optional[str],
-    *,
-    home_channel: Any = None,
-    home_platform: Optional[str] = None,
-) -> Optional[str]:
-    route, _error = diag.resolve_home_route(
-        extra,
-        home_channel=home_channel if home_channel is not None else extra.get("home_channel"),
-        home_platform=home_platform,
-        override=override,
-    )
-    return route
-
-
 def _config_checks(
     config_error: Optional[str],
     env_error: Optional[str],
@@ -627,9 +610,7 @@ def _connector_report(
 def _connector_checks(
     response: Optional[dict[str, Any]],
     home_route: Optional[str],
-    account_hex: Optional[str],
     binary_version: Optional[str],
-    account_mode: str = "auto",
 ) -> list[dict[str, Any]]:
     if response is None:
         return [
@@ -854,7 +835,6 @@ def _connector_checks(
                     code="unresolved",
                 )
             )
-    del account_hex, account_mode
     return checks
 
 
@@ -881,13 +861,6 @@ def _plugin_checks(
             ),
             diag.check(
                 "home.live_agreement",
-                owner="hermes_plugin",
-                provenance="observed",
-                status="unknown",
-                code="unknown",
-            ),
-            diag.check(
-                "media.capability",
                 owner="hermes_plugin",
                 provenance="observed",
                 status="unknown",
@@ -968,15 +941,6 @@ def _plugin_checks(
                 code="unknown",
             )
         )
-    checks.append(
-        diag.check(
-            "media.capability",
-            owner="hermes_plugin",
-            provenance="observed",
-            status="healthy" if live.get("media_ready") else "unknown",
-            code="ready" if live.get("media_ready") else "unavailable",
-        )
-    )
     return checks
 
 
@@ -991,7 +955,7 @@ def _unsupported(check_id: str) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Hermes Marmot installation doctor")
+    parser = argparse.ArgumentParser(description="Hermes Marmot installation doctor", allow_abbrev=False)
     parser.add_argument("--home", required=True)
     parser.add_argument("--hermes-home", required=True)
     parser.add_argument("--plugin-dir", required=True)
@@ -1002,7 +966,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--account-id-hex")
     parser.add_argument("--group-id-hex")
-    parser.add_argument("--auth-token")
     parser.add_argument("--auth-token-file")
     parser.add_argument("--install-service", action="store_true", default=True)
     parser.add_argument("--no-install-service", dest="install_service", action="store_false")

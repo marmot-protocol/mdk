@@ -15,6 +15,10 @@ Update generated bindings, native libraries, and C headers together. Account sto
 
 ### Fixed
 
+- Hermes doctor reports failed or stopping systemd units as fatal/stopped, keeps socket-check ownership stable,
+  and removes the always-ready media check and inline-token command-line option. Diagnostic replay and
+  KeyPackage states are typed, and replay no longer exposes overlapping failure/error counters.
+
 - Optimized macOS C binding builds disable debug stripping to avoid the
   misaligned Mach-O shared libraries rejected by Xcode 27. Linux packaging and
   the C ABI are unchanged.
@@ -113,6 +117,7 @@ Update generated bindings, native libraries, and C headers together. Apple consu
   with paginated report and dismissal-label records, a deletion-masked reported-message lookup,
   and `has_reports` on timeline rows in Rust, Swift/Kotlin and C. Migration 79 adds the indexed
   projections; regenerate bindings and headers with the matching library.
+
 - MDK-owned accepted message edits: timeline, reply and selected chat-list previews share effective text and
   compact edit metadata, with a separate paged accepted-edit history API in Rust, Swift/Kotlin and C. Edits do
   not create transcript rows, move conversations or generate unread/mention activity; raw events remain available.

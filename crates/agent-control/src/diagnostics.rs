@@ -12,11 +12,30 @@ pub enum AgentControlAccountSelection {
     Selected,
 }
 
+/// Availability of the account's current KeyPackage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlKeyPackageAvailability {
+    Unavailable,
+    Absent,
+    Present,
+    Pending,
+    Degraded,
+}
+
+/// Current catch-up/replay lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlReplayState {
+    Idle,
+    Running,
+    Failed,
+}
+
 /// Aggregate KeyPackage metadata without refs, IDs, or failure text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentControlDiagnosticKeyPackage {
-    /// `unavailable`, `absent`, `present`, `pending`, or `degraded`.
-    pub availability: String,
+    pub availability: AgentControlKeyPackageAvailability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     pub present: bool,
@@ -31,7 +50,7 @@ pub struct AgentControlDiagnosticKeyPackage {
 impl AgentControlDiagnosticKeyPackage {
     pub fn unavailable() -> Self {
         Self {
-            availability: "unavailable".to_owned(),
+            availability: AgentControlKeyPackageAvailability::Unavailable,
             phase: None,
             present: false,
             expired: None,
@@ -54,15 +73,15 @@ pub struct AgentControlDiagnosticRelays {
 /// Current catch-up/replay observation plus process-lifetime counters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentControlDiagnosticReplay {
-    /// `idle`, `running`, or `failed`.
-    pub state: String,
+    pub state: AgentControlReplayState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reason: Option<String>,
+    /// Completed scheduled or activity-triggered catch-up passes.
     pub success_count: u64,
+    /// Failed scheduled or activity-triggered catch-up passes.
     pub failure_count: u64,
     pub resync_count: u64,
     pub cancelled_count: u64,
-    pub error_count: u64,
 }
 
 /// Home-group resolution without identifiers.

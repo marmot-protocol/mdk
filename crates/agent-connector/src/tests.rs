@@ -1367,8 +1367,14 @@ async fn diagnostic_status_reports_selection_and_omits_identifiers() {
     assert_eq!(report.selection, AgentControlAccountSelection::None);
     assert_eq!(report.account_count, 0);
     assert_eq!(report.local_signing_account_count, 0);
-    assert_eq!(report.key_package.availability, "unavailable");
-    assert_eq!(report.replay.state, "idle");
+    assert_eq!(
+        report.key_package.availability,
+        agent_control::AgentControlKeyPackageAvailability::Unavailable
+    );
+    assert_eq!(
+        report.replay.state,
+        agent_control::AgentControlReplayState::Idle
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -1409,7 +1415,10 @@ async fn diagnostic_status_reports_selection_and_omits_identifiers() {
     };
     assert_eq!(report.selection, AgentControlAccountSelection::Selected);
     assert_eq!(report.welcomer_count, 1);
-    assert_eq!(report.key_package.availability, "unavailable");
+    assert_eq!(
+        report.key_package.availability,
+        agent_control::AgentControlKeyPackageAvailability::Unavailable
+    );
     assert!(!report.home.requested);
 
     let AgentControlResponse::DiagnosticStatus { report } = connector

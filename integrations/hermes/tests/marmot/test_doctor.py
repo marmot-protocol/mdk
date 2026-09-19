@@ -50,7 +50,6 @@ def _args(root: Path, **overrides) -> SimpleNamespace:
         "json": True,
         "account_id_hex": None,
         "group_id_hex": None,
-        "auth_token": None,
         "auth_token_file": None,
         "install_service": True,
     }
@@ -410,12 +409,12 @@ class DoctorReportTests(unittest.TestCase):
 
     def test_odd_home_override_is_degraded(self) -> None:
         extra = {"group_id_hex": "abc"}
-        route = doctor._configured_home_route(extra, "abc")
+        route = diag.resolve_home_route(extra, override="abc")[0]
         self.assertIsNone(route)
 
     def test_inbound_filter_is_not_home_fallback(self) -> None:
         extra = {"group": "aa" * 16, "group_id_hex": "bb" * 16, "home_channel": None}
-        self.assertIsNone(doctor._configured_home_route(extra, None))
+        self.assertIsNone(diag.resolve_home_route(extra)[0])
 
     def test_main_preserves_healthy_zero_exit(self) -> None:
         argv = [
@@ -558,13 +557,23 @@ class DoctorReportTests(unittest.TestCase):
         self.assertEqual(checks[1]["status"], "fatal")
         self.assertEqual(checks[1]["code"], "invalid")
 
+    def test_systemd_failed_and_deactivating_are_fatal(self) -> None:
+        for state in ("failed", "deactivating"):
+            with self.subTest(state=state), mock.patch.object(
+                diag, "bounded_run", return_value=f"LoadState=loaded\nActiveState={state}\n"
+            ):
+                checks = doctor._service_checks("wn-agent-hermes", "label", True)
+            self.assertEqual(checks[1]["status"], "fatal")
+            self.assertEqual(checks[1]["code"], "stopped")
+            self.assertEqual(diag.report_exit_code(diag.report_object(checks)), 2)
+
     def test_home_uses_platform_channel_not_inbound_filter(self) -> None:
         home_b = "bb" * 16
         filter_a = "aa" * 16
         extra = {"group_id_hex": filter_a, "group": filter_a}
-        self.assertIsNone(doctor._configured_home_route(extra, None))
+        self.assertIsNone(diag.resolve_home_route(extra)[0])
         self.assertEqual(
-            doctor._configured_home_route(extra, None, home_channel=home_b, home_platform="marmot"),
+            diag.resolve_home_route(extra, home_channel=home_b, home_platform="marmot")[0],
             home_b,
         )
         route, error = diag.resolve_home_route(
@@ -666,7 +675,6 @@ class DoctorReportTests(unittest.TestCase):
             "config_matches": True,
             "home_configured": True,
             "home_matches": False,
-            "media_ready": True,
             "reconnect_count": 0,
             "resync_count": 0,
             "recovery_count": 1,
@@ -693,7 +701,6 @@ class DoctorReportTests(unittest.TestCase):
                 "reconciliation": "failed",
                 "config_matches": True,
                 "home_matches": True,
-                "media_ready": True,
             },
             "0.1.0",
             "11" * 16,
@@ -706,7 +713,6 @@ class DoctorReportTests(unittest.TestCase):
                 "reconciliation": "pending",
                 "config_matches": True,
                 "home_matches": True,
-                "media_ready": True,
             },
             "0.1.0",
             "11" * 16,
@@ -718,7 +724,6 @@ class DoctorReportTests(unittest.TestCase):
                 "reconciliation": "succeeded",
                 "config_matches": True,
                 "home_matches": True,
-                "media_ready": True,
             },
             "0.1.0",
             "11" * 16,
@@ -726,7 +731,7 @@ class DoctorReportTests(unittest.TestCase):
         self.assertEqual({item["id"]: item for item in recovered}["subscription.inbound"]["status"], "healthy")
 
     def test_old_connector_socket_closed_is_unsupported(self) -> None:
-        checks = doctor._connector_checks({"error_code": "socket_closed"}, None, None, None)
+        checks = doctor._connector_checks({"error_code": "socket_closed"}, None, None)
         self.assertTrue(all(item["code"] == "unsupported" for item in checks))
         self.assertTrue(all(item["status"] == "unknown" for item in checks))
 
@@ -743,7 +748,6 @@ class DoctorReportTests(unittest.TestCase):
                     "key_package": {"availability": "present"},
                 },
             },
-            None,
             None,
             None,
         )
@@ -1466,7 +1470,9 @@ class DoctorReportTests(unittest.TestCase):
                 connector.assert_not_called()
                 self.assertEqual(next(c for c in report["checks"] if c["id"] == "account.selection")["code"], "unsupported")
                 if "junk" in text:
-                    self.assertEqual(next(c for c in report["checks"] if c["id"] == "socket.control")["code"], "unsupported")
+                    socket_check = next(c for c in report["checks"] if c["id"] == "socket.control")
+                    self.assertEqual(socket_check["code"], "unsupported")
+                    self.assertEqual(socket_check["owner"], "installer")
 
     def test_versions_reject_private_text(self) -> None:
         for version in (*CANARIES, "1.2.3-/private/path", "1.2.3-nsec1secretcanary"):
@@ -1475,7 +1481,7 @@ class DoctorReportTests(unittest.TestCase):
             self.assertEqual(check["code"], "invalid")
             checks = doctor._connector_checks(
                 {"type": "diagnostic_status", "report": {"connector_version": version}},
-                None, None, None, "auto",
+                None, None,
             )
             encoded = json.dumps(checks) + diag.render_human(diag.report_object(checks))
             self.assertNotIn(version, encoded)

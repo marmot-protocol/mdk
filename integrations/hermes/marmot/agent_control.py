@@ -139,25 +139,6 @@ class MarmotAgentControlClient:
             )
         return response
 
-    async def diagnostic_status(
-        self,
-        *,
-        account_id_hex: Optional[str] = None,
-        home_group_id_hex: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"type": "diagnostic_status"}
-        if account_id_hex:
-            payload["account_id_hex"] = _normalize_hex(account_id_hex, "account_id_hex")
-        if home_group_id_hex:
-            payload["home_group_id_hex"] = _normalize_hex(home_group_id_hex, "home_group_id_hex")
-        response = await self.request(payload, timeout=min(self.request_timeout, 5.0))
-        if not isinstance(response.get("report"), dict):
-            raise AgentControlError(
-                "wn-agent returned invalid diagnostic_status response",
-                code="protocol_error",
-            )
-        return response
-
     async def timeline_message_get(
         self,
         account_id_hex: str,

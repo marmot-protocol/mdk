@@ -1350,7 +1350,7 @@ EOF
 }
 
 run_doctor() {
-    local python_root doctor_json doctor_output doctor_status
+    local python_root doctor_json doctor_output doctor_status doctor_service
     if ! command -v python3 >/dev/null 2>&1; then
         emit_doctor_fatal
         return 2

@@ -3,7 +3,7 @@
 use agent_control::{
     AGENT_CONTROL_PROTOCOL_V2, AgentControlAccountSelection, AgentControlDiagnosticHome,
     AgentControlDiagnosticKeyPackage, AgentControlDiagnosticRelays, AgentControlDiagnosticStatus,
-    AgentControlResponse,
+    AgentControlKeyPackageAvailability, AgentControlResponse,
 };
 use cgka_traits::{GroupId, TransportFanoutAttemptState};
 
@@ -130,16 +130,16 @@ impl AgentConnector {
                     .current_not_after
                     .map(|stamp| present && stamp.0 < now);
                 let availability = if status.pending_replacement.is_some() {
-                    "pending"
+                    AgentControlKeyPackageAvailability::Pending
                 } else if present && (expired == Some(true) || failed > 0) {
-                    "degraded"
+                    AgentControlKeyPackageAvailability::Degraded
                 } else if present {
-                    "present"
+                    AgentControlKeyPackageAvailability::Present
                 } else {
-                    "absent"
+                    AgentControlKeyPackageAvailability::Absent
                 };
                 AgentControlDiagnosticKeyPackage {
-                    availability: availability.to_owned(),
+                    availability,
                     phase: Some(status.phase.as_str().to_owned()),
                     present,
                     expired,
@@ -150,7 +150,7 @@ impl AgentConnector {
                 }
             }
             Ok(Some(None)) => AgentControlDiagnosticKeyPackage {
-                availability: "absent".to_owned(),
+                availability: AgentControlKeyPackageAvailability::Absent,
                 phase: None,
                 present: false,
                 expired: None,

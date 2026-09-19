@@ -53,7 +53,6 @@ DISCONNECT_REASONS = (
     "transport",
 )
 
-REDACT_TOKENS = ("token", "secret", "nsec", "password", "authorization")
 INBOUND_MEDIA_KINDS = ("document", "image", "video", "voice")
 OUTBOUND_MEDIA_KINDS = ("document", "image", "video", "voice")
 ACCOUNT_ID_HEX_LEN = 64
@@ -106,13 +105,6 @@ _DOTENV_SINGLE_QUOTED = re.compile(r"'((?:\\'|[^'])*)'")
 _DOTENV_DOUBLE_QUOTED = re.compile(r'"((?:\\"|[^"])*)"')
 _DOTENV_SINGLE_ESCAPES = re.compile(r"\\[\\']")
 _DOTENV_DOUBLE_ESCAPES = re.compile(r"\\[\\'\"abfnrtv]")
-
-
-def redacted(text: str) -> str:
-    """Return a privacy-safe placeholder; never echo caller-supplied text."""
-
-    del text
-    return "<redacted>"
 
 
 def check(
@@ -375,11 +367,6 @@ def split_config_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item).strip() for item in value if str(item).strip()]
     return [part.strip() for part in str(value).split(",") if part.strip()]
-
-
-def parse_dotenv_scalar(raw_value: str) -> str:
-    value, _supported = _parse_dotenv_scalar(raw_value)
-    return value
 
 
 _DOTENV_SINGLE_ESCAPE_MAP = {"\\\\": "\\", "\\'": "'"}
@@ -738,13 +725,9 @@ def resolve_socket_path(
 def resolve_auth_token(
     extra: dict[str, Any],
     *,
-    token: Optional[str] = None,
     token_file: Optional[str] = None,
     env_values: Optional[dict[str, str]] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    if token not in (None, ""):
-        stripped = str(token).strip()
-        return (stripped or None), None if stripped else "empty"
     configured = first_config_value(
         extra, "auth_token", "agent_auth_token", env="MARMOT_AGENT_AUTH_TOKEN", env_values=env_values
     )
@@ -816,7 +799,6 @@ class PluginObservations:
     account_selected: bool = False
     home_configured: bool = False
     loaded_home_digest: str = ""
-    media: dict[str, Any] = field(default_factory=dict)
     _recovery_pending: bool = False
 
     def snapshot(
@@ -847,7 +829,6 @@ class PluginObservations:
             "account_selected": self.account_selected,
             "home_configured": self.home_configured,
             "home_matches": home_matches,
-            "media_ready": bool(self.media.get("inbound") or self.media.get("outbound") or self.media),
             "plugin_version": self.plugin_version,
         }
 

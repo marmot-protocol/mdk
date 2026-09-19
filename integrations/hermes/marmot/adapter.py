@@ -1670,7 +1670,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._observations.account_selected = bool(self.account_id_hex)
         self._observations.home_configured = bool(home_route)
         self._observations.loaded_home_digest = marmot_diagnostics.identity_digest(home_route)
-        self._observations.media = media_capability_status()
         self._observations.plugin_version = marmot_diagnostics.plugin_version_from_manifest(
             Path(__file__).resolve().parent
         )
