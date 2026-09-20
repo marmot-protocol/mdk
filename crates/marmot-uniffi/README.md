@@ -363,6 +363,30 @@ hosts can override or disable that third-party service with
 `MarmotServiceEndpoints::profile_image_blob_endpoint`; FFI callers can continue
 to pass an explicit Blossom server to `uploadProfileImage`.
 
+## Build phases
+
+The no-argument build scripts still build complete local bundles. Release CI
+uses separate phases to parallelize compilation across runners:
+
+| Script | Phase | Work |
+| --- | --- | --- |
+| `xcframework.sh` | `generate` | Host library and generated Swift/headers in `build/ios/swift`; no device builds |
+| `xcframework.sh` | `native <target>` | One `aarch64-apple-ios` or `aarch64-apple-ios-sim` native build |
+| `xcframework.sh` | `assemble` | Assemble existing native slices and `build/ios/swift` into the usual iOS output |
+| `xcframework-macos.sh` | `native` | One `aarch64-apple-darwin` build with the macOS deployment flags |
+| `xcframework-macos.sh` | `assemble` | Assemble the native slice with shared Swift/headers placed in `build/macos/swift` |
+| `kotlin-bindings.sh` | `generate` | Host library, generated Kotlin and Android support files; no NDK required |
+| `kotlin-bindings.sh` | `native` | JNI libraries for `ANDROID_ABIS`; no host library or binding generation |
+
+Run independent phases in separate checkouts/runners. Multiple Cargo processes
+sharing one target directory contend on its lock; separate phases do not make
+concurrent invocations in one checkout safe. All inputs must have matching source,
+builder, toolchain, profile and features. CI transfers inputs only within the same
+workflow run. Apple assembly checks required files before replacing an existing
+bundle and never compiles Rust. Both Apple scripts honor `CARGO_TARGET_DIR`.
+See the [release guide](../../release.md#parallel-builds-and-build-only-rehearsals)
+for the build-only benchmark workflow and cache-warming procedure.
+
 ## Kotlin / Android
 
 Prerequisites:

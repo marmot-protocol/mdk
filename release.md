@@ -496,6 +496,46 @@ It runs when a tag matching `marmotkit-v*` is pushed. The workflow validates ver
 Release. It can also be dispatched with a full commit SHA reachable from `master` to create an immutable iOS, macOS,
 and Android snapshot.
 
+### Parallel builds and build-only rehearsals
+
+The binding workflow builds Kotlin generation and all four Android ABIs in
+independent jobs. Apple builds generate Swift once and compile the iOS device,
+iOS simulator and macOS slices independently, with at most three Apple build
+jobs running at once per workflow. Assembly jobs download inputs from their own
+workflow run, preserve the existing bundle names/layouts and perform the existing
+SwiftPM and app/archive privacy checks. Bundle agreement checks run before
+publication, including matching Swift hashes, source/builder SHAs and checksums.
+
+To measure a workflow change without publishing, dispatch its branch with
+`build_only=true` and an exact source SHA:
+
+```sh
+gh workflow run bindings.yaml --ref codex/parallel-binding-builds \
+  -f source_sha="$(git rev-parse HEAD)" -f build_only=true
+```
+
+Replace the example branch with the branch containing the workflow being tested.
+This builds and validates workflow artifacts but creates no release or tag and
+skips the published-URL consumer checks. Download the three final platform
+artifacts from that run for inspection. Per-input compiler timing reports are
+also uploaded; use job start times and durations to distinguish runner waiting
+from compilation. A successful rehearsal is packaged-artifact evidence, not
+publication or downstream app adoption.
+
+Publishing dispatches still require the workflow and source ancestry on `master`.
+Build-only dispatches from a development branch may build that branch's source.
+Dispatching from `master` still requires source ancestry on `master`, including
+build-only runs, because only those runs may save dependency caches. A build-only
+run on `master` can deliberately warm the per-input caches without publishing.
+Cache keys separate input targets and include the builder scripts/profile/defaults;
+the cache action also keys the Rust toolchain and Cargo dependency inputs.
+
+Avoid overlapping snapshot rehearsals and cohort releases when macOS capacity is
+limited. The three-job Apple bound is per workflow, not an organization-wide
+reservation; separate workflows and repositories can still compete for runners.
+The release coordinator already starts WN Agent, MarmotKit and Marmot C before
+waiting, so its sequential watch commands do not serialize the builds.
+
 Create the tag:
 
 ```sh
