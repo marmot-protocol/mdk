@@ -12,7 +12,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - Host-managed attachment acquisition mode on `MarmotClientOptions`, generation-fenced
   permission and automatic-request commands, and acquired-unavailable/completed-unretained/
   retry-exhausted states. This changes the options layout: recompile with matching
-  generated headers and libraries. See the [attachment migration](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased).
+  generated headers and libraries. See the [attachment migration](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased). ([#1939](https://github.com/marmot-protocol/mdk/pull/1939))
 
 ### Fixed
 
