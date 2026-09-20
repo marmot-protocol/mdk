@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -32,6 +33,8 @@ def put(path, data="fixture"):
     path.write_text(data)
 if name == "rustup" and args[:2] == ["target", "list"]:
     print("\n".join(os.environ["BUILD_TEST_TARGETS"].split()))
+elif name in ["rustc", "cargo"] and args == ["--version"]:
+    print(name + " 1.97.1 fixture")
 elif name == "cargo":
     if args[0] == "run":
         out = pathlib.Path(args[args.index("--out-dir") + 1])
@@ -178,6 +181,55 @@ class BuildPhases(unittest.TestCase):
             ("xcframework-macos.sh", ["unknown"]), ("kotlin-bindings.sh", ["unknown"])]:
             self.run_phase(script, *args, success=False)
         self.assertEqual(self.commands(), [])
+
+    def provenance(self, *args, success=True):
+        result = subprocess.run([sys.executable, str(TOOLS / "build-provenance.py"), *map(str, args)],
+            env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+        return result
+
+    def record_inputs(self, parts):
+        for tool in ["git", "rustc"]:
+            self.shim(self.bin / tool)
+        (self.root / "ndk/source.properties").write_text("Pkg.Revision = 27.2.12479018\n")
+        self.env.update(SOURCE_SHA="a" * 40, BUILDER_SHA="b" * 40,
+            GITHUB_ENV=str(self.root / "github-env"))
+        paths = [self.root / "provenance" / (part + ".json") for part in parts]
+        for part, path in zip(parts, paths):
+            self.provenance("record", part, path)
+        return paths
+
+    def test_android_manifest_uses_observed_build_provenance(self):
+        paths = self.record_inputs(["kotlin", "arm64-v8a", "armeabi-v7a", "x86", "x86_64"])
+        self.provenance("verify", "android", *paths)
+        values = dict(line.split("=", 1) for line in Path(self.env["GITHUB_ENV"]).read_text().splitlines())
+        self.assertEqual(values["MARMOTKIT_BUILD_ANDROID_NDK_HOME"], str(self.root / "ndk"))
+        self.assertEqual(values["MARMOTKIT_BUILD_ANDROID_NDK_VERSION"], "27.2.12479018")
+        self.assertEqual(values["MARMOTKIT_BUILD_RUSTC"], "rustc 1.97.1 fixture")
+        self.assertEqual(values["MARMOTKIT_BUILD_CARGO"], "cargo 1.97.1 fixture")
+        self.assertEqual(values["MARMOTKIT_BUILD_ANDROID_API"], "26")
+
+    def test_provenance_rejects_missing_duplicate_and_disagreeing_inputs(self):
+        paths = self.record_inputs(["kotlin", "arm64-v8a", "armeabi-v7a", "x86", "x86_64"])
+        self.provenance("verify", "android", *paths[:-1], success=False)
+        self.provenance("verify", "android", *paths[:-1], paths[1], success=False)
+        original = json.loads(paths[-1].read_text())
+        for key in ["source_sha", "builder_sha", "rustc", "cargo", "android_ndk_home",
+                    "android_ndk_version", "android_api", "part"]:
+            with self.subTest(key=key):
+                paths[-1].write_text(json.dumps(original | {key: "different"}))
+                self.provenance("verify", "android", *paths, success=False)
+        self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
+
+    def test_apple_provenance_checks_generated_swift_and_native_inputs(self):
+        for platform, parts in [("ios", ["swift", "ios-device", "ios-simulator"]),
+                                ("macos", ["swift", "macos"])]:
+            with self.subTest(platform=platform):
+                paths = self.record_inputs(parts)
+                self.provenance("verify", platform, *paths)
+                data = json.loads(paths[0].read_text())
+                paths[0].write_text(json.dumps(data | {"cargo": "different"}))
+                self.provenance("verify", platform, *paths, success=False)
 
     def test_master_cache_warming_rejects_untrusted_source_ancestry(self):
         # Execute the workflow's actual identity script, rather than a copy of

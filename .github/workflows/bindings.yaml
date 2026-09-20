@@ -27,6 +27,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+  MARMOTKIT_MACOS_DEPLOYMENT_TARGET: "15.0"
+  ANDROID_NDK_VERSION: 27.2.12479018
   OTLP_EXPORT: "1"
   PRODUCT_ANALYTICS_EXPORT: "1"
 
@@ -122,19 +124,22 @@ jobs:
       fail-fast: false
       # Leave capacity for WN Agent on a five-slot macOS plan. This bounds this
       # run only; avoid overlapping snapshot and cohort builds during releases.
+      # Cold rehearsal 35506538221 queued the fourth input for ~12 minutes.
       max-parallel: 3
       matrix:
         include:
           - part: swift
             path: crates/marmot-uniffi/build/ios/swift
+            provenance: crates/marmot-uniffi/build/ios/swift/build-provenance.json
           - part: macos
             path: target/aarch64-apple-darwin/release/libmarmot_uniffi.a
+            provenance: target/aarch64-apple-darwin/release/build-provenance.json
           - part: ios-simulator
             path: target/aarch64-apple-ios-sim/release/libmarmot_uniffi.a
+            provenance: target/aarch64-apple-ios-sim/release/build-provenance.json
           - part: ios-device
             path: target/aarch64-apple-ios/release/libmarmot_uniffi.a
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
+            provenance: target/aarch64-apple-ios/release/build-provenance.json
 
     steps:
       - name: Check out repository
@@ -173,21 +178,27 @@ jobs:
           MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
           MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
           PART: ${{ matrix.part }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+          PROVENANCE_PATH: packaged-source/${{ matrix.provenance }}
         run: |
           set -euo pipefail
           case "$PART" in
             swift) ./crates/marmot-uniffi/xcframework.sh generate ;;
             ios-device) ./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios ;;
             ios-simulator) ./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios-sim ;;
-            macos) ./crates/marmot-uniffi/xcframework-macos.sh native ;;
+            macos) MACOSX_DEPLOYMENT_TARGET="$MARMOTKIT_MACOS_DEPLOYMENT_TARGET" \
+              ./crates/marmot-uniffi/xcframework-macos.sh native ;;
             *) exit 1 ;;
           esac
+          python3 crates/marmot-uniffi/build-provenance.py record "$PART" "$PROVENANCE_PATH"
 
       - name: Upload Apple input
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: marmotkit-input-${{ matrix.part }}-${{ needs.metadata.outputs.source_sha }}
-          path: packaged-source/${{ matrix.path }}
+          path: |
+            packaged-source/${{ matrix.path }}
+            packaged-source/${{ matrix.provenance }}
           if-no-files-found: error
           compression-level: 1
           retention-days: 7
@@ -232,22 +243,32 @@ jobs:
           cargo --version
 
       - name: Download swift input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: marmotkit-input-swift-${{ needs.metadata.outputs.source_sha }}
           path: packaged-source/crates/marmot-uniffi/build/ios/swift
 
       - name: Download ios-device input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: marmotkit-input-ios-device-${{ needs.metadata.outputs.source_sha }}
           path: packaged-source/target/aarch64-apple-ios/release
 
       - name: Download ios-simulator input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: marmotkit-input-ios-simulator-${{ needs.metadata.outputs.source_sha }}
           path: packaged-source/target/aarch64-apple-ios-sim/release
+
+      - name: Verify build provenance
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+        run: |
+          python3 crates/marmot-uniffi/build-provenance.py verify ios \
+            packaged-source/crates/marmot-uniffi/build/ios/swift/build-provenance.json \
+            packaged-source/target/aarch64-apple-ios/release/build-provenance.json \
+            packaged-source/target/aarch64-apple-ios-sim/release/build-provenance.json
 
       - name: Assemble XCFramework from matching inputs
         env:
@@ -319,15 +340,11 @@ jobs:
     runs-on: macos-latest
     needs: [metadata, apple-build]
     timeout-minutes: 60
-    env:
-      # This value is what the job both builds and validates against, so those
-      # two steps cannot disagree. Validating against a lower number fails,
-      # because locally compiled members report exactly this minimum. The
-      # build/package/validate scripts each default to the same 15.0 when run
-      # outside CI; keep those defaults in step with this value.
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
 
     steps:
+      - name: Set macOS deployment target
+        run: echo "MACOSX_DEPLOYMENT_TARGET=$MARMOTKIT_MACOS_DEPLOYMENT_TARGET" >> "$GITHUB_ENV"
+
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -352,16 +369,25 @@ jobs:
           cargo --version
 
       - name: Download swift input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: marmotkit-input-swift-${{ needs.metadata.outputs.source_sha }}
           path: packaged-source/crates/marmot-uniffi/build/macos/swift
 
       - name: Download macos input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: marmotkit-input-macos-${{ needs.metadata.outputs.source_sha }}
           path: packaged-source/target/aarch64-apple-darwin/release
+
+      - name: Verify build provenance
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+        run: |
+          python3 crates/marmot-uniffi/build-provenance.py verify macos \
+            packaged-source/crates/marmot-uniffi/build/macos/swift/build-provenance.json \
+            packaged-source/target/aarch64-apple-darwin/release/build-provenance.json
 
       - name: Assemble XCFramework from matching inputs
         env:
@@ -440,19 +466,14 @@ jobs:
         include:
           - part: kotlin
             target: ""
-            path: kotlin
           - part: arm64-v8a
             target: aarch64-linux-android
-            path: jniLibs/arm64-v8a
           - part: armeabi-v7a
             target: armv7-linux-androideabi
-            path: jniLibs/armeabi-v7a
           - part: x86
             target: i686-linux-android
-            path: jniLibs/x86
           - part: x86_64
             target: x86_64-linux-android
-            path: jniLibs/x86_64
 
     steps:
       - name: Check out repository
@@ -487,8 +508,6 @@ jobs:
       - name: Install Android NDK
         if: matrix.part != 'kotlin'
         shell: bash
-        env:
-          ANDROID_NDK_VERSION: 27.2.12479018
         run: |
           set -euo pipefail
           sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
@@ -533,6 +552,7 @@ jobs:
           MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
           MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
           PART: ${{ matrix.part }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
         run: |
           set -euo pipefail
           if [[ "$PART" == kotlin ]]; then
@@ -540,12 +560,14 @@ jobs:
           else
             ANDROID_ABIS="$PART" ./crates/marmot-uniffi/kotlin-bindings.sh native
           fi
+          python3 crates/marmot-uniffi/build-provenance.py record "$PART" \
+            "packaged-source/crates/marmot-uniffi/output/android/provenance/$PART.json"
 
       - name: Upload Android input
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: marmotkit-input-${{ matrix.part }}-${{ needs.metadata.outputs.source_sha }}
-          path: packaged-source/crates/marmot-uniffi/output/android/${{ matrix.path }}
+          name: marmotkit-input-android-${{ matrix.part }}-${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source/crates/marmot-uniffi/output/android
           if-no-files-found: error
           compression-level: 1
           retention-days: 7
@@ -579,80 +601,20 @@ jobs:
           ref: ${{ needs.metadata.outputs.source_sha }}
           path: packaged-source
 
-      - name: Install Rust toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' packaged-source/rust-toolchain.toml)"
-          rustup toolchain install "$toolchain" --profile minimal
-          rustup default "$toolchain"
-          rustc --version
-          cargo --version
+      - name: Download Android inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: marmotkit-input-android-*-${{ needs.metadata.outputs.source_sha }}
+          merge-multiple: true
+          path: packaged-source/crates/marmot-uniffi/output/android
 
-      - name: Install Android NDK
-        shell: bash
+      - name: Verify build provenance
         env:
-          ANDROID_NDK_VERSION: 27.2.12479018
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
         run: |
-          set -euo pipefail
-          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          if [[ -z "$sdk_root" ]]; then
-            echo "error: ANDROID_SDK_ROOT or ANDROID_HOME must be set on the runner" >&2
-            exit 1
-          fi
-          sdkmanager_bin=""
-          for candidate in \
-            "$sdk_root/cmdline-tools/latest/bin/sdkmanager" \
-            "$sdk_root/cmdline-tools/bin/sdkmanager" \
-            "$sdk_root/tools/bin/sdkmanager"; do
-            if [[ -x "$candidate" ]]; then
-              sdkmanager_bin="$candidate"
-              break
-            fi
-          done
-          if [[ -z "$sdkmanager_bin" ]] && command -v sdkmanager >/dev/null 2>&1; then
-            sdkmanager_bin="$(command -v sdkmanager)"
-          fi
-          if [[ -z "$sdkmanager_bin" ]]; then
-            echo "error: sdkmanager not found under $sdk_root" >&2
-            find "$sdk_root" -maxdepth 4 -type f -name sdkmanager -print >&2 || true
-            exit 1
-          fi
-          set +o pipefail
-          yes | "$sdkmanager_bin" --licenses >/dev/null
-          set -o pipefail
-          "$sdkmanager_bin" "ndk;$ANDROID_NDK_VERSION"
-          echo "ANDROID_NDK_HOME=$sdk_root/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
-
-      - name: Download kotlin input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: marmotkit-input-kotlin-${{ needs.metadata.outputs.source_sha }}
-          path: packaged-source/crates/marmot-uniffi/output/android/kotlin
-
-      - name: Download arm64-v8a input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: marmotkit-input-arm64-v8a-${{ needs.metadata.outputs.source_sha }}
-          path: packaged-source/crates/marmot-uniffi/output/android/jniLibs/arm64-v8a
-
-      - name: Download armeabi-v7a input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: marmotkit-input-armeabi-v7a-${{ needs.metadata.outputs.source_sha }}
-          path: packaged-source/crates/marmot-uniffi/output/android/jniLibs/armeabi-v7a
-
-      - name: Download x86 input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: marmotkit-input-x86-${{ needs.metadata.outputs.source_sha }}
-          path: packaged-source/crates/marmot-uniffi/output/android/jniLibs/x86
-
-      - name: Download x86_64 input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: marmotkit-input-x86_64-${{ needs.metadata.outputs.source_sha }}
-          path: packaged-source/crates/marmot-uniffi/output/android/jniLibs/x86_64
+          python3 crates/marmot-uniffi/build-provenance.py verify android \
+            packaged-source/crates/marmot-uniffi/output/android/provenance/*.json
 
       - name: Package Android bundle
         shell: bash
@@ -708,10 +670,11 @@ jobs:
             "builder_sha": "$BUILDER_SHA",
             "workspace_version": "$workspace_version",
             "cargo_lock_sha256": "$lock_sha",
-            "rustc": "$(rustc --version)",
-            "cargo": "$(cargo --version)",
-            "android_ndk_home": "${ANDROID_NDK_HOME:-}",
-            "android_api": "${ANDROID_API:-26}",
+            "rustc": "$MARMOTKIT_BUILD_RUSTC",
+            "cargo": "$MARMOTKIT_BUILD_CARGO",
+            "android_ndk_home": "$MARMOTKIT_BUILD_ANDROID_NDK_HOME",
+            "android_ndk_version": "$MARMOTKIT_BUILD_ANDROID_NDK_VERSION",
+            "android_api": "$MARMOTKIT_BUILD_ANDROID_API",
             "contents": [
               "kotlin/dev/ipf/marmotkit/marmot_uniffi.kt",
               "jniLibs/arm64-v8a/libmarmot_uniffi.so",

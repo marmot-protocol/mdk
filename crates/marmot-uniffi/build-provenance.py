@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Carry observed compiler identity from build jobs to release assemblers."""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+PARTS = {
+    "ios": {"swift", "ios-device", "ios-simulator"},
+    "macos": {"swift", "macos"},
+    "android": {"kotlin", "arm64-v8a", "armeabi-v7a", "x86", "x86_64"},
+}
+NDK_FIELDS = ("android_ndk_home", "android_ndk_version", "android_api")
+
+
+def record(part, destination):
+    workspace = os.environ["MARMOTKIT_WORKSPACE_DIR"]
+    env = dict(os.environ, PATH=f"{Path.home()}/.cargo/bin:{os.environ['PATH']}")
+
+    def command(*args):
+        return subprocess.check_output(args, cwd=workspace, env=env, text=True).strip()
+
+    data = dict(part=part, source_sha=command("git", "rev-parse", "HEAD"),
+                builder_sha=os.environ["BUILDER_SHA"],
+                rustc=command("rustc", "--version"), cargo=command("cargo", "--version"))
+    if part in PARTS["android"] - {"kotlin"}:
+        ndk = Path(os.environ["ANDROID_NDK_HOME"])
+        properties = dict(line.split("=", 1) for line in
+                          (ndk / "source.properties").read_text().splitlines() if "=" in line)
+        properties = {key.strip(): value.strip() for key, value in properties.items()}
+        data.update(android_ndk_home=str(ndk), android_ndk_version=properties["Pkg.Revision"],
+                    android_api=os.environ.get("ANDROID_API", "26"))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def verify(platform, paths):
+    records = [json.loads(path.read_text()) for path in paths]
+    if len(records) != len(PARTS[platform]) or {r["part"] for r in records} != PARTS[platform]:
+        raise ValueError(f"expected exactly these build inputs: {sorted(PARTS[platform])}")
+    for record in records:
+        for key in ("source_sha", "builder_sha"):
+            if record[key] != os.environ[key.upper()]:
+                raise ValueError(f"{record['part']}: mismatched {key}")
+
+    values = {}
+    for key in ("rustc", "cargo", *(NDK_FIELDS if platform == "android" else ())):
+        applicable = [r for r in records if key not in NDK_FIELDS or r["part"] != "kotlin"]
+        observed = {r[key] for r in applicable}
+        if len(observed) != 1:
+            raise ValueError(f"build inputs disagree on {key}")
+        value = observed.pop()
+        if not isinstance(value, str) or not value or any(c in value for c in "\n\r\0"):
+            raise ValueError(f"invalid {key}")
+        values[key] = value
+    # Write only after every input agrees; assemblers must never sample their
+    # own toolchains to describe artifacts compiled on other runners.
+    with open(os.environ["GITHUB_ENV"], "a") as output:
+        for key, value in values.items():
+            output.write(f"MARMOTKIT_BUILD_{key.upper()}={value}\n")
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) == 4 and sys.argv[1] == "record":
+            record(sys.argv[2], Path(sys.argv[3]))
+        elif len(sys.argv) >= 4 and sys.argv[1] == "verify":
+            verify(sys.argv[2], [Path(path) for path in sys.argv[3:]])
+        else:
+            raise ValueError("usage: build-provenance.py record PART FILE | verify PLATFORM FILE...")
+    except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
+        sys.exit(f"error: {error}")

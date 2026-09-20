@@ -505,6 +505,11 @@ jobs running at once per workflow. Assembly jobs download inputs from their own
 workflow run, preserve the existing bundle names/layouts and perform the existing
 SwiftPM and app/archive privacy checks. Bundle agreement checks run before
 publication, including matching Swift hashes, source/builder SHAs and checksums.
+Swift is generated once: its cross-platform hash agreement checks transfer and
+packaging, not independent regeneration. Each input carries observed compiler
+provenance; assembly verifies agreement before using those values in manifests.
+Artifact downloads fail on digest mismatch, and Android transfers preserve the
+producer's ABI directories.
 
 To measure a workflow change without publishing, dispatch its branch with
 `build_only=true` and an exact source SHA:
@@ -533,6 +538,11 @@ the cache action also keys the Rust toolchain and Cargo dependency inputs.
 Avoid overlapping snapshot rehearsals and cohort releases when macOS capacity is
 limited. The three-job Apple bound is per workflow, not an organization-wide
 reservation; separate workflows and repositories can still compete for runners.
+In cold rehearsal 35506538221, this cap queued the fourth Apple input for roughly
+12 minutes; raising it to four trades that delay for one fewer slot for WN Agent.
+Local no-argument scripts also use `--locked` for reproducibility and `--timings`
+to write compiler reports under `target/cargo-timings/`. Refresh a stale lockfile
+before building bindings.
 The release coordinator already starts WN Agent, MarmotKit and Marmot C before
 waiting, so its sequential watch commands do not serialize the builds.
 
