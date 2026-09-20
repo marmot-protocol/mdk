@@ -180,6 +180,8 @@ mod migration_0084_attachment_worker_demand;
 mod migration_0085_attachment_partials;
 #[path = "migrations/0086_attachment_controls.rs"]
 mod migration_0086_attachment_controls;
+#[path = "migrations/0087_draft_attachment_descriptors.rs"]
+mod migration_0087_draft_attachment_descriptors;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -620,6 +622,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 86,
         name: "0086_attachment_controls",
         apply: migration_0086_attachment_controls::apply,
+    },
+    Migration {
+        version: 87,
+        name: "0087_draft_attachment_descriptors",
+        apply: migration_0087_draft_attachment_descriptors::apply,
     },
 ];
 
