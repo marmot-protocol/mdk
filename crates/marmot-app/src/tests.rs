@@ -10946,6 +10946,8 @@ fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_send
         plaintext: r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#.to_owned(),
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         timeline_at: 1,
+        retention_seconds: None,
+        retention_expires_at: None,
         deleted: false,
         deletion_source: Default::default(),
         attachment_kind: None,

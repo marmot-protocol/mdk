@@ -62,6 +62,13 @@ pub struct ChatListMessagePreviewFfi {
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub timeline_at: u64,
+    /// This message's pinned source-epoch retention. `None` is unknown (safe
+    /// retain); `Some(0)` means retention was explicitly disabled.
+    pub retention_seconds: Option<u64>,
+    /// Exact pinned expiration in Unix seconds. Hide expired previews when
+    /// `now >= retention_expires_at`. `None` means no finite expiry, including
+    /// overflow; do not derive one from `timeline_at` or current group policy.
+    pub retention_expires_at: Option<u64>,
     pub deleted: bool,
     pub deletion_source: super::timeline::DeletionSourceFfi,
     pub attachment_kind: Option<ChatListAttachmentKindFfi>,
@@ -122,6 +129,8 @@ impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
             content_tokens,
             kind: value.kind,
             timeline_at: value.timeline_at,
+            retention_seconds: value.retention_seconds,
+            retention_expires_at: value.retention_expires_at,
             deleted: value.deleted,
             deletion_source: value.deletion_source.into(),
             attachment_kind: value.attachment_kind.map(Into::into),
@@ -459,6 +468,39 @@ mod tests {
             muted: false,
             muted_until_ms: None,
             leave_requested_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn chat_preview_retention_preserves_pinned_decisions() {
+        for (retention_seconds, retention_expires_at) in [
+            (None, None),
+            (Some(0), None),
+            (Some(300), Some(310)),
+            (Some(300), None),
+        ] {
+            let mut row = sample_row();
+            row.last_message = Some(ChatListMessagePreview {
+                group_system: None,
+                message_id_hex: "message".to_owned(),
+                sender: "sender".to_owned(),
+                sender_display_name: None,
+                plaintext: "hello".to_owned(),
+                kind: 9,
+                // Deliberately not the timestamp used to pin the deadline.
+                timeline_at: 999,
+                retention_seconds,
+                retention_expires_at,
+                deleted: false,
+                deletion_source: Default::default(),
+                attachment_kind: None,
+                attachment_count: 0,
+                delivery_state: ChatListMessageDeliveryState::NotApplicable,
+                media_json: None,
+            });
+            let ffi = ChatListRowFfi::from(row).last_message.unwrap();
+            assert_eq!(ffi.retention_seconds, retention_seconds);
+            assert_eq!(ffi.retention_expires_at, retention_expires_at);
         }
     }
 

@@ -1731,6 +1731,8 @@ fn chat_list_fingerprint_preserves_serialized_deduplication_semantics() {
 
     let mut internal_media_changed = base.clone();
     internal_media_changed.last_message = Some(crate::ChatListMessagePreview {
+        retention_seconds: None,
+        retention_expires_at: None,
         group_system: None,
         message_id_hex: "message".to_owned(),
         sender: "sender".to_owned(),
@@ -3305,6 +3307,8 @@ async fn deletion_provenance_only_change_wakes_chat_list_subscribers() {
     let (tx, mut rx) = mpsc::channel(2);
     let mut row = chat_list_test_row("group", "title");
     row.last_message = Some(crate::ChatListMessagePreview {
+        retention_seconds: None,
+        retention_expires_at: None,
         group_system: None,
         message_id_hex: "message".into(),
         sender: "author".into(),
@@ -3334,6 +3338,59 @@ async fn deletion_provenance_only_change_wakes_chat_list_subscribers() {
     assert!(
         matches!(rx.recv().await, Some(RuntimeChatListUpdate::Row { row, .. }) if row.last_message.as_ref().unwrap().deletion_source == crate::DeletionSource::Admin)
     );
+    assert!(
+        reconcile_chat_list_snapshot(
+            &tx,
+            &mut fingerprints,
+            ChatListUpdateTrigger::SnapshotRefresh,
+            vec![row]
+        )
+        .await
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn chat_preview_retention_only_change_wakes_subscribers() {
+    let (tx, mut rx) = mpsc::channel(2);
+    let mut row = chat_list_test_row("group", "title");
+    row.last_message = Some(crate::ChatListMessagePreview {
+        group_system: None,
+        message_id_hex: "message".to_owned(),
+        sender: "author".to_owned(),
+        sender_display_name: None,
+        plaintext: "hello".to_owned(),
+        kind: 9,
+        timeline_at: 10,
+        retention_seconds: None,
+        retention_expires_at: None,
+        deleted: false,
+        deletion_source: Default::default(),
+        attachment_kind: None,
+        attachment_count: 0,
+        delivery_state: crate::ChatListMessageDeliveryState::Pending,
+        media_json: None,
+    });
+    let mut fingerprints =
+        HashMap::from([(row.group_id_hex.clone(), chat_list_row_fingerprint(&row))]);
+    let preview = row.last_message.as_mut().unwrap();
+    preview.retention_seconds = Some(300);
+    preview.retention_expires_at = Some(310);
+    assert!(
+        reconcile_chat_list_snapshot(
+            &tx,
+            &mut fingerprints,
+            ChatListUpdateTrigger::SnapshotRefresh,
+            vec![row.clone()]
+        )
+        .await
+    );
+    let Some(RuntimeChatListUpdate::Row { row: updated, .. }) = rx.recv().await else {
+        panic!("expected a row update for finalized retention");
+    };
+    let preview = updated.last_message.as_ref().unwrap();
+    assert_eq!(preview.retention_seconds, Some(300));
+    assert_eq!(preview.retention_expires_at, Some(310));
     assert!(
         reconcile_chat_list_snapshot(
             &tx,

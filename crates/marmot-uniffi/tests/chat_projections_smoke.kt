@@ -38,12 +38,17 @@ fun main() {
     for (provenance in GroupSystemEventProvenanceFfi.entries) {
         val event = GroupSystemEventFfi(provenance, "Actor", "Subject", "member_added", "Member added", "actor", "subject", null, null, null, null)
         val preview = ChatListMessagePreviewFfi(event, "selected", "actor", null, "raw", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
-            1210u, 50u, false, DeletionSourceFfi.UNKNOWN, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
+            1210u, 50u, null, null, false, DeletionSourceFfi.UNKNOWN, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
         val copy = FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
         // Kotlin ByteArray equality is referential; compare the nested bytes by content.
         check(copy.contentTokens.blankLinesBefore.contentEquals(preview.contentTokens.blankLinesBefore))
         check(copy.contentTokens.blocks == preview.contentTokens.blocks && copy.contentTokens.truncated == preview.contentTokens.truncated)
         check(copy.copy(contentTokens = preview.contentTokens) == preview && copy.groupSystem?.provenance == provenance)
+        for ((seconds, expiry) in listOf<Pair<ULong?, ULong?>>(null to null, 0uL to null, 300uL to 350uL, 300uL to null)) {
+            val timed = preview.copy(retentionSeconds = seconds, retentionExpiresAt = expiry)
+            val timedCopy = FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(timed))
+            check(timedCopy.retentionSeconds == seconds && timedCopy.retentionExpiresAt == expiry)
+        }
     }
     for (source in DeletionSourceFfi.entries) {
         val preview = TimelineReplyPreviewFfi("deleted", "author", "", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),

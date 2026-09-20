@@ -51,10 +51,19 @@ struct ChatProjectionsSmoke {
                 systemType: "member_added", text: "Member added", actorAccountIdHex: "actor", subjectAccountIdHex: "subject",
                 name: nil, oldName: nil, oldRetentionSeconds: nil, newRetentionSeconds: nil)
             let preview = ChatListMessagePreviewFfi(groupSystem: event, messageIdHex: "selected", sender: "actor", senderDisplayName: nil,
-                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50, deleted: false, deletionSource: .unknown,
+                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50,
+                retentionSeconds: nil, retentionExpiresAt: nil, deleted: false, deletionSource: .unknown,
                 attachmentKind: nil, attachmentCount: 0, deliveryState: .notApplicable)
             let copy = try FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
             precondition(copy == preview && copy.groupSystem?.provenance == provenance)
+            let decisions: [(UInt64?, UInt64?)] = [(nil, nil), (0, nil), (300, 350), (300, nil)]
+            for (seconds, expiry) in decisions {
+                var timed = preview
+                timed.retentionSeconds = seconds
+                timed.retentionExpiresAt = expiry
+                let timedCopy = try FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(timed))
+                precondition(timedCopy.retentionSeconds == seconds && timedCopy.retentionExpiresAt == expiry)
+            }
         }
         for source in [DeletionSourceFfi.author, .admin, .unknown] {
             let preview = TimelineReplyPreviewFfi(messageIdHex: "deleted", sender: "author", plaintext: "",

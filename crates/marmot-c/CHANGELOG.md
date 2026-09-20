@@ -16,6 +16,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotChatListMessagePreview` exposes optional per-message `retention_seconds`
+  and `retention_expires_at` so hosts can hide expired previews before pruning.
+  This changes record layout: rebuild with matching headers and libraries. See
+  [preview expiry handling](../marmot-uniffi/CHAT-LIST-ROWS.md#disappearing-message-previews-unreleased).
+
 - `MarmotPresentedChatRow` gains selected draft/message/invitation/empty preview and row-action records. Draft text is owned and deep-freed with the row. This changes record layout: regenerate and recompile with matching headers/libraries. See [C3 integration](../marmot-uniffi/CHAT-LIST-ROWS.md).
 
 ### Documentation

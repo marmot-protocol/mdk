@@ -208,6 +208,8 @@ mod tests {
             media_json: None,
             kind: 9,
             timeline_at: 7,
+            retention_seconds: None,
+            retention_expires_at: None,
             deleted: false,
             deletion_source: crate::DeletionSource::Unknown,
             group_system: None,

@@ -45,6 +45,35 @@ move chats, change pin order, alter filters or create unread activity. A draft o
 Continue using the revisioned conversation draft API for editing and sending; do
 not reconstruct a composer from the shortened list preview.
 
+## Disappearing-message previews (unreleased)
+
+`ChatListMessagePreviewFfi` now carries `retention_seconds` and
+`retention_expires_at` (`retentionSeconds` / `retentionExpiresAt` in Swift/Kotlin).
+These are the selected message's pinned source-epoch decision, just like timeline
+records. Raw rows, presented rows and bounded windows expose the same fields.
+No database migration is needed; install matching regenerated bindings and native
+libraries. C's `MarmotChatListMessagePreview` adds `has_retention_seconds` /
+`retention_seconds` and `has_retention_expires_at` / `retention_expires_at`; rebuild
+consumers with the matching generated header because the record layout changes.
+
+When rendering a message preview, hide its content once the current Unix time in
+**seconds** is greater than or equal to the supplied finite expiry. Re-evaluate
+on foreground/resume and at the deadline while the list is visible: the passage
+of time alone does not emit a chat-list update. Apply this only to the message
+selection, not a separately selected local draft or invitation.
+
+- Missing duration means an unknown/legacy decision: safely retain it.
+- Zero duration means retention was explicitly disabled for that message.
+- Missing expiry means no finite deadline, even with a positive duration (timestamp
+  overflow). Never reconstruct one from `timeline_at` or the current group policy.
+
+For example, after a change from five minutes to thirty seconds, the newer
+message's expiry does not change the older message's five-minute decision.
+These fields allow hiding the expired preview before periodic pruning. They do
+not select an older surviving message automatically; an expired selected message
+can be rendered as an empty preview until an authoritative replacement arrives.
+Keep the row itself, ordering and unread state authoritative to MDK.
+
 ## Existing row gestures
 
 `actions` is local display availability for existing client gestures. It is not

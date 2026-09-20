@@ -9,8 +9,9 @@ use cgka_traits::app_components::{
     encode_group_avatar_url_v1,
 };
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
-    GROUP_SYSTEM_TYPE_GROUP_RENAMED, GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+    AppMessageRetentionDecision, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+    GROUP_SYSTEM_TYPE_ADMIN_REMOVED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+    GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
     GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
 };
@@ -156,6 +157,123 @@ fn setup_store_with_group(group: StoredAccountGroup) -> SqliteAccountStorage {
 
 fn setup_store() -> SqliteAccountStorage {
     setup_store_with_group(group())
+}
+
+fn assert_preview_retention(
+    store: &SqliteAccountStorage,
+    message_id: &str,
+    expected: (Option<u64>, Option<u64>),
+) {
+    let mut rows = store.chat_list_rows(ChatListQuery::default()).unwrap();
+    rows.push(store.chat_list_row(GROUP).unwrap().unwrap());
+    rows.extend(
+        store
+            .chat_list_page(crate::ChatListPageQuery {
+                view: crate::ChatListView::Chats,
+                limit: 10,
+                direction: crate::ChatListPageDirection::Forward,
+                cursor: None,
+            })
+            .unwrap()
+            .rows,
+    );
+    let direct = store.direct_conversation_candidate_rows(REMOTE).unwrap();
+    assert_eq!(direct.len(), 1);
+    rows.extend(direct);
+    assert_eq!(rows.len(), 4);
+    for row in rows {
+        let preview = row.last_message.unwrap();
+        assert_eq!(preview.message_id_hex, message_id);
+        assert_eq!(
+            (preview.retention_seconds, preview.retention_expires_at),
+            expected
+        );
+    }
+    let latest = latest_chat_list_activity_tx(&store.lock().unwrap(), GROUP)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            latest.preview.retention_seconds,
+            latest.preview.retention_expires_at
+        ),
+        expected
+    );
+}
+
+fn retention_store() -> SqliteAccountStorage {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    setup_store_with_group(direct)
+}
+
+#[test]
+fn chat_preview_retention_reads_preserve_every_pinned_state() {
+    for decision in [
+        None,
+        Some(AppMessageRetentionDecision::new(10, 0)),
+        Some(AppMessageRetentionDecision::new(10, 300)),
+        Some(AppMessageRetentionDecision::new(u64::MAX, 1)),
+    ] {
+        let store = retention_store();
+        store
+            .record_app_event_with_retention(&chat("message", REMOTE, 10, "hello"), decision)
+            .unwrap();
+        store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        let expected = (
+            decision.map(|d| d.retention_seconds),
+            decision.and_then(|d| d.expires_at),
+        );
+        assert_preview_retention(&store, "message", expected);
+        store.rebuild_message_timeline_for_group(GROUP).unwrap();
+        store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        assert_preview_retention(&store, "message", expected);
+    }
+}
+
+#[test]
+fn chat_preview_retention_uses_each_message_decision_before_and_after_prune() {
+    let store = retention_store();
+    // A was sent under five minutes; B under thirty seconds. Both remain in
+    // storage at read time, even though B's deadline has passed.
+    for (id, at, seconds) in [("a", 10, 300), ("b", 20, 30)] {
+        store
+            .record_app_event_with_retention(
+                &chat(id, REMOTE, at, id),
+                Some(AppMessageRetentionDecision::new(at, seconds)),
+            )
+            .unwrap();
+    }
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_preview_retention(&store, "b", (Some(30), Some(50)));
+    // Reading exposes the exact expired deadline rather than hiding the row.
+    // Once B is pruned, A still carries its own five-minute decision.
+    store
+        .secure_prune_expired_app_events(GROUP, 50, LOCAL, &no_mentions)
+        .unwrap();
+    assert_preview_retention(&store, "a", (Some(300), Some(310)));
+}
+
+#[test]
+fn chat_preview_retention_finalization_is_visible_without_rebuilding_chat_rows() {
+    let store = retention_store();
+    let mut pending = chat("pending", LOCAL, 50, "hello");
+    pending.source_message_id_hex = None;
+    store.record_app_event(&pending).unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_preview_retention(&store, "pending", (None, None));
+    store
+        .finalize_app_event_source_retention(
+            GROUP,
+            "pending",
+            Some("source-pending"),
+            9,
+            AppMessageRetentionDecision::new(50, 300),
+        )
+        .unwrap();
+    assert_preview_retention(&store, "pending", (Some(300), Some(350)));
 }
 
 // Compare the existing readiness API with migration 0066’s index on synthetic history.

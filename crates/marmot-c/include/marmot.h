@@ -2549,6 +2549,16 @@ typedef struct MarmotChatListMessagePreview {
   struct MarmotMarkdownDocument content_tokens;
   uint64_t kind;
   uint64_t timeline_at;
+  bool has_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_expires_at;
   bool deleted;
   enum MarmotDeletionSource deletion_source;
   bool has_attachment_kind;
