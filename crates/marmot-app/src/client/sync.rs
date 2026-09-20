@@ -4089,16 +4089,15 @@ impl AppClient {
                     self.epoch_backfill_retry_not_before = if verdict.made_novel_progress() {
                         None
                     } else {
-                        let pacing_ordinal = if verdict.made_no_progress() {
-                            no_progress_ordinal
-                        } else if verdict == DrainVerdict::Overflow {
-                            // Overflow does not spend the EOSE ordinal. Using
-                            // that counter here would overwrite the failure
-                            // backoff with the base delay on every retry,
-                            // including retries that only observe an old gap.
-                            retry_ordinal
-                        } else {
+                        let pacing_ordinal = if verdict.spends_eose_attempt() {
                             eose_unconfirmed_ordinal
+                        } else if verdict.made_no_progress() {
+                            no_progress_ordinal
+                        } else {
+                            // Other failures, including overflow, spend only
+                            // the execution ordinal. Using the untouched EOSE
+                            // counter would reset their backoff to the base.
+                            retry_ordinal
                         };
                         Some(Instant::now() + self.epoch_backfill_retry_backoff(pacing_ordinal))
                     };

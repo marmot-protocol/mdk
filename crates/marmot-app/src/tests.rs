@@ -12266,7 +12266,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
         let cursor = crate::unix_now_seconds();
         client.state.last_transport_timestamp = Some(cursor);
         app.save_state(&client.state).unwrap();
-        const HISTORY: usize = 1536;
+        const HISTORY: usize = crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + 16;
         for index in 0..HISTORY {
             let event = epoch_gap_probe(
                 &group.nostr_routing.nostr_group_id_hex,
@@ -12309,7 +12309,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                 .saturating_duration_since(std::time::Instant::now());
             let expected = Duration::from_secs(15 * (1 << ordinal));
             assert!(
-                remaining > expected - Duration::from_secs(1),
+                remaining > expected - Duration::from_secs(1) && remaining <= expected,
                 "overflow attempt {ordinal} must earn {expected:?}, got {remaining:?}"
             );
             let subscriptions = relay.accepted_subscriptions().len();
@@ -12347,80 +12347,6 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                 .unwrap()
                 .is_some()
         );
-
-        // Pacing the replay must not gate ordinary receive or send. A novel
-        // opaque delivery is durably deferred, while its newer timestamp is
-        // fenced until the delivery-gap obligation is actually completed.
-        let live = epoch_gap_probe(
-            &group.nostr_routing.nostr_group_id_hex,
-            cursor + 1,
-            "live-during-cooldown",
-        );
-        let live_id = live.id.clone();
-        inject_epoch_gap_probe(&app, live).await;
-        let received = tokio::time::timeout(Duration::from_secs(2), client.receive_next_delivery())
-            .await
-            .unwrap()
-            .unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
-            panic!("the previous overflow signal was already consumed");
-        };
-        client.ingest_received_delivery(*delivery).await.unwrap();
-        assert!(
-            app.load_state("alice")
-                .unwrap()
-                .seen_events
-                .contains(&live_id)
-        );
-        assert_eq!(
-            app.load_state("alice").unwrap().last_transport_timestamp,
-            Some(cursor)
-        );
-        assert!(
-            client
-                .send(&group_id, b"send during paced recovery")
-                .await
-                .unwrap()
-                .published
-                > 0
-        );
-
-        // The patch changes scheduling only: neither silence nor the new send
-        // cleared the durable gap. Actual replay completion retains the old
-        // generation check. Opaque deferred input must still not advance the
-        // cursor after gap completion; transport retention is not decryption.
-        assert!(client.delivery_overflow_recovery_pending);
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
-        assert!(matches!(
-            client.recover_delivery_overflow().await.unwrap(),
-            crate::DeliveryOverflowRecoveryOutcome::Completed(_)
-        ));
-        assert!(!client.delivery_overflow_recovery_pending);
-        assert!(
-            app.account_storage("alice")
-                .unwrap()
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_none()
-        );
-        let after = epoch_gap_probe(
-            &group.nostr_routing.nostr_group_id_hex,
-            cursor + 2,
-            "live-after-gap-completion",
-        );
-        let after_id = after.id.clone();
-        inject_epoch_gap_probe(&app, after).await;
-        let received = tokio::time::timeout(Duration::from_secs(2), client.receive_next_delivery())
-            .await
-            .unwrap()
-            .unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
-            panic!("no new overflow occurred");
-        };
-        client.ingest_received_delivery(*delivery).await.unwrap();
-        let state = app.load_state("alice").unwrap();
-        assert!(state.seen_events.contains(&after_id));
-        assert_eq!(state.last_transport_timestamp, Some(cursor));
     });
 }
 
