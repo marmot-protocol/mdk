@@ -12,6 +12,18 @@ impl MessageDraftRevision {
     pub fn group_id_hex(&self) -> &str {
         &self.group_id_hex
     }
+
+    /// Device-local idempotency binding. Never send or log this value.
+    #[doc(hidden)]
+    pub fn local_submission_binding(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"mdk-local-draft-submission-v1");
+        hash.update(&self.store_epoch);
+        hash.update(self.group_id_hex.as_bytes());
+        hash.update(self.revision.to_be_bytes());
+        hash.finalize().into()
+    }
 }
 
 #[derive(Clone)]
@@ -70,7 +82,7 @@ impl SqliteAccountStorage {
                 let conn = self.lock()?;
                 check_revision_tx(&conn, expected)?;
             }
-            self.save_message_draft(&expected.group_id_hex, content, reply, attachments)?;
+            self.write_message_draft(&expected.group_id_hex, content, reply, attachments)?;
             Ok(self.selected_message_draft(&expected.group_id_hex)?)
         })
     }
@@ -312,6 +324,7 @@ pub(crate) fn accept_submission_tx(
         ),
         DraftAcceptance::Event(id) => ("app_event_id", rusqlite::types::Value::Text(id.to_owned())),
     };
+    SqliteAccountStorage::accept_local_submission_tx(conn, group, field, &value)?;
     let revision: Option<i64> = conn
         .query_row_cached(
             &format!(

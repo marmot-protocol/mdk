@@ -19,6 +19,14 @@ by a shared major/minor number. External-signer onboarding/login/registration re
 UniFFI-only until a C signer callback interface exists; the host secret-store vtable
 is already supported and is a different interface.
 
+The unreleased [local-send contract](../marmot-uniffi/LOCAL-SENDS.md) adds token-aware
+send/reply/draft/upload calls. C calls block until local acceptance (or upload then
+acceptance), rather than relay completion. Free their results with
+`marmot_local_send_acceptance_free`, `marmot_media_upload_submission_free`, or
+`marmot_local_send_status_free`. The nullable timeline `client_token` is owned by
+its row and released by the row's existing deep-free. Rebuild against the matching
+header/library because this changes the timeline record layout.
+
 Before OS suspension/root handoff, use `marmot_client_shutdown_and_close` and observe
 its status; `marmot_client_shutdown` alone does not close shared database handles.
 Release subscriptions before clients, and never free an object while another call uses it.

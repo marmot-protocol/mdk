@@ -163,7 +163,8 @@ pub(crate) struct CapturedConversation {
 }
 
 // A worker-owned send can yield a coherent read before awaiting transport. Each
-// open window retains at most one such capture, and only for its current query.
+// open window retains its current-query capture and, while browsing history,
+// one exact-query tail capture for return-to-latest.
 // The worker holds weak references so closing a window releases its rows.
 pub(crate) struct SendCapture {
     group: GroupId,
@@ -175,6 +176,7 @@ struct SendCaptureState {
     query: ConversationWindowQuery,
     generation: u64,
     pending: Option<CapturedConversation>,
+    latest: Option<(ConversationWindowQuery, CapturedConversation)>,
 }
 impl SendCapture {
     fn new(group: GroupId, epoch: Vec<u8>, query: ConversationWindowQuery) -> Self {
@@ -185,6 +187,7 @@ impl SendCapture {
                 query,
                 generation: 0,
                 pending: None,
+                latest: None,
             }),
             changed: watch::channel(()).0,
         }
@@ -194,7 +197,9 @@ impl SendCapture {
         if state.query != *query {
             state.query = query.clone();
             state.generation += 1;
-            state.pending = None;
+            state.pending = state.latest.take().and_then(|(captured_query, capture)| {
+                (captured_query == *query).then_some(capture)
+            });
         }
     }
     fn take(&self) -> Option<CapturedConversation> {
@@ -213,7 +218,11 @@ impl AppClient {
             && let Some(capture) = observer.upgrade()
         {
             // A normal worker read supersedes earlier send checkpoints.
-            capture.take();
+            {
+                let mut state = capture.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.pending = None;
+                state.latest = None;
+            }
             if !self
                 .conversation_captures
                 .iter()
@@ -240,12 +249,27 @@ impl AppClient {
             // Use the same live engine/account read boundary as a normal window
             // capture. Never combine frozen permissions with newer account rows.
             // Best effort: the normal read path still owns capture errors.
+            let latest_query = ConversationWindowQuery {
+                opening: ConversationOpenQuery {
+                    target: ConversationOpenTarget::Latest,
+                    limit: query.opening.limit,
+                },
+                before_anchor: None,
+            };
+            let latest = if latest_query != query {
+                capture_conversation(self, &observer.group, latest_query.clone(), &observer.epoch)
+                    .ok()
+                    .map(|capture| (latest_query, capture))
+            } else {
+                None
+            };
             if let Ok(captured) =
                 capture_conversation(self, &observer.group, query, &observer.epoch)
             {
                 let mut state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.generation == generation {
                     state.pending = Some(captured);
+                    state.latest = latest;
                     observer.changed.send_replace(());
                 }
             }
@@ -1012,6 +1036,7 @@ async fn run(
     let mut failed = false;
     let mut retry_delayed = false;
     let mut last_good_position = position.clone();
+    let mut deferred_command = None;
     loop {
         let mut stopping = sources.stopping.clone();
         let command = tokio::select! {
@@ -1019,6 +1044,7 @@ async fn run(
             _ = wait_for_runtime_shutdown(&mut stopping) => return,
             _ = wait_for_account_reset(&mut resets, &reader.label) => return,
             _ = updates.closed() => return,
+            _ = std::future::ready(()), if deferred_command.is_some() => deferred_command.take(),
             command = commands.recv() => { let Some(command) = command else { return; }; Some(command) },
             _ = send_updates.changed() => { dirty = true; continue; },
             result = worker_updates.changed(), if worker_updates_open => {
@@ -1043,13 +1069,30 @@ async fn run(
             }
         };
         sources.drain(); // only the queued prefix; mutations during capture remain queued
+        // Following the tail may use the send's coherent pre-publication capture.
+        // capture_live sets the requested query first, invalidating any capture
+        // from a different viewport/generation. Other navigation commands still
+        // require a fresh worker read. A checkpoint schedules a fresh follow-up
+        // below so invalidations newer than it cannot be lost.
+        let allow_checkpoint = command
+            .as_ref()
+            .is_none_or(|command| matches!(command.action, Action::Latest));
         let reset_label = reader.label.clone();
         let result = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut sources.stopping) => return,
             _ = wait_for_account_reset(&mut resets, &reset_label) => return,
             _ = updates.closed() => return,
-            result = reader.read(&next, current.revision.clone(), current.presentation.header.epoch.is_none(), command.is_none()) => result,
+            // A fresh background capture can be queued behind publication.
+            // Navigation may supersede that read; it must still pass the same
+            // revision check on the next iteration. Explicit commands stay FIFO.
+            incoming = commands.recv(), if command.is_none() => {
+                let Some(incoming) = incoming else { return; };
+                deferred_command = Some(incoming);
+                dirty = true;
+                continue;
+            },
+            result = reader.read(&next, current.revision.clone(), current.presentation.header.epoch.is_none(), allow_checkpoint) => result,
         };
         match result {
             Ok((mut replacement, checkpoint)) => {

@@ -3984,3 +3984,69 @@ Wait for the next value; None means the observation ended. Bind one receive loop
 [Source](src/subscriptions.rs#L476)
 
 </details>
+
+<details>
+<summary>Durable local sends and caller correlation</summary>
+
+### `Marmot::local_send_status`
+
+```rust
+pub fn local_send_status( &self, account_ref: String, group_id_hex: String, client_token: String, ) -> Result<Option<LocalSendStatusFfi>, MarmotKitError>
+```
+
+Read a retained submission's local state without relay I/O. `None` means no retained
+association. `Completed` describes the worker attempt; inspect its summary disposition
+and follow timeline updates for later delivery. See [local sends](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L125)
+
+### `Marmot::reply_to_message_with_client_token`
+
+```rust
+pub async fn reply_to_message_with_client_token( &self, account_ref: String, group_id_hex: String, target_message_id: String, text: String, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a reply and bind its optimistic bubble to an opaque local token.
+Returns local acceptance before relay publication. Repeating the original request
+and token returns the same identity; changed requests are rejected. See [local sends](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L57)
+
+### `Marmot::send_message_draft_with_client_token`
+
+```rust
+pub async fn send_message_draft_with_client_token( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, attachments: Vec<MediaAttachmentReferenceFfi>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Atomically consume exactly the supplied draft revision and retain its token-bound
+message. Prepared attachments must match selected descriptors. Returns local
+acceptance, not delivery; never clear a newer composer on completion. See [local sends](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L79)
+
+### `Marmot::send_text_with_client_token`
+
+```rust
+pub async fn send_text_with_client_token( &self, account_ref: String, group_id_hex: String, text: String, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Admit text durably outside the account publication queue. Use one token per logical
+submission and reconcile by the exact token on timeline rows. Acceptance survives
+caller cancellation and restart; delivery uses ordinary subscriptions. See [local sends](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L37)
+
+### `Marmot::upload_media_with_client_token`
+
+```rust
+pub async fn upload_media_with_client_token( &self, account_ref: String, group_id_hex: String, request: MediaUploadRequestFfi, client_token: String, ) -> Result<MediaUploadSubmissionFfi, MarmotKitError>
+```
+
+Upload encrypted attachments and optionally admit the resulting token-bound message.
+The result includes uploaded references and optional local acceptance. Uploads themselves
+are not idempotent or restart-resumable; query token status after unknown outcomes.
+See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handling.
+
+[Source](src/commands/local_submissions.rs#L101)
+
+</details>

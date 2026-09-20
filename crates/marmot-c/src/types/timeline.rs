@@ -151,6 +151,7 @@ c_mirror! {
     /// One materialized timeline row.
     MarmotTimelineMessageRecord from TimelineMessageRecordFfi,
     free marmot_timeline_message_record_free {
+        opt_str client_token,
         str message_id_hex,
         copy has_reports: bool,
         /// Delivery marker for own (`direction == "sent"`) messages: NULL

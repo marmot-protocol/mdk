@@ -4,6 +4,11 @@ use super::*;
 use crate::runtime::{ConversationOpenQuery, ConversationOpenTarget};
 use cgka_traits::storage::MessageStorage;
 
+#[path = "conversation_cold_open/local_submissions.rs"]
+mod local_submissions;
+#[path = "conversation_cold_open/send_latency.rs"]
+mod send_latency;
+
 struct History {
     _dir: tempfile::TempDir,
     app: MarmotApp,

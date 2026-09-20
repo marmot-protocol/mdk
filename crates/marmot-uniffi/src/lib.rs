@@ -68,9 +68,9 @@ pub enum RelayPolicyFfi {
 }
 
 pub use commands::{
-    CreateGroupOptionsFfi, InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi,
-    OnboardingSubscription, PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi,
-    parse_media_imeta_tag,
+    CreateGroupOptionsFfi, InitialGroupImageFfi, LocalSendAcceptanceFfi, LocalSendStatusFfi,
+    MediaUploadSubmissionFfi, MemberKeyPackagePrewarmSummaryFfi, OnboardingSubscription,
+    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi, parse_media_imeta_tag,
 };
 pub use conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi,

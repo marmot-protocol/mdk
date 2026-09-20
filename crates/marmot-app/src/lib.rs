@@ -90,6 +90,8 @@ pub mod conversation_presentation;
 mod conversions;
 mod directory;
 mod drafts;
+mod local_submissions;
+pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod error;
 mod external_signer;
 mod groups;
@@ -956,7 +958,7 @@ pub struct AppMessageQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SendSummary {
     pub published: usize,
     pub message_ids: Vec<String>,

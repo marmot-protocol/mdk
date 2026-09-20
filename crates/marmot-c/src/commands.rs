@@ -55,6 +55,9 @@ use crate::types::group::{
     MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
     MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
+use crate::types::local_submissions::{
+    MarmotLocalSendAcceptance, MarmotLocalSendStatus, MarmotMediaUploadSubmission,
+};
 use crate::types::maintenance::{
     MarmotGroupMaintenanceStatus, MarmotKeyPackageMaintenanceStatus, MarmotMaintenanceRunSummary,
     MarmotPeriodicMaintenancePolicy,
@@ -801,6 +804,9 @@ c_cmd! {
     /// Send a chat text message to the group. Free with
     /// `marmot_send_summary_free`.
     async fn marmot_send_text(account_ref: str, group_id_hex: str, text: str) -> rec(MarmotSendSummary) = send_text;
+    async fn marmot_send_text_with_client_token(account_ref: str, group_id_hex: str, text: str, client_token: str) -> rec(MarmotLocalSendAcceptance) = send_text_with_client_token;
+    async fn marmot_reply_to_message_with_client_token(account_ref: str, group_id_hex: str, target_message_id: str, text: str, client_token: str) -> rec(MarmotLocalSendAcceptance) = reply_to_message_with_client_token;
+    sync fn marmot_local_send_status(account_ref: str, group_id_hex: str, client_token: str) -> opt_rec(MarmotLocalSendStatus) = local_send_status;
 
     /// Re-drive delivery/convergence for the group (e.g. a stuck pending
     /// own message) without minting duplicates. Free with
@@ -1607,6 +1613,39 @@ pub unsafe extern "C" fn marmot_upload_media(
                     client
                         .marmot
                         .upload_media(account_ref, group_id_hex, request),
+                ),
+                out,
+            )
+        }
+    })
+}
+
+/// Upload and optionally admit a token-bound message. Free with marmot_media_upload_submission_free.
+/// # Safety
+/// Client and borrowed strings/request must be valid; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_upload_media_with_client_token(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    request: *const MarmotMediaUploadRequest,
+    client_token: *const c_char,
+    out: *mut *mut MarmotMediaUploadSubmission,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        let token = try_arg!(unsafe { required_str(client_token) });
+        let request = try_arg!(unsafe { borrowed(request) });
+        let request = try_arg!(unsafe { request.to_ffi() });
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .upload_media_with_client_token(account, group, request, token),
                 ),
                 out,
             )

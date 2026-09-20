@@ -385,6 +385,7 @@ fn presented_timeline_with_tokens(
     content_tokens: crate::markdown::MarkdownDocumentFfi,
 ) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi {
+        client_token: row.client_token.clone(),
         has_reports: row.has_reports,
         edit: row.edit.clone().map(Into::into),
         message_id_hex: row.message_id_hex.clone(),
@@ -531,6 +532,7 @@ impl ConversationConversionCache {
             return cached.converted.clone();
         }
         let source = app::TimelineMessageRecord {
+            client_token: row.client_token.clone(),
             message_id_hex: row.message_id_hex.clone(),
             source_message_id_hex: row.source_message_id_hex.clone(),
             source_epoch: row.source_epoch,
@@ -594,6 +596,7 @@ impl ConversationConversionCache {
 // until their effect on conversion reuse is explicitly considered.
 fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl PartialEq + '_ {
     let app::TimelineMessageRecord {
+        client_token,
         message_id_hex,
         source_message_id_hex,
         source_epoch,
@@ -623,6 +626,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
     (
         (
             message_id_hex,
+            client_token,
             source_message_id_hex,
             source_epoch,
             retention_seconds,
@@ -781,6 +785,7 @@ mod tests {
         .to_content()
         .unwrap();
         let mut record = app::TimelineMessageRecord {
+            client_token: None,
             has_reports: false,
             group_system: Some({
                 let mut event =
@@ -831,6 +836,28 @@ mod tests {
 
 #[cfg(test)]
 mod edit_contract_tests {
+    #[test]
+    fn local_token_survives_raw_prepared_and_cached_conversion() {
+        let mut row: marmot_app::TimelineMessageRecord = serde_json::from_value(serde_json::json!({
+            "message_id_hex":"target","direction":"sent","group_id_hex":"11","sender":"alice",
+            "has_reports":false,"plaintext":"same text","kind":9,"tags":[],"timeline_at":1,"received_at":1,
+            "reactions":{"by_emoji":{},"user_reactions":[]},"deleted":false
+        })).unwrap();
+        let mut cache = super::ConversationConversionCache::default();
+        assert!(cache.row(&row, false).client_token.is_none());
+        row.client_token = Some("opaque-host-token".into());
+        let raw = super::TimelineMessageRecordFfi::from(row.clone());
+        let prepared = cache.row(&row, false);
+        assert_eq!(raw.client_token, row.client_token);
+        assert_eq!(prepared.client_token, row.client_token);
+        assert_eq!(cache.row(&row, false).client_token, row.client_token);
+        assert_eq!(
+            cache.conversions, 2,
+            "token change must invalidate the visible-row cache"
+        );
+        assert!(!format!("{prepared:?}").contains("opaque-host-token"));
+    }
+
     #[test]
     fn prepared_and_legacy_rows_share_effective_content_and_edit_metadata() {
         let row: marmot_app::TimelineMessageRecord = serde_json::from_value(serde_json::json!({

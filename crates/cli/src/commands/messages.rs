@@ -1053,6 +1053,7 @@ mod tests {
         .to_content()
         .unwrap();
         let message = TimelineMessageRecord {
+            client_token: None,
             has_reports: false,
             group_system: None,
             edit: None,

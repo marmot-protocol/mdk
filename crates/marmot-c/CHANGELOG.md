@@ -16,6 +16,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Token-aware send/reply/draft/upload methods, durable local acceptance records and
+  local submission status lookup. `MarmotTimelineMessageRecord` gains nullable
+  `client_token`; regenerate and recompile with matching headers/libraries. See
+  [local sends](../marmot-uniffi/LOCAL-SENDS.md) for ownership and retry semantics.
+
 - `MarmotPresentedChatRow` gains selected draft/message/invitation/empty preview and row-action records. Draft text is owned and deep-freed with the row. This changes record layout: regenerate and recompile with matching headers/libraries. See [C3 integration](../marmot-uniffi/CHAT-LIST-ROWS.md).
 
 ### Documentation

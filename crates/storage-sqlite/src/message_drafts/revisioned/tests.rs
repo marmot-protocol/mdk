@@ -74,6 +74,52 @@ fn queued(payload: &[u8]) -> QueuedOutboundIntent {
         reissue_attempts: 0,
     }
 }
+
+#[test]
+fn local_submission_handoff_rolls_back_with_engine_queue_write() {
+    use sha2::{Digest, Sha256};
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    let payload = b"retained local message";
+    store
+        .insert_local_submission(&crate::LocalSubmission {
+            group_id_hex: GROUP.into(),
+            client_token: "caller-token".into(),
+            message_id_hex: "aa".repeat(32),
+            request_hash: vec![1; 32],
+            payload_hash: Sha256::digest(payload).to_vec(),
+            payload: Some(payload.to_vec()),
+            request_json: Some("{}".into()),
+            expected_epoch: None,
+            state: 0,
+            outcome_json: None,
+        })
+        .unwrap();
+    let result: StorageResult<()> = StorageProvider::with_transaction(&store, |store| {
+        store.put_queued_outbound_intent(&queued(payload))?;
+        assert!(store.next_local_submission()?.is_none());
+        Err(StorageError::Backend("injected rollback".into()))
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        store
+            .next_local_submission()
+            .unwrap()
+            .unwrap()
+            .payload
+            .as_deref(),
+        Some(payload.as_slice())
+    );
+    store.put_queued_outbound_intent(&queued(payload)).unwrap();
+    let accepted = store
+        .local_submission(GROUP, "caller-token")
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.state, 1);
+    assert!(accepted.payload.is_none());
+    assert!(accepted.request_json.is_none());
+    assert!(store.next_local_submission().unwrap().is_none());
+}
 fn attachment() -> StoredMessageDraftAttachment {
     StoredMessageDraftAttachment {
         id: "one".into(),

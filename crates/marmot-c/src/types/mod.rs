@@ -15,6 +15,7 @@ pub mod directory;
 pub mod draft;
 pub mod event;
 pub mod group;
+pub mod local_submissions;
 pub mod maintenance;
 pub mod markdown;
 pub mod media;

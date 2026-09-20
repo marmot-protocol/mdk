@@ -104,6 +104,7 @@ mod avatar_access;
 pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
 mod commands;
 mod event_routing;
+mod local_submissions;
 mod onboarding;
 mod presentation;
 mod presented_chat_list;
@@ -276,6 +277,7 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
+    local_submission_wakeups: watch::Sender<()>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
     attachment_cancellations: watch::Sender<()>,
@@ -367,6 +369,7 @@ impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            local_submission_wakeups: watch::channel(()).0,
             attachment_updates: watch::channel(()).0,
             attachment_cancellations: watch::channel(()).0,
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
@@ -413,6 +416,7 @@ impl RuntimeSharedServices {
         Self {
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
+            local_submission_wakeups: watch::channel(()).0,
             attachment_cancellations: watch::channel(()).0,
             relay_plane: app.relay_plane.clone(),
             app_performance_telemetry: AppPerformanceTelemetry::with_product_analytics(

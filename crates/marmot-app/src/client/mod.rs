@@ -3585,6 +3585,21 @@ impl AppClient {
     where
         F: FnMut(crate::AppProjectionUpdate),
     {
+        self.send_app_event_with_context(group_id, intent, on_local_projection, draft, None)
+            .await
+    }
+
+    async fn send_app_event_with_context<F>(
+        &mut self,
+        group_id: &GroupId,
+        intent: AppMessageIntent,
+        on_local_projection: F,
+        draft: Option<(crate::MessageDraftRevision, Option<String>)>,
+        prepared: Option<MarmotInnerEvent>,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
         use crate::{ProductFamily as Family, ProductUnit};
         let (family, operation) = match &intent {
             AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
@@ -3619,6 +3634,7 @@ impl AppClient {
             intent,
             on_local_projection,
             draft,
+            prepared,
         ))
         .await;
         if let Some(observation) = observation {
@@ -3634,12 +3650,44 @@ impl AppClient {
         result
     }
 
+    pub(crate) async fn publish_local_submission<F>(
+        &mut self,
+        submission: &storage_sqlite::LocalSubmission,
+        on_projection: F,
+    ) -> Result<SendSummary, AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        let group = GroupId::new(hex::decode(&submission.group_id_hex).map_err(|_| {
+            AppError::InvalidAppMessagePayload("invalid local submission group".into())
+        })?);
+        let request = crate::local_submissions::LocalMessageRequest::decode_retained(
+            submission.request_json.as_deref().ok_or_else(|| {
+                AppError::InvalidAppMessagePayload("missing local submission request".into())
+            })?,
+        )?;
+        let event = MarmotInnerEvent::decode(submission.payload.as_deref().ok_or_else(|| {
+            AppError::InvalidAppMessagePayload("missing local submission payload".into())
+        })?)
+        .map_err(|_| {
+            AppError::InvalidAppMessagePayload("invalid local submission payload".into())
+        })?;
+        if !request.attachments.is_empty() {
+            self.sync_runtime_groups().await?;
+            self.validate_draft_media_references(&group, &request.attachments)?;
+        }
+        self.send_app_event_with_context(&group, request.intent(), on_projection, None, Some(event))
+            .await
+            .map(|(_, summary)| summary)
+    }
+
     async fn send_app_event_with_local_projection_unobserved<F>(
         &mut self,
         group_id: &GroupId,
         intent: AppMessageIntent,
         mut on_local_projection: F,
         draft: Option<(crate::MessageDraftRevision, Option<String>)>,
+        prepared: Option<MarmotInnerEvent>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
     where
         F: FnMut(crate::AppProjectionUpdate),
@@ -3753,14 +3801,21 @@ impl AppClient {
                 .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
             _ => None,
         };
-        let event = match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
-            Some(reply) => build_inner_event_with_media_reply(
-                &intent,
-                &sender,
-                unix_now_seconds(),
-                Some(reply),
-            )?,
-            None => build_inner_event(&intent, &sender, unix_now_seconds())?,
+        let event = if let Some(event) = prepared {
+            event.validate_sender(&sender).map_err(|_| {
+                AppError::InvalidAppMessagePayload("invalid local submission author".into())
+            })?;
+            event
+        } else {
+            match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
+                Some(reply) => build_inner_event_with_media_reply(
+                    &intent,
+                    &sender,
+                    unix_now_seconds(),
+                    Some(reply),
+                )?,
+                None => build_inner_event(&intent, &sender, unix_now_seconds())?,
+            }
         };
         let payload = encode_inner_event(&event)?;
         let _draft_guard = if let Some((revision, _)) = draft {

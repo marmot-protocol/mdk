@@ -2029,6 +2029,23 @@ typedef struct MarmotAppQuarantinedGroupList {
 } MarmotAppQuarantinedGroupList;
 
 /**
+ * Durable local acceptance, not a relay acknowledgment.
+ */
+typedef struct MarmotLocalSendAcceptance {
+  char *client_token;
+  char *message_id_hex;
+} MarmotLocalSendAcceptance;
+
+/**
+ * Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected.
+ * Summary is present only for completed attempts; inspect its disposition.
+ */
+typedef struct MarmotLocalSendStatus {
+  uint32_t state;
+  struct MarmotSendSummary *summary;
+} MarmotLocalSendStatus;
+
+/**
  * Result of the per-group secure-delete sweep.
  */
 typedef struct MarmotSecureDeleteExpiredResult {
@@ -3469,6 +3486,14 @@ typedef struct MarmotMediaUploadResult {
 } MarmotMediaUploadResult;
 
 /**
+ * Uploaded references and optional durable message acceptance.
+ */
+typedef struct MarmotMediaUploadSubmission {
+  struct MarmotMediaUploadResult upload;
+  struct MarmotLocalSendAcceptance *acceptance;
+} MarmotMediaUploadSubmission;
+
+/**
  * Result of `marmot_download_media`: decrypted plaintext plus its
  * metadata.
  */
@@ -3589,6 +3614,7 @@ typedef struct MarmotTimelineEditSummary {
  * One materialized timeline row.
  */
 typedef struct MarmotTimelineMessageRecord {
+  char *client_token;
   char *message_id_hex;
   bool has_reports;
   /**
@@ -6396,6 +6422,51 @@ MarmotStatus marmot_send_text(const struct MarmotClient *client,
                               struct MarmotSendSummary **out);
 
 /**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_send_text_with_client_token(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *group_id_hex,
+                                                const char *text,
+                                                const char *client_token,
+                                                struct MarmotLocalSendAcceptance **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_reply_to_message_with_client_token(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       const char *group_id_hex,
+                                                       const char *target_message_id,
+                                                       const char *text,
+                                                       const char *client_token,
+                                                       struct MarmotLocalSendAcceptance **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_local_send_status(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      const char *client_token,
+                                      struct MarmotLocalSendStatus **out);
+
+/**
  * Re-drive delivery/convergence for the group (e.g. a stuck pending
  * own message) without minting duplicates. Free with
  * `marmot_send_summary_free`.
@@ -7896,6 +7967,18 @@ MarmotStatus marmot_upload_media(const struct MarmotClient *client,
                                  const char *group_id_hex,
                                  const struct MarmotMediaUploadRequest *request,
                                  struct MarmotMediaUploadResult **out);
+
+/**
+ * Upload and optionally admit a token-bound message. Free with marmot_media_upload_submission_free.
+ * # Safety
+ * Client and borrowed strings/request must be valid; out must be writable.
+ */
+MarmotStatus marmot_upload_media_with_client_token(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const char *group_id_hex,
+                                                   const struct MarmotMediaUploadRequest *request,
+                                                   const char *client_token,
+                                                   struct MarmotMediaUploadSubmission **out);
 
 /**
  * Download, verify, and decrypt one attachment. Free with
@@ -9799,6 +9882,20 @@ MarmotStatus marmot_send_message_draft(const struct MarmotClient *client,
                                        struct MarmotSendSummary **out);
 
 /**
+ * Atomically consume a draft and admit its token-bound message locally.
+ * # Safety
+ * Client, account, token and revision must be valid; attachments readable for
+ * length (NULL allowed at zero); out writable. Free with marmot_local_send_acceptance_free.
+ */
+MarmotStatus marmot_send_message_draft_with_client_token(const struct MarmotClient *client,
+                                                         const char *account_ref,
+                                                         const struct MarmotMessageDraftRevision *revision,
+                                                         const struct MarmotMediaAttachmentReference *attachments,
+                                                         uintptr_t attachments_len,
+                                                         const char *client_token,
+                                                         struct MarmotLocalSendAcceptance **out);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -10343,6 +10440,36 @@ void marmot_prepared_group_image_upload_list_free(struct MarmotPreparedGroupImag
  * this library.
  */
 void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_local_send_acceptance_free(struct MarmotLocalSendAcceptance *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_media_upload_submission_free(struct MarmotMediaUploadSubmission *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_local_send_status_free(struct MarmotLocalSendStatus *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL
