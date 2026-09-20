@@ -606,11 +606,13 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   rollback. In the missing-anchor rival's own case the pass halts `MissingRetainedAnchor` with no accepted commits and
   never reaches the apply; the row still has to be right, because nothing later corrects it. The stamp is a stored-input
   shape, not a verdict — the unauthenticated-claim rule above still holds. Forensics is decoupled on purpose: the audit
-  row for that persist keeps reporting `current_epoch`, because `incident-replay` reads `MessageStateChanged.epoch` as
-  where the engine was and calls a drop a rollback. Tests, all in `tests/fork_detection.rs`:
+  row for that persist keeps reporting `current_epoch`, and the convergence pass's disposition transitions report the
+  device's pre-apply tip, because `incident-replay` reads `MessageStateChanged.epoch` as where the engine was and calls
+  a drop a rollback. Tests, all in `tests/fork_detection.rs`:
   `restarted_committer_without_source_anchor_halts_through_convergence` (row epoch + the persist's forensic epoch),
   `stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork` (the terminal transition's forensic epoch on
-  the routine redelivery path), and `inbound_commit_at_the_live_epoch_takes_the_convergence_door`.
+  the routine redelivery path), `canonicalization_transition_reports_the_device_tip_not_the_rival_source_epoch` (the
+  pass's disposition transitions), and `inbound_commit_at_the_live_epoch_takes_the_convergence_door`.
 - **A retained anchor for epoch E is the state of E as the device *left* E.** `retain_current_group_epoch_snapshot`
   therefore runs both before an advance past E and immediately after a replayed proposal enters the store at E
   (`openmls_projection::process_openmls_messages_inner`, the `ProposalMessage` arm, under the same

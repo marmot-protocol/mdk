@@ -4647,10 +4647,16 @@ async fn redelivery_of_a_retained_id_answers_buffered_and_moves_nothing() {
     let row_after_first = bob_storage.get_message(&routed_app.id).unwrap();
 
     let second = bob.ingest(routed_app.clone()).await.unwrap();
-    assert!(
-        matches!(second, IngestOutcome::Buffered { .. }),
+    // `Buffered.epoch` is the epoch recorded on the row the input is parked in,
+    // so the seam reports that row and nothing else.
+    assert_eq!(
+        second,
+        IngestOutcome::Buffered {
+            group_id: group_id.clone(),
+            epoch: row_after_first.epoch,
+        },
         "the durable dedup seam answers a retained row before the gate is \
-         reached; got {second:?}"
+         reached, reporting that row's epoch"
     );
     assert_eq!(
         bob_storage

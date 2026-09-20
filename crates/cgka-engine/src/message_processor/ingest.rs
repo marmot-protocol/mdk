@@ -1105,7 +1105,7 @@ impl<S: StorageProvider> Engine<S> {
                 &openmls_msg,
                 msg,
                 &raw_msg_id,
-                current_epoch,
+                msg_epoch,
                 ConvergenceHandoff {
                     wrapper_retirement_reason: if recovered_from_candidate_branch {
                         "recovered_under_candidate_branch"
@@ -1174,7 +1174,7 @@ impl<S: StorageProvider> Engine<S> {
                 &openmls_msg,
                 msg,
                 &raw_msg_id,
-                current_epoch,
+                msg_epoch,
                 ConvergenceHandoff {
                     wrapper_retirement_reason: "buffered_into_convergence",
                     drain: sweep.drain_policy(),
@@ -1187,7 +1187,7 @@ impl<S: StorageProvider> Engine<S> {
                 &openmls_msg,
                 msg,
                 &raw_msg_id,
-                current_epoch,
+                msg_epoch,
                 ConvergenceHandoff {
                     wrapper_retirement_reason: "buffered_into_convergence",
                     drain: sweep.drain_policy(),
@@ -1283,7 +1283,7 @@ impl<S: StorageProvider> Engine<S> {
                         "fork_rival_missing_retained_anchor",
                     )?;
                     return reported(
-                        self.unadjudicable_fork_rival_without_anchor(group_id, &msg.id, current)?,
+                        self.unadjudicable_fork_rival_without_anchor(group_id, &msg.id, msg_epoch)?,
                     );
                 }
 
@@ -2614,7 +2614,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         msg_id: &MessageId,
-        current: EpochId,
+        row_epoch: EpochId,
     ) -> Result<IngestOutcome, EngineError> {
         // `Buffered` promises a later replay of the retained row, and
         // applications open passes off `drain_pending_convergence_groups`, so
@@ -2630,7 +2630,7 @@ impl<S: StorageProvider> Engine<S> {
         );
         Ok(IngestOutcome::Buffered {
             group_id,
-            epoch: current,
+            epoch: row_epoch,
         })
     }
 
@@ -2756,13 +2756,17 @@ impl<S: StorageProvider> Engine<S> {
     /// transport wrapper that arrived through the deferred-peel retry lifecycle
     /// leaves that lifecycle here instead of being re-peeled on every later
     /// replay (mdk#339). No-op on the direct path, where no wrapper exists.
+    ///
+    /// `row_epoch` is what the convergence buffer stamps on that witness row —
+    /// the message's own MLS epoch — and is therefore what a `Buffered` verdict
+    /// here reports.
     fn buffer_openmls_message_into_convergence(
         &mut self,
         group_id: GroupId,
         openmls_msg: &TransportMessage,
         msg: &TransportMessage,
         raw_msg_id: &MessageId,
-        current_epoch: EpochId,
+        row_epoch: EpochId,
         handoff: ConvergenceHandoff<'_>,
     ) -> Result<IngestOutcome, EngineError> {
         let ConvergenceHandoff {
@@ -2784,7 +2788,7 @@ impl<S: StorageProvider> Engine<S> {
             // that no verdict be reached until the whole batch is in.
             return Ok(IngestOutcome::Buffered {
                 group_id,
-                epoch: current_epoch,
+                epoch: row_epoch,
             });
         }
         let result = self
@@ -2798,10 +2802,7 @@ impl<S: StorageProvider> Engine<S> {
             )
             .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
         Ok(convergence_ingest_outcome(
-            &result,
-            msg,
-            group_id,
-            current_epoch,
+            &result, msg, group_id, row_epoch,
         ))
     }
 

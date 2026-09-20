@@ -2720,9 +2720,22 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
         outcome,
         IngestOutcome::Buffered {
             group_id: f.group_id.clone(),
-            epoch: EpochId(2),
+            epoch: rival_source_epoch,
         },
-        "the unadjudicated rival must be retained, not silently classified stale"
+        "the unadjudicated rival must be retained, not silently classified \
+         stale, and `Buffered.epoch` is the epoch of the row it is parked in"
+    );
+    // This seam is once-only: the persist that retained the rival also marked
+    // its transport id processed, so byte-identical redelivery is answered by
+    // the durable dedup seam and never reaches here. The redelivery half of the
+    // `Buffered.epoch` rule is pinned where redelivery does reach a retained
+    // row, in `invite_leave::redelivery_of_a_retained_id_answers_buffered_and_moves_nothing`.
+    assert_eq!(
+        local.ingest(f.competing.clone()).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::Duplicate
+        },
+        "a second copy of the rival must change nothing"
     );
     let record = f.local_storage.get_message(&competing_id).unwrap();
     assert_eq!(
@@ -2829,6 +2842,46 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
                 if reason == "fork_rival_missing_retained_anchor"
         )),
         "the ingest seam must record why it could not adjudicate the rival"
+    );
+}
+
+#[tokio::test]
+async fn canonicalization_transition_reports_the_device_tip_not_the_rival_source_epoch() {
+    // A rival's row carries the epoch it forks FROM, so reading that column
+    // back into `MessageStateChanged.epoch` tells `incident-replay` the engine
+    // was BELOW where it actually is and turns every adjudicated fork into a
+    // reported rollback. The pass's dispositions must report the device's
+    // pre-apply tip, the same decoupling the persist site makes.
+    let (f, local) = router_flip_fixture("canonicalization-epoch").await;
+    assert!(f.sibling_wins);
+    let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    let rival_source_epoch = claimed_mls_epoch(&f.competing.payload);
+
+    drop(local);
+    let (mut local, _audit_dir, audit_path) =
+        restarted_device_with_recorder(&f, "canonicalization-epoch");
+    let device_tip = f.local_storage.get_group(&f.group_id).unwrap().epoch;
+    assert!(
+        rival_source_epoch < device_tip,
+        "the two epochs must differ for this test to say anything; \
+         rival {rival_source_epoch:?} device {device_tip:?}"
+    );
+
+    local.ingest(f.competing.clone()).await.unwrap();
+    drive_convergence(&mut local, &f, &competing_id).await;
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::Processed,
+        "the pass must admit the rival so it emits a disposition transition"
+    );
+
+    drop(local);
+    let events = audit_events(&audit_path);
+    assert_eq!(
+        reported_epoch_for_state(&events, &competing_id, "processed"),
+        Some(device_tip.0),
+        "the canonicalization transition must report where the engine was, \
+         not the rival's source epoch"
     );
 }
 

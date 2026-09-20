@@ -25,9 +25,9 @@ pub enum IngestOutcome {
     /// leaves a retained content row unapplied MUST schedule the group for
     /// convergence; otherwise this outcome promises a replay that never happens.
     ///
-    /// `epoch` is the epoch the engine reported when it parked the message, and
-    /// is informational: it is not a claim about the message's own source epoch,
-    /// and a byte-identical redelivery may report a different one.
+    /// `epoch` is the epoch recorded on the retained row the input is parked
+    /// in: the input's own MLS epoch once peeled, and the device epoch when the
+    /// row was parked before any peel, since that row carries no other.
     Buffered { group_id: GroupId, epoch: EpochId },
     /// Rejected before convergence admission because routing or deduplication
     /// proved the input cannot affect this account-device's canonical state.
