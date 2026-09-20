@@ -167,6 +167,29 @@ impl SqliteAccountStorage {
         reply_to_message_id_hex: Option<&str>,
         media_attachments: &[StoredMessageDraftAttachment],
     ) -> StorageResult<StoredMessageDraft> {
+        self.connection.with_transaction(|| {
+            self.write_message_draft(
+                group_id_hex,
+                content,
+                reply_to_message_id_hex,
+                media_attachments,
+            )?;
+            let conn = self.lock()?;
+            load_message_draft(&conn, group_id_hex)?.ok_or_else(|| {
+                StorageError::Backend("saved message draft could not be reloaded".to_owned())
+            })
+        })
+    }
+
+    /// Write only: revisioned callers need descriptor metadata, not a second
+    /// hydrated copy of every attachment that the host just supplied.
+    fn write_message_draft(
+        &self,
+        group_id_hex: &str,
+        content: &str,
+        reply_to_message_id_hex: Option<&str>,
+        media_attachments: &[StoredMessageDraftAttachment],
+    ) -> StorageResult<()> {
         validate_waveform_samples(media_attachments)?;
         let now_ms = unix_now_ms();
         self.connection.with_transaction(|| {
@@ -195,11 +218,8 @@ impl SqliteAccountStorage {
             )
             .storage()?;
             sync_message_draft_attachments(&tx, group_id_hex, media_attachments)?;
-            let saved = load_message_draft(&tx, group_id_hex)?.ok_or_else(|| {
-                StorageError::Backend("saved message draft could not be reloaded".to_owned())
-            })?;
             tx.commit().storage()?;
-            Ok(saved)
+            Ok(())
         })
     }
 

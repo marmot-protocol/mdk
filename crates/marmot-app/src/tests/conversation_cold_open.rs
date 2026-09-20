@@ -4,6 +4,9 @@ use super::*;
 use crate::runtime::{ConversationOpenQuery, ConversationOpenTarget};
 use cgka_traits::storage::MessageStorage;
 
+#[path = "conversation_cold_open/send_window.rs"]
+mod send_window;
+
 struct History {
     _dir: tempfile::TempDir,
     app: MarmotApp,

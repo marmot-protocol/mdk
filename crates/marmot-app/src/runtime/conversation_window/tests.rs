@@ -1139,6 +1139,23 @@ async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
     assert!(captured.authority.is_some());
     assert_eq!(captured.account.page.page().messages.len(), 5);
 
+    let mut history = query.clone();
+    history.opening.target = ConversationOpenTarget::Message(id(10));
+    observer.set_query(&history);
+    client.publish_conversation_captures(&f.group);
+    assert!(observer.take().is_some());
+    history.opening.target = ConversationOpenTarget::Message(id(11));
+    observer.set_query(&history);
+    assert!(
+        observer.take().is_none(),
+        "another viewport cannot consume the tail capture"
+    );
+    observer.set_query(&query);
+    assert!(
+        observer.take().is_some(),
+        "tail capture must survive intermediate history navigation"
+    );
+
     let other_group = client.create_group("unrelated window", &[]).await.unwrap();
     f.store
         .refresh_chat_list_row(&f.account, &hex::encode(other_group.as_slice()), &|_, _| {

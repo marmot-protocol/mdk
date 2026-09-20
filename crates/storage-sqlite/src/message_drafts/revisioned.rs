@@ -70,7 +70,7 @@ impl SqliteAccountStorage {
                 let conn = self.lock()?;
                 check_revision_tx(&conn, expected)?;
             }
-            self.save_message_draft(&expected.group_id_hex, content, reply, attachments)?;
+            self.write_message_draft(&expected.group_id_hex, content, reply, attachments)?;
             Ok(self.selected_message_draft(&expected.group_id_hex)?)
         })
     }
