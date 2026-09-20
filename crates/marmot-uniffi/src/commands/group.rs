@@ -857,8 +857,10 @@ impl Marmot {
             .await?)
     }
 
-    /// Read local committed application-owned state; None means absent. Refresh
-    /// on group events. Protocol-owned IDs are rejected.
+    /// Read local committed application-owned state; None means absent.
+    /// Refresh on group events. Ids below the application range
+    /// (`APP_OWNED_APP_COMPONENT_ID_START`, 0xf000) are protocol space and
+    /// are rejected.
     pub async fn group_app_component(
         &self,
         account_ref: String,
@@ -874,8 +876,10 @@ impl Marmot {
     }
 
     /// Admin-only replacement of optional application-owned group state.
-    /// Protocol-owned and required IDs are rejected. Empty bytes do not remove
-    /// the component. State survives message expiry and is included in Welcomes.
+    /// Ids below the application range (0xf000), required components and data
+    /// over `APP_COMPONENT_DATA_MAX_LEN` are rejected. Empty bytes do not
+    /// remove the component. State survives message expiry and is included in
+    /// Welcomes, so it is re-encoded into every later commit; keep it small.
     pub async fn update_app_component(
         &self,
         account_ref: String,

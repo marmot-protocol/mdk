@@ -104,16 +104,42 @@ pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId =
 /// `app_data_dictionary`; GroupContext dictionaries only require the id via
 /// `app_components`.
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT_ID: AppComponentId = 0x8009;
+/// Draft multi-device join authorization. Carried only as an MLS
+/// `AppEphemeral` proposal in a multi-device External Commit: the registry
+/// makes it invalid as GroupContext, LeafNode, KeyPackage, GroupInfo or
+/// SafeAAD component data, so it never becomes persistent group state.
+pub const MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID: AppComponentId = 0x800a;
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID: AppComponentId = 0x800b;
 pub const GROUP_LIFECYCLE_COMPONENT_ID: AppComponentId = 0x800c;
 
-/// Every component id the protocol owns, in assignment order. Applications
-/// must not write these; ids outside this list and at or above
-/// [`PRIVATE_USE_APP_COMPONENT_ID_START`] are theirs to allocate.
+/// First component id applications may allocate for themselves.
 ///
-/// Add every new protocol component constant here. The app-facing
-/// `update_app_component` gate and the engine's GroupContext format validation
-/// both read this list, so an id left out silently becomes app-writable.
+/// The protocol registry allocates upward from `0x8001` and is at `0x800c`
+/// today, so "any private-use id the registry has not taken yet" is not a
+/// safe rule for applications: an id chosen that way can be assigned by a
+/// later registry entry, stranding state already committed in live groups.
+/// Applications allocate at or above this boundary instead, which the
+/// protocol never reaches, so the two spaces cannot collide.
+pub const APP_OWNED_APP_COMPONENT_ID_START: AppComponentId = 0xf000;
+
+/// Largest application-owned component payload accepted for a group.
+///
+/// Component state is re-encoded into the GroupContext of every later commit
+/// and into the GroupInfo of every Welcome, so an oversized value inflates
+/// each commit and can push a Welcome past a relay's event-size limit, where
+/// it fails after the commit is already staged. Matches
+/// [`GROUP_PROFILE_DESCRIPTION_MAX_LEN`]: enough for settings, not a blob
+/// store.
+pub const APP_COMPONENT_DATA_MAX_LEN: usize = 4096;
+
+/// Every component id the protocol owns, in registry assignment order.
+///
+/// Add every new protocol component constant here, including draft and
+/// ephemeral-only ones: the engine's GroupContext format validation reads
+/// this list, so an id left out is never format-checked. Applications are
+/// kept away from all of these by the separate
+/// [`APP_OWNED_APP_COMPONENT_ID_START`] boundary rather than by this list, so
+/// a new entry here cannot collide with an id an application already uses.
 pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
     APP_COMPONENTS_COMPONENT_ID,
     SAFE_AAD_COMPONENT_ID,
@@ -126,6 +152,7 @@ pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
     GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+    MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID,
 ];
