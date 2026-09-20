@@ -320,17 +320,15 @@ async fn durable_admission_is_drained_by_a_new_worker() {
         .await
         .unwrap();
     assert_eq!(accepted, retried);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if matches!(
-                runtime
-                    .local_send_status("alice", &h.group, "restart-token")
-                    .unwrap(),
-                Some(crate::LocalSendStatus::Completed(_))
-            ) {
-                break;
+            if let Some(crate::LocalSendStatus::Completed(summary)) = runtime
+                .local_send_status("alice", &h.group, "restart-token")
+                .unwrap()
+            {
+                break summary;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -343,5 +341,180 @@ async fn durable_admission_is_drained_by_a_new_worker() {
             .unwrap()
             .is_none()
     );
+    runtime.shutdown_and_close().await.unwrap();
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let retained = reopened
+        .account_storage("alice")
+        .unwrap()
+        .local_submission(&group_hex, "restart-token")
+        .unwrap()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(retained.outcome_json.as_ref().unwrap()).unwrap();
+    assert_eq!(json["version"], 1);
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    assert_eq!(
+        runtime
+            .local_send_status("alice", &h.group, "restart-token")
+            .unwrap(),
+        Some(crate::LocalSendStatus::Completed(completed))
+    );
+    let (retry, update) = reopened
+        .admit_local_message(
+            "alice",
+            &h.group,
+            "restart-token".into(),
+            LocalMessageRequest {
+                content: "retained before worker startup".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(retry, accepted);
+    assert!(update.is_none());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_submission_requires_a_new_token_after_restart() {
+    let h = History::new(0).await;
+    let request = LocalMessageRequest {
+        content: "rejected attempt".into(),
+        reply_to: None,
+        attachments: vec![],
+    };
+    let (accepted, _) = h
+        .app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "rejected-token".into(),
+            request.clone(),
+            None,
+            42,
+        )
+        .unwrap();
+    let submission = h
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .next_local_submission()
+        .unwrap()
+        .unwrap();
+    h.app
+        .finish_local_message("alice", &submission, &Err(AppError::TransportClosed))
+        .unwrap();
+    h.app.close_storage().unwrap();
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    assert_eq!(
+        runtime
+            .local_send_status("alice", &h.group, "rejected-token")
+            .unwrap(),
+        Some(crate::LocalSendStatus::Rejected)
+    );
+    let error = reopened
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "rejected-token".into(),
+            request.clone(),
+            None,
+            43,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::InvalidAppMessagePayload(ref detail) if detail.contains("rejected submission"))
+    );
+    let store = reopened.account_storage("alice").unwrap();
+    assert!(store.next_local_submission().unwrap().is_none());
+    let original = store
+        .local_submission(&hex::encode(h.group.as_slice()), "rejected-token")
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.message_id_hex, accepted.message_id_hex);
+    assert_eq!(original.state, 3);
+    let (new, _) = reopened
+        .admit_local_message_at("alice", &h.group, "new-token".into(), request, None, 43)
+        .unwrap();
+    assert_ne!(new.message_id_hex, accepted.message_id_hex);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn completion_write_failure_does_not_stall_later_submissions() {
+    let h = History::new(0).await;
+    // Admit before worker startup, so later admission wakeups cannot hide a stall.
+    let mut accepted = Vec::new();
+    for i in 0..3 {
+        accepted.push(
+            h.app
+                .admit_local_message(
+                    "alice",
+                    &h.group,
+                    format!("finish-failure-{i}"),
+                    LocalMessageRequest {
+                        content: format!("queued message {i}"),
+                        reply_to: None,
+                        attachments: vec![],
+                    },
+                    None,
+                )
+                .unwrap()
+                .0,
+        );
+    }
+    let path = h.app.account_storage_path("alice");
+    let keys = h.app.account_home().load_signing_keys("alice").unwrap();
+    let key = h
+        .app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_local_finish BEFORE UPDATE OF outcome_json ON local_message_submissions
+        WHEN NEW.outcome_json IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected finish failure'); END;").unwrap();
+    drop(connection);
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    runtime.start().await.unwrap();
+    let store = h.app.account_storage("alice").unwrap();
+    let group = hex::encode(h.group.as_slice());
+    // Three rows also prevent the initial maintenance tick from masking the bug.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if accepted.iter().all(|a| {
+                store
+                    .timeline_message(&group, &a.message_id_hex)
+                    .unwrap()
+                    .is_some_and(|row| row.source_message_id_hex.is_some())
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("completion failure stalled the app-owned queue until maintenance");
+    assert!(store.next_local_submission().unwrap().is_none());
+    for a in accepted {
+        let row = store
+            .local_submission(&group, &a.client_token)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, 1);
+        assert!(
+            row.outcome_json.is_none(),
+            "fault injection must prevent outcome persistence"
+        );
+    }
     runtime.shutdown_and_close().await.unwrap();
 }

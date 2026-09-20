@@ -1114,6 +1114,7 @@ async fn run_app_runtime_account_worker(
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
     let mut local_submission_wakeups = shared.local_submission_wakeups.subscribe();
     let mut local_submission_due = true;
+    let mut local_submission_retry_at = TokioInstant::now();
     let mut presentation_due = true;
     let mut avatar_due = true;
     let mut attachment_due = true;
@@ -1711,7 +1712,7 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
-            _ = std::future::ready(()), if local_submission_due => {
+            _ = tokio::time::sleep_until(local_submission_retry_at), if local_submission_due => {
                 local_submission_due = false;
                 if let Ok(storage) = app.account_storage(&account_label)
                     && let Ok(Some(submission)) = storage.next_local_submission()
@@ -1725,11 +1726,15 @@ async fn run_app_runtime_account_worker(
                     client.send_telemetry = None;
                     execution.finish_app(&result);
                     shared.app_performance_telemetry().record(AppPerformanceOperation::OutboundMessageSend, started.elapsed(), result.is_ok());
-                    if let Ok(update) = app.finish_local_message(&account_label, &submission, &result) {
-                        if let Some(update) = update {
-                            publish_app_runtime_projection_update(&events, &account_id_hex, &account_label, update);
-                        }
-                        local_submission_due = true;
+                    // A failed completion write must not strand later app-owned
+                    // rows until maintenance. Bound retries too: a pre-engine
+                    // failure can leave this same row at the head of the queue.
+                    let finished = app.finish_local_message(&account_label, &submission, &result);
+                    local_submission_due = true;
+                    local_submission_retry_at = TokioInstant::now()
+                        + if finished.is_err() { Duration::from_millis(100) } else { Duration::ZERO };
+                    if let Ok(Some(update)) = finished {
+                        publish_app_runtime_projection_update(&events, &account_id_hex, &account_label, update);
                     }
                     publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
                     publish_client_pending_applied_summary(&mut client, &events, &account_id_hex, &account_label);

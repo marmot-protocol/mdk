@@ -32,8 +32,10 @@ layout now includes a nullable `client_token`.
 - Tokens contain 1–128 UTF-8 bytes and are scoped to one account-device and group.
   They are opaque, local-only values, never wire tags or diagnostics.
 - Repeating a text/reply/draft request with its original token returns the same
-  identity. A different request using that token is rejected. Draft retry identity
-  binds the original opaque revision, including after that draft was consumed.
+  identity while queued, engine-owned or completed. A rejected attempt returns
+  `InvalidAppMessagePayload` and requires a new token. A different request using
+  that token is rejected. Draft retry identity binds the original opaque revision,
+  including after that draft was consumed.
 - Event IDs and transmitted tags keep their existing protocol behavior. Identical
   sender, second-level timestamp, kind, content and tags produce the same ID.
   If a new token would reuse an existing local submission or source-row identity,
@@ -42,7 +44,7 @@ layout now includes a nullable `client_token`.
   Hosts should mark/remove that optimistic bubble on error, rather than wait for
   a matching row. A later deliberate submission can succeed with a new timestamp;
   no automatic delivery retry or timestamp adjustment is performed.
-  Same-token/same-request retries still return the original acceptance.
+  Same-token/same-request retries return the original acceptance unless rejected.
   No nonce tag is added; future identity changes are a separate discussion in
   [protocol issue #424](https://github.com/marmot-protocol/marmot/issues/424).
 - The token association survives engine handoff, restart, echo and timeline

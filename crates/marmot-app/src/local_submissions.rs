@@ -1,5 +1,9 @@
 //! Durable device-local admission and exact host correlation. Engine validation
 //! and publication remain with the account worker; admission performs no I/O to relays.
+mod outcome;
+pub(crate) use outcome::decode_local_outcome;
+use outcome::encode_local_outcome;
+
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::storage::{GroupStorage, StorageProvider};
 use serde::{Deserialize, Serialize};
@@ -115,14 +119,7 @@ impl MarmotApp {
         result: &Result<crate::SendSummary, AppError>,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let storage = self.account_storage(label)?;
-        let outcome = result
-            .as_ref()
-            .ok()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|_| {
-                AppError::InvalidAppMessagePayload("invalid local submission outcome".into())
-            })?;
+        let outcome = result.as_ref().ok().map(encode_local_outcome).transpose()?;
         StorageProvider::with_transaction(&storage, |storage| {
             let Some(current) =
                 storage.local_submission(&submission.group_id_hex, &submission.client_token)?
@@ -206,6 +203,11 @@ impl MarmotApp {
                 if existing.request_hash != request_hash {
                     return Err(AppError::InvalidAppMessagePayload(
                         "client token is already bound to another submission".into(),
+                    ));
+                }
+                if existing.state == 3 {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "client token belongs to a rejected submission; use a new token".into(),
                     ));
                 }
                 return Ok((

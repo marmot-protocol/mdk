@@ -65,13 +65,9 @@ impl MarmotAppRuntime {
         submission
             .map(|s| {
                 Ok(if let Some(json) = s.outcome_json {
-                    crate::LocalSendStatus::Completed(serde_json::from_str(&json).map_err(
-                        |_| {
-                            AppError::InvalidAppMessagePayload(
-                                "invalid local submission outcome".into(),
-                            )
-                        },
-                    )?)
+                    crate::LocalSendStatus::Completed(
+                        crate::local_submissions::decode_local_outcome(&json)?,
+                    )
                 } else {
                     match s.state {
                         0 => crate::LocalSendStatus::Queued,
@@ -107,7 +103,8 @@ impl MarmotAppRuntime {
 
     /// Persist local ownership and correlation before returning. Publication is
     /// independent of this future. Reusing a token with the same request returns
-    /// the same identity; a changed request is rejected.
+    /// the same identity unless its attempt was rejected before engine acceptance.
+    /// Rejected attempts require a new token; a changed request is also rejected.
     pub async fn submit_text(
         &self,
         account: &str,

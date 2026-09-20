@@ -165,7 +165,8 @@ pub(crate) struct CapturedConversation {
 
 // A worker-owned send can yield a coherent read before awaiting transport. Each
 // open window retains its current-query capture and, while browsing history,
-// one exact-query tail capture for return-to-latest.
+// one exact-query tail capture for a direct return-to-latest. Intermediate
+// navigation or a normal worker read invalidates that speculative tail capture.
 // The worker holds weak references so closing a window releases its rows.
 pub(crate) struct SendCapture {
     group: GroupId,

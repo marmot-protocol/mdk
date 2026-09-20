@@ -6467,6 +6467,7 @@ MarmotStatus marmot_send_text(const struct MarmotClient *client,
                               struct MarmotSendSummary **out);
 
 /**
+ * Return durable local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -6482,6 +6483,7 @@ MarmotStatus marmot_send_text_with_client_token(const struct MarmotClient *clien
                                                 struct MarmotLocalSendAcceptance **out);
 
 /**
+ * Return durable local reply acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -6498,6 +6500,7 @@ MarmotStatus marmot_reply_to_message_with_client_token(const struct MarmotClient
                                                        struct MarmotLocalSendAcceptance **out);
 
 /**
+ * Look up the retained local attempt status; completion may still await delivery. Free with `marmot_local_send_status_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

@@ -804,8 +804,11 @@ c_cmd! {
     /// Send a chat text message to the group. Free with
     /// `marmot_send_summary_free`.
     async fn marmot_send_text(account_ref: str, group_id_hex: str, text: str) -> rec(MarmotSendSummary) = send_text;
+    /// Return durable local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
     async fn marmot_send_text_with_client_token(account_ref: str, group_id_hex: str, text: str, client_token: str) -> rec(MarmotLocalSendAcceptance) = send_text_with_client_token;
+    /// Return durable local reply acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
     async fn marmot_reply_to_message_with_client_token(account_ref: str, group_id_hex: str, target_message_id: str, text: str, client_token: str) -> rec(MarmotLocalSendAcceptance) = reply_to_message_with_client_token;
+    /// Look up the retained local attempt status; completion may still await delivery. Free with `marmot_local_send_status_free`.
     sync fn marmot_local_send_status(account_ref: str, group_id_hex: str, client_token: str) -> opt_rec(MarmotLocalSendStatus) = local_send_status;
 
     /// Re-drive delivery/convergence for the group (e.g. a stuck pending
