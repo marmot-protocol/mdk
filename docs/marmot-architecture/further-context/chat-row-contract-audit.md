@@ -10,12 +10,21 @@ status: audit
 Audited source: `dc7ddf752f33e921f265f3ac6394ca4d9f630f41` (merged
 [#1917](https://github.com/marmot-protocol/mdk/pull/1917)), against the agreed
 [#1742](https://github.com/marmot-protocol/mdk/issues/1742) screen contract.
-This records current behavior and scoped follow-ups; it does not add an API or
+This records behavior at that source and scoped follow-ups; it does not add an API or
 establish adoption of a released artifact by either flagship client.
 
-**The bounded chat list is usable, but the original complete-row contract is not
-finished.** Draft preview replacement is missing. Delivery and lifecycle data
+**At the audited source, the bounded chat list was usable, but the original
+complete-row contract was not finished.** Draft preview replacement is missing. Delivery and lifecycle data
 already reach native callers; replacing their persistence is unnecessary.
+
+## C3 follow-up implementation (unreleased)
+
+The follow-up now implements selected draft/message/invitation/empty previews,
+list draft invalidations and advisory row actions across Rust/UniFFI/C. See the
+[current native contract](../../../crates/marmot-uniffi/CHAT-LIST-ROWS.md) for limits,
+selection rules and authoritative leave preflight. The table below remains the
+historical audit at the named SHA; it does not describe the follow-up's final state.
+C9 released-client/device validation remains separate.
 
 ## Field and update audit
 

@@ -1205,3 +1205,259 @@ async fn avatar_batches_are_local_bounded_and_update_attached_windows_after_lag(
     assert_eq!(retained[0].result.image, Some(image));
     reopened.shutdown_and_close().await.unwrap();
 }
+
+#[tokio::test]
+async fn draft_preview_updates_both_list_contracts_without_reordering_or_network() {
+    let f = Fixture::with_base_rows(3, true);
+    let mut window = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(3))
+        .await
+        .unwrap();
+    let mut legacy = f
+        .runtime
+        .open_presented_chat_list("alice", false)
+        .await
+        .unwrap();
+    let original = window.snapshot.clone();
+    let group = original.rows[0].row.group_id_hex.clone();
+    f.app
+        .save_message_draft("alice", &group, "first draft", None, vec![])
+        .unwrap();
+    let changed = next(&mut window).await;
+    assert_eq!(ids(&changed), ids(&original));
+    assert_eq!(
+        changed.rows[0].row.activity_sort_at,
+        original.rows[0].row.activity_sort_at
+    );
+    assert_eq!(
+        changed.rows[0].row.unread_count,
+        original.rows[0].row.unread_count
+    );
+    assert!(
+        matches!(&changed.rows[0].preview, crate::SelectedChatPreview::Draft(d) if d.text == "first draft")
+    );
+    let update = tokio::time::timeout(Duration::from_secs(5), legacy.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(update.snapshot.rows.iter().any(|r| r.row.group_id_hex == group && matches!(&r.preview, crate::SelectedChatPreview::Draft(d) if d.text == "first draft")));
+    // Revision protection is shared with the composer, not a second list cache.
+    let old = f.app.selected_message_draft("alice", &group).unwrap();
+    f.app
+        .save_message_draft("alice", &group, "newer edit", None, vec![])
+        .unwrap();
+    assert!(
+        f.app
+            .clear_message_draft_if_revision("alice", &old.revision)
+            .is_err()
+    );
+    assert!(
+        matches!(&next(&mut window).await.rows[0].preview, crate::SelectedChatPreview::Draft(d) if d.text == "newer edit")
+    );
+    f.app.delete_message_draft("alice", &group).unwrap();
+    let cleared = next(&mut window).await;
+    assert_eq!(cleared.rows[0].preview, original.rows[0].preview);
+    assert_eq!(ids(&cleared), ids(&original));
+    // A one-shot keyed read has exactly the same selection contract.
+    f.app
+        .save_message_draft("alice", &group, "after reopen", None, vec![])
+        .unwrap();
+    let row = f
+        .runtime
+        .presented_chat_list_row("alice", &group)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&row.preview, crate::SelectedChatPreview::Draft(d) if d.text == "after reopen")
+    );
+    drop(window);
+    let reopened = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(3))
+        .await
+        .unwrap();
+    assert_eq!(reopened.snapshot.rows[0].preview, row.preview);
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
+    use cgka_traits::storage::{
+        GroupStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageProvider,
+    };
+    use cgka_traits::{GroupId, MessageId, SendIntent};
+    let f = Fixture::new(1);
+    f.app
+        .save_message_draft("alice", "0000", "send", None, vec![])
+        .unwrap();
+    let selected = f.app.selected_message_draft("alice", "0000").unwrap();
+    let mut sub = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(1))
+        .await
+        .unwrap();
+    let group_id = GroupId::new(vec![0, 0]);
+    f.store
+        .put_group(&cgka_traits::group::Group {
+            id: group_id.clone(),
+            name: "fixture".into(),
+            description: String::new(),
+            epoch: cgka_traits::EpochId(0),
+            members: vec![],
+            required_capabilities: Default::default(),
+            protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
+            removed: false,
+            unrecoverable: false,
+            disbanded: None,
+            join_epoch: cgka_traits::EpochId(0),
+            local_copy_install_epoch: cgka_traits::EpochId(0),
+            local_copy_welcome_created_at: None,
+        })
+        .unwrap();
+    let intent = QueuedOutboundIntent {
+        id: MessageId::new(vec![3; 32]),
+        group_id: group_id.clone(),
+        intent: SendIntent::AppMessage {
+            group_id,
+            payload: b"payload".to_vec(),
+            expected_epoch: None,
+        },
+        created_at_ms: 1,
+        reissue_attempts: 0,
+    };
+    // Production draft send installs this observer on the accepting engine session.
+    f.store
+        .set_message_draft_commit_observer(f.app.draft_commit_observer("alice"));
+    f.store
+        .stage_message_draft_submission(&selected.revision, "event", b"payload")
+        .unwrap();
+    let result: Result<(), cgka_traits::storage::StorageError> = f.store.with_transaction(|s| {
+        s.put_queued_outbound_intent(&intent)?;
+        assert!(s.selected_message_draft("0000")?.draft.is_none());
+        Err(cgka_traits::storage::StorageError::Backend(
+            "rollback".into(),
+        ))
+    });
+    assert!(result.is_err());
+    assert!(
+        f.app
+            .selected_message_draft("alice", "0000")
+            .unwrap()
+            .draft
+            .is_some()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .is_err()
+    );
+    // Acceptance commits the queue+clear and invokes the existing after-commit observer.
+    f.store.put_queued_outbound_intent(&intent).unwrap();
+    assert_eq!(
+        next(&mut sub).await.rows[0].preview,
+        crate::SelectedChatPreview::Empty
+    );
+    // Saturate the draft channel without relying on another external message to wake it.
+    for _ in 0..2048 {
+        let _ = f
+            .app
+            .presentation_signals
+            .drafts
+            .send(crate::drafts::MessageDraftInvalidation {
+                account_label: "alice".into(),
+                group_id_hex: "0000".into(),
+            });
+    }
+    f.app
+        .save_message_draft("alice", "0000", "after lag", None, vec![])
+        .unwrap();
+    assert!(
+        matches!(&next(&mut sub).await.rows[0].preview, crate::SelectedChatPreview::Draft(d) if d.text == "after lag")
+    );
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[test]
+fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states() {
+    use crate::conversation_presentation::{ConversationAuthority, ConversationParticipation};
+    use cgka_traits::GroupLifecycleState as L;
+    let f = Fixture::new(1);
+    let mut row = f.store.chat_list_row("0000").unwrap().unwrap();
+    // Compare independently implemented public policies, including admin preflight.
+    // Engine-only facts are deliberately tested separately below: list rendering
+    // must not hydrate an engine just to obtain those facts.
+    for membership in [
+        SelfMembership::Member,
+        SelfMembership::Left,
+        SelfMembership::Removed,
+    ] {
+        for lifecycle in [
+            L::Stable,
+            L::PendingPublish,
+            L::Merging,
+            L::Recovering,
+            L::Unrecoverable,
+            L::Disbanded,
+        ] {
+            for pending in [false, true] {
+                for leaving in [false, true] {
+                    for disbanding in [false, true] {
+                        for admin in [false, true] {
+                            row.self_membership = membership;
+                            row.lifecycle_state = lifecycle;
+                            row.pending_confirmation = pending;
+                            row.leave_requested_at_ms = leaving.then_some(1);
+                            row.disbanding = disbanding;
+                            let authority = ConversationAuthority {
+                                is_member: membership == SelfMembership::Member,
+                                self_membership: membership,
+                                is_admin: admin,
+                                admin_count: 1,
+                                pending_confirmation: pending,
+                                leave_request_pending: leaving,
+                                lifecycle: lifecycle.into(),
+                                unrecoverable: false,
+                                disbanding,
+                                disbanding_enabled: false,
+                                has_disbanding_blockers: false,
+                            };
+                            let capabilities = authority.capabilities();
+                            assert_eq!(
+                                ChatListRowActions::for_row(&row).can_start_leave,
+                                capabilities.can_leave
+                                    || capabilities.requires_self_demote_before_leave,
+                                "{authority:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let row = f.store.chat_list_row("0000").unwrap().unwrap();
+    assert!(ChatListRowActions::for_row(&row).can_start_leave);
+    for (is_member, unrecoverable, participation) in [
+        (false, false, ConversationParticipation::Unavailable),
+        (true, true, ConversationParticipation::Active),
+    ] {
+        let capabilities = ConversationAuthority {
+            is_member,
+            self_membership: row.self_membership,
+            is_admin: false,
+            admin_count: 1,
+            pending_confirmation: false,
+            leave_request_pending: false,
+            lifecycle: row.lifecycle_state.into(),
+            unrecoverable,
+            disbanding: false,
+            disbanding_enabled: false,
+            has_disbanding_blockers: false,
+        }
+        .capabilities();
+        assert_eq!(capabilities.participation, participation);
+        assert!(!capabilities.can_leave && !capabilities.requires_self_demote_before_leave);
+    }
+}

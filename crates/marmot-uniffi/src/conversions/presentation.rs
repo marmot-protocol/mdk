@@ -51,8 +51,74 @@ pub struct PresentationVersionFfi {
     pub account_store_epoch: Vec<u8>,
     pub revision: u64,
 }
+/// Selected preview; Message refers to `row.last_message` on this same row.
+/// Hosts localize Invitation/Empty and the Draft label; no extra lookup is needed.
+#[derive(Clone, uniffi::Enum)]
+pub enum SelectedChatPreviewFfi {
+    Draft { draft: ChatListDraftPreviewFfi },
+    Message,
+    Invitation,
+    Empty,
+}
+#[derive(Clone, uniffi::Record)]
+pub struct ChatListDraftPreviewFfi {
+    pub text: String,
+    pub text_truncated: bool,
+    pub attachment_count: u64,
+    pub attachment_kind: Option<super::ChatListAttachmentKindFfi>,
+}
+/// Advisory row gestures. Starting leave still requires authoritative preflight,
+/// including admin demotion/disband decisions; this is not permission to send SelfRemove.
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct ChatListRowActionsFfi {
+    pub can_mark_read: bool,
+    pub can_mark_unread: bool,
+    pub can_pin: bool,
+    pub can_unpin: bool,
+    pub can_mute: bool,
+    pub can_unmute: bool,
+    pub can_archive: bool,
+    pub can_restore: bool,
+    pub can_start_leave: bool,
+    pub can_delete_local: bool,
+}
+impl From<app::SelectedChatPreview> for SelectedChatPreviewFfi {
+    fn from(v: app::SelectedChatPreview) -> Self {
+        match v {
+            app::SelectedChatPreview::Draft(v) => Self::Draft {
+                draft: ChatListDraftPreviewFfi {
+                    text: v.text,
+                    text_truncated: v.text_truncated,
+                    attachment_count: v.attachment_count,
+                    attachment_kind: v.attachment_kind.map(Into::into),
+                },
+            },
+            app::SelectedChatPreview::Message => Self::Message,
+            app::SelectedChatPreview::Invitation => Self::Invitation,
+            app::SelectedChatPreview::Empty => Self::Empty,
+        }
+    }
+}
+impl From<app::ChatListRowActions> for ChatListRowActionsFfi {
+    fn from(v: app::ChatListRowActions) -> Self {
+        Self {
+            can_mark_read: v.can_mark_read,
+            can_mark_unread: v.can_mark_unread,
+            can_pin: v.can_pin,
+            can_unpin: v.can_unpin,
+            can_mute: v.can_mute,
+            can_unmute: v.can_unmute,
+            can_archive: v.can_archive,
+            can_restore: v.can_restore,
+            can_start_leave: v.can_start_leave,
+            can_delete_local: v.can_delete_local,
+        }
+    }
+}
 #[derive(Clone, uniffi::Record)]
 pub struct PresentedChatRowFfi {
+    pub preview: SelectedChatPreviewFfi,
+    pub actions: ChatListRowActionsFfi,
     pub row: ChatListRowFfi,
     pub presentation: ConversationPresentationFfi,
     pub avatar_asset: Option<super::AvatarAssetFfi>,
@@ -75,6 +141,8 @@ macro_rules! impl_redacted_fmt {
     })*};
 }
 impl_redacted_fmt!(
+    SelectedChatPreviewFfi,
+    ChatListDraftPreviewFfi,
     PresentationTextFfi,
     SelectedAvatarFfi,
     ConversationPresentationFfi,
@@ -159,6 +227,8 @@ impl From<app::ChatPresentationVersion> for PresentationVersionFfi {
 impl From<app::PresentedChatRow> for PresentedChatRowFfi {
     fn from(v: app::PresentedChatRow) -> Self {
         Self {
+            preview: v.preview.into(),
+            actions: v.actions.into(),
             avatar_asset: v.avatar_asset.map(Into::into),
             row: v.row.into(),
             presentation: v.presentation.into(),

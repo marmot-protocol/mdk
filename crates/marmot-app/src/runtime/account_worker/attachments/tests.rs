@@ -274,6 +274,10 @@ async fn download_without_engine_and_retain(explicit: bool) {
         "eligible job must queue for global capacity"
     );
     if explicit {
+        // Pure explicit work must retain native retry behavior in HostManaged,
+        // even though it passes through the same worker as automatic demand.
+        client.app.config.attachment_acquisition_mode =
+            crate::AttachmentAcquisitionMode::HostManaged;
         let now = crate::unix_now_seconds();
         let asset = storage
             .attachment_transfer_candidates(now, 1, true)
@@ -308,6 +312,18 @@ async fn download_without_engine_and_retain(explicit: bool) {
         MediaHttpCompletion::Attachment { job, .. } => job.reference.clone(),
         _ => panic!("attachment"),
     };
+    if explicit {
+        let MediaHttpCompletion::Attachment { job, .. } = &done.completion else {
+            panic!("attachment");
+        };
+        // A receipt on an opted-in job forbids any further automatic attempt.
+        // This pure explicit job must not have acquired that contract.
+        assert!(
+            storage
+                .begin_attachment_network_attempt(job, crate::unix_now_seconds())
+                .unwrap()
+        );
+    }
     complete_media_http(&mut client, done, &shared, &http).await;
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
     assert_eq!(
@@ -606,9 +622,223 @@ async fn attachment_cancellation_observation_error_is_not_cancellation() {
     let (_updates, watch) = watch::channel(());
     store.close().unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), cancelled(store, job, watch))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            cancelled(store, job, watch, None)
+        )
+        .await
+        .is_err(),
         "an unobservable store must not masquerade as a durable cancel"
+    );
+}
+
+fn automatic_target() -> crate::AttachmentLocalTarget {
+    crate::AttachmentLocalTarget {
+        message_id_hex: "11".repeat(32),
+        source_message_id_hex: "22".repeat(32),
+        attachment_index: 0,
+    }
+}
+fn all_attachment_permission() -> crate::AttachmentAutomaticPermission {
+    crate::AttachmentAutomaticPermission {
+        images: true,
+        videos: true,
+        audio: true,
+        files: true,
+    }
+}
+
+#[tokio::test]
+async fn attachment_host_managed_requires_demand_and_fences_permission_generations() {
+    let (_dir, mut client, storage, reference) = offline_fixture().await;
+    assert!(matches!(
+        client
+            .app
+            .runtime()
+            .begin_attachment_permission_update("alice")
+            .await,
+        Err(AppError::AttachmentModeRequired)
+    ));
+    client.app.config.attachment_acquisition_mode = crate::AttachmentAcquisitionMode::HostManaged;
+    let runtime = client.app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    let (http, _completions) = context();
+    let mut admission = Admission::default();
+    // Startup cannot turn projection demand into network acquisition.
+    schedule(&client, &runtime.shared, &http, &mut admission).unwrap();
+    assert!(
+        storage
+            .due_attachment_acquisitions(crate::unix_now_seconds(), 64)
+            .unwrap()
+            .is_empty()
+    );
+    let denied = runtime
+        .request_automatic_attachment("alice", &group, automatic_target())
+        .await
+        .unwrap();
+    assert!(!denied.newly_queued);
+    assert_eq!(
+        denied.status.unwrap().state,
+        storage_sqlite::AttachmentTransferState::PolicyBlocked
+    );
+    let stale = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    let current = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        !runtime
+            .set_attachment_automatic_permission("alice", stale, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .set_attachment_automatic_permission(
+                "alice",
+                current.clone(),
+                all_attachment_permission()
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !runtime
+            .set_attachment_automatic_permission("alice", current, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    schedule(&client, &runtime.shared, &http, &mut admission).unwrap();
+    assert!(
+        storage
+            .due_attachment_acquisitions(crate::unix_now_seconds(), 64)
+            .unwrap()
+            .is_empty(),
+        "permission alone is not demand"
+    );
+    let result = runtime
+        .request_automatic_attachment("alice", &group, automatic_target())
+        .await
+        .unwrap();
+    assert!(result.newly_queued);
+    let updates = runtime.shared.attachment_updates.subscribe();
+    let repeated = runtime
+        .request_automatic_attachment("alice", &group, automatic_target())
+        .await
+        .unwrap();
+    assert!(!repeated.newly_queued);
+    assert!(
+        !updates.has_changed().unwrap(),
+        "unchanged demand must not create a presentation wake loop"
+    );
+    let asset = result.status.unwrap().reference.unwrap();
+    let now = crate::unix_now_seconds();
+    let job = storage
+        .claim_attachment_acquisition(&asset, now, now + 100)
+        .unwrap()
+        .unwrap();
+    let lease = runtime
+        .shared
+        .attachment_permissions
+        .lease(
+            &storage.attachment_store_identity().unwrap(),
+            &reference.media_type,
+        )
+        .unwrap();
+    assert!(lease.allowed());
+    let next = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(!lease.allowed());
+    assert!(!storage.begin_attachment_network_attempt(&job, now).unwrap());
+    assert!(!storage.attachment_transfer_is_active(&job, now).unwrap());
+    assert!(
+        runtime
+            .set_attachment_automatic_permission("alice", next.clone(), all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !lease.allowed(),
+        "reapproval must not revive an old transfer"
+    );
+    let replacement = client.app.runtime();
+    assert!(
+        !replacement
+            .set_attachment_automatic_permission("alice", next, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        replacement
+            .request_automatic_attachment("alice", &group, automatic_target())
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentTransferState::Paused
+    );
+    let pending_callback = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    runtime.accounts.deactivate_account("alice").await.unwrap();
+    assert!(matches!(
+        runtime.begin_attachment_permission_update("alice").await,
+        Err(AppError::AttachmentAccountSignedOut)
+    ));
+    assert!(
+        !runtime
+            .set_attachment_automatic_permission(
+                "alice",
+                pending_callback.clone(),
+                all_attachment_permission()
+            )
+            .await
+            .unwrap()
+    );
+    // Reopening the same retained account store must not revive its old approval.
+    AccountHome::open(_dir.path())
+        .set_account_signed_out("alice", false)
+        .unwrap();
+    assert!(
+        !runtime
+            .set_attachment_automatic_permission(
+                "alice",
+                pending_callback,
+                all_attachment_permission()
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        runtime
+            .request_automatic_attachment("alice", &group, automatic_target())
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentTransferState::Paused
+    );
+    AccountHome::open(_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob = client.app.account_storage("bob").unwrap();
+    seed(&bob, &reference, false);
+    assert_eq!(
+        runtime
+            .request_automatic_attachment("bob", &group, automatic_target())
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentTransferState::PolicyBlocked
     );
 }

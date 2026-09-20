@@ -9,6 +9,20 @@ async fn client_at(
     reference: &crate::MediaAttachmentReference,
     create: bool,
 ) -> (AppClient, SqliteAccountStorage) {
+    client_at_with_mode(
+        dir,
+        reference,
+        create,
+        crate::AttachmentAcquisitionMode::NativeAutomatic,
+    )
+    .await
+}
+async fn client_at_with_mode(
+    dir: &std::path::Path,
+    reference: &crate::MediaAttachmentReference,
+    create: bool,
+    mode: crate::AttachmentAcquisitionMode,
+) -> (AppClient, SqliteAccountStorage) {
     if create {
         AccountHome::open(dir).create_account("alice").unwrap();
     }
@@ -16,6 +30,7 @@ async fn client_at(
         dir,
         "wss://relay.example",
         MarmotAppConfig {
+            attachment_acquisition_mode: mode,
             allow_loopback_blob_endpoints: true,
             attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
             ..Default::default()
@@ -57,6 +72,8 @@ fn resume_context(
 ) -> AttachmentResume {
     AttachmentResume {
         automatic: true,
+        permission: None,
+        finishing: Default::default(),
         updates: None,
         storage: store.clone(),
         job: job.clone(),
@@ -66,7 +83,12 @@ fn resume_context(
             .unwrap(),
         budget: 128 * 1024 * 1024,
         directory: dir.into(),
-        disk_reserve: 0,
+        policy: storage_sqlite::AttachmentDownloadPolicy {
+            automatic: true,
+            retained_bytes: 128 * 1024 * 1024,
+            disk_reserve: 0,
+            transfer_limit: 64 * 1024 * 1024,
+        },
     }
 }
 async fn headers(socket: &mut tokio::net::TcpStream) -> String {
@@ -785,7 +807,7 @@ async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
     let (client, store) = client_at(dir.path(), &reference, true).await;
     let job = claim(&store);
     let mut context = resume_context(&store, &job, dir.path(), &reference);
-    context.disk_reserve = u64::MAX; // Any unnecessary checkpoint would refuse.
+    context.budget = 0; // Any unnecessary checkpoint would refuse.
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
@@ -1218,4 +1240,426 @@ async fn attachment_body_idle_deadline_releases_global_capacity_and_retries() {
     );
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn attachment_http_attempt_budget_includes_transport_retries() {
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"bounded network");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".to_owned(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = count.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            headers(&mut socket).await;
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at_with_mode(
+        dir.path(),
+        &reference,
+        true,
+        crate::AttachmentAcquisitionMode::HostManaged,
+    )
+    .await;
+    opt_in(&client).await;
+    let mut job = claim(&store);
+    let asset = job.reference.clone();
+    for _ in 0..4 {
+        let prepared = client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                64 * 1024 * 1024,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            prepared
+                .run_classified(resume_context(&store, &job, dir.path(), &reference))
+                .await
+                .is_err()
+        );
+        let now = crate::unix_now_seconds();
+        store.fail_attachment_acquisition(&job, Some(now)).unwrap();
+        match store
+            .claim_attachment_acquisition(&asset, now, now + 1200)
+            .unwrap()
+        {
+            Some(next) => job = next,
+            None => break,
+        }
+    }
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 16);
+    assert!(
+        store
+            .attachment_transfer_candidates(crate::unix_now_seconds(), 64, true)
+            .unwrap()
+            .is_empty()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn attachment_revocation_prevents_retry_and_old_approval_cannot_restore_it() {
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"permission race");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".to_owned(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let (received, first) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        received.send(()).unwrap();
+        released.await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        drop(socket);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .is_err(),
+            "revocation must prevent subsequent HTTP attempts"
+        );
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (mut client, store) = client_at(dir.path(), &reference, true).await;
+    client.app.config.attachment_acquisition_mode = crate::AttachmentAcquisitionMode::HostManaged;
+    let runtime = client.app.runtime();
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission(
+                "alice",
+                generation.clone(),
+                all_attachment_permission()
+            )
+            .await
+            .unwrap()
+    );
+    let job = claim(&store);
+    let mut resume = resume_context(&store, &job, dir.path(), &reference);
+    resume.permission = runtime.shared.attachment_permissions.lease(
+        &store.attachment_store_identity().unwrap(),
+        &reference.media_type,
+    );
+    assert!(resume.permission.is_some());
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference,
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let transfer = tokio::spawn(prepared.run_classified(resume));
+    first.await.unwrap();
+    let next = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        !runtime
+            .set_attachment_automatic_permission("alice", generation, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    // Even reapproval cannot revive the old in-flight lease or its fallback loop.
+    assert!(
+        runtime
+            .set_attachment_automatic_permission("alice", next, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    release.send(()).unwrap();
+    assert!(transfer.await.unwrap().is_err());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_completed_unretained_body_is_not_downloaded_again() {
+    let (mut reference, ciphertext) =
+        crate::media::tests::attachment_worker_fixture(b"one completed body");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".to_owned(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    ciphertext.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&ciphertext).await.unwrap();
+        drop(socket);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at_with_mode(
+        dir.path(),
+        &reference,
+        true,
+        crate::AttachmentAcquisitionMode::HostManaged,
+    )
+    .await;
+    opt_in(&client).await;
+    let job = claim(&store);
+    let group = GroupId::new(vec![0xab; 16]);
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let result = prepared
+        .run_classified(resume_context(&store, &job, dir.path(), &reference))
+        .await;
+    assert!(result.is_ok());
+    complete(&client, &job, result, 0).unwrap();
+    let runtime = client.app.runtime();
+    let (http, _completions) = context();
+    let mut admission = Admission::default();
+    for _ in 0..10 {
+        let request = runtime
+            .request_automatic_attachment("alice", &group, automatic_target())
+            .await
+            .unwrap();
+        assert!(!request.newly_queued);
+        assert_eq!(
+            request.status.unwrap().state,
+            storage_sqlite::AttachmentTransferState::CompletedUnretained
+        );
+        schedule(&client, &runtime.shared, &http, &mut admission).unwrap();
+    }
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
+    assert!(!admission.is_waiting());
+    server.await.unwrap();
+}
+
+async fn opt_in(client: &AppClient) {
+    let runtime = client.app.runtime();
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission("alice", generation, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .request_automatic_attachment(
+                "alice",
+                &GroupId::new(vec![0xab; 16]),
+                automatic_target()
+            )
+            .await
+            .unwrap()
+            .newly_queued
+    );
+}
+
+#[tokio::test]
+async fn attachment_verified_http_body_publishes_after_permission_and_policy_revocation() {
+    let body = b"verified before revocation";
+    let (mut reference, ciphertext) = crate::media::tests::attachment_worker_fixture(body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".to_owned(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        respond(&mut socket, "200 OK", "", &ciphertext, ciphertext.len()).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at_with_mode(
+        dir.path(),
+        &reference,
+        true,
+        crate::AttachmentAcquisitionMode::HostManaged,
+    )
+    .await;
+    opt_in(&client).await;
+    let job = claim(&store);
+    let group = GroupId::new(vec![0xab; 16]);
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let resume = resume_context(&store, &job, dir.path(), &reference);
+    let finishing = resume.finishing.clone();
+    let result = prepared.run_classified(resume).await;
+    assert!(result.is_ok());
+    assert!(finishing.load(std::sync::atomic::Ordering::Acquire));
+    store
+        .pause_automatic_attachments(crate::unix_now_seconds())
+        .unwrap();
+    let mut policy = store
+        .attachment_download_policy(
+            &super::super::super::super::attachment_controls::default_policy(&client.app.config),
+        )
+        .unwrap();
+    policy.automatic = false;
+    store
+        .set_attachment_download_policy(&policy, crate::unix_now_seconds())
+        .unwrap();
+    // Both completion and cancellation are ready. Completion owns the body.
+    let result = finish_or_cancel(
+        std::future::ready(result),
+        std::future::ready(()),
+        finishing,
+    )
+    .await;
+    complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+    assert_eq!(
+        &*store
+            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 100)
+            .unwrap()
+            .unwrap(),
+        body
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_revocation_waits_for_in_progress_verified_receipt() {
+    let finishing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = finishing.clone();
+    let (ready, cancelled) = tokio::sync::oneshot::channel();
+    let (release, committed) = tokio::sync::oneshot::channel();
+    let (observed, cancellation_observed) = tokio::sync::oneshot::channel();
+    let download = async move {
+        started.store(true, std::sync::atomic::Ordering::Release);
+        ready.send(()).unwrap();
+        committed.await.unwrap();
+        Ok(MediaDownloadResult {
+            plaintext: b"verified".to_vec(),
+            size_bytes: 8,
+            file_name: "test.bin".to_owned(),
+            media_type: "application/octet-stream".to_owned(),
+        })
+    };
+    let task = tokio::spawn(finish_or_cancel(
+        download,
+        async {
+            cancelled.await.unwrap();
+            observed.send(()).unwrap();
+        },
+        finishing,
+    ));
+    cancellation_observed.await.unwrap();
+    assert!(!task.is_finished());
+    release.send(()).unwrap();
+    assert_eq!(task.await.unwrap().unwrap().plaintext, b"verified");
+}
+
+#[tokio::test]
+async fn attachment_transient_disk_pressure_defers_before_receipt() {
+    let body = b"disk pressure can recover";
+    let (listener, reference, cipher) = listener_fixture(body).await;
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            headers(&mut socket).await;
+            respond(&mut socket, "200 OK", "", &cipher, cipher.len()).await;
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at_with_mode(
+        dir.path(),
+        &reference,
+        true,
+        crate::AttachmentAcquisitionMode::HostManaged,
+    )
+    .await;
+    opt_in(&client).await;
+    let job = claim(&store);
+    let mut context = resume_context(&store, &job, dir.path(), &reference);
+    context.policy.disk_reserve = i64::MAX as u64 / 2;
+    let group = GroupId::new(vec![0xab; 16]);
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let result = prepared.run_classified(context).await;
+    assert!(matches!(&result, Err(AttachmentDownloadFailure::Retry(_))));
+    complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+    let status = store
+        .attachment_acquisition_status(&job.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::RetryScheduled
+    );
+    let due = status.due.unwrap();
+    let next = store
+        .claim_attachment_acquisition(&job.reference, due, due + 180)
+        .unwrap()
+        .unwrap();
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let result = prepared
+        .run_classified(resume_context(&store, &next, dir.path(), &reference))
+        .await;
+    assert!(result.is_ok());
+    complete(&client, &next, result, 128 * 1024 * 1024).unwrap();
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        body.len() as u64
+    );
+    server.await.unwrap();
 }

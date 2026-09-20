@@ -739,6 +739,46 @@ describe("startMarmotInbound", () => {
     ]);
   });
 
+  it("does not buffer an unlisted mutation actor as ambient context", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, (message) => {
+      dispatched.push(message);
+    }, {
+      clientFactory: () =>
+        inboundStubClient([
+          {
+            type: "message_edited",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("e1"),
+            target_message_id_hex: HEX32("dd"),
+            actor: { account_id_hex: HEX32("99"), display_name: null, is_self: false },
+            replacement_text: "unauthorized",
+            recorded_at: 122,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "available",
+              text_excerpt: "before",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
+          },
+          inboundEvent("cc", "ff"),
+        ]),
+    });
+
+    await waitFor(() => dispatched.length > 0);
+    stop();
+
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]?.ambientContext ?? []).toEqual([]);
+  });
+
   it("keeps ambient context when a non-triggering message is gated out", async () => {
     const attempted: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {

@@ -2,7 +2,15 @@
 use super::AttachmentDownloadFailure;
 use crate::AppError;
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    future::Future,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Poll,
+};
 use storage_sqlite::{
     ATTACHMENT_CHECKPOINT_BYTES, AttachmentAcquisition, AttachmentPartial,
     AttachmentPartialIdentity, SqliteAccountStorage,
@@ -20,8 +28,11 @@ pub(crate) struct AttachmentResume {
     pub ciphertext_digest: [u8; 32],
     pub budget: u64,
     pub directory: PathBuf,
-    pub disk_reserve: u64,
+    pub policy: storage_sqlite::AttachmentDownloadPolicy,
     pub automatic: bool,
+    pub permission: Option<crate::runtime::attachment_permission::PermissionLease>,
+    /// Once verification finishes, cancellation waits for the receipt and result.
+    pub finishing: Arc<AtomicBool>,
     pub updates: Option<tokio::sync::watch::Sender<()>>,
 }
 fn retry(message: &str) -> AttachmentDownloadFailure {
@@ -31,7 +42,85 @@ fn stop(message: &str) -> AttachmentDownloadFailure {
     AttachmentDownloadFailure::Stop(AppError::BlobStore(message.into()))
 }
 
+/// Distinguish revocation from transport errors without nesting Result values.
+pub(crate) enum NetworkPollError<E> {
+    Revoked(AttachmentDownloadFailure),
+    Operation(E),
+}
+
 impl AttachmentResume {
+    pub(crate) async fn with_permission<F, T, E>(&self, future: F) -> Result<T, NetworkPollError<E>>
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| {
+            if self
+                .permission
+                .as_ref()
+                .is_some_and(|permission| !permission.allowed())
+            {
+                return Poll::Ready(Err(NetworkPollError::Revoked(retry(
+                    "automatic attachment permission revoked",
+                ))));
+            }
+            future
+                .as_mut()
+                .poll(cx)
+                .map(|result| result.map_err(NetworkPollError::Operation))
+        })
+        .await
+    }
+    pub(crate) async fn before_network(&self) -> Result<(), AttachmentDownloadFailure> {
+        if self.permission.as_ref().is_some_and(|p| !p.allowed()) {
+            return Err(retry("automatic attachment permission revoked"));
+        }
+        let this = self.clone();
+        let allowed = tokio::task::spawn_blocking(move || {
+            this.storage
+                .begin_attachment_network_attempt(&this.job, crate::unix_now_seconds())
+        })
+        .await
+        .map_err(|_| stop("attachment admission task failed"))?
+        .map_err(|_| stop("attachment admission failed"))?;
+        if !allowed {
+            return Err(stop("attachment network attempt not admitted"));
+        }
+        Ok(())
+    }
+    pub(crate) async fn completed_body(
+        &self,
+        plaintext_len: usize,
+    ) -> Result<(), AttachmentDownloadFailure> {
+        self.finishing.store(true, Ordering::Release);
+        let this = self.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            // Defer transient disk pressure before recording a completed receipt.
+            // Stable retention quota failures after this boundary remain terminal.
+            let policy = this
+                .storage
+                .attachment_download_policy(&this.policy)
+                .map_err(|_| retry("attachment publication policy unavailable"))?;
+            let free = fs4::available_space(&this.directory).unwrap_or(0);
+            if free
+                < policy
+                    .disk_reserve
+                    .saturating_add((plaintext_len as u64).saturating_mul(4))
+            {
+                return Err(retry("insufficient disk space for attachment publication"));
+            }
+            this.storage
+                .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
+                .map_err(|_| stop("attachment receipt failed"))
+        })
+        .await
+        .map_err(|_| stop("attachment receipt task failed"))??;
+        if !recorded {
+            return Err(stop("attachment receipt superseded"));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn progress(
         &self,
         received: u64,
@@ -131,6 +220,7 @@ impl AttachmentResume {
             let free = fs4::available_space(&this.directory).unwrap_or(0);
             if free
                 < this
+                    .policy
                     .disk_reserve
                     .saturating_add(4 * ATTACHMENT_CHECKPOINT_BYTES as u64)
             {

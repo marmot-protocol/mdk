@@ -13,6 +13,7 @@ import type {
 } from "./client.js";
 import {
   authorizeInboundSender,
+  senderAuthorizationInputFromActor,
   senderAuthorizationInputFromMessage,
   type MarmotSenderAuthorizer,
   type SenderDenyReason,
@@ -273,6 +274,15 @@ export class MarmotInboundBridge {
       event.type === "reaction_removed"
     ) {
       if (this.recent.has(event.event_id_hex)) {
+        return;
+      }
+      const authorization = authorizeInboundSender(
+        this.options.authorizer,
+        senderAuthorizationInputFromActor(event),
+      );
+      if (authorization.outcome === "deny") {
+        this.recent.add(event.event_id_hex);
+        this.options.onDenied?.(authorization.reason);
         return;
       }
       this.recent.add(event.event_id_hex);

@@ -35,6 +35,7 @@ pub struct RuntimePresentedChatListSubscription {
     legacy: RuntimeChatListSubscription,
     presentation: broadcast::Receiver<PresentationInvalidation>,
     avatars: broadcast::Receiver<String>,
+    drafts: broadcast::Receiver<crate::drafts::MessageDraftInvalidation>,
     stopping: watch::Receiver<bool>,
     current: PresentedChatListSnapshot,
     sequence: u64,
@@ -48,6 +49,12 @@ impl RuntimePresentedChatListSubscription {
                 // These payloads are invalidations, not deltas to apply. The upcoming read
                 // includes all committed changes already queued and cancellation keeps dirty.
                 self.legacy.discard_pending_invalidations();
+                // Drain only the queued prefix before reading, not arrivals during the
+                // read. Cap work so continuous producers cannot starve the snapshot.
+                // A lag marker also discards safely: this read recovers from storage.
+                for _ in 0..self.drafts.len().min(1024) {
+                    let _ = self.drafts.try_recv();
+                }
                 let snapshot = tokio::select! {
                     biased;
                     _ = wait_for_runtime_shutdown(&mut self.stopping) => return Ok(None),
@@ -79,6 +86,7 @@ impl RuntimePresentedChatListSubscription {
                     if update.is_none() { return Ok(None); }
                     self.dirty = true;
                 }
+                event = self.drafts.recv() => match event { Ok(event) if event.account_label == self.account_label && self.current.rows.iter().any(|row| row.row.group_id_hex == event.group_id_hex) => self.dirty = true, Err(broadcast::error::RecvError::Lagged(_)) => self.dirty = true, Err(broadcast::error::RecvError::Closed) => return Ok(None), _ => {} },
                 event = self.avatars.recv() => match event { Ok(label) if label == self.account_label => self.dirty = true, Err(broadcast::error::RecvError::Lagged(_)) => self.dirty = true, Err(broadcast::error::RecvError::Closed) => return Ok(None), _ => {} },
                 update = self.presentation.recv() => match update {
                     Ok(update) => {
@@ -140,6 +148,7 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let presentation = self.accounts.app.presentation_signals.updates.subscribe();
         let avatars = self.accounts.app.presentation_signals.avatars.subscribe();
+        let drafts = self.accounts.app.subscribe_message_draft_changes();
         let mut legacy = self
             .subscribe_chat_list(&account.label, include_archived)
             .await?;
@@ -163,6 +172,7 @@ impl MarmotAppRuntime {
             legacy,
             presentation,
             avatars,
+            drafts,
             stopping: self.shared.lifecycle().subscribe_shutdown(),
             sequence: 0,
             dirty: false,
@@ -263,6 +273,77 @@ mod tests {
     use marmot_account::AccountHome;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn presented_list_coalesces_draft_bursts_and_lag_before_reading() {
+        for saves in [16, 2048] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+            let mut client = app.client("alice").await.unwrap();
+            let group = client.create_group("Drafts", &[]).await.unwrap();
+            let id = hex::encode(group.as_slice());
+            let runtime = MarmotAppRuntime::new(app.clone());
+            let mut sub = runtime
+                .open_presented_chat_list("alice", false)
+                .await
+                .unwrap();
+            for revision in 0..saves {
+                app.save_message_draft("alice", &id, &revision.to_string(), None, vec![])
+                    .unwrap();
+            }
+            let update = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&update.snapshot.rows[0].preview,
+                crate::SelectedChatPreview::Draft(d) if d.text == (saves - 1).to_string()));
+            assert_eq!(update.sequence, 1);
+            // Future invalidations must survive coalescing and cancelled idle receives.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), sub.recv())
+                    .await
+                    .is_err()
+            );
+            app.save_message_draft("alice", &id, "later", None, vec![])
+                .unwrap();
+            let update = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&update.snapshot.rows[0].preview,
+                crate::SelectedChatPreview::Draft(d) if d.text == "later"));
+            assert_eq!(update.sequence, 2);
+            // Queue another burst and close storage immediately after its one snapshot.
+            // Any redundant read for already-covered events would now return an error
+            // instead of waiting for genuinely new input.
+            for revision in 0..saves {
+                app.save_message_draft("alice", &id, &revision.to_string(), None, vec![])
+                    .unwrap();
+            }
+            let update = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(update.sequence, 3);
+            app.account_storage("alice").unwrap().close().unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), sub.recv())
+                    .await
+                    .is_err(),
+                "covered draft notifications must not trigger another storage read"
+            );
+            drop(sub);
+            drop(client);
+            runtime.shutdown_and_close().await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn dropping_legacy_list_releases_pump_and_expired_mutes_read_correctly() {

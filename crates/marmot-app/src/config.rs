@@ -51,6 +51,15 @@ pub enum CursorPersistence {
     Frozen,
 }
 
+/// Chooses who supplies automatic attachment demand. Fixed before workers start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AttachmentAcquisitionMode {
+    #[default]
+    NativeAutomatic,
+    /// Host demand and runtime-only permission are both required. Starts denied.
+    HostManaged,
+}
+
 /// Automatic attachment policy. Quota is retained plaintext; disk admission
 /// additionally reserves space for SQLite/WAL copies. No automatic eviction.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +87,8 @@ pub struct MarmotAppConfig {
     /// None disables automatic acquisition; frozen runtimes always disable it.
     /// Per-account native policy overrides are durable.
     pub attachment_acquisition: Option<AttachmentAcquisitionPolicy>,
+    /// Demand and permission ownership, fixed before runtime workers start.
+    pub attachment_acquisition_mode: AttachmentAcquisitionMode,
     /// Disable exporters for short-lived command processes. Frozen cursors always disable them.
     pub usage_diagnostics_silent: bool,
     pub directory_max_future_skew: Duration,
@@ -255,6 +266,7 @@ impl Default for MarmotAppConfig {
         Self {
             key_package_client_name: None,
             attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
+            attachment_acquisition_mode: AttachmentAcquisitionMode::default(),
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             directory_relay_urls: Vec::new(),
@@ -285,6 +297,12 @@ impl Default for MarmotAppConfig {
 }
 
 impl MarmotAppConfig {
+    /// Select native or host-managed demand before constructing a runtime.
+    pub fn with_attachment_acquisition_mode(mut self, mode: AttachmentAcquisitionMode) -> Self {
+        self.attachment_acquisition_mode = mode;
+        self
+    }
+
     pub fn with_key_package_client_name(mut self, name: Option<String>) -> Self {
         self.key_package_client_name = name;
         self

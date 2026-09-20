@@ -2,7 +2,10 @@
 //! the account worker; HTTP/crypto use the existing cancellable media executor.
 use super::*;
 use crate::media::AttachmentDownloadFailure;
-use storage_sqlite::{AttachmentAcquisition, AttachmentPublishResult, SqliteAccountStorage};
+use storage_sqlite::{
+    ATTACHMENT_ACQUISITION_BATCH_LIMIT, AttachmentAcquisition, AttachmentPublishResult,
+    SqliteAccountStorage,
+};
 
 const DEMAND_BATCH: usize = 32;
 // Background HTTP has a two-minute whole-transfer deadline. Leave publication margin.
@@ -81,8 +84,12 @@ async fn cancelled(
     storage: SqliteAccountStorage,
     job: AttachmentAcquisition,
     mut updates: watch::Receiver<()>,
+    permission: Option<super::super::attachment_permission::PermissionLease>,
 ) {
     loop {
+        if permission.as_ref().is_some_and(|p| !p.allowed()) {
+            return;
+        }
         let store = storage.clone();
         let current = job.clone();
         let active = tokio::task::spawn_blocking(move || {
@@ -140,12 +147,29 @@ pub(super) fn schedule(
         admission.resumed = true;
     }
     let expired = storage.prune_expired_attachment_acquisitions(now, 64)?;
-    let more = (policy.automatic
-        && admit_demands(
-            &storage,
+    let host_managed = client.app.config.attachment_acquisition_mode
+        == crate::AttachmentAcquisitionMode::HostManaged;
+    let identity = storage.attachment_store_identity()?;
+    let resumed = if policy.automatic {
+        storage.resume_permitted_attachments(
             now,
-            client.app.config.allow_loopback_blob_endpoints,
-        )?)
+            if host_managed {
+                shared.attachment_permissions.categories(&identity)
+            } else {
+                [true; 4]
+            },
+        )?
+    } else {
+        0
+    };
+    let more = resumed == ATTACHMENT_ACQUISITION_BATCH_LIMIT
+        || (policy.automatic
+            && !host_managed
+            && admit_demands(
+                &storage,
+                now,
+                client.app.config.allow_loopback_blob_endpoints,
+            )?)
         || expired == 64
         || partials == 64;
     // Metadata and expiry maintenance continue when disk or network slots are full.
@@ -176,6 +200,29 @@ pub(super) fn schedule(
         } else {
             policy.transfer_limit
         };
+        let Some(source) = storage.prepare_attachment_acquisition(&candidate, now)? else {
+            continue;
+        };
+        let Some(reference) = reference(
+            &source.slot,
+            source.source_epoch,
+            client.app.config.allow_loopback_blob_endpoints,
+        ) else {
+            storage.finish_attachment_preparation(&candidate, now, None)?;
+            continue;
+        };
+        let permission = if host_managed && !explicit {
+            let Some(lease) = shared
+                .attachment_permissions
+                .lease(&identity, &reference.media_type)
+            else {
+                storage.park_attachment_permission(&candidate)?;
+                continue;
+            };
+            Some(lease)
+        } else {
+            None
+        };
         // References do not declare a trustworthy size. Reserve the configured
         // automatic-sized object even for explicit work, then enforce actual
         // checkpoint/publication capacity as the transfer grows.
@@ -194,17 +241,6 @@ pub(super) fn schedule(
             storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
             continue;
         }
-        let Some(source) = storage.prepare_attachment_acquisition(&candidate, now)? else {
-            continue;
-        };
-        let Some(reference) = reference(
-            &source.slot,
-            source.source_epoch,
-            client.app.config.allow_loopback_blob_endpoints,
-        ) else {
-            storage.finish_attachment_preparation(&candidate, now, None)?;
-            continue;
-        };
         let group = match hex::decode(&source.group_id_hex) {
             Ok(bytes) => GroupId::new(bytes),
             Err(_) => {
@@ -234,6 +270,12 @@ pub(super) fn schedule(
         };
         // A source change replaces the asset token. Claim rechecks the same
         // token/source after preparation, so stale prepared material cannot run.
+        if permission.as_ref().is_some_and(|p| !p.allowed()) {
+            continue;
+        }
+        if host_managed && !explicit {
+            storage.enable_attachment_automatic_history(&candidate)?;
+        }
         let Some(job) = storage.claim_attachment_acquisition(
             &candidate,
             now,
@@ -253,14 +295,17 @@ pub(super) fn schedule(
             ciphertext_digest,
             budget: byte_budget,
             directory: client.app.account_dir(&client.state.label),
-            disk_reserve: policy.disk_reserve,
+            policy: policy.clone(),
             automatic: !explicit,
+            permission: permission.clone(),
+            finishing: Default::default(),
             updates: Some(shared.attachment_updates.clone()),
         };
         let cancel = cancelled(
             storage.clone(),
             job.clone(),
             shared.attachment_cancellations.subscribe(),
+            permission,
         );
         let updates = shared.attachment_updates.clone();
         updates.send_modify(|_| {});
@@ -268,11 +313,9 @@ pub(super) fn schedule(
             http,
             permit,
             async move {
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel => Err(AttachmentDownloadFailure::Retry(AppError::BlobStore("attachment transfer cancelled".into()))),
-                    result = prepared.run_classified(resume) => result,
-                };
+                let finishing = resume.finishing.clone();
+                let result =
+                    finish_or_cancel(prepared.run_classified(resume), cancel, finishing).await;
                 updates.send_modify(|_| {});
                 MediaHttpCompletion::Attachment {
                     job,
@@ -286,6 +329,31 @@ pub(super) fn schedule(
         return Ok(more);
     }
     Ok(more)
+}
+
+/// Prefer a finished result over cancellation. Once verification starts its
+/// receipt, let that finite local step return the body to the publication owner.
+async fn finish_or_cancel<F, C>(
+    download: F,
+    cancel: C,
+    finishing: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<MediaDownloadResult, AttachmentDownloadFailure>
+where
+    F: std::future::Future<Output = Result<MediaDownloadResult, AttachmentDownloadFailure>>,
+    C: std::future::Future<Output = ()>,
+{
+    tokio::pin!(download);
+    tokio::select! {
+        biased;
+        result = &mut download => result,
+        _ = cancel => {
+            if finishing.load(std::sync::atomic::Ordering::Acquire) {
+                download.await
+            } else {
+                Err(AttachmentDownloadFailure::Retry(AppError::BlobStore("attachment transfer cancelled".to_owned())))
+            }
+        },
+    }
 }
 
 pub(super) fn complete(
@@ -303,19 +371,10 @@ pub(super) fn complete(
                 storage.fail_attachment_acquisition(job, None)?;
                 return Ok(());
             }
-            // Other writers may consume disk while HTTP is in flight. Recheck
-            // before starting a full-object SQLite write, without evicting data.
             let policy = storage.attachment_download_policy(
                 &super::super::attachment_controls::default_policy(&client.app.config),
             )?;
-            let reserve = policy.disk_reserve;
             let byte_budget = byte_budget.min(policy.retained_bytes);
-            let free =
-                fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
-            if free < reserve.saturating_add((plaintext.len() as u64).saturating_mul(4)) {
-                storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
-                return Ok(());
-            }
             match storage.complete_attachment_acquisition(job, &plaintext, now, byte_budget) {
                 Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
                 Ok(AttachmentPublishResult::CapacityBlocked) | Err(_) => {

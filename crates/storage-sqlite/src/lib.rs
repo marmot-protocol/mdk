@@ -47,8 +47,8 @@ pub use attachment_acquisition::{
     ATTACHMENT_ACQUISITION_BATCH_LIMIT, ATTACHMENT_CHECKPOINT_BYTES, AttachmentAcquisition,
     AttachmentAcquisitionSource, AttachmentAcquisitionState, AttachmentAcquisitionStatus,
     AttachmentAssetRef, AttachmentDemand, AttachmentPartial, AttachmentPartialIdentity,
-    AttachmentPublishResult, AttachmentWorkerDemand, MAX_ATTACHMENT_LOCAL_READ_BYTES,
-    MAX_RETAINED_ATTACHMENT_BYTES, RetainedAttachmentAsset,
+    AttachmentPermissionCategory, AttachmentPublishResult, AttachmentWorkerDemand,
+    MAX_ATTACHMENT_LOCAL_READ_BYTES, MAX_RETAINED_ATTACHMENT_BYTES, RetainedAttachmentAsset,
 };
 pub use attachment_history::{
     AttachmentHistoryCursor, AttachmentHistoryEntry, AttachmentHistoryError, AttachmentHistoryPage,
@@ -69,11 +69,12 @@ pub use chat_list::{
     ExistingDirectConversation, select_reusable_direct_conversation,
 };
 pub use chat_presentation::{
-    CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationActivePeer, ChatPresentationCatchUp,
+    CHAT_LIST_DRAFT_PREVIEW_CHARS, CHAT_PRESENTATION_BATCH_LIMIT, ChatListDraftPreview,
+    ChatListRowActions, ChatPresentationActivePeer, ChatPresentationCatchUp,
     ChatPresentationCheckpoint, ChatPresentationInput, ChatPresentationRead,
     ChatPresentationVersion, ChatPresentationWrite, ConversationPresentation,
     PresentationResolution, PresentationSource, PresentationText, PresentedChatListSnapshot,
-    PresentedChatRow, SelectedAvatar, StoredChatPresentation,
+    PresentedChatRow, SelectedAvatar, SelectedChatPreview, StoredChatPresentation,
 };
 #[allow(deprecated)]
 pub use connection::SqliteStorage;

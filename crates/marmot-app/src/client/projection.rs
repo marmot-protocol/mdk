@@ -1145,6 +1145,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::Hex(_) => "read_marker_failed:hex",
         AppError::MissingKeyPackage(_) => "read_marker_failed:missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "read_marker_failed:missing_member_inbox_route",
+        AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
         AppError::CreatedGroupProjectionUnavailable(_) => {
@@ -1245,6 +1246,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::AccountSetupKeyPackageRecoveryAvailable => {
             "read_marker_failed:account_setup_key_package_recovery_available"
         }
+        AppError::AttachmentModeRequired => "read_marker_failed:attachment_mode_required",
+        AppError::AttachmentAccountSignedOut => "read_marker_failed:attachment_account_signed_out",
         AppError::RuntimeStopping => "read_marker_failed:runtime_stopping",
         AppError::ReactionNotFound => "read_marker_failed:reaction_not_found",
         AppError::TransportClosed => "read_marker_failed:transport_closed",

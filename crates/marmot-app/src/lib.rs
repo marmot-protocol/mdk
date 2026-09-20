@@ -157,10 +157,11 @@ pub use runtime::{
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
 pub use storage_sqlite::{
-    ChatPinState, ChatPresentationVersion, ConversationOpenError, ConversationPresentation,
+    CHAT_LIST_DRAFT_PREVIEW_CHARS, ChatListDraftPreview, ChatListRowActions, ChatPinState,
+    ChatPresentationVersion, ConversationOpenError, ConversationPresentation,
     PresentationResolution, PresentationSource, PresentationText, PresentedChatListSnapshot,
-    PresentedChatRow, SelectedAvatar, TimelineMessageChange, TimelineRemoveReason,
-    TimelineUpdateTrigger,
+    PresentedChatRow, SelectedAvatar, SelectedChatPreview, TimelineMessageChange,
+    TimelineRemoveReason, TimelineUpdateTrigger,
 };
 
 pub use agent_streams::{
@@ -182,9 +183,10 @@ pub(crate) use client::{
     ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
 };
 pub use config::{
-    AttachmentAcquisitionPolicy, AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence,
-    MarmotAppConfig, MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
+    AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
+    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings,
 };
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
@@ -6269,10 +6271,24 @@ impl MarmotApp {
                 .all(|component_id| metadata.app_components.contains(component_id))
     }
 
-    fn new_nostr_routing(&self) -> Result<NostrRoutingV1, AppError> {
+    fn new_nostr_routing(&self, relays: Option<Vec<String>>) -> Result<NostrRoutingV1, AppError> {
         let mut nostr_group_id = [0_u8; 32];
         OsRng.fill_bytes(&mut nostr_group_id);
-        let relays = self.relay_urls.clone();
+        let relays = relay_plane::RelaySafetyPolicy::with_allow_loopback(
+            self.config.allow_loopback_relay_endpoints,
+        )
+        .sanitize_endpoints(
+            relays
+                .unwrap_or_else(|| self.relay_urls.clone())
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect(),
+            "group create",
+        )
+        .map_err(AppError::InvalidNostrRouting)?
+        .into_iter()
+        .map(|endpoint| endpoint.0)
+        .collect();
         NostrRoutingV1::new(nostr_group_id, relays).map_err(AppError::InvalidNostrRouting)
     }
 }
@@ -6893,9 +6909,10 @@ pub use storage_sqlite::{
 pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};
 
 pub use runtime::{
-    AttachmentAssetRef, AttachmentCategory, AttachmentControl, AttachmentDownloadPolicy,
-    AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion, AttachmentLocalTarget,
-    AttachmentPage, AttachmentPageRead, AttachmentTransferState, AttachmentTransferStatus,
-    MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
-    RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
+    AttachmentAssetRef, AttachmentAutomaticPermission, AttachmentCategory, AttachmentControl,
+    AttachmentDownloadPolicy, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
+    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentTransferState,
+    AttachmentTransferStatus, AutomaticAttachmentRequest, MAX_ATTACHMENT_ASSET_LOOKUPS,
+    MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
+    RuntimeAttachmentTransferSubscription,
 };

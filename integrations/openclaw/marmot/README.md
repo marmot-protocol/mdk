@@ -92,7 +92,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.2"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.3"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256"
 ```
@@ -112,7 +112,7 @@ an `npub` or raw hex public key:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.2"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.3"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
@@ -126,7 +126,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.2"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.3"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256" \
   --yes \
@@ -412,9 +412,13 @@ for any plugin or tenant that is not in the same trust boundary.
 - **Native reply and ambient context**: reply hydration maps to
   `supplemental.quote`; quoted attachment summaries and buffered
   `message_edited`, `message_deleted`, `reaction_added`, `reaction_removed`, and
-  group-state facts map to structured `supplemental.untrustedContext`. Ambient
-  facts are isolated per account/group and attached only to the next triggering
-  user turn; they never start a turn and never enter a system prompt.
+  group-state facts map to structured `supplemental.untrustedContext`. Mutation
+  actors are checked against the same inbound sender ACL before buffering;
+  unauthorized edits, deletions, and reactions are denied without entering
+  ambient context. Group-state facts still carry no member pubkey and remain
+  non-triggering untrusted context. Ambient facts are isolated per
+  account/group and attached only to the next triggering user turn; they never
+  start a turn and never enter a system prompt.
 - **Media**: inbound — an `inbound_message.message` carries non-secret `media` refs
   (the `imeta` mirror); on dispatch the connector calls `download_media` to get
   a host-local decrypted path and passes it to the turn as an OpenClaw

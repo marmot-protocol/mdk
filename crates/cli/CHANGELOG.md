@@ -23,7 +23,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   Authorized inbound finals now require the host delivery-queue identity so
   a successful turn is an acknowledged `send_final`. Packaged sender-policy
   acceptance goes through that production delivery callback rather than a
-  fabricated outbound send.
+  fabricated outbound send. Authenticated mutation events
+  (edits, deletions, and reactions) are authorized before they are buffered
+  as ambient context; unauthorized mutations are denied without buffering.
+
+## [0.10.3] - 2026-09-19
+
+Update generated bindings, native libraries, and C headers together for the changed prepared-row layout. Storage remains at migration 86. See [release notes](../../docs/release/0.10.3.md) and the [client upgrade guide](../../docs/integration/0.10.3.md).
+
+### Added
+
+- Prepared chat rows now select draft/message/invitation/empty previews, include bounded draft text and attachment summaries, and expose advisory list actions. Both live list APIs refresh after draft changes without changing activity order or unread state. Rust, Swift/Kotlin and C share the contract; regenerate bindings and ship matching native libraries/headers.
 
 - Hermes Marmot installation doctor: `install-hermes-marmot.sh --doctor [--json]` reports provenance-labelled
   installation, service, connector, and plugin observations without installing, repairing, or probing delivery.
@@ -31,6 +41,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   a private diagnostics socket.
 
 ### Fixed
+
+- C client teardown on ordinary host threads drains runtime workers before returning,
+  preventing a SQLCipher process-exit race after publisher shutdown.
+
+- Public profile searches continue when relays request optional authentication.
+- Android identity salt publication uses a locked, no-replace path compatible with API 26; concurrent creators retain one canonical salt.
 
 - Hermes doctor distinguishes failed, stopped, and automatically restarting systemd units, keeps socket-check ownership stable,
   and removes the always-ready media check and inline-token command-line option. Diagnostic replay and
@@ -2600,7 +2616,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.10.3...HEAD
+[0.10.3]: https://github.com/marmot-protocol/mdk/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/marmot-protocol/mdk/compare/v0.10.1...v0.10.2
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/v0.9.19...v0.9.20
 [0.9.19]: https://github.com/marmot-protocol/mdk/compare/v0.9.18...v0.9.19

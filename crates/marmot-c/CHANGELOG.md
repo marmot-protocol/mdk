@@ -7,6 +7,32 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Host-managed attachment acquisition mode on `MarmotClientOptions`, generation-fenced
+  permission and automatic-request commands, and acquired-unavailable/completed-unretained/
+  retry-exhausted states. This changes the options layout: recompile with matching
+  generated headers and libraries. See the [attachment migration](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased). ([#1939](https://github.com/marmot-protocol/mdk/pull/1939))
+
+### Fixed
+
+- Expose distinct attachment-mode and signed-out-account status codes with the matching regenerated header. ([#1939](https://github.com/marmot-protocol/mdk/pull/1939))
+
+- 0.10.3 release preflight: ordinary host-thread client free waits for embedded
+  runtime workers to release resources, preventing pending SQLCipher connection
+  destructors from racing process-exit cleanup. Tokio-context free remains
+  nonblocking to avoid deadlock; final process teardown belongs on a host thread.
+
+### Added
+
+- `MarmotChatListMessagePreview` exposes optional per-message `retention_seconds`
+  and `retention_expires_at` so hosts can hide expired previews before pruning.
+  This changes record layout: rebuild with matching headers and libraries. See
+  [preview expiry handling](../marmot-uniffi/CHAT-LIST-ROWS.md#disappearing-message-previews-unreleased).
+  ([#1942](https://github.com/marmot-protocol/mdk/pull/1942))
+
+- `MarmotPresentedChatRow` gains selected draft/message/invitation/empty preview and row-action records. Draft text is owned and deep-freed with the row. This changes record layout: regenerate and recompile with matching headers/libraries. See [C3 integration](../marmot-uniffi/CHAT-LIST-ROWS.md).
+
 ### Documentation
 
 - Clarify that retry safety for invalid required out-pointers does not cover all errors:

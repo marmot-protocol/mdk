@@ -128,7 +128,11 @@ impl SqliteAccountStorage {
                 if let Some(bytes) = bytes {
                     let presentation = crate::chat_presentation::decode_retained(&bytes, dirty)?.presentation;
                     let avatar_asset = crate::avatar_cache::access::target_presentation(conn, &row.group_id_hex, None, &presentation.avatar, crate::codec::unix_now_seconds())?;
-                    rows.push(PresentedChatRow { row: row.clone(), presentation, avatar_asset });
+                    rows.push(PresentedChatRow {
+                        preview: crate::chat_presentation::row_contract::selected_preview_tx(conn, row)?,
+                        actions: crate::ChatListRowActions::for_row(row),
+                        row: row.clone(), presentation, avatar_asset
+                    });
                 } else {
                     pending_presentations.push(row.group_id_hex.clone());
                 }

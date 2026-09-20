@@ -15,6 +15,15 @@ async fn draft_send_acceptance_is_durable_before_relay_io_and_survives_cancellat
     app.save_message_draft("alice", &hex, "send this", None, vec![])
         .unwrap();
     let selected = app.selected_message_draft("alice", &hex).unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut window = runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(5))
+        .await
+        .unwrap();
+    assert!(matches!(
+        window.snapshot.rows[0].preview,
+        SelectedChatPreview::Draft(_)
+    ));
     let mut changes = app.subscribe_message_draft_changes();
     relay.block_next_publish();
     let mut sending =
@@ -35,6 +44,16 @@ async fn draft_send_acceptance_is_durable_before_relay_io_and_survives_cancellat
         .expect("acceptance must notify before relay I/O completes");
     assert_eq!(update.account_label, "alice");
     assert_eq!(update.group_id_hex, hex);
+    let accepted = tokio::time::timeout(Duration::from_secs(5), window.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!matches!(
+        accepted.rows[0].preview,
+        SelectedChatPreview::Draft(_)
+    ));
+
     app.save_message_draft("alice", &hex, "new composer", None, vec![])
         .unwrap();
     let newer = app.selected_message_draft("alice", &hex).unwrap();
@@ -43,12 +62,22 @@ async fn draft_send_acceptance_is_durable_before_relay_io_and_survives_cancellat
         app.selected_message_draft("alice", &hex).unwrap().revision,
         newer.revision
     );
+    let edited = tokio::time::timeout(Duration::from_secs(5), window.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&edited.rows[0].preview, SelectedChatPreview::Draft(d) if d.text == "new composer")
+    );
     relay.release_publish();
     client.retry_group_convergence(&group).await.unwrap();
     assert_eq!(
         app.selected_message_draft("alice", &hex).unwrap().revision,
         newer.revision
     );
+    drop(client);
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test]

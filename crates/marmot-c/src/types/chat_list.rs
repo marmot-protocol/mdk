@@ -115,6 +115,8 @@ c_mirror! {
         rec content_tokens: MarmotMarkdownDocument,
         copy kind: u64,
         copy timeline_at: u64,
+        opt_copy has_retention_seconds/retention_seconds: u64,
+        opt_copy has_retention_expires_at/retention_expires_at: u64,
         copy deleted: bool,
         copy deletion_source: MarmotDeletionSource,
         opt_copy has_attachment_kind/attachment_kind: MarmotChatListAttachmentKind,
@@ -268,6 +270,54 @@ mod tests {
     use crate::memory::boxed;
 
     #[test]
+    fn chat_preview_retention_preserves_optional_values_and_deep_frees() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        for (retention_seconds, retention_expires_at) in [
+            (None, None),
+            (Some(0), None),
+            (Some(300), Some(310)),
+            (Some(300), None),
+        ] {
+            let mut mirror: MarmotChatListMessagePreview = ChatListMessagePreviewFfi {
+                group_system: None,
+                message_id_hex: "message".to_owned(),
+                sender: "sender".to_owned(),
+                sender_display_name: None,
+                plaintext: "hello".to_owned(),
+                content_tokens: marmot_uniffi::MarkdownDocumentFfi::default(),
+                kind: 9,
+                timeline_at: 999,
+                retention_seconds,
+                retention_expires_at,
+                deleted: false,
+                deletion_source: Default::default(),
+                attachment_kind: None,
+                attachment_count: 0,
+                delivery_state: ChatListMessageDeliveryStateFfi::NotApplicable,
+            }
+            .into();
+            assert_eq!(mirror.has_retention_seconds, retention_seconds.is_some());
+            assert_eq!(
+                mirror.retention_seconds,
+                retention_seconds.unwrap_or_default()
+            );
+            assert_eq!(
+                mirror.has_retention_expires_at,
+                retention_expires_at.is_some()
+            );
+            assert_eq!(
+                mirror.retention_expires_at,
+                retention_expires_at.unwrap_or_default()
+            );
+            unsafe { mirror.free_in_place() };
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    #[test]
     fn system_preview_deep_free_preserves_provenance_and_subject() {
         use marmot_uniffi::MarkdownDocumentFfi;
         use marmot_uniffi::conversions::{GroupSystemEventFfi, GroupSystemEventProvenanceFfi};
@@ -295,6 +345,8 @@ mod tests {
             content_tokens: MarkdownDocumentFfi::default(),
             kind: 1210,
             timeline_at: 50,
+            retention_seconds: None,
+            retention_expires_at: None,
             deleted: false,
             deletion_source: Default::default(),
             attachment_kind: None,

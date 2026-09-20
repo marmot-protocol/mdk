@@ -374,6 +374,7 @@ pub(crate) async fn groups_command_with_runtime(
                         description: description.unwrap_or_default(),
                         initial_image,
                         disappearing_message_secs,
+                        relays: None,
                     },
                 )
                 .await?;

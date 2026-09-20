@@ -1090,8 +1090,18 @@ async fn stale_standalone_proposal_never_schedules_or_reenters_pending_state() {
     assert!(alice.drain_auto_publish().is_empty());
 }
 
-#[tokio::test]
-async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
+/// Carol has settled alice's epoch-1 branch and retained its anchor; bob's
+/// competing commit is withheld, and eve — a member only bob's branch knows —
+/// has authored a `Leave` proposal. Carol therefore cannot authenticate that
+/// proposal's sender until the competing parent arrives, which is the
+/// parent-dependent shape both tests below need.
+async fn carol_holding_a_parent_dependent_fork_proposal() -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    TransportMessage,
+    TransportMessage,
+) {
     let (mut alice, _alice_storage) = build_with_storage(b"alice-parent-dependent");
     let (mut bob, _bob_storage) = build_with_storage(b"bob-parent-dependent");
     let (mut carol, carol_storage) = build_with_storage(b"carol-parent-dependent");
@@ -1189,6 +1199,13 @@ async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
         SendResult::Proposal { msg } => msg,
         other => panic!("expected Proposal, got {other:?}"),
     };
+    (carol, carol_storage, group_id, fork_proposal, bob_commit)
+}
+
+#[tokio::test]
+async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
+    let (mut carol, carol_storage, group_id, fork_proposal, bob_commit) =
+        carol_holding_a_parent_dependent_fork_proposal().await;
     let proposal_message_id = MessageId::new(sha2::Sha256::digest(&fork_proposal.payload).to_vec());
     let proposal_id = canonicalization_message_id(&fork_proposal);
 
@@ -1226,6 +1243,66 @@ async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
             .state,
         MessageState::Failed
     );
+}
+
+/// The same seam, reached through the retry lifecycle. It reports `Buffered`,
+/// and a `Buffered` outcome is never the caller's to retire (AGENTS.md), so if
+/// ingest does not retire the wrapper here then nothing does: the row would be
+/// re-peeled on every later publish-cycle replay while still holding whatever
+/// retry budget its lifecycle charges.
+#[tokio::test]
+async fn a_retained_wrapper_is_retired_when_its_proposal_waits_for_its_fork_parent() {
+    let (mut carol, carol_storage, group_id, fork_proposal, _bob_commit) =
+        carol_holding_a_parent_dependent_fork_proposal().await;
+
+    // Re-wrapped under a distinct transport id: wrapper and content are then
+    // two rows, which is the only shape that has a wrapper to retire at all.
+    let wrapper = TransportMessage {
+        id: MessageId::new(b"parent-dependent-wrapper".to_vec()),
+        ..fork_proposal
+    };
+    assert_ne!(
+        wrapper.id,
+        MessageId::new(sha2::Sha256::digest(&wrapper.payload).to_vec()),
+        "the wrapper must not collapse onto its own content id"
+    );
+
+    // A staged publish halts ingest, so the wrapper is retained for replay
+    // instead of peeling now.
+    let pending = match carol
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .expect("self-update stages")
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    assert!(matches!(
+        carol.ingest(wrapper.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    assert_eq!(
+        carol_storage.get_message(&wrapper.id).unwrap().state,
+        MessageState::Retryable
+    );
+
+    // The replay peels the retained row, fails sender authentication on the
+    // still-missing fork parent, and hands the content to the pass.
+    carol.publish_failed(pending).await.unwrap();
+
+    assert_eq!(
+        carol_storage.get_message(&wrapper.id).unwrap().state,
+        MessageState::Processed,
+        "the seam that buffers the proposal owns retiring its wrapper"
+    );
+    assert!(matches!(
+        carol.ingest(wrapper).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::Duplicate
+        }
+    ));
 }
 
 #[tokio::test]

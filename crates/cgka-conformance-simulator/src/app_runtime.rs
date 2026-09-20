@@ -2507,9 +2507,10 @@ fn app_error(error: AppError) -> SubjectError {
         );
     }
     let category = match error {
-        AppError::UserBlocked | AppError::MessageDraftRevisionConflict => {
-            SubjectFailureCategory::ExpectedRefusal
-        }
+        AppError::UserBlocked
+        | AppError::MessageDraftRevisionConflict
+        | AppError::AttachmentModeRequired
+        | AppError::AttachmentAccountSignedOut => SubjectFailureCategory::ExpectedRefusal,
         AppError::RuntimeBusy
         | AppError::AccountSessionBusy
         | AppError::AccountWorkerBusy
@@ -2561,6 +2562,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::MissingMemberInboxRoute(_)
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending
+        | AppError::GroupCreateIncludesCreator
         | AppError::GroupDisbanding(_)
         | AppError::GroupRemoved(_)
         | AppError::AgentStreamPublisher(_)

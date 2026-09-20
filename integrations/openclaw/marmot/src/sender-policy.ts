@@ -410,3 +410,14 @@ export function senderAuthorizationInputFromMessage(message: {
     sender: message.sender,
   };
 }
+
+export function senderAuthorizationInputFromActor(event: {
+  account_id_hex: unknown;
+  actor?: SenderAuthorizationInput["sender"];
+}): SenderAuthorizationInput {
+  return {
+    receivingAccountIdHex: event.account_id_hex,
+    mappedSenderAccountIdHex: event.actor?.account_id_hex,
+    sender: event.actor,
+  };
+}

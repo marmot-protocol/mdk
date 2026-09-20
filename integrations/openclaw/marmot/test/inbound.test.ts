@@ -351,6 +351,86 @@ describe("MarmotInboundBridge", () => {
     expect(denied).toEqual(["missing_authorizer"]);
   });
 
+  it("denies an unlisted mutation actor without buffering ambient context", async () => {
+    const deletion: AgentControlEvent = {
+      type: "message_deleted",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      event_id_hex: HEX32("e8"),
+      target_message_id_hex: HEX32("d8"),
+      actor: { account_id_hex: HEX32("99"), display_name: null, is_self: false },
+      recorded_at: 125,
+      target: {
+        message_id_hex: HEX32("d8"),
+        availability: "deleted",
+        text_truncated: false,
+        attachments_truncated: false,
+      },
+    };
+    const denied: string[] = [];
+    const ambient: string[] = [];
+    const controller = new AbortController();
+    const client = {
+      async *subscribeInbound(): AsyncGenerator<AgentControlEvent> {
+        yield deletion;
+        yield deletion;
+        controller.abort();
+      },
+    } as unknown as InboundSubscribeClient;
+    const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
+      reconnectDelayMs: 1,
+      onDenied: (reason) => denied.push(reason),
+      onMessage: () => {},
+      onAmbientEvent: (event) => {
+        ambient.push(event.type);
+      },
+    });
+
+    await bridge.run(controller.signal);
+    expect(ambient).toEqual([]);
+    expect(denied).toEqual(["sender_not_allowed"]);
+  });
+
+  it("denies a mutation when the authorizer is missing without buffering", async () => {
+    const edited: AgentControlEvent = {
+      type: "message_edited",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      event_id_hex: HEX32("e7"),
+      target_message_id_hex: HEX32("d7"),
+      actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      replacement_text: "edited",
+      recorded_at: 126,
+      target: {
+        message_id_hex: HEX32("d7"),
+        availability: "available",
+        text_truncated: false,
+        attachments_truncated: false,
+      },
+    };
+    const denied: string[] = [];
+    let ambient = 0;
+    const controller = new AbortController();
+    const { client } = makeClient([edited]);
+    const bridge = new MarmotInboundBridge(client, {
+      reconnectDelayMs: 1,
+      onDenied: (reason) => denied.push(reason),
+      onMessage: () => {},
+      onAmbientEvent: () => {
+        ambient += 1;
+        controller.abort();
+      },
+    });
+
+    const run = bridge.run(controller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    await run;
+    expect(ambient).toBe(0);
+    expect(denied).toEqual(["missing_authorizer"]);
+  });
+
   it("denies an unlisted sender without calling onMessage", async () => {
     const id = HEX32("ef");
     const denied: string[] = [];

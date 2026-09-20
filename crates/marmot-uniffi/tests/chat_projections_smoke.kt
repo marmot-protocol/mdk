@@ -1,6 +1,22 @@
 package dev.ipf.marmotkit
 
 fun main() {
+    val options = MarmotOptions(attachmentAcquisitionMode = AttachmentAcquisitionModeFfi.HOST_MANAGED)
+    check(FfiConverterTypeMarmotOptions.lift(FfiConverterTypeMarmotOptions.lower(options)) == options)
+    val permission = AttachmentAutomaticPermissionFfi(false, true, false, true)
+    check(FfiConverterTypeAttachmentAutomaticPermissionFfi.lift(FfiConverterTypeAttachmentAutomaticPermissionFfi.lower(permission)) == permission)
+    for (state in listOf(AttachmentTransferStateFfi.PREVIOUSLY_ACQUIRED_UNAVAILABLE, AttachmentTransferStateFfi.COMPLETED_UNRETAINED, AttachmentTransferStateFfi.RETRY_EXHAUSTED)) {
+        val request = AutomaticAttachmentRequestFfi(AttachmentTransferStatusFfi("opaque", state, 4uL, 0uL, null, null), false)
+        check(FfiConverterTypeAutomaticAttachmentRequestFfi.lift(FfiConverterTypeAutomaticAttachmentRequestFfi.lower(request)) == request)
+    }
+
+    for (preview in listOf(SelectedChatPreviewFfi.Draft(ChatListDraftPreviewFfi("draft 🦀", true, 2u, ChatListAttachmentKindFfi.MIXED)), SelectedChatPreviewFfi.Message, SelectedChatPreviewFfi.Invitation, SelectedChatPreviewFfi.Empty)) {
+        val copy = FfiConverterTypeSelectedChatPreviewFfi.lift(FfiConverterTypeSelectedChatPreviewFfi.lower(preview))
+        check(copy == preview)
+    }
+    val rowActions = ChatListRowActionsFfi(true, false, true, false, true, false, true, false, true, false)
+    check(FfiConverterTypeChatListRowActionsFfi.lift(FfiConverterTypeChatListRowActionsFfi.lower(rowActions)) == rowActions)
+
     val transfer = AttachmentTransferStatusFfi("job", AttachmentTransferStateFfi.VERIFYING_PLAINTEXT, ULong.MAX_VALUE, 17uL, null, 42uL)
     val transferFrame = AttachmentTransferSnapshotFfi(listOf(transfer))
     check(FfiConverterTypeAttachmentTransferSnapshotFfi.lift(FfiConverterTypeAttachmentTransferSnapshotFfi.lower(transferFrame)) == transferFrame)
@@ -31,12 +47,17 @@ fun main() {
     for (provenance in GroupSystemEventProvenanceFfi.entries) {
         val event = GroupSystemEventFfi(provenance, "Actor", "Subject", "member_added", "Member added", "actor", "subject", null, null, null, null)
         val preview = ChatListMessagePreviewFfi(event, "selected", "actor", null, "raw", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
-            1210u, 50u, false, DeletionSourceFfi.UNKNOWN, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
+            1210u, 50u, null, null, false, DeletionSourceFfi.UNKNOWN, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
         val copy = FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
         // Kotlin ByteArray equality is referential; compare the nested bytes by content.
         check(copy.contentTokens.blankLinesBefore.contentEquals(preview.contentTokens.blankLinesBefore))
         check(copy.contentTokens.blocks == preview.contentTokens.blocks && copy.contentTokens.truncated == preview.contentTokens.truncated)
         check(copy.copy(contentTokens = preview.contentTokens) == preview && copy.groupSystem?.provenance == provenance)
+        for ((seconds, expiry) in listOf<Pair<ULong?, ULong?>>(null to null, 0uL to null, 300uL to 350uL, 300uL to null)) {
+            val timed = preview.copy(retentionSeconds = seconds, retentionExpiresAt = expiry)
+            val timedCopy = FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(timed))
+            check(timedCopy.retentionSeconds == seconds && timedCopy.retentionExpiresAt == expiry)
+        }
     }
     for (source in DeletionSourceFfi.entries) {
         val preview = TimelineReplyPreviewFfi("deleted", "author", "", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
@@ -194,5 +215,14 @@ suspend fun compileAttachmentControls(marmot: Marmot, account: String, group: St
     marmot.subscribeAttachmentTransfers(account, group, listOf(target)).use { stream ->
         stream.next()
         stream.cancel()
+    }
+}
+
+suspend fun compileAutomaticAttachment(marmot: Marmot, account: String, group: String, target: AttachmentLocalTargetFfi) {
+    val generation = marmot.beginAttachmentPermissionUpdate(account)
+    val applied = marmot.setAttachmentAutomaticPermission(account, generation, AttachmentAutomaticPermissionFfi(true, false, false, true))
+    if (applied) {
+        val result = marmot.requestAutomaticAttachment(account, group, target)
+        check(!result.newlyQueued || result.status.state == AttachmentTransferStateFfi.QUEUED)
     }
 }

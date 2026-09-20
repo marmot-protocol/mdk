@@ -44,6 +44,8 @@ App runtime bridge for the first real Marmot app surfaces.
   `TimelineUpdateTrigger::CustomEvent` (never folding onto a target message like reactions/deletes) and are queryable
   by kind through `AppMessageQuery::kinds`.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
+  `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
+  before member resolution or group mutation, and preserve app-configured relays when omitted.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`, `avatar.rs` for downloaded avatar admission).
   `media/attachment_resume.rs` adapts attempt-fenced storage checkpoints to the shared safe HTTP path;

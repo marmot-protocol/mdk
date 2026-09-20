@@ -397,6 +397,8 @@ pub struct MarmotClientOptions {
     pub client_name: *const c_char,
     /// Optional callback store; NULL selects the platform keychain.
     pub store: *const MarmotSecretStore,
+    /// 0 = NativeAutomatic (default), 1 = HostManaged (initially denied).
+    pub attachment_acquisition_mode: u32,
 }
 
 /// Create a client with combined relay, cursor, label and secret-storage options.
@@ -420,6 +422,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
             return status;
         }
         let defaults = MarmotClientOptions {
+            attachment_acquisition_mode: 0,
             relay_policy: 0,
             cursor_persistence: 0,
             client_name: std::ptr::null(),
@@ -434,6 +437,12 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
                 set_last_error("invalid relay policy");
                 return MarmotStatus::InvalidArgument;
             }
+        };
+        let attachment_mode = match attachment_controls::MarmotAttachmentAcquisitionMode::from_c(
+            options.attachment_acquisition_mode,
+        ) {
+            Ok(mode) => mode.into(),
+            Err(status) => return status,
         };
         let store = options.store;
         let cursor = match MarmotCursorPersistence::from_c(options.cursor_persistence) {
@@ -462,6 +471,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
                         root,
                         relays,
                         marmot_uniffi::MarmotOptions {
+                            attachment_acquisition_mode: Some(attachment_mode),
                             relay_policy: Some(policy),
                             cursor_persistence: Some(cursor.into()),
                             client_name: name,
@@ -604,16 +614,28 @@ pub(crate) unsafe fn free_client(client: *mut MarmotClient) {
     #[cfg(feature = "alloc-audit")]
     memory::audit::on_free();
     let client = unsafe { Box::from_raw(client) };
-    // Dropping a tokio runtime from within one of its own worker threads
-    // aborts; the shutdown_background escape hatch keeps free safe to call
-    // from any thread (e.g. a callback thread, though callers shouldn't).
     let MarmotClient { runtime, marmot } = *client;
     drop(marmot);
-    runtime.shutdown_background();
+    shutdown_client_runtime(runtime);
+}
+
+fn shutdown_client_runtime(runtime: tokio::runtime::Runtime) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Joining from an async context can panic or deadlock on our own
+        // worker. Preserve the nonblocking escape hatch for that caller.
+        runtime.shutdown_background();
+    } else {
+        // Host-thread free is a teardown barrier. In particular, database
+        // destructors must finish before SQLCipher's process-exit cleanup.
+        drop(runtime);
+    }
 }
 
 /// Destroy a client handle. Call `marmot_client_shutdown` first for a
 /// graceful stop. NULL is a no-op. The handle must not be used afterwards.
+/// Ordinary host threads wait for runtime worker cleanup; calls from a Tokio
+/// context retain nonblocking cleanup. For final process teardown, release
+/// subscriptions and free the client on an ordinary host thread off the UI.
 ///
 /// # Safety
 /// `client` must be NULL or a live handle from `marmot_client_new` that
@@ -688,6 +710,64 @@ mod tests {
                 .expect("nested task must not panic")
         });
         assert_eq!(nested, 42);
+    }
+
+    #[test]
+    fn client_free_waits_for_worker_resource_destructors_on_host_threads() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct Resource {
+            dropping: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                let _ = self.dropping.send(());
+                let _ = self.release.recv();
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (dropping_tx, dropping_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        runtime.spawn(async move {
+            let _resource = Resource {
+                dropping: dropping_tx,
+                release: release_rx,
+            };
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let free_thread = std::thread::spawn(move || {
+            shutdown_client_runtime(runtime);
+            done_tx.send(()).unwrap();
+        });
+        dropping_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early_return = done_rx.recv_timeout(Duration::from_millis(100));
+        // Always release the destructor before asserting, including on the old
+        // background-shutdown implementation, so a failure cannot leak a worker.
+        release_tx.send(()).unwrap();
+        free_thread.join().unwrap();
+        assert_eq!(early_return, Err(mpsc::RecvTimeoutError::Timeout));
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn client_free_remains_safe_on_its_own_runtime_worker() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let handle = runtime.handle().clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        handle.spawn(async move {
+            shutdown_client_runtime(runtime);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
     }
 
     #[test]

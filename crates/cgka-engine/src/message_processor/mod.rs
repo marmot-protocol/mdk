@@ -2744,17 +2744,25 @@ impl<S: StorageProvider> Engine<S> {
                 // the catch-all arm below would retire the replay buffer.
                 Ok(false)
             }
-            Ok(Outcome(IngestOutcome::Buffered { .. } | IngestOutcome::Processed)) => {
-                // The peeled content now has its own content-derived record;
-                // retire the raw transport wrapper so it does not keep
-                // re-entering this retry loop as a stale duplicate — but ONLY
-                // while it is still awaiting retry. `record` is the pre-ingest
-                // sweep snapshot; ingest may have committed a terminal state to
-                // this same row during the call (or a convergence rollback may
-                // have deleted it). That ingest-committed verdict is
-                // authoritative, so re-read the row and retire only a state
-                // ingest left awaiting retry (seam parity with
-                // `replay_buffered_messages`, 5ae9a440).
+            Ok(Outcome(IngestOutcome::Buffered { .. })) => {
+                // Nothing to stamp: ingest owns wrapper retirement, and the one
+                // `Buffered` site that retires nothing parked a row nobody
+                // opened. See AGENTS.md, "a `Buffered` outcome never lets the
+                // caller retire the wrapper". Read the row once: its state says
+                // both whether the slot came back and whether this made progress.
+                let current = self.stored_message_state(&record.id)?;
+                self.release_cap_slot_if_row_left_peel_deferred(record, current);
+                Ok(!store::row_state_is_awaiting_retry(current))
+            }
+            Ok(Outcome(IngestOutcome::Processed)) => {
+                // Applied. A direct apply records the wrapper in the
+                // processed-transport-id set rather than restating its row, so
+                // that row still needs retiring here — but ONLY while it is
+                // still awaiting retry. `record` is the pre-ingest sweep
+                // snapshot; ingest may have committed a terminal state to this
+                // same row during the call (or a convergence rollback may have
+                // deleted it), and that verdict is authoritative (seam parity
+                // with `replay_buffered_messages`, 5ae9a440).
                 if self.raw_transport_row_awaiting_retry(&record.id)? {
                     self.update_stored_message_state(&record.id, MessageState::Processed)?;
                 }
@@ -3312,6 +3320,25 @@ impl<S: StorageProvider> Engine<S> {
         self.note_peel_deferred_row_retired_by_id(&record.group_id, &record.id);
     }
 
+    /// Release the flood-cap slot of a row that has left `PeelDeferred`, given
+    /// its state before re-ingest and `current` after.
+    ///
+    /// The slot belongs to the STATE, not to whoever stamped it. On the direct
+    /// path (wrapper and content share one id) a content row replaces a
+    /// `PeelDeferred` raw row under that id without going through
+    /// [`Self::retire_raw_wrapper`], so keying the release on the transition is
+    /// the only way it fires for both shapes.
+    fn release_cap_slot_if_row_left_peel_deferred(
+        &mut self,
+        record: &MessageRecord,
+        current: Option<MessageState>,
+    ) {
+        if record.state == MessageState::PeelDeferred && current != Some(MessageState::PeelDeferred)
+        {
+            self.note_peel_deferred_row_retired(record);
+        }
+    }
+
     /// [`Self::note_peel_deferred_row_retired`] keyed by the only two fields
     /// it reads, for callers holding metadata rather than a whole record (the
     /// payload bytes come from `deferred_payload_bytes_by_id`, not the row).
@@ -3547,26 +3574,9 @@ impl<S: StorageProvider> Engine<S> {
                 .ingest_group_message(&msg, group_id.as_slice().to_vec())
                 .await
             {
-                Ok(IngestOutcome::Buffered { .. }) => {
-                    if was_peel_deferred {
-                        // The content-derived row is now the buffered
-                        // convergence witness; retire the raw deferred wrapper
-                        // so it leaves the retry lifecycle and frees its cap
-                        // slot (mdk#339), mirroring `retry_deferred_peels`.
-                        self.update_stored_message_state(&record.id, MessageState::Processed)?;
-                        self.note_peel_deferred_row_retired(&record);
-                    } else if self.raw_transport_row_awaiting_retry(&record.id)? {
-                        // Keep the row replayable ONLY while ingest itself did
-                        // not already resolve it. A peeled message buffered
-                        // into convergence retires its own raw wrapper
-                        // (`mark_raw_transport_message_processed_if_awaiting_retry`)
-                        // — resetting it Retryable here would re-peel it on
-                        // every later publish-cycle replay.
-                        self.update_stored_message_state(&record.id, MessageState::Retryable)?;
-                    }
-                }
                 Ok(
-                    IngestOutcome::TransportDeferred { .. }
+                    IngestOutcome::Buffered { .. }
+                    | IngestOutcome::TransportDeferred { .. }
                     | IngestOutcome::LocalState {
                         state: LocalIngestState::Quarantined,
                     }
@@ -3574,9 +3584,14 @@ impl<S: StorageProvider> Engine<S> {
                         category: InputRejectionCategory::UnknownGroup,
                     },
                 ) => {
-                    // Leave the row in its retry state so a later pass re-attempts
-                    // it. `TransportDeferred`: still un-peelable.
-                    // A terminal-after-peel path inside `ingest_group_message`
+                    // Leave the row in its retry state so a later pass
+                    // re-attempts it.
+                    //
+                    // `Buffered`: not the caller's to retire — see AGENTS.md,
+                    // "a `Buffered` outcome never lets the caller retire the
+                    // wrapper". `TransportDeferred`: still un-peelable, or a
+                    // terminal-after-peel path inside `ingest_group_message`
+                    // already settled the row
                     // (`mark_raw_transport_message_failed_if_awaiting_retry`,
                     // `PeelDeferred`/`Retryable` alike). `Quarantined`: the group
                     // is frozen; the row replays once repair clears it.
@@ -3584,6 +3599,13 @@ impl<S: StorageProvider> Engine<S> {
                     // deliberately re-buffered the row `Retryable` because a later
                     // welcome may create the group, so terminalizing it here would
                     // drop a recoverable message.
+                    //
+                    // The cap slot is the one thing this arm still owes: a row
+                    // that left `PeelDeferred` without going through
+                    // `retire_raw_wrapper` (the direct path, where wrapper and
+                    // content share an id) has no other release site.
+                    let current = self.stored_message_state(&record.id)?;
+                    self.release_cap_slot_if_row_left_peel_deferred(&record, current);
                 }
                 Ok(IngestOutcome::LocalState {
                     state: LocalIngestState::Removed,

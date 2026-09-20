@@ -284,6 +284,15 @@ pub struct ChatListMessagePreview {
     pub plaintext: String,
     pub kind: u64,
     pub timeline_at: u64,
+    /// This message's pinned source-epoch retention. `None` is unknown (safe
+    /// retain); `Some(0)` means retention was explicitly disabled.
+    #[serde(default)]
+    pub retention_seconds: Option<u64>,
+    /// Exact pinned expiration in Unix seconds. Hosts may hide the preview at
+    /// this deadline. `None` means no finite expiry, including overflow; never
+    /// derive a deadline from the current group policy or `timeline_at`.
+    #[serde(default)]
+    pub retention_expires_at: Option<u64>,
     pub deleted: bool,
     #[serde(default)]
     pub deletion_source: crate::DeletionSource,
@@ -2158,8 +2167,12 @@ fn latest_chat_list_activity_tx(
                 preview.media_json, preview.direction,
                 preview.source_message_id_hex, preview.invalidation_status,
                 preview.timeline_order_class, preview.timeline_order_primary,
-                preview.timeline_order_phase, preview.timeline_order_at, preview.deletion_source
+                preview.timeline_order_phase, preview.timeline_order_at, preview.deletion_source,
+                source.retention_seconds, source.retention_expires_at
          FROM message_timeline AS preview NOT INDEXED
+         LEFT JOIN app_events AS source
+           ON source.group_id_hex = preview.group_id_hex
+          AND source.message_id_hex = preview.message_id_hex
          WHERE preview.group_id_hex = ?1 AND {activity_filter}
            AND {preview_eligibility}
            AND (
@@ -2254,6 +2267,12 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
         timeline_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
+        retention_seconds: row
+            .get::<_, Option<i64>>("retention_seconds")?
+            .and_then(|value| value.try_into().ok()),
+        retention_expires_at: row
+            .get::<_, Option<i64>>("retention_expires_at")?
+            .and_then(|value| value.try_into().ok()),
         deleted: row.get::<_, i64>(5)? != 0,
         deletion_source: crate::DeletionSource::from_storage(&row.get::<_, String>(14)?),
         attachment_kind: None,
@@ -2403,6 +2422,9 @@ fn direct_conversation_candidate_sql() -> String {
         "{CHAT_LIST_ROW_SELECT_LIST} {CHAT_PIN_POSITION_SQL} AS pinned_position
          FROM direct_conversation_members AS dcm
          JOIN chat_list_rows AS row ON row.group_id_hex = dcm.group_id_hex
+         LEFT JOIN app_events AS preview_source
+            ON preview_source.group_id_hex = row.group_id_hex
+           AND preview_source.message_id_hex = row.last_message_id_hex
          LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
          LEFT JOIN chat_notification_settings AS mute
             ON mute.group_id_hex = row.group_id_hex
@@ -2516,7 +2538,8 @@ macro_rules! chat_list_columns {
                 AND system_source.plaintext = row.last_message_preview
                 AND system_source.recorded_at = row.last_message_timeline_at
             ) ELSE 0 END AS authenticated_group_system,
-            row.last_message_deletion_source AS deletion_source,"
+            row.last_message_deletion_source AS deletion_source,
+            preview_source.retention_seconds, preview_source.retention_expires_at,"
         )
     };
 }
@@ -2543,6 +2566,9 @@ const CHAT_PIN_POSITION_SQL: &str = "CASE WHEN pin.ordinal IS NULL THEN NULL ELS
             ) END";
 
 const CHAT_LIST_ROW_JOINS: &str = "FROM visible_chat_list_rows AS row
+     LEFT JOIN app_events AS preview_source
+        ON preview_source.group_id_hex = row.group_id_hex
+       AND preview_source.message_id_hex = row.last_message_id_hex
      LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
      LEFT JOIN chat_notification_settings AS mute
         ON mute.group_id_hex = row.group_id_hex";
@@ -2575,7 +2601,15 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     );
     let deletion_source =
         crate::DeletionSource::from_storage(row.get_ref("deletion_source")?.as_str()?);
+    let retention_seconds = row
+        .get::<_, Option<i64>>("retention_seconds")?
+        .and_then(|value| value.try_into().ok());
+    let retention_expires_at = row
+        .get::<_, Option<i64>>("retention_expires_at")?
+        .and_then(|value| value.try_into().ok());
     let last_message = last_message_id_hex.map(|message_id_hex| ChatListMessagePreview {
+        retention_seconds,
+        retention_expires_at,
         group_system,
         message_id_hex,
         sender: row.get(12).unwrap_or_default(),

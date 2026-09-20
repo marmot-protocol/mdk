@@ -61,6 +61,9 @@ pub enum AppError {
     /// presentation, while Display remains identity-free for safe diagnostics.
     #[error("member has no valid Marmot inbox relay")]
     MissingMemberInboxRoute(String),
+    /// The creator is already an MLS member and cannot be added again.
+    #[error("group members must not include the creator")]
+    GroupCreateIncludesCreator,
     #[error("unknown local group")]
     UnknownGroup(String),
     /// Invite acceptance requires a current, non-terminal membership projection
@@ -282,6 +285,12 @@ pub enum AppError {
     AccountSetupResetNotApplicable,
     #[error("recoverable KeyPackage setup state exists; retry instead of resetting")]
     AccountSetupKeyPackageRecoveryAvailable,
+    /// Automatic permission APIs require the opt-in host-managed configuration.
+    #[error("host-managed attachment mode required")]
+    AttachmentModeRequired,
+    /// Signed-out accounts cannot grant automatic network permission.
+    #[error("automatic attachment approval requires a signed-in account")]
+    AttachmentAccountSignedOut,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     #[error("no matching reaction by this account to retract")]
@@ -332,6 +341,7 @@ impl AppError {
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
+            Self::GroupCreateIncludesCreator => "group_create_includes_creator",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
@@ -405,6 +415,8 @@ impl AppError {
             Self::AccountSetupKeyPackageRecoveryAvailable => {
                 "account_setup_key_package_recovery_available"
             }
+            Self::AttachmentModeRequired => "attachment_mode_required",
+            Self::AttachmentAccountSignedOut => "attachment_account_signed_out",
             Self::RuntimeStopping => "runtime_stopping",
             Self::ReactionNotFound => "reaction_not_found",
             Self::TransportClosed => "transport_closed",

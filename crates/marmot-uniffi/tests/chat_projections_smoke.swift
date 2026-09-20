@@ -3,6 +3,14 @@ import Foundation
 @main
 struct ChatProjectionsSmoke {
     static func main() throws {
+        for preview in [SelectedChatPreviewFfi.draft(draft: ChatListDraftPreviewFfi(text: "draft 🦀", textTruncated: true, attachmentCount: 2, attachmentKind: .mixed)), .message, .invitation, .empty] {
+            let copy = try FfiConverterTypeSelectedChatPreviewFfi.lift(FfiConverterTypeSelectedChatPreviewFfi.lower(preview))
+            precondition(copy == preview)
+        }
+        let rowActions = ChatListRowActionsFfi(canMarkRead: true, canMarkUnread: false, canPin: true, canUnpin: false, canMute: true, canUnmute: false, canArchive: true, canRestore: false, canStartLeave: true, canDeleteLocal: false)
+        let rowActionsCopy = try FfiConverterTypeChatListRowActionsFfi.lift(FfiConverterTypeChatListRowActionsFfi.lower(rowActions))
+        precondition(rowActionsCopy == rowActions)
+
         let transfer = AttachmentTransferStatusFfi(reference: "job", state: .verifyingPlaintext, attempt: UInt64.max, received: 17, total: nil, retryAt: 42)
         let transferFrame = AttachmentTransferSnapshotFfi(items: [transfer])
         let transferCopy = try FfiConverterTypeAttachmentTransferSnapshotFfi.lift(FfiConverterTypeAttachmentTransferSnapshotFfi.lower(transferFrame))
@@ -43,10 +51,19 @@ struct ChatProjectionsSmoke {
                 systemType: "member_added", text: "Member added", actorAccountIdHex: "actor", subjectAccountIdHex: "subject",
                 name: nil, oldName: nil, oldRetentionSeconds: nil, newRetentionSeconds: nil)
             let preview = ChatListMessagePreviewFfi(groupSystem: event, messageIdHex: "selected", sender: "actor", senderDisplayName: nil,
-                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50, deleted: false, deletionSource: .unknown,
+                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50,
+                retentionSeconds: nil, retentionExpiresAt: nil, deleted: false, deletionSource: .unknown,
                 attachmentKind: nil, attachmentCount: 0, deliveryState: .notApplicable)
             let copy = try FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
             precondition(copy == preview && copy.groupSystem?.provenance == provenance)
+            let decisions: [(UInt64?, UInt64?)] = [(nil, nil), (0, nil), (300, 350), (300, nil)]
+            for (seconds, expiry) in decisions {
+                var timed = preview
+                timed.retentionSeconds = seconds
+                timed.retentionExpiresAt = expiry
+                let timedCopy = try FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(timed))
+                precondition(timedCopy.retentionSeconds == seconds && timedCopy.retentionExpiresAt == expiry)
+            }
         }
         for source in [DeletionSourceFfi.author, .admin, .unknown] {
             let preview = TimelineReplyPreviewFfi(messageIdHex: "deleted", sender: "author", plaintext: "",
