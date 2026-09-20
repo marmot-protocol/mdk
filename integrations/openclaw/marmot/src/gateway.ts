@@ -214,8 +214,8 @@ export async function startMarmotGatewayAccount(
   const cancelRetries = (): void => {
     closed = true;
     authorizer.setLifecycle("replaced");
-    markMarmotSenderAuthorizerLifecycle(ctx.accountId, "replaced");
     if (lane.generation === generation) {
+      markMarmotSenderAuthorizerLifecycle(ctx.accountId, "replaced");
       lane.generation += 1;
     }
     abortController.abort();
@@ -232,9 +232,12 @@ export async function startMarmotGatewayAccount(
     };
     const first = await enqueueSync();
     if (!isCurrent()) {
+      const ownsStatus = lane.generation === generation;
       cancelRetries();
-      markMarmotInboundStopped(ctx.accountId);
-      publishStatus();
+      if (ownsStatus) {
+        markMarmotInboundStopped(ctx.accountId);
+        publishStatus();
+      }
       return;
     }
     if (first?.state === "failed") {

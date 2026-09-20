@@ -21,6 +21,7 @@ import {
   markMarmotInboundReady,
   markMarmotInboundStarting,
   marmotInboundRuntimeSnapshot,
+  marmotSenderAuthorizerLifecycle,
   MARMOT_ALLOWLIST_SYNC_FAILED,
   resetMarmotInboundRuntimeForTests,
 } from "../src/runtime-state.js";
@@ -504,6 +505,57 @@ describe("startMarmotGatewayAccount", () => {
     expect(replacementSubscribes).toBe(1);
     expect(extraSubscribes).toBe(0);
 
+    abortReplacement.abort();
+    await replacement.stop();
+    await replacementRun;
+  });
+
+  it("does not mark a replacement authorizer replaced when a stale start cancels", async () => {
+    let releaseOld!: (result: MarmotAllowlistSyncResult) => void;
+    const oldSync = new Promise<MarmotAllowlistSyncResult>((resolve) => {
+      releaseOld = resolve;
+    });
+    const abortOld = new AbortController();
+    const oldRun = startMarmotGatewayAccount(
+      gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
+        accountId: "work",
+        abortSignal: abortOld.signal,
+      }),
+      {
+        syncAllowlist: async () => oldSync,
+      },
+    );
+    await vi.waitFor(() => {
+      expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({ running: true });
+    });
+
+    lifecycleByAccount.delete("work");
+    const abortReplacement = new AbortController();
+    const replacementRun = startMarmotGatewayAccount(
+      gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
+        accountId: "work",
+        abortSignal: abortReplacement.signal,
+      }),
+    );
+    const replacement = await waitForLifecycle("work");
+    await vi.waitFor(() => {
+      expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+        running: true,
+        connected: true,
+      });
+    });
+    expect(marmotSenderAuthorizerLifecycle("work")).toBe("active");
+
+    releaseOld({ state: "unmanaged" });
+    await oldRun;
+    expect(marmotSenderAuthorizerLifecycle("work")).toBe("active");
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      running: true,
+      connected: true,
+      lastError: null,
+    });
+
+    abortOld.abort();
     abortReplacement.abort();
     await replacement.stop();
     await replacementRun;

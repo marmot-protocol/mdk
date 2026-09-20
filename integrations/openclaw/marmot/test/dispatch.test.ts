@@ -813,14 +813,19 @@ describe("createMarmotInboundDispatcher activation cache", () => {
       mentionsSelf: true,
       messageIdHex: HEX32("02"),
     });
+    expect(groupInfoCalls()).toBe(2);
     // A dispatcher is bound to one receiving account; a mismatched account id
-    // is denied before group-info lookup.
-    await dispatch({
-      ...baseMessage,
-      accountIdHex: otherAccount,
-      mentionsSelf: true,
-      messageIdHex: HEX32("03"),
-    });
+    // is denied before group-info lookup. Changing only groupIdHex would still
+    // reach groupInfo because the receiving account stays bound.
+    expect(
+      await dispatch({
+        ...baseMessage,
+        accountIdHex: otherAccount,
+        mentionsSelf: true,
+        messageIdHex: HEX32("03"),
+      }),
+    ).toBe(false);
+    expect(groupInfoCalls()).toBe(2);
     await dispatch({
       ...baseMessage,
       groupIdHex: mls16,
