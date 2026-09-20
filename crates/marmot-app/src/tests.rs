@@ -15369,15 +15369,9 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
     );
 }
 
-/// A send that failed and is retried inside the same second must end delivered.
-///
-/// Inner app-event ids are NIP-01 hashes over
-/// (pubkey, created_at, kind, tags, content), and `created_at` is whole seconds
-/// (`unix_now_seconds`), with no nonce. So identical text resent inside the same
-/// second as a failed send is not a *similar* event — it is bit-for-bit the same
-/// event, under the same id, landing on the row the failure retracted. Hosts are
-/// told to do exactly this: `marmot-uniffi` prescribes an automatic retry for
-/// `StorageBusy` (milliseconds later) and a user resend for the rest.
+/// Retrying the exact retained event revives its local failure retraction.
+/// Identical newly authored messages within one second also have this identity;
+/// a retained retry deliberately preserves its original identity.
 ///
 /// `record_app_event`'s upsert keeps invalidation terminal, because it cannot
 /// tell this retry from a relay redelivery or a backfill replay. Left there, the
@@ -15385,11 +15379,8 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
 /// `Failed` forever — nothing else clears `invalidated`. The send intent is the
 /// missing evidence, so `record_send_intent_projection` clears the retraction.
 ///
-/// The two sends are built at one fixed `created_at` rather than by sending
-/// twice through the relay harness: that is precisely what a same-second resend
-/// produces, and it pins the collision instead of racing a clock edge.
 #[tokio::test]
-async fn a_same_second_resend_revives_the_row_its_failed_send_retracted() {
+async fn a_retained_event_resend_revives_the_row_its_failed_send_retracted() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
         .create_account("alice")
@@ -15409,10 +15400,10 @@ async fn a_same_second_resend_revives_the_row_its_failed_send_retracted() {
         content: "resent inside the same second".to_owned(),
     };
     let first = build_inner_event(&chat(), &sender, 1_700_000_000).unwrap();
-    let resend = build_inner_event(&chat(), &sender, 1_700_000_000).unwrap();
+    let resend = first.clone();
     assert_eq!(
         first.id, resend.id,
-        "the premise: a same-second resend of identical text is the same event id"
+        "a retained retry preserves the event id"
     );
 
     let status = |app: &MarmotApp| {

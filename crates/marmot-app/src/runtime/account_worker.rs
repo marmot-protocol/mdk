@@ -1112,6 +1112,8 @@ async fn run_app_runtime_account_worker(
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
+    let mut local_submission_wakeups = shared.local_submission_wakeups.subscribe();
+    let mut local_submission_due = true;
     let mut presentation_due = true;
     let mut avatar_due = true;
     let mut attachment_due = true;
@@ -1708,6 +1710,32 @@ async fn run_app_runtime_account_worker(
                         "avatar maintenance failed; retrying on the next tick");
                 }
             }
+            _ = local_submission_wakeups.changed() => { local_submission_due = true; }
+            _ = std::future::ready(()), if local_submission_due => {
+                local_submission_due = false;
+                if let Ok(storage) = app.account_storage(&account_label)
+                    && let Ok(Some(submission)) = storage.next_local_submission()
+                {
+                    let execution = shared.app_performance_telemetry().observe(RuntimeOp::SendExecution);
+                    let started = Instant::now();
+                    client.send_telemetry = Some(shared.app_performance_telemetry());
+                    let result = client.publish_local_submission(&submission, |update| {
+                        publish_app_runtime_projection_update(&events, &account_id_hex, &account_label, update);
+                    }).await;
+                    client.send_telemetry = None;
+                    execution.finish_app(&result);
+                    shared.app_performance_telemetry().record(AppPerformanceOperation::OutboundMessageSend, started.elapsed(), result.is_ok());
+                    if let Ok(update) = app.finish_local_message(&account_label, &submission, &result) {
+                        if let Some(update) = update {
+                            publish_app_runtime_projection_update(&events, &account_id_hex, &account_label, update);
+                        }
+                        local_submission_due = true;
+                    }
+                    publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
+                    publish_client_pending_applied_summary(&mut client, &events, &account_id_hex, &account_label);
+                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                }
+            }
             result = presentation_wakeups.changed() => {
                 if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
             }
@@ -1738,6 +1766,7 @@ async fn run_app_runtime_account_worker(
                 };
             }
             _ = maintenance_tick.tick() => {
+                local_submission_due = true;
                 attachment_due = true;
                 presentation_due = true;
                 avatar_due = true;
@@ -5519,7 +5548,7 @@ fn publish_app_runtime_summary(
     }
 }
 
-fn publish_app_runtime_projection_update(
+pub(super) fn publish_app_runtime_projection_update(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,

@@ -394,3 +394,40 @@ pub unsafe extern "C" fn marmot_send_message_draft(
         }
     })
 }
+
+/// Atomically consume a draft and admit its token-bound message locally.
+/// # Safety
+/// Client, account, token and revision must be valid; attachments readable for
+/// length (NULL allowed at zero); out writable. Free with marmot_local_send_acceptance_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_message_draft_with_client_token(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    revision: *const MarmotMessageDraftRevision,
+    attachments: *const crate::types::media::MarmotMediaAttachmentReference,
+    attachments_len: usize,
+    client_token: *const c_char,
+    out: *mut *mut crate::types::local_submissions::MarmotLocalSendAcceptance,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let token = try_arg!(unsafe { required_str(client_token) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let attachments = try_arg!(unsafe {
+            crate::commands::struct_array(attachments, attachments_len, |a| a.to_ffi())
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_message_draft_with_client_token(
+                    account,
+                    revision.inner.clone(),
+                    attachments,
+                    token,
+                )),
+                out,
+            )
+        }
+    })
+}

@@ -2134,7 +2134,7 @@ pub async fn retry_group_convergence( &self, account_ref: String, group_id_hex: 
 
 Re-attempt publishing a group's pending (committed-but-undelivered) commit(s) without minting a new event.
 
-[Source](src/commands/message.rs#L55)
+[Source](src/commands/message.rs#L54)
 
 ### `Marmot::react_to_message`
 
@@ -2146,7 +2146,7 @@ pub async fn react_to_message( &self, account_ref: String, group_id_hex: String,
 
 React to `target_message_id` with `emoji` (an "add" reaction).
 
-[Source](src/commands/message.rs#L69)
+[Source](src/commands/message.rs#L68)
 
 ### `Marmot::unreact_from_message`
 
@@ -2158,7 +2158,7 @@ pub async fn unreact_from_message( &self, account_ref: String, group_id_hex: Str
 
 Remove all of this account's active reactions from `target_message_id`.
 
-[Source](src/commands/message.rs#L85)
+[Source](src/commands/message.rs#L84)
 
 ### `Marmot::reply_to_message`
 
@@ -2170,7 +2170,7 @@ pub async fn reply_to_message( &self, account_ref: String, group_id_hex: String,
 
 Send `text` as a reply that quotes `target_message_id`.
 
-[Source](src/commands/message.rs#L100)
+[Source](src/commands/message.rs#L99)
 
 ### `Marmot::delete_message`
 
@@ -2182,7 +2182,7 @@ pub async fn delete_message( &self, account_ref: String, group_id_hex: String, t
 
 Mark `target_message_id` deleted for the whole group. This is a tombstone — the original stays in everyone's store; clients render a "message deleted" placeholder.
 
-[Source](src/commands/message.rs#L118)
+[Source](src/commands/message.rs#L117)
 
 ### `Marmot::secure_delete_expired`
 
@@ -2194,7 +2194,7 @@ pub async fn secure_delete_expired( &self, account_ref: String, group_id_hex: St
 
 Securely scrub and prune expired disappearing-message plaintext for a group according to its active retention component. The media hash list identifies pruned encrypted-media blobs so host apps can purge their own decrypted-media disk caches keyed by ciphertext hash.
 
-[Source](src/commands/message.rs#L136)
+[Source](src/commands/message.rs#L135)
 
 ### `Marmot::sweep_expired_retention`
 
@@ -2206,7 +2206,7 @@ pub async fn sweep_expired_retention( &self, account_ref: String, now_ms: u64, )
 
 Run the engine-owned disappearing-message sweep for one account using the supplied Unix wall-clock time in milliseconds. Each group reports pruning, a fail-closed deferral, or a privacy-safe failure category.
 
-[Source](src/commands/message.rs#L152)
+[Source](src/commands/message.rs#L151)
 
 ### `Marmot::edit_message`
 
@@ -2218,7 +2218,7 @@ pub async fn edit_message( &self, account_ref: String, group_id_hex: String, tar
 
 Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits.
 
-[Source](src/commands/message.rs#L173)
+[Source](src/commands/message.rs#L172)
 
 ### `Marmot::send_custom_event`
 
@@ -2230,7 +2230,7 @@ pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String
 
 Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
-[Source](src/commands/message.rs#L194)
+[Source](src/commands/message.rs#L193)
 
 ### `Marmot::messages`
 
@@ -2242,7 +2242,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L216)
+[Source](src/commands/message.rs#L215)
 
 </details>
 
@@ -4017,5 +4017,71 @@ pub async fn set_attachment_automatic_permission( &self, account_ref: String, ge
 Apply media-category permission using the generation captured before evaluating host policy. False means stale, foreign or already consumed; it is not permission to retry with a fresh token. Approval is runtime-only and cannot override the durable automatic policy. See the [permission lifecycle](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased).
 
 [Source](src/commands/attachment_controls.rs#L38)
+
+</details>
+
+<details>
+<summary>Durable local sends and caller correlation</summary>
+
+### `Marmot::local_send_status`
+
+```rust
+pub fn local_send_status( &self, account_ref: String, group_id_hex: String, client_token: String, ) -> Result<Option<LocalSendStatusFfi>, MarmotKitError>
+```
+
+Read a retained submission's local state without relay I/O. `None` means no retained
+association. `Completed` describes the worker attempt; inspect its summary disposition
+and follow timeline updates for later delivery. See [local sends](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L125)
+
+### `Marmot::reply_to_message_with_client_token`
+
+```rust
+pub async fn reply_to_message_with_client_token( &self, account_ref: String, group_id_hex: String, target_message_id: String, text: String, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a reply and bind its optimistic bubble to an opaque local token.
+Returns local acceptance before relay publication. Repeating the original request
+and token returns the same identity; changed requests are rejected. See [local sends](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L57)
+
+### `Marmot::send_message_draft_with_client_token`
+
+```rust
+pub async fn send_message_draft_with_client_token( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, attachments: Vec<MediaAttachmentReferenceFfi>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Atomically consume exactly the supplied draft revision and retain its token-bound
+message. Prepared attachments must match selected descriptors. Returns local
+acceptance, not delivery; never clear a newer composer on completion. See [local sends](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L79)
+
+### `Marmot::send_text_with_client_token`
+
+```rust
+pub async fn send_text_with_client_token( &self, account_ref: String, group_id_hex: String, text: String, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Admit text durably outside the account publication queue. Use one token per logical
+submission and reconcile by the exact token on timeline rows. Acceptance survives
+caller cancellation and restart; delivery uses ordinary subscriptions. See [local sends](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L37)
+
+### `Marmot::upload_media_with_client_token`
+
+```rust
+pub async fn upload_media_with_client_token( &self, account_ref: String, group_id_hex: String, request: MediaUploadRequestFfi, client_token: String, ) -> Result<MediaUploadSubmissionFfi, MarmotKitError>
+```
+
+Upload encrypted attachments and optionally admit the resulting token-bound message.
+The result includes uploaded references and optional local acceptance. Uploads themselves
+are not idempotent or restart-resumable; query token status after unknown outcomes.
+See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handling.
+
+[Source](src/commands/local_submissions.rs#L101)
 
 </details>

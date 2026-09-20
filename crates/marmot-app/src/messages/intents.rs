@@ -926,6 +926,50 @@ mod mention_tests {
     }
 
     #[test]
+    fn local_admission_preserves_legacy_chat_reply_and_media_wire_identity() {
+        let sender = valid_pubkey_hex();
+        let intents = [
+            AppMessageIntent::Chat {
+                content: "same text".into(),
+            },
+            AppMessageIntent::Reply {
+                target_message_id: "aa".repeat(32),
+                text: "same text".into(),
+            },
+            AppMessageIntent::Media {
+                caption: Some("same text".into()),
+                attachments: vec![MediaAttachmentReference {
+                    locators: vec![],
+                    ciphertext_sha256: "11".repeat(32),
+                    plaintext_sha256: "22".repeat(32),
+                    nonce_hex: "33".repeat(12),
+                    file_name: "photo.jpg".into(),
+                    media_type: "image/jpeg".into(),
+                    version: "2".into(),
+                    source_epoch: 0,
+                    dim: None,
+                    thumbhash: None,
+                }],
+            },
+        ];
+        for intent in intents {
+            let legacy = build_inner_event(&intent, &sender, 42).unwrap();
+            let admitted = build_inner_event_with_media_reply(&intent, &sender, 42, None).unwrap();
+            assert_eq!(legacy.id, admitted.id);
+            assert_eq!(
+                encode_inner_event(&legacy).unwrap(),
+                encode_inner_event(&admitted).unwrap()
+            );
+            assert_eq!(legacy.content, admitted.content);
+            for event in [legacy, admitted] {
+                event.validate_id().unwrap();
+                let nonces: Vec<_> = event.tags.iter().filter(|tag| tag[0] == "nonce").collect();
+                assert!(nonces.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn reply_intent_keeps_e_q_and_adds_mention_p_tag() {
         let hex = valid_pubkey_hex();
         let npub = npub_for_account_id(&hex).unwrap();
