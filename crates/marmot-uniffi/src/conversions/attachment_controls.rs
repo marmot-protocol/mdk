@@ -58,6 +58,9 @@ pub enum AttachmentTransferStateFfi {
     Paused,
     Removed,
     PolicyBlocked,
+    PreviouslyAcquiredUnavailable,
+    CompletedUnretained,
+    RetryExhausted,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct AttachmentTransferStatusFfi {
@@ -84,6 +87,15 @@ impl From<Option<app::AttachmentTransferStatus>> for AttachmentTransferStatusFfi
             Some(v) => Self {
                 reference: v.reference.map(|r| r.to_opaque()),
                 state: match v.state {
+                    app::AttachmentTransferState::PreviouslyAcquiredUnavailable => {
+                        AttachmentTransferStateFfi::PreviouslyAcquiredUnavailable
+                    }
+                    app::AttachmentTransferState::CompletedUnretained => {
+                        AttachmentTransferStateFfi::CompletedUnretained
+                    }
+                    app::AttachmentTransferState::RetryExhausted => {
+                        AttachmentTransferStateFfi::RetryExhausted
+                    }
                     app::AttachmentTransferState::NotRequested => {
                         AttachmentTransferStateFfi::NotRequested
                     }
@@ -136,3 +148,49 @@ impl From<Vec<Option<app::AttachmentTransferStatus>>> for AttachmentTransferSnap
 }
 redact!(AttachmentTransferStatusFfi);
 redact!(AttachmentTransferSnapshotFfi);
+
+/// Select before runtime startup; HostManaged never discovers demand autonomously.
+#[derive(Debug, Clone, Copy, Default, uniffi::Enum)]
+pub enum AttachmentAcquisitionModeFfi {
+    #[default]
+    NativeAutomatic,
+    HostManaged,
+}
+impl From<AttachmentAcquisitionModeFfi> for app::AttachmentAcquisitionMode {
+    fn from(mode: AttachmentAcquisitionModeFfi) -> Self {
+        match mode {
+            AttachmentAcquisitionModeFfi::NativeAutomatic => Self::NativeAutomatic,
+            AttachmentAcquisitionModeFfi::HostManaged => Self::HostManaged,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct AttachmentAutomaticPermissionFfi {
+    pub images: bool,
+    pub videos: bool,
+    pub audio: bool,
+    pub files: bool,
+}
+impl From<AttachmentAutomaticPermissionFfi> for app::AttachmentAutomaticPermission {
+    fn from(p: AttachmentAutomaticPermissionFfi) -> Self {
+        Self {
+            images: p.images,
+            videos: p.videos,
+            audio: p.audio,
+            files: p.files,
+        }
+    }
+}
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AutomaticAttachmentRequestFfi {
+    pub status: AttachmentTransferStatusFfi,
+    pub newly_queued: bool,
+}
+impl From<app::AutomaticAttachmentRequest> for AutomaticAttachmentRequestFfi {
+    fn from(r: app::AutomaticAttachmentRequest) -> Self {
+        Self {
+            status: r.status.into(),
+            newly_queued: r.newly_queued,
+        }
+    }
+}

@@ -169,6 +169,14 @@ enum MarmotStatus
   MARMOT_STATUS_CONVERSATION_WINDOW_PRESENTATION = 90,
   MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT = 91,
   MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED = 92,
+  /**
+   * The automatic acquisition API requires HostManaged configuration.
+   */
+  MARMOT_STATUS_ATTACHMENT_MODE_REQUIRED = 93,
+  /**
+   * A signed-out account cannot grant automatic network permission.
+   */
+  MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -795,6 +803,9 @@ typedef enum MarmotAttachmentTransferState {
   MARMOT_ATTACHMENT_TRANSFER_STATE_PAUSED,
   MARMOT_ATTACHMENT_TRANSFER_STATE_REMOVED,
   MARMOT_ATTACHMENT_TRANSFER_STATE_POLICY_BLOCKED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_PREVIOUSLY_ACQUIRED_UNAVAILABLE,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_COMPLETED_UNRETAINED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_EXHAUSTED,
 } MarmotAttachmentTransferState;
 
 typedef enum MarmotChatListView {
@@ -829,6 +840,11 @@ typedef enum MarmotConversationAnchorKind {
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_NEXT,
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_PREVIOUS,
 } MarmotConversationAnchorKind;
+
+typedef enum MarmotAttachmentAcquisitionMode {
+  MARMOT_ATTACHMENT_ACQUISITION_MODE_NATIVE_AUTOMATIC,
+  MARMOT_ATTACHMENT_ACQUISITION_MODE_HOST_MANAGED,
+} MarmotAttachmentAcquisitionMode;
 
 typedef enum MarmotAttachmentControl {
   MARMOT_ATTACHMENT_CONTROL_CANCEL,
@@ -1213,6 +1229,10 @@ typedef struct MarmotClientOptions {
    * Optional callback store; NULL selects the platform keychain.
    */
   const struct MarmotSecretStore *store;
+  /**
+   * 0 = NativeAutomatic (default), 1 = HostManaged (initially denied).
+   */
+  uint32_t attachment_acquisition_mode;
 } MarmotClientOptions;
 
 /**
@@ -5072,6 +5092,21 @@ typedef struct MarmotAttachmentDownloadPolicyInput {
   uint64_t disk_reserve;
   uint64_t transfer_limit;
 } MarmotAttachmentDownloadPolicyInput;
+
+typedef struct MarmotAutomaticAttachmentRequest {
+  struct MarmotAttachmentTransferStatus status;
+  bool newly_queued;
+} MarmotAutomaticAttachmentRequest;
+
+/**
+ * Borrowed runtime permission. All fields are boolean integers (nonzero = true).
+ */
+typedef struct MarmotAttachmentAutomaticPermissionInput {
+  uint8_t images;
+  uint8_t videos;
+  uint8_t audio;
+  uint8_t files;
+} MarmotAttachmentAutomaticPermissionInput;
 
 #ifdef __cplusplus
 extern "C" {
@@ -10896,6 +10931,47 @@ MarmotStatus marmot_attachment_transfer_snapshot(const struct MarmotClient *clie
                                                  const struct MarmotAttachmentLocalTarget *targets,
                                                  uintptr_t targets_len,
                                                  struct MarmotAttachmentTransferSnapshot **out);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_automatic_attachment_request_free(struct MarmotAutomaticAttachmentRequest *ptr);
+
+/**
+ * Revoke automatic permission and return a single-use generation.
+ * # Safety
+ * Client and account must be live, out writable. Free with marmot_string_free.
+ */
+MarmotStatus marmot_begin_attachment_permission_update(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       char **out);
+
+/**
+ * Apply permission only for the current unused generation.
+ * # Safety
+ * Inputs must be live and permission nonnull, out writable. Inputs are borrowed.
+ */
+MarmotStatus marmot_set_attachment_automatic_permission(const struct MarmotClient *client,
+                                                        const char *account_ref,
+                                                        const char *generation,
+                                                        const struct MarmotAttachmentAutomaticPermissionInput *permission,
+                                                        bool *out);
+
+/**
+ * Idempotent automatic demand, preserving suppression, history and retry budget.
+ * # Safety
+ * Inputs must be live, target nonnull, out writable. Free the returned record.
+ */
+MarmotStatus marmot_request_automatic_attachment(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *group_id_hex,
+                                                 const struct MarmotAttachmentLocalTarget *target,
+                                                 struct MarmotAutomaticAttachmentRequest **out);
 
 #ifdef __cplusplus
 }  // extern "C"

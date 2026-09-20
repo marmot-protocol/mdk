@@ -1,4 +1,3 @@
-use super::AttachmentDownloadFailure;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -12,6 +11,8 @@ use nostr::{EventBuilder, JsonUtil, Kind, NostrSigner, Tag, Timestamp as NostrTi
 use serde::Deserialize;
 use url::{Host, Url};
 
+use super::AttachmentDownloadFailure;
+use super::attachment_resume::NetworkPollError;
 use super::host_safety::{
     is_loopback_host, parse_profile_image_fetch_url, parse_profile_image_redirect_url,
     reject_non_public_ip, validate_blossom_fetch_url,
@@ -776,13 +777,43 @@ where
         if operation_remaining.is_zero() {
             return Err(AppError::BlobStore("request timed out".into()).into());
         }
-        let host_setup_started = Instant::now();
-        let client = match tokio::time::timeout(
-            operation_remaining,
-            client_for_url(current.clone()),
-        )
-        .await
+        let partial = match resume {
+            Some(resume) => resume.load(&current, max_body_bytes).await?,
+            None => None,
+        };
+        if let Some(part) = &partial
+            && part.bytes.len() as u64 == part.identity.total
         {
+            if let Some(resume) = resume {
+                resume
+                    .progress(part.identity.total, Some(part.identity.total), true)
+                    .await?;
+            }
+            return Ok(FetchedBlob {
+                bytes: partial.expect("checked").bytes,
+                response_url: current,
+                resumed: true,
+            });
+        }
+        // DNS/host setup is network work too: failed resolution must consume
+        // the same durable budget as HTTP, redirects and locator fallback.
+        if let Some(resume) = resume {
+            resume.before_network().await?;
+        }
+        let host_setup_started = Instant::now();
+        let setup = async {
+            match resume {
+                Some(resume) => {
+                    resume
+                        .with_permission(client_for_url(current.clone()))
+                        .await
+                }
+                None => client_for_url(current.clone())
+                    .await
+                    .map_err(NetworkPollError::Operation),
+            }
+        };
+        let client = match tokio::time::timeout(operation_remaining, setup).await {
             Ok(Ok(client)) => {
                 record_download_phase(
                     telemetry,
@@ -792,7 +823,8 @@ where
                 );
                 client
             }
-            Ok(Err(error)) => {
+            Ok(Err(NetworkPollError::Revoked(error))) => return Err(error),
+            Ok(Err(NetworkPollError::Operation(error))) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadHostSetup,
@@ -829,24 +861,6 @@ where
         if operation_remaining.is_zero() {
             return Err(AppError::BlobStore("request timed out".into()).into());
         }
-        let partial = match resume {
-            Some(resume) => resume.load(&current, max_body_bytes).await?,
-            None => None,
-        };
-        if let Some(part) = &partial
-            && part.bytes.len() as u64 == part.identity.total
-        {
-            if let Some(resume) = resume {
-                resume
-                    .progress(part.identity.total, Some(part.identity.total), true)
-                    .await?;
-            }
-            return Ok(FetchedBlob {
-                bytes: partial.expect("checked").bytes,
-                response_url: current,
-                resumed: true,
-            });
-        }
         let mut request = client.get(current.clone()).timeout(remaining);
         if resume.is_some() {
             request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
@@ -860,7 +874,13 @@ where
                 .header(reqwest::header::IF_RANGE, &part.identity.etag);
         }
         let response_headers_started = Instant::now();
-        let response = match tokio::time::timeout(operation_remaining, request.send()).await {
+        let send = async {
+            match resume {
+                Some(resume) => resume.with_permission(request.send()).await,
+                None => request.send().await.map_err(NetworkPollError::Operation),
+            }
+        };
+        let response = match tokio::time::timeout(operation_remaining, send).await {
             Ok(Ok(response)) => {
                 record_download_phase(
                     telemetry,
@@ -870,7 +890,8 @@ where
                 );
                 response
             }
-            Ok(Err(error)) => {
+            Ok(Err(NetworkPollError::Revoked(error))) => return Err(error),
+            Ok(Err(NetworkPollError::Operation(error))) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadResponseHeaders,

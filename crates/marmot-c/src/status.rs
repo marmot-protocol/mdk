@@ -131,6 +131,10 @@ pub enum MarmotStatus {
     ConversationWindowPresentation = 90,
     MessageDraftRevisionConflict = 91,
     ConversationWindowMessageNotRetained = 92,
+    /// The automatic acquisition API requires HostManaged configuration.
+    AttachmentModeRequired = 93,
+    /// A signed-out account cannot grant automatic network permission.
+    AttachmentAccountSignedOut = 94,
 }
 
 thread_local! {
@@ -199,6 +203,8 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::Publish { .. } => MarmotStatus::Publish,
         MarmotKitError::TransportClosed => MarmotStatus::TransportClosed,
         MarmotKitError::RuntimeStopping => MarmotStatus::RuntimeStopping,
+        MarmotKitError::AttachmentModeRequired => MarmotStatus::AttachmentModeRequired,
+        MarmotKitError::AttachmentAccountSignedOut => MarmotStatus::AttachmentAccountSignedOut,
         MarmotKitError::NotGroupAdmin { .. } => MarmotStatus::NotGroupAdmin,
         MarmotKitError::AdminCannotSelfRemove { .. } => MarmotStatus::AdminCannotSelfRemove,
         MarmotKitError::WouldRemoveLastAdmin { .. } => MarmotStatus::WouldRemoveLastAdmin,
@@ -272,6 +278,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attachment_configuration_errors_have_distinct_status_codes() {
+        assert_eq!(
+            status_from_error(&MarmotKitError::AttachmentModeRequired),
+            MarmotStatus::AttachmentModeRequired
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::AttachmentAccountSignedOut),
+            MarmotStatus::AttachmentAccountSignedOut
+        );
+    }
+
+    #[test]
     fn onboarding_status_codes_preserve_the_master_group_removed_value() {
         assert_eq!(MarmotStatus::GroupRemoved as i32, 63);
         assert_eq!(MarmotStatus::OnboardingActionUnavailable as i32, 64);
@@ -285,6 +303,8 @@ mod tests {
         // exhaustive match forces a new arm for a new variant; add the variant
         // here too so a duplicated or renumbered stable status cannot pass.
         let variants: Vec<MarmotKitError> = vec![
+            MarmotKitError::AttachmentModeRequired,
+            MarmotKitError::AttachmentAccountSignedOut,
             MarmotKitError::ConversationWindowMessageNotRetained,
             MarmotKitError::ConversationWindowInvalidLimit,
             MarmotKitError::ConversationWindowStale,
@@ -460,7 +480,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            83,
+            85,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);

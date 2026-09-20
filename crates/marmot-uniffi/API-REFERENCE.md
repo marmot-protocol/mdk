@@ -591,7 +591,7 @@ pub async fn attachment_download_policy( &self, account_ref: String, ) -> Result
 
 Read the durable per-account automatic acquisition, quota, disk-reserve and transfer-cap policy.
 
-[Source](src/commands/attachment_controls.rs#L27)
+[Source](src/commands/attachment_controls.rs#L64)
 
 ### `Marmot::set_attachment_download_policy`
 
@@ -603,7 +603,7 @@ pub async fn set_attachment_download_policy( &self, account_ref: String, policy:
 
 Validate and persist acquisition policy; disabling automatic work preserves explicit work and retained files.
 
-[Source](src/commands/attachment_controls.rs#L37)
+[Source](src/commands/attachment_controls.rs#L74)
 
 ### `Marmot::control_attachment`
 
@@ -615,7 +615,7 @@ pub async fn control_attachment( &self, account_ref: String, reference: String, 
 
 Cancel durably, retry explicitly, or remove local bytes. Returns false for obsolete references or ineligible operations; cancellation preserves ready bytes.
 
-[Source](src/commands/attachment_controls.rs#L49)
+[Source](src/commands/attachment_controls.rs#L86)
 
 ### `Marmot::download_attachment_again`
 
@@ -627,7 +627,7 @@ pub async fn download_attachment_again( &self, account_ref: String, group_id_hex
 
 Queue explicit acquisition for a current original source slot, clearing removal/cancellation; no reference means unavailable or obsolete.
 
-[Source](src/commands/attachment_controls.rs#L61)
+[Source](src/commands/attachment_controls.rs#L98)
 
 ### `Marmot::attachment_transfer_snapshot`
 
@@ -639,7 +639,7 @@ pub async fn attachment_transfer_snapshot( &self, account_ref: String, group_id_
 
 Read bounded transfer state for up to 64 source slots in one group without requesting a transfer.
 
-[Source](src/commands/attachment_controls.rs#L74)
+[Source](src/commands/attachment_controls.rs#L111)
 
 ### `Marmot::subscribe_attachment_transfers`
 
@@ -651,7 +651,7 @@ pub async fn subscribe_attachment_transfers( &self, account_ref: String, group_i
 
 Observe initial transfer state and coalesced complete replacements for bounded source slots; observation does not request a transfer.
 
-[Source](src/commands/attachment_controls.rs#L96)
+[Source](src/commands/attachment_controls.rs#L133)
 
 </details>
 
@@ -3296,7 +3296,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L233)
+[Source](src/lib.rs#L239)
 
 ### `Marmot::new_with_options`
 
@@ -3308,7 +3308,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L249)
+[Source](src/lib.rs#L255)
 
 ### `Marmot::new`
 
@@ -3320,7 +3320,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L277)
+[Source](src/lib.rs#L283)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3332,7 +3332,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L295)
+[Source](src/lib.rs#L301)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3344,7 +3344,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L325)
+[Source](src/lib.rs#L331)
 
 ### `Marmot::new_with_client_name`
 
@@ -3356,7 +3356,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L344)
+[Source](src/lib.rs#L350)
 
 ### `Marmot::start`
 
@@ -3368,7 +3368,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L381)
+[Source](src/lib.rs#L387)
 
 ### `Marmot::shutdown`
 
@@ -3380,7 +3380,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L393)
+[Source](src/lib.rs#L399)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3392,7 +3392,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L428)
+[Source](src/lib.rs#L434)
 
 ### `Marmot::storage_is_closed`
 
@@ -3404,7 +3404,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L436)
+[Source](src/lib.rs#L442)
 
 ### `Marmot::is_stopping`
 
@@ -3416,7 +3416,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L443)
+[Source](src/lib.rs#L449)
 
 </details>
 
@@ -3982,5 +3982,40 @@ pub async fn next( &self, ) -> Result<Option<crate::conversions::PresentedChatLi
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
 [Source](src/subscriptions.rs#L476)
+
+</details>
+
+<details>
+<summary>Host-managed automatic attachment acquisition</summary>
+
+### `Marmot::begin_attachment_permission_update`
+
+```rust
+pub async fn begin_attachment_permission_update( &self, account_ref: String, ) -> Result<String, MarmotKitError>
+```
+
+Revoke automatic permission for this account before asynchronous network/preference evaluation. Returns a single-use runtime/account generation. Requires HostManaged construction; do not persist the token or mint a new one from a stale callback. See the [host-managed contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased).
+
+[Source](src/commands/attachment_controls.rs#L28)
+
+### `Marmot::request_automatic_attachment`
+
+```rust
+pub async fn request_automatic_attachment( &self, account_ref: String, group_id_hex: String, target: AttachmentLocalTargetFfi, ) -> Result<AutomaticAttachmentRequestFfi, MarmotKitError>
+```
+
+Submit idempotent automatic demand for an authoritative original source slot. Returns current status plus whether work was newly queued; preserves suppression, history, deadlines and retry budgets. Use from foreground and restored workers; never substitute explicit download-again or legacy downloadMedia after a local miss. See [Android migration](ATTACHMENT-ACCESS.md#android-migration).
+
+[Source](src/commands/attachment_controls.rs#L50)
+
+### `Marmot::set_attachment_automatic_permission`
+
+```rust
+pub async fn set_attachment_automatic_permission( &self, account_ref: String, generation: String, permission: AttachmentAutomaticPermissionFfi, ) -> Result<bool, MarmotKitError>
+```
+
+Apply media-category permission using the generation captured before evaluating host policy. False means stale, foreign or already consumed; it is not permission to retry with a fresh token. Approval is runtime-only and cannot override the durable automatic policy. See the [permission lifecycle](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased).
+
+[Source](src/commands/attachment_controls.rs#L38)
 
 </details>

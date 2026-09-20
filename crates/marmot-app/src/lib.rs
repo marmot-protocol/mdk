@@ -183,9 +183,10 @@ pub(crate) use client::{
     ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
 };
 pub use config::{
-    AttachmentAcquisitionPolicy, AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence,
-    MarmotAppConfig, MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
+    AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
+    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings,
 };
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
@@ -6894,9 +6895,10 @@ pub use storage_sqlite::{
 pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};
 
 pub use runtime::{
-    AttachmentAssetRef, AttachmentCategory, AttachmentControl, AttachmentDownloadPolicy,
-    AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion, AttachmentLocalTarget,
-    AttachmentPage, AttachmentPageRead, AttachmentTransferState, AttachmentTransferStatus,
-    MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
-    RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
+    AttachmentAssetRef, AttachmentAutomaticPermission, AttachmentCategory, AttachmentControl,
+    AttachmentDownloadPolicy, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
+    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentTransferState,
+    AttachmentTransferStatus, AutomaticAttachmentRequest, MAX_ATTACHMENT_ASSET_LOOKUPS,
+    MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
+    RuntimeAttachmentTransferSubscription,
 };

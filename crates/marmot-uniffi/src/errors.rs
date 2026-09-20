@@ -136,6 +136,12 @@ pub enum MarmotKitError {
     AccountSetupKeyPackageRecoveryAvailable,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
+    /// Automatic acquisition permission requires HostManaged configuration.
+    #[error("host-managed attachment mode required")]
+    AttachmentModeRequired,
+    /// A signed-out account cannot approve automatic network requests.
+    #[error("automatic attachment approval requires a signed-in account")]
+    AttachmentAccountSignedOut,
     /// An account worker's transport catch-up failed (sync error or timeout).
     /// Distinct, typed variant — separate from [`MarmotKitError::Runtime`] —
     /// so hosts (notably the NSE wake path) can tell a catch-up failure from
@@ -481,6 +487,8 @@ impl From<&AppError> for MarmotKitError {
                 Self::AccountSetupKeyPackageRecoveryAvailable
             }
             AppError::RuntimeStopping => Self::RuntimeStopping,
+            AppError::AttachmentModeRequired => Self::AttachmentModeRequired,
+            AppError::AttachmentAccountSignedOut => Self::AttachmentAccountSignedOut,
             AppError::AccountCatchUp(details) => Self::AccountCatchUp {
                 details: details.to_string(),
             },
@@ -590,6 +598,18 @@ mod tests {
     use cgka_traits::storage::StorageError;
     use marmot_account::{AccountError, AccountHomeError};
     use marmot_app::AppError;
+
+    #[test]
+    fn attachment_configuration_and_account_errors_stay_typed() {
+        assert!(matches!(
+            MarmotKitError::from(AppError::AttachmentModeRequired),
+            MarmotKitError::AttachmentModeRequired
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::AttachmentAccountSignedOut),
+            MarmotKitError::AttachmentAccountSignedOut
+        ));
+    }
 
     #[test]
     fn stale_group_invite_crosses_ffi_as_typed_variant() {

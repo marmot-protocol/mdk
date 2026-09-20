@@ -23,6 +23,23 @@ pub(super) fn valid_attempt(
     job: &AttachmentAcquisition,
     now: u64,
 ) -> StorageResult<bool> {
+    if !valid_publication_attempt(conn, job, now)? {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT permission_paused=0 FROM attachment_acquisition WHERE token=?1",
+        [&job.reference.token],
+        |r| r.get(0),
+    )
+    .storage()
+}
+
+/// Network revocation cannot invalidate publication of an already verified body.
+pub(super) fn valid_publication_attempt(
+    conn: &Connection,
+    job: &AttachmentAcquisition,
+    now: u64,
+) -> StorageResult<bool> {
     if !matches_store(conn, &job.reference)? {
         return Ok(false);
     }

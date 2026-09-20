@@ -282,6 +282,12 @@ pub enum AppError {
     AccountSetupResetNotApplicable,
     #[error("recoverable KeyPackage setup state exists; retry instead of resetting")]
     AccountSetupKeyPackageRecoveryAvailable,
+    /// Automatic permission APIs require the opt-in host-managed configuration.
+    #[error("host-managed attachment mode required")]
+    AttachmentModeRequired,
+    /// Signed-out accounts cannot grant automatic network permission.
+    #[error("automatic attachment approval requires a signed-in account")]
+    AttachmentAccountSignedOut,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     #[error("no matching reaction by this account to retract")]
@@ -405,6 +411,8 @@ impl AppError {
             Self::AccountSetupKeyPackageRecoveryAvailable => {
                 "account_setup_key_package_recovery_available"
             }
+            Self::AttachmentModeRequired => "attachment_mode_required",
+            Self::AttachmentAccountSignedOut => "attachment_account_signed_out",
             Self::RuntimeStopping => "runtime_stopping",
             Self::ReactionNotFound => "reaction_not_found",
             Self::TransportClosed => "transport_closed",

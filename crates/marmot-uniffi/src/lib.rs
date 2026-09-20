@@ -32,6 +32,7 @@ pub use commands::user_blocks::{BlockListSnapshotFfi, BlockListSubscription, Blo
 // Public: `marmot-c` builds its `#[repr(C)]` mirrors from these modules so
 // the C ABI can never drift from the Swift/Kotlin surface.
 pub mod conversions;
+pub use conversions::AttachmentAcquisitionModeFfi;
 mod errors;
 mod external_signer;
 mod markdown;
@@ -196,12 +197,17 @@ pub struct MarmotOptions {
     pub client_name: Option<String>,
     #[uniffi(default = None)]
     pub secret_store: Option<Arc<dyn SecretStore>>,
+    #[uniffi(default = None)]
+    pub attachment_acquisition_mode: Option<AttachmentAcquisitionModeFfi>,
 }
 
 impl MarmotOptions {
     fn app_config(&self) -> MarmotAppConfig {
         let relay_policy = self.relay_policy.unwrap_or(RelayPolicyFfi::PublicOnly);
         MarmotAppConfig::default()
+            .with_attachment_acquisition_mode(
+                self.attachment_acquisition_mode.unwrap_or_default().into(),
+            )
             .with_allow_loopback_relay_endpoints(matches!(
                 relay_policy,
                 RelayPolicyFfi::AllowLoopback | RelayPolicyFfi::AllowLoopbackRelaysAndBlobs
@@ -498,6 +504,19 @@ mod tests {
             marmot_app::CursorPersistence::Advance
         );
         assert_eq!(defaults.key_package_client_name, None);
+        assert_eq!(
+            defaults.attachment_acquisition_mode,
+            marmot_app::AttachmentAcquisitionMode::NativeAutomatic
+        );
+        assert_eq!(
+            MarmotOptions {
+                attachment_acquisition_mode: Some(AttachmentAcquisitionModeFfi::HostManaged),
+                ..Default::default()
+            }
+            .app_config()
+            .attachment_acquisition_mode,
+            marmot_app::AttachmentAcquisitionMode::HostManaged
+        );
         for (policy, relay, blob) in [
             (RelayPolicyFfi::PublicOnly, false, false),
             (RelayPolicyFfi::AllowLoopback, true, false),

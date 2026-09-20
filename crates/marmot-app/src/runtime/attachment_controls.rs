@@ -59,7 +59,7 @@ impl MarmotAppRuntime {
         self.wake_attachment_work();
         Ok(())
     }
-    fn wake_attachment_work(&self) {
+    pub(super) fn wake_attachment_work(&self) {
         self.shared.attachment_updates.send_modify(|_| {});
         self.shared.attachment_cancellations.send_modify(|_| {});
         self.accounts.app.presentation_signals.wake();
@@ -137,6 +137,9 @@ impl MarmotAppRuntime {
         let group = hex::encode(group.as_slice());
         let fallback = default_policy(&self.accounts.app.config);
         let frozen = self.accounts.app.config.cursor_persistence == CursorPersistence::Frozen;
+        let host_managed = self.accounts.app.config.attachment_acquisition_mode
+            == crate::AttachmentAcquisitionMode::HostManaged;
+        let permissions = self.shared.attachment_permissions.clone();
         self.attachment_read(account_ref, move |s, _| {
             let policy = s.attachment_download_policy(&fallback)?;
             let targets = targets
@@ -149,12 +152,33 @@ impl MarmotAppRuntime {
                     )
                 })
                 .collect::<Vec<_>>();
-            Ok(s.attachment_transfer_snapshot(
+            let mut frame = s.attachment_transfer_snapshot(
                 &group,
                 &targets,
                 crate::unix_now_seconds(),
                 policy.automatic && !frozen,
-            )?)
+            )?;
+            if host_managed {
+                for status in frame.rows.iter_mut().flatten() {
+                    if matches!(
+                        status.state,
+                        AttachmentTransferState::Queued
+                            | AttachmentTransferState::RetryScheduled
+                            | AttachmentTransferState::Downloading
+                            | AttachmentTransferState::VerifyingCiphertext
+                            | AttachmentTransferState::Decrypting
+                            | AttachmentTransferState::VerifyingPlaintext
+                    ) && status
+                        .automatic_media_type
+                        .as_ref()
+                        .is_some_and(|mime| !permissions.allows(&frame.store_epoch, mime))
+                    {
+                        status.state = AttachmentTransferState::Paused;
+                        status.retry_at = None;
+                    }
+                }
+            }
+            Ok(frame)
         })
         .await
     }
@@ -337,6 +361,7 @@ mod tests {
     fn attachment_idle_refresh_is_slow_but_never_misses_known_expiry() {
         let mut rows = vec![Some(AttachmentTransferStatus {
             reference: None,
+            automatic_media_type: None,
             state: AttachmentTransferState::Ready,
             attempt: 0,
             received: 0,
