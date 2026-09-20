@@ -126,7 +126,11 @@ Android hosts with a network/type preference matrix should construct MDK with
 `MarmotOptions.attachment_acquisition_mode = HostManaged` **before startup**.
 The default remains `NativeAutomatic` for existing consumers. Host-managed mode
 never turns projection discovery into automatic demand. Both modes use the same
-SQLite jobs, source history, quotas, local reads and explicit controls.
+SQLite jobs, source history, quotas, local reads and explicit controls. The new
+retry budgets and terminal retention-failure behavior apply only to jobs opted in
+through `requestAutomaticAttachment` or claimed by a HostManaged worker (including
+restored persisted jobs). Existing native jobs keep
+their retry behavior; opting a job in is durable even if runtime mode later changes.
 
 Host-managed automatic permission starts denied for every account on each runtime
 construction, including newly created/imported accounts. Sign-out/removal also
@@ -139,7 +143,7 @@ Do not use `automatic=false` as a substitute for selecting host-managed mode.
 For every network or preference change:
 
 1. Call `beginAttachmentPermissionUpdate(account)` before asynchronous policy
-   evaluation. It revokes existing approval and invalidates active automatic leases,
+   evaluation. It revokes existing approval and pauses automatic network work,
    returning a fresh runtime/account/store-scoped generation.
 2. Evaluate the host's current network and media preferences. Call
    `setAttachmentAutomaticPermission(account, generation, permission)` once with
@@ -153,11 +157,17 @@ For every network or preference change:
 Use an ordered host policy coordinator: process the revocation step in event order,
 then perform asynchronous evaluation with that event's captured generation. Do not
 persist generations or Wi-Fi approval. Re-evaluate after runtime reconstruction.
-Permission APIs require HostManaged mode; calling them in NativeAutomatic is an error.
+Permission and automatic-request APIs require HostManaged mode; calling them in
+NativeAutomatic returns `AttachmentModeRequired`. Beginning approval for a signed-out
+account returns `AttachmentAccountSignedOut`. Neither is a media-corruption error.
 MDK checks the shared parser's MIME category, source and policy during admission and
 before HTTP attempts, including transport retry, redirects and locator fallback.
 Revocation cancels active work; bytes already in flight cannot be retracted.
-Reapproval cannot revive a transfer from the old generation.
+Reapproval cannot revive a network transfer from the old generation. A verified
+body may still finish its receipt and local publication after network permission is
+revoked. Explicit cancellation/removal, expiry and source replacement still fence
+publication. Paused jobs have no retry timer; approval readmits existing demand
+without resetting its retry deadline or discarding its resumable ciphertext.
 
 `AutomaticAttachmentRequestFfi` returns `newly_queued` and an authoritative transfer
 `status`. `newly_queued=false` is normal for repeated requests. Existing jobs retain
@@ -171,21 +181,30 @@ cancellation, retry deadlines, progress, budgets and their opaque reference.
 | Ready | Uses retained verified local bytes. |
 | PreviouslyAcquiredUnavailable | Previously published bytes are gone; no automatic reacquisition. |
 | CompletedUnretained | A verified body could not be published, or the process stopped after recording its receipt; no automatic reacquisition. |
-| RetryExhausted | The durable HTTP-attempt budget is spent; no automatic retry. |
+| RetryExhausted | The durable acquisition or network budget is spent; no automatic retry. |
 | Failed / Cancelled / Removed | Preserves terminal state or suppression. |
 | Unavailable | Source is obsolete, hidden, expired, rejected or otherwise unusable. |
 
-The lifetime budget is **four acquisition attempts and at most four network attempts
-per source/request cycle**, including
-transport retries, redirects, range restarts, failed DNS/host setup and fallback. A claimed attempt that fails before networking still spends an acquisition attempt.
-Checkpoint progress,
-recomposition, repeated demand, process restart and policy changes never replenish
-it. A deliberate explicit Retry/download-again starts a new bounded cycle when
-not already fetching. Explicit work bypasses automatic permission, not this budget.
-A completed verified body is recorded before publication; insufficient retention
-capacity or publication failure is terminal. Resource pressure *before* fetching
-can defer admission without spending a network attempt. If the database cannot
-record receipt at all, the persisted attempt budget still bounds subsequent fetches.
+For host-managed demand, the lifetime budget is **four acquisition attempts and
+at most 64 network attempts per source/request cycle**. The network ceiling is a
+separate bound: transport retries, redirects, range restarts, failed DNS/host setup
+and fallback each spend one. A transient 503 retry therefore does not by itself
+consume a whole acquisition attempt. A claim that fails before networking still
+spends an acquisition attempt. Permission/policy interruptions refund the interrupted
+claim exactly once, preserve backoff and retain ciphertext; actual network attempts
+are never refunded. Thus four network changes cannot spend the acquisition budget,
+while pathological reconnection loops remain bounded by actual network activity.
+
+Checkpoint progress, recomposition, repeated demand and process restart never
+replenish these budgets. A deliberate explicit Retry/download-again starts a new
+bounded cycle when not already fetching. Explicit retries of an opted-in job bypass
+automatic permission, not its budget. A completed verified body has one receipt owner
+before publication; insufficient retention capacity or publication failure is terminal
+for opted-in jobs. Resource pressure before fetching can defer admission without
+spending an attempt. If receipt storage fails, the persisted budgets still bound
+subsequent fetches. A size-policy failure remains `PolicyBlocked` even if the budget
+is exhausted; raising the size cap does not replenish that budget, so explicit retry
+may also be needed.
 
 Source identity is the account store incarnation, group, original message and imeta
 index, authoritative source-event ID, epoch, exact slot descriptor and parsed
@@ -195,8 +214,9 @@ replacement source with a new job identity. Explicit removal suppresses the orig
 message slot across replacement until a deliberate download-again. Ordinary loss
 of retained bytes preserves acquisition history and does not create removal intent.
 Source expiry/deletion or store reset ends that history. Migration preserves existing
-ready jobs and seeds budgets from the old failure streak; erased historical attempts
-and acquisitions made outside MDK's durable store cannot be reconstructed.
+jobs and their backoff deadlines without deriving budgets from the old claim/backoff
+counter. New budgets start at zero and native jobs are not opted in by migration.
+Acquisitions made outside MDK's durable store cannot be reconstructed.
 
 ### Android migration
 

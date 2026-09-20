@@ -1,4 +1,3 @@
-use super::AttachmentDownloadFailure;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -12,6 +11,8 @@ use nostr::{EventBuilder, JsonUtil, Kind, NostrSigner, Tag, Timestamp as NostrTi
 use serde::Deserialize;
 use url::{Host, Url};
 
+use super::AttachmentDownloadFailure;
+use super::attachment_resume::NetworkPollError;
 use super::host_safety::{
     is_loopback_host, parse_profile_image_fetch_url, parse_profile_image_redirect_url,
     reject_non_public_ip, validate_blossom_fetch_url,
@@ -807,11 +808,13 @@ where
                         .with_permission(client_for_url(current.clone()))
                         .await
                 }
-                None => Ok(client_for_url(current.clone()).await),
+                None => client_for_url(current.clone())
+                    .await
+                    .map_err(NetworkPollError::Operation),
             }
         };
         let client = match tokio::time::timeout(operation_remaining, setup).await {
-            Ok(Ok(Ok(client))) => {
+            Ok(Ok(client)) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadHostSetup,
@@ -820,8 +823,8 @@ where
                 );
                 client
             }
-            Ok(Err(error)) => return Err(error),
-            Ok(Ok(Err(error))) => {
+            Ok(Err(NetworkPollError::Revoked(error))) => return Err(error),
+            Ok(Err(NetworkPollError::Operation(error))) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadHostSetup,
@@ -874,11 +877,11 @@ where
         let send = async {
             match resume {
                 Some(resume) => resume.with_permission(request.send()).await,
-                None => Ok(request.send().await),
+                None => request.send().await.map_err(NetworkPollError::Operation),
             }
         };
         let response = match tokio::time::timeout(operation_remaining, send).await {
-            Ok(Ok(Ok(response))) => {
+            Ok(Ok(response)) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadResponseHeaders,
@@ -887,8 +890,8 @@ where
                 );
                 response
             }
-            Ok(Err(error)) => return Err(error),
-            Ok(Ok(Err(error))) => {
+            Ok(Err(NetworkPollError::Revoked(error))) => return Err(error),
+            Ok(Err(NetworkPollError::Operation(error))) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadResponseHeaders,

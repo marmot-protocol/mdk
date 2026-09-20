@@ -635,6 +635,14 @@ fn all_attachment_permission() -> crate::AttachmentAutomaticPermission {
 #[tokio::test]
 async fn attachment_host_managed_requires_demand_and_fences_permission_generations() {
     let (_dir, mut client, storage, reference) = offline_fixture().await;
+    assert!(matches!(
+        client
+            .app
+            .runtime()
+            .begin_attachment_permission_update("alice")
+            .await,
+        Err(AppError::AttachmentModeRequired)
+    ));
     client.app.config.attachment_acquisition_mode = crate::AttachmentAcquisitionMode::HostManaged;
     let runtime = client.app.runtime();
     let group = GroupId::new(vec![0xab; 16]);
@@ -764,12 +772,10 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
         .await
         .unwrap();
     runtime.accounts.deactivate_account("alice").await.unwrap();
-    assert!(
-        runtime
-            .begin_attachment_permission_update("alice")
-            .await
-            .is_err()
-    );
+    assert!(matches!(
+        runtime.begin_attachment_permission_update("alice").await,
+        Err(AppError::AttachmentAccountSignedOut)
+    ));
     assert!(
         !runtime
             .set_attachment_automatic_permission(

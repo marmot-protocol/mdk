@@ -169,6 +169,14 @@ enum MarmotStatus
   MARMOT_STATUS_CONVERSATION_WINDOW_PRESENTATION = 90,
   MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT = 91,
   MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED = 92,
+  /**
+   * The automatic acquisition API requires HostManaged configuration.
+   */
+  MARMOT_STATUS_ATTACHMENT_MODE_REQUIRED = 93,
+  /**
+   * A signed-out account cannot grant automatic network permission.
+   */
+  MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

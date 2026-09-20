@@ -1062,6 +1062,8 @@ pub(crate) async fn download_encrypted_media_classified(
         plaintext_verify_started,
         true,
     );
+    // Wipe verified plaintext if the receipt await fails or its task is cancelled.
+    // On success, ownership moves into the publication result below.
     let mut plaintext = zeroize::Zeroizing::new(plaintext);
     if let Some(resume) = &transport.resume {
         resume.completed_body().await?;

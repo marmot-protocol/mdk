@@ -2,7 +2,15 @@
 use super::AttachmentDownloadFailure;
 use crate::AppError;
 use sha2::{Digest, Sha256};
-use std::{future::Future, path::PathBuf, sync::Arc, task::Poll};
+use std::{
+    future::Future,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Poll,
+};
 use storage_sqlite::{
     ATTACHMENT_CHECKPOINT_BYTES, AttachmentAcquisition, AttachmentPartial,
     AttachmentPartialIdentity, SqliteAccountStorage,
@@ -23,6 +31,8 @@ pub(crate) struct AttachmentResume {
     pub disk_reserve: u64,
     pub automatic: bool,
     pub permission: Option<crate::runtime::attachment_permission::PermissionLease>,
+    /// Once verification finishes, cancellation waits for the receipt and result.
+    pub finishing: Arc<AtomicBool>,
     pub updates: Option<tokio::sync::watch::Sender<()>>,
 }
 fn retry(message: &str) -> AttachmentDownloadFailure {
@@ -32,23 +42,32 @@ fn stop(message: &str) -> AttachmentDownloadFailure {
     AttachmentDownloadFailure::Stop(AppError::BlobStore(message.into()))
 }
 
+/// Distinguish revocation from transport errors without nesting Result values.
+pub(crate) enum NetworkPollError<E> {
+    Revoked(AttachmentDownloadFailure),
+    Operation(E),
+}
+
 impl AttachmentResume {
-    pub(crate) async fn with_permission<F>(
-        &self,
-        future: F,
-    ) -> Result<F::Output, AttachmentDownloadFailure>
+    pub(crate) async fn with_permission<F, T, E>(&self, future: F) -> Result<T, NetworkPollError<E>>
     where
-        F: Future,
+        F: Future<Output = Result<T, E>>,
     {
         let mut future = std::pin::pin!(future);
         std::future::poll_fn(|cx| {
-            let mut poll = || future.as_mut().poll(cx).map(Ok);
-            match &self.permission {
-                Some(permission) => permission.with_permission(poll).unwrap_or_else(|| {
-                    Poll::Ready(Err(retry("automatic attachment permission revoked")))
-                }),
-                None => poll(),
+            if self
+                .permission
+                .as_ref()
+                .is_some_and(|permission| !permission.allowed())
+            {
+                return Poll::Ready(Err(NetworkPollError::Revoked(retry(
+                    "automatic attachment permission revoked",
+                ))));
             }
+            future
+                .as_mut()
+                .poll(cx)
+                .map(|result| result.map_err(NetworkPollError::Operation))
         })
         .await
     }
@@ -70,6 +89,7 @@ impl AttachmentResume {
         Ok(())
     }
     pub(crate) async fn completed_body(&self) -> Result<(), AttachmentDownloadFailure> {
+        self.finishing.store(true, Ordering::Release);
         let this = self.clone();
         let recorded = tokio::task::spawn_blocking(move || {
             this.storage

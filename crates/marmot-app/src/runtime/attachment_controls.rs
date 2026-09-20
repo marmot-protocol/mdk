@@ -140,7 +140,7 @@ impl MarmotAppRuntime {
         let host_managed = self.accounts.app.config.attachment_acquisition_mode
             == crate::AttachmentAcquisitionMode::HostManaged;
         let permissions = self.shared.attachment_permissions.clone();
-        self.attachment_read(account_ref, move |s, loopback| {
+        self.attachment_read(account_ref, move |s, _| {
             let policy = s.attachment_download_policy(&fallback)?;
             let targets = targets
                 .iter()
@@ -159,12 +159,8 @@ impl MarmotAppRuntime {
                 policy.automatic && !frozen,
             )?;
             if host_managed {
-                let identity = s.attachment_store_identity()?;
-                for (row, (message, source, index)) in frame.rows.iter_mut().zip(&targets) {
-                    let Some(status) = row else {
-                        continue;
-                    };
-                    if !matches!(
+                for status in frame.rows.iter_mut().flatten() {
+                    if matches!(
                         status.state,
                         AttachmentTransferState::Queued
                             | AttachmentTransferState::RetryScheduled
@@ -172,29 +168,11 @@ impl MarmotAppRuntime {
                             | AttachmentTransferState::VerifyingCiphertext
                             | AttachmentTransferState::Decrypting
                             | AttachmentTransferState::VerifyingPlaintext
-                    ) {
-                        continue;
-                    }
-                    if let Some(reference) = &status.reference
-                        && s.attachment_request_is_explicit(reference)?
+                    ) && status
+                        .automatic_media_type
+                        .as_ref()
+                        .is_some_and(|mime| !permissions.allows(&frame.store_epoch, mime))
                     {
-                        continue;
-                    }
-                    let entry = s.attachment_control_entry(
-                        &group,
-                        message,
-                        source,
-                        *index,
-                        crate::unix_now_seconds(),
-                    )?;
-                    let permission = entry.and_then(|entry| {
-                        let tag = serde_json::from_value::<Vec<String>>(entry.slot).ok()?;
-                        let reference =
-                            crate::parse_media_attachment(&tag, entry.source_epoch, loopback)
-                                .ok()?;
-                        permissions.lease(&identity, &reference.media_type)
-                    });
-                    if permission.is_none() {
                         status.state = AttachmentTransferState::Paused;
                         status.retry_at = None;
                     }
@@ -383,6 +361,7 @@ mod tests {
     fn attachment_idle_refresh_is_slow_but_never_misses_known_expiry() {
         let mut rows = vec![Some(AttachmentTransferStatus {
             reference: None,
+            automatic_media_type: None,
             state: AttachmentTransferState::Ready,
             attempt: 0,
             received: 0,

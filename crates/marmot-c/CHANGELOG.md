@@ -16,6 +16,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Fixed
 
+- Expose distinct attachment-mode and signed-out-account status codes with the matching regenerated header. ([#1939](https://github.com/marmot-protocol/mdk/pull/1939))
+
 - 0.10.3 release preflight: ordinary host-thread client free waits for embedded
   runtime workers to release resources, preventing pending SQLCipher connection
   destructors from racing process-exit cleanup. Tokio-context free remains
