@@ -13014,13 +13014,15 @@ fn build(intent: AppMessageIntent) -> MarmotInnerEvent {
 }
 
 #[test]
-fn chat_intent_builds_kind_nine_with_no_tags() {
+fn chat_intent_builds_kind_nine_with_identity_entropy() {
     let event = build(AppMessageIntent::Chat {
         content: "hello".to_owned(),
     });
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
     assert_eq!(event.content, "hello");
-    assert!(event.tags.is_empty());
+    assert_eq!(event.tags.len(), 1);
+    assert_eq!(event.tags[0][0], "nonce");
+    assert_eq!(hex::decode(&event.tags[0][1]).unwrap().len(), 16);
     assert_eq!(event.pubkey, SENDER_HEX);
 }
 

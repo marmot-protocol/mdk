@@ -3614,7 +3614,6 @@ typedef struct MarmotTimelineEditSummary {
  * One materialized timeline row.
  */
 typedef struct MarmotTimelineMessageRecord {
-  char *client_token;
   char *message_id_hex;
   bool has_reports;
   /**
@@ -3694,6 +3693,7 @@ typedef struct MarmotTimelineMessageRecord {
    * for delivered messages.
    */
   char *invalidation_status;
+  char *client_token;
 } MarmotTimelineMessageRecord;
 
 /**
