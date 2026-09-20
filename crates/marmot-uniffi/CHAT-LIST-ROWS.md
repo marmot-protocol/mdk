@@ -45,7 +45,7 @@ move chats, change pin order, alter filters or create unread activity. A draft o
 Continue using the revisioned conversation draft API for editing and sending; do
 not reconstruct a composer from the shortened list preview.
 
-## Disappearing-message previews (unreleased)
+## Disappearing-message previews (0.10.4)
 
 `ChatListMessagePreviewFfi` now carries `retention_seconds` and
 `retention_expires_at` (`retentionSeconds` / `retentionExpiresAt` in Swift/Kotlin).

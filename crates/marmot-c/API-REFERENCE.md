@@ -4718,7 +4718,7 @@ Deep-free the returned automatic-request record and its nested status/reference.
 MarmotStatus marmot_begin_attachment_permission_update(const struct MarmotClient *client, const char *account_ref, char **out);
 ```
 
-Blocking revocation and generation issuance for HostManaged mode. Inputs are borrowed; free the returned generation with marmot_string_free. Call before asynchronous policy evaluation and keep the token with that evaluation. See the [shared permission contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased).
+Blocking revocation and generation issuance for HostManaged mode. Inputs are borrowed; free the returned generation with marmot_string_free. Call before asynchronous policy evaluation and keep the token with that evaluation. See the [shared permission contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
 [Header contract](include/marmot.h#L11080)
 
@@ -4738,7 +4738,7 @@ Blocking, idempotent automatic demand for the exact source slot. Inputs are borr
 MarmotStatus marmot_set_attachment_automatic_permission(const struct MarmotClient *client, const char *account_ref, const char *generation, const struct MarmotAttachmentAutomaticPermissionInput *permission, bool *out);
 ```
 
-Blocking application of runtime-only category permission. All inputs are borrowed; boolean input integers use nonzero for true. False output means the generation was stale, foreign or already consumed. Required output validation occurs before mutation. See the [shared permission contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased).
+Blocking application of runtime-only category permission. All inputs are borrowed; boolean input integers use nonzero for true. False output means the generation was stale, foreign or already consumed. Required output validation occurs before mutation. See the [shared permission contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
 [Header contract](include/marmot.h#L11089)
 

@@ -9,6 +9,39 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-09-20
+
+Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through
+migration 89; back up before upgrade because downgrade is unsupported. See the
+[release notes](../../docs/release/0.10.4.md) and the
+[client upgrade guide](../../docs/integration/0.10.4.md).
+
+### Added
+
+- Token-aware text, reply, draft and media-send entry points provide durable local acceptance and exact caller-token
+  correlation across restart. Existing send methods retain their relay-completion semantics.
+- Optional host-managed automatic attachment acquisition adds generation-fenced network/media permission, idempotent
+  demand, bounded durable retry budgets and terminal acquisition-history states. Native automatic acquisition remains
+  the default.
+- Chat-list message previews expose the selected message's pinned retention duration and expiry.
+- WN Agent control protocol v2 can create groups with optional founding relay routes. Hermes can opt into reaction-
+  based approval decisions; this remains disabled by default.
+
+### Fixed
+
+- Deferred transport wrappers parked before MLS peel remain redeliverable instead of being retired as processed.
+- Epoch-backfill overflow failures use execution-based exponential retry backoff instead of repeatedly returning to
+  the base delay. This is a pacing mitigation, not resumable recovery.
+- Revisioned draft saves avoid unused attachment-plaintext hydration, and conversation windows can return to a
+  coherent locally accepted pending-message checkpoint before relay publication completes.
+- Automatic attachment acquisition preserves verified publication across permission changes and prevents repeated
+  downloads after terminal retention or retry outcomes.
+
+### Packaging
+
+- MarmotKit release builds now compile Android ABIs and Apple slices in parallel, verify cross-platform provenance
+  agreement, and support non-publishing build-only rehearsals. Published bundle names and layouts are unchanged.
+
 ## [0.10.3] - 2026-09-19
 
 Update generated bindings, native libraries, and C headers together for the changed prepared-row layout. Storage remains at migration 86. See [release notes](../../docs/release/0.10.3.md) and the [client upgrade guide](../../docs/integration/0.10.3.md).

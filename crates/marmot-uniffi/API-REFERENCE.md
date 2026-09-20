@@ -3994,7 +3994,7 @@ Wait for the next value; None means the observation ended. Bind one receive loop
 pub async fn begin_attachment_permission_update( &self, account_ref: String, ) -> Result<String, MarmotKitError>
 ```
 
-Revoke automatic permission for this account before asynchronous network/preference evaluation. Returns a single-use runtime/account generation. Requires HostManaged construction; do not persist the token or mint a new one from a stale callback. See the [host-managed contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased).
+Revoke automatic permission for this account before asynchronous network/preference evaluation. Returns a single-use runtime/account generation. Requires HostManaged construction; do not persist the token or mint a new one from a stale callback. See the [host-managed contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
 [Source](src/commands/attachment_controls.rs#L28)
 
@@ -4014,7 +4014,7 @@ Submit idempotent automatic demand for an authoritative original source slot. Re
 pub async fn set_attachment_automatic_permission( &self, account_ref: String, generation: String, permission: AttachmentAutomaticPermissionFfi, ) -> Result<bool, MarmotKitError>
 ```
 
-Apply media-category permission using the generation captured before evaluating host policy. False means stale, foreign or already consumed; it is not permission to retry with a fresh token. Approval is runtime-only and cannot override the durable automatic policy. See the [permission lifecycle](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased).
+Apply media-category permission using the generation captured before evaluating host policy. False means stale, foreign or already consumed; it is not permission to retry with a fresh token. Approval is runtime-only and cannot override the durable automatic policy. See the [permission lifecycle](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
 [Source](src/commands/attachment_controls.rs#L38)
 

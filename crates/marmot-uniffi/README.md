@@ -2,7 +2,7 @@
 
 UniFFI bindings for the Marmot app runtime.
 
-Host-controlled automatic downloads use the [host-managed attachment contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased), including Android WorkManager migration.
+Host-controlled automatic downloads use the [host-managed attachment contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104), including Android WorkManager migration.
 
 ## Integration guide and API reference
 
@@ -19,7 +19,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
 | [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
-| [Durable local sends](LOCAL-SENDS.md) | Unreleased early acceptance, exact optimistic-bubble correlation and retry semantics. |
+| [Durable local sends](LOCAL-SENDS.md) | 0.10.4 early acceptance, exact optimistic-bubble correlation and retry semantics. |
 | [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership. |
 
 ### What MDK owns and what the host owns

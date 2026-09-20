@@ -1,4 +1,4 @@
-# Durable local sends and caller correlation (unreleased)
+# Durable local sends and caller correlation (0.10.4)
 
 Use `send_text_with_client_token`, `reply_to_message_with_client_token`, and
 `send_message_draft_with_client_token` for a host optimistic composer. They return

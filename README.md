@@ -33,8 +33,9 @@ If you are developing Marmot itself, read these files in order:
 
 Client integrations start with the [binding integration guide](crates/marmot-uniffi/README.md#integration-guide-and-api-reference),
 [complete method reference](crates/marmot-uniffi/API-REFERENCE.md), and [C ABI guide](crates/marmot-c/README.md).
-Version-specific upgrade steps live in the [integration guides](docs/integration/README.md),
-starting with [0.10.1 → 0.10.2](docs/integration/0.10.2.md). Release checklists and the
+Version-specific upgrade steps live in the [integration guides](docs/integration/README.md).
+The latest is [0.10.3 → 0.10.4](docs/integration/0.10.4.md); read every intervening guide
+when skipping releases. Release checklists and the
 companion-document requirement live in [`release.md`](release.md).
 
 ## Repository Map

@@ -6,6 +6,7 @@ short [release notes](../release/) and the [current binding integration referenc
 
 | Upgrade | Detailed guide | Release notes |
 | --- | --- | --- |
+| 0.10.3 → 0.10.4 | [0.10.4 integration](0.10.4.md) | [0.10.4 notes](../release/0.10.4.md) |
 | 0.10.2 → 0.10.3 | [0.10.3 integration](0.10.3.md) | [0.10.3 notes](../release/0.10.3.md) |
 | 0.10.1 → 0.10.2 | [0.10.2 integration](0.10.2.md) | [0.10.2 notes](../release/0.10.2.md) |
 
