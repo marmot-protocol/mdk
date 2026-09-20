@@ -228,8 +228,7 @@ fn build_client_with_recorder(
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let audit_dir = tempfile::TempDir::new().unwrap();
     let audit_path = audit_dir.path().join("audit.jsonl");
-    let recorder =
-        marmot_forensics::JsonlRecorder::open(&audit_path, hex::encode(id).to_string()).unwrap();
+    let recorder = marmot_forensics::JsonlRecorder::open(&audit_path, hex::encode(id)).unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -1199,6 +1198,153 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
             "the {state} audit row must report this engine's epoch, not the commit's claim"
         );
     }
+}
+
+/// A past-epoch commit the device's own incoming wire-format policy refuses is
+/// rejected inside `unprotect_message` before `decrypt_message` can raise
+/// `WrongEpoch`, and `classify_process_message_rejection` maps
+/// `IncompatibleWireFormat` only for proposals — so a commit lands on the
+/// unclassified `Retryable` arm of the direct-path error match. The row that
+/// arm transitions carries the commit's source epoch; the audit row for the
+/// transition must keep reporting the device's own epoch, because
+/// `incident-replay` folds `MessageStateChanged.epoch` into the engine's
+/// position and reads a drop as a rollback.
+#[tokio::test]
+async fn commit_refused_by_the_incoming_wire_format_policy_reports_the_device_epoch() {
+    use cgka_engine::{DEFAULT_MAX_PAST_EPOCHS, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, join_config};
+    use openmls::group::{MlsGroupJoinConfig, PURE_CIPHERTEXT_WIRE_FORMAT_POLICY};
+
+    let (mut alice, alice_storage, _audit_dir, audit_path) =
+        build_client_with_recorder(b"wire-format-local");
+    let mut bob = build_client(b"wire-format-rival");
+    let mut dave = build_client(b"wire-format-invitee");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "wire-format-refusal".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // Bob commits from epoch 1; Alice advances past the rewind horizon so the
+    // commit reaches the direct-ingest path rather than convergence.
+    let dave_kp = dave.fresh_key_package().await.unwrap();
+    let late_commit = match bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![dave_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            bob.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected Bob invite GroupEvolution, got {other:?}"),
+    };
+    let advance_epochs = V1_MAX_REWIND_COMMITS + 1;
+    for i in 0..advance_epochs {
+        let pending = match alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(format!("wire-format-refusal-{i}")),
+                description: None,
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::GroupEvolution { pending, .. } => pending,
+            other => panic!("expected Alice update GroupEvolution, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+    }
+    let device_epoch = EpochId(1 + advance_epochs);
+    assert_eq!(alice.epoch(&group_id).unwrap(), device_epoch);
+
+    // Flip only the wire-format policy of Alice's own group: everything Bob's
+    // commit carries stays genuine, and the refusal comes from OpenMLS's real
+    // incoming-policy check.
+    {
+        let crypto = RustCrypto::default();
+        let provider = EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+            &crypto,
+            alice_storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mut stored = MlsGroup::load(provider.storage(), &mls_gid)
+            .expect("load Alice's MLS group")
+            .expect("Alice has group state");
+        let ratchet = *join_config(DEFAULT_MAX_PAST_EPOCHS).sender_ratchet_configuration();
+        let build = |policy| {
+            MlsGroupJoinConfig::builder()
+                .wire_format_policy(policy)
+                .max_past_epochs(DEFAULT_MAX_PAST_EPOCHS)
+                .use_ratchet_tree_extension(true)
+                .sender_ratchet_configuration(ratchet)
+                .build()
+        };
+        assert_eq!(
+            stored.configuration(),
+            &build(PURE_PLAINTEXT_WIRE_FORMAT_POLICY),
+            "only the wire-format policy may differ from the engine's own config"
+        );
+        stored
+            .set_configuration(
+                alice_storage.mls_storage(),
+                &build(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY),
+            )
+            .expect("install a ciphertext-only incoming policy");
+    }
+
+    let late_commit_id = MessageId::new(Sha256::digest(&late_commit.payload).to_vec());
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..late_commit
+    };
+    let error = alice
+        .ingest(routed)
+        .await
+        .expect_err("a handshake message the incoming policy refuses cannot be processed");
+    assert!(
+        format!("{error:?}").contains("IncompatibleWireFormat"),
+        "expected the wire-format refusal, got {error:?}"
+    );
+
+    // The row and the device really do sit at different epochs here, which is
+    // what makes the assertion below discriminating.
+    assert_eq!(
+        alice_storage.get_message(&late_commit_id).unwrap().epoch,
+        EpochId(1)
+    );
+
+    drop(alice);
+    let events = audit_events(&audit_path);
+    assert_eq!(
+        reported_epoch_for_state(&events, &late_commit_id, "retryable"),
+        Some(device_epoch.0),
+        "the retryable audit row must report this engine's epoch, not the commit's source epoch"
+    );
 }
 
 #[tokio::test]
@@ -2797,11 +2943,7 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
     // Drop the engine so the JsonlRecorder flushes on Drop, then pin the
     // forensic trail of the halt.
     drop(local);
-    let events: Vec<marmot_forensics::AuditEvent> = std::fs::read_to_string(&audit_path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let events = audit_events(&audit_path);
     assert!(
         events.iter().any(|event| matches!(
             &event.kind,
@@ -4035,6 +4177,13 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
 /// The convergence-admission door already answers the question above the same
 /// way, and must keep doing so: with the source anchor present the rival is
 /// buffered for the pass and stored at the epoch it forks from.
+///
+/// This is not a duplicate of
+/// `inbound_commit_at_the_live_epoch_takes_the_convergence_door`: there the
+/// commit's source epoch equals the device epoch, so its final assertion cannot
+/// tell a source-epoch stamp from a device-epoch one. Here they differ (source
+/// 1, device 2), which makes this the only assertion that discriminates what
+/// the convergence door stamps.
 #[tokio::test]
 async fn convergence_admitted_fork_rival_is_retained_at_the_epoch_it_forks_from() {
     let (f, mut local) = router_flip_fixture("admitted-rival-source-epoch-stamp").await;

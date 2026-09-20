@@ -1229,6 +1229,12 @@ impl<S: StorageProvider> Engine<S> {
             })
         })? {
             Ok(p) => p,
+            // Every arm below transitions a row that may carry a commit's
+            // source epoch, so all of them report `current_epoch` explicitly:
+            // `update_stored_message_state`'s default would emit the row epoch.
+            // The success-path arms further down keep the plain form, because a
+            // commit `process_message` accepted was at the live epoch and an
+            // application row is persisted at `current_epoch`.
             Err(e) if process_message_error_is_too_distant_in_the_past(&e) => {
                 // Refine the historical classification (mdk#339):
                 // below either of this copy's floors the message was never
@@ -1321,7 +1327,11 @@ impl<S: StorageProvider> Engine<S> {
                 // in-memory group the gate above already passed. Should it fire
                 // anyway, the content row stays `Failed` — and a later re-join's
                 // re-open, which takes raw transport rows only, leaves it there.
-                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                self.update_stored_message_state_reported_at(
+                    &msg.id,
+                    MessageState::Failed,
+                    current_epoch,
+                )?;
                 self.realize_self_eviction(&group_id, current_epoch)?;
                 return reported(IngestOutcome::LocalState {
                     state: LocalIngestState::Removed,
@@ -1364,7 +1374,11 @@ impl<S: StorageProvider> Engine<S> {
                         category,
                     )?);
                 }
-                self.update_stored_message_state(&msg.id, MessageState::Retryable)?;
+                self.update_stored_message_state_reported_at(
+                    &msg.id,
+                    MessageState::Retryable,
+                    current_epoch,
+                )?;
                 return Err(EngineError::Backend(format!("process_message: {e:?}")));
             }
         };
