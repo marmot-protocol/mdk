@@ -1630,9 +1630,9 @@ pub async fn group_app_component( &self, account_ref: String, group_id_hex: Stri
 
 **Current.**
 
-Read one application-owned group component from local committed MLS state. `None` is absence; a record with empty `data` is present empty state. `component_id` must lie in the private-use range and must not name a protocol-owned component, otherwise `InvalidAppComponent` is returned; use the typed profile, image, retention and policy APIs for protocol settings. Applications coordinate their own IDs and payload versioning. Reads are serialized through the account worker and may wait behind an in-flight mutation, so refresh after group events (including `EpochChanged` and convergence) and after local updates.
+Read one application-owned group component from local committed MLS state. `None` is absence; a record with empty `data` is present empty state. `component_id` must be at or above `APP_OWNED_APP_COMPONENT_ID_START` (`0xf000`), otherwise `InvalidAppComponent` is returned; use the typed profile, image, retention and policy APIs for protocol settings. The protocol registry allocates upward from `0x8001`, so an id picked merely because it is unassigned today can be taken by a later registry entry — applications allocate inside the application range instead, and version their own payloads. Reads are serialized through the account worker and may wait behind an in-flight mutation, so refresh after group events (including `EpochChanged` and convergence) and after local updates.
 
-[Source](src/commands/group.rs#L862)
+[Source](src/commands/group.rs#L864)
 
 ### `Marmot::update_app_component`
 
@@ -1642,9 +1642,9 @@ pub async fn update_app_component( &self, account_ref: String, group_id_hex: Str
 
 **Current.**
 
-Replace one optional application-owned component through an admin-authorized MLS commit. Protocol-owned IDs and components the group requires are rejected with `InvalidAppComponent`. Empty `data` stores an empty payload; it does not remove the component. The value survives message expiry and reaches newly invited members in their Welcome without sharing earlier application-message history, and unsupported clients preserve the bytes without interpreting them. Publication and convergence semantics match other group mutations: handle publication uncertainty and `GroupChangeSuperseded` rather than assuming a local change wins every later concurrent commit. The runtime does not retry an application's desired value.
+Replace one optional application-owned component through an admin-authorized MLS commit. Ids below `APP_OWNED_APP_COMPONENT_ID_START` (`0xf000`), components the group requires, and `data` longer than `APP_COMPONENT_DATA_MAX_LEN` (4096 bytes) are rejected with `InvalidAppComponent`. The value is re-encoded into the GroupContext of every later commit and into every Welcome, so this is a settings channel rather than a blob store. Empty `data` stores an empty payload; it does not remove the component. The value survives message expiry and reaches newly invited members in their Welcome without sharing earlier application-message history, and unsupported clients preserve the bytes without interpreting them. Publication and convergence semantics match other group mutations: handle publication uncertainty and `GroupChangeSuperseded` rather than assuming a local change wins every later concurrent commit. The runtime does not retry an application's desired value.
 
-[Source](src/commands/group.rs#L879)
+[Source](src/commands/group.rs#L883)
 
 ### `Marmot::update_message_retention`
 
@@ -1656,7 +1656,7 @@ pub async fn update_message_retention( &self, account_ref: String, group_id_hex:
 
 Set the per-group disappearing-message retention, wrapping the engine's `update_message_retention`. `disappearing_message_secs` of `0` disables expiry; any positive value is the retention window in seconds. Thin passthrough over the already-public engine API (mdk#571).
 
-[Source](src/commands/group.rs#L898)
+[Source](src/commands/group.rs#L902)
 
 ### `Marmot::group_recovery_status`
 
@@ -1668,7 +1668,7 @@ pub async fn group_recovery_status( &self, account_ref: String, group_id_hex: St
 
 Re-read on GroupStateUpdated; display uncertainty separately from whether the user accepted the original invitation.
 
-[Source](src/commands/group.rs#L914)
+[Source](src/commands/group.rs#L918)
 
 ### `Marmot::confirm_group_rejoin`
 
@@ -1680,7 +1680,7 @@ pub async fn confirm_group_rejoin( &self, account_ref: String, welcome_id_hex: S
 
 Call only after explicit user consent to replace the active copy. Show the offer's authenticated inviter and pass its exact id and state token.
 
-[Source](src/commands/group.rs#L929)
+[Source](src/commands/group.rs#L933)
 
 ### `Marmot::decline_group_rejoin`
 
@@ -1692,7 +1692,7 @@ pub async fn decline_group_rejoin( &self, account_ref: String, welcome_id_hex: S
 
 Decline a proposed recovery rejoin.
 
-[Source](src/commands/group.rs#L944)
+[Source](src/commands/group.rs#L948)
 
 ### `Marmot::accept_group_invite`
 
@@ -1704,7 +1704,7 @@ pub async fn accept_group_invite( &self, account_ref: String, group_id_hex: Stri
 
 Accept a pending group invitation.
 
-[Source](src/commands/group.rs#L956)
+[Source](src/commands/group.rs#L960)
 
 ### `Marmot::decline_group_invite`
 
@@ -1716,7 +1716,7 @@ pub async fn decline_group_invite( &self, account_ref: String, group_id_hex: Str
 
 Decline a pending group invitation.
 
-[Source](src/commands/group.rs#L969)
+[Source](src/commands/group.rs#L973)
 
 ### `Marmot::update_group_profile`
 
@@ -1728,7 +1728,7 @@ pub async fn update_group_profile( &self, account_ref: String, group_id_hex: Str
 
 Update the group name and description.
 
-[Source](src/commands/group.rs#L982)
+[Source](src/commands/group.rs#L986)
 
 ### `Marmot::update_group_image`
 
@@ -1740,7 +1740,7 @@ pub async fn update_group_image( &self, account_ref: String, group_id_hex: Strin
 
 Encrypt and upload a group avatar to Blossom, then commit the `marmot.group.blossom.image.v1` component. `plaintext` must contain the decoded image bytes; use `clear_group_image` to remove an existing encrypted Blossom avatar.
 
-[Source](src/commands/group.rs#L1001)
+[Source](src/commands/group.rs#L1005)
 
 ### `Marmot::clear_group_image`
 
@@ -1752,7 +1752,7 @@ pub async fn clear_group_image( &self, account_ref: String, group_id_hex: String
 
 Clear the group's encrypted Blossom avatar by committing the absent `marmot.group.blossom.image.v1` component state.
 
-[Source](src/commands/group.rs#L1019)
+[Source](src/commands/group.rs#L1023)
 
 ### `Marmot::download_group_blossom_image`
 
@@ -1764,7 +1764,7 @@ pub async fn download_group_blossom_image( &self, account_ref: String, group_id_
 
 Fetch and decrypt the group's encrypted Blossom avatar (`marmot.group.blossom.image.v1`) into raw image bytes (PNG/JPEG/…). Errors when the group has no Blossom image set. Presence and the content hash (for caching) are on `AppGroupRecordFfi::image_hash_hex`; when the group also carries a URL avatar, the URL takes precedence for rendering.
 
-[Source](src/commands/group.rs#L1038)
+[Source](src/commands/group.rs#L1042)
 
 ### `Marmot::update_group_avatar_url`
 
@@ -1776,7 +1776,7 @@ pub async fn update_group_avatar_url( &self, account_ref: String, group_id_hex: 
 
 Set (or clear, with `url = None`) the group's URL-based avatar (`marmot.group.avatar-url.v1`). The URL is validated (https-only, no localhost/private hosts) and normalized before it is committed.
 
-[Source](src/commands/group.rs#L1054)
+[Source](src/commands/group.rs#L1058)
 
 ### `Marmot::replace_encrypted_media_blob_endpoints`
 
@@ -1788,7 +1788,7 @@ pub async fn replace_encrypted_media_blob_endpoints( &self, account_ref: String,
 
 Replace the group's encrypted-media default blob endpoints as a full `marmot.group.encrypted-media.v1` component update. Requires the caller to be an admin.
 
-[Source](src/commands/group.rs#L1073)
+[Source](src/commands/group.rs#L1077)
 
 ### `Marmot::promote_admin`
 
@@ -1800,7 +1800,7 @@ pub async fn promote_admin( &self, account_ref: String, group_id_hex: String, me
 
 Grant admin rights to `member_ref` (npub or hex). Requires the caller to be an admin; publishes a group state update.
 
-[Source](src/commands/group.rs#L1093)
+[Source](src/commands/group.rs#L1097)
 
 ### `Marmot::demote_admin`
 
@@ -1812,7 +1812,7 @@ pub async fn demote_admin( &self, account_ref: String, group_id_hex: String, mem
 
 Revoke `member_ref`'s admin rights.
 
-[Source](src/commands/group.rs#L1112)
+[Source](src/commands/group.rs#L1116)
 
 ### `Marmot::self_demote_admin`
 
@@ -1824,7 +1824,7 @@ pub async fn self_demote_admin( &self, account_ref: String, group_id_hex: String
 
 Step down as an admin of `group_id_hex` (demote the active account).
 
-[Source](src/commands/group.rs#L1131)
+[Source](src/commands/group.rs#L1135)
 
 ### `Marmot::invite_members_detailed`
 
@@ -1836,7 +1836,7 @@ pub async fn invite_members_detailed( &self, account_ref: String, group_id_hex: 
 
 Same as `Self::invite_members`, returning the post-mutation group snapshot.
 
-[Source](src/commands/group.rs#L1150)
+[Source](src/commands/group.rs#L1154)
 
 ### `Marmot::invite_members_detailed_with_initial_admins`
 
@@ -1848,7 +1848,7 @@ pub async fn invite_members_detailed_with_initial_admins( &self, account_ref: St
 
 Same as `Self::invite_members_with_initial_admins`, returning the post-mutation group snapshot.
 
-[Source](src/commands/group.rs#L1167)
+[Source](src/commands/group.rs#L1171)
 
 ### `Marmot::remove_members_detailed`
 
@@ -1860,7 +1860,7 @@ pub async fn remove_members_detailed( &self, account_ref: String, group_id_hex: 
 
 Remove selected members and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1192)
+[Source](src/commands/group.rs#L1196)
 
 ### `Marmot::promote_admin_detailed`
 
@@ -1872,7 +1872,7 @@ pub async fn promote_admin_detailed( &self, account_ref: String, group_id_hex: S
 
 Promote selected members and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1211)
+[Source](src/commands/group.rs#L1215)
 
 ### `Marmot::demote_admin_detailed`
 
@@ -1884,7 +1884,7 @@ pub async fn demote_admin_detailed( &self, account_ref: String, group_id_hex: St
 
 Demote selected administrators and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1230)
+[Source](src/commands/group.rs#L1234)
 
 ### `Marmot::self_demote_admin_detailed`
 
@@ -1896,7 +1896,7 @@ pub async fn self_demote_admin_detailed( &self, account_ref: String, group_id_he
 
 Demote the current account and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1249)
+[Source](src/commands/group.rs#L1253)
 
 ### `Marmot::group_mls_state`
 
@@ -1908,7 +1908,7 @@ pub async fn group_mls_state( &self, account_ref: String, group_id_hex: String, 
 
 Current MLS state (epoch, member count, required components) for the conversation developer/debug view.
 
-[Source](src/commands/group.rs#L1269)
+[Source](src/commands/group.rs#L1273)
 
 ### `Marmot::quarantined_groups`
 
@@ -1920,7 +1920,7 @@ pub async fn quarantined_groups( &self, account_ref: String, ) -> Result<Vec<App
 
 Stored groups that failed session-open hydration and were skipped so the rest of the account could open (mdk#151 / #417). These groups are not in the live roster and otherwise vanish from the account with no explanation; surface them in a per-group recovery flow (mdk#426) distinct from healthy and archived groups, using `reason` to pick the per-reason guidance, and offer `Self::retry_hydrate_quarantined_group`.
 
-[Source](src/commands/group.rs#L1289)
+[Source](src/commands/group.rs#L1293)
 
 ### `Marmot::retry_hydrate_quarantined_group`
 
@@ -1932,7 +1932,7 @@ pub async fn retry_hydrate_quarantined_group( &self, account_ref: String, group_
 
 Re-attempt hydration of a single quarantined group (mdk#426).
 
-[Source](src/commands/group.rs#L1305)
+[Source](src/commands/group.rs#L1309)
 
 ### `Marmot::set_group_archived`
 
@@ -1944,7 +1944,7 @@ pub async fn set_group_archived( &self, account_ref: String, group_id_hex: Strin
 
 Flag a group archived (or restore it). Local-only projection state — it does not change membership or publish anything. The chats list filters archived groups unless `include_archived` is set.
 
-[Source](src/commands/group.rs#L1320)
+[Source](src/commands/group.rs#L1324)
 
 ### `Marmot::group_maintenance_status`
 
@@ -1956,7 +1956,7 @@ pub async fn group_maintenance_status( &self, account_ref: String, group_id_hex:
 
 Inspect maintenance status for a group.
 
-[Source](src/commands/group.rs#L1335)
+[Source](src/commands/group.rs#L1339)
 
 ### `Marmot::key_package_maintenance_status`
 
@@ -1968,7 +1968,7 @@ pub async fn key_package_maintenance_status( &self, account_ref: String, ) -> Re
 
 Inspect account KeyPackage maintenance status.
 
-[Source](src/commands/group.rs#L1348)
+[Source](src/commands/group.rs#L1352)
 
 ### `Marmot::schedule_group_self_update`
 
@@ -1980,7 +1980,7 @@ pub async fn schedule_group_self_update( &self, account_ref: String, group_id_he
 
 Schedule a group self-update.
 
-[Source](src/commands/group.rs#L1359)
+[Source](src/commands/group.rs#L1363)
 
 ### `Marmot::periodic_maintenance_policy`
 
@@ -1992,7 +1992,7 @@ pub async fn periodic_maintenance_policy( &self, account_ref: String, ) -> Resul
 
 Read periodic maintenance policy.
 
-[Source](src/commands/group.rs#L1371)
+[Source](src/commands/group.rs#L1375)
 
 ### `Marmot::set_periodic_maintenance_policy`
 
@@ -2004,7 +2004,7 @@ pub async fn set_periodic_maintenance_policy( &self, account_ref: String, policy
 
 Set periodic maintenance policy.
 
-[Source](src/commands/group.rs#L1382)
+[Source](src/commands/group.rs#L1386)
 
 ### `Marmot::pause_maintenance`
 
@@ -2016,7 +2016,7 @@ pub async fn pause_maintenance(&self, account_ref: String) -> Result<(), MarmotK
 
 Pause maintenance for an account.
 
-[Source](src/commands/group.rs#L1393)
+[Source](src/commands/group.rs#L1397)
 
 ### `Marmot::resume_maintenance`
 
@@ -2028,7 +2028,7 @@ pub async fn resume_maintenance(&self, account_ref: String) -> Result<(), Marmot
 
 Resume maintenance for an account.
 
-[Source](src/commands/group.rs#L1397)
+[Source](src/commands/group.rs#L1401)
 
 ### `Marmot::run_due_maintenance`
 
@@ -2040,7 +2040,7 @@ pub async fn run_due_maintenance( &self, account_ref: String, ) -> Result<Mainte
 
 Run due maintenance for an account.
 
-[Source](src/commands/group.rs#L1401)
+[Source](src/commands/group.rs#L1405)
 
 </details>
 

@@ -6206,8 +6206,9 @@ MarmotStatus marmot_update_message_retention(const struct MarmotClient *client,
 /**
  * Read application-owned local group state. An absent component writes
  * NULL to `*out` and still returns `MARMOT_STATUS_OK`; a written record
- * with zero `data_len` is present empty state. Refresh on group events.
- * Free with `marmot_app_component_free`.
+ * with zero `data_len` is present empty state. Ids below 0xf000 are
+ * protocol space and are rejected. Refresh on group events. Free with
+ * `marmot_group_app_component_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -8507,7 +8508,9 @@ MarmotStatus marmot_record_host_performance(const struct MarmotClient *client,
 
 /**
  * Replace an optional application-owned component through an admin MLS commit.
- * Rejects protocol-owned and required IDs. Empty bytes are stored, not removed.
+ * Rejects ids below 0xf000, required components, and `data_len` over 4096.
+ * Empty bytes are stored, not removed. The value is re-encoded into every
+ * later commit and Welcome, so keep it small.
  * Free the returned summary with `marmot_send_summary_free`.
  *
  * # Safety
@@ -10469,7 +10472,7 @@ void marmot_event_free(struct MarmotEvent *event);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
-void marmot_app_component_free(struct MarmotGroupAppComponent *ptr);
+void marmot_group_app_component_free(struct MarmotGroupAppComponent *ptr);
 
 /**
  * Free a disband request returned by `marmot_disband_group`. NULL is a

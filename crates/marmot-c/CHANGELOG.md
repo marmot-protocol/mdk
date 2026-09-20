@@ -83,12 +83,16 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 ### Added
 
 - `marmot_group_app_component` and admin-only `marmot_update_app_component`
-  expose opaque optional group state for application-owned private-use IDs.
-  Protocol-owned and required component IDs cannot be updated through this API.
-  An absent component writes NULL to `*out` and still returns OK; present
-  empty data writes a record with zero length.
-  Release records with `marmot_app_component_free`. Invalid component IDs return
-  the appended `MARMOT_STATUS_INVALID_APP_COMPONENT` status (93).
+  expose opaque optional group state for application-owned component IDs.
+  Applications allocate IDs at or above `0xf000`; every ID below that is
+  protocol space and is rejected, so a component the registry assigns later
+  can never collide with one an application already committed. Required
+  components cannot be updated through this API, and `data_len` is capped at
+  4096 bytes because the value is re-encoded into every later commit and every
+  Welcome. An absent component writes NULL to `*out` and still returns OK;
+  present empty data writes a record with zero length.
+  Release records with `marmot_group_app_component_free`. Invalid component IDs
+  return the appended `MARMOT_STATUS_INVALID_APP_COMPONENT` status (95).
   Existing record layouts and status values are unchanged.
 
 - `MarmotClientOptions` and `marmot_client_new_with_configuration` combine relay

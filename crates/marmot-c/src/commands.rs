@@ -713,8 +713,9 @@ c_cmd! {
 
     /// Read application-owned local group state. An absent component writes
     /// NULL to `*out` and still returns `MARMOT_STATUS_OK`; a written record
-    /// with zero `data_len` is present empty state. Refresh on group events.
-    /// Free with `marmot_app_component_free`.
+    /// with zero `data_len` is present empty state. Ids below 0xf000 are
+    /// protocol space and are rejected. Refresh on group events. Free with
+    /// `marmot_group_app_component_free`.
     async fn marmot_group_app_component(account_ref: str, group_id_hex: str, component_id: val u16) -> opt_rec(MarmotGroupAppComponent) = group_app_component;
 
     /// Query advisory membership health and pending rejoin offers.
@@ -2487,7 +2488,9 @@ pub unsafe extern "C" fn marmot_record_host_performance(
 }
 
 /// Replace an optional application-owned component through an admin MLS commit.
-/// Rejects protocol-owned and required IDs. Empty bytes are stored, not removed.
+/// Rejects ids below 0xf000, required components, and `data_len` over 4096.
+/// Empty bytes are stored, not removed. The value is re-encoded into every
+/// later commit and Welcome, so keep it small.
 /// Free the returned summary with `marmot_send_summary_free`.
 ///
 /// # Safety

@@ -8,11 +8,12 @@ use cgka_traits::app_components::{
     GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    GroupLifecycleV1, GroupProfileV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, decode_components_list,
-    decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2, decode_group_avatar_url_v1,
-    decode_group_blossom_image_v1, decode_group_lifecycle_v1, decode_group_profile_v1,
-    decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors, encode_components_list,
+    GroupLifecycleV1, GroupProfileV1, MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, PROTOCOL_OWNED_APP_COMPONENT_IDS,
+    SAFE_AAD_COMPONENT_ID, decode_components_list, decode_encrypted_media_policy_v1,
+    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
+    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
+    decode_quic_varint, encode_component_vectors, encode_components_list,
     encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::engine::CommitOrderingPriority;
@@ -47,6 +48,13 @@ pub const CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS: [AppComponent
     [GROUP_ADMIN_POLICY_COMPONENT_ID];
 pub const CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
     [ACCOUNT_IDENTITY_PROOF_COMPONENT_ID];
+
+/// Protocol components that never carry persistent dictionary state at all.
+/// The multi-device join authorization rides one `AppEphemeral` proposal and
+/// the registry makes it invalid as GroupContext data, so it has no
+/// GroupContext format to validate.
+const CURRENT_PROFILE_EPHEMERAL_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
+    [MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InitialComponentState {
@@ -1143,11 +1151,13 @@ fn required_app_components_of_extensions(
 }
 
 fn is_known_group_component(component_id: AppComponentId) -> bool {
-    // Protocol-owned minus the leaf-only account proof, which never carries
-    // GroupContext state. Reading the canonical list keeps a newly assigned
-    // component id format-validated without editing this function.
+    // Protocol-owned minus the ids that carry no GroupContext state at all:
+    // the leaf-only account proof and the ephemeral-only join authorization.
+    // Reading the canonical list keeps a newly assigned component id
+    // format-validated without editing this function.
     PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(&component_id)
         && !CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(&component_id)
+        && !CURRENT_PROFILE_EPHEMERAL_ONLY_APP_COMPONENTS.contains(&component_id)
 }
 
 pub(crate) fn ratchet_tree_nodes(

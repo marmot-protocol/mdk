@@ -178,12 +178,28 @@ places; re-setting the group image on a current build republishes it to the curr
 
 ## Application-owned group state
 
-`MarmotAppRuntime::group_app_component` reads opaque private-use component
-bytes from local MLS state; `update_app_component` replaces one optional
-component through an admin-authorized MLS commit. The same methods are exported
-by UniFFI and C. Applications coordinate their own component IDs and version
-their payloads. Protocol-owned IDs and updates to required components are
-rejected; use the existing typed APIs for protocol settings.
+`MarmotAppRuntime::group_app_component` reads opaque application-owned
+component bytes from local MLS state; `update_app_component` replaces one
+optional component through an admin-authorized MLS commit. The same methods are
+exported by UniFFI and C. Updates to required components are rejected; use the
+existing typed APIs for protocol settings.
+
+Applications allocate their own component ids at or above
+`APP_OWNED_APP_COMPONENT_ID_START` (`0xf000`) and version their own payloads.
+Ids below that boundary are refused. The boundary exists because the protocol
+registry allocates upward from `0x8001` and is still growing: an application
+that picked the next unassigned private-use id would have that id assigned out
+from under it by a later registry entry, which both breaks its own writes and
+starts applying protocol format validation to bytes already committed in live
+groups. Nothing coordinates ids between applications, so treat the range as
+first-come and version the payload.
+
+Payloads are capped at `APP_COMPONENT_DATA_MAX_LEN` (4096 bytes). Component
+state is re-encoded into the GroupContext of every later commit and into the
+GroupInfo of every Welcome, so an oversized value inflates every commit and can
+push a Welcome past a relay's event-size limit — after the commit is already
+staged. This is a settings channel, not a blob store; put bulk data behind a
+reference.
 
 An absent component returns `None`; a present empty payload returns
 `Some(Vec::new())`. Empty payloads do not remove a component. The state survives

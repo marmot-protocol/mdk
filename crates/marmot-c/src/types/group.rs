@@ -24,7 +24,7 @@ use crate::memory::{CFree, optional_str, required_str};
 
 c_mirror! {
     /// Opaque application-owned group state. Empty data is distinct from absence.
-    MarmotGroupAppComponent from GroupAppComponentFfi, free marmot_app_component_free {
+    MarmotGroupAppComponent from GroupAppComponentFfi, free marmot_group_app_component_free {
         copy component_id: u16,
         bytes data/data_len,
     }
@@ -382,9 +382,9 @@ mod tests {
                     data
                 );
             }
-            unsafe { marmot_app_component_free(boxed(mirror)) };
+            unsafe { marmot_group_app_component_free(boxed(mirror)) };
         }
-        unsafe { marmot_app_component_free(std::ptr::null_mut()) };
+        unsafe { marmot_group_app_component_free(std::ptr::null_mut()) };
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), start);
     }

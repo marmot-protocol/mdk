@@ -3126,11 +3126,29 @@ async fn app_component_lifecycle() {
     );
 
     let epoch = runtime.group_mls_state(&alice, &group).await.unwrap().epoch;
-    let reserved = runtime
-        .update_app_component(&alice, &group, 0x8003, vec![])
+    // Protocol space: an assigned id, the draft multi-device-join id the
+    // registry already owns, and the registry's next unassigned id. All three
+    // are below the application range and none of them reaches an MLS commit.
+    for protocol_id in [0x8003, 0x800a, 0x800d] {
+        let reserved = runtime
+            .update_app_component(&alice, &group, protocol_id, vec![])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(reserved, AppError::InvalidAppComponent(_)),
+            "{protocol_id:#06x} must be refused"
+        );
+    }
+    let oversized = runtime
+        .update_app_component(
+            &alice,
+            &group,
+            COMPONENT,
+            vec![0u8; cgka_traits::app_components::APP_COMPONENT_DATA_MAX_LEN + 1],
+        )
         .await
         .unwrap_err();
-    assert!(matches!(reserved, AppError::InvalidAppComponent(_)));
+    assert!(matches!(oversized, AppError::InvalidAppComponent(_)));
     let forbidden = runtime
         .update_app_component(&bob, &group, COMPONENT, vec![1, 1])
         .await
