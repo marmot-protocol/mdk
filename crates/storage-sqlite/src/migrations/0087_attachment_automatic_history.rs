@@ -31,6 +31,38 @@ mod tests {
     use crate::migrations::{MIGRATIONS, run};
 
     #[test]
+    fn attachment_permission_backfill_matches_shared_classifier() {
+        let media_types = [
+            "image/png",
+            "VIDEO/mp4",
+            "audio/ogg",
+            "application/pdf",
+            "",
+            "unknown",
+            " image /jpeg",
+            "video",
+            "text/plain",
+            "IMAGE/SVG+XML",
+        ];
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..86]).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        for (index, mime) in media_types.iter().enumerate() {
+            let slot = serde_json::json!(["imeta", format!("m {mime}")]).to_string();
+            conn.execute("INSERT INTO attachment_acquisition(token,group_id_hex,message_id_hex,attachment_index,source_message_id_hex,source_epoch,slot_json,plaintext_digest,due)
+                VALUES(randomblob(16),'g','m',?1,'s',1,?2,randomblob(32),0)", rusqlite::params![index as i64, slot]).unwrap();
+        }
+        run(&mut conn, MIGRATIONS).unwrap();
+        for (index, mime) in media_types.iter().enumerate() {
+            let category: u8 = conn.query_row("SELECT permission_category FROM attachment_acquisition WHERE attachment_index=?1", [index as i64], |r| r.get(0)).unwrap();
+            assert_eq!(
+                category,
+                crate::AttachmentPermissionCategory::from_media_type(mime) as u8
+            );
+        }
+    }
+
+    #[test]
     fn upgrade_preserves_jobs_with_large_historical_backoff_counters() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         run(&mut conn, &MIGRATIONS[..86]).unwrap();

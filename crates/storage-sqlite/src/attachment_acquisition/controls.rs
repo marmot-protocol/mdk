@@ -103,6 +103,15 @@ impl SqliteAccountStorage {
         if !allowed_categories.into_iter().any(|allowed| allowed) {
             return Ok(0);
         }
+        // The common worker tick stays read-only. A concurrent pause after this
+        // check is picked up by the next tick; the transaction reselects rows.
+        let paused: bool = self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE permission_paused=1 AND state=5)",
+            [], |row| row.get(0),
+        ).storage()?;
+        if !paused {
+            return Ok(0);
+        }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let mut tokens = Vec::new();

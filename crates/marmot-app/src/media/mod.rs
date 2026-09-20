@@ -1066,7 +1066,7 @@ pub(crate) async fn download_encrypted_media_classified(
     // On success, ownership moves into the publication result below.
     let mut plaintext = zeroize::Zeroizing::new(plaintext);
     if let Some(resume) = &transport.resume {
-        resume.completed_body().await?;
+        resume.completed_body(plaintext.len()).await?;
     }
     let plaintext = std::mem::take(&mut *plaintext);
     Ok(MediaDownloadResult {

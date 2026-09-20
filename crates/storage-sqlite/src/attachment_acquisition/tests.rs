@@ -2594,3 +2594,84 @@ fn attachment_permission_readmission_is_bounded_and_skips_denied_categories() {
         0
     );
 }
+
+#[test]
+fn attachment_terminal_failure_clears_permission_pause() {
+    for opted_in in [false, true] {
+        for exhausted in [false, true] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            seed(&store, "one");
+            let asset = request(&store, "one");
+            if opted_in {
+                store.enable_attachment_automatic_history(&asset).unwrap();
+            }
+            let job = store
+                .claim_attachment_acquisition(&asset, 12, 100)
+                .unwrap()
+                .unwrap();
+            if exhausted {
+                for _ in 0..64 {
+                    assert!(store.begin_attachment_network_attempt(&job, 12).unwrap());
+                }
+            }
+            store.pause_automatic_attachments(13).unwrap();
+            // Cover hard failure and the exhausted-budget terminal arm.
+            let retry = (opted_in && exhausted).then_some(30);
+            assert!(store.fail_attachment_acquisition(&job, retry).unwrap());
+            let paused: bool = store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT permission_paused FROM attachment_acquisition",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!paused);
+            assert_eq!(
+                transfer(&store, "one", true).state,
+                if opted_in && exhausted {
+                    AttachmentTransferState::RetryExhausted
+                } else {
+                    AttachmentTransferState::Failed
+                }
+            );
+            assert_eq!(
+                store.resume_permitted_attachments(40, [true; 4]).unwrap(),
+                0
+            );
+            assert!(
+                store
+                    .due_attachment_acquisitions(40, 64)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn attachment_repeated_demand_does_not_rewrite_permission_category() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    request(&store, "one");
+    let before = store.lock().unwrap().total_changes();
+    request(&store, "one");
+    assert_eq!(store.lock().unwrap().total_changes(), before);
+}
+
+#[test]
+fn attachment_idle_permission_resume_is_read_only() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    request(&store, "one");
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("PRAGMA query_only=ON")
+        .unwrap();
+    assert_eq!(
+        store.resume_permitted_attachments(12, [true; 4]).unwrap(),
+        0
+    );
+}

@@ -19,7 +19,8 @@ or obsolete sources; it is **not** a download failure, progress event or request
 An available empty file has a non-null reference and a zero byte count.
 
 The call loads no payload bytes and starts no download or engine worker. Automatic
-acquisition defaults on when the account runtime is running; use the C8-D2 controls below
+acquisition defaults on in `NativeAutomatic` mode when the account runtime is running.
+`HostManaged` starts denied until the host grants permission. Use the C8-D2 controls below
 to observe transfers, remove local files, or change the durable per-account policy.
 Local access is useful only when MDK has acquired/published the bytes. Coordinate client
 adoption of those controls with the binding release (C9); publishing an MDK release alone
@@ -100,7 +101,7 @@ cannot download attachments before acceptance. These commands persist intent wit
 network readiness; acquisition needs an active, non-frozen account runtime.
 
 `attachmentDownloadPolicy` / `setAttachmentDownloadPolicy` read/write a durable per-account
-policy. Automatic acquisition defaults on: 2 GiB retained quota, 256 MiB free-disk reserve plus
+policy. In `NativeAutomatic` mode automatic acquisition defaults on: 2 GiB retained quota, 256 MiB free-disk reserve plus
 SQLite/WAL headroom, 64 MiB automatic ciphertext ceiling, one runtime-wide acquisition at a time.
 Explicit queued downloads use the existing 512 MiB hard limit and 15-minute transfer deadline.
 Initial disk/quota admission reserves the automatic cap (64 MiB by default), then checkpoint
@@ -128,8 +129,8 @@ The default remains `NativeAutomatic` for existing consumers. Host-managed mode
 never turns projection discovery into automatic demand. Both modes use the same
 SQLite jobs, source history, quotas, local reads and explicit controls. The new
 retry budgets and terminal retention-failure behavior apply only to jobs opted in
-through `requestAutomaticAttachment` or claimed by a HostManaged worker (including
-restored persisted jobs). Existing native jobs keep
+through `requestAutomaticAttachment` or claimed as automatic work by a HostManaged worker (including
+restored persisted jobs). Pure explicit requests are not opted in. Existing native jobs keep
 their retry behavior; opting a job in is durable even if runtime mode later changes.
 
 Host-managed automatic permission starts denied for every account on each runtime
@@ -200,7 +201,9 @@ replenish these budgets. A deliberate explicit Retry/download-again starts a new
 bounded cycle when not already fetching. Explicit retries of an opted-in job bypass
 automatic permission, not its budget. A completed verified body has one receipt owner
 before publication; insufficient retention capacity or publication failure is terminal
-for opted-in jobs. Resource pressure before fetching can defer admission without
+for opted-in jobs. The free-disk check runs before the receipt; a transient shortage
+there schedules a bounded retry without recording successful acquisition. Resource pressure
+before fetching can defer admission without
 spending an attempt. If receipt storage fails, the persisted budgets still bound
 subsequent fetches. A size-policy failure remains `PolicyBlocked` even if the budget
 is exhausted; raising the size cap does not replenish that budget, so explicit retry

@@ -28,7 +28,7 @@ pub(crate) struct AttachmentResume {
     pub ciphertext_digest: [u8; 32],
     pub budget: u64,
     pub directory: PathBuf,
-    pub disk_reserve: u64,
+    pub policy: storage_sqlite::AttachmentDownloadPolicy,
     pub automatic: bool,
     pub permission: Option<crate::runtime::attachment_permission::PermissionLease>,
     /// Once verification finishes, cancellation waits for the receipt and result.
@@ -88,16 +88,33 @@ impl AttachmentResume {
         }
         Ok(())
     }
-    pub(crate) async fn completed_body(&self) -> Result<(), AttachmentDownloadFailure> {
+    pub(crate) async fn completed_body(
+        &self,
+        plaintext_len: usize,
+    ) -> Result<(), AttachmentDownloadFailure> {
         self.finishing.store(true, Ordering::Release);
         let this = self.clone();
         let recorded = tokio::task::spawn_blocking(move || {
+            // Defer transient disk pressure before recording a completed receipt.
+            // Stable retention quota failures after this boundary remain terminal.
+            let policy = this
+                .storage
+                .attachment_download_policy(&this.policy)
+                .map_err(|_| retry("attachment publication policy unavailable"))?;
+            let free = fs4::available_space(&this.directory).unwrap_or(0);
+            if free
+                < policy
+                    .disk_reserve
+                    .saturating_add((plaintext_len as u64).saturating_mul(4))
+            {
+                return Err(retry("insufficient disk space for attachment publication"));
+            }
             this.storage
                 .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
+                .map_err(|_| stop("attachment receipt failed"))
         })
         .await
-        .map_err(|_| stop("attachment receipt task failed"))?
-        .map_err(|_| stop("attachment receipt failed"))?;
+        .map_err(|_| stop("attachment receipt task failed"))??;
         if !recorded {
             return Err(stop("attachment receipt superseded"));
         }
@@ -203,6 +220,7 @@ impl AttachmentResume {
             let free = fs4::available_space(&this.directory).unwrap_or(0);
             if free
                 < this
+                    .policy
                     .disk_reserve
                     .saturating_add(4 * ATTACHMENT_CHECKPOINT_BYTES as u64)
             {

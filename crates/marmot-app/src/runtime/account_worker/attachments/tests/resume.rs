@@ -83,7 +83,12 @@ fn resume_context(
             .unwrap(),
         budget: 128 * 1024 * 1024,
         directory: dir.into(),
-        disk_reserve: 0,
+        policy: storage_sqlite::AttachmentDownloadPolicy {
+            automatic: true,
+            retained_bytes: 128 * 1024 * 1024,
+            disk_reserve: 0,
+            transfer_limit: 64 * 1024 * 1024,
+        },
     }
 }
 async fn headers(socket: &mut tokio::net::TcpStream) -> String {
@@ -802,7 +807,7 @@ async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
     let (client, store) = client_at(dir.path(), &reference, true).await;
     let job = claim(&store);
     let mut context = resume_context(&store, &job, dir.path(), &reference);
-    context.disk_reserve = u64::MAX; // Any unnecessary checkpoint would refuse.
+    context.budget = 0; // Any unnecessary checkpoint would refuse.
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
@@ -1597,4 +1602,64 @@ async fn attachment_revocation_waits_for_in_progress_verified_receipt() {
     assert!(!task.is_finished());
     release.send(()).unwrap();
     assert_eq!(task.await.unwrap().unwrap().plaintext, b"verified");
+}
+
+#[tokio::test]
+async fn attachment_transient_disk_pressure_defers_before_receipt() {
+    let body = b"disk pressure can recover";
+    let (listener, reference, cipher) = listener_fixture(body).await;
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            headers(&mut socket).await;
+            respond(&mut socket, "200 OK", "", &cipher, cipher.len()).await;
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at_with_mode(
+        dir.path(),
+        &reference,
+        true,
+        crate::AttachmentAcquisitionMode::HostManaged,
+    )
+    .await;
+    opt_in(&client).await;
+    let job = claim(&store);
+    let mut context = resume_context(&store, &job, dir.path(), &reference);
+    context.policy.disk_reserve = i64::MAX as u64 / 2;
+    let group = GroupId::new(vec![0xab; 16]);
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let result = prepared.run_classified(context).await;
+    assert!(matches!(&result, Err(AttachmentDownloadFailure::Retry(_))));
+    complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+    let status = store
+        .attachment_acquisition_status(&job.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::RetryScheduled
+    );
+    let due = status.due.unwrap();
+    let next = store
+        .claim_attachment_acquisition(&job.reference, due, due + 180)
+        .unwrap()
+        .unwrap();
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let result = prepared
+        .run_classified(resume_context(&store, &next, dir.path(), &reference))
+        .await;
+    assert!(result.is_ok());
+    complete(&client, &next, result, 128 * 1024 * 1024).unwrap();
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        body.len() as u64
+    );
+    server.await.unwrap();
 }

@@ -47,18 +47,11 @@ pub enum AttachmentPageRead {
 }
 
 pub(crate) fn category(media_type: &str) -> AttachmentCategory {
-    match media_type
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "image" => AttachmentCategory::Image,
-        "video" => AttachmentCategory::Video,
-        "audio" => AttachmentCategory::Audio,
-        _ => AttachmentCategory::File,
+    match storage_sqlite::AttachmentPermissionCategory::from_media_type(media_type) {
+        storage_sqlite::AttachmentPermissionCategory::Image => AttachmentCategory::Image,
+        storage_sqlite::AttachmentPermissionCategory::Video => AttachmentCategory::Video,
+        storage_sqlite::AttachmentPermissionCategory::Audio => AttachmentCategory::Audio,
+        storage_sqlite::AttachmentPermissionCategory::File => AttachmentCategory::File,
     }
 }
 

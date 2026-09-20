@@ -2,7 +2,10 @@
 //! the account worker; HTTP/crypto use the existing cancellable media executor.
 use super::*;
 use crate::media::AttachmentDownloadFailure;
-use storage_sqlite::{AttachmentAcquisition, AttachmentPublishResult, SqliteAccountStorage};
+use storage_sqlite::{
+    ATTACHMENT_ACQUISITION_BATCH_LIMIT, AttachmentAcquisition, AttachmentPublishResult,
+    SqliteAccountStorage,
+};
 
 const DEMAND_BATCH: usize = 32;
 // Background HTTP has a two-minute whole-transfer deadline. Leave publication margin.
@@ -159,7 +162,7 @@ pub(super) fn schedule(
     } else {
         0
     };
-    let more = resumed == 64
+    let more = resumed == ATTACHMENT_ACQUISITION_BATCH_LIMIT
         || (policy.automatic
             && !host_managed
             && admit_demands(
@@ -270,7 +273,7 @@ pub(super) fn schedule(
         if permission.as_ref().is_some_and(|p| !p.allowed()) {
             continue;
         }
-        if host_managed {
+        if host_managed && !explicit {
             storage.enable_attachment_automatic_history(&candidate)?;
         }
         let Some(job) = storage.claim_attachment_acquisition(
@@ -292,7 +295,7 @@ pub(super) fn schedule(
             ciphertext_digest,
             budget: byte_budget,
             directory: client.app.account_dir(&client.state.label),
-            disk_reserve: policy.disk_reserve,
+            policy: policy.clone(),
             automatic: !explicit,
             permission: permission.clone(),
             finishing: Default::default(),
@@ -368,19 +371,10 @@ pub(super) fn complete(
                 storage.fail_attachment_acquisition(job, None)?;
                 return Ok(());
             }
-            // Other writers may consume disk while HTTP is in flight. Recheck
-            // before starting a full-object SQLite write, without evicting data.
             let policy = storage.attachment_download_policy(
                 &super::super::attachment_controls::default_policy(&client.app.config),
             )?;
-            let reserve = policy.disk_reserve;
             let byte_budget = byte_budget.min(policy.retained_bytes);
-            let free =
-                fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
-            if free < reserve.saturating_add((plaintext.len() as u64).saturating_mul(4)) {
-                storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
-                return Ok(());
-            }
             match storage.complete_attachment_acquisition(job, &plaintext, now, byte_budget) {
                 Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
                 Ok(AttachmentPublishResult::CapacityBlocked) | Err(_) => {

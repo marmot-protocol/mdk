@@ -274,6 +274,10 @@ async fn download_without_engine_and_retain(explicit: bool) {
         "eligible job must queue for global capacity"
     );
     if explicit {
+        // Pure explicit work must retain native retry behavior in HostManaged,
+        // even though it passes through the same worker as automatic demand.
+        client.app.config.attachment_acquisition_mode =
+            crate::AttachmentAcquisitionMode::HostManaged;
         let now = crate::unix_now_seconds();
         let asset = storage
             .attachment_transfer_candidates(now, 1, true)
@@ -308,6 +312,18 @@ async fn download_without_engine_and_retain(explicit: bool) {
         MediaHttpCompletion::Attachment { job, .. } => job.reference.clone(),
         _ => panic!("attachment"),
     };
+    if explicit {
+        let MediaHttpCompletion::Attachment { job, .. } = &done.completion else {
+            panic!("attachment");
+        };
+        // A receipt on an opted-in job forbids any further automatic attempt.
+        // This pure explicit job must not have acquired that contract.
+        assert!(
+            storage
+                .begin_attachment_network_attempt(job, crate::unix_now_seconds())
+                .unwrap()
+        );
+    }
     complete_media_http(&mut client, done, &shared, &http).await;
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
     assert_eq!(

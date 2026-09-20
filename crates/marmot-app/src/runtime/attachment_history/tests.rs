@@ -286,6 +286,9 @@ fn attachment_discovery_legacy_epoch_and_categories_preserve_parser_verdicts() {
             panic!("accepted")
         };
         assert_eq!(*attachment_index, 9);
+        // Storage classifies the raw m field; parser-based permission leases
+        // must see that same verbatim MIME value.
+        assert_eq!(reference.media_type, mime);
         assert_eq!(
             *reference,
             crate::parse_media_attachment(&raw, None, false).unwrap()

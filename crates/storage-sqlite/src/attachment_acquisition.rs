@@ -18,6 +18,35 @@ pub const MAX_ATTACHMENT_LOCAL_READ_BYTES: usize = 1024 * 1024;
 pub const ATTACHMENT_ACQUISITION_BATCH_LIMIT: usize = 64;
 const MAX_DESCRIPTOR_BYTES: usize = 16384;
 
+/// Shared permission buckets. Discriminants are persisted by migration 0087.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AttachmentPermissionCategory {
+    Image = 0,
+    Video = 1,
+    Audio = 2,
+    File = 3,
+}
+impl AttachmentPermissionCategory {
+    /// Classify the verbatim `m ` field preserved by the media parser. Unknown
+    /// families are files; parser rejection remains a separate admission gate.
+    pub fn from_media_type(media_type: &str) -> Self {
+        match media_type
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "image" => Self::Image,
+            "video" => Self::Video,
+            "audio" => Self::Audio,
+            _ => Self::File,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentAssetRef {
     store_epoch: Vec<u8>,
@@ -320,10 +349,10 @@ impl SqliteAccountStorage {
             conn.execute(
                 "INSERT INTO attachment_acquisition(
                     token,group_id_hex,message_id_hex,attachment_index,
-                    source_message_id_hex,source_epoch,slot_json,plaintext_digest,expires_at,due)
-                 VALUES(randomblob(16),?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                    source_message_id_hex,source_epoch,slot_json,plaintext_digest,expires_at,due,permission_category)
+                 VALUES(randomblob(16),?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(group_id_hex,message_id_hex,attachment_index)
-                 DO UPDATE SET state=0,due=excluded.due
+                 DO UPDATE SET state=0,due=excluded.due,permission_category=excluded.permission_category
                  WHERE attachment_acquisition.state=5 AND attachment_acquisition.cancelled=0 AND (attachment_acquisition.automatic_history=0 OR (attachment_acquisition.body_completed=0 AND attachment_acquisition.network_attempts<64 AND attachment_acquisition.acquisition_attempts<4)) AND attachment_acquisition.permission_paused=0",
                 params![
                     group,
@@ -334,17 +363,11 @@ impl SqliteAccountStorage {
                     slot,
                     &plaintext_digest[..],
                     expires,
-                    now
+                    now,
+                    AttachmentPermissionCategory::from_media_type(&controls::slot_media_type(&slot)) as u8
                 ],
             )
             .storage()?;
-            let media_type = controls::slot_media_type(&slot);
-            let category = match media_type.split('/').next().unwrap_or("").trim().to_ascii_lowercase().as_str() {
-                "image" => 0, "video" => 1, "audio" => 2, _ => 3,
-            };
-            conn.execute("UPDATE attachment_acquisition SET permission_category=?4
-                WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
-                params![group,message,index,category]).storage()?;
             let token = conn
                 .query_row(
                     "SELECT token FROM attachment_acquisition
@@ -634,7 +657,7 @@ impl SqliteAccountStorage {
         }
         Ok(conn
             .execute(
-                "UPDATE attachment_acquisition SET state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN 4 WHEN permission_paused=1 AND ?4 IS NOT NULL THEN 5 ELSE ?3 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?4 END,retry_not_before=CASE WHEN permission_paused=1 THEN COALESCE(?4,retry_not_before) ELSE retry_not_before END,attempt=NULL
+                "UPDATE attachment_acquisition SET state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN 4 WHEN permission_paused=1 AND ?4 IS NOT NULL THEN 5 ELSE ?3 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?4 END,retry_not_before=CASE WHEN permission_paused=1 THEN COALESCE(?4,retry_not_before) ELSE retry_not_before END,permission_paused=CASE WHEN ?4 IS NULL OR (automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4)) THEN 0 ELSE permission_paused END,attempt=NULL
              WHERE token=?1 AND state=1 AND attempt=?2",
                 params![
                     job.reference.token,
