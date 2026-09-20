@@ -54,6 +54,15 @@ impl SqliteAccountStorage {
         self.lock()?.query_row_cached(&format!("SELECT {COLUMNS} FROM local_message_submissions WHERE group_id_hex=?1 AND client_token=?2"), params![group, token], from_row).optional().storage()
     }
 
+    /// Check both retained admissions and source rows, including legacy sends.
+    /// Call inside the transaction that inserts the admission and pending row.
+    pub fn local_message_identity_exists(&self, group: &str, message: &str) -> StorageResult<bool> {
+        self.lock()?.query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM local_message_submissions WHERE group_id_hex=?1 AND message_id_hex=?2) OR EXISTS(SELECT 1 FROM app_events WHERE group_id_hex=?1 AND message_id_hex=?2)",
+            params![group, message], |row| row.get(0),
+        ).storage()
+    }
+
     /// Called inside the app transaction that also records the pending source row.
     pub fn insert_local_submission(&self, submission: &LocalSubmission) -> StorageResult<()> {
         let conn = self.lock()?;

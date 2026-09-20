@@ -13014,15 +13014,13 @@ fn build(intent: AppMessageIntent) -> MarmotInnerEvent {
 }
 
 #[test]
-fn chat_intent_builds_kind_nine_with_identity_entropy() {
+fn chat_intent_builds_kind_nine_with_no_tags() {
     let event = build(AppMessageIntent::Chat {
         content: "hello".to_owned(),
     });
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
     assert_eq!(event.content, "hello");
-    assert_eq!(event.tags.len(), 1);
-    assert_eq!(event.tags[0][0], "nonce");
-    assert_eq!(hex::decode(&event.tags[0][1]).unwrap().len(), 16);
+    assert!(event.tags.is_empty());
     assert_eq!(event.pubkey, SENDER_HEX);
 }
 
@@ -15294,8 +15292,8 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
 }
 
 /// Retrying the exact retained event revives its local failure retraction.
-/// Independent newly authored messages now carry distinct entropy even within
-/// one second; a retained retry deliberately preserves its original identity.
+/// Identical newly authored messages within one second also have this identity;
+/// a retained retry deliberately preserves its original identity.
 ///
 /// `record_app_event`'s upsert keeps invalidation terminal, because it cannot
 /// tell this retry from a relay redelivery or a backfill replay. Left there, the

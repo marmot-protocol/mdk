@@ -5655,8 +5655,8 @@ impl MarmotApp {
     /// fresh send intent for an id a failed send already retracted starts from a
     /// live pending row instead of a permanent tombstone.
     ///
-    /// An exact retained-event retry reuses the failed send's id; independently
-    /// authored chat messages carry fresh entropy even within one second.
+    /// An exact retained-event retry reuses the failed send's id; identical
+    /// independently authored chat messages within one second also share an id.
     /// `record_app_event`'s upsert keeps
     /// invalidation terminal, so the revival has to be explicit and has to carry
     /// evidence — and the send intent is the evidence. Only this path can

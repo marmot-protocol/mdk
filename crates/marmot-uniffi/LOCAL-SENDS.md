@@ -34,11 +34,16 @@ layout now includes a nullable `client_token`.
 - Repeating a text/reply/draft request with its original token returns the same
   identity. A different request using that token is rejected. Draft retry identity
   binds the original opaque revision, including after that draft was consumed.
-- Two independent submissions, including identical text in the same second,
-  receive distinct event IDs through independent random event entropy. The caller
-  token is neither transmitted nor used to derive that entropy.
-  The shared kind-9 builder applies this to legacy text/reply/media/draft sends
-  and stream finals too. The wire-visible `nonce` tag is tracked by
+- Event IDs and transmitted tags keep their existing protocol behavior. Identical
+  sender, second-level timestamp, kind, content and tags produce the same ID.
+  If a new token would reuse an existing local submission or source-row identity,
+  admission fails with `InvalidAppMessagePayload` ("message identity collision")
+  before accepting work, replacing a token association or consuming a draft.
+  Hosts should mark/remove that optimistic bubble on error, rather than wait for
+  a matching row. A later deliberate submission can succeed with a new timestamp;
+  no automatic delivery retry or timestamp adjustment is performed.
+  Same-token/same-request retries still return the original acceptance.
+  No nonce tag is added; future identity changes are a separate discussion in
   [protocol issue #424](https://github.com/marmot-protocol/marmot/issues/424).
 - The token association survives engine handoff, restart, echo and timeline
   reprojection. Remote and legacy messages have no caller token. Deleting the

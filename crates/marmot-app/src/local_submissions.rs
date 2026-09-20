@@ -153,8 +153,29 @@ impl MarmotApp {
         account_ref: &str,
         group: &cgka_traits::GroupId,
         token: String,
+        request: LocalMessageRequest,
+        draft: Option<MessageDraftRevision>,
+    ) -> Result<(LocalSendAcceptance, Option<AppProjectionUpdate>), AppError> {
+        self.admit_local_message_at(
+            account_ref,
+            group,
+            token,
+            request,
+            draft,
+            unix_now_seconds(),
+        )
+    }
+
+    // Explicit event time makes collision tests independent of wall-clock edges.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_local_message_at(
+        &self,
+        account_ref: &str,
+        group: &cgka_traits::GroupId,
+        token: String,
         mut request: LocalMessageRequest,
         draft: Option<MessageDraftRevision>,
+        created_at: u64,
     ) -> Result<(LocalSendAcceptance, Option<AppProjectionUpdate>), AppError> {
         if token.is_empty() || token.len() > 128 {
             return Err(AppError::InvalidAppMessagePayload(
@@ -235,9 +256,17 @@ impl MarmotApp {
             let event = build_inner_event_with_media_reply(
                 &intent,
                 &account.account_id_hex,
-                unix_now_seconds(),
+                created_at,
                 media_reply,
             )?;
+            // Keep the existing wire identity. A new token must not overwrite
+            // another admission's correlation or adopt an existing legacy row.
+            // Same-token retries returned above, before rebuilding an event.
+            if storage.local_message_identity_exists(&group_hex, &event.id)? {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "message identity collision: an identical event already exists; submission was not accepted".into(),
+                ));
+            }
             let payload = encode_inner_event(&event)?;
             for attachment in &request.attachments {
                 attachment.validate(self.allow_loopback_blob_endpoints())?;

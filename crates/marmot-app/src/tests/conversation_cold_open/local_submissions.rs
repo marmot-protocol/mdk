@@ -81,12 +81,13 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
     };
     let (first, update) = h
         .app
-        .admit_local_message(
+        .admit_local_message_at(
             "alice",
             &h.group,
             "host-secret-token".into(),
             request.clone(),
             Some(saved.revision.clone()),
+            42,
         )
         .unwrap();
     assert!(
@@ -125,6 +126,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
             .contains("host-secret-token")
     );
     assert_eq!(event.content, "same text");
+    assert!(event.tags.is_empty(), "correlation must not add wire tags");
     let changed = LocalMessageRequest {
         content: "different".into(),
         reply_to: None,
@@ -135,9 +137,52 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
             .admit_local_message("alice", &h.group, "host-secret-token".into(), changed, None)
             .is_err()
     );
+    let selected = h.app.selected_message_draft("alice", &group).unwrap();
+    let newer_draft = h
+        .app
+        .save_message_draft_if_revision("alice", &selected.revision, "same text", None, vec![])
+        .unwrap();
+    let collision = h
+        .app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "another-token".into(),
+            LocalMessageRequest {
+                content: String::new(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            Some(newer_draft.revision.clone()),
+            42,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(collision, crate::AppError::InvalidAppMessagePayload(ref detail) if detail.contains("message identity collision"))
+    );
+    assert!(
+        store
+            .local_submission(&group, "another-token")
+            .unwrap()
+            .is_none()
+    );
+    let preserved = h.app.selected_message_draft("alice", &group).unwrap();
+    assert_eq!(preserved.revision, newer_draft.revision);
+    assert_eq!(preserved.draft.unwrap().content, "same text");
+    assert_eq!(
+        store
+            .timeline_message(&group, &first.message_id_hex)
+            .unwrap()
+            .unwrap()
+            .client_token
+            .as_deref(),
+        Some("host-secret-token")
+    );
+    // A later timestamp has a distinct existing-protocol identity. Rejection
+    // did not reserve the new token or mutate the original association.
     let (second, _) = h
         .app
-        .admit_local_message(
+        .admit_local_message_at(
             "alice",
             &h.group,
             "another-token".into(),
@@ -147,6 +192,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
                 attachments: vec![],
             },
             None,
+            43,
         )
         .unwrap();
     assert_ne!(first.message_id_hex, second.message_id_hex);

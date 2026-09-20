@@ -68,6 +68,7 @@ fn queued(payload: &[u8]) -> QueuedOutboundIntent {
         intent: SendIntent::AppMessage {
             group_id,
             payload: payload.to_vec(),
+            expected_epoch: None,
         },
         created_at_ms: 1,
         reissue_attempts: 0,
@@ -89,7 +90,6 @@ fn local_submission_handoff_rolls_back_with_engine_queue_write() {
             payload_hash: Sha256::digest(payload).to_vec(),
             payload: Some(payload.to_vec()),
             request_json: Some("{}".into()),
-            expected_epoch: None,
             state: 0,
             outcome_json: None,
         })
