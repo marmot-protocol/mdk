@@ -1139,11 +1139,27 @@ async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
     assert!(captured.authority.is_some());
     assert_eq!(captured.account.page.page().messages.len(), 5);
 
+    client.publish_conversation_captures(&f.group);
+    let (_, generation) = observer.checkpoint().unwrap();
+    client.publish_conversation_captures(&f.group);
+    observer.acknowledge(generation);
+    assert!(
+        observer.take().is_some(),
+        "old presentation cannot clear a newer send"
+    );
+
     let mut history = query.clone();
     history.opening.target = ConversationOpenTarget::Message(id(10));
     observer.set_query(&history);
     client.publish_conversation_captures(&f.group);
     assert!(observer.take().is_some());
+    observer.set_query(&query);
+    assert!(
+        observer.take().is_some(),
+        "matching tail query consumes checkpoint"
+    );
+    observer.set_query(&history);
+    client.publish_conversation_captures(&f.group);
     history.opening.target = ConversationOpenTarget::Message(id(11));
     observer.set_query(&history);
     assert!(
@@ -1152,8 +1168,8 @@ async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
     );
     observer.set_query(&query);
     assert!(
-        observer.take().is_some(),
-        "tail capture must survive intermediate history navigation"
+        observer.take().is_none(),
+        "intermediate navigation invalidates the speculative tail capture"
     );
 
     let other_group = client.create_group("unrelated window", &[]).await.unwrap();
@@ -1698,5 +1714,213 @@ async fn authoritative_removed_conversation_finishes_send_readiness_as_unavailab
         ),
         (1, 1, 0, 0)
     );
+    f.close().await;
+}
+
+#[test]
+fn return_to_latest_reuses_checkpoint_when_background_presentation_is_cancelled() {
+    // Occupy the only blocking thread after setup, so presentation suspends
+    // after acquiring its at-tail checkpoint. No timing race or production hook.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let f = Fixture::new(5).await;
+            let initial = f.open(ConversationOpenTarget::Latest, 5).await.snapshot;
+            let worker = f.runtime.accounts.workers.lock().await[&f.account]
+                .commands
+                .clone();
+            let query = ConversationWindowQuery {
+                opening: ConversationOpenQuery {
+                    target: ConversationOpenTarget::Latest,
+                    limit: 5,
+                },
+                before_anchor: None,
+            };
+            let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+            f.draft("checkpoint composer");
+            let (respond, response) = oneshot::channel();
+            worker
+                .send(AccountWorkerCommand::CaptureConversation {
+                    queued: None,
+                    group_id: f.group.clone(),
+                    query: query.clone(),
+                    store_epoch: epoch.clone(),
+                    observer: None,
+                    respond,
+                })
+                .await
+                .unwrap();
+            let capture = Arc::new(SendCapture::new(
+                f.group.clone(),
+                epoch.clone(),
+                query.clone(),
+            ));
+            capture.state.lock().unwrap().pending = Some(response.await.unwrap().unwrap());
+            assert!(capture.state.lock().unwrap().latest.is_none());
+            // Any fallback worker read stays blocked, like relay publication.
+            f.mode.store(5, Ordering::SeqCst);
+            let telemetry = f.runtime.shared.app_performance_telemetry().clone();
+            let reader = Reader {
+                telemetry: telemetry.clone(),
+                authority_ready: None,
+                send_ready: None,
+                app: f.app.clone(),
+                label: "alice".into(),
+                account_id: f.account.clone(),
+                group: f.group.clone(),
+                store_epoch: epoch,
+                worker: watch::channel(Some(Ok(worker))).1,
+                send_capture: capture.clone(),
+            };
+            let sources = Sources {
+                avatars: f.app.presentation_signals.avatars.subscribe(),
+                events: f.runtime.events.subscribe(),
+                profiles: f.app.presentation_signals.profile_updates.subscribe(),
+                presentation: f.app.presentation_signals.updates.subscribe(),
+                drafts: f.app.presentation_signals.drafts.subscribe(),
+                stopping: f.runtime.shared.lifecycle().subscribe_shutdown(),
+            };
+            let resets = f.app.presentation_signals.account_resets.subscribe();
+            let (commands, command_rx) = mpsc::channel(8);
+            let (updates, changes) = watch::channel(Ok(initial.clone()));
+            let (entered, blocked) = oneshot::channel();
+            let (release, hold) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                let _ = hold.recv();
+            });
+            blocked.await.unwrap();
+            let actor = tokio::spawn(run(
+                reader,
+                query,
+                initial.clone(),
+                sources,
+                resets,
+                command_rx,
+                updates,
+            ));
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if telemetry
+                        .snapshot()
+                        .runtime_operations
+                        .iter()
+                        .any(|metric| {
+                            metric.operation == RuntimeOp::ConversationPresentation
+                                && metric.in_flight > 0
+                        })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let (reply, response) = oneshot::channel();
+            commands
+                .send(Command {
+                    revision: initial.revision,
+                    action: Action::Latest,
+                    reply,
+                })
+                .await
+                .unwrap();
+            // Wait until run has cancelled the suspended background read and
+            // begun presentation for the explicit Latest command.
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if telemetry
+                        .snapshot()
+                        .runtime_operations
+                        .iter()
+                        .any(|metric| {
+                            metric.operation == RuntimeOp::ConversationPresentation
+                                && metric.cancelled > 0
+                        })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            let result = timeout(Duration::from_secs(10), response).await;
+            drop(commands);
+            drop(changes);
+            actor.await.unwrap();
+            f.close().await;
+            let snapshot = result
+                .expect("Latest waited for a worker read")
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.draft.draft.unwrap().content, "checkpoint composer");
+            assert!(
+                capture.checkpoint().is_none(),
+                "completed presentation consumes its checkpoint"
+            );
+        });
+}
+
+#[tokio::test]
+#[ignore = "workstation capture-cost diagnostic; not a device latency threshold"]
+async fn send_checkpoint_capture_cost() {
+    let f = Fixture::new(200).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    let mut client = f.app.client("alice").await.unwrap();
+    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    for (label, target) in [
+        ("tail", ConversationOpenTarget::Latest),
+        ("history", ConversationOpenTarget::Message(id(50))),
+    ] {
+        let query = ConversationWindowQuery {
+            opening: ConversationOpenQuery { target, limit: 50 },
+            before_anchor: None,
+        };
+        let observer = Arc::new(SendCapture::new(
+            f.group.clone(),
+            epoch.clone(),
+            query.clone(),
+        ));
+        client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+        let mut baseline = Vec::new();
+        let mut checkpoint = Vec::new();
+        for trial in 0..105 {
+            let start = std::time::Instant::now();
+            let captured =
+                capture_conversation(&mut client, &f.group, query.clone(), &epoch).unwrap();
+            let single_us = start.elapsed().as_micros();
+            drop(captured);
+            let start = std::time::Instant::now();
+            client.publish_conversation_captures(&f.group);
+            let publish_us = start.elapsed().as_micros();
+            assert!(observer.take().is_some());
+            if trial >= 5 {
+                baseline.push(single_us);
+                checkpoint.push(publish_us);
+            }
+        }
+        baseline.sort_unstable();
+        checkpoint.sort_unstable();
+        eprintln!(
+            "{label}: single capture p50/p95={}/{} us; send checkpoints p50/p95={}/{} us",
+            baseline[49], baseline[94], checkpoint[49], checkpoint[94]
+        );
+    }
+    drop(client);
     f.close().await;
 }

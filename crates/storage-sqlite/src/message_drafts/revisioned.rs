@@ -257,17 +257,16 @@ pub(crate) fn selected_tx(conn: &Connection, group: &str) -> StorageResult<Selec
     Ok(SelectedMessageDraft { revision, draft })
 }
 
+pub(crate) const SELECTED_ATTACHMENTS_SQL: &str =
+    "SELECT attachment_id, file_name, media_type, length(plaintext),
+        dim, thumbhash, duration_seconds, waveform_samples_json FROM message_draft_attachments
+        WHERE group_id_hex = ?1 ORDER BY position";
+
 fn selected_attachments_tx(
     conn: &Connection,
     group: &str,
 ) -> StorageResult<Vec<SelectedMessageDraftAttachment>> {
-    let mut statement = conn
-        .prepare_cached(
-            "SELECT attachment_id, file_name, media_type, length(plaintext),
-        dim, thumbhash, duration_seconds, waveform_samples_json FROM message_draft_attachments
-        WHERE group_id_hex = ?1 ORDER BY position",
-        )
-        .storage()?;
+    let mut statement = conn.prepare_cached(SELECTED_ATTACHMENTS_SQL).storage()?;
     let rows = statement
         .query_map([group], |row| {
             Ok((

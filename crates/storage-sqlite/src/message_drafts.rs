@@ -167,6 +167,7 @@ impl SqliteAccountStorage {
         reply_to_message_id_hex: Option<&str>,
         media_attachments: &[StoredMessageDraftAttachment],
     ) -> StorageResult<StoredMessageDraft> {
+        validate_waveform_samples(media_attachments)?;
         self.connection.with_transaction(|| {
             self.write_message_draft(
                 group_id_hex,
@@ -182,7 +183,8 @@ impl SqliteAccountStorage {
     }
 
     /// Write only: revisioned callers need descriptor metadata, not a second
-    /// hydrated copy of every attachment that the host just supplied.
+    /// hydrated copy of every attachment that the host just supplied. Callers
+    /// validate waveform samples before entering their outer transaction.
     fn write_message_draft(
         &self,
         group_id_hex: &str,
@@ -190,7 +192,6 @@ impl SqliteAccountStorage {
         reply_to_message_id_hex: Option<&str>,
         media_attachments: &[StoredMessageDraftAttachment],
     ) -> StorageResult<()> {
-        validate_waveform_samples(media_attachments)?;
         let now_ms = unix_now_ms();
         self.connection.with_transaction(|| {
             let mut conn = self.lock()?;
@@ -248,18 +249,17 @@ fn validate_waveform_samples(attachments: &[StoredMessageDraftAttachment]) -> St
     Ok(())
 }
 
+pub(crate) const ATTACHMENT_SUMMARIES_SQL: &str =
+    "SELECT attachment_id, file_name, media_type, length(plaintext)
+             FROM message_draft_attachments
+             WHERE group_id_hex = ?1
+             ORDER BY position ASC";
+
 fn load_message_draft_attachment_summaries(
     conn: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Vec<StoredMessageDraftAttachmentSummary>> {
-    let mut statement = conn
-        .prepare_cached(
-            "SELECT attachment_id, file_name, media_type, length(plaintext)
-             FROM message_draft_attachments
-             WHERE group_id_hex = ?1
-             ORDER BY position ASC",
-        )
-        .storage()?;
+    let mut statement = conn.prepare_cached(ATTACHMENT_SUMMARIES_SQL).storage()?;
     let rows = statement
         .query_map(params![group_id_hex], |row| {
             Ok((
