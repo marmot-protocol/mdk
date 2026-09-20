@@ -31,7 +31,7 @@ pub(crate) enum MessageDisposition {
     /// and every retained snapshot. Retained as `PeelDeferred`; retried only
     /// when the (epoch, snapshot-set) peel context actually changes.
     RetryPending,
-    /// A retained `PeelDeferred` row exhausted its changed-context retry
+    /// A retained `PeelDeferred` row exhausted its live-context retry
     /// budget without peeling. The row is released as a local resource
     /// refusal; the same transport id remains eligible on later redelivery.
     RetryBudgetRefused,

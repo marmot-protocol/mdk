@@ -460,8 +460,10 @@ pub(crate) fn message_state_transition_event(
 }
 
 /// Resource-refusal release of a deferred-peel row, carrying the lifecycle's
-/// per-row telemetry: how many re-peel attempts it consumed and how long it
-/// resided locally before release (mdk#339). `released` deliberately does not
+/// per-row telemetry: how long it resided locally before release, and a
+/// `retry_count` in the unit the release was decided on — live peel contexts
+/// failed under for a retry-budget refusal, re-peels performed otherwise
+/// (mdk#339). `released` deliberately does not
 /// claim a terminal message state; the row no longer exists and same-id
 /// redelivery remains eligible.
 pub(crate) fn deferred_peel_resource_refused_event(

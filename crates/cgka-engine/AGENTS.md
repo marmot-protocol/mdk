@@ -366,9 +366,22 @@ branches, and a wide shallow fork cannot evict the deep branch that actually car
 *selection* is uncapped — a branch past the prefix can still win a pass and peels natively once adopted. Finally,
 failure to enumerate branches (missing anchor, missing own-commit checkpoint, exhausted budget) yields no contexts
 rather than an error — the pass, not this helper, owns every verdict. Because candidate branch
-states are part of the peel context, `deferred_peel_context_fingerprint` folds in the stored commit graph: a newly
+states are part of the peel context, `deferred_peel_context` folds in the stored commit graph: a newly
 retained rival commit adds a readable context even when the live epoch and retained-anchor set are unchanged, and
-without that term the sweep gate would stay armed exactly where it must not.
+without that term the sweep gate would stay armed exactly where it must not. That full fingerprint gates re-attempts
+and counts work done (`distinct_context_attempts`, one per re-peel — the conformance snapshot's structural-progress
+witness that a bounded generation is draining). **The retry budget is a different unit: `MAX_DEFERRED_PEEL_ATTEMPTS`
+is spent per distinct *live* peel context — live epoch plus retained-anchor set, the same walk's other half — counted
+in `live_context_attempts`, never per stored commit.** A victim wedged on its own branch reaches a rival row one
+commit per sweep generation; charging those generations releases the deep rows before the crawl arrives (the field's
+`8413db02`, 616 retry-budget releases). One live context costs one unit however long that crawl runs, and such rows
+stay bounded by residence and the per-group caps instead. Keep the two counters apart: collapsing them either
+over-charges the wedged victim or leaves a draining 975-row generation with no durable progress witness, which the
+simulator's 8-pass drain guard reads as a stalled scheduler. `distinct_context_attempts` keeps its name because it
+is a durable serde field: a Rust name that disagrees with the persisted one is its own trap, so read the doc comment,
+not the name. Pinned by
+`tests/deferred_peel_lifecycle.rs::wedged_victim_crawl_outlives_the_retry_budget` and its control
+`::advancing_live_epoch_spends_the_retry_budget_once_per_epoch`.
 
 **Contested-ness and contexts are separate answers.** That shared-source-epoch check is the *only* thing that decides
 whether the graph is contested, and `CandidateBranchPeel` carries it independently of the captured contexts, because

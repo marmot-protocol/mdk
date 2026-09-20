@@ -116,7 +116,7 @@ pub enum InputRejectionCategory {
 pub enum InboundResourceLimit {
     /// The per-group durable transport-deferred row cap is full.
     TransportDeferredCapacity,
-    /// A retained transport object exhausted its changed-context retry budget
+    /// A retained transport object exhausted its live-context retry budget
     /// and was retired without a terminal validity claim.
     TransportDeferredRetryBudget,
     /// A retained transport object exhausted its durable local residence

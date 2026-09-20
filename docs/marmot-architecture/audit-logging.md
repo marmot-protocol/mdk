@@ -363,7 +363,7 @@ Emitted after `do_ingest()` returns `Ok(outcome)`.
 | `authorization_failed` | Authenticated input was not authorized in the applicable state. |
 | `transport_deferred` | Current transport context cannot decrypt the object; a changed context may recover it. |
 | `resource_refused_deferred_capacity` | The per-group retained transport-deferred row cap was full. |
-| `resource_refused_retry_budget` | A retained transport object exhausted its changed-context retry budget and was released. |
+| `resource_refused_retry_budget` | A retained transport object exhausted its live-context retry budget and was released. |
 | `pre_membership` | The message predates this account-device's membership. |
 | `beyond_anchor` | Convergence excluded input below the retained anchor. |
 | `beyond_rollback_horizon` | Convergence excluded input beyond the rollback horizon. |
@@ -952,7 +952,7 @@ Current `reason` values found in production call sites:
 | `fork_loser` | A same-epoch incumbent branch loses fork resolution and its message is invalidated. |
 | `peel_failed_no_snapshot` | Historical stable tag: group-message peel failed and no fallback snapshot could recover it; the outcome is `transport_deferred` and state becomes `peel_deferred`. |
 | `resource_refused_deferred_capacity` | The retained transport-deferred row cap refused an additional object without persisting it. |
-| `resource_refused_retry_budget` | A retained transport-deferred row exhausted its changed-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. |
+| `resource_refused_retry_budget` | A retained transport-deferred row exhausted its live-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. `retry_count` on this row counts live contexts, the unit the budget is spent in; on every other release reason it counts re-peels performed. |
 | `stale_epoch_no_snapshot` | Stale-epoch peel failed and no fallback snapshot could recover it; state becomes `failed`. |
 | `app_payload_retention_expired` | A message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained app-payload window; state becomes `failed`. |
 | `superseded_by_replacement_welcome` | A verified replacement Welcome discarded this device's live MLS copy, so an unresolved commit retained below the new copy's epoch can never be applied; state becomes `epoch_invalidated`. |

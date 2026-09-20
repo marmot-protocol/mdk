@@ -1474,6 +1474,8 @@ mod tests {
                 residence_deadline_wall_ms: 11_000,
                 distinct_context_attempts: index as u32,
                 last_context_fingerprint: Some([id; 32]),
+                live_context_attempts: index as u32,
+                last_live_context_fingerprint: Some([id; 32]),
             });
             if index == 1 {
                 store
@@ -1557,6 +1559,8 @@ mod tests {
                                     residence_deadline_wall_ms: 11_000,
                                     distinct_context_attempts: 3,
                                     last_context_fingerprint: Some([0xA5; 32]),
+                                    live_context_attempts: 3,
+                                    last_live_context_fingerprint: Some([0xA5; 32]),
                                 });
                             }
                             tx.put_message(&message)?;
@@ -1848,6 +1852,8 @@ mod tests {
             residence_deadline_wall_ms: 11_000,
             distinct_context_attempts: 3,
             last_context_fingerprint: Some([0xA5; 32]),
+            live_context_attempts: 3,
+            last_live_context_fingerprint: Some([0xA5; 32]),
         });
         store.put_message(&message).unwrap();
         assert_eq!(store.get_message(&message.id).unwrap(), message);

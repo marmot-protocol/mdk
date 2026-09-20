@@ -29,6 +29,8 @@ fn fresh_deferred_peel_lifecycle(
         residence_deadline_wall_ms: now.wall_ms.saturating_add(deferred_peel_residence_ms),
         distinct_context_attempts: 0,
         last_context_fingerprint: None,
+        live_context_attempts: 0,
+        last_live_context_fingerprint: None,
     }
 }
 
@@ -939,8 +941,19 @@ impl<S: StorageProvider> Engine<S> {
         resource: InboundResourceLimit,
         disposition: crate::message_disposition::MessageDisposition,
     ) -> Result<(), EngineError> {
+        // Report the count this release was actually decided on, so the audit
+        // row can be read against the budget it names. Only the retry-budget
+        // path spends `live_context_attempts`; a residence release is timed out
+        // regardless of context, and re-peels performed is the useful number.
         let retry_count = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
-            u64::from(lifecycle.distinct_context_attempts)
+            u64::from(
+                if disposition == crate::message_disposition::MessageDisposition::RetryBudgetRefused
+                {
+                    lifecycle.live_context_attempts
+                } else {
+                    lifecycle.distinct_context_attempts
+                },
+            )
         });
         let residence_ms = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
             lifecycle
@@ -1465,7 +1478,7 @@ mod tests {
         assert!(storage.has_processed_transport_id(&transport_id).unwrap());
     }
 
-    /// The commit-digest memo behind `deferred_peel_context_fingerprint`
+    /// The commit-digest memo behind `deferred_peel_context`
     /// remembers a per-payload verdict keyed by `MessageId`. A same-id row
     /// overwritten under a different payload variant (RawTransport re-persisted
     /// as an OpenMLS-wire commit, the mdk#369 path above) must re-classify:
@@ -1479,12 +1492,9 @@ mod tests {
             .persist_transport_message(&raw_row, &group_id, EpochId(3), MessageState::Sent)
             .unwrap();
 
-        let before = engine.deferred_peel_context_fingerprint(&group_id).unwrap();
+        let before = engine.deferred_peel_context(&group_id).unwrap();
         // Second call runs against the now-populated memo; it must agree.
-        assert_eq!(
-            before,
-            engine.deferred_peel_context_fingerprint(&group_id).unwrap()
-        );
+        assert_eq!(before, engine.deferred_peel_context(&group_id).unwrap());
 
         let commit_row = TransportMessage {
             payload: real_commit_wire_bytes(),
@@ -1494,11 +1504,18 @@ mod tests {
             .persist_openmls_wire_message(&commit_row, &group_id, EpochId(3), MessageState::Sent)
             .unwrap();
 
-        let after = engine.deferred_peel_context_fingerprint(&group_id).unwrap();
+        let after = engine.deferred_peel_context(&group_id).unwrap();
         assert_ne!(
-            before, after,
+            before.full, after.full,
             "a RawTransport row overwritten as an OpenMLS-wire commit must \
              re-classify instead of reusing the memoized non-commit verdict"
+        );
+        // The retry budget's unit, pinned where the two halves diverge: this is
+        // the one seam in the tree that adds a stored commit under a fixed
+        // epoch and anchor set.
+        assert_eq!(
+            before.live, after.live,
+            "a stored commit deepens the graph; it is not a new live context"
         );
     }
 }
