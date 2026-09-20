@@ -12242,6 +12242,188 @@ fn legacy_account_projection_clamps_poisoned_transport_cursor_on_import() {
     );
 }
 
+/// Reproduce repeated overflow verdicts at the account queue boundary. These are
+/// distinct transport IDs already retained by the application, not SDK-level
+/// cross-relay duplicates, which are filtered before this boundary.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
+    run_composed_app_runtime_test("epoch-overflow-empty-retry", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config()
+                .with_dev_epoch_backfill_execution_quantum_ms(5_000)
+                .with_dev_epoch_backfill_retry_backoff_ms(15_000),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        let cursor = crate::unix_now_seconds();
+        client.state.last_transport_timestamp = Some(cursor);
+        app.save_state(&client.state).unwrap();
+        const HISTORY: usize = 1536;
+        for index in 0..HISTORY {
+            let event = epoch_gap_probe(
+                &group.nostr_routing.nostr_group_id_hex,
+                cursor.saturating_sub(600 + index as u64),
+                &format!("retained-history-{index}"),
+            );
+            client.remember_seen_event(event.id.clone());
+            inject_epoch_gap_probe(&app, event).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let health = app.relay_plane.relay_health().await;
+                if health.account_delivery_dropped
+                    >= (HISTORY - crate::relay_plane::ACCOUNT_DELIVERY_BUFFER) as u64
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the undrained history must overflow the account queue");
+
+        for ordinal in 0..2 {
+            if ordinal > 0 {
+                expire_epoch_backfill_retry_cooldown(&mut client);
+            }
+            assert!(matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                    )
+                    .await
+                    .unwrap(),
+                crate::EpochBackfillRunOutcome::Incomplete(_)
+            ));
+            let remaining = client
+                .epoch_backfill_retry_not_before
+                .unwrap()
+                .saturating_duration_since(std::time::Instant::now());
+            let expected = Duration::from_secs(15 * (1 << ordinal));
+            assert!(
+                remaining > expected - Duration::from_secs(1),
+                "overflow attempt {ordinal} must earn {expected:?}, got {remaining:?}"
+            );
+            let subscriptions = relay.accepted_subscriptions().len();
+            assert!(matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Receive
+                    )
+                    .await
+                    .unwrap(),
+                crate::EpochBackfillRunOutcome::Deferred
+            ));
+            assert_eq!(relay.accepted_subscriptions().len(), subscriptions);
+        }
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 2);
+        assert_eq!(
+            failed[0]["kind"]["skipped"],
+            crate::relay_plane::ACCOUNT_DELIVERY_BUFFER
+        );
+        assert_eq!(failed[1]["kind"]["skipped"], 0);
+        for row in failed {
+            assert_eq!(row["kind"]["error_kind"], "account_delivery_queue_overflow");
+        }
+        assert_eq!(
+            app.load_state("alice").unwrap().last_transport_timestamp,
+            Some(cursor)
+        );
+        assert!(client.has_pending_epoch_backfill());
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
+
+        // Pacing the replay must not gate ordinary receive or send. A novel
+        // opaque delivery is durably deferred, while its newer timestamp is
+        // fenced until the delivery-gap obligation is actually completed.
+        let live = epoch_gap_probe(
+            &group.nostr_routing.nostr_group_id_hex,
+            cursor + 1,
+            "live-during-cooldown",
+        );
+        let live_id = live.id.clone();
+        inject_epoch_gap_probe(&app, live).await;
+        let received = tokio::time::timeout(Duration::from_secs(2), client.receive_next_delivery())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            panic!("the previous overflow signal was already consumed");
+        };
+        client.ingest_received_delivery(*delivery).await.unwrap();
+        assert!(
+            app.load_state("alice")
+                .unwrap()
+                .seen_events
+                .contains(&live_id)
+        );
+        assert_eq!(
+            app.load_state("alice").unwrap().last_transport_timestamp,
+            Some(cursor)
+        );
+        assert!(
+            client
+                .send(&group_id, b"send during paced recovery")
+                .await
+                .unwrap()
+                .published
+                > 0
+        );
+
+        // The patch changes scheduling only: neither silence nor the new send
+        // cleared the durable gap. Actual replay completion retains the old
+        // generation check. Opaque deferred input must still not advance the
+        // cursor after gap completion; transport retention is not decryption.
+        assert!(client.delivery_overflow_recovery_pending);
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        assert!(matches!(
+            client.recover_delivery_overflow().await.unwrap(),
+            crate::DeliveryOverflowRecoveryOutcome::Completed(_)
+        ));
+        assert!(!client.delivery_overflow_recovery_pending);
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none()
+        );
+        let after = epoch_gap_probe(
+            &group.nostr_routing.nostr_group_id_hex,
+            cursor + 2,
+            "live-after-gap-completion",
+        );
+        let after_id = after.id.clone();
+        inject_epoch_gap_probe(&app, after).await;
+        let received = tokio::time::timeout(Duration::from_secs(2), client.receive_next_delivery())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            panic!("no new overflow occurred");
+        };
+        client.ingest_received_delivery(*delivery).await.unwrap();
+        let state = app.load_state("alice").unwrap();
+        assert!(state.seen_events.contains(&after_id));
+        assert_eq!(state.last_transport_timestamp, Some(cursor));
+    });
+}
+
 #[test]
 fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
     run_composed_app_runtime_test("delivery-overflow-reopen", || async {

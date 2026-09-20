@@ -4091,6 +4091,12 @@ impl AppClient {
                     } else {
                         let pacing_ordinal = if verdict.made_no_progress() {
                             no_progress_ordinal
+                        } else if verdict == DrainVerdict::Overflow {
+                            // Overflow does not spend the EOSE ordinal. Using
+                            // that counter here would overwrite the failure
+                            // backoff with the base delay on every retry,
+                            // including retries that only observe an old gap.
+                            retry_ordinal
                         } else {
                             eose_unconfirmed_ordinal
                         };
