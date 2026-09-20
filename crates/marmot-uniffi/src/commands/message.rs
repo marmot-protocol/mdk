@@ -39,9 +39,8 @@ impl Marmot {
     /// message sent while offline (or when the relay was unreachable) lands in
     /// the timeline with `source_message_id_hex == null` — committed, not yet
     /// delivered. Re-sending the same text mints a fresh commit, so it is the
-    /// wrong tool here: it either duplicates the bubble or — inside the same
-    /// second as the original, where the NIP-01 id collides — silently reuses
-    /// the same timeline row. This drives the existing pending commit to the
+    /// wrong tool here: it creates another independent message and bubble.
+    /// This drives the existing pending commit to the
     /// relays via convergence instead, so the original timeline row flips to
     /// delivered (`source_message_id_hex == Some(..)`) on success and no new
     /// event is created.

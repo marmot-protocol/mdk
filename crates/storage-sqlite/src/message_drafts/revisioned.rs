@@ -324,7 +324,6 @@ pub(crate) fn accept_submission_tx(
         ),
         DraftAcceptance::Event(id) => ("app_event_id", rusqlite::types::Value::Text(id.to_owned())),
     };
-    SqliteAccountStorage::accept_local_submission_tx(conn, group, field, &value)?;
     let revision: Option<i64> = conn
         .query_row_cached(
             &format!(

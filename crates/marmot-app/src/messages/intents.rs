@@ -297,7 +297,30 @@ pub(crate) fn build_inner_event_with_media_reply(
     created_at: u64,
     media_reply: Option<&str>,
 ) -> Result<MarmotInnerEvent, AppError> {
-    let event = |kind, tags, content| {
+    // All kind-9 send paths share event uniqueness, including legacy sends,
+    // replies, media, drafts and stream finals. Retry retained event bytes rather
+    // than rebuilding: entropy is independent of local caller correlation.
+    // Protocol proposal: https://github.com/marmot-protocol/marmot/issues/424.
+    let nonce = if matches!(
+        intent,
+        AppMessageIntent::Chat { .. }
+            | AppMessageIntent::Reply { .. }
+            | AppMessageIntent::Media { .. }
+            | AppMessageIntent::StreamFinal { .. }
+    ) {
+        use rand::RngCore;
+        let mut nonce = [0u8; 16];
+        rand::rngs::OsRng.try_fill_bytes(&mut nonce).map_err(|_| {
+            AppError::InvalidAppMessagePayload("message identity entropy unavailable".into())
+        })?;
+        Some(hex::encode(nonce))
+    } else {
+        None
+    };
+    let event = |kind, mut tags: Vec<Vec<String>>, content| {
+        if let Some(nonce) = &nonce {
+            tags.push(vec!["nonce".into(), nonce.clone()]);
+        }
         MarmotInnerEvent::new(
             sender_pubkey_hex.to_owned(),
             created_at,
@@ -923,6 +946,47 @@ mod mention_tests {
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
+
+    #[test]
+    fn same_second_chat_reply_and_media_have_unique_ids_in_the_shared_builder() {
+        let sender = valid_pubkey_hex();
+        let intents = [
+            AppMessageIntent::Chat {
+                content: "same text".into(),
+            },
+            AppMessageIntent::Reply {
+                target_message_id: "aa".repeat(32),
+                text: "same text".into(),
+            },
+            AppMessageIntent::Media {
+                caption: Some("same text".into()),
+                attachments: vec![MediaAttachmentReference {
+                    locators: vec![],
+                    ciphertext_sha256: "11".repeat(32),
+                    plaintext_sha256: "22".repeat(32),
+                    nonce_hex: "33".repeat(12),
+                    file_name: "photo.jpg".into(),
+                    media_type: "image/jpeg".into(),
+                    version: "2".into(),
+                    source_epoch: 0,
+                    dim: None,
+                    thumbhash: None,
+                }],
+            },
+        ];
+        for intent in intents {
+            let legacy = build_inner_event(&intent, &sender, 42).unwrap();
+            let admitted = build_inner_event_with_media_reply(&intent, &sender, 42, None).unwrap();
+            assert_ne!(legacy.id, admitted.id);
+            assert_eq!(legacy.content, admitted.content);
+            for event in [legacy, admitted] {
+                event.validate_id().unwrap();
+                let nonces: Vec<_> = event.tags.iter().filter(|tag| tag[0] == "nonce").collect();
+                assert_eq!(nonces.len(), 1);
+                assert_eq!(hex::decode(&nonces[0][1]).unwrap().len(), 16);
+            }
+        }
     }
 
     #[test]

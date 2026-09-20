@@ -5655,10 +5655,9 @@ impl MarmotApp {
     /// fresh send intent for an id a failed send already retracted starts from a
     /// live pending row instead of a permanent tombstone.
     ///
-    /// Inner app-event ids are NIP-01 hashes over
-    /// (pubkey, created_at, kind, tags, content) with second-granular
-    /// `created_at`, so a resend of identical text inside the same second as a
-    /// failed send reuses that send's id. `record_app_event`'s upsert keeps
+    /// An exact retained-event retry reuses the failed send's id; independently
+    /// authored chat messages carry fresh entropy even within one second.
+    /// `record_app_event`'s upsert keeps
     /// invalidation terminal, so the revival has to be explicit and has to carry
     /// evidence — and the send intent is the evidence. Only this path can
     /// produce one: replay seams (`observe_drained_session_events`, backfill,

@@ -2,7 +2,6 @@
 //! and publication remain with the account worker; admission performs no I/O to relays.
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::storage::{GroupStorage, StorageProvider};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage_sqlite::LocalSubmission;
@@ -35,6 +34,25 @@ pub enum LocalSendStatus {
     EngineOwned,
     Completed(crate::SendSummary),
     Rejected,
+}
+
+/// Decode for validation/projection, but preserve the bytes that bind engine
+/// acceptance to the durable app queue. Re-encoding is not this boundary's job.
+pub(crate) fn retained_event(
+    submission: &LocalSubmission,
+) -> Result<(MarmotInnerEvent, Vec<u8>), AppError> {
+    let payload = submission.payload.as_deref().ok_or_else(|| {
+        AppError::InvalidAppMessagePayload("missing local submission payload".into())
+    })?;
+    if Sha256::digest(payload).as_slice() != submission.payload_hash {
+        return Err(AppError::InvalidAppMessagePayload(
+            "local submission payload digest mismatch".into(),
+        ));
+    }
+    let event = MarmotInnerEvent::decode(payload).map_err(|_| {
+        AppError::InvalidAppMessagePayload("invalid local submission payload".into())
+    })?;
+    Ok((event, payload.to_vec()))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -214,38 +232,13 @@ impl MarmotApp {
             let media_reply = (!request.attachments.is_empty())
                 .then_some(request.reply_to.as_deref())
                 .flatten();
-            let mut event = build_inner_event_with_media_reply(
+            let event = build_inner_event_with_media_reply(
                 &intent,
                 &account.account_id_hex,
                 unix_now_seconds(),
                 media_reply,
             )?;
-            // Independent entropy, never the host token or a hash of it. Nostr
-            // timestamps have second precision; identical rapid sends need
-            // distinct event identities without changing displayed content.
-            let mut nonce = [0u8; 16];
-            rand::rngs::OsRng.try_fill_bytes(&mut nonce).map_err(|_| {
-                AppError::InvalidAppMessagePayload("message identity entropy unavailable".into())
-            })?;
-            event.tags.push(vec!["nonce".into(), hex::encode(nonce)]);
-            event = MarmotInnerEvent::new(
-                event.pubkey,
-                event.created_at,
-                event.kind,
-                event.tags,
-                event.content,
-            );
             let payload = encode_inner_event(&event)?;
-            let expected_epoch = request.attachments.first().map(|a| a.source_epoch);
-            if request
-                .attachments
-                .iter()
-                .any(|a| Some(a.source_epoch) != expected_epoch)
-            {
-                return Err(AppError::InvalidEncryptedMedia(
-                    "media references must share an epoch".into(),
-                ));
-            }
             for attachment in &request.attachments {
                 attachment.validate(self.allow_loopback_blob_endpoints())?;
                 if attachment.source_epoch != stored_group.epoch.0 {
@@ -263,7 +256,6 @@ impl MarmotApp {
                 payload_hash: Sha256::digest(&payload).to_vec(),
                 payload: Some(payload),
                 request_json: Some(request.encode_retained()?),
-                expected_epoch,
                 state: 0,
                 outcome_json: None,
             };

@@ -37,6 +37,9 @@ layout now includes a nullable `client_token`.
 - Two independent submissions, including identical text in the same second,
   receive distinct event IDs through independent random event entropy. The caller
   token is neither transmitted nor used to derive that entropy.
+  The shared kind-9 builder applies this to legacy text/reply/media/draft sends
+  and stream finals too. The wire-visible `nonce` tag is tracked by
+  [protocol issue #424](https://github.com/marmot-protocol/marmot/issues/424).
 - The token association survives engine handoff, restart, echo and timeline
   reprojection. Remote and legacy messages have no caller token. Deleting the
   retained source/group also removes its association: token reuse after retention

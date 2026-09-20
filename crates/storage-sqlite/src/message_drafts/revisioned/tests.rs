@@ -68,7 +68,6 @@ fn queued(payload: &[u8]) -> QueuedOutboundIntent {
         intent: SendIntent::AppMessage {
             group_id,
             payload: payload.to_vec(),
-            expected_epoch: None,
         },
         created_at_ms: 1,
         reissue_attempts: 0,

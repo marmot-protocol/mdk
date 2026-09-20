@@ -16,8 +16,8 @@ pub struct LocalSubmission {
     pub payload_hash: Vec<u8>,
     pub payload: Option<Vec<u8>>,
     pub request_json: Option<String>,
-    pub expected_epoch: Option<u64>,
-    /// 0: app-owned queue; 1: engine-owned; 2: rejected before engine acceptance.
+    /// 0: app-owned queue; 1: engine-owned; 3: rejected before engine acceptance.
+    /// Value 2 is reserved for the API's completed outcome (stored in outcome_json).
     pub state: u8,
     pub outcome_json: Option<String>,
 }
@@ -38,13 +38,12 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalSubmission> {
         request_hash: row.get(3)?,
         payload_hash: row.get(4)?,
         payload: row.get(5)?,
-        expected_epoch: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
-        state: row.get(7)?,
-        outcome_json: row.get(8)?,
-        request_json: row.get(9)?,
+        state: row.get(6)?,
+        outcome_json: row.get(7)?,
+        request_json: row.get(8)?,
     })
 }
-const COLUMNS: &str = "group_id_hex, client_token, message_id_hex, request_hash, payload_hash, payload, expected_epoch, state, outcome_json, request_json";
+const COLUMNS: &str = "group_id_hex, client_token, message_id_hex, request_hash, payload_hash, payload, state, outcome_json, request_json";
 
 impl SqliteAccountStorage {
     pub fn local_submission(
@@ -72,8 +71,8 @@ impl SqliteAccountStorage {
             ));
         }
         conn.execute_cached(
-            "INSERT INTO local_message_submissions(group_id_hex,client_token,message_id_hex,request_hash,payload_hash,payload,expected_epoch,request_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![submission.group_id_hex, submission.client_token, submission.message_id_hex, submission.request_hash, submission.payload_hash, submission.payload, submission.expected_epoch.map(i64::try_from).transpose().map_err(|_| StorageError::Backend("invalid submission epoch".to_owned()))?, submission.request_json],
+            "INSERT INTO local_message_submissions(group_id_hex,client_token,message_id_hex,request_hash,payload_hash,payload,request_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![submission.group_id_hex, submission.client_token, submission.message_id_hex, submission.request_hash, submission.payload_hash, submission.payload, submission.request_json],
         ).storage()?;
         Ok(())
     }
@@ -106,7 +105,7 @@ impl SqliteAccountStorage {
         outcome: Option<&str>,
     ) -> StorageResult<()> {
         self.lock()?.execute_cached(
-            "UPDATE local_message_submissions SET state=CASE WHEN state=0 THEN 2 ELSE state END, payload=NULL, request_json=NULL, outcome_json=?3 WHERE group_id_hex=?1 AND client_token=?2",
+            "UPDATE local_message_submissions SET state=CASE WHEN state=0 THEN 3 ELSE state END, payload=NULL, request_json=NULL, outcome_json=?3 WHERE group_id_hex=?1 AND client_token=?2",
             params![group, token, outcome],
         ).storage()?;
         Ok(())

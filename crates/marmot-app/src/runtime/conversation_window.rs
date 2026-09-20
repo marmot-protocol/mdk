@@ -197,9 +197,15 @@ impl SendCapture {
         if state.query != *query {
             state.query = query.clone();
             state.generation += 1;
-            state.pending = state.latest.take().and_then(|(captured_query, capture)| {
-                (captured_query == *query).then_some(capture)
-            });
+            state.pending = if state
+                .latest
+                .as_ref()
+                .is_some_and(|(captured_query, _)| captured_query == query)
+            {
+                state.latest.take().map(|(_, capture)| capture)
+            } else {
+                None
+            };
         }
     }
     fn take(&self) -> Option<CapturedConversation> {

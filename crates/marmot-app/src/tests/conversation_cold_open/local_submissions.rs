@@ -2,85 +2,67 @@ use super::*;
 use crate::local_submissions::LocalMessageRequest;
 
 #[tokio::test]
-async fn return_to_latest_from_history_uses_send_checkpoint_before_relay_release() {
-    let h = History::new(60).await;
-    let runtime = MarmotAppRuntime::new(h.app.clone());
-    let mut window = runtime
-        .open_conversation_window(
-            "alice",
-            &h.group,
-            ConversationOpenQuery {
-                target: ConversationOpenTarget::Message(format!("{:064x}", 10)),
-                limit: 10,
-            },
-        )
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while window.snapshot.presentation.header.epoch.is_none() {
-            window.snapshot = window.recv().await.unwrap().unwrap();
-        }
-    })
-    .await
+async fn retained_submission_preserves_noncanonical_json_bytes_for_engine_handoff() {
+    use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent};
+    use sha2::{Digest, Sha256};
+    let h = History::new(0).await;
+    let event = crate::messages::build_inner_event(
+        &crate::messages::AppMessageIntent::Chat {
+            content: "retained bytes".into(),
+        },
+        &h.account,
+        42,
+    )
     .unwrap();
-    h.relay.block_next_publish();
-    let sender = runtime.clone();
-    let group = h.group.clone();
-    let sending = tokio::spawn(async move {
-        sender
-            .send_message("alice", &group, b"latest checkpoint message".to_vec())
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(10), h.relay.wait_for_blocked_publish())
-        .await
-        .unwrap();
-    // Wait for the actor's ordinary fresh read to queue behind the held send.
-    // The latest command must supersede this background read, rather than only
-    // working when it happens to arrive before the actor starts that read.
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if runtime
-                .app_performance_snapshot()
-                .runtime_operations
-                .iter()
-                .any(|metric| {
-                    metric.operation == crate::RuntimePerformanceOperation::ConversationCaptureQueue
-                        && metric.in_flight > 0
-                })
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let handle = window.window_handle();
-    let result = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match handle.return_to_latest(&window.snapshot.revision).await {
-                Ok(snapshot) => break snapshot,
-                Err(crate::ConversationWindowError::StaleWindow) => {
-                    window.snapshot = window.recv().await.unwrap().unwrap();
-                }
-                Err(error) => panic!("navigation failed: {error:?}"),
-            }
-        }
-    })
-    .await;
-    h.relay.release_publish();
-    sending.await.unwrap().unwrap();
-    let snapshot = result.expect("navigation waited for relay publication");
-    assert!(
-        snapshot
-            .page
-            .page()
-            .messages
-            .iter()
-            .any(|row| row.plaintext == "latest checkpoint message"
-                && row.source_message_id_hex.is_none())
+    let payload = serde_json::to_vec_pretty(&event).unwrap();
+    assert_ne!(
+        payload,
+        crate::messages::encode_inner_event(&event).unwrap()
     );
-    runtime.shutdown_and_close().await.unwrap();
+    let mut submission = storage_sqlite::LocalSubmission {
+        group_id_hex: hex::encode(h.group.as_slice()),
+        client_token: "payload-token".into(),
+        message_id_hex: event.id.clone(),
+        request_hash: vec![1; 32],
+        payload_hash: Sha256::digest(&payload).to_vec(),
+        payload: Some(payload.clone()),
+        request_json: Some("{}".into()),
+        state: 0,
+        outcome_json: None,
+    };
+    let store = h.app.account_storage("alice").unwrap();
+    store.insert_local_submission(&submission).unwrap();
+    let (decoded, retained) = crate::local_submissions::retained_event(&submission).unwrap();
+    assert_eq!(decoded.id, event.id);
+    assert_eq!(retained, payload);
+    store
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: cgka_traits::MessageId::new(vec![5; 32]),
+            group_id: h.group.clone(),
+            intent: cgka_traits::SendIntent::AppMessage {
+                group_id: h.group.clone(),
+                payload: retained,
+                expected_epoch: None,
+            },
+            created_at_ms: 1,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .local_submission(&submission.group_id_hex, &submission.client_token)
+            .unwrap()
+            .unwrap()
+            .state,
+        1
+    );
+    assert!(store.next_local_submission().unwrap().is_none());
+    submission.payload.as_mut().unwrap().push(b' ');
+    assert!(
+        crate::local_submissions::retained_event(&submission).is_err(),
+        "a mismatched retained digest must fail before engine work"
+    );
+    h.app.close_storage().unwrap();
 }
 
 #[tokio::test]

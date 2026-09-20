@@ -6,8 +6,8 @@ use cgka_traits::storage::MessageStorage;
 
 #[path = "conversation_cold_open/local_submissions.rs"]
 mod local_submissions;
-#[path = "conversation_cold_open/send_latency.rs"]
-mod send_latency;
+#[path = "conversation_cold_open/send_window.rs"]
+mod send_window;
 
 struct History {
     _dir: tempfile::TempDir,

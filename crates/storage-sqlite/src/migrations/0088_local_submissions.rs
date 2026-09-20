@@ -13,8 +13,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             payload_hash BLOB NOT NULL CHECK(length(payload_hash) = 32),
             payload BLOB,
             request_json TEXT,
-            expected_epoch INTEGER,
-            state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0, 1, 2)),
+            state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0, 1, 3)),
             outcome_json TEXT,
             UNIQUE(group_id_hex, client_token),
             UNIQUE(group_id_hex, message_id_hex)

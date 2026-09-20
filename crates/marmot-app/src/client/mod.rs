@@ -3595,7 +3595,7 @@ impl AppClient {
         intent: AppMessageIntent,
         on_local_projection: F,
         draft: Option<(crate::MessageDraftRevision, Option<String>)>,
-        prepared: Option<MarmotInnerEvent>,
+        prepared: Option<(MarmotInnerEvent, Vec<u8>)>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
     where
         F: FnMut(crate::AppProjectionUpdate),
@@ -3666,19 +3666,20 @@ impl AppClient {
                 AppError::InvalidAppMessagePayload("missing local submission request".into())
             })?,
         )?;
-        let event = MarmotInnerEvent::decode(submission.payload.as_deref().ok_or_else(|| {
-            AppError::InvalidAppMessagePayload("missing local submission payload".into())
-        })?)
-        .map_err(|_| {
-            AppError::InvalidAppMessagePayload("invalid local submission payload".into())
-        })?;
+        let (event, payload) = crate::local_submissions::retained_event(submission)?;
         if !request.attachments.is_empty() {
             self.sync_runtime_groups().await?;
             self.validate_draft_media_references(&group, &request.attachments)?;
         }
-        self.send_app_event_with_context(&group, request.intent(), on_projection, None, Some(event))
-            .await
-            .map(|(_, summary)| summary)
+        self.send_app_event_with_context(
+            &group,
+            request.intent(),
+            on_projection,
+            None,
+            Some((event, payload)),
+        )
+        .await
+        .map(|(_, summary)| summary)
     }
 
     async fn send_app_event_with_local_projection_unobserved<F>(
@@ -3687,7 +3688,7 @@ impl AppClient {
         intent: AppMessageIntent,
         mut on_local_projection: F,
         draft: Option<(crate::MessageDraftRevision, Option<String>)>,
-        prepared: Option<MarmotInnerEvent>,
+        prepared: Option<(MarmotInnerEvent, Vec<u8>)>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
     where
         F: FnMut(crate::AppProjectionUpdate),
@@ -3801,13 +3802,13 @@ impl AppClient {
                 .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
             _ => None,
         };
-        let event = if let Some(event) = prepared {
+        let (event, payload) = if let Some((event, payload)) = prepared {
             event.validate_sender(&sender).map_err(|_| {
                 AppError::InvalidAppMessagePayload("invalid local submission author".into())
             })?;
-            event
+            (event, payload)
         } else {
-            match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
+            let event = match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
                 Some(reply) => build_inner_event_with_media_reply(
                     &intent,
                     &sender,
@@ -3815,9 +3816,10 @@ impl AppClient {
                     Some(reply),
                 )?,
                 None => build_inner_event(&intent, &sender, unix_now_seconds())?,
-            }
+            };
+            let payload = encode_inner_event(&event)?;
+            (event, payload)
         };
-        let payload = encode_inner_event(&event)?;
         let _draft_guard = if let Some((revision, _)) = draft {
             let storage = self.app.draft_storage(&self.state.label)?;
             self.runtime.session().set_message_draft_commit_observer(
