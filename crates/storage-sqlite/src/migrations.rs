@@ -184,6 +184,9 @@ mod migration_0086_attachment_controls;
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
 
+#[path = "migrations/0087_attachment_automatic_history.rs"]
+mod migration_0087_attachment_automatic_history;
+
 pub(crate) struct Migration {
     pub(crate) version: i64,
     pub(crate) name: &'static str,
@@ -620,6 +623,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 86,
         name: "0086_attachment_controls",
         apply: migration_0086_attachment_controls::apply,
+    },
+    Migration {
+        version: 87,
+        name: "0087_attachment_automatic_history",
+        apply: migration_0087_attachment_automatic_history::apply,
     },
 ];
 

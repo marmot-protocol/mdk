@@ -230,6 +230,7 @@ fn combined_options_validate_before_transferring_store_ownership() {
     let relay = CString::new("ws://127.0.0.1:1").unwrap();
     let relays = [relay.as_ptr()];
     let mut options = marmot_c::MarmotClientOptions {
+        attachment_acquisition_mode: 0,
         relay_policy: 2,
         cursor_persistence: 1,
         client_name: name.as_ptr(),

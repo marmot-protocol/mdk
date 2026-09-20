@@ -46,6 +46,22 @@ pub enum AttachmentPageRead {
     InvalidLimit,
 }
 
+pub(crate) fn category(media_type: &str) -> AttachmentCategory {
+    match media_type
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image" => AttachmentCategory::Image,
+        "video" => AttachmentCategory::Video,
+        "audio" => AttachmentCategory::Audio,
+        _ => AttachmentCategory::File,
+    }
+}
+
 fn present(
     entry: storage_sqlite::AttachmentHistoryEntry,
     allow_loopback: bool,
@@ -70,20 +86,7 @@ fn present(
         } => {
             *attachment_index = index;
             // Classification is presentation of an already-validated MIME, not another imeta parser.
-            match reference
-                .media_type
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "image" => AttachmentCategory::Image,
-                "video" => AttachmentCategory::Video,
-                "audio" => AttachmentCategory::Audio,
-                _ => AttachmentCategory::File,
-            }
+            category(&reference.media_type)
         }
         MediaAttachmentOutcome::Rejected {
             attachment_index, ..

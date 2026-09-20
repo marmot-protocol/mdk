@@ -1062,6 +1062,11 @@ pub(crate) async fn download_encrypted_media_classified(
         plaintext_verify_started,
         true,
     );
+    let mut plaintext = zeroize::Zeroizing::new(plaintext);
+    if let Some(resume) = &transport.resume {
+        resume.completed_body().await?;
+    }
+    let plaintext = std::mem::take(&mut *plaintext);
     Ok(MediaDownloadResult {
         size_bytes: plaintext.len() as u64,
         plaintext,

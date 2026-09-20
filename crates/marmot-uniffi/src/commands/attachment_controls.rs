@@ -24,6 +24,43 @@ impl AttachmentTransferSubscription {
 }
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Revoke automatic permission before evaluating new host network policy.
+    pub async fn begin_attachment_permission_update(
+        &self,
+        account_ref: String,
+    ) -> Result<String, MarmotKitError> {
+        Ok(self
+            .runtime
+            .begin_attachment_permission_update(&account_ref)
+            .await?)
+    }
+    /// Apply a single-use generation; false means stale, foreign, or already used.
+    pub async fn set_attachment_automatic_permission(
+        &self,
+        account_ref: String,
+        generation: String,
+        permission: AttachmentAutomaticPermissionFfi,
+    ) -> Result<bool, MarmotKitError> {
+        Ok(self
+            .runtime
+            .set_attachment_automatic_permission(&account_ref, generation, permission.into())
+            .await?)
+    }
+    /// Idempotent automatic demand for the current authoritative source slot.
+    pub async fn request_automatic_attachment(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target: AttachmentLocalTargetFfi,
+    ) -> Result<AutomaticAttachmentRequestFfi, MarmotKitError> {
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .request_automatic_attachment(&account_ref, &group, target.into())
+            .await?
+            .into())
+    }
+
     pub async fn attachment_download_policy(
         &self,
         account_ref: String,

@@ -81,8 +81,12 @@ async fn cancelled(
     storage: SqliteAccountStorage,
     job: AttachmentAcquisition,
     mut updates: watch::Receiver<()>,
+    permission: Option<super::super::attachment_permission::PermissionLease>,
 ) {
     loop {
+        if permission.as_ref().is_some_and(|p| !p.allowed()) {
+            return;
+        }
         let store = storage.clone();
         let current = job.clone();
         let active = tokio::task::spawn_blocking(move || {
@@ -140,7 +144,11 @@ pub(super) fn schedule(
         admission.resumed = true;
     }
     let expired = storage.prune_expired_attachment_acquisitions(now, 64)?;
+    let host_managed = client.app.config.attachment_acquisition_mode
+        == crate::AttachmentAcquisitionMode::HostManaged;
+    let identity = storage.attachment_store_identity()?;
     let more = (policy.automatic
+        && !host_managed
         && admit_demands(
             &storage,
             now,
@@ -205,6 +213,22 @@ pub(super) fn schedule(
             storage.finish_attachment_preparation(&candidate, now, None)?;
             continue;
         };
+        let permission = if host_managed && !explicit {
+            let Some(lease) = shared
+                .attachment_permissions
+                .lease(&identity, &reference.media_type)
+            else {
+                storage.finish_attachment_preparation(
+                    &candidate,
+                    now,
+                    Some(now.saturating_add(15)),
+                )?;
+                continue;
+            };
+            Some(lease)
+        } else {
+            None
+        };
         let group = match hex::decode(&source.group_id_hex) {
             Ok(bytes) => GroupId::new(bytes),
             Err(_) => {
@@ -234,6 +258,9 @@ pub(super) fn schedule(
         };
         // A source change replaces the asset token. Claim rechecks the same
         // token/source after preparation, so stale prepared material cannot run.
+        if permission.as_ref().is_some_and(|p| !p.allowed()) {
+            continue;
+        }
         let Some(job) = storage.claim_attachment_acquisition(
             &candidate,
             now,
@@ -255,12 +282,14 @@ pub(super) fn schedule(
             directory: client.app.account_dir(&client.state.label),
             disk_reserve: policy.disk_reserve,
             automatic: !explicit,
+            permission: permission.clone(),
             updates: Some(shared.attachment_updates.clone()),
         };
         let cancel = cancelled(
             storage.clone(),
             job.clone(),
             shared.attachment_cancellations.subscribe(),
+            permission,
         );
         let updates = shared.attachment_updates.clone();
         updates.send_modify(|_| {});
@@ -303,6 +332,9 @@ pub(super) fn complete(
                 storage.fail_attachment_acquisition(job, None)?;
                 return Ok(());
             }
+            if !storage.mark_attachment_body_completed(job, now)? {
+                return Ok(());
+            }
             // Other writers may consume disk while HTTP is in flight. Recheck
             // before starting a full-object SQLite write, without evicting data.
             let policy = storage.attachment_download_policy(
@@ -313,13 +345,13 @@ pub(super) fn complete(
             let free =
                 fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
             if free < reserve.saturating_add((plaintext.len() as u64).saturating_mul(4)) {
-                storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
+                storage.fail_attachment_acquisition(job, None)?;
                 return Ok(());
             }
             match storage.complete_attachment_acquisition(job, &plaintext, now, byte_budget) {
                 Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
                 Ok(AttachmentPublishResult::CapacityBlocked) | Err(_) => {
-                    storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
+                    storage.fail_attachment_acquisition(job, None)?;
                 }
             }
         }

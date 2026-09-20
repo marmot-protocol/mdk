@@ -2,7 +2,7 @@
 use super::AttachmentDownloadFailure;
 use crate::AppError;
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc};
+use std::{future::Future, path::PathBuf, sync::Arc, task::Poll};
 use storage_sqlite::{
     ATTACHMENT_CHECKPOINT_BYTES, AttachmentAcquisition, AttachmentPartial,
     AttachmentPartialIdentity, SqliteAccountStorage,
@@ -22,6 +22,7 @@ pub(crate) struct AttachmentResume {
     pub directory: PathBuf,
     pub disk_reserve: u64,
     pub automatic: bool,
+    pub permission: Option<crate::runtime::attachment_permission::PermissionLease>,
     pub updates: Option<tokio::sync::watch::Sender<()>>,
 }
 fn retry(message: &str) -> AttachmentDownloadFailure {
@@ -32,6 +33,57 @@ fn stop(message: &str) -> AttachmentDownloadFailure {
 }
 
 impl AttachmentResume {
+    pub(crate) async fn with_permission<F>(
+        &self,
+        future: F,
+    ) -> Result<F::Output, AttachmentDownloadFailure>
+    where
+        F: Future,
+    {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| {
+            let mut poll = || future.as_mut().poll(cx).map(Ok);
+            match &self.permission {
+                Some(permission) => permission.with_permission(poll).unwrap_or_else(|| {
+                    Poll::Ready(Err(retry("automatic attachment permission revoked")))
+                }),
+                None => poll(),
+            }
+        })
+        .await
+    }
+    pub(crate) async fn before_network(&self) -> Result<(), AttachmentDownloadFailure> {
+        if self.permission.as_ref().is_some_and(|p| !p.allowed()) {
+            return Err(retry("automatic attachment permission revoked"));
+        }
+        let this = self.clone();
+        let allowed = tokio::task::spawn_blocking(move || {
+            this.storage
+                .begin_attachment_network_attempt(&this.job, crate::unix_now_seconds())
+        })
+        .await
+        .map_err(|_| stop("attachment admission task failed"))?
+        .map_err(|_| stop("attachment admission failed"))?;
+        if !allowed {
+            return Err(stop("attachment network attempt not admitted"));
+        }
+        Ok(())
+    }
+    pub(crate) async fn completed_body(&self) -> Result<(), AttachmentDownloadFailure> {
+        let this = self.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            this.storage
+                .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
+        })
+        .await
+        .map_err(|_| stop("attachment receipt task failed"))?
+        .map_err(|_| stop("attachment receipt failed"))?;
+        if !recorded {
+            return Err(stop("attachment receipt superseded"));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn progress(
         &self,
         received: u64,

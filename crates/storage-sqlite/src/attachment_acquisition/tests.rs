@@ -401,7 +401,8 @@ fn attachment_retry_deadlines_capacity_integrity_and_transaction_rollback() {
         store.retained_attachment_byte_count().unwrap(),
         BODY.len() as u64
     );
-    assert!(store.fail_attachment_acquisition(&job, Some(50)).unwrap());
+    assert!(!store.fail_attachment_acquisition(&job, Some(50)).unwrap());
+    assert!(store.retry_attachment_acquisition(&two, 50).unwrap());
     assert_eq!(request(&store, "two"), two);
     assert!(
         store
@@ -1055,6 +1056,11 @@ fn attachment_partial_publication_accounts_other_partials_and_releases_own() {
             .unwrap(),
         AttachmentPublishResult::CapacityBlocked
     );
+    assert!(store.explicitly_retry_attachment(&a, 12).unwrap());
+    let job = store
+        .claim_attachment_acquisition(&a, 12, 100)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         store
             .complete_attachment_acquisition(&job, BODY, 12, BODY.len() as u64 + 10)
@@ -1908,4 +1914,347 @@ fn attachment_transfer_snapshot_reports_expiry_even_for_ready_rows() {
         .unwrap();
     assert!(rows[0].is_none());
     assert_eq!(next, None);
+}
+
+fn automatic_request(
+    store: &SqliteAccountStorage,
+    message: &str,
+    allowed: bool,
+) -> (Option<AttachmentTransferStatus>, bool) {
+    store
+        .request_automatic_attachment(
+            GROUP,
+            &selected(message),
+            digest(),
+            12,
+            (
+                &AttachmentDownloadPolicy {
+                    automatic: true,
+                    retained_bytes: 10000,
+                    disk_reserve: 0,
+                    transfer_limit: 100,
+                },
+                allowed,
+            ),
+        )
+        .unwrap()
+}
+
+#[test]
+fn automatic_demand_preserves_acquisition_history_after_authoritative_bytes_are_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let key = SqlCipherKey::new("automatic-history").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for message in ["one", "two", "three", "four", "five", "six", "seven"] {
+        seed(&store, message);
+        let (state, queued) = automatic_request(&store, message, true);
+        assert!(queued);
+        publish(&store, &state.unwrap().reference.unwrap());
+    }
+    // Remove the authoritative SQLCipher bytes, not the Android presentation cache.
+    sql(&store, "DELETE FROM retained_attachment_bytes");
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
+    store.rebuild_message_timeline_for_group(GROUP).unwrap();
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for _ in 0..10 {
+        for message in ["one", "two", "three", "four", "five", "six", "seven"] {
+            let (state, queued) = automatic_request(&store, message, true);
+            assert!(!queued);
+            assert_eq!(
+                state.unwrap().state,
+                AttachmentTransferState::PreviouslyAcquiredUnavailable
+            );
+        }
+        assert!(
+            store
+                .attachment_transfer_candidates(1000, 64, true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let reference = request(&store, "one");
+    assert!(store.explicitly_retry_attachment(&reference, 12).unwrap());
+    publish(&store, &reference);
+    assert_eq!(
+        automatic_request(&store, "one", true).0.unwrap().state,
+        AttachmentTransferState::Ready
+    );
+}
+
+#[test]
+fn automatic_demand_preserves_suppression_deadlines_and_policy() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    assert_eq!(
+        automatic_request(&store, "one", false).0.unwrap().state,
+        AttachmentTransferState::PolicyBlocked
+    );
+    assert!(
+        store
+            .due_attachment_acquisitions(12, 64)
+            .unwrap()
+            .is_empty()
+    );
+    let (status, queued) = automatic_request(&store, "one", true);
+    assert!(queued);
+    let reference = status.unwrap().reference.unwrap();
+    let job = store
+        .claim_attachment_acquisition(&reference, 12, 100)
+        .unwrap()
+        .unwrap();
+    store.fail_attachment_acquisition(&job, Some(50)).unwrap();
+    for _ in 0..10 {
+        let (status, queued) = automatic_request(&store, "one", true);
+        assert!(!queued);
+        assert_eq!(status.unwrap().retry_at, Some(50));
+    }
+    store.cancel_attachment_acquisition(&reference).unwrap();
+    assert_eq!(
+        automatic_request(&store, "one", true).0.unwrap().state,
+        AttachmentTransferState::Cancelled
+    );
+    store.remove_attachment_reference(&reference).unwrap();
+    assert_eq!(
+        automatic_request(&store, "one", true).0.unwrap().state,
+        AttachmentTransferState::Removed
+    );
+}
+
+#[test]
+fn automatic_network_budget_survives_progress_reopen_and_repeated_demand() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let key = SqlCipherKey::new("automatic-budget").unwrap();
+    let mut store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&store, "one");
+    let reference = request(&store, "one");
+    for attempt in 0..4 {
+        let now = 12 + attempt;
+        let job = store
+            .claim_attachment_acquisition(&reference, now, 100)
+            .unwrap()
+            .unwrap();
+        assert!(store.begin_attachment_network_attempt(&job, now).unwrap());
+        assert!(
+            store
+                .checkpoint_attachment_partial(
+                    &job,
+                    &partial_identity(100),
+                    attempt,
+                    b"x",
+                    now,
+                    10000
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .attachment_acquisition_status(&reference)
+                .unwrap()
+                .unwrap()
+                .attempts,
+            1
+        );
+        store
+            .fail_attachment_acquisition(&job, Some(now + 1))
+            .unwrap();
+        for _ in 0..10 {
+            assert!(!automatic_request(&store, "one", true).1);
+        }
+        store.close().unwrap();
+        store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store.resume_attachment_acquisitions(now + 1, 64).unwrap();
+    }
+    assert!(
+        store
+            .claim_attachment_acquisition(&reference, 100, 200)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        automatic_request(&store, "one", true).0.unwrap().state,
+        AttachmentTransferState::RetryExhausted
+    );
+    assert!(store.explicitly_retry_attachment(&reference, 100).unwrap());
+    let job = store
+        .claim_attachment_acquisition(&reference, 100, 200)
+        .unwrap()
+        .unwrap();
+    assert!(store.begin_attachment_network_attempt(&job, 100).unwrap());
+}
+
+#[test]
+fn automatic_completed_body_is_terminal_after_capacity_failure_or_process_death() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let key = SqlCipherKey::new("automatic-receipt").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for message in ["capacity", "crash"] {
+        seed(&store, message);
+        let reference = request(&store, message);
+        let job = store
+            .claim_attachment_acquisition(&reference, 12, 100)
+            .unwrap()
+            .unwrap();
+        assert!(store.mark_attachment_body_completed(&job, 12).unwrap());
+        if message == "capacity" {
+            assert_eq!(
+                store
+                    .complete_attachment_acquisition(&job, BODY, 12, 0)
+                    .unwrap(),
+                AttachmentPublishResult::CapacityBlocked
+            );
+        }
+    }
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    store.resume_attachment_acquisitions(13, 64).unwrap();
+    for message in ["capacity", "crash"] {
+        let (status, queued) = automatic_request(&store, message, true);
+        assert!(!queued);
+        assert_eq!(
+            status.unwrap().state,
+            AttachmentTransferState::CompletedUnretained
+        );
+        assert!(
+            store
+                .retained_attachment_asset(GROUP, message, &format!("source-{message}"), 0, 13)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        store
+            .attachment_transfer_candidates(1000, 64, true)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn automatic_history_replacement_is_independent_but_slot_removal_stays_suppressed() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let original = request(&store, "one");
+    publish(&store, &original);
+    // Simulate an authoritative source-selection update, not another rendering.
+    sql(
+        &store,
+        "UPDATE message_timeline SET source_message_id_hex='replacement',source_epoch=4 WHERE message_id_hex='one'",
+    );
+    let entry = store
+        .attachment_control_entry(GROUP, "one", "replacement", 0, 12)
+        .unwrap()
+        .unwrap();
+    let policy = AttachmentDownloadPolicy {
+        automatic: true,
+        retained_bytes: 10000,
+        disk_reserve: 0,
+        transfer_limit: 100,
+    };
+    let (status, queued) = store
+        .request_automatic_attachment(GROUP, &entry, digest(), 12, (&policy, true))
+        .unwrap();
+    assert!(queued);
+    let replacement = status.unwrap().reference.unwrap();
+    assert_ne!(replacement, original);
+    assert!(
+        store
+            .read_retained_attachment(&original, 12, 0, 100)
+            .unwrap()
+            .is_none()
+    );
+    store.remove_attachment_reference(&replacement).unwrap();
+    sql(
+        &store,
+        "UPDATE message_timeline SET source_message_id_hex='third-source' WHERE message_id_hex='one'",
+    );
+    let entry = store
+        .attachment_control_entry(GROUP, "one", "third-source", 0, 12)
+        .unwrap()
+        .unwrap();
+    let (status, queued) = store
+        .request_automatic_attachment(GROUP, &entry, digest(), 12, (&policy, true))
+        .unwrap();
+    assert!(!queued);
+    assert_eq!(status.unwrap().state, AttachmentTransferState::Removed);
+}
+
+#[test]
+fn automatic_request_can_readmit_eligible_parked_work_without_replacing_identity() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let reference = request(&store, "one");
+    sql(&store, "UPDATE attachment_acquisition SET state=5,due=NULL");
+    assert!(!automatic_request(&store, "one", false).1);
+    let (state, queued) = automatic_request(&store, "one", true);
+    assert!(queued);
+    let state = state.unwrap();
+    assert_eq!(state.reference, Some(reference));
+    assert_eq!(state.state, AttachmentTransferState::Queued);
+}
+
+#[test]
+fn automatic_budget_does_not_invalidate_a_live_final_attempt() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let asset = request(&store, "one");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    for _ in 0..4 {
+        assert!(store.begin_attachment_network_attempt(&job, 12).unwrap());
+    }
+    assert!(
+        store
+            .claim_attachment_acquisition(&asset, 13, 200)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.attachment_transfer_is_active(&job, 13).unwrap());
+    assert!(store.mark_attachment_body_completed(&job, 13).unwrap());
+    assert!(
+        store
+            .claim_attachment_acquisition(&asset, 13, 200)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, BODY, 13, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+}
+
+#[test]
+fn automatic_retry_budget_also_bounds_failures_before_networking() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let asset = request(&store, "one");
+    for now in 12..16 {
+        let job = store
+            .claim_attachment_acquisition(&asset, now, 100)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .fail_attachment_acquisition(&job, Some(now + 1))
+                .unwrap()
+        );
+        assert_eq!(request(&store, "one"), asset);
+    }
+    assert!(
+        store
+            .claim_attachment_acquisition(&asset, 16, 100)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        automatic_request(&store, "one", true).0.unwrap().state,
+        AttachmentTransferState::RetryExhausted
+    );
 }

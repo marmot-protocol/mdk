@@ -2,6 +2,8 @@
 
 UniFFI bindings for the Marmot app runtime.
 
+Host-controlled automatic downloads use the [host-managed attachment contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-unreleased), including Android WorkManager migration.
+
 ## Integration guide and API reference
 
 This is the current integration entry point for Swift/iOS, Swift/macOS and Kotlin/Android.

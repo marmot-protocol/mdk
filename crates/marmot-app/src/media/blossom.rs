@@ -776,14 +776,42 @@ where
         if operation_remaining.is_zero() {
             return Err(AppError::BlobStore("request timed out".into()).into());
         }
-        let host_setup_started = Instant::now();
-        let client = match tokio::time::timeout(
-            operation_remaining,
-            client_for_url(current.clone()),
-        )
-        .await
+        let partial = match resume {
+            Some(resume) => resume.load(&current, max_body_bytes).await?,
+            None => None,
+        };
+        if let Some(part) = &partial
+            && part.bytes.len() as u64 == part.identity.total
         {
-            Ok(Ok(client)) => {
+            if let Some(resume) = resume {
+                resume
+                    .progress(part.identity.total, Some(part.identity.total), true)
+                    .await?;
+            }
+            return Ok(FetchedBlob {
+                bytes: partial.expect("checked").bytes,
+                response_url: current,
+                resumed: true,
+            });
+        }
+        // DNS/host setup is network work too: failed resolution must consume
+        // the same durable budget as HTTP, redirects and locator fallback.
+        if let Some(resume) = resume {
+            resume.before_network().await?;
+        }
+        let host_setup_started = Instant::now();
+        let setup = async {
+            match resume {
+                Some(resume) => {
+                    resume
+                        .with_permission(client_for_url(current.clone()))
+                        .await
+                }
+                None => Ok(client_for_url(current.clone()).await),
+            }
+        };
+        let client = match tokio::time::timeout(operation_remaining, setup).await {
+            Ok(Ok(Ok(client))) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadHostSetup,
@@ -792,7 +820,8 @@ where
                 );
                 client
             }
-            Ok(Err(error)) => {
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(Err(error))) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadHostSetup,
@@ -829,24 +858,6 @@ where
         if operation_remaining.is_zero() {
             return Err(AppError::BlobStore("request timed out".into()).into());
         }
-        let partial = match resume {
-            Some(resume) => resume.load(&current, max_body_bytes).await?,
-            None => None,
-        };
-        if let Some(part) = &partial
-            && part.bytes.len() as u64 == part.identity.total
-        {
-            if let Some(resume) = resume {
-                resume
-                    .progress(part.identity.total, Some(part.identity.total), true)
-                    .await?;
-            }
-            return Ok(FetchedBlob {
-                bytes: partial.expect("checked").bytes,
-                response_url: current,
-                resumed: true,
-            });
-        }
         let mut request = client.get(current.clone()).timeout(remaining);
         if resume.is_some() {
             request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
@@ -860,8 +871,14 @@ where
                 .header(reqwest::header::IF_RANGE, &part.identity.etag);
         }
         let response_headers_started = Instant::now();
-        let response = match tokio::time::timeout(operation_remaining, request.send()).await {
-            Ok(Ok(response)) => {
+        let send = async {
+            match resume {
+                Some(resume) => resume.with_permission(request.send()).await,
+                None => Ok(request.send().await),
+            }
+        };
+        let response = match tokio::time::timeout(operation_remaining, send).await {
+            Ok(Ok(Ok(response))) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadResponseHeaders,
@@ -870,7 +887,8 @@ where
                 );
                 response
             }
-            Ok(Err(error)) => {
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(Err(error))) => {
                 record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadResponseHeaders,

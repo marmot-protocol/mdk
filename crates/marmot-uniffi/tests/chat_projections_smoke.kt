@@ -1,6 +1,15 @@
 package dev.ipf.marmotkit
 
 fun main() {
+    val options = MarmotOptions(attachmentAcquisitionMode = AttachmentAcquisitionModeFfi.HOST_MANAGED)
+    check(FfiConverterTypeMarmotOptions.lift(FfiConverterTypeMarmotOptions.lower(options)) == options)
+    val permission = AttachmentAutomaticPermissionFfi(false, true, false, true)
+    check(FfiConverterTypeAttachmentAutomaticPermissionFfi.lift(FfiConverterTypeAttachmentAutomaticPermissionFfi.lower(permission)) == permission)
+    for (state in listOf(AttachmentTransferStateFfi.PREVIOUSLY_ACQUIRED_UNAVAILABLE, AttachmentTransferStateFfi.COMPLETED_UNRETAINED, AttachmentTransferStateFfi.RETRY_EXHAUSTED)) {
+        val request = AutomaticAttachmentRequestFfi(AttachmentTransferStatusFfi("opaque", state, 4uL, 0uL, null, null), false)
+        check(FfiConverterTypeAutomaticAttachmentRequestFfi.lift(FfiConverterTypeAutomaticAttachmentRequestFfi.lower(request)) == request)
+    }
+
     for (preview in listOf(SelectedChatPreviewFfi.Draft(ChatListDraftPreviewFfi("draft 🦀", true, 2u, ChatListAttachmentKindFfi.MIXED)), SelectedChatPreviewFfi.Message, SelectedChatPreviewFfi.Invitation, SelectedChatPreviewFfi.Empty)) {
         val copy = FfiConverterTypeSelectedChatPreviewFfi.lift(FfiConverterTypeSelectedChatPreviewFfi.lower(preview))
         check(copy == preview)
@@ -201,5 +210,14 @@ suspend fun compileAttachmentControls(marmot: Marmot, account: String, group: St
     marmot.subscribeAttachmentTransfers(account, group, listOf(target)).use { stream ->
         stream.next()
         stream.cancel()
+    }
+}
+
+suspend fun compileAutomaticAttachment(marmot: Marmot, account: String, group: String, target: AttachmentLocalTargetFfi) {
+    val generation = marmot.beginAttachmentPermissionUpdate(account)
+    val applied = marmot.setAttachmentAutomaticPermission(account, generation, AttachmentAutomaticPermissionFfi(true, false, false, true))
+    if (applied) {
+        val result = marmot.requestAutomaticAttachment(account, group, target)
+        check(!result.newlyQueued || result.status.state == AttachmentTransferStateFfi.QUEUED)
     }
 }

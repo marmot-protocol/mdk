@@ -397,6 +397,8 @@ pub struct MarmotClientOptions {
     pub client_name: *const c_char,
     /// Optional callback store; NULL selects the platform keychain.
     pub store: *const MarmotSecretStore,
+    /// 0 = NativeAutomatic (default), 1 = HostManaged (initially denied).
+    pub attachment_acquisition_mode: u32,
 }
 
 /// Create a client with combined relay, cursor, label and secret-storage options.
@@ -420,6 +422,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
             return status;
         }
         let defaults = MarmotClientOptions {
+            attachment_acquisition_mode: 0,
             relay_policy: 0,
             cursor_persistence: 0,
             client_name: std::ptr::null(),
@@ -434,6 +437,12 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
                 set_last_error("invalid relay policy");
                 return MarmotStatus::InvalidArgument;
             }
+        };
+        let attachment_mode = match attachment_controls::MarmotAttachmentAcquisitionMode::from_c(
+            options.attachment_acquisition_mode,
+        ) {
+            Ok(mode) => mode.into(),
+            Err(status) => return status,
         };
         let store = options.store;
         let cursor = match MarmotCursorPersistence::from_c(options.cursor_persistence) {
@@ -462,6 +471,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
                         root,
                         relays,
                         marmot_uniffi::MarmotOptions {
+                            attachment_acquisition_mode: Some(attachment_mode),
                             relay_policy: Some(policy),
                             cursor_persistence: Some(cursor.into()),
                             client_name: name,

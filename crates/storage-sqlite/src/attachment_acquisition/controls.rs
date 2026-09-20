@@ -38,6 +38,9 @@ pub enum AttachmentTransferState {
     Paused,
     Removed,
     PolicyBlocked,
+    PreviouslyAcquiredUnavailable,
+    CompletedUnretained,
+    RetryExhausted,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentTransferStatus {
@@ -59,6 +62,128 @@ pub struct AttachmentTransferFrame {
 }
 
 impl SqliteAccountStorage {
+    /// Revoke active automatic leases without resetting history or retry budgets.
+    pub fn pause_automatic_attachments(&self, now: u64) -> StorageResult<()> {
+        self.lock()?.execute("UPDATE attachment_acquisition SET state=CASE WHEN body_completed=1 THEN 4 ELSE 0 END,due=CASE WHEN body_completed=1 THEN NULL ELSE ?1 END,attempt=NULL WHERE state=1 AND explicit_request=0", [u64_to_i64(now)?]).storage()?;
+        Ok(())
+    }
+    /// Opaque store incarnation for runtime-only permission scoping. Never log it.
+    pub fn attachment_store_identity(&self) -> StorageResult<Vec<u8>> {
+        let conn = self.lock()?;
+        epoch(&conn)
+    }
+
+    /// Charge every outbound HTTP attempt, including range restarts and locator
+    /// fallback. This counter never resets on checkpoints or worker recovery.
+    pub fn begin_attachment_network_attempt(
+        &self,
+        job: &AttachmentAcquisition,
+        now: u64,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !partial::valid_attempt(&conn, job, now)? { return Ok(false); }
+            Ok(conn.execute("UPDATE attachment_acquisition SET network_attempts=min(network_attempts+1,2147483647)
+                WHERE token=?1 AND body_completed=0 AND cancelled=0
+                AND network_attempts<4 AND (explicit_request=1 OR COALESCE((SELECT automatic FROM attachment_download_policy WHERE id=1),1)=1)",
+                [&job.reference.token]).storage()? == 1)
+        })
+    }
+
+    /// Record a verified body receipt before publication. A crash or retention
+    /// failure after this point cannot turn a completed body into new demand.
+    pub fn mark_attachment_body_completed(
+        &self,
+        job: &AttachmentAcquisition,
+        now: u64,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !partial::valid_attempt(&conn, job, now)? {
+                return Ok(false);
+            }
+            Ok(conn
+                .execute(
+                    "UPDATE attachment_acquisition SET body_completed=1 WHERE token=?1",
+                    [&job.reference.token],
+                )
+                .storage()?
+                == 1)
+        })
+    }
+
+    /// Policy, source validation, idempotent demand and returned status share a
+    /// transaction. The caller holds its runtime permission fence for this call.
+    pub fn request_automatic_attachment(
+        &self,
+        group: &str,
+        selected: &crate::AttachmentHistoryEntry,
+        digest: [u8; 32],
+        now: u64,
+        policy: (&AttachmentDownloadPolicy, bool),
+    ) -> StorageResult<(Option<AttachmentTransferStatus>, bool)> {
+        let index = u32::try_from(selected.attachment_index)
+            .map_err(|_| invalid("invalid attachment index"))?;
+        self.connection.with_transaction(|| {
+            let current = self.attachment_control_entry(
+                group,
+                &selected.message_id_hex,
+                &selected.source_message_id_hex,
+                index,
+                now,
+            )?;
+            if !current.is_some_and(|entry| {
+                entry.slot == selected.slot && entry.source_epoch == selected.source_epoch
+            }) {
+                return Ok((None, false));
+            }
+            let automatic = policy.1 && self.attachment_download_policy(policy.0)?.automatic;
+            let status = self.attachment_transfer_status(
+                group,
+                &selected.message_id_hex,
+                &selected.source_message_id_hex,
+                index,
+                now,
+                automatic,
+            )?;
+            // Existing state (including cancellation, loss of bytes and retry
+            // deadlines) wins over demand and is never reset by a screen render.
+            if status.as_ref().is_none_or(|s| {
+                !matches!(
+                    s.state,
+                    AttachmentTransferState::NotRequested | AttachmentTransferState::Paused
+                )
+            }) {
+                return Ok((status, false));
+            }
+            if !automatic {
+                return Ok((
+                    status.map(|mut s| {
+                        if s.state == AttachmentTransferState::NotRequested {
+                            s.state = AttachmentTransferState::PolicyBlocked;
+                        }
+                        s
+                    }),
+                    false,
+                ));
+            }
+            match self.request_attachment_acquisition(group, selected, digest, now)? {
+                AttachmentDemand::Requested(_) => Ok((
+                    self.attachment_transfer_status(
+                        group,
+                        &selected.message_id_hex,
+                        &selected.source_message_id_hex,
+                        index,
+                        now,
+                        automatic,
+                    )?,
+                    true,
+                )),
+                AttachmentDemand::Suppressed | AttachmentDemand::Unavailable => Ok((None, false)),
+            }
+        })
+    }
+
     /// Capture store identity and all bounded source slots under one read transaction.
     pub fn attachment_transfer_snapshot(
         &self,
@@ -151,8 +276,8 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
-            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL
-                WHERE token=?1 AND state IN(0,1,2,4,5) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
+            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
+                WHERE token=?1 AND (state IN(0,1,2,4,5) OR (state=3 AND NOT EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token))) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
                 params![reference.token,u64_to_i64(now)?]).storage()?==1)
         })
     }
@@ -367,7 +492,7 @@ fn transfer_status(
     }
 
     let removed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_removal_suppression WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",params![group,message,index],|r|r.get(0)).storage()?;
-    let status=conn.query_row(&format!("SELECT token,state,cancelled,explicit_request,size_blocked_max,progress_epoch,progress_received,progress_total,progress_phase,due
+    let status=conn.query_row(&format!("SELECT token,state,cancelled,explicit_request,size_blocked_max,progress_epoch,progress_received,progress_total,progress_phase,due,body_completed,network_attempts,EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token),acquisition_attempts
                 FROM attachment_acquisition q WHERE group_id_hex=?1 AND message_id_hex=?2 AND source_message_id_hex=?3 AND attachment_index=?4 AND {SOURCE_MATCH}"),params![group,message,source,index],|r| {
                 let stored_state = r.get::<_,u8>(1)?;
                 let cancelled = r.get::<_,bool>(2)?;
@@ -375,8 +500,11 @@ fn transfer_status(
                 let size_blocked = r.get::<_,Option<i64>>(4)?.is_some();
                 let phase = r.get::<_,u8>(8)?;
                 let state = match stored_state {
+                    3 if !r.get::<_,bool>(12)? => AttachmentTransferState::PreviouslyAcquiredUnavailable,
                     3 => AttachmentTransferState::Ready,
                     _ if cancelled => AttachmentTransferState::Cancelled,
+                    _ if r.get::<_,bool>(10)? && stored_state!=1 => AttachmentTransferState::CompletedUnretained,
+                    _ if (nonnegative(r,11)? >= 4 || nonnegative(r,13)? >= 4) && stored_state!=1 => AttachmentTransferState::RetryExhausted,
                     _ if size_blocked => AttachmentTransferState::PolicyBlocked,
                     4 => AttachmentTransferState::Failed,
                     _ if !automatic && !explicit => AttachmentTransferState::Paused,

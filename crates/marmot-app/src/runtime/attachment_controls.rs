@@ -59,7 +59,7 @@ impl MarmotAppRuntime {
         self.wake_attachment_work();
         Ok(())
     }
-    fn wake_attachment_work(&self) {
+    pub(super) fn wake_attachment_work(&self) {
         self.shared.attachment_updates.send_modify(|_| {});
         self.shared.attachment_cancellations.send_modify(|_| {});
         self.accounts.app.presentation_signals.wake();
@@ -137,7 +137,10 @@ impl MarmotAppRuntime {
         let group = hex::encode(group.as_slice());
         let fallback = default_policy(&self.accounts.app.config);
         let frozen = self.accounts.app.config.cursor_persistence == CursorPersistence::Frozen;
-        self.attachment_read(account_ref, move |s, _| {
+        let host_managed = self.accounts.app.config.attachment_acquisition_mode
+            == crate::AttachmentAcquisitionMode::HostManaged;
+        let permissions = self.shared.attachment_permissions.clone();
+        self.attachment_read(account_ref, move |s, loopback| {
             let policy = s.attachment_download_policy(&fallback)?;
             let targets = targets
                 .iter()
@@ -149,12 +152,55 @@ impl MarmotAppRuntime {
                     )
                 })
                 .collect::<Vec<_>>();
-            Ok(s.attachment_transfer_snapshot(
+            let mut frame = s.attachment_transfer_snapshot(
                 &group,
                 &targets,
                 crate::unix_now_seconds(),
                 policy.automatic && !frozen,
-            )?)
+            )?;
+            if host_managed {
+                let identity = s.attachment_store_identity()?;
+                for (row, (message, source, index)) in frame.rows.iter_mut().zip(&targets) {
+                    let Some(status) = row else {
+                        continue;
+                    };
+                    if !matches!(
+                        status.state,
+                        AttachmentTransferState::Queued
+                            | AttachmentTransferState::RetryScheduled
+                            | AttachmentTransferState::Downloading
+                            | AttachmentTransferState::VerifyingCiphertext
+                            | AttachmentTransferState::Decrypting
+                            | AttachmentTransferState::VerifyingPlaintext
+                    ) {
+                        continue;
+                    }
+                    if let Some(reference) = &status.reference
+                        && s.attachment_request_is_explicit(reference)?
+                    {
+                        continue;
+                    }
+                    let entry = s.attachment_control_entry(
+                        &group,
+                        message,
+                        source,
+                        *index,
+                        crate::unix_now_seconds(),
+                    )?;
+                    let permission = entry.and_then(|entry| {
+                        let tag = serde_json::from_value::<Vec<String>>(entry.slot).ok()?;
+                        let reference =
+                            crate::parse_media_attachment(&tag, entry.source_epoch, loopback)
+                                .ok()?;
+                        permissions.lease(&identity, &reference.media_type)
+                    });
+                    if permission.is_none() {
+                        status.state = AttachmentTransferState::Paused;
+                        status.retry_at = None;
+                    }
+                }
+            }
+            Ok(frame)
         })
         .await
     }
