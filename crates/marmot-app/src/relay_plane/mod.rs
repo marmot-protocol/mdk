@@ -840,6 +840,62 @@ impl MarmotRelayPlane {
         }
     }
 
+    pub(super) async fn publish_signed_event(
+        &self,
+        fallback: &dyn NostrRelayClient,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        // Signed envelopes need no account signer. Reuse the subscription
+        // pool's sockets instead of opening a second connection for each send.
+        let mut shared = self
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .filter(|client| event.sig.is_some() && !client.client().pool().is_shutdown());
+        // Keep fresh connection attempts on the existing path, including its
+        // distinction between a failed dial and an ambiguous in-flight send.
+        if let Some(client) = shared {
+            for endpoint in endpoints {
+                if client
+                    .client()
+                    .relay(endpoint.as_str())
+                    .await
+                    .is_ok_and(|relay| relay.is_connected())
+                {
+                    continue;
+                }
+                shared = None;
+                break;
+            }
+        }
+        let publisher: &dyn NostrRelayClient = match shared {
+            Some(client) => client,
+            None => fallback,
+        };
+        let outcome = publisher
+            .publish_event(endpoints, event, required_acks)
+            .await;
+        // A public read socket can still require account authentication to
+        // write. Preserve the signer-bound path for that explicit rejection.
+        match outcome {
+            Err(error)
+                if shared.is_some()
+                    && error.publish_endpoint_failures().iter().any(|failure| {
+                        failure.rejection_category
+                            == Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired)
+                    }) =>
+            {
+                fallback
+                    .publish_event(endpoints, event, required_acks)
+                    .await
+            }
+            result => result,
+        }
+    }
+
     pub(crate) fn sanitize_relay_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,
@@ -2734,12 +2790,8 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
         let outcome = self
             .relay_plane
-            .inner
-            .transport
-            .adapter
-            .publish_event_with_client(
+            .publish_signed_event(
                 self.publish_client.as_ref(),
-                &request.account_id,
                 request.target.endpoints(),
                 &event,
                 request.required_acks,
