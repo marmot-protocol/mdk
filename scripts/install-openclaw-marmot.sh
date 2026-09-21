@@ -717,10 +717,10 @@ configure_openclaw_gateway() {
     fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
-    log "would patch OpenClaw config: $config_path"
-    log "would preserve other OpenClaw channels and only update channels.marmot"
-    log "would preserve existing channels.marmot.senderPolicy if present"
-    log "would not copy --allow-welcomer into senderPolicy; configure senderPolicy or MARMOT_ALLOWED_USERS before claiming chat readiness"
+        log "would patch OpenClaw config: $config_path"
+        log "would preserve other OpenClaw channels and only update channels.marmot"
+        log "would preserve existing channels.marmot.senderPolicy if present"
+        log "would not copy --allow-welcomer into senderPolicy; configure senderPolicy or MARMOT_ALLOWED_USERS before claiming chat readiness"
         return 0
     fi
 

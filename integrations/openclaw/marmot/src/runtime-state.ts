@@ -93,8 +93,8 @@ function project(facts: AccountLiveFacts): ChannelAccountSnapshot {
     lastStartAt: facts.lastStartAt,
     lastStopAt: facts.lastStopAt,
     lastError:
-      senderError ??
-      (facts.policy === "failed" ? MARMOT_ALLOWLIST_SYNC_FAILED : facts.inboundError),
+      (facts.policy === "failed" ? MARMOT_ALLOWLIST_SYNC_FAILED : facts.inboundError) ??
+      senderError,
     lastInboundAt: facts.lastInboundAt,
     lastOutboundAt: facts.lastOutboundAt,
   };

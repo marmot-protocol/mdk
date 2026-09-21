@@ -624,16 +624,6 @@ export function createMarmotInboundDispatcher(
                     // triggered this turn. The destination itself comes from
                     // ctxPayload.OriginatingTo / ctxPayload.To.
                     replyToId: message.messageIdHex,
-                    // Marmot's adapter requires the host delivery-queue
-                    // identity. Ask for required unknown-send reconciliation
-                    // so the host constructs that context instead of calling
-                    // send.text without a queue id.
-                    requiredCapabilities: {
-                      text: true,
-                      replyTo: true,
-                      messageSendingHooks: true,
-                      reconcileUnknownSend: true,
-                    },
                   });
                   assertDurableReplyHandled(result);
                 },

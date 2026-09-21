@@ -216,6 +216,10 @@ describe("createSenderAuthorizer", () => {
         outcome: "deny",
         reason: "receiving_account_mismatch",
       });
+      expect(authorizer.authorize(input({ receiving: "not-an-account-id" }))).toEqual({
+        outcome: "deny",
+        reason: "malformed_receiving_account",
+      });
       authorizer.setLifecycle("stopped");
       expect(authorizer.authorize(input())).toEqual({
         outcome: "deny",

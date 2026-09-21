@@ -177,6 +177,16 @@ describe("per-account composed readiness", () => {
     expect(JSON.stringify(marmotInboundRuntimeSnapshot("work"))).not.toContain("aa".repeat(32));
   });
 
+  it("keeps operational failures visible ahead of sender-policy readiness", () => {
+    beginMarmotAccountLifecycle("work");
+    markMarmotSenderPolicyResult("work", { state: "missing", allowedUserCount: 0 });
+    markMarmotAllowlistSyncResult("work", { state: "failed", reason: "unverified" });
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      connected: false,
+      lastError: MARMOT_ALLOWLIST_SYNC_FAILED,
+    });
+  });
+
   it("does not report connected while the bound authorizer lifecycle is stopped", () => {
     beginMarmotAccountLifecycle("work");
     markMarmotAllowlistSyncResult("work", { state: "reconciled" });

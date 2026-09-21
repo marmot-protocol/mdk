@@ -10,7 +10,6 @@ import {
   resetMarmotGatewayRecoveryForTests,
   startMarmotGatewayAccount,
   MARMOT_ALLOWLIST_RETRY_MAX_MS,
-  MARMOT_SUPERSEDED_SYNC_DRAIN_MS,
 } from "../src/gateway.js";
 import {
   resetMarmotInboundAccountsForTests,
@@ -511,23 +510,20 @@ describe("startMarmotGatewayAccount", () => {
     await replacementRun;
   });
 
-  it("does not mark a replacement authorizer replaced when a stale start cancels", async () => {
-    let releaseOld!: (result: MarmotAllowlistSyncResult) => void;
-    const oldSync = new Promise<MarmotAllowlistSyncResult>((resolve) => {
-      releaseOld = resolve;
-    });
+  it("does not let a stale lifecycle stop overwrite a healthy replacement", async () => {
     const abortOld = new AbortController();
     const oldRun = startMarmotGatewayAccount(
       gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
         accountId: "work",
         abortSignal: abortOld.signal,
       }),
-      {
-        syncAllowlist: async () => oldSync,
-      },
     );
+    const oldLifecycle = await waitForLifecycle("work");
     await vi.waitFor(() => {
-      expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({ running: true });
+      expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+        running: true,
+        connected: true,
+      });
     });
 
     lifecycleByAccount.delete("work");
@@ -547,7 +543,7 @@ describe("startMarmotGatewayAccount", () => {
     });
     expect(marmotSenderAuthorizerLifecycle("work")).toBe("active");
 
-    releaseOld({ state: "unmanaged" });
+    await oldLifecycle.stop();
     await oldRun;
     expect(marmotSenderAuthorizerLifecycle("work")).toBe("active");
     expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
@@ -556,13 +552,12 @@ describe("startMarmotGatewayAccount", () => {
       lastError: null,
     });
 
-    abortOld.abort();
     abortReplacement.abort();
     await replacement.stop();
     await replacementRun;
   });
 
-  it("starts a replacement when a superseded allowlist sync never settles", async () => {
+  it("keeps replacement allowlist reconciliation behind an unsettled predecessor", async () => {
     let markOldSyncCalled!: () => void;
     const oldSyncCalled = new Promise<void>((resolve) => {
       markOldSyncCalled = resolve;
@@ -571,11 +566,9 @@ describe("startMarmotGatewayAccount", () => {
     const oldSync = new Promise<MarmotAllowlistSyncResult>((resolve) => {
       releaseOld = resolve;
     });
-    const abortOld = new AbortController();
     const oldRun = startMarmotGatewayAccount(
       gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
         accountId: "work",
-        abortSignal: abortOld.signal,
       }),
       {
         syncAllowlist: async () => {
@@ -584,48 +577,28 @@ describe("startMarmotGatewayAccount", () => {
         },
       },
     );
-    // The superseded generation must own an in-flight sync before the
-    // replacement reads the lane tail; otherwise this proves nothing.
     await oldSyncCalled;
 
     lifecycleByAccount.delete("work");
+    const replacementSync = vi.fn(async () => ({ state: "unmanaged" }) as const);
     const abortReplacement = new AbortController();
-    const drainWaits: number[] = [];
     const replacementRun = startMarmotGatewayAccount(
       gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
         accountId: "work",
         abortSignal: abortReplacement.signal,
       }),
-      {
-        drainDelay: async (ms) => {
-          drainWaits.push(ms);
-        },
-      },
+      { syncAllowlist: replacementSync },
     );
-
-    // The replacement reaches its passive lifecycle while the superseded sync
-    // is still unsettled.
-    const replacement = await waitForLifecycle("work");
-    expect(drainWaits).toEqual([MARMOT_SUPERSEDED_SYNC_DRAIN_MS]);
-    expect(marmotSenderAuthorizerLifecycle("work")).toBe("active");
-    await vi.waitFor(() => {
-      expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
-        running: true,
-        connected: true,
-        lastError: null,
-      });
-    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(replacementSync).not.toHaveBeenCalled();
+    expect(lifecycleByAccount.has("work")).toBe(false);
 
     releaseOld({ state: "unmanaged" });
     await oldRun;
-    expect(marmotSenderAuthorizerLifecycle("work")).toBe("active");
-    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
-      running: true,
-      connected: true,
-      lastError: null,
-    });
+    const replacement = await waitForLifecycle("work");
+    expect(replacementSync).toHaveBeenCalledTimes(1);
 
-    abortOld.abort();
     abortReplacement.abort();
     await replacement.stop();
     await replacementRun;

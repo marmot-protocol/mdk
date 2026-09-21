@@ -237,7 +237,7 @@ describe("resolveMarmotChannelAccount", () => {
     expect(JSON.stringify(issues)).not.toContain(HEX32("11"));
   });
 
-  it("rejects supplied connected=true snapshots when sender policy is missing or invalid", async () => {
+  it("uses lifecycle-bound sender readiness for supplied host snapshots", async () => {
     const plugin = createMarmotChannelPlugin();
     const status = plugin.status;
     if (!status?.buildAccountSnapshot || !status.probeAccount) {
@@ -280,6 +280,12 @@ describe("resolveMarmotChannelAccount", () => {
 
     for (const testCase of cases) {
       const account = resolveMarmotChannelAccount(testCase.cfg, "default");
+      beginMarmotAccountLifecycle("default");
+      markMarmotSenderPolicyResult("default", {
+        state: testCase.label === "malformed" ? "invalid" : "missing",
+        allowedUserCount: 0,
+      });
+      markMarmotInboundReady("default");
       const snapshot = await status.buildAccountSnapshot({
         account,
         cfg: testCase.cfg,
@@ -294,6 +300,19 @@ describe("resolveMarmotChannelAccount", () => {
       expect(JSON.stringify(snapshot), testCase.label).not.toContain(allowed);
     }
 
+    const missingAccount = resolveMarmotChannelAccount(cases[0]!.cfg, "default");
+    const operationalError = await status.buildAccountSnapshot({
+      account: missingAccount,
+      cfg: cases[0]!.cfg,
+      runtime: { ...healthyRuntime, lastError: MARMOT_ALLOWLIST_SYNC_FAILED },
+      probe: { ok: true, accounts: 1, localSigningAccounts: 1 },
+      audit: undefined,
+    });
+    expect(operationalError).toMatchObject({
+      connected: false,
+      lastError: MARMOT_ALLOWLIST_SYNC_FAILED,
+    });
+
     const validCfg = {
       channels: {
         marmot: {
@@ -303,6 +322,9 @@ describe("resolveMarmotChannelAccount", () => {
       },
     } as unknown as Cfg;
     const validAccount = resolveMarmotChannelAccount(validCfg, "default");
+    beginMarmotAccountLifecycle("default");
+    markMarmotSenderPolicyResult("default", { state: "allowlist", allowedUserCount: 1 });
+    markMarmotInboundReady("default");
     const valid = await status.buildAccountSnapshot({
       account: validAccount,
       cfg: validCfg,
@@ -312,7 +334,7 @@ describe("resolveMarmotChannelAccount", () => {
     });
     expect(valid).toMatchObject({ connected: true, lastError: null });
 
-    const replacedCfg = {
+    const editedCfg = {
       channels: {
         marmot: {
           senderPolicy: { allowedUsers: ["nope"] },
@@ -320,14 +342,26 @@ describe("resolveMarmotChannelAccount", () => {
         },
       },
     } as unknown as Cfg;
-    const replaced = await status.buildAccountSnapshot({
-      account: resolveMarmotChannelAccount(replacedCfg, "default"),
-      cfg: replacedCfg,
+    const beforeRestart = await status.buildAccountSnapshot({
+      account: resolveMarmotChannelAccount(editedCfg, "default"),
+      cfg: editedCfg,
       runtime: healthyRuntime,
       probe: { ok: true, accounts: 1, localSigningAccounts: 1 },
       audit: undefined,
     });
-    expect(replaced).toMatchObject({
+    expect(beforeRestart).toMatchObject({ connected: true, lastError: null });
+
+    beginMarmotAccountLifecycle("default");
+    markMarmotSenderPolicyResult("default", { state: "invalid", allowedUserCount: 0 });
+    markMarmotInboundReady("default");
+    const afterRestart = await status.buildAccountSnapshot({
+      account: resolveMarmotChannelAccount(editedCfg, "default"),
+      cfg: editedCfg,
+      runtime: healthyRuntime,
+      probe: { ok: true, accounts: 1, localSigningAccounts: 1 },
+      audit: undefined,
+    });
+    expect(afterRestart).toMatchObject({
       connected: false,
       lastError: MARMOT_SENDER_POLICY_INVALID,
     });
@@ -342,6 +376,12 @@ describe("resolveMarmotChannelAccount", () => {
         },
       },
     } as unknown as Cfg;
+    beginMarmotAccountLifecycle("default");
+    markMarmotSenderPolicyResult("default", { state: "allowlist", allowedUserCount: 1 });
+    markMarmotInboundReady("default");
+    beginMarmotAccountLifecycle("other");
+    markMarmotSenderPolicyResult("other", { state: "missing", allowedUserCount: 0 });
+    markMarmotInboundReady("other");
     const namedValid = await status.buildAccountSnapshot({
       account: resolveMarmotChannelAccount(namedCfg, "default"),
       cfg: namedCfg,

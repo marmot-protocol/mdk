@@ -19,16 +19,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   sender policy is fail-closed and is not reported as a healthy channel.
   A transient inbound setup failure no longer leaves the shared sender
   authorizer stopped across the gateway retry, a replaced generation no
-  longer overwrites a healthy replacement's published authorizer status,
-  a replacement start no longer waits without bound on a superseded
-  generation's unsettled allowlist sync, and host-supplied status snapshots
-  cannot report connected while that policy is unenforceable.
-  Authorized inbound finals now require the host delivery-queue identity so
-  a successful turn is an acknowledged `send_final`. Packaged sender-policy
-  acceptance goes through that production delivery callback rather than a
-  fabricated outbound send. Authenticated mutation events
+  longer overwrites a healthy replacement's published authorizer status, and
+  host-supplied status snapshots cannot report connected while that policy is
+  unenforceable. Authenticated mutation events
   (edits, deletions, and reactions) are authorized before they are buffered
-  as ambient context; unauthorized mutations are denied without buffering.
+  as ambient context; unauthorized and self-authored mutations are denied
+  without buffering.
 
 ## [0.10.4] - 2026-09-20
 

@@ -38,6 +38,7 @@ export type SenderDenyReason =
   | "missing_actor"
   | "missing_self_flag"
   | "malformed_sender"
+  | "malformed_receiving_account"
   | "inconsistent_sender"
   | "self_sender"
   | "self_id_equality"
@@ -284,7 +285,7 @@ export function authorizeSenderIdentity(
   }
   const receivingId = envelopeAccountId(input.receivingAccountIdHex);
   if (receivingId === null) {
-    return { outcome: "deny", reason: "receiving_account_mismatch" };
+    return { outcome: "deny", reason: "malformed_receiving_account" };
   }
   if (boundReceivingAccountIdHex === null) {
     return { outcome: "deny", reason: "lifecycle_unbound" };

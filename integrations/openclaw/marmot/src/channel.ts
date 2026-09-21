@@ -35,6 +35,8 @@ import { createMarmotMessageAdapter } from "./outbound.js";
 import {
   DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
   marmotInboundRuntimeSnapshot,
+  marmotSenderAuthorizerLifecycle,
+  marmotSenderPolicyState,
 } from "./runtime-state.js";
 import { senderPolicyErrorCode, senderPolicyIsReady } from "./sender-policy.js";
 
@@ -108,11 +110,14 @@ function accountSnapshot(
   const fallback = marmotInboundRuntimeSnapshot(accountId);
   // Prefer a supplied host runtime, including a deliberate `lastError: null`.
   // Do not overlay the compatibility snapshot or resurrect stale errors.
-  // Sender-policy readiness still constrains connected/healthy: a stale host
-  // connected=true cannot mask a missing or invalid policy.
+  // The lifecycle-bound policy facts are authoritative while the account runs.
+  // Re-resolving configuration here would make environment changes appear to
+  // take effect before the documented gateway restart.
   const source = runtime ?? fallback;
-  const policyError = senderPolicyErrorCode(account.senderPolicy.state);
-  const senderReady = senderPolicyIsReady(account.senderPolicy.state);
+  const senderPolicy = marmotSenderPolicyState(accountId) ?? "pending";
+  const policyError = senderPolicyErrorCode(senderPolicy);
+  const senderReady =
+    senderPolicyIsReady(senderPolicy) && marmotSenderAuthorizerLifecycle(accountId) === "active";
   return {
     accountId,
     name: accountId,
@@ -122,7 +127,7 @@ function accountSnapshot(
     connected: senderReady && source.connected === true,
     lastStartAt: source.lastStartAt ?? null,
     lastStopAt: source.lastStopAt ?? null,
-    lastError: policyError ?? source.lastError ?? null,
+    lastError: source.lastError ?? policyError ?? null,
     lastInboundAt: source.lastInboundAt,
     lastOutboundAt: source.lastOutboundAt,
     reconnectAttempts: source.reconnectAttempts,
@@ -133,11 +138,10 @@ function accountSnapshot(
 }
 
 async function probeMarmotAccount(account: ResolvedMarmotAccount): Promise<MarmotStatusProbe> {
-  const senderReady = senderPolicyIsReady(account.senderPolicy.state);
   const response = await clientForAccount(account).accountList();
   const localSigningAccounts = response.accounts.filter((entry) => entry.local_signing).length;
   return {
-    ok: localSigningAccounts > 0 && senderReady,
+    ok: localSigningAccounts > 0,
     accounts: response.accounts.length,
     localSigningAccounts,
     senderPolicyState: account.senderPolicy.state,
