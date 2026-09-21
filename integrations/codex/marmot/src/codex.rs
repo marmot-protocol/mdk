@@ -12,6 +12,9 @@ use marmot_terminal_harness::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+const MINIMUM_ATTACHMENT_CODEX_VERSION: &str = "0.146.0";
+const MINIMUM_ATTACHMENT_CODEX_VERSION_PARTS: (u64, u64, u64) = (0, 146, 0);
+
 #[derive(Clone)]
 pub(crate) struct CodexBackend {
     bin: String,
@@ -100,6 +103,9 @@ async fn run_with_bin(
         error,
         observed_session: None,
     })?;
+    if !prepared.is_empty() {
+        verify_codex_attachment_capability(bin).await?;
+    }
     let images = prepared
         .iter()
         .filter(|attachment| attachment.native_image)
@@ -166,6 +172,57 @@ async fn run_with_bin(
         }
     }
     Ok(outcome)
+}
+
+async fn verify_codex_attachment_capability(bin: &str) -> Result<(), RunFailure> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(bin)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| RunFailure {
+        error: HarnessError::BackendTimedOut,
+        observed_session: None,
+    })?
+    .map_err(|_| RunFailure {
+        error: HarnessError::BackendSpawn,
+        observed_session: None,
+    })?;
+    if output.status.success()
+        && codex_attachment_version_supported(&String::from_utf8_lossy(&output.stdout))
+    {
+        return Ok(());
+    }
+    Err(RunFailure {
+        error: HarnessError::AttachmentBackendVersionUnsupported {
+            minimum: MINIMUM_ATTACHMENT_CODEX_VERSION,
+        },
+        observed_session: None,
+    })
+}
+
+fn codex_attachment_version_supported(output: &str) -> bool {
+    let mut fields = output.split_whitespace();
+    if fields.next() != Some("codex-cli") {
+        return false;
+    }
+    let Some(version) = fields.next() else {
+        return false;
+    };
+    if fields.next().is_some() {
+        return false;
+    }
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    let (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    (major, minor, patch) >= MINIMUM_ATTACHMENT_CODEX_VERSION_PARTS
 }
 
 struct PreparedAttachment<'a> {
@@ -552,6 +609,67 @@ mod tests {
             file_name: file_name.to_owned(),
             size_bytes: fs::metadata(path).unwrap().len(),
         }
+    }
+
+    #[test]
+    fn attachment_capability_requires_supported_codex_cli_version() {
+        assert!(codex_attachment_version_supported("codex-cli 0.146.0\n"));
+        assert!(codex_attachment_version_supported("codex-cli 0.200.1\n"));
+        assert!(codex_attachment_version_supported(
+            "codex-cli 1.0.0-beta.1\n"
+        ));
+        assert!(!codex_attachment_version_supported("codex-cli 0.145.9\n"));
+        assert!(!codex_attachment_version_supported("codex-cli 0.146\n"));
+        assert!(!codex_attachment_version_supported("other-cli 0.146.0\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn older_codex_cli_rejects_attachments_before_starting_a_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let notes = root.path().join("notes.txt");
+        let marker = root.path().join("turn-started");
+        let script = root.path().join("old-codex");
+        fs::write(&notes, b"notes").unwrap();
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${{1:-}}\" = \"--version\" ]; then\n  printf '%s\\n' 'codex-cli 0.145.0'\n  exit 0\nfi\ntouch '{}'\nexit 64\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+
+        let failure = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: None,
+                prompt: "inspect".to_owned(),
+                artifact_output: None,
+            },
+            vec![attachment(&notes, "text/plain", "notes.txt")],
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                failure.error,
+                HarnessError::AttachmentBackendVersionUnsupported { minimum: "0.146.0" }
+            ),
+            "unexpected attachment capability failure: {:?}",
+            failure.error
+        );
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -983,6 +1101,10 @@ mod tests {
             format!(
                 r#"#!/usr/bin/env bash
 set -euo pipefail
+if [ "${{1:-}}" = "--version" ]; then
+  printf '%s\n' 'codex-cli 0.146.0'
+  exit 0
+fi
 if [ "$#" -ne 9 ] || [ "$1" != "exec" ] || [ "$2" != "resume" ] || \
    [ "$3" != "--image" ] || [ "$4" != "{}" ] || \
    [ "$5" != "--image" ] || [ "$6" != "{}" ] || \
@@ -1066,6 +1188,10 @@ printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":
             &script,
             r#"#!/usr/bin/env bash
 set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' 'codex-cli 0.146.0'
+  exit 0
+fi
 if [ "$#" -ne 3 ] || [ "$1" != "exec" ] || [ "$2" != "--json" ] || [ "$3" != "-" ]; then
   printf 'unexpected args:' >&2
   printf ' <%s>' "$@" >&2
@@ -1158,7 +1284,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
         fs::write(
             &script,
             format!(
-                "#!/usr/bin/env bash\nset -euo pipefail\n{}\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"thread-private-files\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"read every accepted private file\"}}}}'\n",
+                "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${{1:-}}\" = \"--version\" ]; then\n  printf '%s\\n' 'codex-cli 0.146.0'\n  exit 0\nfi\n{}\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"thread-private-files\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"read every accepted private file\"}}}}'\n",
                 comparisons.join("\n")
             ),
         )
@@ -1583,10 +1709,16 @@ exit 64
             .output()
             .expect("run codex --version");
         assert!(version.status.success());
+        let version_output = String::from_utf8_lossy(&version.stdout);
         assert!(
-            String::from_utf8_lossy(&version.stdout).starts_with("codex-cli "),
-            "unexpected Codex version output"
+            codex_attachment_version_supported(&version_output),
+            "real attachment smoke requires Codex CLI {MINIMUM_ATTACHMENT_CODEX_VERSION} or newer; got {version_output:?}"
         );
+
+        let attachment_root = tempfile::tempdir().unwrap();
+        let notes = attachment_root.path().join("codex-attachment-smoke.txt");
+        let token = "CODEX_STAGED_FILE_TOKEN_7D3A2F";
+        fs::write(&notes, format!("{token}\n")).unwrap();
 
         let (tx, mut rx) = mpsc::channel(8);
         let outcome = run_with_bin(
@@ -1597,10 +1729,16 @@ exit 64
                 idle_timeout: Duration::from_secs(30),
                 cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
                 session_id: None,
-                prompt: "Reply with exactly CODEX_CONNECTOR_OK and nothing else.".to_owned(),
+                prompt: format!(
+                    "Read the staged non-image attachment and reply with exactly CODEX_ATTACHMENT_OK: {token} and nothing else."
+                ),
                 artifact_output: None,
             },
-            Vec::new(),
+            vec![attachment(
+                &notes,
+                "text/plain",
+                "codex-attachment-smoke.txt",
+            )],
             tx,
         )
         .await
@@ -1613,7 +1751,7 @@ exit 64
         while let Some(RunnerEvent::Text(text)) = rx.recv().await {
             reply.push_str(&text);
         }
-        assert_eq!(reply.trim(), "CODEX_CONNECTOR_OK");
+        assert_eq!(reply.trim(), format!("CODEX_ATTACHMENT_OK: {token}"));
 
         let (resume_tx, mut resume_rx) = mpsc::channel(8);
         let resumed = run_with_bin(

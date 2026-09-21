@@ -2122,6 +2122,10 @@ async fn handle_backend_run_failure(
             "[{}] {} does not support this attachment batch; no backend turn was started.",
             config.spec.reply_prefix, config.spec.display_name
         ),
+        HarnessError::AttachmentBackendVersionUnsupported { minimum } => format!(
+            "[{}] {} attachments require CLI version {} or newer; upgrade {} and retry. No backend turn was started.",
+            config.spec.reply_prefix, config.spec.display_name, minimum, config.spec.display_name
+        ),
         _ => {
             if let Some(session_id) = resumable_session {
                 if let Err(err) = persist_recovery_record(

@@ -42,6 +42,8 @@ pub enum HarnessError {
     AttachmentInvalid,
     #[error("backend does not support this attachment type")]
     AttachmentUnsupported,
+    #[error("backend attachment support requires CLI version {minimum} or newer")]
+    AttachmentBackendVersionUnsupported { minimum: &'static str },
     #[error("artifact exports are disabled")]
     ArtifactExportsDisabled,
     #[error("artifact authorization is missing, expired, or does not match this turn")]
@@ -79,6 +81,9 @@ impl HarnessError {
             Self::AttachmentBytesLimit => "attachment_bytes_limit",
             Self::AttachmentInvalid => "attachment_invalid",
             Self::AttachmentUnsupported => "attachment_unsupported",
+            Self::AttachmentBackendVersionUnsupported { .. } => {
+                "attachment_backend_version_unsupported"
+            }
             Self::ArtifactExportsDisabled => "artifact_exports_disabled",
             Self::ArtifactAuthorizationInvalid => "artifact_authorization_invalid",
             Self::ArtifactOutsideAllowedRoots => "artifact_outside_allowed_roots",

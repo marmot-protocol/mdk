@@ -183,7 +183,7 @@ All attachments from one Marmot message are downloaded in message order, copied 
 | Archives | ZIP, gzip, bzip2, xz, 7z, RAR, or tar signature | Staged-file manifest entry |
 | Opaque binary or any unrecognized format | No supported signature and not UTF-8 text | Unsupported; reject the complete batch before starting Codex |
 
-The connector pins Codex CLI 0.146.0. Although the app-server protocol has a structured audio input, `codex exec` 0.146.0 exposes native file input only through `--image`; audio therefore uses the staged-file fallback above rather than a nonexistent CLI audio flag. The same delivery contract applies to new and resumed threads. Missing, size-changed, unreadable, non-regular, unsupported-format, count-limit, or aggregate-size failures reject the complete batch before Codex starts; no attachment is silently dropped.
+Attachments require Codex CLI 0.146.0 or newer. Before an attachment turn, the connector checks `codex --version` and rejects older or unrecognized versions with an upgrade instruction before Codex starts. Although the app-server protocol has a structured audio input, `codex exec` 0.146.0 exposes native file input only through `--image`; audio therefore uses the staged-file fallback above rather than a nonexistent CLI audio flag. The same delivery contract applies to new and resumed threads. Missing, size-changed, unreadable, non-regular, unsupported-format, count-limit, or aggregate-size failures reject the complete batch before Codex starts; no attachment is silently dropped.
 
 Batch copies remain available for the complete turn and are removed after success, failure, timeout, or cancellation. Stale batch directories are reconciled when the connector starts.
 
@@ -218,7 +218,9 @@ bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$(awk 'BE
 ```
 
 The real Codex contract test is ignored by default because it requires an
-installed, authenticated Codex and makes a model request:
+installed, authenticated Codex CLI 0.146.0 or newer and makes model requests.
+Its first turn proves that a staged non-image text attachment is readable, and
+its second turn verifies session resume:
 
 ```sh
 cargo test -p wn-codex real_codex_exec_contract -- --ignored --nocapture
