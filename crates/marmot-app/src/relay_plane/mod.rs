@@ -92,6 +92,7 @@ struct RelayPlaneTransport {
     adapter: NostrTransportAdapter,
     sdk_relay_client: Option<NostrSdkRelayClient>,
     directory_client: Option<NostrSdkClient>,
+    publication_signer: tokio::sync::RwLock<()>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     account_deliveries: RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
     account_delivery_metrics: Arc<AccountDeliveryMetrics>,
@@ -749,6 +750,7 @@ impl MarmotRelayPlane {
             adapter,
             sdk_relay_client,
             directory_client,
+            publication_signer: tokio::sync::RwLock::new(()),
             directory_events: broadcast::channel(DIRECTORY_EVENT_BUFFER).0,
             account_deliveries: RwLock::new(HashMap::new()),
             account_delivery_metrics: Arc::new(AccountDeliveryMetrics::default()),
@@ -842,6 +844,7 @@ impl MarmotRelayPlane {
 
     pub(super) async fn publish_signed_event(
         &self,
+        account: &MemberId,
         fallback: &dyn NostrRelayClient,
         endpoints: &[TransportEndpoint],
         event: &NostrTransportEvent,
@@ -861,6 +864,29 @@ impl MarmotRelayPlane {
                     && !client.client().pool().is_shutdown()
                     && account_deliveries_read(&self.inner.transport.account_deliveries).len() == 1
             });
+        // Registration can continue: subsequent multi-account sends use their
+        // own publishers. Hold the signer stable for this admitted publication.
+        let signer_lease = if shared.is_some() {
+            Some(self.inner.transport.publication_signer.read().await)
+        } else {
+            None
+        };
+        if let Some(client) = shared {
+            let owns_pool = {
+                let accounts = account_deliveries_read(&self.inner.transport.account_deliveries);
+                accounts.len() == 1 && accounts.contains_key(account)
+            };
+            let signer_matches = match client.client().signer().await {
+                Ok(signer) => signer
+                    .get_public_key()
+                    .await
+                    .is_ok_and(|key| key.as_bytes().as_slice() == account.as_slice()),
+                Err(_) => true, // Signerless public sockets use the auth fallback.
+            };
+            if !owns_pool || !signer_matches {
+                shared = None;
+            }
+        }
         // Keep fresh connection attempts on the existing path, including its
         // distinction between a failed dial and an ambiguous in-flight send.
         if let Some(client) = shared {
@@ -881,9 +907,11 @@ impl MarmotRelayPlane {
             Some(client) => client,
             None => fallback,
         };
+        let signer_lease = signer_lease.filter(|_| shared.is_some());
         let outcome = publisher
             .publish_event(endpoints, event, required_acks)
             .await;
+        drop(signer_lease);
         let auth_rejected = |failure: &cgka_traits::TransportEndpointFailure| {
             failure.rejection_category
                 == Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired)
@@ -2830,6 +2858,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         ) {
             self.relay_plane
                 .publish_signed_event(
+                    &self.account_id,
                     self.publish_client.as_ref(),
                     request.target.endpoints(),
                     &event,
