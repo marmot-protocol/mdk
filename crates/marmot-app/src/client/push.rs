@@ -585,7 +585,13 @@ impl AppClient {
                     .relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
                 let result = self
                     .relay_plane
-                    .publish_signed_event(fallback.as_ref(), &endpoints, &event, 1)
+                    .publish_signed_event(
+                        self.adapter.account_id(),
+                        fallback.as_ref(),
+                        &endpoints,
+                        &event,
+                        1,
+                    )
                     .await;
                 if let Some(observation) = observation {
                     observation.finish(if result.is_ok() {
