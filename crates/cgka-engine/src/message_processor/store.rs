@@ -941,13 +941,30 @@ impl<S: StorageProvider> Engine<S> {
         resource: InboundResourceLimit,
         disposition: crate::message_disposition::MessageDisposition,
     ) -> Result<(), EngineError> {
-        // Report the count this release was actually decided on, so the audit
-        // row can be read against the budget it names. Only the retry-budget
-        // path spends `live_context_attempts`; a residence release is timed out
-        // regardless of context, and re-peels performed is the useful number.
+        // The application reads `TransportObjectResourceRefused` as evidence
+        // that this device is missing history it was served, and arms a
+        // full-history backfill from it. Traffic older than this copy's Welcome
+        // is the one shape where that is knowably wasted work: the copy's own
+        // epochs begin at the commit that minted its Welcome, so a re-fetch can
+        // only bring back more of what it already cannot open. The release
+        // itself is unchanged — only the announcement is dropped, which is why
+        // a timestamp is allowed to decide it at all. It is a compose-time
+        // value for application messages and this seam cannot tell those from
+        // commits, so being wrong here must stay free, and here it is: the row
+        // is released either way, and the id stays eligible for redelivery.
+        let predates_this_copy = self.released_row_predates_local_copy(record);
+        let released_as = if predates_this_copy {
+            crate::message_disposition::MessageDisposition::PredatesLocalCopy
+        } else {
+            disposition
+        };
+        // Report the count the release was decided on, so the audit row reads
+        // against the bound its reason names: only a retry-budget refusal
+        // spends `live_context_attempts`; every other reason reports re-peels
+        // performed.
         let retry_count = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
             u64::from(
-                if disposition == crate::message_disposition::MessageDisposition::RetryBudgetRefused
+                if released_as == crate::message_disposition::MessageDisposition::RetryBudgetRefused
                 {
                     lifecycle.live_context_attempts
                 } else {
@@ -961,24 +978,8 @@ impl<S: StorageProvider> Engine<S> {
                 .max(self.convergence_now().wall_ms)
                 .saturating_sub(lifecycle.first_observed_wall_ms)
         });
-        // The application reads `TransportObjectResourceRefused` as evidence
-        // that this device is missing history it was served, and arms a
-        // full-history backfill from it. Traffic older than this copy's Welcome
-        // is the one shape where that is knowably wasted work: the copy's own
-        // epochs begin at the commit that minted its Welcome, so a re-fetch can
-        // only bring back more of what it already cannot open. The release
-        // itself is unchanged — only the announcement is dropped, which is why
-        // a timestamp is allowed to decide it at all. It is a compose-time
-        // value for application messages and this seam cannot tell those from
-        // commits, so being wrong here must stay free, and here it is: the row
-        // is released either way, and the id stays eligible for redelivery.
-        let predates_this_copy = self.released_row_predates_local_copy(record);
         self.storage.release_message_for_replay(record)?;
-        let release_reason = if predates_this_copy {
-            crate::message_disposition::MessageDisposition::PredatesLocalCopy.tag()
-        } else {
-            disposition.tag()
-        };
+        let release_reason = released_as.tag();
         tracing::info!(
             target: "cgka_engine::message_processor",
             method = "release_deferred_peel_row",

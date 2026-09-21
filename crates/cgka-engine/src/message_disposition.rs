@@ -29,7 +29,8 @@ pub(crate) enum MessageDisposition {
     PredatesLocalCopy,
     /// The transport bytes failed to peel against the current epoch context
     /// and every retained snapshot. Retained as `PeelDeferred`; retried only
-    /// when the (epoch, snapshot-set) peel context actually changes.
+    /// when the full peel context changes: live epoch, retained snapshot set,
+    /// or stored commit graph.
     RetryPending,
     /// A retained `PeelDeferred` row exhausted its live-context retry
     /// budget without peeling. The row is released as a local resource
