@@ -46,11 +46,11 @@ interface AccountRecoveryLane {
    */
   syncAbort: AbortController | null;
   /**
-   * Generation whose `syncAllowlist` call is dispatched and unsettled, or null
-   * when no call is outstanding. A successor reads this to learn whether it
-   * inherited a writer that can still land a mutation after the handover.
+   * Every reconciliation call that has been dispatched and has not settled.
+   * A new generation inherits all of them, not just the newest: repeated
+   * handovers must not abandon a writer an earlier handover already inherited.
    */
-  syncInFlightGeneration: number | null;
+  pendingSyncs: Set<Promise<void>>;
 }
 
 const recoveryLanes = new Map<string, AccountRecoveryLane>();
@@ -101,7 +101,7 @@ function laneFor(accountId: string): AccountRecoveryLane {
     generation: 0,
     syncTail: Promise.resolve(),
     syncAbort: null,
-    syncInFlightGeneration: null,
+    pendingSyncs: new Set(),
   };
   recoveryLanes.set(accountId, created);
   return created;
@@ -158,13 +158,17 @@ export async function startMarmotGatewayAccount(
   lane.generation = generation;
 
   // Reconciliation is a non-atomic read-modify-write over a shared account, so
-  // two generations must never run it at once. Awaiting the predecessor is not
-  // how to get that: its control calls carry no timeout, so a stalled one would
-  // keep this generation from ever starting. Tell it to stop instead, then take
-  // the lane. It stops at its next mutation boundary; anything it left pending
-  // is covered by this generation's own pass, which reads the allowlist fresh
-  // and reconciles the current desired set.
-  const supersededSync = lane.syncInFlightGeneration !== null ? lane.syncTail : null;
+  // a predecessor must not keep issuing mutations once this generation starts.
+  // Awaiting it is not how to get that: its control calls carry no timeout, so
+  // a stalled one would keep this generation from ever starting. Tell it to
+  // stop instead, then take the lane. It issues nothing further beyond the
+  // request already in flight, and anything it left pending is covered by this
+  // generation's own pass, which reads the allowlist fresh and reconciles the
+  // current desired set.
+  // Captured synchronously, before this generation's first await: a further
+  // handover can happen before the follow-up below is registered, and the
+  // successor must inherit these same writers rather than only the newest.
+  const supersededSyncs = [...lane.pendingSyncs];
   lane.syncAbort?.abort();
   const syncAbort = new AbortController();
   lane.syncAbort = syncAbort;
@@ -202,18 +206,21 @@ export async function startMarmotGatewayAccount(
           warn: (message) => ctx.log?.warn?.(message),
         },
       };
-      lane.syncInFlightGeneration = generation;
+      const call = syncAllowlist(api, {
+        channelAccountId: ctx.accountId,
+        signal: syncAbort.signal,
+      });
+      // Publish this dispatched call on the lane so a successor can wait for
+      // exactly this request, whatever happens to this generation meanwhile.
+      const dispatched = call.then(
+        () => undefined,
+        () => undefined,
+      );
+      lane.pendingSyncs.add(dispatched);
       try {
-        result = await syncAllowlist(api, {
-          channelAccountId: ctx.accountId,
-          signal: syncAbort.signal,
-        });
+        result = await call;
       } finally {
-        // Clear only this generation's own marker. A superseded call settling
-        // late must not report a successor's in-flight sync as finished.
-        if (lane.syncInFlightGeneration === generation) {
-          lane.syncInFlightGeneration = null;
-        }
+        lane.pendingSyncs.delete(dispatched);
       }
       applySyncResult(result);
     });
@@ -292,14 +299,15 @@ export async function startMarmotGatewayAccount(
       scheduleAllowlistRetry();
     }
 
-    // The superseded generation was told to stop, but the one request it had
-    // already dispatched cannot be recalled, so it can still land after this
-    // generation read the allowlist back. Reconcile once more when its call
-    // finally settles, so a late write cannot outlive the handover. A
-    // predecessor that never settles never triggers this, which is exactly why
-    // this generation did not wait on it.
-    if (supersededSync) {
-      void supersededSync.then(() => {
+    // A superseded generation was told to stop, but the request it had already
+    // dispatched cannot be recalled, so it can still land after this generation
+    // read the allowlist back. Follow each inherited writer up separately when
+    // it settles, so a late write cannot outlive the handover and one writer
+    // that never settles cannot gate the follow-up for one that did. A writer
+    // that never settles simply never fires, which is why this generation did
+    // not wait on it in the first place.
+    for (const dispatched of supersededSyncs) {
+      void dispatched.then(() => {
         if (!isCurrent()) {
           return;
         }

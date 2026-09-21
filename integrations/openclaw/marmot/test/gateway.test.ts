@@ -646,9 +646,10 @@ describe("startMarmotGatewayAccount", () => {
     // Liveness: reaching the passive lifecycle at all means this generation did
     // not block on a predecessor that has not settled.
     const replacement = await waitForLifecycle("work");
-    // Safety: reconciliation is a non-atomic read-modify-write, so the two
-    // generations still must not overlap. The predecessor was told to stop
-    // before this one touched the allowlist.
+    // Safety: reconciliation is a non-atomic read-modify-write, so the
+    // predecessor must stop issuing mutations before this generation starts
+    // its own pass. Only the request already in flight can still be
+    // outstanding, and that one is followed up when it settles.
     expect(predecessorStoppedFirst).toBe(true);
     expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({ running: true });
 
@@ -691,6 +692,47 @@ describe("startMarmotGatewayAccount", () => {
     await replacement.stop();
     await replacementRun;
     old.abort.abort();
+  });
+
+  it("inherits every unsettled writer across repeated handovers", async () => {
+    const first = startStalledGeneration("work");
+    await first.dispatched;
+    const second = startStalledGeneration("work");
+    await second.dispatched;
+    expect(first.signal()?.aborted).toBe(true);
+
+    const abortThird = new AbortController();
+    const thirdRun = startMarmotGatewayAccount(
+      gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
+        accountId: "work",
+        abortSignal: abortThird.signal,
+      }),
+    );
+    const third = await waitForLifecycle("work");
+    expect(second.signal()?.aborted).toBe(true);
+    expect(syncCalls).toEqual([{ channelAccountId: "work" }]);
+
+    // The oldest writer was abandoned by the first handover and must still be
+    // followed up after the second one, or its late mutation outlives both.
+    first.release({ state: "unmanaged" });
+    await first.run;
+    await vi.waitFor(() => {
+      expect(syncCalls).toHaveLength(2);
+    });
+
+    // A writer that never settles must not gate the follow-up for one that did,
+    // so each inherited writer gets its own pass.
+    second.release({ state: "unmanaged" });
+    await second.run;
+    await vi.waitFor(() => {
+      expect(syncCalls).toHaveLength(3);
+    });
+
+    abortThird.abort();
+    await third.stop();
+    await thirdRun;
+    first.abort.abort();
+    second.abort.abort();
   });
 
   it("does not reconcile again when no superseded sync was in flight", async () => {
