@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-runtime";
 
 import type { MarmotAgentControlClient } from "../src/client.js";
+import { syncAllowlist as realSyncAllowlist, type AllowlistClient } from "../src/security.js";
 import type { ResolvedMarmotAccount } from "../src/config.js";
 import {
   allowlistRetryDelayMs,
@@ -825,23 +826,83 @@ describe("startMarmotGatewayAccount", () => {
     await secondRun;
   });
 
-  it("stops a generation's reconciliation when that generation is torn down", async () => {
-    const abortFirst = new AbortController();
-    const firstRun = startMarmotGatewayAccount(
-      gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
-        accountId: "work",
-        abortSignal: abortFirst.signal,
-      }),
-    );
-    const first = await waitForLifecycle("work");
-    expect(syncSignals).toHaveLength(1);
-    expect(syncSignals[0]?.aborted).toBe(false);
+  it("lets a multi-removal reconciliation finish when the account stops", async () => {
+    const stale = ["11".repeat(32), "22".repeat(32)];
+    const effective = new Set(stale);
+    const removes: string[] = [];
+    let markFirstRemoveStarted!: () => void;
+    const firstRemoveStarted = new Promise<void>((resolve) => {
+      markFirstRemoveStarted = resolve;
+    });
+    let releaseFirstRemove!: () => void;
+    const firstRemoveGate = new Promise<void>((resolve) => {
+      releaseFirstRemove = resolve;
+    });
+    const client = {
+      async allowlistList() {
+        return {
+          type: "allowlist",
+          account_id_hex: "aa".repeat(32),
+          welcomer_account_ids_hex: [...effective],
+        };
+      },
+      async allowlistAdd() {
+        return { type: "ack" };
+      },
+      async allowlistRemove(_account: string, id: string) {
+        removes.push(id);
+        if (removes.length === 1) {
+          markFirstRemoveStarted();
+          await firstRemoveGate;
+        }
+        effective.delete(id);
+        return { type: "ack" };
+      },
+    } as unknown as AllowlistClient;
 
-    abortFirst.abort();
-    await first.stop();
-    await firstRun;
-    // A stopped generation must not leave a live writer behind on the lane.
-    expect(syncSignals[0]?.aborted).toBe(true);
+    // First pass fails so the retry runs the real multi-removal sequence.
+    let passes = 0;
+    const abort = new AbortController();
+    const running = startMarmotGatewayAccount(
+      gatewayContext(account({ allowFrom: [], marmotAccountIdHex: "aa".repeat(32) }), {
+        accountId: "work",
+        abortSignal: abort.signal,
+      }),
+      {
+        random: () => 0,
+        delay: async () => undefined,
+        syncAllowlist: async (_api, options = {}) => {
+          passes += 1;
+          if (passes === 1) {
+            return { state: "failed", reason: "control" };
+          }
+          const result = await realSyncAllowlist(client, "aa".repeat(32), [], options.signal);
+          return result.verified
+            ? { state: "reconciled" }
+            : { state: "failed", reason: "unverified" };
+        },
+      },
+    );
+
+    const lifecycle = await waitForLifecycle("work");
+    await firstRemoveStarted;
+
+    // Stop the account with no successor while the retry is between removals.
+    void lifecycle.stop();
+    await vi.waitFor(() => {
+      expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({ running: false });
+    });
+
+    releaseFirstRemove();
+    await running;
+
+    // Nothing else will revoke these, so teardown must not cut the sequence
+    // short: a stopped account cannot be left with a welcomer it revoked.
+    await vi.waitFor(() => {
+      expect(removes).toEqual(stale);
+    });
+    expect([...effective]).toEqual([]);
+    abort.abort();
   });
 
   it("releases failed inbound attempts before retrying through the real runtime", async () => {

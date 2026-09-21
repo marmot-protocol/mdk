@@ -266,13 +266,13 @@ export async function startMarmotGatewayAccount(
       markMarmotSenderAuthorizerLifecycle(ctx.accountId, "replaced");
       lane.generation += 1;
     }
-    if (lane.syncAbort === syncAbort) {
-      lane.syncAbort = null;
-    }
-    // This generation is done reconciling either way; stop its sync here rather
-    // than through an `abortController` listener, which would outlive every
-    // inbound retry and read as a leaked subscription.
-    syncAbort.abort();
+    // Deliberately does not abort `syncAbort`. This also runs for an ordinary
+    // host or account stop, and cancelling reconciliation there would strand a
+    // half-finished revocation sequence with no replacement generation to
+    // complete it — the open-ended fail-open this design claims to avoid. Only
+    // an actual supersession aborts, via the new start's `lane.syncAbort`.
+    // `lane.syncAbort` stays put for the same reason: a later start must still
+    // be able to stop this pass before reconciling against it.
     abortController.abort();
     allowlistRetryPending = false;
   };
