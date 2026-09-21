@@ -20,6 +20,55 @@ use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
 
 const DEFAULT_CONCURRENT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[tokio::test]
+#[ignore = "unchanged subscription latency diagnostic"]
+async fn unchanged_sync_latency() {
+    for count in [1u32, 100, 1000] {
+        let relay = Arc::new(FakeRelayClient::default());
+        let adapter = NostrTransportAdapter::new(relay.clone());
+        let account_id = MemberId::new(vec![0xA1; 32]);
+        let groups = (0..count)
+            .map(|index| TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(index.to_be_bytes().to_vec()),
+                transport_group_id: [index.to_be_bytes().as_slice(), &[0; 28]].concat(),
+                endpoints: vec![TransportEndpoint("wss://group.example".into())],
+            })
+            .collect::<Vec<_>>();
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+                group_subscriptions: groups.clone(),
+                since: None,
+            })
+            .await
+            .unwrap();
+        let mut samples = Vec::new();
+        for index in 0..110 {
+            let request = TransportGroupSync {
+                account_id: account_id.clone(),
+                group_subscriptions: groups.clone(),
+                since: Some(Timestamp(1_700_000_000 + index)),
+            };
+            let started = std::time::Instant::now();
+            adapter.sync_account_groups(request).await.unwrap();
+            if index >= 10 {
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "groups={count} samples=100 median_ms={:.6} p95_ms={:.6}",
+            samples[49], samples[94]
+        );
+        assert_eq!(
+            relay.subscriptions.lock().unwrap().len(),
+            count as usize + 1
+        );
+        assert!(relay.unsubscribed.lock().unwrap().is_empty());
+    }
+}
+
 fn concurrent_subscribe_timeout() -> Duration {
     std::env::var("MARMOT_CONCURRENT_SUBSCRIBE_TEST_TIMEOUT_MS")
         .ok()

@@ -580,10 +580,12 @@ impl AppClient {
                     "trigger",
                     crate::ProductUnit::Attempt,
                 );
-                let result = self
+                let fallback = self
                     .app
-                    .relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone())
-                    .publish_event(&endpoints, &event, 1)
+                    .relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
+                let result = self
+                    .relay_plane
+                    .publish_signed_event(fallback.as_ref(), &endpoints, &event, 1)
                     .await;
                 if let Some(observation) = observation {
                     observation.finish(if result.is_ok() {
