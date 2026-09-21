@@ -14,6 +14,21 @@
 
 set -euo pipefail
 
+# Split phases let CI build native slices independently; no arguments retains
+# the complete local build used by downstream synchronization scripts.
+MODE="${1:-all}"
+case "$MODE" in
+  all|generate|assemble) [[ $# -le 1 ]] || { echo "usage: $0 [all|generate|assemble|native <aarch64-apple-ios|aarch64-apple-ios-sim>]" >&2; exit 2; } ;;
+  native)
+    [[ $# -eq 2 ]] || { echo "native requires one iOS target" >&2; exit 2; }
+    case "$2" in
+      aarch64-apple-ios|aarch64-apple-ios-sim) ;;
+      *) echo "unsupported iOS target: $2" >&2; exit 2 ;;
+    esac
+    ;;
+  *) echo "usage: $0 [all|generate|assemble|native <aarch64-apple-ios|aarch64-apple-ios-sim>]" >&2; exit 2 ;;
+esac
+
 # Force rustup's cargo to win over any Homebrew-installed cargo, so that
 # rust-toolchain.toml is honored and iOS targets are visible.
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -29,7 +44,10 @@ TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$TOOL_DIR/marmotkit-release-profile.env"
 WORKSPACE_DIR="${MARMOTKIT_WORKSPACE_DIR:-$(cd "$TOOL_DIR/../.." && pwd)}"
 CRATE_DIR="${MARMOTKIT_CRATE_DIR:-$WORKSPACE_DIR/crates/marmot-uniffi}"
-TARGET_DIR="$WORKSPACE_DIR/target"
+TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"
+if [[ "$TARGET_DIR" != /* ]]; then
+  TARGET_DIR="$WORKSPACE_DIR/$TARGET_DIR"
+fi
 # Scoped to build/ios, not build/, so cleaning this script's scratch space
 # cannot take xcframework-macos.sh's build/macos with it.
 BUILD_DIR="$CRATE_DIR/build/ios"
@@ -60,28 +78,64 @@ fi
 # sync-bindings.sh).
 cd "$WORKSPACE_DIR"
 
-echo "==> Cleaning previous build artifacts"
-rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_NAME.swift" "$OUT_DIR/PrivacyInfo.xcprivacy"
+if [[ "$MODE" == native ]]; then
+  rustup target add "$2"
+  cargo build --locked --release --timings -p "$CRATE_NAME" --target "$2" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+  exit 0
+fi
+
+if [[ "$MODE" == generate ]]; then
+  rm -rf "$BUILD_DIR/swift"
+  mkdir -p "$BUILD_DIR/swift"
+  echo "==> Building host dylib (used for binding generation)"
+  cargo build --locked --release --timings -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+
+  echo "==> Generating Swift bindings"
+  cargo run --locked --release --timings -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
+    generate \
+    --library "$TARGET_DIR/release/lib${LIB_BASENAME}.dylib" \
+    --language swift \
+    --out-dir "$BUILD_DIR/swift"
+
+  exit 0
+fi
+
+if [[ "$MODE" == all ]]; then
+  echo "==> Cleaning previous build artifacts"
+  rm -rf "$BUILD_DIR"
+  mkdir -p "$BUILD_DIR"
+  echo "==> Ensuring iOS targets are installed"
+  rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+  echo "==> Building host dylib (used for binding generation)"
+  cargo build --locked --release --timings -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+
+  echo "==> Building iOS device target (aarch64-apple-ios)"
+  cargo build --locked --release --timings -p "$CRATE_NAME" --target aarch64-apple-ios ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+
+  echo "==> Building iOS simulator target (aarch64-apple-ios-sim)"
+  cargo build --locked --release --timings -p "$CRATE_NAME" --target aarch64-apple-ios-sim ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+
+  echo "==> Generating Swift bindings"
+  cargo run --locked --release --timings -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
+    generate \
+    --library "$TARGET_DIR/release/lib${LIB_BASENAME}.dylib" \
+    --language swift \
+    --out-dir "$BUILD_DIR/swift"
+
+fi
+
+# Assembly only consumes existing slices and generated bindings. In particular,
+# never delete build/*/swift downloaded from the generation job.
+for input in "$BUILD_DIR/swift/${LIB_BASENAME}.swift" \
+  "$BUILD_DIR/swift/${LIB_BASENAME}FFI.h" \
+  "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" \
+  "$TARGET_DIR/aarch64-apple-ios/release/lib${LIB_BASENAME}.a" \
+  "$TARGET_DIR/aarch64-apple-ios-sim/release/lib${LIB_BASENAME}.a"; do
+  [[ -s "$input" ]] || { echo "error: missing assembly input: $input" >&2; exit 1; }
+done
+rm -rf "$BUILD_DIR/headers" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_NAME.swift" "$OUT_DIR/PrivacyInfo.xcprivacy"
 mkdir -p "$BUILD_DIR/headers" "$OUT_DIR"
-
-echo "==> Ensuring iOS targets are installed"
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-
-echo "==> Building host dylib (used for binding generation)"
-cargo build --release -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
-
-echo "==> Building iOS device target (aarch64-apple-ios)"
-cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
-
-echo "==> Building iOS simulator target (aarch64-apple-ios-sim)"
-cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios-sim ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
-
-echo "==> Generating Swift bindings"
-cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
-  generate \
-  --library "$TARGET_DIR/release/lib${LIB_BASENAME}.dylib" \
-  --language swift \
-  --out-dir "$BUILD_DIR/swift"
 
 echo "==> Staging headers + modulemap for XCFramework"
 cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.h" "$BUILD_DIR/headers/"

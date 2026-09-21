@@ -206,8 +206,10 @@ impl From<AppGroupSystemEvent> for GroupSystemEventFfi {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(Clone, uniffi::Record)]
 pub struct TimelineMessageRecordFfi {
+    /// Opaque local submission token; absent for remote or legacy messages.
+    pub client_token: Option<String>,
     pub has_reports: bool,
     pub message_id_hex: String,
     /// Delivery marker for own (`direction == "sent"`) messages. An own send
@@ -270,12 +272,22 @@ pub struct TimelineMessageRecordFfi {
     pub invalidation_status: Option<String>,
 }
 
+impl std::fmt::Debug for TimelineMessageRecordFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimelineMessageRecordFfi")
+            .field("has_client_token", &self.client_token.is_some())
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
 impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
     fn from(value: TimelineMessageRecord) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let group_system = value.group_system;
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         Self {
+            client_token: value.client_token,
             has_reports: value.has_reports,
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
@@ -672,6 +684,7 @@ mod tests {
         reply_preview: Option<TimelineReplyPreview>,
     ) -> TimelineMessageRecord {
         TimelineMessageRecord {
+            client_token: None,
             has_reports: false,
             group_system: None,
             edit: None,

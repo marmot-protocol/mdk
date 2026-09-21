@@ -421,13 +421,13 @@ impl MediaAttachmentOutcome {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MediaLocator {
     pub kind: String,
     pub value: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MediaAttachmentReference {
     pub locators: Vec<MediaLocator>,
     pub ciphertext_sha256: String,

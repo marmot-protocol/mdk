@@ -593,6 +593,34 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   At most `MAX_OWN_COMMIT_REISSUE_ATTEMPTS`
   re-issues, then `Abandoned`. The decision is returned as a `SupersededIntentReport` so the runtime can announce it
   (mdk#1734). Tests: `tests/distributed_convergence.rs::superseded_profile_edit_*`.
+- **A commit row's `epoch` column is the epoch that commit forks FROM, at every inbound door that has parsed the
+  content type** — the pre-parse persists (a peel failure, a non-MLS or Welcome body in a group-message envelope) stamp
+  `current_epoch`, because no commit is known to be in hand yet. The convergence door stamps the projected
+  `source_epoch`; direct ingest stamps the commit's own wire epoch, which is always below
+  `current_epoch` there because the `commit_should_enter_convergence` decision routes every commit at or above the live
+  epoch into convergence. Two seams already state the rule for rows they read: `distributed_convergence.rs` ("the
+  stored record's epoch is the commit's source epoch (the fork it lost)") and `openmls_projection.rs`'s own-checkpoint
+  prefix, which computes `resulting_epoch` as `record.epoch + 1`. The reachable hazard from a device-epoch stamp is in
+  `apply_start_epoch_for_canonicalization_result`: it reads the first accepted commit NOT already in the applied
+  prefix, so when a lower commit whose anchor exists heads the branch and is already in that prefix, a direct-path row
+  becomes the first non-prefix commit; a device-epoch stamp then yields `apply_start_epoch >= current_epoch`,
+  `rewind_to_retained_anchor` stays false, and the replay runs against live state — `WrongEpoch`, failed apply,
+  rollback. That hazard is derived from reading `apply_start_epoch_for_canonicalization_result`, not pinned by any test
+  below — the tests listed pin the stamp and the forensic epoch, not the replay it would misdirect. In the
+  missing-anchor rival's own case the pass halts `MissingRetainedAnchor` with no accepted commits and never reaches
+  the apply; the row still has to be right, because nothing later corrects it. The stamp is a stored-input
+  shape, not a verdict — the unauthenticated-claim rule above still holds. Forensics is decoupled on purpose: the audit
+  row for that persist and every arm of the direct-path error match that writes the row itself keep reporting
+  `current_epoch` (all four use `update_stored_message_state_reported_at`; the classified-rejection branch is reached
+  only after `decrypt_message`, where a past-epoch commit has already failed `WrongEpoch`), and the convergence pass's
+  disposition transitions report the
+  device's pre-apply tip, because `incident-replay` reads `MessageStateChanged.epoch` as where the engine was and calls
+  a drop a rollback. Tests, all in `tests/fork_detection.rs`:
+  `restarted_committer_without_source_anchor_halts_through_convergence` (row epoch + the persist's forensic epoch),
+  `stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork` (the terminal transition's forensic epoch on
+  the routine redelivery path), `canonicalization_transition_reports_the_device_tip_not_the_rival_source_epoch` (the
+  pass's disposition transitions), `inbound_commit_at_the_live_epoch_takes_the_convergence_door`, and
+  `commit_refused_by_the_incoming_wire_format_policy_reports_the_device_epoch` (the unclassified `Retryable` arm).
 - **A retained anchor for epoch E is the state of E as the device *left* E.** `retain_current_group_epoch_snapshot`
   therefore runs both before an advance past E and immediately after a replayed proposal enters the store at E
   (`openmls_projection::process_openmls_messages_inner`, the `ProposalMessage` arm, under the same

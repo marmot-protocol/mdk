@@ -198,6 +198,7 @@ c_mirror! {
         /// Convergence invalidation reason (e.g. `LosingBranch`); NULL
         /// for delivered messages.
         opt_str invalidation_status,
+        opt_str client_token,
     }
 }
 

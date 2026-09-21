@@ -213,6 +213,63 @@ fn build_client_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, Sqlite
     (engine, storage)
 }
 
+/// [`build_client_with_storage`] with a forensic recorder attached, for tests
+/// that assert on the audit trail. The recorder flushes on drop, so drop the
+/// engine before reading `audit_events(&path)`; keep the `TempDir` alive until
+/// after that read.
+fn build_client_with_recorder(
+    id: &[u8],
+) -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    tempfile::TempDir,
+    std::path::PathBuf,
+) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let audit_dir = tempfile::TempDir::new().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    let recorder = marmot_forensics::JsonlRecorder::open(&audit_path, hex::encode(id)).unwrap();
+    let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .unwrap();
+    (engine, storage, audit_dir, audit_path)
+}
+
+fn audit_events(path: &std::path::Path) -> Vec<marmot_forensics::AuditEvent> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The epoch the forensic trail reports for a message's transition into
+/// `new_state`, which is where the engine was when it handled the message —
+/// never the message's own claimed epoch. See `incident-replay`'s
+/// `MessageStateChanged` doc.
+fn reported_epoch_for_state(
+    events: &[marmot_forensics::AuditEvent],
+    msg_id: &MessageId,
+    new_state: &str,
+) -> Option<u64> {
+    let wanted = hex::encode(msg_id.as_slice());
+    events.iter().rev().find_map(|event| match &event.kind {
+        marmot_forensics::AuditEventKind::MessageStateChanged {
+            msg_id,
+            new_state: state,
+            epoch,
+            ..
+        } if *msg_id == wanted && state == new_state => Some(*epoch),
+        _ => None,
+    })?
+}
+
 fn reopen_current_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
     let mut engine = EngineBuilder::new(storage)
         .identity(pad32(id))
@@ -1028,7 +1085,8 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
     let late_committer = labels[0];
     let local_committer = labels[labels.len() - 1];
 
-    let (mut alice, _alice_storage) = build_client_with_storage(local_committer);
+    let (mut alice, _alice_storage, _audit_dir, audit_path) =
+        build_client_with_recorder(local_committer);
     let mut bob = build_client(late_committer);
     let mut dave = build_client(b"late-dave");
 
@@ -1096,6 +1154,7 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
     let terminal_epoch = EpochId(1 + advance_epochs);
     assert_eq!(alice.epoch(&group_id).unwrap(), terminal_epoch);
 
+    let late_commit_id = MessageId::new(Sha256::digest(&late_commit.payload).to_vec());
     let routed = TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
             transport_group_id: group_id.as_slice().to_vec(),
@@ -1124,6 +1183,168 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
         "late commits outside the rewind horizon must not change canonical state"
     );
     assert_eq!(alice.epoch(&group_id).unwrap(), terminal_epoch);
+
+    // The row a beyond-horizon commit leaves behind carries the commit's own
+    // source epoch, but the forensic trail must keep reporting where this
+    // engine was: `incident-replay` folds `MessageStateChanged.epoch` into an
+    // engine's current position and reads a drop below its high-water mark as a
+    // rollback. Routine relay redelivery takes exactly this path.
+    drop(alice);
+    let events = audit_events(&audit_path);
+    for state in ["created", "failed"] {
+        assert_eq!(
+            reported_epoch_for_state(&events, &late_commit_id, state),
+            Some(terminal_epoch.0),
+            "the {state} audit row must report this engine's epoch, not the commit's claim"
+        );
+    }
+}
+
+/// A past-epoch commit the device's own incoming wire-format policy refuses is
+/// rejected inside `unprotect_message` before `decrypt_message` can raise
+/// `WrongEpoch`, and `classify_process_message_rejection` maps
+/// `IncompatibleWireFormat` only for proposals — so a commit lands on the
+/// unclassified `Retryable` arm of the direct-path error match. The row that
+/// arm transitions carries the commit's source epoch; the audit row for the
+/// transition must keep reporting the device's own epoch, because
+/// `incident-replay` folds `MessageStateChanged.epoch` into the engine's
+/// position and reads a drop as a rollback.
+#[tokio::test]
+async fn commit_refused_by_the_incoming_wire_format_policy_reports_the_device_epoch() {
+    use cgka_engine::{DEFAULT_MAX_PAST_EPOCHS, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, join_config};
+    use openmls::group::{MlsGroupJoinConfig, PURE_CIPHERTEXT_WIRE_FORMAT_POLICY};
+
+    let (mut alice, alice_storage, _audit_dir, audit_path) =
+        build_client_with_recorder(b"wire-format-local");
+    let mut bob = build_client(b"wire-format-rival");
+    let mut dave = build_client(b"wire-format-invitee");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "wire-format-refusal".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // Bob commits from epoch 1; Alice advances past the rewind horizon so the
+    // commit reaches the direct-ingest path rather than convergence.
+    let dave_kp = dave.fresh_key_package().await.unwrap();
+    let late_commit = match bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![dave_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            bob.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected Bob invite GroupEvolution, got {other:?}"),
+    };
+    let advance_epochs = V1_MAX_REWIND_COMMITS + 1;
+    for i in 0..advance_epochs {
+        let pending = match alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(format!("wire-format-refusal-{i}")),
+                description: None,
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::GroupEvolution { pending, .. } => pending,
+            other => panic!("expected Alice update GroupEvolution, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+    }
+    let device_epoch = EpochId(1 + advance_epochs);
+    assert_eq!(alice.epoch(&group_id).unwrap(), device_epoch);
+
+    // Flip only the wire-format policy of Alice's own group: everything Bob's
+    // commit carries stays genuine, and the refusal comes from OpenMLS's real
+    // incoming-policy check.
+    {
+        let crypto = RustCrypto::default();
+        let provider = EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+            &crypto,
+            alice_storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mut stored = MlsGroup::load(provider.storage(), &mls_gid)
+            .expect("load Alice's MLS group")
+            .expect("Alice has group state");
+        let ratchet = *join_config(DEFAULT_MAX_PAST_EPOCHS).sender_ratchet_configuration();
+        let build = |policy| {
+            MlsGroupJoinConfig::builder()
+                .wire_format_policy(policy)
+                .max_past_epochs(DEFAULT_MAX_PAST_EPOCHS)
+                .use_ratchet_tree_extension(true)
+                .sender_ratchet_configuration(ratchet)
+                .build()
+        };
+        assert_eq!(
+            stored.configuration(),
+            &build(PURE_PLAINTEXT_WIRE_FORMAT_POLICY),
+            "only the wire-format policy may differ from the engine's own config"
+        );
+        stored
+            .set_configuration(
+                alice_storage.mls_storage(),
+                &build(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY),
+            )
+            .expect("install a ciphertext-only incoming policy");
+    }
+
+    let late_commit_id = MessageId::new(Sha256::digest(&late_commit.payload).to_vec());
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..late_commit
+    };
+    let error = alice
+        .ingest(routed)
+        .await
+        .expect_err("a handshake message the incoming policy refuses cannot be processed");
+    assert!(
+        format!("{error:?}").contains("IncompatibleWireFormat"),
+        "expected the wire-format refusal, got {error:?}"
+    );
+
+    // The row and the device really do sit at different epochs here, which is
+    // what makes the assertion below discriminating.
+    assert_eq!(
+        alice_storage.get_message(&late_commit_id).unwrap().epoch,
+        EpochId(1)
+    );
+
+    drop(alice);
+    let events = audit_events(&audit_path);
+    assert_eq!(
+        reported_epoch_for_state(&events, &late_commit_id, "retryable"),
+        Some(device_epoch.0),
+        "the retryable audit row must report this engine's epoch, not the commit's source epoch"
+    );
 }
 
 #[tokio::test]
@@ -2626,9 +2847,16 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
     // the original silent-drop defect stays closed.
     let f = anchor_less_forked_device("silent").await;
     let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    let rival_source_epoch = claimed_mls_epoch(&f.competing.payload);
     let (mut local, _audit_dir, audit_path) =
         restarted_device_with_recorder(&f, "restarted-committer");
     let _ = local.drain_pending_convergence_groups();
+    let device_epoch = f.local_storage.get_group(&f.group_id).unwrap().epoch;
+    assert!(
+        rival_source_epoch < device_epoch,
+        "the seam under test only exists for a rival behind the device; \
+         rival {rival_source_epoch:?} device {device_epoch:?}"
+    );
 
     let outcome = local.ingest(f.competing.clone()).await.unwrap();
 
@@ -2638,14 +2866,35 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
         outcome,
         IngestOutcome::Buffered {
             group_id: f.group_id.clone(),
-            epoch: EpochId(2),
+            epoch: rival_source_epoch,
         },
-        "the unadjudicated rival must be retained, not silently classified stale"
+        "the unadjudicated rival must be retained, not silently classified \
+         stale, and `Buffered.epoch` is the epoch of the row it is parked in"
     );
+    // This seam is once-only: the persist that retained the rival also marked
+    // its transport id processed, so byte-identical redelivery is answered by
+    // the durable dedup seam and never reaches here. The redelivery half of the
+    // `Buffered.epoch` rule is pinned where redelivery does reach a retained
+    // row, in `invite_leave::redelivery_of_a_retained_id_answers_buffered_and_moves_nothing`.
     assert_eq!(
-        f.local_storage.get_message(&competing_id).unwrap().state,
+        local.ingest(f.competing.clone()).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::Duplicate
+        },
+        "a second copy of the rival must change nothing"
+    );
+    let record = f.local_storage.get_message(&competing_id).unwrap();
+    assert_eq!(
+        record.state,
         MessageState::Created,
         "the rival stays in the pass-opening state convergence needs"
+    );
+    // A commit row's epoch is the epoch it forks from on every door, because
+    // `apply_start_epoch_for_canonicalization_result` reads that column back as
+    // the accepted branch's source epoch.
+    assert_eq!(
+        record.epoch, rival_source_epoch,
+        "the retained rival must carry its own source epoch, not the device's"
     );
     assert!(
         !f.local_storage
@@ -2694,11 +2943,7 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
     // Drop the engine so the JsonlRecorder flushes on Drop, then pin the
     // forensic trail of the halt.
     drop(local);
-    let events: Vec<marmot_forensics::AuditEvent> = std::fs::read_to_string(&audit_path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let events = audit_events(&audit_path);
     assert!(
         events.iter().any(|event| matches!(
             &event.kind,
@@ -2707,6 +2952,31 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
         )),
         "the durable halt must leave an audit row naming the missing material"
     );
+    // The forensic epoch is not the row epoch. `incident-replay` reads
+    // `MessageStateChanged.epoch` as "the engine handled a message while at
+    // `epoch`" and folds the newest timed one into that engine's current
+    // position, calling a drop below its own high-water mark a rollback. So the
+    // row may carry the rival's source epoch while the audit trail must keep
+    // reporting where this engine actually was.
+    let persist_epoch = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            marmot_forensics::AuditEventKind::MessageStateChanged {
+                msg_id,
+                reason,
+                epoch,
+                ..
+            } if *msg_id == hex::encode(competing_id.as_slice()) && reason == "persist" => {
+                Some(*epoch)
+            }
+            _ => None,
+        })
+        .expect("retaining the rival must leave a persist row in the forensic trail");
+    assert_eq!(
+        persist_epoch,
+        Some(device_epoch.0),
+        "the persist audit row must report this engine's own epoch, never the rival's claim"
+    );
     assert!(
         events.iter().any(|event| matches!(
             &event.kind,
@@ -2714,6 +2984,46 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
                 if reason == "fork_rival_missing_retained_anchor"
         )),
         "the ingest seam must record why it could not adjudicate the rival"
+    );
+}
+
+#[tokio::test]
+async fn canonicalization_transition_reports_the_device_tip_not_the_rival_source_epoch() {
+    // A rival's row carries the epoch it forks FROM, so reading that column
+    // back into `MessageStateChanged.epoch` tells `incident-replay` the engine
+    // was BELOW where it actually is and turns every adjudicated fork into a
+    // reported rollback. The pass's dispositions must report the device's
+    // pre-apply tip, the same decoupling the persist site makes.
+    let (f, local) = router_flip_fixture("canonicalization-epoch").await;
+    assert!(f.sibling_wins);
+    let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    let rival_source_epoch = claimed_mls_epoch(&f.competing.payload);
+
+    drop(local);
+    let (mut local, _audit_dir, audit_path) =
+        restarted_device_with_recorder(&f, "canonicalization-epoch");
+    let device_tip = f.local_storage.get_group(&f.group_id).unwrap().epoch;
+    assert!(
+        rival_source_epoch < device_tip,
+        "the two epochs must differ for this test to say anything; \
+         rival {rival_source_epoch:?} device {device_tip:?}"
+    );
+
+    local.ingest(f.competing.clone()).await.unwrap();
+    drive_convergence(&mut local, &f, &competing_id).await;
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::Processed,
+        "the pass must admit the rival so it emits a disposition transition"
+    );
+
+    drop(local);
+    let events = audit_events(&audit_path);
+    assert_eq!(
+        reported_epoch_for_state(&events, &competing_id, "processed"),
+        Some(device_tip.0),
+        "the canonicalization transition must report where the engine was, \
+         not the rival's source epoch"
     );
 }
 
@@ -3862,4 +4172,121 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
         "the displaced own commit must stay reconsiderable"
     );
     assert_eq!(own.epoch, EpochId(1));
+}
+
+/// The convergence-admission door already answers the question above the same
+/// way, and must keep doing so: with the source anchor present the rival is
+/// buffered for the pass and stored at the epoch it forks from.
+///
+/// This is not a duplicate of
+/// `inbound_commit_at_the_live_epoch_takes_the_convergence_door`: there the
+/// commit's source epoch equals the device epoch, so its final assertion cannot
+/// tell a source-epoch stamp from a device-epoch one. Here they differ (source
+/// 1, device 2), which makes this the only assertion that discriminates what
+/// the convergence door stamps.
+#[tokio::test]
+async fn convergence_admitted_fork_rival_is_retained_at_the_epoch_it_forks_from() {
+    let (f, mut local) = router_flip_fixture("admitted-rival-source-epoch-stamp").await;
+    let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    let rival_source_epoch = claimed_mls_epoch(&f.competing.payload);
+    assert!(rival_source_epoch < local.epoch(&f.group_id).unwrap());
+
+    local.ingest(f.competing.clone()).await.unwrap();
+
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().epoch,
+        rival_source_epoch,
+        "the convergence door stamps a buffered rival with its own source epoch"
+    );
+}
+
+/// A commit at the device's live epoch takes the convergence door, never the
+/// direct apply.
+///
+/// This is the premise the direct-path persist site leans on when it treats
+/// every commit reaching it as a past-epoch one: the
+/// `commit_should_enter_convergence` decision routes every commit at or above
+/// the live epoch into convergence. The row it leaves behind carries the epoch
+/// the commit forks from, which the apply then moves past.
+#[tokio::test]
+async fn inbound_commit_at_the_live_epoch_takes_the_convergence_door() {
+    let (mut creator, _creator_storage) = build_client_with_storage(b"same-epoch-creator");
+    let (mut joiner, joiner_storage) = build_client_with_storage(b"same-epoch-joiner");
+    let mut invitee = build_client(b"same-epoch-invitee");
+
+    let joiner_kp = joiner.fresh_key_package().await.unwrap();
+    let (group_id, create) = creator
+        .create_group(CreateGroupRequest {
+            name: "same epoch".into(),
+            description: String::new(),
+            members: vec![joiner_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![creator.self_id()],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            creator.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    joiner.join_welcome(welcome).await.unwrap();
+    joiner.drain_events();
+
+    let invitee_kp = invitee.fresh_key_package().await.unwrap();
+    let (commit, pending) = match creator
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![invitee_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    creator.confirm_published(pending).await.unwrap();
+    let commit_source_epoch = claimed_mls_epoch(&commit.payload);
+    assert_eq!(commit_source_epoch, joiner.epoch(&group_id).unwrap());
+    let commit_id = MessageId::new(Sha256::digest(&commit.payload).to_vec());
+
+    let outcome = joiner
+        .ingest(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..commit
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        cgka_traits::ingest::IngestOutcome::Buffered {
+            group_id: group_id.clone(),
+            epoch: commit_source_epoch,
+        },
+        "a live-epoch commit is buffered for the pass, never applied directly"
+    );
+    let _ = joiner.drain_pending_convergence_groups();
+    joiner
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+
+    assert_eq!(
+        joiner.epoch(&group_id).unwrap(),
+        EpochId(commit_source_epoch.0 + 1),
+        "the commit must genuinely apply, leaving its row epoch behind the device"
+    );
+    assert_eq!(
+        joiner_storage.get_message(&commit_id).unwrap().epoch,
+        commit_source_epoch
+    );
 }

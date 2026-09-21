@@ -69,6 +69,11 @@ if rg -n 'releases/download/wn-agent-latest/install-' "${active_paths[@]}"; then
     exit 1
 fi
 
+if rg -n 'wn-agent-latest' .github/workflows; then
+    echo "error: release workflows must not create, update, or advertise a mutable WN Agent alias" >&2
+    exit 1
+fi
+
 stale_versioned_urls="$(
     rg -n -o 'wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi)-marmot\.sh' \
         "${active_paths[@]}" |

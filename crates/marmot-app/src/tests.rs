@@ -12242,6 +12242,114 @@ fn legacy_account_projection_clamps_poisoned_transport_cursor_on_import() {
     );
 }
 
+/// Reproduce repeated overflow verdicts at the account queue boundary. These are
+/// distinct transport IDs already retained by the application, not SDK-level
+/// cross-relay duplicates, which are filtered before this boundary.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
+    run_composed_app_runtime_test("epoch-overflow-empty-retry", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config()
+                .with_dev_epoch_backfill_execution_quantum_ms(5_000)
+                .with_dev_epoch_backfill_retry_backoff_ms(15_000),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        let cursor = crate::unix_now_seconds();
+        client.state.last_transport_timestamp = Some(cursor);
+        app.save_state(&client.state).unwrap();
+        const HISTORY: usize = crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + 16;
+        for index in 0..HISTORY {
+            let event = epoch_gap_probe(
+                &group.nostr_routing.nostr_group_id_hex,
+                cursor.saturating_sub(600 + index as u64),
+                &format!("retained-history-{index}"),
+            );
+            client.remember_seen_event(event.id.clone());
+            inject_epoch_gap_probe(&app, event).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let health = app.relay_plane.relay_health().await;
+                if health.account_delivery_dropped
+                    >= (HISTORY - crate::relay_plane::ACCOUNT_DELIVERY_BUFFER) as u64
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the undrained history must overflow the account queue");
+
+        for ordinal in 0..2 {
+            if ordinal > 0 {
+                expire_epoch_backfill_retry_cooldown(&mut client);
+            }
+            assert!(matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                    )
+                    .await
+                    .unwrap(),
+                crate::EpochBackfillRunOutcome::Incomplete(_)
+            ));
+            let remaining = client
+                .epoch_backfill_retry_not_before
+                .unwrap()
+                .saturating_duration_since(std::time::Instant::now());
+            let expected = Duration::from_secs(15 * (1 << ordinal));
+            assert!(
+                remaining > expected - Duration::from_secs(1) && remaining <= expected,
+                "overflow attempt {ordinal} must earn {expected:?}, got {remaining:?}"
+            );
+            let subscriptions = relay.accepted_subscriptions().len();
+            assert!(matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Receive
+                    )
+                    .await
+                    .unwrap(),
+                crate::EpochBackfillRunOutcome::Deferred
+            ));
+            assert_eq!(relay.accepted_subscriptions().len(), subscriptions);
+        }
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 2);
+        assert_eq!(
+            failed[0]["kind"]["skipped"],
+            crate::relay_plane::ACCOUNT_DELIVERY_BUFFER
+        );
+        assert_eq!(failed[1]["kind"]["skipped"], 0);
+        for row in failed {
+            assert_eq!(row["kind"]["error_kind"], "account_delivery_queue_overflow");
+        }
+        assert_eq!(
+            app.load_state("alice").unwrap().last_transport_timestamp,
+            Some(cursor)
+        );
+        assert!(client.has_pending_epoch_backfill());
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
+    });
+}
+
 #[test]
 fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
     run_composed_app_runtime_test("delivery-overflow-reopen", || async {
@@ -15369,15 +15477,9 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
     );
 }
 
-/// A send that failed and is retried inside the same second must end delivered.
-///
-/// Inner app-event ids are NIP-01 hashes over
-/// (pubkey, created_at, kind, tags, content), and `created_at` is whole seconds
-/// (`unix_now_seconds`), with no nonce. So identical text resent inside the same
-/// second as a failed send is not a *similar* event — it is bit-for-bit the same
-/// event, under the same id, landing on the row the failure retracted. Hosts are
-/// told to do exactly this: `marmot-uniffi` prescribes an automatic retry for
-/// `StorageBusy` (milliseconds later) and a user resend for the rest.
+/// Retrying the exact retained event revives its local failure retraction.
+/// Identical newly authored messages within one second also have this identity;
+/// a retained retry deliberately preserves its original identity.
 ///
 /// `record_app_event`'s upsert keeps invalidation terminal, because it cannot
 /// tell this retry from a relay redelivery or a backfill replay. Left there, the
@@ -15385,11 +15487,8 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
 /// `Failed` forever — nothing else clears `invalidated`. The send intent is the
 /// missing evidence, so `record_send_intent_projection` clears the retraction.
 ///
-/// The two sends are built at one fixed `created_at` rather than by sending
-/// twice through the relay harness: that is precisely what a same-second resend
-/// produces, and it pins the collision instead of racing a clock edge.
 #[tokio::test]
-async fn a_same_second_resend_revives_the_row_its_failed_send_retracted() {
+async fn a_retained_event_resend_revives_the_row_its_failed_send_retracted() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
         .create_account("alice")
@@ -15409,10 +15508,10 @@ async fn a_same_second_resend_revives_the_row_its_failed_send_retracted() {
         content: "resent inside the same second".to_owned(),
     };
     let first = build_inner_event(&chat(), &sender, 1_700_000_000).unwrap();
-    let resend = build_inner_event(&chat(), &sender, 1_700_000_000).unwrap();
+    let resend = first.clone();
     assert_eq!(
         first.id, resend.id,
-        "the premise: a same-second resend of identical text is the same event id"
+        "a retained retry preserves the event id"
     );
 
     let status = |app: &MarmotApp| {

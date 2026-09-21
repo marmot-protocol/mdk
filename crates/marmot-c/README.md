@@ -11,13 +11,21 @@ Use the [complete C symbol reference](API-REFERENCE.md) for every function decla
 including ownership helpers, and the [shared method reference](../marmot-uniffi/API-REFERENCE.md)
 for runtime purposes and recommended alternatives to older screen paths.
 
-The [0.10.1 → 0.10.2 integration guide](../../docs/integration/0.10.2.md) explains
-new defaults, media adoption, KeyPackages and changed records. Future releases have
-companions in the [integration index](../../docs/integration/README.md).
+The [0.10.3 → 0.10.4 integration guide](../../docs/integration/0.10.4.md) explains
+the current record, enum, error and schema changes. Every supported release has a
+companion in the [integration index](../../docs/integration/README.md).
 Read the exact version's header and docs; C record layout compatibility is not implied
 by a shared major/minor number. External-signer onboarding/login/registration remain
 UniFFI-only until a C signer callback interface exists; the host secret-store vtable
 is already supported and is a different interface.
+
+The 0.10.4 [local-send contract](../marmot-uniffi/LOCAL-SENDS.md) adds token-aware
+send/reply/draft/upload calls. C calls block until local acceptance (or upload then
+acceptance), rather than relay completion. Free their results with
+`marmot_local_send_acceptance_free`, `marmot_media_upload_submission_free`, or
+`marmot_local_send_status_free`. The nullable timeline `client_token` is owned by
+its row and released by the row's existing deep-free. Rebuild against the matching
+header/library because this changes the timeline record layout.
 
 Before OS suspension/root handoff, use `marmot_client_shutdown_and_close` and observe
 its status; `marmot_client_shutdown` alone does not close shared database handles.
@@ -224,7 +232,7 @@ diff-gates the checked-in header.
 ## Selected chat-list presentation
 
 The additive `marmot_presented_chat_list` and `marmot_presented_chat_list_row` return complete existing row fields
-plus MDK-selected title/avatar descriptors. The unreleased C3 additions extend
+plus MDK-selected title/avatar descriptors. The 0.10.3 C3 additions extend
 `MarmotPresentedChatRow` with preview and action fields, changing its binary layout.
 Rebuild consumers with the matching generated header and native library; function signatures are unchanged.
 `marmot_open_presented_chat_list` returns an attached handle; take its `*_snapshot` once, then use `*_next` for
@@ -255,6 +263,6 @@ opaque targets, `marmot_read_avatar_assets` for bounded local bytes (at most 16 
 `marmot_avatar_asset_list_free` / `marmot_avatar_bytes_list_free` functions. Regenerate/recompile consumers against the
 matching header and library; the resolved chat/conversation records now contain an optional avatar metadata pointer.
 
-### Selected chat-list previews and actions (unreleased)
+### Selected chat-list previews and actions (0.10.3)
 
 `MarmotPresentedChatRow` now embeds `preview` and `actions`. The Draft preview owns its text; the parent row/snapshot free releases it. Message selection refers to the same row’s `last_message`. Rebuild with the matching header/library; see the [shared C3 integration contract](../marmot-uniffi/CHAT-LIST-ROWS.md).

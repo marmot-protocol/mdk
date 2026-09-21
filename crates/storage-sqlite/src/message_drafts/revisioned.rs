@@ -12,6 +12,18 @@ impl MessageDraftRevision {
     pub fn group_id_hex(&self) -> &str {
         &self.group_id_hex
     }
+
+    /// Device-local idempotency binding. Never send or log this value.
+    #[doc(hidden)]
+    pub fn local_submission_binding(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"mdk-local-draft-submission-v1");
+        hash.update(&self.store_epoch);
+        hash.update(self.group_id_hex.as_bytes());
+        hash.update(self.revision.to_be_bytes());
+        hash.finalize().into()
+    }
 }
 
 #[derive(Clone)]
@@ -70,7 +82,7 @@ impl SqliteAccountStorage {
                 let conn = self.lock()?;
                 check_revision_tx(&conn, expected)?;
             }
-            self.save_message_draft(&expected.group_id_hex, content, reply, attachments)?;
+            self.write_message_draft(&expected.group_id_hex, content, reply, attachments)?;
             Ok(self.selected_message_draft(&expected.group_id_hex)?)
         })
     }
@@ -245,17 +257,16 @@ pub(crate) fn selected_tx(conn: &Connection, group: &str) -> StorageResult<Selec
     Ok(SelectedMessageDraft { revision, draft })
 }
 
+pub(crate) const SELECTED_ATTACHMENTS_SQL: &str =
+    "SELECT attachment_id, file_name, media_type, length(plaintext),
+        dim, thumbhash, duration_seconds, waveform_samples_json FROM message_draft_attachments
+        WHERE group_id_hex = ?1 ORDER BY position";
+
 fn selected_attachments_tx(
     conn: &Connection,
     group: &str,
 ) -> StorageResult<Vec<SelectedMessageDraftAttachment>> {
-    let mut statement = conn
-        .prepare_cached(
-            "SELECT attachment_id, file_name, media_type, length(plaintext),
-        dim, thumbhash, duration_seconds, waveform_samples_json FROM message_draft_attachments
-        WHERE group_id_hex = ?1 ORDER BY position",
-        )
-        .storage()?;
+    let mut statement = conn.prepare_cached(SELECTED_ATTACHMENTS_SQL).storage()?;
     let rows = statement
         .query_map([group], |row| {
             Ok((

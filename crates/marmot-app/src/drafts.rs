@@ -306,7 +306,7 @@ impl MarmotApp {
         self.notify_draft_changed(account_ref, expected.group_id_hex());
         Ok(result)
     }
-    fn notify_draft_changed(&self, account_ref: &str, group: &str) {
+    pub(crate) fn notify_draft_changed(&self, account_ref: &str, group: &str) {
         if let Ok(account) = self.account_home().account(account_ref) {
             let _ = self
                 .presentation_signals

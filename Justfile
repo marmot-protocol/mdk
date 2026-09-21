@@ -154,6 +154,14 @@ release-all-draft version:
 release-all-dry-run version:
     ./scripts/cut-full-release.sh --dry-run {{version}}
 
+# Intentionally lightweight check for an initial version/docs-only release PR.
+# GitHub CI owns compilation, tests, and artifact builds for this stage.
+release-pr-preflight version:
+    git diff --check
+    python3 scripts/check_binding_docs.py --release-version {{version}}
+    ./scripts/check_agent_install_docs.sh
+    ./scripts/cut-full-release.sh --dry-run {{version}}
+
 release-wn-agent version:
     ./scripts/cut-wn-agent-release.sh {{version}}
 
@@ -612,6 +620,10 @@ binding-docs-gate:
     python3 scripts/check_binding_docs.py
     python3 scripts/test_check_binding_docs.py
 
+# Exercise release build phases without compiling Rust or requiring platform SDKs.
+binding-build-gate:
+    python3 crates/marmot-uniffi/test-build-phases.py
+
 # Refresh mechanical signatures/source links while preserving integration prose.
 # New exports are scaffolded and remain failing until an author completes their guidance.
 binding-docs-update:
@@ -637,6 +649,6 @@ apple-privacy-gate:
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate c-parity-gate binding-docs-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate c-parity-gate binding-docs-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin test

@@ -7,21 +7,28 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-character commit SHA on master to publish as an immutable MarmotKit snapshot
+        description: Full 40-character source SHA (must be on master when publishing)
         required: true
         type: string
+      build_only:
+        description: Build and validate workflow artifacts without creating tags or releases
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: marmotkit-bindings-${{ inputs.source_sha || github.ref }}
+  group: marmotkit-bindings-${{ inputs.source_sha || github.ref }}-${{ inputs.build_only && github.sha || 'publish' }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+  MARMOTKIT_MACOS_DEPLOYMENT_TARGET: "15.0"
+  ANDROID_NDK_VERSION: 27.2.12479018
   OTLP_EXPORT: "1"
   PRODUCT_ANALYTICS_EXPORT: "1"
 
@@ -54,13 +61,14 @@ jobs:
         env:
           REQUESTED_SHA: ${{ inputs.source_sha }}
           BUILDER_SHA: ${{ github.sha }}
+          BUILD_ONLY: ${{ inputs.build_only }}
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse 'HEAD^{commit}')"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
 
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            if [[ "$BUILD_ONLY" != true && "$GITHUB_REF" != "refs/heads/master" ]]; then
               echo "error: snapshot publishing must run with the workflow from refs/heads/master" >&2
               exit 1
             fi
@@ -72,10 +80,12 @@ jobs:
               echo "error: requested SHA resolved to unexpected commit $source_sha" >&2
               exit 1
             fi
-            git fetch --no-tags origin master
-            if ! git merge-base --is-ancestor "$source_sha" origin/master; then
-              echo "error: snapshot SHA must be a commit reachable from origin/master" >&2
-              exit 1
+            if [[ "$BUILD_ONLY" != true || "$GITHUB_REF" == refs/heads/master ]]; then
+              git fetch --no-tags origin master
+              if ! git merge-base --is-ancestor "$source_sha" origin/master; then
+                echo "error: snapshot SHA must be a commit reachable from origin/master" >&2
+                exit 1
+              fi
             fi
             release_id="snapshot-$source_sha"
             release_tag="marmotkit-snapshot-$source_sha"
@@ -105,10 +115,107 @@ jobs:
             echo "is_snapshot=$is_snapshot"
           } >> "$GITHUB_OUTPUT"
 
-  ios-bindings:
-    name: Build iOS bindings
+  apple-build:
+    name: Build Apple input (${{ matrix.part }})
     runs-on: macos-latest
     needs: metadata
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Leave capacity for WN Agent on a five-slot macOS plan. This bounds this
+      # run only; avoid overlapping snapshot and cohort builds during releases.
+      # Cold rehearsal 35506538221 queued the fourth input for ~12 minutes.
+      max-parallel: 3
+      matrix:
+        include:
+          - part: swift
+            path: crates/marmot-uniffi/build/ios/swift
+            provenance: crates/marmot-uniffi/build/ios/swift/build-provenance.json
+          - part: macos
+            path: target/aarch64-apple-darwin/release/libmarmot_uniffi.a
+            provenance: target/aarch64-apple-darwin/release/build-provenance.json
+          - part: ios-simulator
+            path: target/aarch64-apple-ios-sim/release/libmarmot_uniffi.a
+            provenance: target/aarch64-apple-ios-sim/release/build-provenance.json
+          - part: ios-device
+            path: target/aarch64-apple-ios/release/libmarmot_uniffi.a
+            provenance: target/aarch64-apple-ios/release/build-provenance.json
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Check out packaged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' packaged-source/rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: marmotkit-${{ matrix.part }}
+          key: ${{ hashFiles('crates/marmot-uniffi/marmotkit-*.env', 'crates/marmot-uniffi/*framework*.sh', 'crates/marmot-uniffi/kotlin-bindings.sh') }}
+          workspaces: packaged-source -> target
+
+      - name: Build one Apple input
+        env:
+          MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
+          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
+          PART: ${{ matrix.part }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+          PROVENANCE_PATH: packaged-source/${{ matrix.provenance }}
+        run: |
+          set -euo pipefail
+          case "$PART" in
+            swift) ./crates/marmot-uniffi/xcframework.sh generate ;;
+            ios-device) ./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios ;;
+            ios-simulator) ./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios-sim ;;
+            macos) MACOSX_DEPLOYMENT_TARGET="$MARMOTKIT_MACOS_DEPLOYMENT_TARGET" \
+              ./crates/marmot-uniffi/xcframework-macos.sh native ;;
+            *) exit 1 ;;
+          esac
+          python3 crates/marmot-uniffi/build-provenance.py record "$PART" "$PROVENANCE_PATH"
+
+      - name: Upload Apple input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-input-${{ matrix.part }}-${{ needs.metadata.outputs.source_sha }}
+          path: |
+            packaged-source/${{ matrix.path }}
+            packaged-source/${{ matrix.provenance }}
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 7
+
+      - name: Upload compiler timings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-timings-${{ matrix.part }}-${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source/target/cargo-timings/*.html
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ios-bindings:
+    name: Assemble and validate iOS bindings
+    runs-on: macos-latest
+    needs: [metadata, apple-build]
     timeout-minutes: 60
 
     steps:
@@ -132,21 +239,42 @@ jobs:
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' packaged-source/rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal
           rustup default "$toolchain"
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
           rustc --version
           cargo --version
 
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Download swift input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          workspaces: packaged-source -> target
+          name: marmotkit-input-swift-${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source/crates/marmot-uniffi/build/ios/swift
 
-      - name: Build MarmotKit XCFramework
+      - name: Download ios-device input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: marmotkit-input-ios-device-${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source/target/aarch64-apple-ios/release
+
+      - name: Download ios-simulator input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: marmotkit-input-ios-simulator-${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source/target/aarch64-apple-ios-sim/release
+
+      - name: Verify build provenance
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+        run: |
+          python3 crates/marmot-uniffi/build-provenance.py verify ios \
+            packaged-source/crates/marmot-uniffi/build/ios/swift/build-provenance.json \
+            packaged-source/target/aarch64-apple-ios/release/build-provenance.json \
+            packaged-source/target/aarch64-apple-ios-sim/release/build-provenance.json
+
+      - name: Assemble XCFramework from matching inputs
         env:
           MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
           MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
-        run: ./crates/marmot-uniffi/xcframework.sh
+        run: ./crates/marmot-uniffi/xcframework.sh assemble
 
       - name: Package immutable iOS artifacts
         shell: bash
@@ -208,19 +336,15 @@ jobs:
           if-no-files-found: error
 
   macos-bindings:
-    name: Build macOS bindings
+    name: Assemble and validate macOS bindings
     runs-on: macos-latest
-    needs: metadata
+    needs: [metadata, apple-build]
     timeout-minutes: 60
-    env:
-      # This value is what the job both builds and validates against, so those
-      # two steps cannot disagree. Validating against a lower number fails,
-      # because locally compiled members report exactly this minimum. The
-      # build/package/validate scripts each default to the same 15.0 when run
-      # outside CI; keep those defaults in step with this value.
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
 
     steps:
+      - name: Set macOS deployment target
+        run: echo "MACOSX_DEPLOYMENT_TARGET=$MARMOTKIT_MACOS_DEPLOYMENT_TARGET" >> "$GITHUB_ENV"
+
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -241,21 +365,35 @@ jobs:
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' packaged-source/rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal
           rustup default "$toolchain"
-          rustup target add aarch64-apple-darwin
           rustc --version
           cargo --version
 
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Download swift input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          workspaces: packaged-source -> target
+          name: marmotkit-input-swift-${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source/crates/marmot-uniffi/build/macos/swift
 
-      - name: Build MarmotKit macOS XCFramework
+      - name: Download macos input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: marmotkit-input-macos-${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source/target/aarch64-apple-darwin/release
+
+      - name: Verify build provenance
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+        run: |
+          python3 crates/marmot-uniffi/build-provenance.py verify macos \
+            packaged-source/crates/marmot-uniffi/build/macos/swift/build-provenance.json \
+            packaged-source/target/aarch64-apple-darwin/release/build-provenance.json
+
+      - name: Assemble XCFramework from matching inputs
         env:
           MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
           MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
-        run: ./crates/marmot-uniffi/xcframework-macos.sh
+        run: ./crates/marmot-uniffi/xcframework-macos.sh assemble
 
       - name: Package immutable macOS artifacts
         shell: bash
@@ -317,11 +455,25 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  android-bindings:
-    name: Build Android bindings
+  android-build:
+    name: Build Android input (${{ matrix.part }})
     runs-on: ubuntu-latest
     needs: metadata
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: kotlin
+            target: ""
+          - part: arm64-v8a
+            target: aarch64-linux-android
+          - part: armeabi-v7a
+            target: armv7-linux-androideabi
+          - part: x86
+            target: i686-linux-android
+          - part: x86_64
+            target: x86_64-linux-android
 
     steps:
       - name: Check out repository
@@ -344,18 +496,18 @@ jobs:
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' packaged-source/rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal
           rustup default "$toolchain"
-          rustup target add \
-            aarch64-linux-android \
-            armv7-linux-androideabi \
-            i686-linux-android \
-            x86_64-linux-android
           rustc --version
           cargo --version
 
-      - name: Install Android NDK
-        shell: bash
+      - name: Install native target
+        if: matrix.part != 'kotlin'
         env:
-          ANDROID_NDK_VERSION: 27.2.12479018
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+
+      - name: Install Android NDK
+        if: matrix.part != 'kotlin'
+        shell: bash
         run: |
           set -euo pipefail
           sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
@@ -391,13 +543,78 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: marmotkit-${{ matrix.part }}
+          key: ${{ hashFiles('crates/marmot-uniffi/marmotkit-*.env', 'crates/marmot-uniffi/*framework*.sh', 'crates/marmot-uniffi/kotlin-bindings.sh') }}
           workspaces: packaged-source -> target
 
-      - name: Build MarmotKit Kotlin and JNI bindings
+      - name: Build one Android input
         env:
           MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}/packaged-source
           MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
-        run: ./crates/marmot-uniffi/kotlin-bindings.sh
+          PART: ${{ matrix.part }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PART" == kotlin ]]; then
+            ./crates/marmot-uniffi/kotlin-bindings.sh generate
+          else
+            ANDROID_ABIS="$PART" ./crates/marmot-uniffi/kotlin-bindings.sh native
+          fi
+          python3 crates/marmot-uniffi/build-provenance.py record "$PART" \
+            "packaged-source/crates/marmot-uniffi/output/android/provenance/$PART.json"
+
+      - name: Upload Android input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-input-android-${{ matrix.part }}-${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source/crates/marmot-uniffi/output/android
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 7
+
+      - name: Upload compiler timings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-timings-${{ matrix.part }}-${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source/target/cargo-timings/*.html
+          if-no-files-found: ignore
+          retention-days: 7
+
+  android-bindings:
+    name: Assemble and validate Android bindings
+    runs-on: ubuntu-latest
+    needs: [metadata, android-build]
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Check out packaged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.metadata.outputs.source_sha }}
+          path: packaged-source
+
+      - name: Download Android inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: marmotkit-input-android-*-${{ needs.metadata.outputs.source_sha }}
+          merge-multiple: true
+          path: packaged-source/crates/marmot-uniffi/output/android
+
+      - name: Verify build provenance
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+        run: |
+          python3 crates/marmot-uniffi/build-provenance.py verify android \
+            packaged-source/crates/marmot-uniffi/output/android/provenance/*.json
 
       - name: Package Android bundle
         shell: bash
@@ -453,10 +670,11 @@ jobs:
             "builder_sha": "$BUILDER_SHA",
             "workspace_version": "$workspace_version",
             "cargo_lock_sha256": "$lock_sha",
-            "rustc": "$(rustc --version)",
-            "cargo": "$(cargo --version)",
-            "android_ndk_home": "${ANDROID_NDK_HOME:-}",
-            "android_api": "${ANDROID_API:-26}",
+            "rustc": "$MARMOTKIT_BUILD_RUSTC",
+            "cargo": "$MARMOTKIT_BUILD_CARGO",
+            "android_ndk_home": "$MARMOTKIT_BUILD_ANDROID_NDK_HOME",
+            "android_ndk_version": "$MARMOTKIT_BUILD_ANDROID_NDK_VERSION",
+            "android_api": "$MARMOTKIT_BUILD_ANDROID_API",
             "contents": [
               "kotlin/dev/ipf/marmotkit/marmot_uniffi.kt",
               "jniLibs/arm64-v8a/libmarmot_uniffi.so",
@@ -516,8 +734,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  release:
-    name: Create GitHub release
+  verify-bundles:
+    name: Verify assembled bundle agreement
     runs-on: ubuntu-latest
     needs:
       - metadata
@@ -530,6 +748,92 @@ jobs:
       needs.ios-bindings.result == 'success' &&
       needs.macos-bindings.result == 'success' &&
       needs.android-bindings.result == 'success'
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Download binding artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ios dist/macos dist/android
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "marmotkit-ios-$SOURCE_SHA" --dir dist/ios
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "marmotkit-macos-$SOURCE_SHA" --dir dist/macos
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "marmotkit-android-$SOURCE_SHA" --dir dist/android
+
+      - name: Verify matching Swift manifests
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
+          SWIFT_NAME: ${{ needs.metadata.outputs.swift_name }}
+        run: |
+          set -euo pipefail
+          version="$RELEASE_ID"
+
+          # The generated Swift binding is platform-independent and published
+          # once, by the iOS job. Both assemblers consume the same generation
+          # artifact from this run; assert their packaged hashes still agree.
+          ios_swift_sha="$(jq -r --arg name "$SWIFT_NAME" '.artifacts[$name].sha256' \
+            "dist/ios/marmotkit-ios-$version.manifest.json")"
+          macos_swift_sha="$(jq -r --arg name "$SWIFT_NAME" '.artifacts[$name].sha256' \
+            "dist/macos/marmotkit-macos-$version.manifest.json")"
+          # Check both manifests for a recorded hash before comparing, so a
+          # malformed manifest reports itself instead of masquerading as an
+          # iOS/macOS Swift mismatch.
+          if [[ -z "$ios_swift_sha" || "$ios_swift_sha" == "null" ]]; then
+            echo "error: iOS manifest does not record a SHA-256 for $SWIFT_NAME" >&2
+            exit 1
+          fi
+          if [[ -z "$macos_swift_sha" || "$macos_swift_sha" == "null" ]]; then
+            echo "error: macOS manifest does not record a SHA-256 for $SWIFT_NAME" >&2
+            exit 1
+          fi
+          if [[ "$ios_swift_sha" != "$macos_swift_sha" ]]; then
+            echo "error: iOS and macOS jobs packaged different Swift bindings from $SOURCE_SHA" >&2
+            exit 1
+          fi
+
+          printf '%s  %s\n' "$ios_swift_sha" "dist/ios/$SWIFT_NAME" | shasum -a 256 -c -
+          for platform in ios macos android; do
+            (cd "dist/$platform" && shasum -a 256 -c ./*.sha256)
+          done
+          for platform in ios macos; do
+            jq -e --arg source "$SOURCE_SHA" --arg builder "$BUILDER_SHA" \
+              '.source_sha == $source and .builder_sha == $builder' \
+              "dist/$platform/marmotkit-$platform-$version.manifest.json" >/dev/null
+          done
+          unzip -p "dist/android/marmotkit-android-$version.zip" \
+            "marmotkit-android-$version/manifest.json" | \
+            jq -e --arg source "$SOURCE_SHA" --arg builder "$BUILDER_SHA" \
+              '.source_sha == $source and .builder_sha == $builder' >/dev/null
+          echo "Verified assembled bundles for source $SOURCE_SHA and builder $BUILDER_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - metadata
+      - ios-bindings
+      - macos-bindings
+      - android-bindings
+      - verify-bundles
+    if: >-
+      always() && !inputs.build_only &&
+      needs.metadata.result == 'success' &&
+      needs.ios-bindings.result == 'success' &&
+      needs.macos-bindings.result == 'success' &&
+      needs.android-bindings.result == 'success' &&
+      needs.verify-bundles.result == 'success'
     timeout-minutes: 15
     permissions:
       actions: read
@@ -570,30 +874,6 @@ jobs:
           notes="$RUNNER_TEMP/release-notes.md"
           checksum="$(cat "dist/ios/$BINARY_NAME.swiftpm-checksum")"
           macos_checksum="$(cat "dist/macos/$MACOS_BINARY_NAME.swiftpm-checksum")"
-
-          # The generated Swift binding is platform-independent and published
-          # once, by the iOS job. Both jobs generate it independently from the
-          # same source SHA, so assert they agree: a mismatch means a consumer
-          # could compile that Swift against a mismatched binary ABI.
-          ios_swift_sha="$(jq -r --arg name "$SWIFT_NAME" '.artifacts[$name].sha256' \
-            "dist/ios/marmotkit-ios-$version.manifest.json")"
-          macos_swift_sha="$(jq -r --arg name "$SWIFT_NAME" '.artifacts[$name].sha256' \
-            "dist/macos/marmotkit-macos-$version.manifest.json")"
-          # Check both manifests for a recorded hash before comparing, so a
-          # malformed manifest reports itself instead of masquerading as an
-          # iOS/macOS Swift mismatch.
-          if [[ -z "$ios_swift_sha" || "$ios_swift_sha" == "null" ]]; then
-            echo "error: iOS manifest does not record a SHA-256 for $SWIFT_NAME" >&2
-            exit 1
-          fi
-          if [[ -z "$macos_swift_sha" || "$macos_swift_sha" == "null" ]]; then
-            echo "error: macOS manifest does not record a SHA-256 for $SWIFT_NAME" >&2
-            exit 1
-          fi
-          if [[ "$ios_swift_sha" != "$macos_swift_sha" ]]; then
-            echo "error: iOS and macOS jobs generated different Swift bindings from $SOURCE_SHA" >&2
-            exit 1
-          fi
 
           cat > "$notes" <<EOF
           MarmotKit bindings generated from exact MDK commit \`$SOURCE_SHA\` by workflow commit \`$BUILDER_SHA\`.

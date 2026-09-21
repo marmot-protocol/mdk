@@ -110,6 +110,14 @@ The canonical protocol specification lives in
 
 Run `just fast-ci` before pushing; let GitHub CI run the full `just ci` test matrix.
 
+Exception: for an initial cohort-release PR limited to version fields, workspace package versions in `Cargo.lock`,
+vector `conformance_version` values, changelogs, release/integration documentation, README/install version pins, and
+other release metadata, run only `just release-pr-preflight <version>`, then open the PR and let GitHub CI provide the
+compile/test signal. Do not run `just fast-ci`, `just test`, `just ci`, Tamarin, benchmarks, binding bundle builds, or
+artifact builds before opening that PR. If preparing the release exposes an implementation or workflow defect, fix it
+in a separate PR with the normal targeted verification instead of expanding the metadata PR. After the metadata PR is
+merged and required CI succeeds, run `just release-all <version>` to build and publish the cohort.
+
 `just fast-ci` covers formatting, compile-time checks, and clippy across the workspace (including OTLP feature builds).
 It intentionally skips `just test`, which is the slow part of CI.
 

@@ -15,6 +15,13 @@
 
 set -euo pipefail
 
+# Native jobs need no host library or generator. Generation needs no NDK.
+MODE="${1:-all}"
+case "$MODE" in
+  all|generate|native) [[ $# -le 1 ]] || { echo "expected at most one phase" >&2; exit 2; } ;;
+  *) echo "usage: $0 [all|generate|native]" >&2; exit 2 ;;
+esac
+
 # Force rustup's cargo to win over any Homebrew-installed cargo so Android
 # targets installed through rustup are visible.
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -208,46 +215,57 @@ validate_stripped_android_library() {
 
 cd "$WORKSPACE_DIR"
 
-NDK_DIR="$(find_android_ndk)"
-HOST_TAG="$(ndk_host_tag "$NDK_DIR")"
-require_rust_targets
-
-echo "==> Cleaning previous Android/Kotlin build artifacts"
-rm -rf "$OUT_DIR"
-mkdir -p "$KOTLIN_OUT_DIR" "$JNI_OUT_DIR"
-
-echo "==> Building host dylib (used for binding generation)"
-# The host dylib must keep its symbol table: uniffi-bindgen's library mode
-# reads the uniffi metadata through it. Strip only the Android target builds
-# below, never this host build.
-RUSTFLAGS="" cargo build --release -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
-
-echo "==> Generating Kotlin bindings"
-RUSTFLAGS="" cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
-  generate \
-  --library "$(host_dylib_path)" \
-  --language kotlin \
-  --config "$CRATE_DIR/uniffi.toml" \
-  --no-format \
-  --out-dir "$KOTLIN_OUT_DIR"
-
-if [[ ! -f "$KOTLIN_OUT_DIR/dev/ipf/marmotkit/${LIB_BASENAME}.kt" ]]; then
-  echo "error: uniffi-bindgen produced no Kotlin binding (host dylib missing uniffi metadata?)" >&2
-  exit 1
+if [[ "$MODE" != generate ]]; then
+  NDK_DIR="$(find_android_ndk)"
+  HOST_TAG="$(ndk_host_tag "$NDK_DIR")"
+  require_rust_targets
 fi
 
-echo "==> Copying hand-written Android Kotlin support (ndk-context init bridge)"
-# kotlin-support/ mirrors the Kotlin package layout, so copying its contents into
-# the generated output lands MarmotAndroid.kt next to marmot_uniffi.kt and the
-# io.crates.keyring.Keyring JNI shim under its required package.
-cp -R "$CRATE_DIR/kotlin-support/." "$KOTLIN_OUT_DIR/"
+if [[ "$MODE" == all ]]; then
+  rm -rf "$OUT_DIR"
+fi
+
+if [[ "$MODE" != native ]]; then
+  rm -rf "$KOTLIN_OUT_DIR"
+  mkdir -p "$KOTLIN_OUT_DIR"
+  echo "==> Building host dylib (used for binding generation)"
+  # The host dylib must keep its symbol table: uniffi-bindgen's library mode
+  # reads the uniffi metadata through it. Strip only the Android target builds
+  # below, never this host build.
+  RUSTFLAGS="" cargo build --locked --release --timings -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+
+  echo "==> Generating Kotlin bindings"
+  RUSTFLAGS="" cargo run --locked --release --timings -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
+    generate \
+    --library "$(host_dylib_path)" \
+    --language kotlin \
+    --config "$CRATE_DIR/uniffi.toml" \
+    --no-format \
+    --out-dir "$KOTLIN_OUT_DIR"
+
+  if [[ ! -f "$KOTLIN_OUT_DIR/dev/ipf/marmotkit/${LIB_BASENAME}.kt" ]]; then
+    echo "error: uniffi-bindgen produced no Kotlin binding (host dylib missing uniffi metadata?)" >&2
+    exit 1
+  fi
+
+  echo "==> Copying hand-written Android Kotlin support (ndk-context init bridge)"
+  # kotlin-support/ mirrors the Kotlin package layout, so copying its contents into
+  # the generated output lands MarmotAndroid.kt next to marmot_uniffi.kt and the
+  # io.crates.keyring.Keyring JNI shim under its required package.
+  cp -R "$CRATE_DIR/kotlin-support/." "$KOTLIN_OUT_DIR/"
+
+fi
+if [[ "$MODE" == generate ]]; then
+  exit 0
+fi
 
 for abi in $ANDROID_ABIS; do
   target="$(abi_to_target "$abi")"
   echo "==> Building Android target $target ($abi)"
   configure_android_toolchain "$NDK_DIR" "$HOST_TAG" "$target"
   CARGO_PROFILE_RELEASE_STRIP=symbols \
-    cargo build --release -p "$CRATE_NAME" --target "$target" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+    cargo build --locked --release --timings -p "$CRATE_NAME" --target "$target" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+  rm -rf "${JNI_OUT_DIR:?}/$abi"
   mkdir -p "$JNI_OUT_DIR/$abi"
   cp "$TARGET_DIR/$target/release/lib${LIB_BASENAME}.so" "$JNI_OUT_DIR/$abi/"
   validate_stripped_android_library "$JNI_OUT_DIR/$abi/lib${LIB_BASENAME}.so"

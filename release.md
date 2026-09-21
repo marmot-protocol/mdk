@@ -166,6 +166,27 @@ supplement link; do not silently rewrite the source/binary provenance.
 
 ## Preflight For Any Release
 
+### Initial release PR
+
+Keep the initial release PR limited to version fields, workspace package versions in `Cargo.lock`, vector
+`conformance_version` values, changelogs, release/integration documentation, README/install version pins, and other
+release metadata. Before opening it, run only:
+
+```sh
+just release-pr-preflight <version>
+```
+
+This deliberately checks the release version, companion-document linkage, installer guidance, diff whitespace, tag
+availability, and coordinator inputs without compiling, testing, benchmarking, generating binding bundles, or building
+artifacts. Open the PR immediately after it passes and use required GitHub CI as the compile/test signal. Do not run
+`just fast-ci`, `just test`, `just ci`, Tamarin, benchmarks, binding bundle builds, or artifact builds first.
+
+If release preparation exposes an implementation or workflow defect, stop and fix it in a separate PR with the normal
+targeted verification; do not turn the release-metadata PR into a code/test repair branch. After the metadata PR merges
+and required CI succeeds, start the actual cohort build with `just release-all <version>`.
+
+### Final release readiness
+
 Start from a clean checkout at the commit you intend to release:
 
 ```sh
@@ -188,7 +209,9 @@ links. It also rejects a supplied version that differs from the workspace. The f
 release coordinator runs this check before any tag/release mutation, including dry runs.
 A successful check verifies existence/linkage, not the accuracy or completeness of prose.
 
-Run the normal workspace checks:
+Required GitHub CI on the exact release commit is the authoritative workspace check. Do not repeat that matrix locally
+after the initial release PR merges. If the intended release commit was changed after CI, or required CI did not cover
+the relevant surface, run the missing checks before tagging:
 
 ```sh
 just fmt-check
@@ -426,14 +449,13 @@ Each binary/plugin tarball carries a `manifest.json` recording the release tag, 
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
 
 The installer assets are generated during the release and default to their own immutable `wn-agent-v<version>` release
-tag and `<version>` asset suffix. The mutable `wn-agent-latest` release is a rolling convenience alias, not an
-authoritative pin; repeatable installs use immutable `wn-agent-v<version>` tags. A verified install for the current
-workspace release looks like:
+tag and `<version>` asset suffix. Versioned releases are the only supported install channel; the release workflow must
+not create or update a mutable latest alias. A verified install for the current workspace release looks like:
 
 ```sh
 (
 set -eu
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.3"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.4"
 
 install_verified() (
   set -eu
@@ -495,6 +517,56 @@ It runs when a tag matching `marmotkit-v*` is pushed. The workflow validates ver
 `marmotkit-v0.9.0`, builds the iOS, macOS, and Android binding bundles, and creates the matching immutable GitHub
 Release. It can also be dispatched with a full commit SHA reachable from `master` to create an immutable iOS, macOS,
 and Android snapshot.
+
+### Parallel builds and build-only rehearsals
+
+The binding workflow builds Kotlin generation and all four Android ABIs in
+independent jobs. Apple builds generate Swift once and compile the iOS device,
+iOS simulator and macOS slices independently, with at most three Apple build
+jobs running at once per workflow. Assembly jobs download inputs from their own
+workflow run, preserve the existing bundle names/layouts and perform the existing
+SwiftPM and app/archive privacy checks. Bundle agreement checks run before
+publication, including matching Swift hashes, source/builder SHAs and checksums.
+Swift is generated once: its cross-platform hash agreement checks transfer and
+packaging, not independent regeneration. Each input carries observed compiler
+provenance; assembly verifies agreement before using those values in manifests.
+Artifact downloads fail on digest mismatch, and Android transfers preserve the
+producer's ABI directories.
+
+To measure a workflow change without publishing, dispatch its branch with
+`build_only=true` and an exact source SHA:
+
+```sh
+gh workflow run bindings.yaml --ref codex/parallel-binding-builds \
+  -f source_sha="$(git rev-parse HEAD)" -f build_only=true
+```
+
+Replace the example branch with the branch containing the workflow being tested.
+This builds and validates workflow artifacts but creates no release or tag and
+skips the published-URL consumer checks. Download the three final platform
+artifacts from that run for inspection. Per-input compiler timing reports are
+also uploaded; use job start times and durations to distinguish runner waiting
+from compilation. A successful rehearsal is packaged-artifact evidence, not
+publication or downstream app adoption.
+
+Publishing dispatches still require the workflow and source ancestry on `master`.
+Build-only dispatches from a development branch may build that branch's source.
+Dispatching from `master` still requires source ancestry on `master`, including
+build-only runs, because only those runs may save dependency caches. A build-only
+run on `master` can deliberately warm the per-input caches without publishing.
+Cache keys separate input targets and include the builder scripts/profile/defaults;
+the cache action also keys the Rust toolchain and Cargo dependency inputs.
+
+Avoid overlapping snapshot rehearsals and cohort releases when macOS capacity is
+limited. The three-job Apple bound is per workflow, not an organization-wide
+reservation; separate workflows and repositories can still compete for runners.
+In cold rehearsal 35506538221, this cap queued the fourth Apple input for roughly
+12 minutes; raising it to four trades that delay for one fewer slot for WN Agent.
+Local no-argument scripts also use `--locked` for reproducibility and `--timings`
+to write compiler reports under `target/cargo-timings/`. Refresh a stale lockfile
+before building bindings.
+The release coordinator already starts WN Agent, MarmotKit and Marmot C before
+waiting, so its sequential watch commands do not serialize the builds.
 
 Create the tag:
 

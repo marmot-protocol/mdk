@@ -150,22 +150,14 @@ def _heredoc(text: str, variable: str) -> str:
 
 def workflow_release_note_claim_errors(text: str) -> list[str]:
     versioned = _heredoc(text, "notes")
-    rolling = _heredoc(text, "latest_notes")
     errors: list[str] = []
     if not (
-        "releases/download/wn-agent-latest" in versioned
-        and re.search(r"\bmutable\b", versioned, re.IGNORECASE)
-        and "releases/download/$tag" in versioned
+        "releases/download/$tag" in versioned
         and "exact" in versioned.lower()
     ):
-        errors.append("versioned notes must distinguish the mutable latest alias from the exact release tag")
-    if not (
-        "releases/download/$latest_tag" in rolling
-        and re.search(r"\bmutable\b", rolling, re.IGNORECASE)
-        and "$tag" in rolling
-        and re.search(r"\bimmutable\b", rolling, re.IGNORECASE)
-    ):
-        errors.append("rolling notes must distinguish the mutable latest alias from the immutable release tag")
+        errors.append("versioned notes must install from their exact release tag")
+    if "wn-agent-latest" in text or _heredoc(text, "latest_notes"):
+        errors.append("workflow must not advertise or generate a mutable latest alias")
     return errors
 
 
@@ -257,15 +249,15 @@ def repository_errors(root: Path) -> list[str]:
         )
         if verified_call.search(release_text) is None:
             errors.append(f"release.md: missing verified install call for {installer}")
-        if len(verified_call.findall(workflow_text)) < 2:
+        if len(verified_call.findall(workflow_text)) < 1:
             errors.append(
-                ".github/workflows/wn-agent-binaries.yml: expected latest and "
-                f"version-pinned verified calls for {installer}"
+                ".github/workflows/wn-agent-binaries.yml: expected a "
+                f"version-pinned verified call for {installer}"
             )
 
     for label, text, minimum in (
         ("release.md", release_text, 1),
-        (".github/workflows/wn-agent-binaries.yml", workflow_text, 2),
+        (".github/workflows/wn-agent-binaries.yml", workflow_text, 1),
     ):
         if text.count("shasum -a 256 -c") < minimum:
             errors.append(f"{label}: missing shasum SHA-256 verification branch")

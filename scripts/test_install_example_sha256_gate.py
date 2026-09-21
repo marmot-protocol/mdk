@@ -140,11 +140,15 @@ install_verified "$base_url/install.sh"
         ).read_text(encoding="utf-8")
         self.assertEqual(gate.workflow_release_note_claim_errors(workflow), [])
         mutations = (
-            workflow.replace("mutable \\`wn-agent-latest\\`", "rolling \\`wn-agent-latest\\`", 1),
-            workflow.replace("mutable \\`$latest_tag\\`", "rolling \\`$latest_tag\\`", 1),
             workflow.replace(
-                'base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest"',
+                'base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag"',
                 'base_url="https://github.com/$GITHUB_REPOSITORY/releases/latest"',
+                1,
+            ),
+            workflow.replace("Install this exact WN Agent release with:", "Install this WN Agent release with:", 1),
+            workflow.replace(
+                "WN Agent \\`$version\\` from MDK commit \\`$GITHUB_SHA\\`.",
+                "WN Agent \\`$version\\` from the wn-agent-latest alias.",
                 1,
             ),
         )

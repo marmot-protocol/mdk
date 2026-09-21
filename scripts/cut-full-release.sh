@@ -123,8 +123,8 @@ if [ -n "$(git status --porcelain)" ]; then
     fi
 fi
 
-# Fetch only the immutable release-track tags used below. The historical
-# `wn-agent-latest` tag is not an authoritative update channel and is excluded.
+# Fetch only the immutable release-track tags used below. Mutable convenience
+# aliases are not authoritative update channels and are excluded.
 run git fetch --no-tags origin master \
     'refs/tags/v*:refs/tags/v*' \
     'refs/tags/wn-agent-v*:refs/tags/wn-agent-v*' \

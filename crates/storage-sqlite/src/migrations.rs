@@ -180,12 +180,16 @@ mod migration_0084_attachment_worker_demand;
 mod migration_0085_attachment_partials;
 #[path = "migrations/0086_attachment_controls.rs"]
 mod migration_0086_attachment_controls;
+#[path = "migrations/0089_local_submissions.rs"]
+mod migration_0089_local_submissions;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
 
 #[path = "migrations/0087_attachment_automatic_history.rs"]
 mod migration_0087_attachment_automatic_history;
+#[path = "migrations/0088_draft_attachment_descriptors.rs"]
+mod migration_0088_draft_attachment_descriptors;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -628,6 +632,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 87,
         name: "0087_attachment_automatic_history",
         apply: migration_0087_attachment_automatic_history::apply,
+    },
+    Migration {
+        version: 88,
+        name: "0088_draft_attachment_descriptors",
+        apply: migration_0088_draft_attachment_descriptors::apply,
+    },
+    Migration {
+        version: 89,
+        name: "0089_local_submissions",
+        apply: migration_0089_local_submissions::apply,
     },
 ];
 

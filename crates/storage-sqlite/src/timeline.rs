@@ -219,8 +219,11 @@ impl DeletionSource {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineMessageRecord {
+    /// Opaque device-local submission identity. Never reconstructed from tags.
+    #[serde(default)]
+    pub client_token: Option<String>,
     #[serde(default)]
     pub has_reports: bool,
     #[serde(default)]
@@ -262,6 +265,15 @@ pub struct TimelineMessageRecord {
     /// tombstone instead of silently disappearing. Carries the engine invalidation
     /// reason (e.g. `LosingBranch`, `BeyondAnchor`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
+}
+
+impl std::fmt::Debug for TimelineMessageRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimelineMessageRecord")
+            .field("has_client_token", &self.client_token.is_some())
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TimelineMessageRecord {
@@ -1553,7 +1565,8 @@ impl SqliteAccountStorage {
                         timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                         timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                         timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
-                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
+                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
                  FROM visible_message_timeline AS timeline
                  LEFT JOIN app_events AS source
                    ON source.group_id_hex = timeline.group_id_hex
@@ -3282,7 +3295,8 @@ fn timeline_records_by_ids_tx(
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
-                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
+                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
              FROM message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3543,7 +3557,8 @@ fn timeline_query_sql(
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
-                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
+                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3942,6 +3957,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
     let deleted = row.get::<_, bool>(17)?;
     Ok(TimelineMessageRecord {
+        client_token: row.get("client_token")?,
         has_reports: false,
         group_system: crate::group_system::projected_group_system(
             row.get::<_, i64>(9)?.try_into().unwrap_or_default(),

@@ -37,6 +37,13 @@ impl OutboundIntentStorage for SqliteAccountStorage {
             .storage()?;
             let changed =
                 if let cgka_traits::SendIntent::AppMessage { payload, .. } = &record.intent {
+                    use sha2::{Digest, Sha256};
+                    Self::accept_local_submission_tx(
+                        &conn,
+                        &hex::encode(record.group_id.as_slice()),
+                        "payload_hash",
+                        &rusqlite::types::Value::Blob(Sha256::digest(payload).to_vec()),
+                    )?;
                     accept_submission_tx(
                         &conn,
                         &hex::encode(record.group_id.as_slice()),
@@ -234,6 +241,12 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
             )
             .storage()?;
             let changed = if let Some(message) = fanout.application_message() {
+                Self::accept_local_submission_tx(
+                    &conn,
+                    &hex::encode(message.group_id.as_slice()),
+                    "app_event_id",
+                    &rusqlite::types::Value::Text(message.app_event_id.clone()),
+                )?;
                 accept_submission_tx(
                     &conn,
                     &hex::encode(message.group_id.as_slice()),

@@ -24,7 +24,7 @@ acquisition defaults on in `NativeAutomatic` mode when the account runtime is ru
 to observe transfers, remove local files, or change the durable per-account policy.
 Local access is useful only when MDK has acquired/published the bytes. Coordinate client
 adoption of those controls with the binding release (C9); publishing an MDK release alone
-does not add that UI to a client. For host network/type policy, use the [host-managed contract](#host-managed-automatic-acquisition-unreleased) below.
+does not add that UI to a client. For host network/type policy, use the [host-managed contract](#host-managed-automatic-acquisition-0104) below.
 The durable `automatic` flag remains an additional override; toggling it cancels active
 automatic leases while preserving partials, explicit requests and retained files.
 
@@ -121,7 +121,7 @@ expiry. Controls and presentation notifications wake them promptly; active rows 
 one-second fallback. Cross-writer changes without notifications can take up to 30 seconds
 while idle. Local-byte reads always revalidate visibility and expiry immediately.
 
-## Host-managed automatic acquisition (unreleased)
+## Host-managed automatic acquisition (0.10.4)
 
 Android hosts with a network/type preference matrix should construct MDK with
 `MarmotOptions.attachment_acquisition_mode = HostManaged` **before startup**.

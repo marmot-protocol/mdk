@@ -5,12 +5,12 @@
 # is platform-independent and already published once by the iOS job under the
 # name MarmotKit-<release-id>.swift. Emitting it here would collide with that
 # asset name on the shared release. Its SHA-256 is still recorded in this
-# manifest so the release job can assert both jobs generated the same surface.
+# manifest so the release job can assert both jobs packaged the same surface.
 
 set -euo pipefail
 
-# Match xcframework-macos.sh: report the rustup-selected toolchain that built
-# the artifact, not an unrelated Homebrew cargo/rustc earlier on PATH.
+# Local packaging uses the rustup toolchain; CI supplies verified observations
+# from the jobs that compiled each input, rather than sampling the assembler.
 export PATH="$HOME/.cargo/bin:$PATH"
 
 usage() {
@@ -53,8 +53,8 @@ python3 "$TOOL_DIR/validate-apple-privacy.py" "$PRIVACY_MANIFEST" --product-anal
 
 workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$WORKSPACE_DIR/Cargo.toml" | head -n 1)"
 lock_sha="$(shasum -a 256 "$WORKSPACE_DIR/Cargo.lock" | awk '{print $1}')"
-rust_version="$(rustc --version)"
-cargo_version="$(cargo --version)"
+rust_version="${MARMOTKIT_BUILD_RUSTC:-$(rustc --version)}"
+cargo_version="${MARMOTKIT_BUILD_CARGO:-$(cargo --version)}"
 deployment_target="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 if [[ "${OTLP_EXPORT:-}" != "1" && "${OTLP_EXPORT:-}" != "true" ]]; then
   echo "error: MarmotKit release artifacts require OTLP_EXPORT=1" >&2

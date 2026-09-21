@@ -214,6 +214,12 @@ Pushing a formal `marmotkit-v*` tag publishes iOS, macOS, and Android bindings. 
 the `MarmotKit Bindings` workflow with a full SHA on `master`. Its immutable release tag is derived from that SHA.
 Snapshots publish the iOS, macOS, and Android bindings from the same source SHA.
 
+Set the dispatch input `build_only=true` to build and validate workflow artifacts
+without publishing. This also permits testing the workflow on a development
+branch. Publishing retains the `master` workflow/source-ancestry restrictions.
+See [parallel builds and rehearsals](../../release.md#parallel-builds-and-build-only-rehearsals)
+for phase boundaries, concurrency limits, cache warming and evidence scope.
+
 Publishing first uploads and verifies every asset on a draft, then publishes it under repository-enforced immutable
 releases. A retry discards only an incomplete draft. Publishing fails if a public release already exists, and snapshot
 publishing also fails if its derived tag already exists. Assets and snapshot tags are never replaced or moved; a

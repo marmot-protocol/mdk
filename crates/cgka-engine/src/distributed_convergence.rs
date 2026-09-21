@@ -1526,7 +1526,7 @@ impl<S: StorageProvider> Engine<S> {
                         .storage
                         .get_message(&disposition.message_id)
                         .map_err(storage_projection_error)?;
-                    Ok((disposition, record.state, record.epoch))
+                    Ok((disposition, record.state))
                 })
                 .collect::<Result<Vec<_>, OpenMlsProjectionError>>()?
         } else {
@@ -1556,7 +1556,11 @@ impl<S: StorageProvider> Engine<S> {
         // re-arm it — otherwise an edge-driven host never comes back for the
         // durable queue.
         self.schedule_drain_for_retained_outbound_intents(group_id);
-        for (disposition, previous_state, epoch) in disposition_transitions {
+        // The reported epoch is the device's pre-apply tip, never the row's.
+        // A commit row carries the epoch it forks from, and `incident-replay`
+        // reads `MessageStateChanged.epoch` as where the engine was — a rival's
+        // source epoch there reads as a rollback.
+        for (disposition, previous_state) in disposition_transitions {
             if previous_state == disposition.state {
                 continue;
             }
@@ -1566,7 +1570,7 @@ impl<S: StorageProvider> Engine<S> {
                     hex::encode(disposition.message_id.as_slice()),
                     Some(previous_state),
                     disposition.state,
-                    Some(epoch),
+                    Some(previous_tip),
                     disposition.reason,
                 ),
             );

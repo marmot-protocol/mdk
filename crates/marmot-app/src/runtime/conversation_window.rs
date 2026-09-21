@@ -157,13 +157,16 @@ impl ConversationWindowSnapshot {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct CapturedConversation {
     account: ConversationAccountSnapshot,
     authority: Option<GroupAuthoritySnapshot>,
 }
 
 // A worker-owned send can yield a coherent read before awaiting transport. Each
-// open window retains at most one such capture, and only for its current query.
+// open window retains its current-query capture and, while browsing history,
+// one exact-query tail capture for a direct return-to-latest. Intermediate
+// navigation or a normal worker read invalidates that speculative tail capture.
 // The worker holds weak references so closing a window releases its rows.
 pub(crate) struct SendCapture {
     group: GroupId,
@@ -175,6 +178,7 @@ struct SendCaptureState {
     query: ConversationWindowQuery,
     generation: u64,
     pending: Option<CapturedConversation>,
+    latest: Option<(ConversationWindowQuery, CapturedConversation)>,
 }
 impl SendCapture {
     fn new(group: GroupId, epoch: Vec<u8>, query: ConversationWindowQuery) -> Self {
@@ -185,6 +189,7 @@ impl SendCapture {
                 query,
                 generation: 0,
                 pending: None,
+                latest: None,
             }),
             changed: watch::channel(()).0,
         }
@@ -194,9 +199,27 @@ impl SendCapture {
         if state.query != *query {
             state.query = query.clone();
             state.generation += 1;
+            state.pending = state.latest.take().and_then(|(captured_query, capture)| {
+                (captured_query == *query).then_some(capture)
+            });
+        }
+    }
+    // Keep the source checkpoint until presentation completes. Cancellation
+    // drops only this bounded descriptor/row copy, so navigation can retry it.
+    fn checkpoint(&self) -> Option<(CapturedConversation, u64)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .pending
+            .clone()
+            .map(|capture| (capture, state.generation))
+    }
+    fn acknowledge(&self, generation: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.generation == generation {
             state.pending = None;
         }
     }
+    #[cfg(test)]
     fn take(&self) -> Option<CapturedConversation> {
         self.state
             .lock()
@@ -213,7 +236,12 @@ impl AppClient {
             && let Some(capture) = observer.upgrade()
         {
             // A normal worker read supersedes earlier send checkpoints.
-            capture.take();
+            {
+                let mut state = capture.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.generation += 1;
+                state.pending = None;
+                state.latest = None;
+            }
             if !self
                 .conversation_captures
                 .iter()
@@ -240,12 +268,32 @@ impl AppClient {
             // Use the same live engine/account read boundary as a normal window
             // capture. Never combine frozen permissions with newer account rows.
             // Best effort: the normal read path still owns capture errors.
+            let latest_query = ConversationWindowQuery {
+                opening: ConversationOpenQuery {
+                    target: ConversationOpenTarget::Latest,
+                    limit: query.opening.limit,
+                },
+                before_anchor: None,
+            };
+            // A history observer costs one extra coherent authority/account
+            // capture per send, even if the user never returns to the tail.
+            // Bound that speculative work to one same-limit tail viewport;
+            // latest observers still require only their current-query capture.
+            let latest = if latest_query != query {
+                capture_conversation(self, &observer.group, latest_query.clone(), &observer.epoch)
+                    .ok()
+                    .map(|capture| (latest_query, capture))
+            } else {
+                None
+            };
             if let Ok(captured) =
                 capture_conversation(self, &observer.group, query, &observer.epoch)
             {
                 let mut state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.generation == generation {
+                    state.generation += 1;
                     state.pending = Some(captured);
+                    state.latest = latest;
                     observer.changed.send_replace(());
                 }
             }
@@ -513,7 +561,7 @@ impl Reader {
         &mut self,
         query: &ConversationWindowQuery,
         allow_checkpoint: bool,
-    ) -> Result<(CapturedConversation, bool), ConversationWindowError> {
+    ) -> Result<(CapturedConversation, Option<u64>), ConversationWindowError> {
         let worker = match self.worker.borrow().as_ref() {
             Some(Ok(worker)) => worker.clone(),
             Some(Err(error)) if error.terminal() => return Err(error.clone()),
@@ -524,8 +572,8 @@ impl Reader {
         }
         self.send_capture.set_query(query);
         let mut changed = self.send_capture.changed.subscribe();
-        if allow_checkpoint && let Some(captured) = self.send_capture.take() {
-            return Ok((captured, true));
+        if allow_checkpoint && let Some((captured, generation)) = self.send_capture.checkpoint() {
+            return Ok((captured, Some(generation)));
         }
         let (respond, rx) = oneshot::channel();
         let capture = async {
@@ -546,10 +594,10 @@ impl Reader {
         loop {
             tokio::select! {
                 biased;
-                result = &mut capture => return result.map(|captured| (captured, false)),
+                result = &mut capture => return result.map(|captured| (captured, None)),
                 _ = changed.changed(), if allow_checkpoint => {
                     if worker.is_closed() { return Err(ConversationWindowError::Closed); }
-                    if let Some(captured) = self.send_capture.take() { return Ok((captured, true)); }
+                    if let Some((captured, generation)) = self.send_capture.checkpoint() { return Ok((captured, Some(generation))); }
                 }
             }
         }
@@ -568,9 +616,8 @@ impl Reader {
             // cancels on close/reset/shutdown; never downgrade to a local read.
             let (captured, checkpoint) = self.capture_live(query, allow_checkpoint).await?;
             return self
-                .present(captured, revision)
-                .await
-                .map(|snapshot| (snapshot, checkpoint));
+                .present_checkpoint(captured, revision, checkpoint)
+                .await;
         }
         let observation = self
             .telemetry
@@ -582,16 +629,30 @@ impl Reader {
             Err(_) => TelemetryOutcome::Timeout,
         });
         match captured {
-            Ok(Ok((captured, checkpoint))) => self
-                .present(captured, revision)
-                .await
-                .map(|snapshot| (snapshot, checkpoint)),
+            Ok(Ok((captured, checkpoint))) => {
+                self.present_checkpoint(captured, revision, checkpoint)
+                    .await
+            }
             Ok(Err(ConversationWindowError::NotReady)) | Err(_) => self
                 .read_local(query, revision)
                 .await
                 .map(|snapshot| (snapshot, false)),
             Ok(Err(error)) => Err(error),
         }
+    }
+
+    async fn present_checkpoint(
+        &self,
+        captured: CapturedConversation,
+        revision: ConversationWindowRevision,
+        checkpoint: Option<u64>,
+    ) -> Result<(ConversationWindowSnapshot, bool), ConversationWindowError> {
+        let result = self.present(captured, revision).await;
+        if let Some(generation) = checkpoint {
+            // Do not clear a newer send or a checkpoint for another query.
+            self.send_capture.acknowledge(generation);
+        }
+        result.map(|snapshot| (snapshot, checkpoint.is_some()))
     }
 
     async fn read_local(
@@ -1012,6 +1073,7 @@ async fn run(
     let mut failed = false;
     let mut retry_delayed = false;
     let mut last_good_position = position.clone();
+    let mut deferred_command = None;
     loop {
         let mut stopping = sources.stopping.clone();
         let command = tokio::select! {
@@ -1019,6 +1081,7 @@ async fn run(
             _ = wait_for_runtime_shutdown(&mut stopping) => return,
             _ = wait_for_account_reset(&mut resets, &reader.label) => return,
             _ = updates.closed() => return,
+            _ = std::future::ready(()), if deferred_command.is_some() => deferred_command.take(),
             command = commands.recv() => { let Some(command) = command else { return; }; Some(command) },
             _ = send_updates.changed() => { dirty = true; continue; },
             result = worker_updates.changed(), if worker_updates_open => {
@@ -1043,13 +1106,30 @@ async fn run(
             }
         };
         sources.drain(); // only the queued prefix; mutations during capture remain queued
+        // Following the tail may use the send's coherent pre-publication capture.
+        // capture_live sets the requested query first, invalidating any capture
+        // from a different viewport/generation. Other navigation commands still
+        // require a fresh worker read. A checkpoint schedules a fresh follow-up
+        // below so invalidations newer than it cannot be lost.
+        let allow_checkpoint = command
+            .as_ref()
+            .is_none_or(|command| matches!(command.action, Action::Latest));
         let reset_label = reader.label.clone();
         let result = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut sources.stopping) => return,
             _ = wait_for_account_reset(&mut resets, &reset_label) => return,
             _ = updates.closed() => return,
-            result = reader.read(&next, current.revision.clone(), current.presentation.header.epoch.is_none(), command.is_none()) => result,
+            // A fresh background capture can be queued behind publication.
+            // Navigation may supersede that read; it must still pass the same
+            // revision check on the next iteration. Explicit commands stay FIFO.
+            incoming = commands.recv(), if command.is_none() => {
+                let Some(incoming) = incoming else { return; };
+                deferred_command = Some(incoming);
+                dirty = true;
+                continue;
+            },
+            result = reader.read(&next, current.revision.clone(), current.presentation.header.epoch.is_none(), allow_checkpoint) => result,
         };
         match result {
             Ok((mut replacement, checkpoint)) => {

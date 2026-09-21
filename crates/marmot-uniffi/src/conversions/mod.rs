@@ -504,6 +504,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_preserves_materialized_metadata() {
         let record = TimelineMessageRecord {
+            client_token: None,
             has_reports: false,
             group_system: None,
             edit: None,
@@ -632,6 +633,7 @@ mod tests {
         .to_content()
         .unwrap();
         let record = TimelineMessageRecord {
+            client_token: None,
             has_reports: false,
             group_system: Some({
                 let mut event =
@@ -687,6 +689,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_ignores_malformed_group_system_payload() {
         let record = TimelineMessageRecord {
+            client_token: None,
             has_reports: false,
             group_system: None,
             edit: None,
