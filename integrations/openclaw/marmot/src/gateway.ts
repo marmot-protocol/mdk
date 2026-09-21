@@ -29,9 +29,15 @@ import { createSenderAuthorizer } from "./sender-policy.js";
 
 export const MARMOT_ALLOWLIST_RETRY_BASE_MS = 1_000;
 export const MARMOT_ALLOWLIST_RETRY_MAX_MS = 30_000;
+export const MARMOT_SUPERSEDED_SYNC_DRAIN_MS = 5_000;
 
 export interface MarmotGatewayAccountHooks {
   delay?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /**
+   * Bounds the wait on a superseded generation's allowlist sync. Separate from
+   * `delay` so retry-backoff assertions are not perturbed by the drain timer.
+   */
+  drainDelay?: (ms: number, signal: AbortSignal) => Promise<void>;
   random?: () => number;
   syncAllowlist?: typeof syncMarmotAllowlist;
   startInbound?: typeof startMarmotInbound;
@@ -81,6 +87,58 @@ export function allowlistRetryDelayMs(attempt: number, random: () => number = Ma
   return Math.min(MARMOT_ALLOWLIST_RETRY_MAX_MS, exp * (0.5 + random() * 0.5));
 }
 
+/**
+ * Wait for a superseded generation's allowlist sync before this generation
+ * reconciles, but never wait on it forever.
+ *
+ * `lane.syncTail` serializes allowlist reconciliation per account so a stale
+ * generation cannot race a replacement against the same wn-agent allowlist.
+ * The tail can still be an unsettled control-socket call owned by a generation
+ * that has already been superseded, and that generation's result is discarded
+ * anyway. Bound the wait, then detach the stale tail so a replacement start is
+ * not held behind a predecessor that never settles.
+ */
+async function drainSupersededSync(
+  lane: AccountRecoveryLane,
+  signal: AbortSignal,
+  drainDelay: (ms: number, signal: AbortSignal) => Promise<void>,
+  warn: (message: string) => void,
+): Promise<void> {
+  if (signal.aborted) {
+    // Already shutting down: an aborted signal never fires `abort` again, so
+    // arming the drain timer here could only stall an unwinding start.
+    return;
+  }
+  const tail = lane.syncTail;
+  let drained = false;
+  const settled = tail.then(
+    () => {
+      drained = true;
+    },
+    () => {
+      drained = true;
+    },
+  );
+  const drainAbort = new AbortController();
+  const cancelDrain = (): void => {
+    drainAbort.abort();
+  };
+  signal.addEventListener("abort", cancelDrain, { once: true });
+  try {
+    await Promise.race([settled, drainDelay(MARMOT_SUPERSEDED_SYNC_DRAIN_MS, drainAbort.signal)]);
+  } finally {
+    drainAbort.abort();
+    signal.removeEventListener("abort", cancelDrain);
+  }
+  if (drained) {
+    return;
+  }
+  lane.syncTail = Promise.resolve();
+  if (!signal.aborted) {
+    warn("marmot: superseded allowlist sync did not settle; starting without it");
+  }
+}
+
 function laneFor(accountId: string): AccountRecoveryLane {
   const existing = recoveryLanes.get(accountId);
   if (existing) {
@@ -101,6 +159,7 @@ export async function startMarmotGatewayAccount(
     setStatus: ctx.setStatus,
   });
   const delay = hooks.delay ?? defaultDelay;
+  const drainDelay = hooks.drainDelay ?? defaultDelay;
   const random = hooks.random ?? Math.random;
   const syncAllowlist = hooks.syncAllowlist ?? syncMarmotAllowlist;
   const startInbound = hooks.startInbound ?? startMarmotInbound;
@@ -130,7 +189,6 @@ export async function startMarmotGatewayAccount(
   const lane = laneFor(ctx.accountId);
   const generation = lane.generation + 1;
   lane.generation = generation;
-  await lane.syncTail.catch(() => undefined);
 
   const abortController = new AbortController();
   const onHostAbort = (): void => {
@@ -141,6 +199,10 @@ export async function startMarmotGatewayAccount(
   } else {
     ctx.abortSignal.addEventListener("abort", onHostAbort, { once: true });
   }
+
+  await drainSupersededSync(lane, abortController.signal, drainDelay, (message) =>
+    ctx.log?.warn?.(message),
+  );
 
   let closed = false;
   let allowlistAttempt = 0;

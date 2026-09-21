@@ -20,8 +20,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   A transient inbound setup failure no longer leaves the shared sender
   authorizer stopped across the gateway retry, a replaced generation no
   longer overwrites a healthy replacement's published authorizer status,
-  and host-supplied status snapshots cannot report connected while that
-  policy is unenforceable.
+  a replacement start no longer waits without bound on a superseded
+  generation's unsettled allowlist sync, and host-supplied status snapshots
+  cannot report connected while that policy is unenforceable.
   Authorized inbound finals now require the host delivery-queue identity so
   a successful turn is an acknowledged `send_final`. Packaged sender-policy
   acceptance goes through that production delivery callback rather than a
