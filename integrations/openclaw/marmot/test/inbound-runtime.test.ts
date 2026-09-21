@@ -1581,6 +1581,7 @@ describe("syncMarmotAllowlist", () => {
       failInitialList?: boolean;
       failReadBack?: boolean;
       mutateOnReadBack?: (effective: Set<string>) => void;
+      onRemove?: (id: string) => void;
     } = {},
   ): {
     client: MarmotAgentControlClient;
@@ -1632,6 +1633,7 @@ describe("syncMarmotAllowlist", () => {
           throw new Error(SECRET_ERROR);
         }
         effective.delete(id);
+        options.onRemove?.(id);
         return { type: "ack" };
       },
     } as unknown as MarmotAgentControlClient;
@@ -1656,6 +1658,51 @@ describe("syncMarmotAllowlist", () => {
     expect(result).toEqual({ state: "reconciled" });
     expect(added).toEqual([HEX32("11")]);
     expect(effective.has(HEX32("11"))).toBe(true);
+  });
+
+  it("reports a superseded handover without warning when the signal aborts", async () => {
+    const stale = HEX32("11");
+    const { client, added, removed } = allowlistStubClient([stale]);
+    const warnings: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { dm: { allowFrom: [HEX32("22")] } } } },
+      logger: { info: () => {}, warn: (message: string) => warnings.push(message) },
+    };
+
+    const result = await syncMarmotAllowlist(api, {
+      clientFactory: () => client,
+      signal: AbortSignal.abort(),
+    });
+
+    // A handover is not an operational failure, so it must not raise the
+    // allowlist-failure warning operators are meant to act on.
+    expect(result).toEqual({ state: "failed", reason: "superseded" });
+    expect(warnings).toEqual([]);
+    expect(added).toEqual([]);
+    expect(removed).toEqual([]);
+  });
+
+  it("stops mutating partway through when the signal aborts mid-pass", async () => {
+    const controller = new AbortController();
+    const stale = [HEX32("11"), HEX32("22")];
+    const { client, added, removed } = allowlistStubClient(stale, {
+      onRemove: () => controller.abort(),
+    });
+    const warnings: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { dm: { allowFrom: [HEX32("33")] } } } },
+      logger: { info: () => {}, warn: (message: string) => warnings.push(message) },
+    };
+
+    const result = await syncMarmotAllowlist(api, {
+      clientFactory: () => client,
+      signal: controller.signal,
+    });
+
+    expect(result).toEqual({ state: "failed", reason: "superseded" });
+    expect(removed).toHaveLength(1);
+    expect(added).toEqual([]);
+    expect(warnings).toEqual([]);
   });
 
   it("is a no-op (no client used) when no allowFrom is configured", async () => {

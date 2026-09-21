@@ -757,6 +757,12 @@ export interface SyncAllowlistOptions {
   clientFactory?: ClientFactory;
   /** OpenClaw channel account id whose allowlist should be mirrored. */
   channelAccountId?: string | null;
+  /**
+   * Stops reconciliation at the next mutation boundary. The gateway aborts a
+   * generation's signal when that generation is superseded, so a replacement
+   * does not race a predecessor over the same allowlist.
+   */
+  signal?: AbortSignal;
 }
 
 function warnAllowlistFailure(api: InboundPluginApi): void {
@@ -773,6 +779,10 @@ function warnAllowlistFailure(api: InboundPluginApi): void {
  * result and aggregate warnings rather than throwing. A failed revocation gets
  * its own warning: it is the one outcome that leaves the account more
  * permissive than the operator asked for.
+ *
+ * An aborted sync reports `superseded` and stays quiet: it is a deliberate
+ * handover to a replacement generation, not an operational failure, and it
+ * cannot have widened access.
  */
 export async function syncMarmotAllowlist(
   api: InboundPluginApi,
@@ -818,7 +828,10 @@ export async function syncMarmotAllowlist(
   }
 
   try {
-    const result = await syncAllowlist(client, accountIdHex, allowFrom);
+    const result = await syncAllowlist(client, accountIdHex, allowFrom, options.signal);
+    if (options.signal?.aborted) {
+      return { state: "failed", reason: "superseded" };
+    }
     if (result.failedRemovals.length > 0) {
       // Fail-open risk: those welcomers stay authorized on the shared account
       // until the next successful sync, so never let it read as a clean start.
@@ -837,6 +850,11 @@ export async function syncMarmotAllowlist(
     );
     return { state: "failed", reason: "unverified" };
   } catch {
+    if (options.signal?.aborted) {
+      // Tearing the control connection down under an abort is a handover, not
+      // an operational failure worth warning about.
+      return { state: "failed", reason: "superseded" };
+    }
     warnAllowlistFailure(api);
     return { state: "failed", reason: "control" };
   }

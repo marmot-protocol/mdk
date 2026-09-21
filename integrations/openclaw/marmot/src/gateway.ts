@@ -40,6 +40,17 @@ export interface MarmotGatewayAccountHooks {
 interface AccountRecoveryLane {
   generation: number;
   syncTail: Promise<void>;
+  /**
+   * Aborts the reconciliation owned by the generation that currently holds
+   * `syncTail`, so a replacement can supersede it instead of waiting on it.
+   */
+  syncAbort: AbortController | null;
+  /**
+   * Generation whose `syncAllowlist` call is dispatched and unsettled, or null
+   * when no call is outstanding. A successor reads this to learn whether it
+   * inherited a writer that can still land a mutation after the handover.
+   */
+  syncInFlightGeneration: number | null;
 }
 
 const recoveryLanes = new Map<string, AccountRecoveryLane>();
@@ -86,7 +97,12 @@ function laneFor(accountId: string): AccountRecoveryLane {
   if (existing) {
     return existing;
   }
-  const created = { generation: 0, syncTail: Promise.resolve() };
+  const created: AccountRecoveryLane = {
+    generation: 0,
+    syncTail: Promise.resolve(),
+    syncAbort: null,
+    syncInFlightGeneration: null,
+  };
   recoveryLanes.set(accountId, created);
   return created;
 }
@@ -127,14 +143,6 @@ export async function startMarmotGatewayAccount(
   publishStatus();
   ctx.log?.info?.("marmot: starting inbound subscription");
 
-  const lane = laneFor(ctx.accountId);
-  const generation = lane.generation + 1;
-  lane.generation = generation;
-  // Reconciliation is a non-atomic read-modify-write. Retain the per-account
-  // serialization barrier even when the prior generation has been replaced;
-  // detaching an unsettled writer could restore a revoked welcomer.
-  await lane.syncTail.catch(() => undefined);
-
   const abortController = new AbortController();
   const onHostAbort = (): void => {
     abortController.abort();
@@ -144,6 +152,23 @@ export async function startMarmotGatewayAccount(
   } else {
     ctx.abortSignal.addEventListener("abort", onHostAbort, { once: true });
   }
+
+  const lane = laneFor(ctx.accountId);
+  const generation = lane.generation + 1;
+  lane.generation = generation;
+
+  // Reconciliation is a non-atomic read-modify-write over a shared account, so
+  // two generations must never run it at once. Awaiting the predecessor is not
+  // how to get that: its control calls carry no timeout, so a stalled one would
+  // keep this generation from ever starting. Tell it to stop instead, then take
+  // the lane. It stops at its next mutation boundary; anything it left pending
+  // is covered by this generation's own pass, which reads the allowlist fresh
+  // and reconciles the current desired set.
+  const supersededSync = lane.syncInFlightGeneration !== null ? lane.syncTail : null;
+  lane.syncAbort?.abort();
+  const syncAbort = new AbortController();
+  lane.syncAbort = syncAbort;
+  lane.syncTail = Promise.resolve();
 
   let closed = false;
   let allowlistAttempt = 0;
@@ -177,7 +202,19 @@ export async function startMarmotGatewayAccount(
           warn: (message) => ctx.log?.warn?.(message),
         },
       };
-      result = await syncAllowlist(api, { channelAccountId: ctx.accountId });
+      lane.syncInFlightGeneration = generation;
+      try {
+        result = await syncAllowlist(api, {
+          channelAccountId: ctx.accountId,
+          signal: syncAbort.signal,
+        });
+      } finally {
+        // Clear only this generation's own marker. A superseded call settling
+        // late must not report a successor's in-flight sync as finished.
+        if (lane.syncInFlightGeneration === generation) {
+          lane.syncInFlightGeneration = null;
+        }
+      }
       applySyncResult(result);
     });
     lane.syncTail = run.then(
@@ -222,6 +259,13 @@ export async function startMarmotGatewayAccount(
       markMarmotSenderAuthorizerLifecycle(ctx.accountId, "replaced");
       lane.generation += 1;
     }
+    if (lane.syncAbort === syncAbort) {
+      lane.syncAbort = null;
+    }
+    // This generation is done reconciling either way; stop its sync here rather
+    // than through an `abortController` listener, which would outlive every
+    // inbound retry and read as a leaked subscription.
+    syncAbort.abort();
     abortController.abort();
     allowlistRetryPending = false;
   };
@@ -246,6 +290,21 @@ export async function startMarmotGatewayAccount(
     }
     if (first?.state === "failed") {
       scheduleAllowlistRetry();
+    }
+
+    // The superseded generation was told to stop, but the one request it had
+    // already dispatched cannot be recalled, so it can still land after this
+    // generation read the allowlist back. Reconcile once more when its call
+    // finally settles, so a late write cannot outlive the handover. A
+    // predecessor that never settles never triggers this, which is exactly why
+    // this generation did not wait on it.
+    if (supersededSync) {
+      void supersededSync.then(() => {
+        if (!isCurrent()) {
+          return;
+        }
+        void enqueueSync().catch(() => undefined);
+      });
     }
 
     const channelRuntime = ctx.channelRuntime as unknown as OpenClawChannelRuntime | undefined;

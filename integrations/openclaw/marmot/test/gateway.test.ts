@@ -16,6 +16,7 @@ import {
   startMarmotInbound as startMarmotInboundExport,
   type InboundPluginApi,
   type MarmotAllowlistSyncResult,
+  type SyncAllowlistOptions,
 } from "../src/inbound-runtime.js";
 import {
   markMarmotInboundReady,
@@ -28,6 +29,8 @@ import {
 import type { MarmotSenderAuthorizer } from "../src/sender-policy.js";
 
 const syncCalls: Array<{ channelAccountId?: string | null }> = [];
+/** Abort signals handed to each `syncMarmotAllowlist` call, in call order. */
+const syncSignals: Array<AbortSignal | undefined> = [];
 const statusPatches: Array<Record<string, unknown> & { subscribeCalls?: number }> = [];
 let recordedSubscribeCalls = 0;
 let lifecycleStarts = 0;
@@ -88,6 +91,33 @@ vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
   },
 }));
 
+/** Records a sync call in the shape assertions use, plus its abort signal. */
+function recordSyncCall(options: SyncAllowlistOptions = {}): void {
+  syncCalls.push({ channelAccountId: options.channelAccountId });
+  syncSignals.push(options.signal);
+}
+
+async function defaultSyncMarmotAllowlist(
+  _api: InboundPluginApi,
+  options: SyncAllowlistOptions = {},
+): Promise<MarmotAllowlistSyncResult> {
+  recordSyncCall(options);
+  return { state: "unmanaged" };
+}
+
+function defaultStartMarmotInbound(
+  _api: unknown,
+  _dispatch: unknown,
+  options?: { channelAccountId?: string | null },
+): () => void {
+  const accountId = options?.channelAccountId ?? "default";
+  markMarmotInboundStarting(accountId);
+  queueMicrotask(() => {
+    markMarmotInboundReady(accountId);
+  });
+  return () => {};
+}
+
 const { inboundRuntimeActual } = vi.hoisted(() => ({
   inboundRuntimeActual: {} as {
     startMarmotInbound?: typeof startMarmotInboundExport;
@@ -99,18 +129,8 @@ vi.mock("../src/inbound-runtime.js", async (importOriginal) => {
   inboundRuntimeActual.startMarmotInbound = actual.startMarmotInbound;
   return {
     ...actual,
-    syncMarmotAllowlist: vi.fn(async (_api: InboundPluginApi, options = {}) => {
-      syncCalls.push(options);
-      return { state: "unmanaged" } satisfies MarmotAllowlistSyncResult;
-    }),
-    startMarmotInbound: vi.fn((_api, _dispatch, options: { channelAccountId?: string | null }) => {
-      const accountId = options.channelAccountId ?? "default";
-      markMarmotInboundStarting(accountId);
-      queueMicrotask(() => {
-        markMarmotInboundReady(accountId);
-      });
-      return () => {};
-    }),
+    syncMarmotAllowlist: vi.fn(defaultSyncMarmotAllowlist),
+    startMarmotInbound: vi.fn(defaultStartMarmotInbound),
   };
 });
 
@@ -191,10 +211,16 @@ afterEach(async () => {
   resetMarmotInboundRuntimeForTests();
   resetMarmotGatewayRecoveryForTests();
   syncCalls.length = 0;
+  syncSignals.length = 0;
   statusPatches.length = 0;
   recordedSubscribeCalls = 0;
   lifecycleStarts = 0;
   vi.clearAllMocks();
+  // `clearAllMocks` clears calls but keeps implementations, so a per-test
+  // override would otherwise decide the behaviour of every later test.
+  const runtime = await import("../src/inbound-runtime.js");
+  vi.mocked(runtime.syncMarmotAllowlist).mockImplementation(defaultSyncMarmotAllowlist);
+  vi.mocked(runtime.startMarmotInbound).mockImplementation(defaultStartMarmotInbound);
   vi.useRealTimers();
 });
 
@@ -235,7 +261,7 @@ describe("startMarmotGatewayAccount", () => {
       { state: "reconciled" },
     ];
     vi.mocked(syncMarmotAllowlist).mockImplementation(async (_api, options = {}) => {
-      syncCalls.push(options);
+      recordSyncCall(options);
       return outcomes[Math.min(syncCalls.length - 1, outcomes.length - 1)]!;
     });
     vi.mocked(startMarmotInbound).mockImplementation((_api, _dispatch, options) => {
@@ -283,7 +309,7 @@ describe("startMarmotGatewayAccount", () => {
       { state: "reconciled" },
     ];
     vi.mocked(syncMarmotAllowlist).mockImplementation(async (_api, options = {}) => {
-      syncCalls.push(options);
+      recordSyncCall(options);
       return outcomes[Math.min(syncCalls.length - 1, outcomes.length - 1)]!;
     });
     vi.mocked(startMarmotInbound).mockImplementation((_api, _dispatch, options) => {
@@ -311,7 +337,7 @@ describe("startMarmotGatewayAccount", () => {
   it("cancels a pending retry on abort and does not publish a later healthy patch", async () => {
     const { syncMarmotAllowlist } = await import("../src/inbound-runtime.js");
     vi.mocked(syncMarmotAllowlist).mockImplementation(async (_api, options = {}) => {
-      syncCalls.push(options);
+      recordSyncCall(options);
       return { state: "failed", reason: "control" };
     });
     const abort = new AbortController();
@@ -349,7 +375,7 @@ describe("startMarmotGatewayAccount", () => {
     ]);
     vi.mocked(syncMarmotAllowlist).mockImplementation(async (_api, options = {}) => {
       const accountId = options.channelAccountId ?? "default";
-      syncCalls.push(options);
+      recordSyncCall(options);
       const queue = next.get(accountId) ?? [{ state: "unmanaged" }];
       return queue.length > 1 ? queue.shift()! : queue[0]!;
     });
@@ -557,51 +583,169 @@ describe("startMarmotGatewayAccount", () => {
     await replacementRun;
   });
 
-  it("keeps replacement allowlist reconciliation behind an unsettled predecessor", async () => {
-    let markOldSyncCalled!: () => void;
-    const oldSyncCalled = new Promise<void>((resolve) => {
-      markOldSyncCalled = resolve;
+  /**
+   * Starts a generation whose allowlist sync stays in flight until released, so
+   * a replacement can be started against a genuinely unsettled predecessor.
+   */
+  function startStalledGeneration(accountId: string): {
+    run: Promise<void>;
+    abort: AbortController;
+    signal: () => AbortSignal | undefined;
+    dispatched: Promise<void>;
+    release: (result: MarmotAllowlistSyncResult) => void;
+  } {
+    let markDispatched!: () => void;
+    const dispatched = new Promise<void>((resolve) => {
+      markDispatched = resolve;
     });
-    let releaseOld!: (result: MarmotAllowlistSyncResult) => void;
-    const oldSync = new Promise<MarmotAllowlistSyncResult>((resolve) => {
-      releaseOld = resolve;
+    let release!: (result: MarmotAllowlistSyncResult) => void;
+    const stalled = new Promise<MarmotAllowlistSyncResult>((resolve) => {
+      release = resolve;
     });
-    const oldRun = startMarmotGatewayAccount(
+    let signal: AbortSignal | undefined;
+    const abort = new AbortController();
+    const run = startMarmotGatewayAccount(
       gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
-        accountId: "work",
+        accountId,
+        abortSignal: abort.signal,
       }),
       {
-        syncAllowlist: async () => {
-          markOldSyncCalled();
-          return oldSync;
+        syncAllowlist: async (_api, options = {}) => {
+          signal = options.signal;
+          markDispatched();
+          return stalled;
         },
       },
     );
-    await oldSyncCalled;
+    return { run, abort, signal: () => signal, dispatched, release };
+  }
+
+  it("aborts a superseded allowlist sync before the replacement reconciles", async () => {
+    const old = startStalledGeneration("work");
+    // The predecessor must genuinely own an in-flight sync, or this proves
+    // nothing about the handover.
+    await old.dispatched;
+    expect(old.signal()?.aborted).toBe(false);
 
     lifecycleByAccount.delete("work");
-    const replacementSync = vi.fn(async () => ({ state: "unmanaged" }) as const);
+    let predecessorStoppedFirst: boolean | undefined;
     const abortReplacement = new AbortController();
     const replacementRun = startMarmotGatewayAccount(
       gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
         accountId: "work",
         abortSignal: abortReplacement.signal,
       }),
-      { syncAllowlist: replacementSync },
+      {
+        syncAllowlist: async () => {
+          predecessorStoppedFirst = old.signal()?.aborted;
+          return { state: "unmanaged" };
+        },
+      },
     );
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(replacementSync).not.toHaveBeenCalled();
-    expect(lifecycleByAccount.has("work")).toBe(false);
 
-    releaseOld({ state: "unmanaged" });
-    await oldRun;
+    // Liveness: reaching the passive lifecycle at all means this generation did
+    // not block on a predecessor that has not settled.
     const replacement = await waitForLifecycle("work");
-    expect(replacementSync).toHaveBeenCalledTimes(1);
+    // Safety: reconciliation is a non-atomic read-modify-write, so the two
+    // generations still must not overlap. The predecessor was told to stop
+    // before this one touched the allowlist.
+    expect(predecessorStoppedFirst).toBe(true);
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({ running: true });
+
+    old.release({ state: "unmanaged" });
+    await old.run;
+    abortReplacement.abort();
+    await replacement.stop();
+    await replacementRun;
+    old.abort.abort();
+  });
+
+  it("reconciles again once a superseded sync finally settles", async () => {
+    const old = startStalledGeneration("work");
+    await old.dispatched;
+
+    lifecycleByAccount.delete("work");
+    const abortReplacement = new AbortController();
+    const replacementRun = startMarmotGatewayAccount(
+      gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
+        accountId: "work",
+        abortSignal: abortReplacement.signal,
+      }),
+    );
+    const replacement = await waitForLifecycle("work");
+
+    // The replacement reconciled once. The predecessor used the hook, so it
+    // contributes nothing to syncCalls.
+    expect(syncCalls).toEqual([{ channelAccountId: "work" }]);
+
+    // Aborting cannot recall the one request the predecessor had already
+    // dispatched, so it can still land after this generation read the allowlist
+    // back. Settling must therefore trigger one more reconciliation.
+    old.release({ state: "unmanaged" });
+    await old.run;
+    await vi.waitFor(() => {
+      expect(syncCalls).toEqual([{ channelAccountId: "work" }, { channelAccountId: "work" }]);
+    });
 
     abortReplacement.abort();
     await replacement.stop();
     await replacementRun;
+    old.abort.abort();
+  });
+
+  it("does not reconcile again when no superseded sync was in flight", async () => {
+    const abortFirst = new AbortController();
+    const firstRun = startMarmotGatewayAccount(
+      gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
+        accountId: "work",
+        abortSignal: abortFirst.signal,
+      }),
+    );
+    const first = await waitForLifecycle("work");
+    expect(syncCalls).toEqual([{ channelAccountId: "work" }]);
+
+    lifecycleByAccount.delete("work");
+    const abortSecond = new AbortController();
+    const secondRun = startMarmotGatewayAccount(
+      gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
+        accountId: "work",
+        abortSignal: abortSecond.signal,
+      }),
+    );
+    const second = await waitForLifecycle("work");
+
+    // A settled predecessor owes its successor nothing, so the handover must not
+    // cost an extra reconciliation pass.
+    await vi.waitFor(() => {
+      expect(syncCalls).toEqual([{ channelAccountId: "work" }, { channelAccountId: "work" }]);
+    });
+    expect(syncCalls).toHaveLength(2);
+
+    abortFirst.abort();
+    abortSecond.abort();
+    await first.stop();
+    await second.stop();
+    await firstRun;
+    await secondRun;
+  });
+
+  it("stops a generation's reconciliation when that generation is torn down", async () => {
+    const abortFirst = new AbortController();
+    const firstRun = startMarmotGatewayAccount(
+      gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
+        accountId: "work",
+        abortSignal: abortFirst.signal,
+      }),
+    );
+    const first = await waitForLifecycle("work");
+    expect(syncSignals).toHaveLength(1);
+    expect(syncSignals[0]?.aborted).toBe(false);
+
+    abortFirst.abort();
+    await first.stop();
+    await firstRun;
+    // A stopped generation must not leave a live writer behind on the lane.
+    expect(syncSignals[0]?.aborted).toBe(true);
   });
 
   it("releases failed inbound attempts before retrying through the real runtime", async () => {
@@ -791,7 +935,7 @@ describe("startMarmotGatewayAccount", () => {
     const { syncMarmotAllowlist } = await import("../src/inbound-runtime.js");
     let calls = 0;
     vi.mocked(syncMarmotAllowlist).mockImplementation(async (_api, options = {}) => {
-      syncCalls.push(options);
+      recordSyncCall(options);
       calls += 1;
       if (calls === 1) {
         return { state: "failed", reason: "control" };

@@ -11,6 +11,8 @@ interface StubOptions {
   failRemoves?: string[];
   /** Runs on every read-back (list call after the first); may mutate or throw. */
   onReadBack?: (effective: Set<string>) => void;
+  /** Runs after each `allowlist_remove` is applied. */
+  onRemove?: (id: string) => void;
 }
 
 /**
@@ -58,6 +60,7 @@ function stubAllowlist(
         throw new Error("allowlist_remove failed");
       }
       effective.delete(id);
+      options.onRemove?.(id);
       return { type: "ack" };
     },
   } as unknown as AllowlistClient;
@@ -179,6 +182,59 @@ describe("syncAllowlist", () => {
     } as unknown as AllowlistClient;
 
     await expect(syncAllowlist(client, HEX32("aa"), [HEX32("33")])).rejects.toThrow();
+  });
+
+  it("mutates nothing when the signal is already aborted", async () => {
+    const { client, adds, removes, effective } = stubAllowlist([HEX32("11")]);
+    const aborted = AbortSignal.abort();
+
+    const result = await syncAllowlist(client, HEX32("aa"), [HEX32("33")], aborted);
+
+    expect(adds).toEqual([]);
+    expect(removes).toEqual([]);
+    expect([...effective]).toEqual([HEX32("11")]);
+    expect(result.verified).toBe(false);
+  });
+
+  it("stops at the next mutation boundary when aborted mid-pass", async () => {
+    const stale = [HEX32("11"), HEX32("22")];
+    const controller = new AbortController();
+    const { client, removes, effective } = stubAllowlist(stale, {
+      // Abort while the first revocation is still the in-flight request.
+      onRemove: () => controller.abort(),
+    });
+
+    const result = await syncAllowlist(client, HEX32("aa"), [HEX32("33")], controller.signal);
+
+    // The dispatched request still lands; the sequence stops before the next.
+    expect(removes).toHaveLength(1);
+    expect(result.removed).toHaveLength(1);
+    // A pending revocation survives the abort, so the result must not read as
+    // reconciled. The replacement generation's own pass is what clears it.
+    expect(effective.size).toBe(1);
+    expect(result.verified).toBe(false);
+    // Aborting never authorizes anything new: the addition never ran.
+    expect(effective.has(HEX32("33"))).toBe(false);
+  });
+
+  it("abandons additions rather than revocations when aborted between the loops", async () => {
+    const stale = HEX32("11");
+    const fresh = HEX32("33");
+    const controller = new AbortController();
+    const { client, adds, removes, effective } = stubAllowlist([stale], {
+      onRemove: () => controller.abort(),
+    });
+
+    const result = await syncAllowlist(client, HEX32("aa"), [fresh], controller.signal);
+
+    // Revocations run first, so an abort leaves the account strictly narrower
+    // than desired rather than retaining a welcomer the operator revoked.
+    expect(removes).toEqual([stale]);
+    expect(adds).toEqual([]);
+    expect(result.removed).toEqual([stale]);
+    expect(effective.has(stale)).toBe(false);
+    expect(effective.has(fresh)).toBe(false);
+    expect(result.verified).toBe(false);
   });
 });
 

@@ -35,7 +35,9 @@ export type MarmotAllowlistSyncFailureReason =
   | "config_resolution"
   | "account_resolution"
   | "control"
-  | "unverified";
+  | "unverified"
+  /** The owning gateway generation was replaced before reconciliation finished. */
+  | "superseded";
 
 interface AccountLiveFacts {
   accountId: string;

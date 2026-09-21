@@ -68,13 +68,27 @@ async function effectiveWelcomers(
  * authoritative set diverges but cannot assume any particular intermediate
  * state. The read-back is also account-scoped, not connector-scoped, so a
  * concurrent writer on a shared account reads as divergence.
+ *
+ * `signal` stops the sequence at the next mutation boundary, for a caller whose
+ * desired set has been superseded. Stopping early never authorizes an entry the
+ * caller did not ask for, but it can leave a revocation pending — the same
+ * exposure as a failed removal. That is bounded rather than open-ended: a
+ * caller only aborts because a replacement is taking over, and the replacement
+ * reconciles the current desired set against a fresh read. The single request
+ * already dispatched cannot be recalled, so an aborted sync still owes its
+ * caller one in-flight mutation. `verified` is false whenever the sequence
+ * stopped early.
  */
 export async function syncAllowlist(
   client: AllowlistClient,
   accountIdHex: string,
   desired: Array<string | number>,
+  signal?: AbortSignal,
 ): Promise<AllowlistSyncResult> {
   const want = welcomerIdSet(desired);
+  if (signal?.aborted) {
+    return { added: [], removed: [], failedAdds: [], failedRemovals: [], verified: false };
+  }
   // Nothing has been mutated yet, so an unreadable current set is a plain throw.
   const have = await effectiveWelcomers(client, accountIdHex);
 
@@ -90,6 +104,9 @@ export async function syncAllowlist(
     if (want.has(id)) {
       continue;
     }
+    if (signal?.aborted) {
+      return result;
+    }
     try {
       await client.allowlistRemove(accountIdHex, id);
       result.removed.push(id);
@@ -101,12 +118,19 @@ export async function syncAllowlist(
     if (have.has(id)) {
       continue;
     }
+    if (signal?.aborted) {
+      return result;
+    }
     try {
       await client.allowlistAdd(accountIdHex, id);
       result.added.push(id);
     } catch {
       result.failedAdds.push(id);
     }
+  }
+
+  if (signal?.aborted) {
+    return result;
   }
 
   try {
