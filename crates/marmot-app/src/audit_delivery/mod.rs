@@ -19,6 +19,9 @@
 //! A cursor's boundary digest covers at most the final 64 KiB before its byte
 //! offset; stable device/inode identity detects pathname replacement, and a
 //! sealed segment is validated separately at its exact final length and digest.
+//! Already-acknowledged sealed history and registered prefixes verified in the
+//! current store lifetime are revalidated on reopen rather than rehashed for
+//! every preparation; live access still verifies the file identity and length.
 
 mod recovery;
 mod state;

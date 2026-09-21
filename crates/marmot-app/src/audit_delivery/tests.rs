@@ -78,6 +78,31 @@ fn j02_acknowledged_prefix_is_not_resent() {
 }
 
 #[test]
+fn sealed_segment_registered_prefix_is_hashed_once_while_draining() {
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let segment = SegmentId::generate();
+    let mut store = AuditDeliveryStore::create(temporary.path(), journal, profile()).unwrap();
+    let payload = (0..17)
+        .map(|index| format!("record-{index}\n"))
+        .collect::<String>();
+    fs_private::write_private(&store.segment_path(&segment).unwrap(), payload.as_bytes()).unwrap();
+    store
+        .register_segment(segment, SegmentStatus::Sealed)
+        .unwrap();
+
+    let mut range_count = 0;
+    while let Some(prepared) = store.prepare_next().unwrap() {
+        range_count += 1;
+        store.recover_prepared().unwrap().unwrap();
+        store.acknowledge(prepared.token()).unwrap();
+    }
+
+    assert_eq!(range_count, 3);
+    assert_eq!(store.registered_prefix_validation_count(), 1);
+}
+
+#[test]
 fn registration_is_refused_while_a_prepared_range_is_pending() {
     let (root, journal, _segment, mut store) = store_with_segment(b"one\n");
     store.prepare_next().unwrap().unwrap();
