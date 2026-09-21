@@ -3251,3 +3251,150 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
         "count updates do not enqueue duplicate controls"
     );
 }
+
+/// Quorum success must retry observed auth rejections without losing receipts.
+#[tokio::test]
+async fn retry_auth_after_quorum() {
+    use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
+    use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, WritePolicy};
+    use nostr_relay_builder::{LocalRelay, RelayBuilder};
+    use nostr_sdk::prelude::{EventBuilder, Keys, Kind, RelayMessage, RelayPoolNotification};
+    use tokio::sync::Semaphore;
+    use tokio::time::{sleep, timeout};
+
+    #[derive(Debug, Clone)]
+    struct PublicAckGate(Arc<Semaphore>);
+    impl WritePolicy for PublicAckGate {
+        fn admit_event<'a>(
+            &'a self,
+            _: &'a nostr::Event,
+            _: &'a std::net::SocketAddr,
+        ) -> BoxedFuture<'a, PolicyResult> {
+            Box::pin(async move {
+                timeout(Duration::from_secs(5), self.0.acquire())
+                    .await
+                    .expect("shared client must observe auth rejections")
+                    .unwrap()
+                    .forget();
+                PolicyResult::Accept
+            })
+        }
+    }
+
+    let gate = PublicAckGate(Arc::new(Semaphore::new(0)));
+    let public = LocalRelay::new(RelayBuilder::default().write_policy(gate.clone()));
+    let auth = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+        mode: RelayBuilderNip42Mode::Write,
+    }));
+    public.run().await.unwrap();
+    auth.run().await.unwrap();
+    let auth_url = auth.url().await;
+    let endpoints = vec![
+        TransportEndpoint(public.url().await.to_string()),
+        TransportEndpoint(auth_url.to_string()),
+    ];
+    let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
+    let fallback =
+        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(Keys::generate()).build());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account.clone(), Arc::new(fallback.clone()));
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account,
+            inbox_endpoints: endpoints.clone(),
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while plane.relay_health().await.connected != 2 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    for accepted_count in [2, 1] {
+        if accepted_count == 1 {
+            fallback.client().shutdown().await;
+        }
+        let mut notifications = plane
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .unwrap()
+            .client()
+            .notifications();
+        let auth_url = auth_url.clone();
+        let release = gate.0.clone();
+        let rejection_gate = tokio::spawn(async move {
+            timeout(Duration::from_secs(5), async {
+                // Match SDK_RELAY_PUBLISH_ATTEMPTS: do not release the public
+                // ACK until all shared-client auth rejections were observed.
+                let mut rejected = 0;
+                while rejected < 3 {
+                    if let RelayPoolNotification::Message {
+                        relay_url,
+                        message:
+                            RelayMessage::Ok {
+                                status: false,
+                                message,
+                                ..
+                            },
+                        ..
+                    } = notifications.recv().await.unwrap()
+                        && relay_url == auth_url
+                        && message.starts_with("auth-required:")
+                    {
+                        rejected += 1;
+                    }
+                }
+                release.add_permits(1);
+            })
+            .await
+            .expect("three auth rejections before public acknowledgement");
+        });
+        let signed = EventBuilder::new(Kind::TextNote, "auth quorum regression")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+        let outcome = timeout(
+            Duration::from_secs(10),
+            plane.publish_signed_event(&fallback, &endpoints, &event, 1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        rejection_gate.await.unwrap();
+        assert_eq!(
+            outcome.message_id,
+            Some(MessageId::new(signed.id.to_bytes().to_vec()))
+        );
+        assert_eq!(outcome.accepted.len(), accepted_count);
+        assert!(
+            outcome
+                .accepted
+                .iter()
+                .any(|receipt| receipt.endpoint == endpoints[0])
+        );
+        if accepted_count == 2 {
+            assert!(
+                outcome
+                    .accepted
+                    .iter()
+                    .any(|receipt| receipt.endpoint == endpoints[1])
+            );
+            assert!(outcome.failed.is_empty());
+        } else {
+            assert_eq!(outcome.failed.len(), 1);
+            assert_eq!(outcome.failed[0].endpoint, endpoints[1]);
+            assert_eq!(
+                outcome.failed[0].rejection_category,
+                Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired)
+            );
+        }
+    }
+    plane.shutdown().await;
+}

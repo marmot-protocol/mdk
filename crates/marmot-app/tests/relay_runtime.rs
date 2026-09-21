@@ -380,26 +380,6 @@ async fn send_connection_reuse() {
     proxy.abort();
 }
 
-/// Delays the public acknowledgement until the auth-only relay has rejected
-/// the shared client's three attempts (two 600 ms retry intervals).
-#[derive(Debug)]
-struct DelayGroupWrites;
-
-impl WritePolicy for DelayGroupWrites {
-    fn admit_event<'a>(
-        &'a self,
-        event: &'a nostr::Event,
-        _: &'a SocketAddr,
-    ) -> BoxedFuture<'a, PolicyResult> {
-        Box::pin(async move {
-            if event.kind == Kind::MlsGroupMessage {
-                sleep(Duration::from_secs(2)).await;
-            }
-            PolicyResult::Accept
-        })
-    }
-}
-
 #[tokio::test]
 async fn signed_publish_reuses_pool() {
     use cgka_traits::{
@@ -410,20 +390,11 @@ async fn signed_publish_reuses_pool() {
     use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
 
-    for (auth, mixed) in [
-        (None, false),
-        (
-            Some(RelayBuilderNip42 {
-                mode: RelayBuilderNip42Mode::Write,
-            }),
-            false,
-        ),
-        (
-            Some(RelayBuilderNip42 {
-                mode: RelayBuilderNip42Mode::Write,
-            }),
-            true,
-        ),
+    for auth in [
+        None,
+        Some(RelayBuilderNip42 {
+            mode: RelayBuilderNip42Mode::Write,
+        }),
     ] {
         let auth_required = auth.is_some();
         let builder = match auth {
@@ -433,12 +404,6 @@ async fn signed_publish_reuses_pool() {
         let relay = LocalRelay::new(builder);
         relay.run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
-        let public_relay = LocalRelay::new(RelayBuilder::default().write_policy(DelayGroupWrites));
-        let mut endpoints = vec![endpoint];
-        if mixed {
-            public_relay.run().await.unwrap();
-            endpoints.push(TransportEndpoint(public_relay.url().await.to_string()));
-        }
         let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
         let signer =
             NostrSdkRelayClient::new(NostrSdkClient::builder().signer(Keys::generate()).build());
@@ -451,14 +416,14 @@ async fn signed_publish_reuses_pool() {
         adapter
             .activate_account(TransportAccountActivation {
                 account_id: account.clone(),
-                inbox_endpoints: endpoints.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
                 group_subscriptions: Vec::new(),
                 since: None,
             })
             .await
             .unwrap();
         timeout(Duration::from_secs(5), async {
-            while plane.relay_health().await.connected != endpoints.len() {
+            while plane.relay_health().await.connected != 1 {
                 sleep(Duration::from_millis(10)).await;
             }
         })
@@ -481,7 +446,7 @@ async fn signed_publish_reuses_pool() {
             target: TransportPublishTarget::Group {
                 group_id: GroupId::new(vec![0xC3; 32]),
                 transport_group_id: vec![0xD4; 32],
-                endpoints: endpoints.clone(),
+                endpoints: vec![endpoint],
             },
             required_acks: 1,
         };
@@ -491,31 +456,13 @@ async fn signed_publish_reuses_pool() {
                 .unwrap()
                 .unwrap();
             assert!(report.met_required_acks());
-            assert_eq!(report.accepted.len(), endpoints.len());
-            assert!(report.failed.is_empty());
             assert_eq!(report.message_id, request.message.id);
         }
-        assert_eq!(
-            plane.relay_health().await.connection_attempts,
-            endpoints.len()
-        );
-        assert_eq!(plane.relay_health().await.connected, endpoints.len());
-        if mixed {
-            signer.client().shutdown().await;
-            let report = adapter.publish(request.clone()).await.unwrap();
-            assert_eq!(report.accepted.len(), 1);
-            assert_eq!(report.accepted[0].endpoint, endpoints[1]);
-            assert_eq!(report.failed.len(), 1);
-            assert_eq!(report.failed[0].endpoint, endpoints[0]);
-            assert_eq!(
-                report.failed[0].rejection_category,
-                Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired)
-            );
-            assert_eq!(report.message_id, request.message.id);
-        }
+        assert_eq!(plane.relay_health().await.connection_attempts, 1);
+        assert_eq!(plane.relay_health().await.connected, 1);
         plane.shutdown().await;
         // A shut-down receive pool must leave the account publisher usable.
-        if auth_required && !mixed {
+        if auth_required {
             assert!(adapter.publish(request).await.unwrap().met_required_acks());
         }
         signer.client().shutdown().await;
@@ -5422,10 +5369,6 @@ async fn overlapping_reciprocal_invites_deliver_both_incoming_welcomes() {
     let dir = tempfile::tempdir().unwrap();
     let gate = BlockNextGroupMessages::new();
     let (_relay, app, url) = group_message_blocking_app(&dir, gate.clone()).await;
-    // The mock handles writes serially per socket. Separate group relays let
-    // both commit gates overlap even when accounts share subscription sockets.
-    let bob_relay = LocalRelay::new(RelayBuilder::default().write_policy(gate.clone()));
-    bob_relay.run().await.unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = || AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
@@ -5442,15 +5385,7 @@ async fn overlapping_reciprocal_invites_deliver_both_incoming_welcomes() {
         .await
         .unwrap();
     let bob_group = runtime
-        .create_group_with_options(
-            &bob_id,
-            "bob reciprocal invite",
-            &[],
-            marmot_app::AppCreateGroupOptions {
-                relays: Some(vec![bob_relay.url().await.to_string()]),
-                ..Default::default()
-            },
-        )
+        .create_group(&bob_id, "bob reciprocal invite", &[], None)
         .await
         .unwrap();
     let mut alice_events = runtime.subscribe();

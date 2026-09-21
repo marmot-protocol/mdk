@@ -849,12 +849,18 @@ impl MarmotRelayPlane {
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
         // Signed envelopes need no account signer. Reuse the subscription
         // pool's sockets instead of opening a second connection for each send.
+        // ponytail: reuse is single-account. Persistent per-account publish
+        // sockets would extend reuse without coupling concurrent accounts.
         let mut shared = self
             .inner
             .transport
             .sdk_relay_client
             .as_ref()
-            .filter(|client| event.sig.is_some() && !client.client().pool().is_shutdown());
+            .filter(|client| {
+                event.sig.is_some()
+                    && !client.client().pool().is_shutdown()
+                    && account_deliveries_read(&self.inner.transport.account_deliveries).len() == 1
+            });
         // Keep fresh connection attempts on the existing path, including its
         // distinction between a failed dial and an ambiguous in-flight send.
         if let Some(client) = shared {
@@ -2816,15 +2822,25 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         request.validate_envelope_matches_target()?;
         let event = NostrTransportEvent::from_transport_message(&request.message)
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
-        let outcome = self
-            .relay_plane
-            .publish_signed_event(
-                self.publish_client.as_ref(),
-                request.target.endpoints(),
-                &event,
-                request.required_acks,
-            )
-            .await?;
+        // Welcome fanout runs independently of account commands. Keep it off
+        // the receive socket so a blocked inbox write cannot stall group sends.
+        let outcome = if matches!(
+            request.target,
+            cgka_traits::TransportPublishTarget::Group { .. }
+        ) {
+            self.relay_plane
+                .publish_signed_event(
+                    self.publish_client.as_ref(),
+                    request.target.endpoints(),
+                    &event,
+                    request.required_acks,
+                )
+                .await?
+        } else {
+            self.publish_client
+                .publish_event(request.target.endpoints(), &event, request.required_acks)
+                .await?
+        };
         let local_fanout_endpoints = if !outcome.accepted.is_empty() {
             outcome
                 .accepted
