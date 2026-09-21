@@ -878,19 +878,47 @@ impl MarmotRelayPlane {
         let outcome = publisher
             .publish_event(endpoints, event, required_acks)
             .await;
+        let auth_rejected = |failure: &cgka_traits::TransportEndpointFailure| {
+            failure.rejection_category
+                == Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired)
+        };
         // A public read socket can still require account authentication to
         // write. Preserve the signer-bound path for that explicit rejection.
         match outcome {
             Err(error)
                 if shared.is_some()
-                    && error.publish_endpoint_failures().iter().any(|failure| {
-                        failure.rejection_category
-                            == Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired)
-                    }) =>
+                    && error.publish_endpoint_failures().iter().any(auth_rejected) =>
             {
                 fallback
                     .publish_event(endpoints, event, required_acks)
                     .await
+            }
+            Ok(mut outcome) if shared.is_some() => {
+                // Quorum success can still include explicit auth rejections.
+                // Retry only those endpoints, preserving every prior receipt.
+                for failure in std::mem::take(&mut outcome.failed) {
+                    if !auth_rejected(&failure) {
+                        outcome.failed.push(failure);
+                        continue;
+                    }
+                    match fallback
+                        .publish_event(std::slice::from_ref(&failure.endpoint), event, 1)
+                        .await
+                    {
+                        Ok(retry)
+                            if retry
+                                .accepted
+                                .iter()
+                                .any(|receipt| receipt.endpoint == failure.endpoint) =>
+                        {
+                            outcome.accepted.extend(retry.accepted)
+                        }
+                        // A failed retry must not erase the original rejection
+                        // or turn an acknowledged publication into an error.
+                        _ => outcome.failed.push(failure),
+                    }
+                }
+                Ok(outcome)
             }
             result => result,
         }
