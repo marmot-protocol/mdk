@@ -215,14 +215,18 @@ fn codex_attachment_version_supported(output: &str) -> bool {
     if fields.next().is_some() {
         return false;
     }
-    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let (core, prerelease) = version
+        .split_once('-')
+        .map_or((version, false), |(core, _)| (core, true));
     let mut parts = core.split('.').map(str::parse::<u64>);
     let (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return false;
     };
-    (major, minor, patch) >= MINIMUM_ATTACHMENT_CODEX_VERSION_PARTS
+    let parsed = (major, minor, patch);
+    parsed > MINIMUM_ATTACHMENT_CODEX_VERSION_PARTS
+        || (parsed == MINIMUM_ATTACHMENT_CODEX_VERSION_PARTS && !prerelease)
 }
 
 struct PreparedAttachment<'a> {
@@ -619,6 +623,9 @@ mod tests {
             "codex-cli 1.0.0-beta.1\n"
         ));
         assert!(!codex_attachment_version_supported("codex-cli 0.145.9\n"));
+        assert!(!codex_attachment_version_supported(
+            "codex-cli 0.146.0-beta.1\n"
+        ));
         assert!(!codex_attachment_version_supported("codex-cli 0.146\n"));
         assert!(!codex_attachment_version_supported("other-cli 0.146.0\n"));
     }
