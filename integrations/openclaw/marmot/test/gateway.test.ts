@@ -735,6 +735,60 @@ describe("startMarmotGatewayAccount", () => {
     second.abort.abort();
   });
 
+  it("retries a failed late-settlement follow-up until it reconciles", async () => {
+    const old = startStalledGeneration("work");
+    await old.dispatched;
+
+    // Initial pass, then the follow-up triggered by the inherited writer
+    // settling, then the scheduled retry of that follow-up.
+    const outcomes: MarmotAllowlistSyncResult[] = [
+      { state: "unmanaged" },
+      { state: "failed", reason: "control" },
+      { state: "reconciled" },
+    ];
+    const replacementSyncs: MarmotAllowlistSyncResult[] = [];
+    const delays: number[] = [];
+    const abortReplacement = new AbortController();
+    const replacementRun = startMarmotGatewayAccount(
+      gatewayContext(account({ allowFrom: ["aa"], marmotAccountIdHex: "aa".repeat(32) }), {
+        accountId: "work",
+        abortSignal: abortReplacement.signal,
+      }),
+      {
+        random: () => 0,
+        delay: async (ms) => {
+          delays.push(ms);
+        },
+        syncAllowlist: async () => {
+          const next = outcomes[Math.min(replacementSyncs.length, outcomes.length - 1)]!;
+          replacementSyncs.push(next);
+          return next;
+        },
+      },
+    );
+    const replacement = await waitForLifecycle("work");
+    expect(replacementSyncs).toEqual([{ state: "unmanaged" }]);
+
+    old.release({ state: "unmanaged" });
+    await old.run;
+
+    // The follow-up is the only pass that can correct the inherited writer's
+    // late mutation, so a transient failure there must still converge.
+    await vi.waitFor(() => {
+      expect(replacementSyncs).toEqual([
+        { state: "unmanaged" },
+        { state: "failed", reason: "control" },
+        { state: "reconciled" },
+      ]);
+    });
+    expect(delays[0]).toBe(allowlistRetryDelayMs(0, () => 0));
+
+    abortReplacement.abort();
+    await replacement.stop();
+    await replacementRun;
+    old.abort.abort();
+  });
+
   it("does not reconcile again when no superseded sync was in flight", async () => {
     const abortFirst = new AbortController();
     const firstRun = startMarmotGatewayAccount(

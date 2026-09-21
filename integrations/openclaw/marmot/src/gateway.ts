@@ -307,11 +307,22 @@ export async function startMarmotGatewayAccount(
     // that never settles simply never fires, which is why this generation did
     // not wait on it in the first place.
     for (const dispatched of supersededSyncs) {
-      void dispatched.then(() => {
+      void dispatched.then(async () => {
         if (!isCurrent()) {
           return;
         }
-        void enqueueSync().catch(() => undefined);
+        try {
+          // Feed the outcome back into the retry path. A follow-up is the only
+          // thing correcting a late write, so letting a transient failure end
+          // here would strand a revoked welcomer as authorized.
+          const followUp = await enqueueSync();
+          if (followUp?.state === "failed") {
+            scheduleAllowlistRetry();
+          }
+        } catch {
+          // Typed sync results cannot throw; swallow unexpected hook failures
+          // so a voided follow-up cannot become an unhandled rejection.
+        }
       });
     }
 
