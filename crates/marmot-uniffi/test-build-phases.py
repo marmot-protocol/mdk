@@ -215,7 +215,7 @@ class BuildPhases(unittest.TestCase):
         paths = self.record_inputs(["kotlin", "arm64-v8a", "armeabi-v7a", "x86", "x86_64"])
         recorded = json.loads(paths[0].read_text())
         expected_profile_hash = hashlib.sha256(
-            (self.crate / "marmotkit-release-profile.env").read_bytes()
+            (TOOLS / "marmotkit-release-profile.env").read_bytes()
         ).hexdigest()
         self.assertEqual(recorded["release_profile_sha256"], expected_profile_hash)
         self.provenance("verify", "android", *paths)
@@ -249,13 +249,13 @@ class BuildPhases(unittest.TestCase):
                 paths[0].write_text(json.dumps(data | {"cargo": "different"}))
                 self.provenance("verify", platform, *paths, success=False)
 
-    def test_snapshot_verification_hashes_the_packaged_profile(self):
+    def test_snapshot_verification_hashes_the_builder_profile(self):
         workflow = (TOOLS.parents[1] / ".github/workflows/bindings.yaml").read_text()
         verify_steps = workflow.split("      - name: Verify build provenance\n")[1:]
         self.assertEqual(len(verify_steps), 3)
         for step in verify_steps:
             step = step.split("      - name:", 1)[0]
-            self.assertIn(
+            self.assertNotIn(
                 "MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi",
                 step,
             )

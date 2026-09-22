@@ -10,6 +10,7 @@ on:
       - .github/workflows/bindings-profile.yml
       - .github/workflows/bindings-profile-measurement.yml
       - crates/marmot-uniffi/**
+      - "!crates/marmot-uniffi/*.md"
       - "!crates/marmot-uniffi/**/*.md"
   push:
     branches:
@@ -22,6 +23,7 @@ on:
       - .github/workflows/bindings-profile.yml
       - .github/workflows/bindings-profile-measurement.yml
       - crates/marmot-uniffi/**
+      - "!crates/marmot-uniffi/*.md"
       - "!crates/marmot-uniffi/**/*.md"
   schedule:
     - cron: "37 3 * * 1"
@@ -124,6 +126,11 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
           shared-key: marmotkit-profile-${{ matrix.part }}
           key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'crates/marmot-uniffi/marmotkit-*.env', 'crates/marmot-uniffi/*framework*.sh') }}
+      - name: Verify native archive reconstruction and linking
+        if: matrix.part == 'swift'
+        run: |
+          rustup component add llvm-tools-preview
+          python3 crates/marmot-uniffi/test-native-archive.py
       - name: Build one Apple candidate input
         env:
           PART: ${{ matrix.part }}
@@ -133,10 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$PART" in
-            swift)
-              python3 crates/marmot-uniffi/test-native-archive.py
-              ./crates/marmot-uniffi/xcframework.sh generate
-              ;;
+            swift) ./crates/marmot-uniffi/xcframework.sh generate ;;
             ios-device) ./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios ;;
             ios-simulator) ./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios-sim ;;
             macos) ./crates/marmot-uniffi/xcframework-macos.sh native ;;

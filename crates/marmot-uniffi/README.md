@@ -440,7 +440,10 @@ Android or Apple native target once in parallel, transfers those inputs only
 within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
 iOS and macOS candidate packages. Pull requests restore the trusted release
-cache read-only; only runs using the workflow from `master` may update it.
+cache read-only; only runs using the workflow from `master` may update it. A
+weekly scheduled exact-head run on `master` provides drift detection and
+refreshes those trusted cache seeds; it intentionally executes the complete
+packaging matrix.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full

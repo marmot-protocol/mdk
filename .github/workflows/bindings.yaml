@@ -264,7 +264,6 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
           BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
-          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
         run: |
           python3 crates/marmot-uniffi/build-provenance.py verify ios \
             packaged-source/crates/marmot-uniffi/build/ios/swift/build-provenance.json \
@@ -385,7 +384,6 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
           BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
-          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
         run: |
           python3 crates/marmot-uniffi/build-provenance.py verify macos \
             packaged-source/crates/marmot-uniffi/build/macos/swift/build-provenance.json \
@@ -614,7 +612,6 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
           BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
-          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
         run: |
           python3 crates/marmot-uniffi/build-provenance.py verify android \
             packaged-source/crates/marmot-uniffi/output/android/provenance/*.json

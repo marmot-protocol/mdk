@@ -35,11 +35,6 @@ def feature_set():
     }
 
 
-def release_profile_path():
-    crate = Path(os.environ.get("MARMOTKIT_CRATE_DIR", Path(__file__).parent))
-    return crate / "marmotkit-release-profile.env"
-
-
 def record(part, destination):
     workspace = os.environ["MARMOTKIT_WORKSPACE_DIR"]
     env = dict(os.environ, PATH=f"{Path.home()}/.cargo/bin:{os.environ['PATH']}")
@@ -47,7 +42,7 @@ def record(part, destination):
     def command(*args):
         return subprocess.check_output(args, cwd=workspace, env=env, text=True).strip()
 
-    profile = release_profile_path()
+    profile = Path(__file__).with_name("marmotkit-release-profile.env")
     data = dict(part=part, source_sha=command("git", "rev-parse", "HEAD"),
                 builder_sha=os.environ["BUILDER_SHA"],
                 workflow_run_id=os.environ.get("GITHUB_RUN_ID", "local"),
@@ -72,7 +67,7 @@ def verify(platform, paths):
         "source_sha": os.environ["SOURCE_SHA"],
         "builder_sha": os.environ["BUILDER_SHA"],
         "workflow_run_id": os.environ.get("GITHUB_RUN_ID", "local"),
-        "release_profile_sha256": sha256(release_profile_path()),
+        "release_profile_sha256": sha256(Path(__file__).with_name("marmotkit-release-profile.env")),
         "feature_set": feature_set(),
     }
     for record in records:

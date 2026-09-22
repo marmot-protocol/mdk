@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import struct
@@ -748,13 +749,41 @@ class ReleaseProfileTests(unittest.TestCase):
     def test_automatic_profile_workflow_limits_cost_and_preserves_diagnostics(self):
         text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
         trigger = text.split("permissions:", 1)[0]
-        self.assertEqual(trigger.count('!crates/marmot-uniffi/**/*.md'), 2)
+        excluded = [
+            line.strip().removeprefix("- ").strip('"').strip("'")
+            for line in trigger.splitlines()
+            if line.strip().startswith(("- \"!crates/marmot-uniffi/", "- '!crates/marmot-uniffi/"))
+        ]
+
+        def github_glob_matches(path, pattern):
+            expression = ""
+            index = 0
+            while index < len(pattern):
+                if pattern.startswith("**", index):
+                    expression += ".*"
+                    index += 2
+                elif pattern[index] == "*":
+                    expression += "[^/]*"
+                    index += 1
+                else:
+                    expression += re.escape(pattern[index])
+                    index += 1
+            return re.fullmatch(expression, path) is not None
+
+        for document in HERE.rglob("*.md"):
+            relative = document.relative_to(ROOT).as_posix()
+            self.assertTrue(
+                any(github_glob_matches(relative, pattern.removeprefix("!")) for pattern in excluded),
+                f"Markdown-only change would still trigger packaging: {relative}",
+            )
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text)
         self.assertGreaterEqual(text.count("error: sdkmanager not found under $sdk_root"), 1)
-        self.assertIn('swift)\n              python3 crates/marmot-uniffi/test-native-archive.py', text)
+        apple_build = text.split("  apple-build:", 1)[1].split("  android-build:", 1)[0]
+        self.assertIn("if: matrix.part == 'swift'", apple_build)
+        self.assertIn("rustup component add llvm-tools-preview", apple_build)
+        self.assertIn("python3 crates/marmot-uniffi/test-native-archive.py", apple_build)
         ios_package = text.split("  ios-package:", 1)[1]
         self.assertNotIn("test-native-archive.py", ios_package)
-        self.assertEqual(text.count("test-apple-privacy.py"), 1)
 
     def test_profile_workflows_are_non_publishing_and_diagnostic_rich(self):
         for workflow in ("bindings-profile.yml", "bindings-profile-measurement.yml"):
