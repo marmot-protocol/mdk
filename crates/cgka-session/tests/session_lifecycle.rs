@@ -1106,3 +1106,6 @@ async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_sto
     assert!(reopened.ensure_group_hydrated(&group).unwrap());
     assert_eq!(reopened.group_authority(&group).unwrap(), before);
 }
+
+#[path = "support/group_recovery_cases.rs"]
+mod group_recovery;

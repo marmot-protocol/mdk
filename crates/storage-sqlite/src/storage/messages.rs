@@ -1002,7 +1002,7 @@ fn state_query_params(
 /// Update normalized rows without reading or rewriting their payload. A legacy
 /// row is decoded once and promoted atomically so subsequent state flips use
 /// the scalar fast path.
-fn update_message_state_on_connection(
+pub(crate) fn update_message_state_on_connection(
     conn: &rusqlite::Connection,
     id: &MessageId,
     new_state: MessageState,

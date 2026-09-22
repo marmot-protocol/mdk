@@ -41,6 +41,9 @@ use storage_sqlite::{
 
 const TRACE_TARGET: &str = "cgka_session::session";
 
+mod group_recovery;
+pub use group_recovery::{GroupRecoveryError, GroupRecoveryReport, PreparedGroupRecovery};
+
 pub type SessionResult<T> = Result<T, SessionError>;
 
 #[derive(Debug, thiserror::Error)]
