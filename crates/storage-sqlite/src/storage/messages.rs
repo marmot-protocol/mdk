@@ -87,7 +87,7 @@ impl SqliteAccountStorage {
             ).storage()?.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)))
                 .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
             for (group_id, epoch) in groups {
-                crate::account_recovery::arm_epoch_tx(
+                crate::account_recovery::arm_released_epoch_tx(
                     &conn,
                     &group_id,
                     epoch,

@@ -38,11 +38,14 @@ CREATE TABLE account_recovery_obligations (
     eligibility INTEGER NOT NULL DEFAULT 0 CHECK(eligibility BETWEEN 0 AND 4),
     incomplete_reason INTEGER CHECK(incomplete_reason BETWEEN 0 AND 7),
     caller_origin INTEGER NOT NULL DEFAULT 0 CHECK(caller_origin IN (0, 1)),
-    CHECK((cause != 0) OR (account_label IS NOT NULL AND marker_token IS NOT NULL
+    CHECK((cause NOT IN (0, 6)) OR (account_label IS NOT NULL AND marker_token IS NOT NULL
           AND pending_since IS NOT NULL AND dropped_count IS NOT NULL)),
     CHECK((cause != 1) OR (group_id IS NOT NULL AND stalled_epoch IS NOT NULL))
 );
 CREATE INDEX account_recovery_pending ON account_recovery_obligations(state, eligibility);
+CREATE INDEX account_recovery_group ON account_recovery_obligations(cause, group_id, stalled_epoch);
+CREATE INDEX account_recovery_account ON account_recovery_obligations(cause, account_label, marker_token);
+CREATE INDEX account_recovery_epoch_order ON account_recovery_obligations(updated_at_ms, group_id) WHERE cause = 1 AND state = 0;
 
 CREATE TABLE account_recovery_scopes (
     obligation_id BLOB NOT NULL REFERENCES account_recovery_obligations(id) ON DELETE CASCADE,

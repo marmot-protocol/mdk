@@ -38,7 +38,12 @@ an observation has not been imported, including a valid zero-count loss marker.
 Attempt reservations fence demand and imported loss, survive reopen, and refuse unknown
 scope versions. They do not certify coverage. Runtime dispatch consolidation and qualified
 completion are subsequent integration work under [the recovery design](../../docs/marmot-architecture/further-context/account-recovery-ownership.md).
-Legacy clear methods remain caller-directed retirement adapters, not completion proofs.
+Legacy clear methods remain caller-directed retirement adapters, not completion proofs;
+they retain loss watermarks until the coordinated owner can prove safe reclamation.
+Duplicate/stale epoch observations join without resetting eligibility; receipt release
+is distinct new evidence. Notification loss imports a separate cause. Reservations
+fence selected obligations plus account-wide invalidation, so unrelated joins do not
+block an otherwise eligible selection.
 This foundation must land with that coordinated integration; an old binary refuses schema
 0092, and binary downgrade requires a pre-upgrade backup.
 

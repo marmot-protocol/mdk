@@ -108,6 +108,25 @@ pub(crate) fn arm_epoch_tx(
     epoch: i64,
     now: i64,
 ) -> StorageResult<()> {
+    join_epoch_tx(conn, group, epoch, now, false)
+}
+
+pub(crate) fn arm_released_epoch_tx(
+    conn: &Connection,
+    group: &[u8],
+    epoch: i64,
+    now: i64,
+) -> StorageResult<()> {
+    join_epoch_tx(conn, group, epoch, now, true)
+}
+
+fn join_epoch_tx(
+    conn: &Connection,
+    group: &[u8],
+    epoch: i64,
+    now: i64,
+    released_input: bool,
+) -> StorageResult<()> {
     let key = format!("epoch:{}", hex::encode(group));
     conn.execute_cached(
         "INSERT INTO account_recovery_obligations
@@ -116,8 +135,9 @@ pub(crate) fn arm_epoch_tx(
          ON CONFLICT(demand_key) DO UPDATE SET
              stalled_epoch = MAX(stalled_epoch, excluded.stalled_epoch),
              revision = revision + 1, state = 0, eligibility = 0,
-             updated_at_ms = excluded.updated_at_ms",
-        params![key, group, epoch, milliseconds(now)?],
+             updated_at_ms = excluded.updated_at_ms
+         WHERE excluded.stalled_epoch > stalled_epoch OR ?5",
+        params![key, group, epoch, milliseconds(now)?, released_input],
     )
     .storage()?;
     conn.execute_cached(
@@ -129,6 +149,8 @@ pub(crate) fn arm_epoch_tx(
     Ok(())
 }
 
+/// Only a serialized worker observation chooses the current plane token.
+/// Random token values and callback write timestamps do not order generations.
 pub(crate) fn arm_overflow_tx(
     conn: &Connection,
     label: &str,
@@ -136,20 +158,71 @@ pub(crate) fn arm_overflow_tx(
     dropped: i64,
     now: i64,
 ) -> StorageResult<()> {
-    let key = format!("overflow:{label}");
+    // Import may have joined this generation before its queued control record
+    // reaches the worker. Adopting that already-covered identity is metadata,
+    // not another loss observation or permission to reset quiescence.
+    let adopted = conn.execute_cached(
+        "UPDATE account_recovery_obligations SET marker_token = ?2,
+             dropped_count = (SELECT imported_count FROM account_delivery_loss_evidence
+                 WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2),
+             pending_since = (SELECT pending_since FROM account_delivery_loss_evidence
+                 WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2)
+         WHERE demand_key = ?1 AND marker_token != ?2 AND EXISTS(
+             SELECT 1 FROM account_delivery_loss_evidence
+             WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2 AND imported_count >= ?3)",
+        params![format!("overflow:{label}"), token, dropped, label],
+    ).storage()?;
+    if adopted == 0 {
+        join_loss_tx(conn, label, 0, token, dropped, now, true)?;
+    }
+    // Preserve what the worker already observed, even when this token's marker
+    // callback has not committed yet. A delayed duplicate cannot rearm debt.
     conn.execute_cached(
+        "INSERT INTO account_delivery_loss_evidence
+         (account_label, cause, marker_token, pending_since, dropped_count, imported_count)
+         VALUES (?1, 0, ?2, ?3, ?4, ?4)
+         ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
+             dropped_count = MAX(dropped_count, excluded.dropped_count),
+             imported_count = MAX(COALESCE(imported_count, 0), excluded.imported_count)",
+        params![label, token, now, dropped],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn join_loss_tx(
+    conn: &Connection,
+    label: &str,
+    cause: i64,
+    token: i64,
+    dropped: i64,
+    now: i64,
+    adopt_token: bool,
+) -> StorageResult<()> {
+    let (prefix, demand_cause) = match cause {
+        0 => ("overflow", 0),
+        1 => ("notification", 6),
+        _ => {
+            return Err(StorageError::Serialization(
+                "unsupported recovery loss cause".into(),
+            ));
+        }
+    };
+    let key = format!("{prefix}:{label}");
+    let changed = conn.execute_cached(
         "INSERT INTO account_recovery_obligations
          (demand_key, cause, account_label, marker_token, pending_since, dropped_count, created_at_ms, updated_at_ms)
-         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?6)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
          ON CONFLICT(demand_key) DO UPDATE SET
-             revision = revision + CASE WHEN marker_token != excluded.marker_token
-                 OR dropped_count < excluded.dropped_count OR state != 0 THEN 1 ELSE 0 END,
-             eligibility = CASE WHEN marker_token != excluded.marker_token
-                 OR dropped_count < excluded.dropped_count OR state != 0 THEN 0 ELSE eligibility END,
-             pending_since = CASE WHEN marker_token = excluded.marker_token THEN pending_since ELSE excluded.pending_since END,
-             dropped_count = CASE WHEN marker_token = excluded.marker_token THEN MAX(dropped_count, excluded.dropped_count) ELSE excluded.dropped_count END,
-             marker_token = excluded.marker_token, state = 0, updated_at_ms = excluded.updated_at_ms",
-        params![key, label, token, now, dropped, milliseconds(now)?],
+             revision = revision + 1, state = 0, eligibility = 0,
+             pending_since = CASE WHEN ?8 AND marker_token != excluded.marker_token
+                 THEN excluded.pending_since ELSE MIN(pending_since, excluded.pending_since) END,
+             dropped_count = CASE WHEN marker_token = excluded.marker_token THEN MAX(dropped_count, excluded.dropped_count)
+                 WHEN ?8 THEN excluded.dropped_count ELSE dropped_count END,
+             marker_token = CASE WHEN ?8 THEN excluded.marker_token ELSE marker_token END,
+             updated_at_ms = excluded.updated_at_ms
+         WHERE marker_token != excluded.marker_token OR dropped_count < excluded.dropped_count",
+        params![key, demand_cause, label, token, now, dropped, milliseconds(now)?, adopt_token],
     ).storage()?;
     conn.execute_cached(
         "INSERT OR IGNORE INTO account_recovery_scopes(obligation_id, scope_id)
@@ -157,22 +230,45 @@ pub(crate) fn arm_overflow_tx(
         [key],
     )
     .storage()?;
+    if changed > 0 {
+        conn.execute_cached(
+            "UPDATE account_recovery_state SET loss_revision = loss_revision + 1 WHERE singleton = 1", [],
+        ).storage()?;
+    }
     Ok(())
+}
+
+/// Selection may cover a subset. Additional unrelated obligations do not
+/// invalidate it; account-wide loss/route/inventory fences remain conservative.
+fn selected_fence_matches(
+    current: &RecoveryRevisionFence,
+    selected: &RecoveryRevisionFence,
+) -> bool {
+    current.loss_revision == selected.loss_revision
+        && current.route_revision == selected.route_revision
+        && current.inventory_revision == selected.inventory_revision
+        && !selected.obligations.is_empty()
+        && selected
+            .obligations
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[1].0)
+        && selected.obligations.iter().all(|(id, revision)| {
+            current
+                .obligations
+                .binary_search_by_key(id, |(candidate, _)| *candidate)
+                .is_ok_and(|index| current.obligations[index].1 == *revision)
+        })
 }
 
 impl SqliteAccountStorage {
     pub fn recovery_retry_state(&self) -> StorageResult<RecoveryRetryState> {
-        {
-            let conn = self.lock()?;
-            retry_state(&conn)
-        }
+        let conn = self.lock()?;
+        retry_state(&conn)
     }
 
     pub fn recovery_revision_fence(&self) -> StorageResult<RecoveryRevisionFence> {
-        {
-            let conn = self.lock()?;
-            revision_fence(&conn)
-        }
+        let conn = self.lock()?;
+        revision_fence(&conn)
     }
 
     /// Reserve pacing before an executor can have external effects. No policy
@@ -197,23 +293,30 @@ impl SqliteAccountStorage {
                 "SELECT EXISTS(SELECT 1 FROM account_delivery_loss_evidence WHERE (imported_count IS NULL OR dropped_count > imported_count))",
                 [], |row| row.get(0),
             ).storage()?;
-            let unknown_format: bool = conn.query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM account_recovery_scopes s
-                 JOIN account_recovery_obligations o ON o.id = s.obligation_id
-                 WHERE o.state = 0 AND s.scope_format != 1)",
-                [], |row| row.get(0),
-            ).storage()?;
-            if unknown_format {
-                return Err(StorageError::Serialization("unsupported recovery scope format".into()));
-            }
-            let eligible: bool = conn.query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
-                 WHERE state = 0 AND (eligibility IN (0, 1) OR ?1))",
-                [explicit_override], |row| row.get(0),
-            ).storage()?;
-            if unimported || !eligible || revision_fence(&conn)? != *expected
+            // One account-device identity per database: all loss causes must
+            // be imported by that account owner before any scoped reservation.
+            if unimported || !selected_fence_matches(&revision_fence(&conn)?, expected)
                 || (!explicit_override && now_ms < state.not_before_ms)
             {
+                return Ok(None);
+            }
+            let mut eligible = false;
+            for (id, _) in &expected.obligations {
+                let unknown_format: bool = conn.query_row_cached(
+                    "SELECT EXISTS(SELECT 1 FROM account_recovery_scopes
+                     WHERE obligation_id = ?1 AND scope_format != 1)",
+                    [id.as_slice()], |row| row.get(0),
+                ).storage()?;
+                if unknown_format {
+                    return Err(StorageError::Serialization("unsupported recovery scope format".into()));
+                }
+                eligible |= conn.query_row_cached(
+                    "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
+                     WHERE id = ?1 AND state = 0 AND (eligibility IN (0, 1) OR ?2))",
+                    params![id.as_slice(), explicit_override], |row| row.get::<_, bool>(0),
+                ).storage()?;
+            }
+            if !eligible {
                 return Ok(None);
             }
             conn.execute_cached(
@@ -274,22 +377,18 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let rows = conn.prepare_cached(
-                "SELECT marker_token, pending_since, dropped_count
+                "SELECT cause, marker_token, pending_since, dropped_count
                  FROM account_delivery_loss_evidence
-                 WHERE account_label = ?1 AND cause = 0 AND (imported_count IS NULL OR dropped_count > imported_count)
-                 ORDER BY pending_since, marker_token",
-            ).storage()?.query_map([label], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
+                 WHERE account_label = ?1 AND (imported_count IS NULL OR dropped_count > imported_count)
+                 ORDER BY cause, marker_token",
+            ).storage()?.query_map([label], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)))
                 .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
-            for (token, observed_at, dropped) in rows {
-                arm_overflow_tx(&conn, label, token, dropped, observed_at)?;
+            for (cause, token, observed_at, dropped) in rows {
+                join_loss_tx(&conn, label, cause, token, dropped, observed_at, false)?;
                 conn.execute_cached(
                     "UPDATE account_delivery_loss_evidence SET imported_count = ?3
-                     WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
-                    params![label, token, dropped],
-                ).storage()?;
-                conn.execute_cached(
-                    "UPDATE account_recovery_state SET loss_revision = loss_revision + 1 WHERE singleton = 1",
-                    [],
+                     WHERE account_label = ?1 AND cause = ?4 AND marker_token = ?2",
+                    params![label, token, dropped, cause],
                 ).storage()?;
             }
             Ok(())
@@ -338,6 +437,234 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store.ensure_account_projection("alice").unwrap();
         store
+    }
+
+    #[test]
+    fn duplicate_and_stale_epoch_observations_preserve_quiescence() {
+        let store = fixture();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("INSERT INTO cgka_groups(id, epoch, record) VALUES (x'01', 7, x'00')")
+            .unwrap();
+        let arm = |epoch| {
+            store
+                .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                    group_id_hex: "01".into(),
+                    stalled_epoch: epoch,
+                }])
+                .unwrap()
+        };
+        arm(7);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE account_recovery_obligations SET eligibility = 3")
+            .unwrap();
+        let before = store.recovery_revision_fence().unwrap();
+        arm(7);
+        arm(6);
+        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        assert!(
+            store
+                .reserve_recovery_attempt(&before, 1000, 15000, false)
+                .unwrap()
+                .is_none()
+        );
+        arm(8);
+        assert!(
+            store
+                .reserve_recovery_attempt(
+                    &store.recovery_revision_fence().unwrap(),
+                    1000,
+                    15000,
+                    false
+                )
+                .unwrap()
+                .is_some()
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE account_recovery_obligations SET state = 1")
+            .unwrap();
+        arm(8);
+        assert!(
+            store
+                .recovery_revision_fence()
+                .unwrap()
+                .obligations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn notification_loss_imports_independent_demand_without_blocking_forever() {
+        let store = fixture();
+        store.lock().unwrap().execute_batch(
+            "INSERT INTO account_delivery_loss_evidence(account_label,cause,marker_token,pending_since,dropped_count)
+             VALUES ('alice',1,7,10,0)"
+        ).unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        let fence = store.recovery_revision_fence().unwrap();
+        assert_eq!(fence.obligations.len(), 1);
+        assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+        assert!(
+            store
+                .reserve_recovery_attempt(&fence, 1000, 15000, false)
+                .unwrap()
+                .is_some()
+        );
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(store.recovery_revision_fence().unwrap(), fence);
+    }
+
+    #[test]
+    fn late_old_marker_does_not_replace_current_token_or_duplicate_loss_revision() {
+        let store = fixture();
+        store
+            .mark_account_delivery_recovery("alice", 90, 4)
+            .unwrap();
+        let first = store.recovery_revision_fence().unwrap();
+        store
+            .record_account_delivery_loss("alice", 90, 4, 10)
+            .unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(store.recovery_revision_fence().unwrap(), first);
+        store
+            .mark_account_delivery_recovery("alice", 10, 6)
+            .unwrap();
+        let current = store.recovery_revision_fence().unwrap();
+        store
+            .record_account_delivery_loss("alice", 90, 4, 20)
+            .unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(
+            store
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .unwrap()
+                .marker_token,
+            10
+        );
+        assert_eq!(store.recovery_revision_fence().unwrap(), current);
+        // A previously unobserved token has no trustworthy generation ordering.
+        // Join its uncertainty conservatively, without replacing the current token.
+        store
+            .record_account_delivery_loss("alice", 80, 3, 30)
+            .unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(
+            store
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .unwrap()
+                .marker_token,
+            10
+        );
+        assert!(store.recovery_revision_fence().unwrap().loss_revision > current.loss_revision);
+    }
+
+    #[test]
+    fn worker_adopts_already_imported_generation_without_rearming_it() {
+        let store = fixture();
+        store
+            .mark_account_delivery_recovery("alice", 20, 4)
+            .unwrap();
+        store
+            .record_account_delivery_loss("alice", 10, 6, 10)
+            .unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE account_recovery_obligations SET eligibility = 3")
+            .unwrap();
+        let before = store.recovery_revision_fence().unwrap();
+        store
+            .mark_account_delivery_recovery("alice", 10, 6)
+            .unwrap();
+        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        assert_eq!(
+            store
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .unwrap()
+                .marker_token,
+            10
+        );
+        assert!(
+            store
+                .reserve_recovery_attempt(&before, 1000, 15000, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_retirement_keeps_evidence_watermark_for_a_late_writer() {
+        let store = fixture();
+        store
+            .record_account_delivery_loss("alice", 3, 9, 10)
+            .unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(store.clear_account_delivery_recovery("alice", 3).unwrap());
+        let before = store.recovery_revision_fence().unwrap();
+        store
+            .record_account_delivery_loss("alice", 3, 9, 11)
+            .unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        store
+            .record_account_delivery_loss("alice", 3, 10, 12)
+            .unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(
+            store.recovery_revision_fence().unwrap().obligations.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn reservation_fences_selected_demand_without_blocking_on_unrelated_joins() {
+        let store = fixture();
+        store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+        let selected = store.recovery_revision_fence().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("INSERT INTO cgka_groups(id, epoch, record) VALUES (x'01', 7, x'00')")
+            .unwrap();
+        store
+            .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: "01".into(),
+                stalled_epoch: 7,
+            }])
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE account_recovery_obligations SET eligibility = 3 WHERE cause = 0",
+            )
+            .unwrap();
+        assert!(
+            store
+                .reserve_recovery_attempt(&selected, 1000, 15000, false)
+                .unwrap()
+                .is_none(),
+            "unselected eligible demand cannot authorize the selected quiescent scope"
+        );
+        assert!(
+            store
+                .reserve_recovery_attempt(&selected, 1000, 15000, true)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.recovery_revision_fence().unwrap().obligations.len(),
+            2
+        );
     }
 
     #[test]

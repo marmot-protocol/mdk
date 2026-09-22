@@ -166,9 +166,13 @@ intent still creates demand atomically when the existing receipt consumer runs.
 Create the four tables, convert and validate row counts/keys, then remove the two
 old demand tables within the same migration transaction. Copy each old loss row
 into the evidence table as well as preserving its demand in the ledger. The owner
-imports evidence transactionally: only an increased `(token, count)` advances the
-loss/obligation revision, and imported counts cannot regress. A late old callback
-cannot overwrite a newer token. Retain the current evidence watermark until the
+imports evidence transactionally: only previously unobserved loss advances the
+loss/obligation revision, and imported counts cannot regress. Worker observations
+also preserve an imported watermark, so a delayed callback for already-observed loss
+is a duplicate. Adopting an already-imported token changes only the compatibility
+pointer, not revision or eligibility. Only the serialized worker adopts a current plane token; random
+tokens and callback timestamps never establish generation order. An unrecognized
+late token joins uncertain loss conservatively without replacing the current token. Retain the current evidence watermark until the
 plane confirms its marker writer is finished; reclaim it only after fenced
 completion. Reopen has no surviving old callback. Compare unimported evidence
 inside the completion transaction; a newer count is not hidden behind the worker
@@ -178,6 +182,7 @@ storage methods as adapters into the new authority, not writable legacy SQL tabl
 Read adapters select the corresponding causes; mark adapters perform request/join.
 Keep the public storage clear signatures and their documented token/epoch-exact
 low-level retirement semantics, restricted to the corresponding legacy cause;
+legacy retirement retains imported loss watermarks and cannot reclaim them;
 they cannot certify qualified completion or clear explicit/maintenance demand.
 Add revision-aware CAS primitives for all internal completion. No owner/executor
 path may call the old clears. This preserves supported lower-level methods without

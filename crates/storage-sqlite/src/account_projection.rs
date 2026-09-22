@@ -505,8 +505,9 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for intent in intents {
-                let group = hex::decode(&intent.group_id_hex)
-                    .map_err(|_| StorageError::Serialization("invalid recovery group id".into()))?;
+                let group = hex::decode(&intent.group_id_hex).map_err(|error| {
+                    StorageError::Serialization(format!("invalid epoch backfill group id: {error}"))
+                })?;
                 crate::account_recovery::arm_epoch_tx(
                     &conn,
                     &group,
@@ -665,14 +666,9 @@ impl SqliteAccountStorage {
                     params![label, marker_token],
                 )
                 .storage()?;
-            if cleared > 0 {
-                conn.execute_cached(
-                    "DELETE FROM account_delivery_loss_evidence
-                     WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
-                    params![label, marker_token],
-                )
-                .storage()?;
-            }
+            // Legacy retirement is not qualified completion. Keep the imported
+            // watermark so a late duplicate writer cannot recreate retired debt.
+            // Only the coordinated owner completion/plane-ack path may reclaim it.
             Ok(cleared > 0)
         })
     }
