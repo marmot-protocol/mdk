@@ -548,11 +548,16 @@ async fn defaults_append_relay_roles() {
             vec![
                 vec!["r".into(), "wss://read.example".into(), "read".into()],
                 vec!["r".into(), "wss://write.example".into(), "write".into()],
-                vec!["r".into(), "wss://both.example".into()],
+                vec!["r".into(), "wss://both.example".into(), "read".into()],
+                vec!["r".into(), "wss://both.example/".into(), "write".into()],
+                vec!["r".into(), "wss://read.example/".into(), "read".into()],
                 vec!["r".into(), "wss://default.example/".into(), "read".into()],
             ]
         } else {
-            vec![vec!["relay".into(), "wss://inbox.example".into()]]
+            vec![
+                vec!["relay".into(), "wss://inbox.example".into()],
+                vec!["relay".into(), "wss://inbox.example/".into()],
+            ]
         };
         let event = signed(&keys, step.kind() as u16, tags, "", unix_now_seconds());
         let manager = runtime.accounts();

@@ -1834,16 +1834,23 @@ impl AccountManager {
                     reads = state.relays;
                 }
             }
-            let mut known = reads
-                .iter()
-                .chain(&writes)
-                .map(|relay| nostr::RelayUrl::parse(relay))
-                .collect::<Result<HashSet<_>, _>>()
-                .map_err(|_| onboarding_error())?;
+            // Use one spelling per endpoint across both roles, preserving the
+            // first observed spelling and the union of its capabilities.
+            let mut known = HashMap::new();
+            for relays in [&mut reads, &mut writes] {
+                let mut seen = HashSet::new();
+                for relay in relays.iter_mut() {
+                    let url = nostr::RelayUrl::parse(&*relay).map_err(|_| onboarding_error())?;
+                    *relay = known.entry(url).or_insert_with(|| relay.clone()).clone();
+                }
+                relays.retain(|relay| seen.insert(relay.clone()));
+            }
             for relay in &c.options.default_relays {
-                if !known.insert(nostr::RelayUrl::parse(relay).map_err(|_| onboarding_error())?) {
+                let url = nostr::RelayUrl::parse(relay).map_err(|_| onboarding_error())?;
+                if known.contains_key(&url) {
                     continue;
                 }
+                known.insert(url, relay.clone());
                 reads.push(relay.clone());
                 if step == OnboardingStep::Relays {
                     writes.push(relay.clone());
