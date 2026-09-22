@@ -21,8 +21,11 @@ import {
   DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
   markMarmotAllowlistSyncResult,
   markMarmotInboundStopped,
+  markMarmotSenderAuthorizerLifecycle,
+  markMarmotSenderPolicyResult,
   marmotInboundRuntimeSnapshot,
 } from "./runtime-state.js";
+import { createSenderAuthorizer } from "./sender-policy.js";
 
 export const MARMOT_ALLOWLIST_RETRY_BASE_MS = 1_000;
 export const MARMOT_ALLOWLIST_RETRY_MAX_MS = 30_000;
@@ -116,12 +119,20 @@ export async function startMarmotGatewayAccount(
   };
 
   beginMarmotAccountLifecycle(ctx.accountId);
+  const authorizer = createSenderAuthorizer({ policy: ctx.account.senderPolicy });
+  if (ctx.account.marmotAccountIdHex) {
+    authorizer.bindReceivingAccount(ctx.account.marmotAccountIdHex);
+  }
+  markMarmotSenderPolicyResult(ctx.accountId, ctx.account.senderPolicy);
   publishStatus();
   ctx.log?.info?.("marmot: starting inbound subscription");
 
   const lane = laneFor(ctx.accountId);
   const generation = lane.generation + 1;
   lane.generation = generation;
+  // Reconciliation is a non-atomic read-modify-write. Retain the per-account
+  // serialization barrier even when the prior generation has been replaced;
+  // detaching an unsettled writer could restore a revoked welcomer.
   await lane.syncTail.catch(() => undefined);
 
   const abortController = new AbortController();
@@ -140,6 +151,7 @@ export async function startMarmotGatewayAccount(
   let inboundAttempt = 0;
   let inboundRetrying = false;
   let inboundStop: () => void = () => {};
+  let stoppedStatusGeneration: number | null = null;
 
   const isCurrent = (): boolean =>
     !closed && lane.generation === generation && !abortController.signal.aborted;
@@ -205,7 +217,9 @@ export async function startMarmotGatewayAccount(
 
   const cancelRetries = (): void => {
     closed = true;
+    authorizer.setLifecycle("replaced");
     if (lane.generation === generation) {
+      markMarmotSenderAuthorizerLifecycle(ctx.accountId, "replaced");
       lane.generation += 1;
     }
     abortController.abort();
@@ -222,9 +236,12 @@ export async function startMarmotGatewayAccount(
     };
     const first = await enqueueSync();
     if (!isCurrent()) {
+      const ownsStatus = lane.generation === generation;
       cancelRetries();
-      markMarmotInboundStopped(ctx.accountId);
-      publishStatus();
+      if (ownsStatus) {
+        markMarmotInboundStopped(ctx.accountId);
+        publishStatus();
+      }
       return;
     }
     if (first?.state === "failed") {
@@ -248,6 +265,7 @@ export async function startMarmotGatewayAccount(
       channelAccountId: account.accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
       groupActivation: account.groupActivation,
       mentionPatterns,
+      authorizer,
       log: (message) => ctx.log?.info?.(message),
     });
 
@@ -262,6 +280,7 @@ export async function startMarmotGatewayAccount(
         signal: abortController.signal,
         channelAccountId: ctx.accountId,
         configuredAgentName,
+        authorizer,
         invalidateGroupActivation: dispatch.invalidateGroupActivation,
         clearGroupActivationCache: dispatch.clearGroupActivationCache,
         statusSink: () => {
@@ -306,10 +325,20 @@ export async function startMarmotGatewayAccount(
         };
       },
       stop: (stopInbound) => {
+        const ownedLane = lane.generation === generation;
         cancelRetries();
+        if (ownedLane) {
+          stoppedStatusGeneration = lane.generation;
+        }
         stopInbound();
       },
       onStop: () => {
+        if (
+          stoppedStatusGeneration === null ||
+          lane.generation !== stoppedStatusGeneration
+        ) {
+          return;
+        }
         markMarmotInboundStopped(ctx.accountId);
         publishStatus();
       },

@@ -143,6 +143,10 @@ impl AppClient {
                 ("send_media", Some(attachments.len() as u64))
             }
             AppMessageIntent::Custom { .. } => ("send_custom_event", None),
+            AppMessageIntent::Poll { options, .. } => ("create_poll", Some(options.len() as u64)),
+            AppMessageIntent::PollResponse { option_ids, .. } => {
+                ("cast_poll_vote", Some(option_ids.len() as u64))
+            }
             AppMessageIntent::Report { .. } => ("report_message", None),
             AppMessageIntent::DismissReports { .. } => ("dismiss_reports", None),
             AppMessageIntent::StreamStart { .. }

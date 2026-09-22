@@ -33,6 +33,7 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - `src/config.ts` — channel config schema + `MARMOT_*` resolution.
 - `src/account.ts` — single agent-account resolution (`account_list`).
 - `src/security.ts` — OpenClaw `dm.allowFrom` → `wn-agent` welcomer allowlist sync.
+- `src/sender-policy.ts` — account-global inbound sender ACL (distinct from welcomers).
 - `src/channel.ts` — `createChatChannelPlugin` (meta, capabilities, config, message, security, threading).
 - `index.ts` / `setup-entry.ts` — plugin runtime + setup entries.
 - `test/` — Vitest unit and connector tests.

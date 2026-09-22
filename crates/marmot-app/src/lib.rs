@@ -186,6 +186,10 @@ pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
     AuditLogUploadResult,
 };
+pub use cgka_traits::{
+    MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,
+    PollProjection, PollType,
+};
 pub use client::AppClient;
 pub(crate) use client::{
     ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
@@ -5132,7 +5136,7 @@ impl MarmotApp {
             method = "ensure_account_state"
         )
         .entered();
-        self.account_home().account(label)?;
+        let account = self.account_home().account(label)?;
         let mut ready = self
             .account_state_ready
             .lock()
@@ -5147,7 +5151,7 @@ impl MarmotApp {
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
         self.migrate_legacy_account_projection_if_needed(label)?;
         self.account_storage(label)?
-            .ensure_account_projection(label)?;
+            .ensure_account_projection_with_identity(label, &account.account_id_hex)?;
         ready.insert(label.to_owned());
         Ok(())
     }

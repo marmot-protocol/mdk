@@ -69,7 +69,7 @@ pub use chat_list::{
     ChatListAvatar, ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview,
     ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery,
     ChatListRow, ChatListView, ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
-    ExistingDirectConversation, select_reusable_direct_conversation,
+    ExistingDirectConversation, conversation_kind, select_reusable_direct_conversation,
 };
 pub use chat_presentation::{
     CHAT_LIST_DRAFT_PREVIEW_CHARS, CHAT_PRESENTATION_BATCH_LIMIT, ChatListDraftPreview,

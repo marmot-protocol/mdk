@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
@@ -4895,8 +4896,10 @@ impl AppClient {
                     .ok()
                     .flatten()
                     .is_some_and(|message| {
-                        message.kind == MARMOT_APP_EVENT_KIND_CHAT
-                            && !message.deleted
+                        matches!(
+                            message.kind,
+                            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
+                        ) && !message.deleted
                             && !message.invalidated
                     })
             });

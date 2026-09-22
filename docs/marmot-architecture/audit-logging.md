@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-09-18
+updated: 2026-09-21
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -363,7 +363,7 @@ Emitted after `do_ingest()` returns `Ok(outcome)`.
 | `authorization_failed` | Authenticated input was not authorized in the applicable state. |
 | `transport_deferred` | Current transport context cannot decrypt the object; a changed context may recover it. |
 | `resource_refused_deferred_capacity` | The per-group retained transport-deferred row cap was full. |
-| `resource_refused_retry_budget` | A retained transport object exhausted its changed-context retry budget and was released. |
+| `resource_refused_retry_budget` | A retained transport object exhausted its live-context retry budget and was released. |
 | `pre_membership` | The message predates this account-device's membership. |
 | `beyond_anchor` | Convergence excluded input below the retained anchor. |
 | `beyond_rollback_horizon` | Convergence excluded input beyond the rollback horizon. |
@@ -587,6 +587,7 @@ Emitted when the engine's per-group `EpochState` changes or is re-established du
 
 Current `new_state` values:
 
+- `seeded`
 - `stable`
 - `pending_publish`
 - `recovering`
@@ -595,18 +596,21 @@ Current `new_state` values:
 Current `reason` values found in production call sites:
 
 - `founding_create`
+- `hydrate_seed_group`
 - `hydrate_stable_group`
+- `hydrate_removed_group`
 - `hydrate_unrecoverable_group`
 - `hydrate_durable_group_evolution`
 - `join_welcome`
 - `join_welcome_repair`
+- `recipient_confirmed_rejoin`
 - `begin_pending`
 - `publish_confirmed`
 - `publish_failed`
 - `auto_commit_stage_failed`
 - `update_group_data_stage_failed`
-- `fork_detected`
 - `missing_retained_anchor`
+- `missing_own_commit_checkpoint`
 
 Metadata notes:
 
@@ -619,6 +623,14 @@ Metadata notes:
   unless a later `new_state = "stable"` row with `reason = "join_welcome_repair"` (the one legal exit, emitted by
   `repair_to_stable`) shows the verified repair completed for that `(engine_id, group_ref)`.
   Goggles derives its error-severity `epoch_state_transition` projection row from exactly this state.
+- `reason = "hydrate_removed_group"` marks the session open (`seeded` from the cheap pass, then `stable` or
+  `pending_publish` from the per-group promotion, whichever that copy's recovered lifecycle calls for) of a local copy
+  this device was *removed* from. A copy that is removed *and* halted takes `hydrate_unrecoverable_group` instead:
+  the halt outranks the departure. Such a copy is deliberately still hydrated — an
+  authenticated re-add Welcome needs it — and every other row it emits looks like a live group's, so this reason is
+  the only signal that a group's repeated opens belong to a departed copy rather than an active conversation. It is
+  not an error and needs no repair; a re-join clears the marker and the reason reverts to
+  `hydrate_seed_group` / `hydrate_stable_group`.
 - `reason = "missing_retained_anchor"` has exactly one emission site: the convergence coordinator's
   materialization-time halt, paired with a `convergence_run_state` row carrying the same `error_kind`. Direct ingest
   never emits it. Ingest reaches the same missing-anchor condition through OpenMLS's `WrongEpoch` framing check, which
@@ -952,7 +964,7 @@ Current `reason` values found in production call sites:
 | `fork_loser` | A same-epoch incumbent branch loses fork resolution and its message is invalidated. |
 | `peel_failed_no_snapshot` | Historical stable tag: group-message peel failed and no fallback snapshot could recover it; the outcome is `transport_deferred` and state becomes `peel_deferred`. |
 | `resource_refused_deferred_capacity` | The retained transport-deferred row cap refused an additional object without persisting it. |
-| `resource_refused_retry_budget` | A retained transport-deferred row exhausted its changed-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. |
+| `resource_refused_retry_budget` | A retained transport-deferred row exhausted its live-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. `retry_count` on this row counts live contexts, the unit the budget is spent in; on every other release reason it counts re-peels performed. |
 | `stale_epoch_no_snapshot` | Stale-epoch peel failed and no fallback snapshot could recover it; state becomes `failed`. |
 | `app_payload_retention_expired` | A message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained app-payload window; state becomes `failed`. |
 | `superseded_by_replacement_welcome` | A verified replacement Welcome discarded this device's live MLS copy, so an unresolved commit retained below the new copy's epoch can never be applied; state becomes `epoch_invalidated`. |
@@ -1006,8 +1018,8 @@ metadata keys for indexing.
 | `human_action.action` | local/observed action labels such as `create_group`, `invite_members`, `remove_members`, `leave_group`, `send_message`, `reply_message`, `edit_message`, `react`, `unreact`, `delete_message`, `send_media`, `decline_group_invite`, `promote_admin`, `demote_admin`, `self_demote_admin`, `update_admin_policy`, `update_message_retention`, `replace_encrypted_media_blob_endpoints`, `update_group_avatar_url`, `update_group_profile`, `group_joined`, `update_group_image`, `epoch_changed`; `system` rows use the audit event kind tag as the action. |
 | `human_action.fields` | `name`, `description`, `admins`, `members`, `membership`, `avatar_url`, `avatar`, `image`, `message_retention`, `encrypted_media` |
 | `pending_kind` | `create_group`, `group_evolution` |
-| `epoch_state.new_state` | `stable`, `pending_publish`, `recovering`, `unrecoverable` |
-| `epoch_state.reason` | `hydrate_stable_group`, `join_welcome`, `begin_pending`, `publish_confirmed`, `publish_failed`, `fork_detected`, `missing_retained_anchor` |
+| `epoch_state.new_state` | `seeded`, `stable`, `pending_publish`, `recovering`, `unrecoverable` |
+| `epoch_state.reason` | `auto_commit_stage_failed`, `begin_pending`, `founding_create`, `hydrate_durable_group_evolution`, `hydrate_removed_group`, `hydrate_seed_group`, `hydrate_stable_group`, `hydrate_unrecoverable_group`, `join_welcome`, `join_welcome_repair`, `missing_own_commit_checkpoint`, `missing_retained_anchor`, `publish_confirmed`, `publish_failed`, `recipient_confirmed_rejoin`, `update_group_data_stage_failed` |
 | `group_state.change_kind` | `member_added`, `member_removed`, `member_left`, `admin_added`, `admin_removed`, `group_renamed`, `group_avatar_changed`, `message_retention_changed` |
 | `group_state.fields` | `members`, `membership`, `admins`, `name`, `avatar`, `message_retention` |
 | `convergence error_kinds` | `unsupported_policy`, `missing_retained_anchor`, `candidate_state_unavailable`, `mls_validation_failed`, `outbound_intent_stale`, `storage_unavailable` |

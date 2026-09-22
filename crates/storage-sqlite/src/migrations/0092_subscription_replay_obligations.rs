@@ -1,4 +1,4 @@
-//! Migration 0090: durable per-route subscription replay obligations.
+//! Migration 0092: durable per-route subscription replay obligations.
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
@@ -70,7 +70,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        run(&mut connection, &MIGRATIONS[..89]).unwrap();
+        run(&mut connection, &MIGRATIONS[..91]).unwrap();
 
         let transaction = connection.transaction().unwrap();
         apply(&transaction).unwrap();

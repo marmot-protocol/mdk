@@ -4043,3 +4043,216 @@ async fn disband_settle_retires_deferred_peel_rows_without_refusal() {
         "retiring a terminal group's backlog must be silent"
     );
 }
+
+/// A split-brain victim wedged on its own branch. Its own branch stays the
+/// deepest one it can see, so its live peel context never moves, while each
+/// sweep recovers exactly one more rival commit through the rival branch tip
+/// context — the crawl the field sees on a device pinned at its own epoch for
+/// weeks. Returns the deepest rival artifact, readable only once the crawl
+/// reaches the tip that sealed it.
+async fn wedged_victim_crawling_a_rival_branch() -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    TransportMessage,
+) {
+    let victim_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut victim =
+        build_epoch_sealed_client_with_storage(b"crawl-victim", victim_storage.clone());
+    let (mut rival, _rival_storage) = build_epoch_sealed_client(b"crawl-rival");
+
+    let rival_kp = rival.fresh_key_package().await.unwrap();
+    let routing = NostrRoutingV1::new([0x44; 32], vec!["wss://relay.example".into()]).unwrap();
+    let (group_id, create) = victim
+        .create_group(CreateGroupRequest {
+            name: "rival-branch-crawl".into(),
+            description: String::new(),
+            members: vec![rival_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(&routing).unwrap(),
+            }],
+            initial_admins: vec![rival.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    victim.confirm_published(pending).await.unwrap();
+    rival
+        .join_welcome(welcome_for(&welcomes, b"crawl-rival"))
+        .await
+        .unwrap();
+
+    // The victim's own branch: four self-updates from the shared epoch keep it
+    // the deepest branch this device can see for the whole crawl, so branch
+    // selection never moves its live epoch.
+    for _ in 0..4 {
+        let (_own, pending) = evolution(
+            victim
+                .send(SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                })
+                .await
+                .unwrap(),
+        );
+        victim.confirm_published(pending).await.unwrap();
+    }
+
+    // The rival branch forks from the same epoch and runs three commits deep.
+    let mut rival_commits = Vec::new();
+    for _ in 0..3 {
+        let (msg, pending) = evolution(
+            rival
+                .send(SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                })
+                .await
+                .unwrap(),
+        );
+        rival.confirm_published(pending).await.unwrap();
+        rival_commits.push(msg);
+    }
+    let deep_app = send_app(&mut rival, &group_id, "deepest rival witness").await;
+
+    // Only the fork root is sealed under the shared epoch secret. Retain the
+    // deepest artifact first so every sweep offers it a context before the
+    // commit that would deepen the crawl.
+    let mut commits = rival_commits.into_iter();
+    let rival_root = commits.next().expect("rival fork root");
+    assert!(matches!(
+        victim.ingest(deep_app.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert!(matches!(
+        victim.ingest(rival_root).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    for commit in commits {
+        assert!(matches!(
+            victim.ingest(commit).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+
+    (victim, victim_storage, group_id, deep_app)
+}
+
+/// The retry budget counts distinct *live* peel contexts. A wedged victim's
+/// live epoch and retained anchors never move, so the rival commits it
+/// recovers one per sweep must not spend the budget of the deeper rows that
+/// crawl has not reached yet.
+#[tokio::test]
+async fn wedged_victim_crawl_outlives_the_retry_budget() {
+    let (mut victim, storage, group_id, deep_app) = wedged_victim_crawling_a_rival_branch().await;
+    victim.set_deferred_peel_retry_budget(2);
+    let wedged_epoch = victim.epoch(&group_id).unwrap();
+
+    for _ in 0..4 {
+        victim.retry_deferred_peels(&group_id).await.unwrap();
+        assert_eq!(
+            victim.epoch(&group_id).unwrap(),
+            wedged_epoch,
+            "the victim must stay wedged on its own branch for this crawl"
+        );
+    }
+
+    let retained = storage
+        .get_message(&deep_app.id)
+        .expect("the deepest rival row must survive the crawl, not be budget-refused");
+    assert_eq!(
+        retained.state,
+        MessageState::Processed,
+        "the crawl must reach the deepest rival row and peel it"
+    );
+}
+
+/// The half of the budget that must not move: on a group whose LIVE peel
+/// context advances, a row that can never peel is charged once per live
+/// context and refused at the budget. `TransportDeferredRetryBudget` is the
+/// public projection of the `RetryBudgetRefused` disposition, so it pins the
+/// release reason, not just the release.
+#[tokio::test]
+async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
+    let (mut alice, mut carol, carol_storage, _peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs().await;
+
+    // One more alice-only epoch, so the stuck row stays unreadable at every
+    // epoch carol reaches.
+    let (mut frank, _frank_storage) = build_client(b"frank-beyond-every-epoch");
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let (_withheld, pending) = evolution(
+        alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![frank_kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+
+    carol.set_deferred_peel_retry_budget(2);
+    let stuck_app = send_app(&mut alice, &group_id, "ahead of every epoch carol reaches").await;
+    assert!(matches!(
+        carol.ingest(stuck_app.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+
+    let attempts = |storage: &SqliteAccountStorage| {
+        storage
+            .get_message(&stuck_app.id)
+            .unwrap()
+            .deferred_peel
+            .expect("deferred lifecycle persisted")
+            .live_context_attempts
+    };
+
+    // Live context 1: epoch 1.
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(attempts(&carol_storage), 1);
+
+    // Live context 2: epoch 2.
+    carol.ingest(commit2).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+        .await
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(attempts(&carol_storage), 2);
+
+    // Live context 3: epoch 3 — the row is over budget and refused.
+    carol.drain_events();
+    carol.ingest(commit3).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_002)
+        .await
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert!(
+        matches!(
+            carol_storage.get_message(&stuck_app.id),
+            Err(StorageError::NotFound)
+        ),
+        "a row a live-context advance can never open must still be refused"
+    );
+    assert!(
+        carol.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::TransportObjectResourceRefused {
+                message_id,
+                resource: InboundResourceLimit::TransportDeferredRetryBudget,
+                ..
+            } if *message_id == stuck_app.id
+        )),
+        "the refusal must name the retry budget, not residence or capacity"
+    );
+}

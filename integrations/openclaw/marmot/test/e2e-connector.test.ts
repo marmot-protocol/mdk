@@ -25,6 +25,7 @@ import {
   type InboundPluginApi,
 } from "../src/inbound-runtime.js";
 import { resetMarmotInboundRuntimeForTests } from "../src/runtime-state.js";
+import { testAllowlistAuthorizer } from "./sender-policy-fixtures.js";
 
 const RUN_CONNECTOR_E2E = process.env.MARMOT_OPENCLAW_CONNECTOR_E2E === "1";
 const maybeDescribe = RUN_CONNECTOR_E2E ? describe : describe.skip;
@@ -169,6 +170,7 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
                 accountIdHex: ACCOUNT_ID_HEX,
                 groupIdHex: GROUP_ID_HEX,
                 profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [SENDER_ACCOUNT_ID_HEX] },
               },
             },
           },
@@ -236,6 +238,7 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
           channelAccountId: "default",
           groupActivation: "always",
           mentionPatterns: [],
+          authorizer: testAllowlistAuthorizer(ACCOUNT_ID_HEX, [SENDER_ACCOUNT_ID_HEX]),
         });
         const runInbound = () =>
           startMarmotInbound(api, dispatch, {

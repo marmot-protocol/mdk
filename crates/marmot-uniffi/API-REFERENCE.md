@@ -2232,6 +2232,37 @@ Send an app-defined event with an arbitrary non-reserved kind. `tags` and `conte
 
 [Source](src/commands/message.rs#L193)
 
+### `Marmot::create_poll`
+
+**Current.** Typed API for an encrypted NIP-88 group poll; do not build kinds 1068/1018 through `send_custom_event`.
+
+```rust
+pub async fn create_poll( &self, account_ref: String, group_id_hex: String, question: String, options: Vec<String>, poll_type: PollTypeFfi, ends_at: Option<u64>, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Pass two through ten option labels and an optional Unix-seconds deadline no more than 30 days after creation. MDK
+validates bounded display text, assigns stable option ids in display order, and exposes results through the timeline
+poll projection. Creation follows MDK's canonical conversation classification: named two-member conversations are
+groups, while unnamed two-member conversations are direct. Polls are neither anonymous nor election-grade. See
+[Polls](POLLS.md).
+
+[Source](src/commands/message.rs#L211)
+
+### `Marmot::cast_poll_vote`
+
+**Current.** Use for a complete replacement selection on an existing encrypted group poll.
+
+```rust
+pub async fn cast_poll_vote( &self, account_ref: String, group_id_hex: String, poll_event_id: String, option_ids: Vec<String>, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+The poll must already be a valid local timeline row in this group and remain open. Pass one option id for single choice
+or one through ten unique ids for multiple choice; use the ids from `TimelineMessageRecordFfi.poll`, not option labels.
+This is a replacement, not a delta or unvote. MDK revalidates the poll against the response event's actual timestamp at
+send time, and an accepted open poll remains votable after conversation reclassification. See [Polls](POLLS.md).
+
+[Source](src/commands/message.rs#L236)
+
 ### `Marmot::messages`
 
 **Lower-level.** Raw stored messages; complete conversation screens use open_conversation_window.
@@ -2242,7 +2273,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L215)
+[Source](src/commands/message.rs#L257)
 
 </details>
 
@@ -3296,7 +3327,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L241)
+[Source](src/lib.rs#L242)
 
 ### `Marmot::new_with_options`
 
@@ -3308,7 +3339,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L257)
+[Source](src/lib.rs#L258)
 
 ### `Marmot::new`
 
@@ -3320,7 +3351,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L285)
+[Source](src/lib.rs#L286)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3332,7 +3363,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L303)
+[Source](src/lib.rs#L304)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3344,7 +3375,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L333)
+[Source](src/lib.rs#L334)
 
 ### `Marmot::new_with_client_name`
 
@@ -3356,7 +3387,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L352)
+[Source](src/lib.rs#L353)
 
 ### `Marmot::start`
 
@@ -3368,7 +3399,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L389)
+[Source](src/lib.rs#L390)
 
 ### `Marmot::shutdown`
 
@@ -3380,7 +3411,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L401)
+[Source](src/lib.rs#L402)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3392,7 +3423,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L436)
+[Source](src/lib.rs#L437)
 
 ### `Marmot::storage_is_closed`
 
@@ -3404,7 +3435,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L444)
+[Source](src/lib.rs#L445)
 
 ### `Marmot::is_stopping`
 
@@ -3416,7 +3447,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L451)
+[Source](src/lib.rs#L452)
 
 </details>
 

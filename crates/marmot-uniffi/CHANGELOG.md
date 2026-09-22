@@ -8,6 +8,11 @@
   subscription, including typed inbox/current/historical route state, endpoint
   admission and registration outcomes, and pending replay/retry state.
 
+- Add bounded encrypted NIP-88 poll creation and replacement-vote methods. Timeline rows expose deterministic poll
+  counts, participants, local selection and deadline state. Poll creation follows canonical group-conversation
+  classification; an accepted open poll remains votable after reclassification. Regenerate Swift/Kotlin
+  bindings with the matching library.
+
 ## 0.10.4 - 2026-09-20
 
 ### Fixed

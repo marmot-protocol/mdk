@@ -509,6 +509,7 @@ mod tests {
             client_token: None,
             has_reports: false,
             group_system: None,
+            poll: None,
             edit: None,
             message_id_hex: "message-1".to_owned(),
             source_message_id_hex: Some("source-1".to_owned()),
@@ -643,6 +644,7 @@ mod tests {
                 event.provenance = marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState;
                 event
             }),
+            poll: None,
             edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
@@ -694,6 +696,7 @@ mod tests {
             client_token: None,
             has_reports: false,
             group_system: None,
+            poll: None,
             edit: None,
             message_id_hex: "system-bad".to_owned(),
             source_message_id_hex: None,

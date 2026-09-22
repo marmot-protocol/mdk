@@ -29,6 +29,8 @@ fn fresh_deferred_peel_lifecycle(
         residence_deadline_wall_ms: now.wall_ms.saturating_add(deferred_peel_residence_ms),
         distinct_context_attempts: 0,
         last_context_fingerprint: None,
+        live_context_attempts: 0,
+        last_live_context_fingerprint: None,
     }
 }
 
@@ -166,6 +168,37 @@ pub(crate) fn row_state_is_awaiting_retry(state: Option<MessageState>) -> bool {
     )
 }
 
+/// The epoch a message row carries and the epoch the forensic trail reports for
+/// writing it.
+///
+/// They differ only for a past-epoch commit on direct ingest: the row keeps the
+/// epoch the commit forks from, while `MessageStateChanged.epoch` must keep
+/// saying where this engine was — `incident-replay` folds that field into an
+/// engine's current position and reads a drop as a rollback.
+#[derive(Clone, Copy)]
+pub(crate) struct RowEpochs {
+    row: EpochId,
+    reported: EpochId,
+}
+
+impl RowEpochs {
+    /// The ordinary case: the engine was at the epoch the row records.
+    pub(crate) fn at(epoch: EpochId) -> Self {
+        Self {
+            row: epoch,
+            reported: epoch,
+        }
+    }
+
+    /// The row records `row` while the engine was at `device`.
+    pub(crate) fn row_at(row: EpochId, device: EpochId) -> Self {
+        Self {
+            row,
+            reported: device,
+        }
+    }
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) fn recorded_message_outcome(
         &self,
@@ -278,7 +311,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            RowEpochs::at(epoch),
             MessageState::Sent,
             StoredMessagePayload::staged_invite_welcome(msg.clone(), origin_commit_id.clone()),
             None,
@@ -344,7 +377,7 @@ impl<S: StorageProvider> Engine<S> {
             self.persist_stored_message_payload(
                 msg.id.clone(),
                 group_id,
-                epoch,
+                RowEpochs::at(epoch),
                 MessageState::Sent,
                 payload,
                 None,
@@ -452,7 +485,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            RowEpochs::at(epoch),
             state,
             StoredMessagePayload::raw_transport(msg.clone()),
             None,
@@ -619,7 +652,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_encoded_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            RowEpochs::at(epoch),
             state,
             encoded_payload,
             None,
@@ -666,7 +699,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            RowEpochs::at(epoch),
             state,
             StoredMessagePayload::openmls_wire(msg.clone()),
             None,
@@ -684,10 +717,36 @@ impl<S: StorageProvider> Engine<S> {
         state: MessageState,
         transport_id: &MessageId,
     ) -> Result<(), EngineError> {
+        self.persist_openmls_wire_message_with_processed_transport_id_at(
+            msg,
+            group_id,
+            RowEpochs::at(epoch),
+            state,
+            transport_id,
+        )
+    }
+
+    /// [`Self::persist_openmls_wire_message_with_processed_transport_id`] with
+    /// the row epoch and the forensic epoch given separately.
+    ///
+    /// Only past-epoch commits on direct ingest need them apart: the row must
+    /// carry the epoch the commit forks from (see the commit-row rule in
+    /// `AGENTS.md`), while the forensic trail must keep saying where this engine
+    /// was when it handled the message — `incident-replay` folds
+    /// `MessageStateChanged.epoch` into an engine's current position and reads a
+    /// drop as a rollback.
+    pub(crate) fn persist_openmls_wire_message_with_processed_transport_id_at(
+        &self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+        epochs: RowEpochs,
+        state: MessageState,
+        transport_id: &MessageId,
+    ) -> Result<(), EngineError> {
         self.persist_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            epochs,
             state,
             StoredMessagePayload::openmls_wire(msg.clone()),
             Some(transport_id),
@@ -698,7 +757,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         id: MessageId,
         group_id: &GroupId,
-        epoch: EpochId,
+        epochs: RowEpochs,
         state: MessageState,
         payload: StoredMessagePayload,
         processed_transport_id: Option<&MessageId>,
@@ -709,7 +768,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_encoded_stored_message_payload(
             id,
             group_id,
-            epoch,
+            epochs,
             state,
             payload,
             processed_transport_id,
@@ -720,11 +779,12 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         id: MessageId,
         group_id: &GroupId,
-        epoch: EpochId,
+        epochs: RowEpochs,
         state: MessageState,
         payload: Vec<u8>,
         processed_transport_id: Option<&MessageId>,
     ) -> Result<(), EngineError> {
+        let epoch = epochs.row;
         let id_hex = hex::encode(id.as_slice());
         let previous = match self.storage.get_message(&id) {
             Ok(record) => Some(record),
@@ -787,7 +847,7 @@ impl<S: StorageProvider> Engine<S> {
                 id_hex,
                 previous.map(|record| record.state),
                 state,
-                Some(epoch),
+                Some(epochs.reported),
                 "persist",
             ),
         );
@@ -799,13 +859,37 @@ impl<S: StorageProvider> Engine<S> {
         id: &MessageId,
         state: MessageState,
     ) -> Result<(), EngineError> {
+        self.update_stored_message_state_inner(id, state, None)
+    }
+
+    /// [`Self::update_stored_message_state`] for a row whose epoch is the
+    /// message's own rather than this engine's.
+    ///
+    /// Same split as [`Self::persist_openmls_wire_message_with_processed_transport_id_at`]:
+    /// the row keeps the commit's source epoch, the forensic trail keeps
+    /// reporting where this engine was when it handled the message.
+    pub(crate) fn update_stored_message_state_reported_at(
+        &self,
+        id: &MessageId,
+        state: MessageState,
+        device_epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        self.update_stored_message_state_inner(id, state, Some(device_epoch))
+    }
+
+    fn update_stored_message_state_inner(
+        &self,
+        id: &MessageId,
+        state: MessageState,
+        device_epoch: Option<EpochId>,
+    ) -> Result<(), EngineError> {
         let previous = self.storage.get_message(id).ok();
         self.storage.update_message_state(id, state)?;
         let event = crate::audit_helpers::message_state_transition_event(
             hex::encode(id.as_slice()),
             previous.as_ref().map(|record| record.state),
             state,
-            previous.as_ref().map(|record| record.epoch),
+            device_epoch.or_else(|| previous.as_ref().map(|record| record.epoch)),
             "state_update",
         );
         if let Some(record) = previous {
@@ -857,15 +941,6 @@ impl<S: StorageProvider> Engine<S> {
         resource: InboundResourceLimit,
         disposition: crate::message_disposition::MessageDisposition,
     ) -> Result<(), EngineError> {
-        let retry_count = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
-            u64::from(lifecycle.distinct_context_attempts)
-        });
-        let residence_ms = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
-            lifecycle
-                .wall_high_water_ms
-                .max(self.convergence_now().wall_ms)
-                .saturating_sub(lifecycle.first_observed_wall_ms)
-        });
         // The application reads `TransportObjectResourceRefused` as evidence
         // that this device is missing history it was served, and arms a
         // full-history backfill from it. Traffic older than this copy's Welcome
@@ -878,12 +953,33 @@ impl<S: StorageProvider> Engine<S> {
         // commits, so being wrong here must stay free, and here it is: the row
         // is released either way, and the id stays eligible for redelivery.
         let predates_this_copy = self.released_row_predates_local_copy(record);
-        self.storage.release_message_for_replay(record)?;
-        let release_reason = if predates_this_copy {
-            crate::message_disposition::MessageDisposition::PredatesLocalCopy.tag()
+        let released_as = if predates_this_copy {
+            crate::message_disposition::MessageDisposition::PredatesLocalCopy
         } else {
-            disposition.tag()
+            disposition
         };
+        // Report the count the release was decided on, so the audit row reads
+        // against the bound its reason names: only a retry-budget refusal
+        // spends `live_context_attempts`; every other reason reports re-peels
+        // performed.
+        let retry_count = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
+            u64::from(
+                if released_as == crate::message_disposition::MessageDisposition::RetryBudgetRefused
+                {
+                    lifecycle.live_context_attempts
+                } else {
+                    lifecycle.distinct_context_attempts
+                },
+            )
+        });
+        let residence_ms = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
+            lifecycle
+                .wall_high_water_ms
+                .max(self.convergence_now().wall_ms)
+                .saturating_sub(lifecycle.first_observed_wall_ms)
+        });
+        self.storage.release_message_for_replay(record)?;
+        let release_reason = released_as.tag();
         tracing::info!(
             target: "cgka_engine::message_processor",
             method = "release_deferred_peel_row",
@@ -1116,6 +1212,7 @@ impl<S: StorageProvider> Engine<S> {
 
 #[cfg(test)]
 mod tests {
+    use super::RowEpochs;
     use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
     use crate::engine::EngineBuilder;
     use async_trait::async_trait;
@@ -1327,7 +1424,7 @@ mod tests {
             .persist_stored_message_payload(
                 staged_welcome.id.clone(),
                 &group_id,
-                EpochId(3),
+                RowEpochs::at(EpochId(3)),
                 MessageState::Sent,
                 StoredMessagePayload::staged_invite_welcome(
                     staged_welcome.clone(),
@@ -1382,7 +1479,7 @@ mod tests {
         assert!(storage.has_processed_transport_id(&transport_id).unwrap());
     }
 
-    /// The commit-digest memo behind `deferred_peel_context_fingerprint`
+    /// The commit-digest memo behind `deferred_peel_context`
     /// remembers a per-payload verdict keyed by `MessageId`. A same-id row
     /// overwritten under a different payload variant (RawTransport re-persisted
     /// as an OpenMLS-wire commit, the mdk#369 path above) must re-classify:
@@ -1396,12 +1493,9 @@ mod tests {
             .persist_transport_message(&raw_row, &group_id, EpochId(3), MessageState::Sent)
             .unwrap();
 
-        let before = engine.deferred_peel_context_fingerprint(&group_id).unwrap();
+        let before = engine.deferred_peel_context(&group_id).unwrap();
         // Second call runs against the now-populated memo; it must agree.
-        assert_eq!(
-            before,
-            engine.deferred_peel_context_fingerprint(&group_id).unwrap()
-        );
+        assert_eq!(before, engine.deferred_peel_context(&group_id).unwrap());
 
         let commit_row = TransportMessage {
             payload: real_commit_wire_bytes(),
@@ -1411,11 +1505,18 @@ mod tests {
             .persist_openmls_wire_message(&commit_row, &group_id, EpochId(3), MessageState::Sent)
             .unwrap();
 
-        let after = engine.deferred_peel_context_fingerprint(&group_id).unwrap();
+        let after = engine.deferred_peel_context(&group_id).unwrap();
         assert_ne!(
-            before, after,
+            before.full, after.full,
             "a RawTransport row overwritten as an OpenMLS-wire commit must \
              re-classify instead of reusing the memoized non-commit verdict"
+        );
+        // The retry budget's unit, pinned where the two halves diverge: this is
+        // the one seam in the tree that adds a stored commit under a fixed
+        // epoch and anchor set.
+        assert_eq!(
+            before.live, after.live,
+            "a stored commit deepens the graph; it is not a new live context"
         );
     }
 }

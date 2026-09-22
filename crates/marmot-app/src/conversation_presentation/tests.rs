@@ -54,6 +54,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
         client_token: None,
         has_reports: false,
         group_system: None,
+        poll: None,
         edit: None,
         message_id_hex: "01".repeat(32),
         source_message_id_hex: Some("02".repeat(32)),

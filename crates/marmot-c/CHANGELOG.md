@@ -16,6 +16,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   allocations and require `marmot_account_transport_status_snapshot_free`; callback items
   remain borrowed. Regenerate the header and use it with the matching library.
 
+- Add `marmot_create_poll`, `marmot_cast_poll_vote`, and structured poll projection records. This adds a nullable field
+  to `MarmotTimelineMessageRecord`; poll creation follows canonical group-conversation classification, while an
+  accepted open poll remains votable after reclassification. Regenerate and recompile with the matching header and
+  library.
+
 ## [0.10.4] - 2026-09-20
 
 ### Added

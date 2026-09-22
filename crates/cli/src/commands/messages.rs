@@ -1056,6 +1056,7 @@ mod tests {
             client_token: None,
             has_reports: false,
             group_system: None,
+            poll: None,
             edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,

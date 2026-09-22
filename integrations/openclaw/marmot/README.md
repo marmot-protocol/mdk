@@ -167,7 +167,12 @@ wn-agent bootstrap --home ~/.marmot-agents/openclaw --label openclaw-agent \
 openclaw gateway run
 ```
 
-Invite the printed agent account from the phone app.
+Invite the printed agent account from the phone app. The installer does not
+copy `--allow-welcomer` / `dm.allowFrom` into sender policy. Before claiming
+chat readiness, set `channels.marmot.senderPolicy` (raw 64-character account
+hex, or `allowAll: true`) or export `MARMOT_ALLOWED_USERS` /
+`MARMOT_ALLOW_ALL_USERS`, then restart the OpenClaw gateway. Reinstall
+preserves an existing `senderPolicy`.
 
 ## Dev setup
 
@@ -285,7 +290,8 @@ advanced shared deployment can point both gateways at one `wn-agent`:
 | — | `MARMOT_OUTBOUND_MEDIA_DIR` | `$MARMOT_HOME/dev/outbound-media` (short-lived connector-approved staging copies) |
 | `mentionPatterns` | `MARMOT_MENTION_PATTERNS` | — (extra case-insensitive trigger phrases; the configured agent name is always a trigger) |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
-| `dm.policy` / `dm.allowFrom` | — | `allowlist` |
+| `dm.policy` / `dm.allowFrom` | — | `allowlist` (welcomer/inviter admission only) |
+| `senderPolicy.allowedUsers` / `senderPolicy.allowAll` | `MARMOT_ALLOWED_USERS` / `MARMOT_ALLOW_ALL_USERS` | missing (deny every sender; not sender-ready) |
 
 The QUIC/streaming settings are still accepted for configuration compatibility,
 but inbound agent replies are currently delivered final-only.
@@ -318,12 +324,35 @@ for any plugin or tenant that is not in the same trust boundary.
   Dispatch is serialized per group (distinct groups run concurrently, each group
   stays FIFO), so a slow turn in one group never blocks inbound for others; set
   `debounceMs` to coalesce rapid same-sender bursts into one turn.
-- **Activation gating**: in a multi-party group the agent replies only when
-  addressed — it is `p`-tag mentioned, the text matches a `mentionPatterns`
-  trigger (or the agent name), or the conversation is an effective DM (exactly
-  two members, resolved via the `group_info` control op). Set
-  `groupActivation: "always"` to reply to every message. Effective DMs always
-  reply. Activation policy itself is unchanged. A single bounded
+- **Inbound sender authorization**: every authenticated inbound message is
+  checked against an adapter-owned, account-global sender ACL *before*
+  debounce, queue admission, profile onboarding, group-info lookup, media or
+  history reads, session/route construction, or the OpenClaw turn kernel.
+  Configure `channels.marmot.senderPolicy` (`allowedUsers` and optional
+  `allowAll`) or, when that property is absent on the selected account, the
+  Hermes-compatible environment fallback `MARMOT_ALLOWED_USERS` /
+  `MARMOT_ALLOW_ALL_USERS`. Presence of `senderPolicy` replaces the entire
+  environment policy atomically; it never unions with env and never falls
+  through on invalid or empty config. Named accounts do not inherit a sibling
+  or root policy. IDs are raw 64-character Marmot account hex (trim
+  surrounding config whitespace, then require exact hex, lowercase, and
+  dedupe). One invalid entry invalidates the whole policy, including
+  `allowAll: true`. Envelope identities are stricter: no trimming or prefix
+  repair, and self-authored or receiving-account-equal senders are denied
+  even under allow-all. Missing policy or an empty list without explicit
+  allow-all denies every sender and is not sender-ready. Changes take effect
+  on account/gateway restart; this snapshot is not a roster cache. An allowed
+  sender is not an OpenClaw owner/admin and does not gain extra tools or
+  profiles. Denial is silent (no reply) and privacy-safe (fixed reason
+  classes only).
+- **Activation gating**: after a sender is authorized, in a multi-party group
+  the agent replies only when addressed — it is `p`-tag mentioned, the text
+  matches a `mentionPatterns` trigger (or the agent name), or the conversation
+  is an effective DM (exactly two members, resolved via the `group_info`
+  control op). Set `groupActivation: "always"` to reply to every authorized
+  message. Effective DMs always reply. Activation may only narrow
+  authorization; mentions, triggers, reply context, display names, and group
+  content cannot widen it. A single bounded
   per-(account, group) cache now stores both `is_direct` and the normalized
   group subject (display text only) so activation and native conversation
   metadata share one in-flight `group_info` read. The cache holds at most 256
@@ -383,9 +412,13 @@ for any plugin or tenant that is not in the same trust boundary.
 - **Native reply and ambient context**: reply hydration maps to
   `supplemental.quote`; quoted attachment summaries and buffered
   `message_edited`, `message_deleted`, `reaction_added`, `reaction_removed`, and
-  group-state facts map to structured `supplemental.untrustedContext`. Ambient
-  facts are isolated per account/group and attached only to the next triggering
-  user turn; they never start a turn and never enter a system prompt.
+  group-state facts map to structured `supplemental.untrustedContext`. Mutation
+  actors are checked against the same inbound sender ACL before buffering;
+  unauthorized edits, deletions, and reactions are denied without entering
+  ambient context. Group-state facts still carry no member pubkey and remain
+  non-triggering untrusted context. Ambient facts are isolated per
+  account/group and attached only to the next triggering user turn; they never
+  start a turn and never enter a system prompt.
 - **Media**: inbound — an `inbound_message.message` carries non-secret `media` refs
   (the `imeta` mirror); on dispatch the connector calls `download_media` to get
   a host-local decrypted path and passes it to the turn as an OpenClaw
@@ -418,25 +451,30 @@ for any plugin or tenant that is not in the same trust boundary.
   `channels.marmot.dm.allowFrom` (hex account ids) into `wn-agent`'s welcomer
   allowlist (a no-op when none is configured, so it never wipes an allowlist
   managed directly on `wn-agent`). `wn-agent` still performs welcomer-based
-  post-join accept/decline. With `allowFrom` set the mirror is *exact
-  reconciliation* of an account-scoped list: entries another integration added
-  to the same `wn-agent` account are removed. It performs best-effort
-  reconciliation: revocations run before additions, every step is attempted
-  even when an earlier one fails, and the effective list is read back afterward.
-  `wn-agent` has no atomic replace, so a partial control-plane failure is
-  reported, not repaired: the connector logs `welcomer allowlist revocation
-  failed …` (entries still authorized) or `welcomer allowlist not reconciled …`,
-  and inbound still starts. Healthy channel status means the inbound
-  subscription is acknowledged *and* a configured policy was reconciled (or
-  the allowlist is unmanaged). A failed managed sync publishes
+  post-join accept/decline. This list is **invite admission only**; it does
+  not authorize post-join senders to invoke the agent. With `allowFrom` set
+  the mirror is *exact reconciliation* of an account-scoped list: entries
+  another integration added to the same `wn-agent` account are removed. It
+  performs best-effort reconciliation: revocations run before additions, every
+  step is attempted even when an earlier one fails, and the effective list is
+  read back afterward. `wn-agent` has no atomic replace, so a partial
+  control-plane failure is reported, not repaired: the connector logs
+  `welcomer allowlist revocation failed …` (entries still authorized) or
+  `welcomer allowlist not reconciled …`, and inbound still starts. Healthy
+  channel status requires the inbound subscription acknowledgement, an
+  acceptable welcomer state (reconciled or unmanaged), *and* an active sender
+  policy (`allowlist` or explicit `allow_all`). Missing or invalid sender
+  policy publishes `lastError: "marmot_sender_policy_missing"` or
+  `"marmot_sender_policy_invalid"` and is not masked by a successful socket
+  probe. A failed managed welcomer sync publishes
   `lastError: "marmot_allowlist_sync_failed"` and retries in the running
   gateway task (1s base, exponential backoff with jitter, 30s cap) until a
-  later verified or unmanaged result. That degraded status is diagnostic only:
-  it does not fail-closed invitations or inbound dispatch. Status snapshots
-  identify the affected OpenClaw channel account and never include Marmot
-  account ids, allowlist members, token/path values, or raw exception text.
-  A failed revocation leaves that entry authorized until a later successful
-  sync.
+  later verified or unmanaged result. That welcomer degradation is diagnostic
+  only for invitations; inbound sender authorization still fail-closes.
+  Status snapshots identify the affected OpenClaw channel account and never
+  include Marmot account ids, allowlist members, token/path values, raw
+  policy values, or exception text. A failed revocation leaves that welcomer
+  authorized until a later successful sync.
 - **Profile-name onboarding** (`src/profile-onboarding.ts`, on by default;
   disable with `profileNameOnboarding: false`): when the agent joins a group it
   asks, on its own, whether to publish a public Nostr profile (`kind:0`) name —

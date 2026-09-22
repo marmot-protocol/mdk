@@ -8,6 +8,10 @@ import { homedir } from "node:os";
 import { buildJsonChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
 
 import { MarmotAgentControlClient } from "./client.js";
+import {
+  resolveSenderPolicy,
+  type SenderPolicyResolution,
+} from "./sender-policy.js";
 
 export const DEFAULT_MARMOT_HOME = "~/.marmot";
 
@@ -51,6 +55,15 @@ export interface MarmotChannelAccountConfig {
     policy?: string;
     allowFrom?: Array<string | number>;
   };
+  /**
+   * Account-global inbound sender ACL. Distinct from `dm.allowFrom`, which
+   * only reconciles wn-agent welcomers. Presence of this property replaces the
+   * `MARMOT_ALLOWED_USERS` / `MARMOT_ALLOW_ALL_USERS` environment fallback.
+   */
+  senderPolicy?: {
+    allowedUsers?: string[];
+    allowAll?: boolean;
+  };
 }
 
 /** Fully-resolved Marmot connection + policy for one OpenClaw account. */
@@ -70,6 +83,7 @@ export interface ResolvedMarmotAccount {
   profileOnboardingStatePath: string;
   dmPolicy?: string;
   allowFrom: Array<string | number>;
+  senderPolicy: SenderPolicyResolution;
 }
 
 export interface ResolveDeps {
@@ -128,6 +142,23 @@ const MARMOT_ACCOUNT_PROPERTIES = {
       enabled: { type: "boolean" },
       policy: { type: "string", enum: ["open", "allowlist", "pairing", "disabled"] },
       allowFrom: { type: "array", items: { type: ["string", "number"] } },
+    },
+  },
+  senderPolicy: {
+    type: "object",
+    additionalProperties: false,
+    description:
+      "Account-global inbound sender ACL. Distinct from dm.allowFrom welcomer admission. Raw 64-character Marmot account hex only.",
+    properties: {
+      allowedUsers: {
+        type: "array",
+        items: { type: "string" },
+        description: "Exact 64-character Marmot account hex ids allowed to invoke the agent.",
+      },
+      allowAll: {
+        type: "boolean",
+        description: "Explicit opt-in to accept any authenticated non-self sender.",
+      },
     },
   },
 };
@@ -350,6 +381,7 @@ export function resolveMarmotAccount(
     profileOnboardingStatePath,
     dmPolicy: cfg.dm?.policy,
     allowFrom: cfg.dm?.allowFrom ?? [],
+    senderPolicy: resolveSenderPolicy(cfg, env),
   };
 }
 

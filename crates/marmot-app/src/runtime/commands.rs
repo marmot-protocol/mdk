@@ -1678,6 +1678,67 @@ impl AccountManager {
         .await
     }
 
+    pub(crate) async fn create_poll(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        question: String,
+        options: Vec<String>,
+        poll_type: cgka_traits::PollType,
+        ends_at: Option<u64>,
+    ) -> Result<SendSummary, AppError> {
+        self.send_app_event(
+            account_ref,
+            group_id,
+            AppMessageIntent::Poll {
+                question,
+                options,
+                poll_type,
+                ends_at,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn cast_poll_vote(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        poll_event_id: String,
+        option_ids: Vec<String>,
+    ) -> Result<SendSummary, AppError> {
+        let account = self.resolve(account_ref)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let poll = self
+            .app
+            .timeline_message(&account.label, &group_id_hex, &poll_event_id)?
+            .and_then(|message| message.poll)
+            .ok_or_else(|| {
+                AppError::InvalidAppMessagePayload(
+                    "poll response requires a valid locally accepted poll in this group".into(),
+                )
+            })?;
+        if !poll.open {
+            return Err(AppError::InvalidAppMessagePayload("poll is closed".into()));
+        }
+        let option_ids_in_poll = poll
+            .options
+            .iter()
+            .map(|option| option.id.clone())
+            .collect::<Vec<_>>();
+        cgka_traits::validate_poll_selection(poll.poll_type, &option_ids_in_poll, &option_ids)
+            .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
+        self.send_app_event(
+            &account.label,
+            group_id,
+            AppMessageIntent::PollResponse {
+                poll_event_id,
+                option_ids,
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn upload_media(
         &self,
         account_ref: &str,

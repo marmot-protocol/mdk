@@ -1334,7 +1334,24 @@ where
         group_id: &GroupId,
     ) -> AccountResult<cgka_traits::MessageId> {
         use sha2::{Digest, Sha256};
-        self.session.group_record(group_id)?;
+        let group = self.session.group_record(group_id)?;
+        // There is no leaf left to rotate, and the engine's send gate answers
+        // any intent for a terminal copy with exactly this error. Refuse here
+        // rather than persist an obligation the sweep can only fail.
+        if group.is_terminal() {
+            return Err(cgka_traits::EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: if group.removed {
+                        "Removed"
+                    } else {
+                        "Disbanded"
+                    },
+                    to: "SelfUpdate",
+                    reason: "terminal local group copy has no leaf to rotate",
+                },
+            )
+            .into());
+        }
         if let Some(existing) = self
             .session
             .maintenance_obligations_for_group(group_id)?
@@ -1535,7 +1552,9 @@ where
         } else {
             self.session.live_group_ids()?
         } {
-            let Some(mut state) = self.session.group_maintenance(&group_id)? else {
+            let Some(Some(mut state)) =
+                skips_group_this_tick(self.session.group_maintenance(&group_id))?
+            else {
                 continue;
             };
             if !state.periodic_enrolled {
@@ -1611,6 +1630,25 @@ where
             ) {
                 continue;
             }
+            // An obligation outlives the membership it was minted under:
+            // disenrollment is event-driven only, so a removal this device
+            // never saw as an event leaves it live against a terminal record.
+            // Driving it means a `SelfUpdate` the removed-copy send gate is
+            // guaranteed to refuse — `Retry` + `maintenance_send_failed` with
+            // no attempt cap, every tick forever. Reach the event-driven
+            // cleanup's verdict here instead.
+            let Some(group) =
+                skips_group_this_tick(self.session.group_record(&obligation.group_id))?
+            else {
+                continue;
+            };
+            if group.is_terminal() {
+                obligation.phase = MaintenancePhase::Failed;
+                obligation.last_failure_code = Some("local_member_removed".into());
+                self.persist_maintenance_obligation(&obligation)?;
+                self.maintenance_quiet_monotonic.remove(&obligation.id);
+                continue;
+            }
             let original_obligation = obligation.clone();
             if obligation
                 .operational_target_at
@@ -1620,24 +1658,27 @@ where
             }
 
             if self.maintenance_paused {
-                let has_prepared_evolution = self
-                    .session
-                    .group_evolutions_for_group(&obligation.group_id)?
-                    .into_iter()
-                    .any(|evolution| {
-                        evolution.phase != GroupEvolutionPhase::SupersededByConvergence
-                            && matches!(
-                                &evolution.semantic,
-                                GroupEvolutionSemantic::SelfUpdate {
-                                    obligation_id,
-                                    ..
-                                } if obligation_id.as_ref() == Some(&obligation.id)
-                            )
-                            && matches!(
-                                evolution.phase,
-                                GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
-                            )
-                    });
+                let Some(evolutions) = skips_group_this_tick(
+                    self.session
+                        .group_evolutions_for_group(&obligation.group_id),
+                )?
+                else {
+                    continue;
+                };
+                let has_prepared_evolution = evolutions.into_iter().any(|evolution| {
+                    evolution.phase != GroupEvolutionPhase::SupersededByConvergence
+                        && matches!(
+                            &evolution.semantic,
+                            GroupEvolutionSemantic::SelfUpdate {
+                                obligation_id,
+                                ..
+                            } if obligation_id.as_ref() == Some(&obligation.id)
+                        )
+                        && matches!(
+                            evolution.phase,
+                            GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
+                        )
+                });
                 if !has_prepared_evolution {
                     self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
                     continue;
@@ -1721,21 +1762,23 @@ where
                     }
                 }
                 MaintenancePhase::PendingPublication | MaintenancePhase::Retry => {
-                    if let Some(evolution) = self
-                        .session
-                        .group_evolutions_for_group(&obligation.group_id)?
-                        .into_iter()
-                        .find(|evolution| {
-                            evolution.phase != GroupEvolutionPhase::SupersededByConvergence
-                                && matches!(
-                                    &evolution.semantic,
-                                    GroupEvolutionSemantic::SelfUpdate {
-                                        obligation_id,
-                                        ..
-                                    } if obligation_id.as_ref() == Some(&obligation.id)
-                                )
-                        })
-                    {
+                    let Some(evolutions) = skips_group_this_tick(
+                        self.session
+                            .group_evolutions_for_group(&obligation.group_id),
+                    )?
+                    else {
+                        continue;
+                    };
+                    if let Some(evolution) = evolutions.into_iter().find(|evolution| {
+                        evolution.phase != GroupEvolutionPhase::SupersededByConvergence
+                            && matches!(
+                                &evolution.semantic,
+                                GroupEvolutionSemantic::SelfUpdate {
+                                    obligation_id,
+                                    ..
+                                } if obligation_id.as_ref() == Some(&obligation.id)
+                            )
+                    }) {
                         if evolution.phase == GroupEvolutionPhase::Confirmed {
                             self.complete_maintenance_obligation(&mut obligation, now)?;
                             continue;
@@ -4441,6 +4484,39 @@ where
             retry_deferred: false,
             terminal_failure: !published && !accepted_by_any_endpoint && !fanout.possible_exposure,
         })
+    }
+}
+
+/// Must this maintenance tick leave the group behind `result` alone?
+///
+/// Every group-scoped engine read the sweep makes passes `ensure_group_live`,
+/// which fails closed on a seeded-but-unhydrated copy (`GroupNotHydrated`) and
+/// on a quarantined one (`UnknownGroup`). Both clear on someone else's
+/// schedule — the embedder's hydration pipeline, the per-group repair surface —
+/// so the work stays owed, `Ok(None)` means skip it this tick, and one such
+/// group never aborts the sweep for every group behind it. Every other error
+/// still propagates.
+///
+/// The `UnknownGroup` arm doubles as defense in depth for the epoch-manager
+/// invariant that a quarantined group holds no epoch entry: if a failed
+/// hydration ever left one behind, `live_group_ids` would list the group and
+/// the sweep would meet it here.
+fn skips_group_this_tick<T>(result: Result<T, SessionError>) -> AccountResult<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(SessionError::Engine(
+            cgka_traits::EngineError::GroupNotHydrated(_)
+            | cgka_traits::EngineError::UnknownGroup(_),
+        )) => {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "run_due_maintenance",
+                error_kind = "group_not_live",
+                "group maintenance remains retryable"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 

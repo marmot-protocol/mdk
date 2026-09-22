@@ -86,7 +86,7 @@ use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
 use crate::types::timeline::{
-    MarmotTimelineMessageQuery, MarmotTimelineMessageRecord, MarmotTimelinePage,
+    MarmotPollType, MarmotTimelineMessageQuery, MarmotTimelineMessageRecord, MarmotTimelinePage,
 };
 use crate::types::transport_status::MarmotAccountTransportStatusSnapshot;
 use crate::types::user_blocks::MarmotBlockedUserList;
@@ -2330,6 +2330,86 @@ pub unsafe extern "C" fn marmot_send_custom_event(
                     kind,
                     tags,
                     content,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Create an encrypted NIP-88 poll in a group conversation. Option ids use `"0"`
+/// through `"9"`. Free `out` with `marmot_send_summary_free`.
+///
+/// # Safety
+/// Strings must be valid; `options` must hold `options_len` valid strings (or
+/// be NULL with length 0); `poll_type` must be a valid `MarmotPollType`
+/// discriminant; `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_create_poll(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    question: *const c_char,
+    options: *const *const c_char,
+    options_len: usize,
+    poll_type: u32,
+    has_ends_at: u8,
+    ends_at: u64,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let question = try_arg!(unsafe { required_str(question) });
+        let options = try_arg!(unsafe { str_array(options, options_len) });
+        let poll_type = try_arg!(MarmotPollType::from_c(poll_type));
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.create_poll(
+                    account_ref,
+                    group_id_hex,
+                    question,
+                    options,
+                    poll_type.to_ffi(),
+                    (has_ends_at != 0).then_some(ends_at),
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Replace this account's selection; accepted open polls remain votable after reclassification.
+///
+/// # Safety
+/// Strings must be valid; `option_ids` must hold `option_ids_len` valid strings
+/// (or be NULL with length 0); `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_cast_poll_vote(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    poll_event_id: *const c_char,
+    option_ids: *const *const c_char,
+    option_ids_len: usize,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let poll_event_id = try_arg!(unsafe { required_str(poll_event_id) });
+        let option_ids = try_arg!(unsafe { str_array(option_ids, option_ids_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.cast_poll_vote(
+                    account_ref,
+                    group_id_hex,
+                    poll_event_id,
+                    option_ids,
                 )),
                 out,
             )
