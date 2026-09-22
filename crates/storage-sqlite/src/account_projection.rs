@@ -699,6 +699,8 @@ impl SqliteAccountStorage {
                          last_arm_at_ms, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(group_id) DO UPDATE SET
+                        qualified_certificate = CASE WHEN stalled_epoch != excluded.stalled_epoch OR excluded.fruitless_completions < fruitless_completions THEN NULL ELSE qualified_certificate END,
+                        last_sample_at_ms = CASE WHEN stalled_epoch != excluded.stalled_epoch OR excluded.fruitless_completions < fruitless_completions THEN NULL ELSE last_sample_at_ms END,
                         stalled_epoch = excluded.stalled_epoch,
                         fruitless_completions = excluded.fruitless_completions,
                         fruitless_reported = excluded.fruitless_reported,

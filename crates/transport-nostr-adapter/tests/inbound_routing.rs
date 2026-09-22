@@ -293,6 +293,9 @@ impl NostrRelayClient for PartialFailureRelayClient {
 
 #[derive(Default)]
 struct FakeRelayClient {
+    scoped: Mutex<Vec<(String, NostrSubscription)>>,
+    scoped_removed: Mutex<Vec<String>>,
+    fail_scoped_remove: AtomicBool,
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
     unsubscribed: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
     unsubscribed_accounts: Mutex<Vec<MemberId>>,
@@ -311,6 +314,35 @@ impl FakeRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for FakeRelayClient {
+    fn supports_scoped_subscriptions(&self) -> bool {
+        true
+    }
+    async fn subscribe_scoped(
+        &self,
+        subscription: NostrSubscription,
+        id: String,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .push(subscription.clone());
+        self.scoped.lock().unwrap().push((id, subscription));
+        Ok(())
+    }
+    async fn unsubscribe_scoped(
+        &self,
+        _subscription: NostrSubscription,
+        id: String,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self.fail_scoped_remove.swap(false, Ordering::SeqCst) {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected teardown failure".into(),
+            ));
+        }
+        self.scoped_removed.lock().unwrap().push(id);
+        Ok(())
+    }
+
     async fn subscribe(
         &self,
         subscription: transport_nostr_adapter::NostrSubscription,
@@ -3910,4 +3942,232 @@ async fn maintenance_teardown_retries() {
             usize::from(reinstall.is_some())
         );
     }
+}
+
+#[tokio::test]
+async fn recovery_maintenance_fences_late_eose_and_retries_exact_teardown() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![1; 32]);
+    let first = TransportEndpoint("wss://first.example".into());
+    let second = TransportEndpoint("wss://second.example".into());
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![2; 16]),
+        transport_group_id: vec![3; 32],
+        endpoints: vec![first.clone(), second.clone()],
+    };
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .unwrap();
+    let old = adapter
+        .install_group_maintenance_recovery_subscription(&account, &group, 1)
+        .await
+        .unwrap();
+    assert_eq!(relay.scoped.lock().unwrap()[0].0, old);
+    adapter.handle_relay_eose(first.clone(), old.clone()).await;
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&old, &first).await,
+        Some(true)
+    );
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&old, &second).await,
+        Some(false)
+    );
+    assert_eq!(
+        adapter
+            .subscription_endpoint_eose(&old, &TransportEndpoint("wss://unknown.example".into()))
+            .await,
+        None
+    );
+    relay.fail_scoped_remove.store(true, Ordering::SeqCst);
+    assert!(
+        adapter
+            .remove_group_maintenance_recovery_subscription(&account, &old)
+            .await
+            .is_err()
+    );
+    assert_eq!(adapter.metrics().await.unsubscribe_retries_pending, 1);
+    let fresh = adapter
+        .install_group_maintenance_recovery_subscription(&account, &group, 2)
+        .await
+        .unwrap();
+    assert_ne!(fresh, old);
+    adapter.handle_relay_eose(second.clone(), old.clone()).await;
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&fresh, &second).await,
+        Some(false)
+    );
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account.clone(),
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(adapter.metrics().await.unsubscribe_retries_pending, 0);
+    assert_eq!(*relay.scoped_removed.lock().unwrap(), vec![old]);
+    adapter
+        .handle_relay_eose(second.clone(), fresh.clone())
+        .await;
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&fresh, &second).await,
+        Some(true)
+    );
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&fresh, &first).await,
+        Some(false)
+    );
+    assert!(
+        adapter
+            .remove_group_maintenance_recovery_subscription(&MemberId::new(vec![9; 32]), &fresh)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&fresh, &second).await,
+        Some(true)
+    );
+    adapter
+        .remove_group_maintenance_recovery_subscription(&account, &fresh)
+        .await
+        .unwrap();
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&fresh, &second).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn unsupported_recovery_maintenance_never_stages_or_queues_teardown() {
+    let relay = Arc::new(ConcurrentSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![1; 32]);
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .unwrap();
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![2; 16]),
+        transport_group_id: vec![3; 32],
+        endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+    };
+    let before = relay.started.load(Ordering::SeqCst);
+    for attempt in 1..=3 {
+        assert!(
+            adapter
+                .install_group_maintenance_recovery_subscription(&account, &group, attempt)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(relay.started.load(Ordering::SeqCst), before);
+    assert_eq!(adapter.metrics().await.unsubscribe_retries_pending, 0);
+}
+
+#[tokio::test]
+async fn recovery_maintenance_never_reopens_a_consumed_attempt() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![1; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![2; 16]),
+        transport_group_id: vec![3; 32],
+        endpoints: vec![endpoint.clone()],
+    };
+    let activation = TransportAccountActivation {
+        account_id: account.clone(),
+        inbox_endpoints: vec![],
+        group_subscriptions: vec![],
+        since: None,
+    };
+    adapter.activate_account(activation.clone()).await.unwrap();
+    let id = adapter
+        .install_group_maintenance_recovery_subscription(&account, &group, 7)
+        .await
+        .unwrap();
+    assert!(id.starts_with("marmot:maintenance-recovery:"));
+    assert!(id.len() <= 64);
+    adapter
+        .handle_relay_eose(endpoint.clone(), id.clone())
+        .await;
+    assert_eq!(
+        adapter
+            .install_group_maintenance_recovery_subscription(&account, &group, 7)
+            .await
+            .unwrap(),
+        id
+    );
+    assert_eq!(
+        relay.scoped.lock().unwrap().len(),
+        1,
+        "live join must not issue another REQ"
+    );
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&id, &endpoint).await,
+        Some(true)
+    );
+    relay.fail_scoped_remove.store(true, Ordering::SeqCst);
+    assert!(
+        adapter
+            .remove_group_maintenance_recovery_subscription(&account, &id)
+            .await
+            .is_err()
+    );
+    assert!(
+        adapter
+            .install_group_maintenance_recovery_subscription(&account, &group, 7)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        adapter.metrics().await.unsubscribe_retries_pending,
+        1,
+        "failed reuse must preserve exact CLOSE intent"
+    );
+    adapter
+        .handle_relay_eose(endpoint.clone(), id.clone())
+        .await;
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&id, &endpoint).await,
+        None
+    );
+    adapter
+        .remove_group_maintenance_recovery_subscription(&account, &id)
+        .await
+        .unwrap();
+    assert!(
+        adapter
+            .install_group_maintenance_recovery_subscription(&account, &group, 7)
+            .await
+            .is_err()
+    );
+    adapter.activate_account(activation).await.unwrap();
+    assert!(
+        adapter
+            .install_group_maintenance_recovery_subscription(&account, &group, 6)
+            .await
+            .is_err()
+    );
+    let fresh = adapter
+        .install_group_maintenance_recovery_subscription(&account, &group, 8)
+        .await
+        .unwrap();
+    adapter.handle_relay_eose(endpoint.clone(), id).await;
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&fresh, &endpoint).await,
+        Some(false)
+    );
 }

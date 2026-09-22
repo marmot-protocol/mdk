@@ -126,12 +126,14 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
     assert_eq!(account_deliveries_read(&deliveries).len(), 1);
 }
 
-#[test]
-fn account_delivery_recovery_metrics_report_retry_outcomes_without_identity() {
+#[tokio::test]
+async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identity() {
     let overflow = AccountDeliveryOverflowState::default();
     let generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
     overflow.consume_signal(generation);
     let first = overflow.start_recovery(1);
+    assert!(overflow.start_marker_persistence());
+    overflow.persist_marker_before_drop(Arc::new(|_, _, _| Ok(()))).await;
     let elapsed_ms = overflow.finish_recovery(first).unwrap();
     overflow.record_recovery_success(elapsed_ms);
 
@@ -170,7 +172,7 @@ async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let observed_attempts = attempts.clone();
-    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
         observed_attempts.fetch_add(1, Ordering::SeqCst);
         Err(AccountDeliveryRecoveryMarkerError::Closed)
     });
@@ -203,7 +205,7 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     let marker: AccountDeliveryRecoveryMarker = {
         let entered = entered.clone();
         let release = release.clone();
-        Arc::new(move |_, _| {
+        Arc::new(move |_, _, _| {
             entered.store(true, Ordering::SeqCst);
             while !release.load(Ordering::SeqCst) {
                 std::thread::yield_now();
@@ -223,7 +225,11 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     .await
     .expect("the old generation marker worker must start");
 
-    assert!(overflow.finish_recovery(old_attempt).is_some());
+    assert!(overflow.finish_recovery(old_attempt).is_none(),
+        "a writer still in flight must prevent acknowledgment and generation reuse");
+    // Exercise the defensive stale-worker fence independently of the public
+    // handoff, which now forbids this transition while a writer is in flight.
+    overflow.inner.lock().unwrap().pending = false;
     let new_generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
     overflow.consume_signal(new_generation);
     assert!(overflow.start_marker_persistence());
@@ -1453,7 +1459,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
     let marker_attempts = Arc::new(AtomicUsize::new(0));
     let marker_flag = marker_persisted.clone();
     let attempts = marker_attempts.clone();
-    let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
+    let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(AccountDeliveryRecoveryMarkerError::Retryable);
         }
@@ -2082,4 +2088,42 @@ fn publish_report_preserves_fallback_message_id() {
     );
     assert_eq!(report.message_id.as_slice(), vec![0x55; 32].as_slice());
     assert_eq!(report.required_acks, 2);
+}
+
+#[tokio::test]
+async fn notification_loss_is_durable_and_survives_receiver_replacement() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let storage = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
+    storage.ensure_account_projection("alice").unwrap();
+    let evidence = storage.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |cause, token, count| {
+        evidence.record_account_recovery_loss("alice", cause, token, count, 1)
+            .map_err(|_| AccountDeliveryRecoveryMarkerError::Retryable)
+    });
+    let adapter = plane.account_adapter_with_recovery_marker(account.clone(), relay.clone(), Some(marker.clone()));
+    recover_relay_notification_forwarder(&plane.inner.transport, RelayNotificationConsumerExit::Lagged(0));
+    let loss = adapter.pending_delivery_overflow().unwrap();
+    assert_eq!(loss.dropped, 0);
+    assert_eq!(loss.notification_losses, 1);
+    assert!(timeout(Duration::from_secs(1), adapter.receive()).await.unwrap().unwrap().is_none());
+    let replacement = plane.account_adapter_with_recovery_marker(account, relay, Some(marker));
+    assert!(Arc::ptr_eq(&adapter.delivery_overflow, &replacement.delivery_overflow));
+    timeout(Duration::from_secs(2), async {
+        while !replacement.delivery_overflow.marker_barrier_complete() {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    storage.synchronize_account_delivery_loss("alice").unwrap();
+    let pending = storage.pending_recovery_demands().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].cause == storage_sqlite::RecoveryCause::NotificationLoss);
+    assert!(storage.account_delivery_recovery("alice").unwrap().is_none());
+    let old = replacement.start_delivery_overflow_recovery(loss.marker_token);
+    recover_relay_notification_forwarder(&plane.inner.transport, RelayNotificationConsumerExit::Closed);
+    assert!(replacement.finish_delivery_overflow_recovery(old).is_none());
+    replacement.fail_delivery_overflow_recovery();
+    assert_eq!(replacement.pending_delivery_overflow().unwrap().notification_losses, 2);
+    plane.shutdown().await;
 }

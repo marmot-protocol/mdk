@@ -455,6 +455,35 @@ pub trait NostrRelayClient: Send + Sync {
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError>;
 
+    /// Whether this client preserves caller-supplied wire ids for both scoped
+    /// subscribe and teardown. Checked before staging any recovery session.
+    fn supports_scoped_subscriptions(&self) -> bool {
+        false
+    }
+
+    /// Subscribe under an owner-fenced wire id. Older injected clients fail
+    /// closed instead of silently issuing an unfenced maintenance request.
+    async fn subscribe_scoped(
+        &self,
+        _subscription: NostrSubscription,
+        _subscription_id: String,
+    ) -> Result<(), TransportAdapterError> {
+        Err(TransportAdapterError::Subscription(
+            "scoped subscription unsupported".to_owned(),
+        ))
+    }
+
+    /// Remove the exact wire id supplied to `subscribe_scoped`.
+    async fn unsubscribe_scoped(
+        &self,
+        _subscription: NostrSubscription,
+        _subscription_id: String,
+    ) -> Result<(), TransportAdapterError> {
+        Err(TransportAdapterError::Subscription(
+            "scoped subscription unsupported".to_owned(),
+        ))
+    }
+
     /// Tear down every subscription this client holds for an account.
     ///
     /// Must be a no-op returning `Ok` for an account the client knows nothing
@@ -554,7 +583,8 @@ impl NostrTransportAdapter {
             .values()
             .map(|account| account.groups.len())
             .sum();
-        metrics.unsubscribe_retries_pending = state.pending_unsubscribes.len();
+        metrics.unsubscribe_retries_pending =
+            state.pending_unsubscribes.len() + state.pending_scoped_unsubscribes.len();
         metrics
     }
 
@@ -635,6 +665,23 @@ impl NostrTransportAdapter {
                 }
             }
         }
+        let scoped = self.state.read().await.pending_scoped_unsubscribes.clone();
+        for (id, subscription) in scoped {
+            match self
+                .relay_client
+                .unsubscribe_scoped(subscription, id.clone())
+                .await
+            {
+                Ok(()) => {
+                    let mut state = self.state.write().await;
+                    if state.pending_scoped_unsubscribes.remove(&id).is_some() {
+                        state.record_confirmed_unsubscribes(1);
+                        confirmed += 1;
+                    }
+                }
+                Err(_) => failed_count += 1,
+            }
+        }
         (confirmed, failed_count)
     }
 
@@ -679,6 +726,22 @@ impl NostrTransportAdapter {
             .subscription_any_eose(subscription_id)
     }
 
+    /// Session-bound EOSE for one caller-supplied endpoint. Unknown or retired
+    /// subscription membership returns None. This is a protocol boundary only,
+    /// never exhaustive historical coverage or durable admission. No reverse
+    /// relay-index mapping or diagnostic identity export is performed.
+    pub async fn subscription_endpoint_eose(
+        &self,
+        subscription_id: &str,
+        endpoint: &TransportEndpoint,
+    ) -> Option<bool> {
+        let state = self.state.read().await;
+        let relay = state.relay_index.existing_index_for(endpoint)?;
+        state
+            .sync
+            .subscription_endpoint_eose(subscription_id, relay)
+    }
+
     /// End-of-stored-events progress across the route snapshot issued by the
     /// account's most recent activation — its inbox plus one per group route,
     /// with every endpoint retained as an independent proof obligation.
@@ -721,6 +784,34 @@ impl NostrTransportAdapter {
         account_id: &MemberId,
         group: &TransportGroupSubscription,
     ) -> Result<String, TransportAdapterError> {
+        self.install_maintenance_subscription(account_id, group, None)
+            .await
+    }
+
+    /// Install a maintenance session fenced by the recovery owner's durable
+    /// attempt. Reusing a live token joins that session. Once removed or failed,
+    /// a strictly greater token is required, including across account activation.
+    pub async fn install_group_maintenance_recovery_subscription(
+        &self,
+        account_id: &MemberId,
+        group: &TransportGroupSubscription,
+        attempt: u64,
+    ) -> Result<String, TransportAdapterError> {
+        self.install_maintenance_subscription(account_id, group, Some(attempt))
+            .await
+    }
+
+    async fn install_maintenance_subscription(
+        &self,
+        account_id: &MemberId,
+        group: &TransportGroupSubscription,
+        attempt: Option<u64>,
+    ) -> Result<String, TransportAdapterError> {
+        if attempt.is_some() && !self.relay_client.supports_scoped_subscriptions() {
+            return Err(TransportAdapterError::Subscription(
+                "scoped subscription unsupported".into(),
+            ));
+        }
         let subscription_guard = self.subscription_lock.clone().lock_owned().await;
         let subscription = NostrSubscription::GroupMaintenance {
             account_id: account_id.clone(),
@@ -728,7 +819,16 @@ impl NostrTransportAdapter {
             transport_group_id: group.transport_group_id.clone(),
             endpoints: group.endpoints.clone(),
         };
-        let subscription_id = subscription.subscription_id();
+        let subscription_id = match attempt {
+            Some(attempt) => compact_subscription_id(
+                "maintenance-recovery",
+                &[
+                    subscription.subscription_id().as_bytes(),
+                    &attempt.to_be_bytes(),
+                ],
+            ),
+            None => subscription.subscription_id(),
+        };
         let now_ms = self.now_ms();
         {
             let mut state = self.state.write().await;
@@ -738,32 +838,63 @@ impl NostrTransportAdapter {
             if state.maintenance_routes.contains_key(&subscription_id) {
                 return Ok(subscription_id);
             }
+            if let Some(attempt) = attempt {
+                let key = (account_id.clone(), group.group_id.clone());
+                if state
+                    .maintenance_attempt_high_water
+                    .get(&key)
+                    .is_some_and(|high| attempt <= *high)
+                {
+                    return Err(TransportAdapterError::Subscription(
+                        "maintenance recovery attempt was already consumed".into(),
+                    ));
+                }
+                // Burn before I/O. Cancellation and even a confirmed CLOSE can
+                // leave late notifications, so removal never resets this fence.
+                state.maintenance_attempt_high_water.insert(key, attempt);
+            }
             // A history REQ can synchronously replay messages. Routing must
             // exist before SDK deduplication consumes their first delivery.
             state
                 .maintenance_routes
                 .insert(subscription_id.clone(), subscription.clone());
             state.rebuild_transport_group_index();
-            state.record_subscription_starts(std::slice::from_ref(&subscription), now_ms);
+            state.record_scoped_subscription_start(&subscription, &subscription_id, now_ms);
         }
         let (complete, abandoned) = oneshot::channel();
         let cleanup_state = self.state.clone();
         let cleanup_subscription = subscription.clone();
+        let cleanup_id = subscription_id.clone();
         tokio::spawn(async move {
             let _subscription_guard = subscription_guard;
             if abandoned.await.is_err() {
                 let mut state = cleanup_state.write().await;
-                state
-                    .maintenance_routes
-                    .remove(&cleanup_subscription.subscription_id());
-                state.forget_subscription_starts(std::slice::from_ref(&cleanup_subscription));
+                state.maintenance_routes.remove(&cleanup_id);
+                state.sync.forget_subscription(&cleanup_id);
+                if attempt.is_some() {
+                    state
+                        .pending_scoped_unsubscribes
+                        .insert(cleanup_id, cleanup_subscription);
+                }
                 state.rebuild_transport_group_index();
             }
         });
-        if let Err(error) = self.relay_client.subscribe(subscription.clone()).await {
+        let result = if attempt.is_some() {
+            self.relay_client
+                .subscribe_scoped(subscription.clone(), subscription_id.clone())
+                .await
+        } else {
+            self.relay_client.subscribe(subscription.clone()).await
+        };
+        if let Err(error) = result {
             let mut state = self.state.write().await;
             state.maintenance_routes.remove(&subscription_id);
-            state.forget_subscription_starts(std::slice::from_ref(&subscription));
+            state.sync.forget_subscription(&subscription_id);
+            if attempt.is_some() {
+                state
+                    .pending_scoped_unsubscribes
+                    .insert(subscription_id.clone(), subscription);
+            }
             state.rebuild_transport_group_index();
             let _ = complete.send(());
             return Err(error);
@@ -792,6 +923,48 @@ impl NostrTransportAdapter {
             .write()
             .await
             .remove_pending_unsubscribe_by_id(&subscription_id);
+        Ok(())
+    }
+
+    /// Remove an exact maintenance session, retaining teardown intent on
+    /// cancellation or relay error. Unknown/already removed ids are idempotent.
+    pub async fn remove_group_maintenance_recovery_subscription(
+        &self,
+        account_id: &MemberId,
+        subscription_id: &str,
+    ) -> Result<(), TransportAdapterError> {
+        let _guard = self.subscription_lock.lock().await;
+        let subscription = {
+            let mut state = self.state.write().await;
+            let subscription = state
+                .maintenance_routes
+                .get(subscription_id)
+                .or_else(|| state.pending_scoped_unsubscribes.get(subscription_id))
+                .cloned();
+            let Some(subscription) = subscription else {
+                return Ok(());
+            };
+            if subscription.account_id() != account_id {
+                return Err(TransportAdapterError::Subscription(
+                    "maintenance account mismatch".into(),
+                ));
+            }
+            state.maintenance_routes.remove(subscription_id);
+            state.sync.forget_subscription(subscription_id);
+            state.rebuild_transport_group_index();
+            state
+                .pending_scoped_unsubscribes
+                .insert(subscription_id.to_owned(), subscription.clone());
+            subscription
+        };
+        self.relay_client
+            .unsubscribe_scoped(subscription, subscription_id.to_owned())
+            .await?;
+        self.state
+            .write()
+            .await
+            .pending_scoped_unsubscribes
+            .remove(subscription_id);
         Ok(())
     }
 
@@ -1439,6 +1612,9 @@ struct AdapterState {
     /// the ids its predecessor is still using. Bounded by the number of distinct
     /// accounts activated in this process.
     activation_attempt_high_water: HashMap<MemberId, SubscriptionAttempt>,
+    // Lifetime fence, one scalar per account/group that used recovery maintenance.
+    // Do not clear on route removal or deactivation: old EOSE can still arrive.
+    maintenance_attempt_high_water: HashMap<(MemberId, GroupId), u64>,
     /// Derived accelerator for `routes_for` group delivery (#698/#752): maps a
     /// `transport_group_id` to its candidate routes, so an inbound group event is
     /// resolved in O(matching groups) instead of scanning O(accounts × groups)
@@ -1453,6 +1629,7 @@ struct AdapterState {
     /// removal; these are relay-side cleanups only, drained on later
     /// `sync_account_groups` calls (never a reason to fail a sync).
     pending_unsubscribes: Vec<NostrSubscription>,
+    pending_scoped_unsubscribes: HashMap<String, NostrSubscription>,
     metrics: NostrAdapterMetrics,
     relay_index: RelayIndexRegistry,
     telemetry: RelayDeliveryTelemetry,
@@ -1630,6 +1807,8 @@ impl AdapterState {
     /// Drop queued per-subscription unsubscribes for an account whose relay
     /// state is being torn down wholesale via `unsubscribe_account`.
     fn clear_pending_unsubscribes_for_account(&mut self, account_id: &MemberId) {
+        self.pending_scoped_unsubscribes
+            .retain(|_, subscription| subscription.account_id() != account_id);
         self.pending_unsubscribes
             .retain(|subscription| subscription.account_id() != account_id);
     }
@@ -1696,15 +1875,27 @@ impl AdapterState {
         self.telemetry.record_sighting(message_id, relay, now_ms);
     }
 
+    fn record_scoped_subscription_start(
+        &mut self,
+        subscription: &NostrSubscription,
+        id: &str,
+        now_ms: u64,
+    ) {
+        let relays = subscription
+            .endpoints()
+            .iter()
+            .map(|endpoint| self.relay_index.index_for(endpoint))
+            .collect::<Vec<_>>();
+        self.sync.record_subscription_start(id, &relays, now_ms);
+    }
+
     fn record_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
         for subscription in subscriptions {
-            let relays: Vec<RelayIndex> = subscription
-                .endpoints()
-                .iter()
-                .map(|endpoint| self.relay_index.index_for(endpoint))
-                .collect();
-            self.sync
-                .record_subscription_start(&subscription.subscription_id(), &relays, now_ms);
+            self.record_scoped_subscription_start(
+                subscription,
+                &subscription.subscription_id(),
+                now_ms,
+            );
         }
     }
 

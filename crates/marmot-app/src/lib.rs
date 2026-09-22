@@ -191,8 +191,8 @@ pub(crate) use client::{
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
     AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
-    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings,
+    RecoveryExecutorMode, RelayTelemetryExportConfig, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
@@ -1713,7 +1713,28 @@ impl MarmotApp {
             crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
         };
         let _ = open.runtime.take_maintenance_activity();
+        let recovery_policy = if cfg!(feature = "test-policy-overrides")
+            && let Some(ms) = self.config.dev_epoch_backfill_retry_backoff_ms
+        {
+            client::recovery::RecoveryRetryPolicy {
+                base: Duration::from_millis(ms.max(1)),
+                cap: Duration::from_millis(ms.max(1).saturating_mul(20)),
+            }
+        } else {
+            client::recovery::RecoveryRetryPolicy {
+                base: EPOCH_BACKFILL_RETRY_BACKOFF,
+                cap: EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
+            }
+        };
+        let mut recovery_owner = client::recovery::AccountRecoveryOwner::open(
+            &self.account_storage(&open.state.label)?,
+            unix_now_seconds().saturating_mul(1000),
+            Instant::now(),
+            recovery_policy,
+        )?;
+        recovery_owner.select_executor_mode(self.config.recovery_executor_mode);
         let mut client = AppClient {
+            recovery_owner,
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,
@@ -1757,14 +1778,13 @@ impl MarmotApp {
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
-            epoch_backfill_retry_not_before: None,
-            pending_epoch_backfill: None,
+            pending_recovery_arm_writes: HashMap::new(),
+            pending_recovery_capacity_writes: HashMap::new(),
             released_backfill_reload_pending: true,
             #[cfg(test)]
             fail_next_released_backfill_reload: false,
             #[cfg(test)]
             fail_next_terminal_recovery_retire: false,
-            queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
@@ -3684,11 +3704,14 @@ impl MarmotApp {
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;
+        recovery_storage.restore_unacknowledged_recovery_loss()?;
         recovery_storage.synchronize_account_delivery_loss(label)?;
         let delivery_overflow_recovery = recovery_storage.account_delivery_recovery(label)?;
-        let delivery_overflow_recovery_pending = delivery_overflow_recovery.is_some();
-        let delivery_overflow_recovery_marker_token =
-            delivery_overflow_recovery.map(|recovery| recovery.marker_token);
+        let notification_loss = recovery_storage.pending_recovery_demands()?.into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
+        let delivery_overflow_recovery_pending = delivery_overflow_recovery.is_some() || notification_loss.is_some();
+        let delivery_overflow_recovery_marker_token = delivery_overflow_recovery.map(|recovery| recovery.marker_token)
+            .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
@@ -3768,10 +3791,11 @@ impl MarmotApp {
         let recovery_storage = self.account_storage(label)?;
         let recovery_label = label.to_owned();
         let recovery_marker: relay_plane::AccountDeliveryRecoveryMarker =
-            Arc::new(move |marker_token, dropped| {
+            Arc::new(move |cause, marker_token, dropped| {
                 recovery_storage
-                    .record_account_delivery_loss(
+                    .record_account_recovery_loss(
                         &recovery_label,
+                        cause,
                         marker_token,
                         dropped,
                         unix_now_seconds(),

@@ -188,6 +188,10 @@ mod migration_0090_poll_response_edges;
 mod migration_0091_account_local_identity;
 #[path = "migrations/0092_account_recovery_owner.rs"]
 mod migration_0092_account_recovery_owner;
+#[path = "migrations/0093_recovery_route_snapshot.rs"]
+mod migration_0093_recovery_route_snapshot;
+#[path = "migrations/0094_qualified_stall_observations.rs"]
+mod migration_0094_qualified_stall_observations;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -663,6 +667,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 92,
         name: "0092_account_recovery_owner",
         apply: migration_0092_account_recovery_owner::apply,
+    },
+    Migration {
+        version: 93,
+        name: "0093_recovery_route_snapshot",
+        apply: migration_0093_recovery_route_snapshot::apply,
+    },
+    Migration {
+        version: 94,
+        name: "0094_qualified_stall_observations",
+        apply: migration_0094_qualified_stall_observations::apply,
     },
 ];
 

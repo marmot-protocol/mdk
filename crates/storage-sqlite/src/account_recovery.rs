@@ -1,5 +1,19 @@
 //! Account-private recovery demand. The worker owns demand and completion;
 //! the narrow loss writer may only append monotonically increasing evidence.
+mod demand;
+pub use demand::{
+    RecoveryCause, RecoveryDemand, RecoveryDemandTicket, RecoveryPredicate, RecoveryRequest,
+};
+mod loss;
+mod plan;
+mod stall;
+pub use stall::QualifiedRecoveryStallSample;
+pub use loss::{RecoveryLossCause, RecoveryLossWatermark};
+pub use plan::{
+    RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
+    RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
+};
+
 use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64};
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -91,6 +105,17 @@ fn revision_fence(conn: &Connection) -> StorageResult<RecoveryRevisionFence> {
         inventory_revision: i64_to_u64(inventory)?,
         obligations,
     })
+}
+
+/// Invalidate coverage atomically with removal of retained inventory. Positive
+/// admissions and idempotent deletes leave this fence unchanged.
+pub(crate) fn invalidate_inventory_tx(conn: &Connection, removed: usize) -> StorageResult<()> {
+    if removed != 0 {
+        conn.execute_cached(
+            "UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1", [],
+        ).storage()?;
+    }
+    Ok(())
 }
 
 fn milliseconds(seconds: i64) -> StorageResult<i64> {
@@ -271,6 +296,51 @@ impl SqliteAccountStorage {
         revision_fence(&conn)
     }
 
+    /// Observe current desired route/capability policy, not a historical goal.
+    /// Reconnect/open with an identical snapshot is a read-equivalent no-op.
+    /// Changed policy invalidates in-flight results and rechecks pending demand,
+    /// but never forgives its durable retry reservation.
+    pub fn observe_recovery_route_snapshot(&self, snapshot: [u8; 32]) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let previous: Option<Vec<u8>> = conn.query_row_cached(
+                "SELECT route_snapshot FROM account_recovery_state WHERE singleton=1", [], |row| row.get(0),
+            ).storage()?;
+            if previous.as_deref() == Some(snapshot.as_slice()) { return Ok(false); }
+            let changed = previous.is_some() || conn.query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM account_recovery_scopes WHERE snapshot_state=1)", [], |row| row.get::<_,bool>(0),
+            ).storage()?;
+            conn.execute_cached("UPDATE account_recovery_state SET route_snapshot=?1,route_revision=route_revision+?2 WHERE singleton=1",
+                params![snapshot.as_slice(),i64::from(changed)]).storage()?;
+            if changed {
+                conn.execute_cached("UPDATE account_recovery_obligations SET revision=revision+1,eligibility=0 WHERE state=0", []).storage()?;
+            }
+            Ok(changed)
+        })
+    }
+
+    /// Automatic plans omit quiescent demand even when unrelated eligible work
+    /// is present. Explicit selection may investigate that demand once.
+    pub fn recovery_eligible_revision_fence(
+        &self,
+        explicit: bool,
+    ) -> StorageResult<RecoveryRevisionFence> {
+        let conn = self.lock()?;
+        let mut fence = revision_fence(&conn)?;
+        let mut selected = Vec::new();
+        for (id, revision) in fence.obligations {
+            let eligible: bool = conn.query_row_cached(
+                "SELECT eligibility IN (0,1) OR ?2 FROM account_recovery_obligations WHERE id=?1",
+                params![id.as_slice(), explicit], |row| row.get(0),
+            ).storage()?;
+            if eligible {
+                selected.push((id, revision));
+            }
+        }
+        fence.obligations = selected;
+        Ok(fence)
+    }
+
     /// Reserve pacing before an executor can have external effects. No policy
     /// constant lives in storage: the owner supplies the already-selected delay.
     /// A cancelled caller leaves both demand and this reservation durable.
@@ -300,7 +370,6 @@ impl SqliteAccountStorage {
             {
                 return Ok(None);
             }
-            let mut eligible = false;
             for (id, _) in &expected.obligations {
                 let unknown_format: bool = conn.query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM account_recovery_scopes
@@ -310,14 +379,12 @@ impl SqliteAccountStorage {
                 if unknown_format {
                     return Err(StorageError::Serialization("unsupported recovery scope format".into()));
                 }
-                eligible |= conn.query_row_cached(
+                let eligible: bool = conn.query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
                      WHERE id = ?1 AND state = 0 AND (eligibility IN (0, 1) OR ?2))",
                     params![id.as_slice(), explicit_override], |row| row.get::<_, bool>(0),
                 ).storage()?;
-            }
-            if !eligible {
-                return Ok(None);
+                if !eligible { return Ok(None); }
             }
             conn.execute_cached(
                 "UPDATE account_recovery_state SET next_attempt = next_attempt + 1,
@@ -326,6 +393,43 @@ impl SqliteAccountStorage {
                 params![now, delay, due],
             ).storage()?;
             Ok(Some(retry_state(&conn)?))
+        })
+    }
+
+    /// The worker calls this only for newly and durably retained input inside
+    /// the grant's scope. Engine progress, duplicate delivery and SDK counters
+    /// are not admission. Reset backoff without allowing a new activation less
+    /// than the minimum delay after this progress checkpoint.
+    pub fn checkpoint_recovery_progress(
+        &self,
+        expected: &RecoveryRevisionFence,
+        attempt_serial: u64,
+        now_ms: u64,
+        minimum_delay_ms: u64,
+    ) -> StorageResult<bool> {
+        let due = now_ms.checked_add(minimum_delay_ms).ok_or_else(|| {
+            StorageError::Serialization("recovery deadline outside supported range".into())
+        })?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let prior = retry_state(&conn)?;
+            if attempt_serial == 0 || prior.attempt_serial != attempt_serial || prior.ordinal <= 1
+                || !selected_fence_matches(&revision_fence(&conn)?, expected)
+                || !plan::no_unimported_loss(&conn)?
+            {
+                return Ok(false);
+            }
+            conn.execute_cached(
+                "UPDATE account_recovery_state SET retry_ordinal=1,retry_recorded_at_ms=?1,
+                 retry_delay_ms=?2,retry_not_before_ms=?3 WHERE singleton=1",
+                params![
+                    sqlite_integer(now_ms)?,
+                    sqlite_integer(minimum_delay_ms)?,
+                    sqlite_integer(due)?
+                ],
+            )
+            .storage()?;
+            Ok(true)
         })
     }
 
@@ -404,27 +508,13 @@ impl SqliteAccountStorage {
         dropped_count: u64,
         observed_at_seconds: u64,
     ) -> StorageResult<()> {
-        let integer = |value| {
-            i64::try_from(value).map_err(|_| {
-                StorageError::Serialization("recovery evidence outside supported range".into())
-            })
-        };
-        self.lock()?
-            .execute_cached(
-                "INSERT INTO account_delivery_loss_evidence
-             (account_label, cause, marker_token, pending_since, dropped_count)
-             VALUES (?1, 0, ?2, ?3, ?4)
-             ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
-                 dropped_count = MAX(dropped_count, excluded.dropped_count)",
-                params![
-                    label,
-                    integer(marker_token)?,
-                    integer(observed_at_seconds)?,
-                    integer(dropped_count)?
-                ],
-            )
-            .storage()?;
-        Ok(())
+        self.record_account_recovery_loss(
+            label,
+            RecoveryLossCause::Queue,
+            marker_token,
+            dropped_count,
+            observed_at_seconds,
+        )
     }
 }
 
