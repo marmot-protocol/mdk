@@ -28,7 +28,9 @@ adds a `nostr-sdk` backed `NostrSdkRelayClient`.
 
 `install_group_maintenance_recovery_subscription` accepts the account recovery owner's durable attempt serial and
 returns an opaque wire id. A replacement session must use a fresh serial, including after cancellation or reopen.
-Reusing a serial joins the same logical attempt; it is not a new first-EOSE boundary. Remove the session with
+Reusing a serial joins only a live session without resetting its EOSE. After failure, cancellation or removal, the adapter
+requires a strictly greater serial for that account/group, even across account activation. Its lifetime high-water map
+retains one scalar per account/group that used this API. Remove the session with
 `remove_group_maintenance_recovery_subscription` and its returned id. Failed or cancelled teardown retains retry intent.
 
 `subscription_endpoint_eose` reports EOSE only for the caller-supplied endpoint in that subscription's captured

@@ -465,29 +465,23 @@ pub trait NostrRelayClient: Send + Sync {
     /// closed instead of silently issuing an unfenced maintenance request.
     async fn subscribe_scoped(
         &self,
-        subscription: NostrSubscription,
-        subscription_id: String,
+        _subscription: NostrSubscription,
+        _subscription_id: String,
     ) -> Result<(), TransportAdapterError> {
-        if subscription_id != subscription.subscription_id() {
-            return Err(TransportAdapterError::Subscription(
-                "scoped subscription unsupported".to_owned(),
-            ));
-        }
-        self.subscribe(subscription).await
+        Err(TransportAdapterError::Subscription(
+            "scoped subscription unsupported".to_owned(),
+        ))
     }
 
     /// Remove the exact wire id supplied to `subscribe_scoped`.
     async fn unsubscribe_scoped(
         &self,
-        subscription: NostrSubscription,
-        subscription_id: String,
+        _subscription: NostrSubscription,
+        _subscription_id: String,
     ) -> Result<(), TransportAdapterError> {
-        if subscription_id != subscription.subscription_id() {
-            return Err(TransportAdapterError::Subscription(
-                "scoped subscription unsupported".to_owned(),
-            ));
-        }
-        self.unsubscribe(subscription).await
+        Err(TransportAdapterError::Subscription(
+            "scoped subscription unsupported".to_owned(),
+        ))
     }
 
     /// Tear down every subscription this client holds for an account.
@@ -795,7 +789,8 @@ impl NostrTransportAdapter {
     }
 
     /// Install a maintenance session fenced by the recovery owner's durable
-    /// attempt. Reusing a token joins that session; a new attempt has a new id.
+    /// attempt. Reusing a live token joins that session. Once removed or failed,
+    /// a strictly greater token is required, including across account activation.
     pub async fn install_group_maintenance_recovery_subscription(
         &self,
         account_id: &MemberId,
@@ -825,13 +820,13 @@ impl NostrTransportAdapter {
             endpoints: group.endpoints.clone(),
         };
         let subscription_id = match attempt {
-            Some(attempt) => {
-                let mut digest = Sha256::new();
-                digest.update(b"maintenance-recovery-v1");
-                digest.update(subscription.subscription_id().as_bytes());
-                digest.update(attempt.to_be_bytes());
-                format!("{:x}", digest.finalize())
-            }
+            Some(attempt) => compact_subscription_id(
+                "maintenance-recovery",
+                &[
+                    subscription.subscription_id().as_bytes(),
+                    &attempt.to_be_bytes(),
+                ],
+            ),
             None => subscription.subscription_id(),
         };
         let now_ms = self.now_ms();
@@ -843,7 +838,21 @@ impl NostrTransportAdapter {
             if state.maintenance_routes.contains_key(&subscription_id) {
                 return Ok(subscription_id);
             }
-            state.pending_scoped_unsubscribes.remove(&subscription_id);
+            if let Some(attempt) = attempt {
+                let key = (account_id.clone(), group.group_id.clone());
+                if state
+                    .maintenance_attempt_high_water
+                    .get(&key)
+                    .is_some_and(|high| attempt <= *high)
+                {
+                    return Err(TransportAdapterError::Subscription(
+                        "maintenance recovery attempt was already consumed".into(),
+                    ));
+                }
+                // Burn before I/O. Cancellation and even a confirmed CLOSE can
+                // leave late notifications, so removal never resets this fence.
+                state.maintenance_attempt_high_water.insert(key, attempt);
+            }
             // A history REQ can synchronously replay messages. Routing must
             // exist before SDK deduplication consumes their first delivery.
             state
@@ -862,23 +871,30 @@ impl NostrTransportAdapter {
                 let mut state = cleanup_state.write().await;
                 state.maintenance_routes.remove(&cleanup_id);
                 state.sync.forget_subscription(&cleanup_id);
-                state
-                    .pending_scoped_unsubscribes
-                    .insert(cleanup_id, cleanup_subscription);
+                if attempt.is_some() {
+                    state
+                        .pending_scoped_unsubscribes
+                        .insert(cleanup_id, cleanup_subscription);
+                }
                 state.rebuild_transport_group_index();
             }
         });
-        if let Err(error) = self
-            .relay_client
-            .subscribe_scoped(subscription.clone(), subscription_id.clone())
-            .await
-        {
+        let result = if attempt.is_some() {
+            self.relay_client
+                .subscribe_scoped(subscription.clone(), subscription_id.clone())
+                .await
+        } else {
+            self.relay_client.subscribe(subscription.clone()).await
+        };
+        if let Err(error) = result {
             let mut state = self.state.write().await;
             state.maintenance_routes.remove(&subscription_id);
             state.sync.forget_subscription(&subscription_id);
-            state
-                .pending_scoped_unsubscribes
-                .insert(subscription_id.clone(), subscription);
+            if attempt.is_some() {
+                state
+                    .pending_scoped_unsubscribes
+                    .insert(subscription_id.clone(), subscription);
+            }
             state.rebuild_transport_group_index();
             let _ = complete.send(());
             return Err(error);
@@ -1596,6 +1612,9 @@ struct AdapterState {
     /// the ids its predecessor is still using. Bounded by the number of distinct
     /// accounts activated in this process.
     activation_attempt_high_water: HashMap<MemberId, SubscriptionAttempt>,
+    // Lifetime fence, one scalar per account/group that used recovery maintenance.
+    // Do not clear on route removal or deactivation: old EOSE can still arrive.
+    maintenance_attempt_high_water: HashMap<(MemberId, GroupId), u64>,
     /// Derived accelerator for `routes_for` group delivery (#698/#752): maps a
     /// `transport_group_id` to its candidate routes, so an inbound group event is
     /// resolved in O(matching groups) instead of scanning O(accounts × groups)
@@ -1872,13 +1891,11 @@ impl AdapterState {
 
     fn record_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
         for subscription in subscriptions {
-            let relays: Vec<RelayIndex> = subscription
-                .endpoints()
-                .iter()
-                .map(|endpoint| self.relay_index.index_for(endpoint))
-                .collect();
-            self.sync
-                .record_subscription_start(&subscription.subscription_id(), &relays, now_ms);
+            self.record_scoped_subscription_start(
+                subscription,
+                &subscription.subscription_id(),
+                now_ms,
+            );
         }
     }
 
