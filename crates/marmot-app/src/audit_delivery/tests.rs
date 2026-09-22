@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use super::recovery::FaultPoint;
+use super::state::MAX_RANGE_BYTES;
 use super::*;
 
 fn profile() -> DestinationProfile {
@@ -486,6 +487,24 @@ fn live_prepare_and_seal_reject_same_inode_registered_prefix_rewrite() {
         state_before
     );
 
+    let (root, journal, segment, store) = store_with_segment(b"one\n");
+    let path = store.segment_path(&segment).unwrap();
+    let generation = path.parent().unwrap().parent().unwrap();
+    drop(store);
+    let mut reopened = reopen(&root, &journal);
+    let manifest_before = fs::read(generation.join("manifest.json")).unwrap();
+    let inode = fs::metadata(&path).unwrap().ino();
+    fs_private::write_private(&path, b"two\n").unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert!(matches!(
+        reopened.seal_active_segment(&segment),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+    assert_eq!(
+        fs::read(generation.join("manifest.json")).unwrap(),
+        manifest_before
+    );
+
     let (_root, _journal, segment, mut store) = store_with_segment(b"one\n");
     store.seal_active_segment(&segment).unwrap();
     let path = store.segment_path(&segment).unwrap();
@@ -608,6 +627,34 @@ fn j10_incomplete_tail_and_missing_newline_are_bounded_without_repair() {
         store.register_segment(segment, SegmentStatus::Active),
         Err(AuditDeliveryError::RangeTooLarge)
     ));
+
+    let exact_limit = vec![b'x'; MAX_RANGE_BYTES];
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let segment = SegmentId::generate();
+    let mut store = AuditDeliveryStore::create(temporary.path(), journal, profile()).unwrap();
+    fs_private::write_private(&store.segment_path(&segment).unwrap(), &exact_limit).unwrap();
+    assert!(matches!(
+        store.register_segment(segment, SegmentStatus::Active),
+        Err(AuditDeliveryError::RangeTooLarge)
+    ));
+
+    let repairable_tail = vec![b'x'; MAX_RANGE_BYTES - 1];
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let segment = SegmentId::generate();
+    let mut store = AuditDeliveryStore::create(temporary.path(), journal, profile()).unwrap();
+    fs_private::write_private(&store.segment_path(&segment).unwrap(), &repairable_tail).unwrap();
+    store
+        .register_segment(segment.clone(), SegmentStatus::Active)
+        .unwrap();
+    assert!(store.prepare_next().unwrap().is_none());
+    append(&store, &segment, b"\n");
+    store.seal_active_segment(&segment).unwrap();
+    assert_eq!(
+        store.prepare_next().unwrap().unwrap().bodies(),
+        &[repairable_tail]
+    );
 
     let (_root, _journal, _segment, mut store) = store_with_segment(b"incomplete");
     assert!(store.prepare_next().unwrap().is_none());

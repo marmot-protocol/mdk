@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::recovery::{
-    FaultPoint, Faults, JournalDirectories, atomic_replace, create_generation_directory,
-    create_private_directory, open_journal_directories, open_or_recover_empty_journal_directories,
-    open_segment_read, open_segment_sync, read_bounded, validate_single_component,
+    FaultPoint, Faults, JournalDirectories, atomic_replace, create_journal_directories,
+    open_or_recover_empty_journal_directories, open_segment_read, open_segment_sync, read_bounded,
+    validate_single_component,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -26,7 +26,7 @@ const STATE_FILE: &str = "state.json";
 const SEGMENTS_DIR: &str = "segments";
 const MAX_SEGMENTS: usize = 256;
 const MAX_RECORDS_PER_RANGE: usize = 8;
-const MAX_RANGE_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_RANGE_BYTES: usize = 1024 * 1024;
 const BOUNDARY_DIGEST_BYTES: u64 = 64 * 1024;
 pub(super) const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
@@ -391,9 +391,7 @@ impl AuditDeliveryStore {
             .join("audit-delivery")
             .join("v1")
             .join(journal_id.as_str());
-        create_generation_directory(&root)?;
-        create_private_directory(&root.join(SEGMENTS_DIR))?;
-        let directories = open_journal_directories(&root)?;
+        let directories = create_journal_directories(&root)?;
         let manifest = Manifest {
             version: FORMAT_VERSION,
             journal_id: journal_id.clone(),
@@ -620,7 +618,8 @@ impl AuditDeliveryStore {
         }
         let file_name = segment_file_name(segment_id);
         let file = open_segment_sync(&self.directories.segments, OsStr::new(&file_name))?;
-        self.validate_live_segment(&file, entry)?;
+        validate_registered_shape(&file, entry)?;
+        validate_registered_digest(&file, entry)?;
         let (length, digest) = file_length_and_digest(&file)?;
         validate_acknowledged_boundary(&file, self.cursor(segment_id)?)?;
         validate_payload_framing(&file, length, true)?;
@@ -1149,7 +1148,7 @@ fn validate_payload_framing(
                 .len()
                 .checked_add(amount - body_start)
                 .ok_or(AuditDeliveryError::RangeTooLarge)?;
-            if body_length > MAX_RANGE_BYTES {
+            if body_length >= MAX_RANGE_BYTES {
                 return Err(AuditDeliveryError::RangeTooLarge);
             }
             body.extend_from_slice(&buffer[body_start..amount]);
@@ -1323,7 +1322,7 @@ fn read_complete_range(
         if start + consumed as u64 != expected_end || consumed != bytes.len() || bodies.is_empty() {
             return Err(AuditDeliveryError::CorruptState);
         }
-    } else if bodies.is_empty() && length.saturating_sub(start) > MAX_RANGE_BYTES as u64 {
+    } else if bodies.is_empty() && length.saturating_sub(start) >= MAX_RANGE_BYTES as u64 {
         return Err(AuditDeliveryError::RangeTooLarge);
     }
     Ok((bodies, start + consumed as u64))

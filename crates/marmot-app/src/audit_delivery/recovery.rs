@@ -1,5 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,44 +98,38 @@ pub(super) fn validate_single_component(value: &str) -> Result<(), AuditDelivery
     Ok(())
 }
 
-pub(super) fn create_private_directory(path: &Path) -> Result<(), AuditDeliveryError> {
-    fs_private::prepare_directory_path(
-        path,
+pub(super) fn create_journal_directories(
+    path: &Path,
+) -> Result<JournalDirectories, AuditDeliveryError> {
+    let parent = path.parent().ok_or(AuditDeliveryError::UnsafePath)?;
+    let parent = fs_private::prepare_directory_path(
+        parent,
         fs_private::PRIVATE_DIR_MODE,
         fs_private::ExistingDirectoryMode::Enforce,
     )
-    .map(|_| ())
     .map_err(|source| AuditDeliveryError::Filesystem {
         operation: "create private journal directory",
         source,
-    })
-}
-
-pub(super) fn create_generation_directory(path: &Path) -> Result<(), AuditDeliveryError> {
-    let parent = path.parent().ok_or(AuditDeliveryError::UnsafePath)?;
-    create_private_directory(parent)?;
-    let mut builder = fs::DirBuilder::new();
-    use std::os::unix::fs::DirBuilderExt;
-    builder.mode(fs_private::PRIVATE_DIR_MODE);
-    match builder.create(path) {
-        Ok(()) => Ok(()),
+    })?;
+    let name = path.file_name().ok_or(AuditDeliveryError::UnsafePath)?;
+    let root = match parent.create_private_subdirectory(name) {
+        Ok(root) => root,
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            Err(AuditDeliveryError::GenerationCollision)
+            return Err(AuditDeliveryError::GenerationCollision);
         }
-        Err(source) => Err(AuditDeliveryError::Filesystem {
-            operation: "create journal generation directory",
-            source,
-        }),
-    }
-}
-
-pub(super) fn open_journal_directories(
-    path: &Path,
-) -> Result<JournalDirectories, AuditDeliveryError> {
-    let root = open_generation_directory(path)?;
+        Err(source) => {
+            return Err(AuditDeliveryError::Filesystem {
+                operation: "create journal generation directory",
+                source,
+            });
+        }
+    };
     let segments = root
-        .open_existing_private_subdirectory(OsStr::new("segments"))
-        .map_err(map_generation_directory_error)?;
+        .create_private_subdirectory(OsStr::new("segments"))
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "create journal segments directory",
+            source,
+        })?;
     Ok(JournalDirectories { root, segments })
 }
 
