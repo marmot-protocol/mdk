@@ -1,7 +1,7 @@
 ---
 title: Account recovery ownership — issue 1946
 updated: 2026-09-22
-status: Phase A reviewed design; loss-writer exception approved; implementation pending
+status: Phase A design; loss-writer exception approved; implementation pending
 ---
 
 # Account recovery ownership
@@ -10,7 +10,6 @@ This is the concrete Phase A design for [#1946](https://github.com/marmot-protoc
 checked against clean source revision `3db9d29de00222622cd98a9598982457ecb61786`.
 It applies the agreed ownership, completion and staged-delivery sections of
 [#1976](https://github.com/marmot-protocol/mdk/issues/1976), read on 2026-09-22.
-The initial schema/outcome review is recorded on PR #1982; corrections are recorded below.
 This is not evidence that the new owner is implemented.
 
 Recommendation: one `AccountRecoveryOwner` inside `AppClient`, invoked through the
@@ -44,15 +43,15 @@ The integration may not activate until B1–B3's relevant safety regressions pas
 | `runtime/account_worker.rs:1805,1882`, maintenance tick | 15-second `sync_with_partial_progress` when key-package catch-up required, followed by epoch helper | Maintenance requests/joins typed prerequisite; history selection is owner-only. Keep 15-second caller budget and domain state; budget expiry leaves demand. Nonblocking resume is P7 | B2; maintenance plus receive joins same demand without resetting deadline |
 | `client/mod.rs:1046`, `advance_post_join_maintenance_subscriptions` | Per-group temporary full-history subscription, durable CatchUp/EOSE deadline; `group_maintenance_any_eose` at 1174 | Maintenance owns prerequisite and grace/quiet state; owner authorizes/coalesces history-interest acquisition. Helper becomes install/poll/retire executor for owner grant, never a retry decision | B2/B3; first EOSE advances only protocol prerequisite, never account history; restart keeps deadline |
 | `runtime/account_worker.rs:2121` (`handle_account_worker_catch_up`, live dispatcher) and `:3265` (`account_worker_command_future`, currently bypassed by the live dispatcher), explicit catch-up; `client/sync.rs:4269`, `repair_full_history_with_control` | Explicit seam bypasses epoch cooldown, rotates epoch intents, then may run another unfloored repair/overflow leg | Public wrappers request one caller ticket, join compatible plan, use existing cancellation/partial-summary adapter. Remove prearmed epoch loop and autonomous overflow leg | B2; one activation across quanta, cancelled waiter, later durable demand retained |
-| `client/sync.rs:4036`, `run_pending_epoch_backfill`; worker helper at 5402 | `PendingEpochBackfill`/queue, `Instant` cooldown, per-intent counters; `activate_transport(None)` and full-history drain, then unconditional overflow chaining at 5468 | Remove execution/retry ownership and queue. Detector supplies facts; one owner grants executor. Keep audit translation and ingestion/checkpoint helpers only as delegates | B2; baseline fixture below changes 2/3 activations to 1/1 |
+| `client/sync.rs:4036`, `run_pending_epoch_backfill`; `runtime/account_worker.rs:5402` helper | `PendingEpochBackfill`/queue, `Instant` cooldown, per-intent counters; `activate_transport(None)` and full-history drain, then unpaced overflow chaining at `runtime/account_worker.rs:5467` | Remove execution/retry ownership and queue. Detector supplies facts; one owner grants executor. Keep audit translation and ingestion/checkpoint helpers only as delegates | B2; baseline fixture below changes 2/3 activations to 1/1 |
 | `client/sync.rs:1855`, `recover_delivery_overflow*` | Durable marker plus process-local plane generation; no own cooldown; fresh activation each call | Internal executor only, requiring nonconstructible grant. Completion moves to owner transaction; no helper may clear marker independently | B1/B2; overflow cannot bypass owner cooldown from any seam |
 | `client/epoch_stall.rs`, `backfill_trigger_for`, `observe_undecryptable`, `observe_resource_refusal` | Threshold, contested fork and refused input currently arm same broad replay | Detector retains authenticated facts and debounce; evidence policy below chooses demand/local work. Arming cannot authorize I/O | B2/B3; mixed evidence and refusal-redelivery tests |
 | `epoch_stall.rs`, `rearm_wedged`, `observe_fruitless_completion`; `sync.rs`, `finish_epoch_backfill_execution` | Hourly same-epoch arm buys replay; three EOSE-confirmed fruitless replays can escalate | Replace replay-arm precondition with durable, unique qualified coverage + engine-observation certificates. Timer schedules reassessment only | B3; no repeated certificate count, valid wedge escalation without blanket replay |
 | Worker reconnect at `account_worker.rs:1585`; `client/sync.rs:628`, `note_connectivity_restored` | Worker reconstruction/backoff restores subscriptions and live tail; intentionally skips blocking catch-up | Restore owner state locally; reconnect submits readiness/loss facts without executing catch-up in reopen. Keep worker lifecycle and backend connection retry | B2; reconnect replies/live tail service before any maintenance acquisition |
 | `client/sync.rs:1105`, `retry_pending_runtime_group_subscription_refresh`; worker `ScheduledRuntimeGroupSubscriptionRefresh` | Deferred route refresh may force activation; plane adapter reuses complete identical incremental activation | Plane retains registration authority. Registration is live-interest installation, not implicit history repair; route changes notify owner and invalidate matching plans | B2 minimal readiness adaptation; P3 isolated registration; route-revision/stale EOSE tests |
-| `relay_plane/mod.rs:1610,1748`, notification-consumer lag/exit | 0.44 broadcast `Lagged` exits the consumer; forwarder recovery clears account delivery routes and separately broadcasts directory `RecoveryRequired`. This does not create the account-queue overflow marker | Record typed receiver-loss evidence for affected account contexts, distinct from queue overflow; join unknown-scope demand through owner, invalidate dependent coverage. Directory signal remains directory-only | B2; lag/closed receiver causes distinct loss demand, not invented event-drop counts or directory-driven replay |
+| `relay_plane/mod.rs:1610,1748`, notification-consumer lag/exit | 0.44 broadcast `Lagged` exits the consumer; forwarder recovery clears account delivery routes and separately broadcasts directory `RecoveryRequired`. This does not create the account-queue overflow marker | Plane reports an explicit lag exit cause to the worker; the worker records typed receiver-loss evidence and joins distinct unknown-scope demand. Generic closure/reconnect is not evidence. Directory signal remains directory-only | B2; confirmed lag is an intentional new loss trigger; ordinary close, shutdown and reconnect do not request history |
 | `relay_plane/mod.rs:1222`, account queue saturation | Router `record_drop` latches a generation and cumulative drop count, reserves a control slot, and starts marker persistence independently of the saturated queue | Keep loss fence; owner joins persisted queue-loss evidence and compares token **and drop count** at completion | B2; later omissions with the same token invalidate old results; other accounts continue |
-| `lib.rs:3773`, recovery-marker callback; `relay_plane/mod.rs`, `persist_marker_before_drop` | A separate account-local blocking task persists overflow evidence and retries storage contention every 100 ms while the router continues; this is not the serialized account worker | Recommend retaining only this loss-evidence writer, with an evidence table consumed by the owner. It cannot select/complete recovery or access engine/receipts. The task owner approved this narrow exception on 2026-09-22 | B1/B2, approved exception; block worker, omit delivery, crash before worker resumes, verify durable loss on reopen |
+| `lib.rs:3773`, recovery-marker callback; `relay_plane/mod.rs`, `persist_marker_before_drop` | A separate account-local blocking task persists overflow evidence and retries storage contention every 100 ms while the router continues; this is not the serialized account worker | Retain only this loss-evidence writer, extending it to persist same-token count growth until the generation closes, with an evidence table consumed by the owner. It cannot select/complete recovery or access engine/receipts. The task owner approved this narrow exception on 2026-09-22 | B1/B2, approved exception; block worker, omit delivery, crash before worker resumes, verify durable loss on reopen |
 | `client/receipts.rs`, `transport_receipts` / release synchronization | Sole exclusive receipt view; consumes released journal, retires disk and memory receipts, reloads old backfill intents | Keep sole consumer and atomic storage contract. Transaction creates/joins owner demand and invalidates inventory revision instead of writing old intent table | B1/B2; reload failure after journal consumption, released ID fetched despite SDK seen cache |
 | `client/mod.rs` / `sync.rs`, `recover_superseded_invites_best_effort` | Invitation recovery/publication state, exact welcome retries | Separate invitation owner, unchanged; any independently justified account-history need uses owner, not blanket migration of invitation jobs | Retain; existing invitation regressions |
 | `runtime/onboarding*`, setup readiness/recovery | Durable onboarding stages and publication/preflight | Separate onboarding owner, unchanged | Retain; setup cancellation/reopen tests |
@@ -116,11 +115,10 @@ endpoint strings leave encrypted storage in diagnostics.
 | `account_recovery_state`, singleton `1` | `next_attempt`, `loss_revision`, `route_revision`, `inventory_revision`; `retry_ordinal`, `retry_recorded_at_ms`, `retry_delay_ms`, `retry_not_before_ms`. `inventory_revision` invalidates coverage on release/removal/compaction, not every positive admission. Rollback executor selection is process-local configuration, not persisted schema |
 | `account_recovery_obligations`, `id` BLOB PK | Unique typed `demand_key`; `cause`, nullable group FK/`stalled_epoch`, legacy account label/loss token/count/time where applicable; `revision`, `predicate`, `urgency`, timestamps, `state` (`pending`, `satisfied`, `retired`), `eligibility` (`ready`, `retry`, `waiting_capacity`, `waiting_capability`, `needs_deep_repair`), `incomplete_reason`, durable/caller origin. Account-wide demand has NULL group |
 | `account_recovery_scopes`, `(obligation_id, scope_id)` | FK cascade; route kind/role/MLS group/transport ID, `route_revision`, `since` (NULL = unbounded older request), frozen `until`, optional 32-byte `known_event_id`; `scope_revision`, `snapshot_state` (`unresolved`, `ready`), inventory floor/rotation progress. `scope_format = 1` versions an explicitly decoded plan/outcome blob containing canonical requested/admitted endpoints, endpoint policy, qualified endpoint checkpoints, attempt token and captured revision fences. Unknown versions fail closed. One latest checkpoint per scope, no separate attempt log or known-event table |
-| `account_delivery_loss_evidence`, `(account_label, cause, marker_token)` PK | Loss token, first-observed time, max observed count and nullable owner-imported count (NULL means never imported, including zero-count observations). Copy old 0053 rows as queue-loss facts. The approved writer may only insert/increase observed evidence; only the owner advances imported count/acknowledges it. Distinct tokens cannot overwrite one another; cause separates queue omissions from notification-consumer loss. No evidence row authorizes I/O or clears demand |
+| `account_delivery_loss_evidence`, `(account_label, cause, marker_token)` PK | Loss token, first-observed time, max observed count, nullable owner-imported count (NULL means never imported, including zero-count observations) and nullable legacy-retired count. Copy old 0053 rows with imported count equal to observed count because their demand is migrated in the same transaction. The approved off-worker writer may only insert/increase queue-loss evidence; notification evidence is worker-written. Only the owner advances imported count/acknowledges it. Distinct tokens cannot overwrite one another; cause separates queue omissions from notification-consumer loss. No evidence row authorizes I/O or clears demand |
 
 `demand_key` is a typed encoding: overflow + account label (normally one per database);
-epoch gap + MLS
-group; maintenance prerequisite + durable job ID + predicate; explicit repair +
+notification-consumer loss + account label; epoch gap + MLS group; maintenance prerequisite + durable job ID + predicate; explicit repair +
 operation token. A known-event demand includes its scope identity. Distinct causes
 remain distinct rows. Coalescing operates on plan work, not by flattening causes
 into one row. Do not allocate a new row on every receive tick or every timer.
@@ -165,14 +163,15 @@ intent still creates demand atomically when the existing receipt consumer runs.
 
 Create the four tables, convert and validate row counts/keys, then remove the two
 old demand tables within the same migration transaction. Copy each old loss row
-into the evidence table as well as preserving its demand in the ledger. The owner
-imports evidence transactionally: only previously unobserved loss advances the
-loss/obligation revision, and imported counts cannot regress. Worker observations
-also preserve an imported watermark, so a delayed callback for already-observed loss
-is a duplicate. Adopting an already-imported token changes only the compatibility
-pointer, not revision or eligibility. Only the serialized worker adopts a current plane token; random
-tokens and callback timestamps never establish generation order. An unrecognized
-late token joins uncertain loss conservatively without replacing the current token. Retain the current evidence watermark until the
+into the evidence table with `imported_count = observed_count`, as well as preserving
+its demand in the ledger. Only new loss changes the imported watermark. Changing
+which token the compatibility pointer represents also advances loss/obligation
+revisions, so a grant cannot keep the same fence across generation adoption;
+adopting already-imported evidence does not reset quiescence or retry state.
+Already-imported callback duplicates cannot replace that pointer. An unrecognized
+token is joined with a changed pointer, making an older token-only clear fail closed;
+random token values do not establish generation order. Every generation retains
+its own import/legacy-retirement watermark. Retain the current evidence until the
 plane confirms its marker writer is finished; reclaim it only after fenced
 completion. Reopen has no surviving old callback. Compare unimported evidence
 inside the completion transaction; a newer count is not hidden behind the worker
@@ -180,6 +179,10 @@ being occupied. Inject both late-writer and same-token-count races in B1/B2.
 Retain the old tables' supported Rust
 storage methods as adapters into the new authority, not writable legacy SQL tables.
 Read adapters select the corresponding causes; mark adapters perform request/join.
+Legacy token retirement records its own evidence watermark and restores any other
+joined generations atomically, returning incomplete while any remain. Imported
+is not retired; retained watermarks suppress late duplicates while count growth
+rearms demand. Qualified owner completion remains the only evidence-reclamation path.
 Keep the public storage clear signatures and their documented token/epoch-exact
 low-level retirement semantics, restricted to the corresponding legacy cause;
 legacy retirement retains imported loss watermarks and cannot reclaim them;
@@ -198,12 +201,17 @@ and cannot promise preservation of later writes; no automatic destructive down
 migration is proposed. This preserves the existing schema-compatibility contract.
 
 The supported runtime rollback is a **same-schema, single-owner conservative
-executor mode**, selected through runtime configuration only while no grant is active. It retains every ledger
-row/revision, retry deadline and receipt contract and uses the legacy broad executor
-under the same owner. It never resurrects old independent schedulers or old-table
+executor mode**, selected through runtime configuration only while no grant is active.
+Normal mode coalesces compatible obligations into one plan; conservative mode disables
+that coalescing and selects one obligation per legacy broad-executor grant. This
+is a fallback for plan-sharing defects, not a rollback of the ledger or its owner.
+It retains every row/revision, account-wide retry deadline, completion predicate and
+receipt contract; processing separate obligations cannot buy extra retry overrides. It never resurrects old independent schedulers or old-table
 writers. Faults can suspend new authorization while local receive/projection remains
 available. B1/B2 must demonstrate normal→conservative→normal on populated pending
-state and cancellation during handoff before activation; rollback does not claim
+state and cancellation during handoff before activation. The fixture must show one
+coalesced normal plan versus separate conservative grants for compatible demands,
+with unchanged pacing and independent completion; rollback does not claim
 to cure the legacy worker-blocking/coverage limitations. Remove the temporary mode
 only after #1948/#1945's rollout/rollback gate, not during this consolidation.
 
@@ -337,6 +345,22 @@ explicit authorized withdrawal, never the result of unavailable coverage. No deb
 is marked satisfied to stop traffic. Test zero additional activations across
 multiple capped retry windows and reopen, followed by each permitted rearm cause.
 
+Apply that eligibility rule by cause, without changing completion predicates:
+
+- An epoch-gap attempt with no admitted input, transient failure, or a legacy EOSE
+  remains `retry` on the capped schedule. EOSE's lack of a coverage certificate is
+  not itself proof that acquiring the missing epoch input is unsupported. Explicitly
+  established lack of the required acquisition capability can quiesce that scope.
+- Unknown-scope overflow, notification loss and below-floor investigations have a
+  bounded automatic investigation budget. Proven unsupported coverage or exhaustion
+  of that budget preserves debt in `waiting_capability`/`needs_deep_repair`; an
+  unchanged unknown result cannot authorize a standing full-history replay loop.
+- `Unknown` alone proves neither incapability nor completion. Carry the cause,
+  independent missing-input evidence and remaining investigation budget into policy.
+  All-endpoint history still requires qualified coverage and admission; only an
+  independently declared known-event predicate can complete from one retained copy.
+  Epoch movement alone cannot be substituted for either admission or coverage.
+
 Persist `(recorded_at_ms, delay_ms, not_before_ms)` and ordinal, never `Instant`.
 On open sample wall time once: if it is within the stored interval, restore its
 remaining delay; if beyond due, permit one selection; if before recorded time,
@@ -436,14 +460,8 @@ Do not equate selected/registered attempts with completed recovery.
 
 ## Delivery and design gate
 
-PR #1982 was independently reviewed by Claude Opus and Cursor Grok Fast at
-`8a470a65229dc3b599e8e896a0aa1ed36aeb681d`. This revision addresses the source-map/
-ledger corrections, adds unprovable-scope quiescence, reduces seven proposed tables
-to four and removes persisted rollout mode. Both reviewers exited successfully;
-these are addressed findings, not a claim that they reviewed the revised head.
-
 1. Phase A: publish this source-checked proposal and executable baseline. The initial
-   schema/outcome review required by #1976 is recorded above; resolve findings before
+   schema/outcome review required by #1976 is recorded on the PR; resolve findings before
    adding tables or changing runtime behavior. No implementation acceptance is
    implied by a documentation PR or by the prior architecture discussion.
 2. B1: failing-first storage/state-machine tests, populated migration and rollback
@@ -476,6 +494,21 @@ acquisition can hold the worker. Preserve only loss-evidence persistence and its
 close-terminal behavior. Demand, retry, completion, receipts and MLS remain under
 the account mutation owner. This is an explicit exception to the literal sole-
 worker storage-mutation sentence, not permission for another recovery dispatcher.
+
+The current writer stops after its first successful snapshot. B2 must instead
+coalesce each same-token increase into durable `max(observed_count)` before treating
+that generation as fully persisted. Completion compares the captured count against
+both the durable watermark and the plane fence, and joins newer loss rather than
+clearing it. Migration imports its initial watermark once; startup must not count
+the same migrated omission as fresh loss.
+
+Notification lag does not widen this exception. The plane carries a typed lag exit
+reason, distinct from shutdown/ordinary closure, to each affected account worker.
+The worker assigns a fresh incident token, writes a zero-count notification fact
+(no invented event-loss count), and imports it into the separate notification key
+in one transaction. This intentionally adds bounded investigation for confirmed
+consumer loss; reconnect still restores the live tail without synchronous history.
+This is B2 work, not a claim that the current forwarder supplies that exit contract.
 
 The rejected alternative was to eliminate that writer and pre-arm a worker-written
 live-session guard, converting unclean close into unknown-scope debt. It would need
