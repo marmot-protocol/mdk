@@ -567,8 +567,9 @@ impl AuditDeliveryStore {
         if recover_missing_initial_state {
             store.publish_state()?;
         }
-        store.recover_registration_gap()?;
-        store.validate_all()?;
+        if !store.recover_registration_gap()? {
+            store.validate_all()?;
+        }
         Ok(store)
     }
 
@@ -1023,9 +1024,9 @@ impl AuditDeliveryStore {
         self.acknowledged_prefix_validations.load(Ordering::Relaxed)
     }
 
-    fn recover_registration_gap(&mut self) -> Result<(), AuditDeliveryError> {
+    fn recover_registration_gap(&mut self) -> Result<bool, AuditDeliveryError> {
         if self.manifest.segments.len() == self.state.cursors.len() {
-            return Ok(());
+            return Ok(false);
         }
         if self.manifest.segments.len() != self.state.cursors.len().saturating_add(1)
             || self.state.prepared.is_some()
@@ -1060,7 +1061,7 @@ impl AuditDeliveryStore {
         validation?;
         self.publish_state_value(&recovered)?;
         self.state = recovered;
-        Ok(())
+        Ok(true)
     }
 
     fn validate_prepared_cursor(&self, prepared: &PreparedState) -> Result<(), AuditDeliveryError> {
