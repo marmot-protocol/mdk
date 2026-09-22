@@ -8,6 +8,44 @@ pub enum HostPerformanceOperationFfi {
     InboundMessageVisible,
     ConversationLocalVisible,
     ConversationComposerReady,
+    LinuxStartupBeforeVault,
+    LinuxStartupAfterVault,
+    LinuxWindowInit,
+    LinuxFontsInit,
+    LinuxRuntimeBoot,
+    LinuxAccountLoad,
+    LinuxAccountSwitch,
+    LinuxFrameUpdate,
+    LinuxFrameLayout,
+    LinuxFrameDraw,
+    LinuxFramePresent,
+    LinuxFramePostPresent,
+    LinuxFrameUntilPresent,
+    LinuxFrameIdleWait,
+    LinuxChatListLoad,
+    LinuxContactsLoad,
+    LinuxArchivedLoad,
+    LinuxProfileLoad,
+    LinuxProfileRead,
+    LinuxTimelineOpen,
+    LinuxTimelinePage,
+    LinuxTimelineHandoff,
+    LinuxTimelineApply,
+    LinuxSendWorker,
+    LinuxMessageOpWorker,
+    LinuxSearchGlobal,
+    LinuxSearchSidebar,
+    LinuxMediaQueueWait,
+    LinuxMediaWorker,
+    LinuxMediaLoad,
+    LinuxMediaCacheHit,
+    LinuxMediaDecode,
+    LinuxMediaPublish,
+    LinuxVaultDeriveKey,
+    LinuxVaultOpen,
+    LinuxVaultCreate,
+    LinuxVaultPersist,
+    LinuxSettingsSave,
 }
 
 /// Bounded runtime diagnostics. Operation names are defined by MDK, never callers.
@@ -132,10 +170,9 @@ impl From<marmot_app::AppPerformanceOperationSnapshot> for AppPerformanceOperati
 /// Aggregate counters and fixed-bucket histograms per reviewed operation only:
 /// no account, group, message, relay, URL, pubkey, payload, or key material.
 ///
-/// The field-per-operation layout is deliberate: it mirrors
-/// `marmot_app::AppPerformanceSnapshot` exactly, so adding a phase to the app
-/// telemetry fails this conversion's exhaustive struct literal until the FFI
-/// surface is reviewed and updated in lockstep.
+/// The conversion exhaustively reviews `marmot_app::AppPerformanceSnapshot`.
+/// Linux host distributions are exported through OTLP and omitted from this
+/// record; adding a phase still requires an explicit FFI decision.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AppPerformanceSnapshotFfi {
     pub runtime_operations: Vec<RuntimePerformanceSnapshotFfi>,
@@ -233,9 +270,7 @@ pub struct AppPerformanceSnapshotFfi {
 impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
     fn from(value: marmot_app::AppPerformanceSnapshot) -> Self {
         // Destructure the source with no `..` so a new
-        // `AppPerformanceSnapshot` field fails compilation here — not just
-        // when the destination record is edited — until the FFI surface is
-        // reviewed and grows the same field in lockstep.
+        // `AppPerformanceSnapshot` field requires an explicit FFI decision.
         let marmot_app::AppPerformanceSnapshot {
             runtime_operations,
             app_start,
@@ -320,6 +355,45 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             media_download_plaintext_verify,
             host_splash_ready,
             host_foreground_local_ready,
+            // Linux distributions are available through Rust snapshots and OTLP.
+            host_linux_startup_before_vault: _,
+            host_linux_startup_after_vault: _,
+            host_linux_window_init: _,
+            host_linux_fonts_init: _,
+            host_linux_runtime_boot: _,
+            host_linux_account_load: _,
+            host_linux_account_switch: _,
+            host_linux_frame_update: _,
+            host_linux_frame_layout: _,
+            host_linux_frame_draw: _,
+            host_linux_frame_present: _,
+            host_linux_frame_post_present: _,
+            host_linux_frame_until_present: _,
+            host_linux_frame_idle_wait: _,
+            host_linux_chat_list_load: _,
+            host_linux_contacts_load: _,
+            host_linux_archived_load: _,
+            host_linux_profile_load: _,
+            host_linux_profile_read: _,
+            host_linux_timeline_open: _,
+            host_linux_timeline_page: _,
+            host_linux_timeline_handoff: _,
+            host_linux_timeline_apply: _,
+            host_linux_send_worker: _,
+            host_linux_message_op_worker: _,
+            host_linux_search_global: _,
+            host_linux_search_sidebar: _,
+            host_linux_media_queue_wait: _,
+            host_linux_media_worker: _,
+            host_linux_media_load: _,
+            host_linux_media_cache_hit: _,
+            host_linux_media_decode: _,
+            host_linux_media_publish: _,
+            host_linux_vault_derive_key: _,
+            host_linux_vault_open: _,
+            host_linux_vault_create: _,
+            host_linux_vault_persist: _,
+            host_linux_settings_save: _,
         } = value;
         Self {
             runtime_operations: runtime_operations.into_iter().map(Into::into).collect(),
@@ -422,6 +496,44 @@ impl From<HostPerformanceOperationFfi> for marmot_app::HostPerformanceOperation 
             }
             HostPerformanceOperationFfi::ConversationLocalVisible => Self::ConversationLocalVisible,
             HostPerformanceOperationFfi::ForegroundLocalReady => Self::ForegroundLocalReady,
+            HostPerformanceOperationFfi::LinuxStartupBeforeVault => Self::LinuxStartupBeforeVault,
+            HostPerformanceOperationFfi::LinuxStartupAfterVault => Self::LinuxStartupAfterVault,
+            HostPerformanceOperationFfi::LinuxWindowInit => Self::LinuxWindowInit,
+            HostPerformanceOperationFfi::LinuxFontsInit => Self::LinuxFontsInit,
+            HostPerformanceOperationFfi::LinuxRuntimeBoot => Self::LinuxRuntimeBoot,
+            HostPerformanceOperationFfi::LinuxAccountLoad => Self::LinuxAccountLoad,
+            HostPerformanceOperationFfi::LinuxAccountSwitch => Self::LinuxAccountSwitch,
+            HostPerformanceOperationFfi::LinuxFrameUpdate => Self::LinuxFrameUpdate,
+            HostPerformanceOperationFfi::LinuxFrameLayout => Self::LinuxFrameLayout,
+            HostPerformanceOperationFfi::LinuxFrameDraw => Self::LinuxFrameDraw,
+            HostPerformanceOperationFfi::LinuxFramePresent => Self::LinuxFramePresent,
+            HostPerformanceOperationFfi::LinuxFramePostPresent => Self::LinuxFramePostPresent,
+            HostPerformanceOperationFfi::LinuxFrameUntilPresent => Self::LinuxFrameUntilPresent,
+            HostPerformanceOperationFfi::LinuxFrameIdleWait => Self::LinuxFrameIdleWait,
+            HostPerformanceOperationFfi::LinuxChatListLoad => Self::LinuxChatListLoad,
+            HostPerformanceOperationFfi::LinuxContactsLoad => Self::LinuxContactsLoad,
+            HostPerformanceOperationFfi::LinuxArchivedLoad => Self::LinuxArchivedLoad,
+            HostPerformanceOperationFfi::LinuxProfileLoad => Self::LinuxProfileLoad,
+            HostPerformanceOperationFfi::LinuxProfileRead => Self::LinuxProfileRead,
+            HostPerformanceOperationFfi::LinuxTimelineOpen => Self::LinuxTimelineOpen,
+            HostPerformanceOperationFfi::LinuxTimelinePage => Self::LinuxTimelinePage,
+            HostPerformanceOperationFfi::LinuxTimelineHandoff => Self::LinuxTimelineHandoff,
+            HostPerformanceOperationFfi::LinuxTimelineApply => Self::LinuxTimelineApply,
+            HostPerformanceOperationFfi::LinuxSendWorker => Self::LinuxSendWorker,
+            HostPerformanceOperationFfi::LinuxMessageOpWorker => Self::LinuxMessageOpWorker,
+            HostPerformanceOperationFfi::LinuxSearchGlobal => Self::LinuxSearchGlobal,
+            HostPerformanceOperationFfi::LinuxSearchSidebar => Self::LinuxSearchSidebar,
+            HostPerformanceOperationFfi::LinuxMediaQueueWait => Self::LinuxMediaQueueWait,
+            HostPerformanceOperationFfi::LinuxMediaWorker => Self::LinuxMediaWorker,
+            HostPerformanceOperationFfi::LinuxMediaLoad => Self::LinuxMediaLoad,
+            HostPerformanceOperationFfi::LinuxMediaCacheHit => Self::LinuxMediaCacheHit,
+            HostPerformanceOperationFfi::LinuxMediaDecode => Self::LinuxMediaDecode,
+            HostPerformanceOperationFfi::LinuxMediaPublish => Self::LinuxMediaPublish,
+            HostPerformanceOperationFfi::LinuxVaultDeriveKey => Self::LinuxVaultDeriveKey,
+            HostPerformanceOperationFfi::LinuxVaultOpen => Self::LinuxVaultOpen,
+            HostPerformanceOperationFfi::LinuxVaultCreate => Self::LinuxVaultCreate,
+            HostPerformanceOperationFfi::LinuxVaultPersist => Self::LinuxVaultPersist,
+            HostPerformanceOperationFfi::LinuxSettingsSave => Self::LinuxSettingsSave,
         }
     }
 }

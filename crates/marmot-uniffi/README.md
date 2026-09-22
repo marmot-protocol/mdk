@@ -137,6 +137,14 @@ remain the host's responsibility, including removal of downstream copies after l
 
 ### Localization, privacy and diagnostics
 
+`record_host_performance` also accepts 38 fixed `Linux*` stages for startup, frames,
+account/timeline work, search, media and vault/settings I/O. These elapsed spans
+include early/error returns. Opt-in OTLP export reports unlabeled
+`app_host_linux_*_duration_ms` histograms and `app_host_linux_*_samples` counters,
+without success/failure series. Linux distributions are available in Rust snapshots
+and OTLP, but omitted from `AppPerformanceSnapshotFfi`. The operation enum remains
+platform-independent; regenerate Swift/Kotlin bindings when adopting its new cases.
+
 Use typed presentation, capability, deletion and group-system fields rather than parsing English
 strings or guessing from membership counts. Clients localize fallback labels and system wording.
 Preserve unknown variants/provenance as neutral presentation rather than inventing an actor.

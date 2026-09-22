@@ -105,6 +105,44 @@ pub(crate) enum AppPerformanceOperation {
     MediaDownloadPlaintextVerify,
     HostSplashReady,
     HostForegroundLocalReady,
+    HostLinuxStartupBeforeVault,
+    HostLinuxStartupAfterVault,
+    HostLinuxWindowInit,
+    HostLinuxFontsInit,
+    HostLinuxRuntimeBoot,
+    HostLinuxAccountLoad,
+    HostLinuxAccountSwitch,
+    HostLinuxFrameUpdate,
+    HostLinuxFrameLayout,
+    HostLinuxFrameDraw,
+    HostLinuxFramePresent,
+    HostLinuxFramePostPresent,
+    HostLinuxFrameUntilPresent,
+    HostLinuxFrameIdleWait,
+    HostLinuxChatListLoad,
+    HostLinuxContactsLoad,
+    HostLinuxArchivedLoad,
+    HostLinuxProfileLoad,
+    HostLinuxProfileRead,
+    HostLinuxTimelineOpen,
+    HostLinuxTimelinePage,
+    HostLinuxTimelineHandoff,
+    HostLinuxTimelineApply,
+    HostLinuxSendWorker,
+    HostLinuxMessageOpWorker,
+    HostLinuxSearchGlobal,
+    HostLinuxSearchSidebar,
+    HostLinuxMediaQueueWait,
+    HostLinuxMediaWorker,
+    HostLinuxMediaLoad,
+    HostLinuxMediaCacheHit,
+    HostLinuxMediaDecode,
+    HostLinuxMediaPublish,
+    HostLinuxVaultDeriveKey,
+    HostLinuxVaultOpen,
+    HostLinuxVaultCreate,
+    HostLinuxVaultPersist,
+    HostLinuxSettingsSave,
 }
 
 /// Host-app milestones accepted by [`AppPerformanceTelemetry::record_host_performance`].
@@ -122,6 +160,44 @@ pub enum HostPerformanceOperation {
     InboundMessageVisible,
     ConversationLocalVisible,
     ConversationComposerReady,
+    LinuxStartupBeforeVault,
+    LinuxStartupAfterVault,
+    LinuxWindowInit,
+    LinuxFontsInit,
+    LinuxRuntimeBoot,
+    LinuxAccountLoad,
+    LinuxAccountSwitch,
+    LinuxFrameUpdate,
+    LinuxFrameLayout,
+    LinuxFrameDraw,
+    LinuxFramePresent,
+    LinuxFramePostPresent,
+    LinuxFrameUntilPresent,
+    LinuxFrameIdleWait,
+    LinuxChatListLoad,
+    LinuxContactsLoad,
+    LinuxArchivedLoad,
+    LinuxProfileLoad,
+    LinuxProfileRead,
+    LinuxTimelineOpen,
+    LinuxTimelinePage,
+    LinuxTimelineHandoff,
+    LinuxTimelineApply,
+    LinuxSendWorker,
+    LinuxMessageOpWorker,
+    LinuxSearchGlobal,
+    LinuxSearchSidebar,
+    LinuxMediaQueueWait,
+    LinuxMediaWorker,
+    LinuxMediaLoad,
+    LinuxMediaCacheHit,
+    LinuxMediaDecode,
+    LinuxMediaPublish,
+    LinuxVaultDeriveKey,
+    LinuxVaultOpen,
+    LinuxVaultCreate,
+    LinuxVaultPersist,
+    LinuxSettingsSave,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,6 +487,82 @@ pub struct AppPerformanceSnapshot {
     pub host_splash_ready: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub host_foreground_local_ready: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_startup_before_vault: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_startup_after_vault: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_window_init: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_fonts_init: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_runtime_boot: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_account_load: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_account_switch: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_frame_update: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_frame_layout: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_frame_draw: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_frame_present: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_frame_post_present: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_frame_until_present: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_frame_idle_wait: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_chat_list_load: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_contacts_load: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_archived_load: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_profile_load: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_profile_read: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_timeline_open: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_timeline_page: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_timeline_handoff: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_timeline_apply: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_send_worker: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_message_op_worker: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_search_global: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_search_sidebar: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_media_queue_wait: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_media_worker: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_media_load: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_media_cache_hit: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_media_decode: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_media_publish: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_vault_derive_key: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_vault_open: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_vault_create: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_vault_persist: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_linux_settings_save: AppPerformanceOperationSnapshot,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -502,6 +654,44 @@ struct AppPerformanceTelemetryInner {
     media_download_plaintext_verify: AppPerformanceOperationTelemetry,
     host_splash_ready: AppPerformanceOperationTelemetry,
     host_foreground_local_ready: AppPerformanceOperationTelemetry,
+    host_linux_startup_before_vault: AppPerformanceOperationTelemetry,
+    host_linux_startup_after_vault: AppPerformanceOperationTelemetry,
+    host_linux_window_init: AppPerformanceOperationTelemetry,
+    host_linux_fonts_init: AppPerformanceOperationTelemetry,
+    host_linux_runtime_boot: AppPerformanceOperationTelemetry,
+    host_linux_account_load: AppPerformanceOperationTelemetry,
+    host_linux_account_switch: AppPerformanceOperationTelemetry,
+    host_linux_frame_update: AppPerformanceOperationTelemetry,
+    host_linux_frame_layout: AppPerformanceOperationTelemetry,
+    host_linux_frame_draw: AppPerformanceOperationTelemetry,
+    host_linux_frame_present: AppPerformanceOperationTelemetry,
+    host_linux_frame_post_present: AppPerformanceOperationTelemetry,
+    host_linux_frame_until_present: AppPerformanceOperationTelemetry,
+    host_linux_frame_idle_wait: AppPerformanceOperationTelemetry,
+    host_linux_chat_list_load: AppPerformanceOperationTelemetry,
+    host_linux_contacts_load: AppPerformanceOperationTelemetry,
+    host_linux_archived_load: AppPerformanceOperationTelemetry,
+    host_linux_profile_load: AppPerformanceOperationTelemetry,
+    host_linux_profile_read: AppPerformanceOperationTelemetry,
+    host_linux_timeline_open: AppPerformanceOperationTelemetry,
+    host_linux_timeline_page: AppPerformanceOperationTelemetry,
+    host_linux_timeline_handoff: AppPerformanceOperationTelemetry,
+    host_linux_timeline_apply: AppPerformanceOperationTelemetry,
+    host_linux_send_worker: AppPerformanceOperationTelemetry,
+    host_linux_message_op_worker: AppPerformanceOperationTelemetry,
+    host_linux_search_global: AppPerformanceOperationTelemetry,
+    host_linux_search_sidebar: AppPerformanceOperationTelemetry,
+    host_linux_media_queue_wait: AppPerformanceOperationTelemetry,
+    host_linux_media_worker: AppPerformanceOperationTelemetry,
+    host_linux_media_load: AppPerformanceOperationTelemetry,
+    host_linux_media_cache_hit: AppPerformanceOperationTelemetry,
+    host_linux_media_decode: AppPerformanceOperationTelemetry,
+    host_linux_media_publish: AppPerformanceOperationTelemetry,
+    host_linux_vault_derive_key: AppPerformanceOperationTelemetry,
+    host_linux_vault_open: AppPerformanceOperationTelemetry,
+    host_linux_vault_create: AppPerformanceOperationTelemetry,
+    host_linux_vault_persist: AppPerformanceOperationTelemetry,
+    host_linux_settings_save: AppPerformanceOperationTelemetry,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -986,6 +1176,128 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::HostForegroundLocalReady => {
                 inner.host_foreground_local_ready.record(duration, success);
             }
+            AppPerformanceOperation::HostLinuxStartupBeforeVault => {
+                inner
+                    .host_linux_startup_before_vault
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxStartupAfterVault => {
+                inner
+                    .host_linux_startup_after_vault
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxWindowInit => {
+                inner.host_linux_window_init.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxFontsInit => {
+                inner.host_linux_fonts_init.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxRuntimeBoot => {
+                inner.host_linux_runtime_boot.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxAccountLoad => {
+                inner.host_linux_account_load.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxAccountSwitch => {
+                inner.host_linux_account_switch.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxFrameUpdate => {
+                inner.host_linux_frame_update.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxFrameLayout => {
+                inner.host_linux_frame_layout.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxFrameDraw => {
+                inner.host_linux_frame_draw.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxFramePresent => {
+                inner.host_linux_frame_present.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxFramePostPresent => {
+                inner
+                    .host_linux_frame_post_present
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxFrameUntilPresent => {
+                inner
+                    .host_linux_frame_until_present
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxFrameIdleWait => {
+                inner.host_linux_frame_idle_wait.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxChatListLoad => {
+                inner.host_linux_chat_list_load.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxContactsLoad => {
+                inner.host_linux_contacts_load.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxArchivedLoad => {
+                inner.host_linux_archived_load.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxProfileLoad => {
+                inner.host_linux_profile_load.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxProfileRead => {
+                inner.host_linux_profile_read.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxTimelineOpen => {
+                inner.host_linux_timeline_open.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxTimelinePage => {
+                inner.host_linux_timeline_page.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxTimelineHandoff => {
+                inner.host_linux_timeline_handoff.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxTimelineApply => {
+                inner.host_linux_timeline_apply.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxSendWorker => {
+                inner.host_linux_send_worker.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxMessageOpWorker => {
+                inner.host_linux_message_op_worker.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxSearchGlobal => {
+                inner.host_linux_search_global.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxSearchSidebar => {
+                inner.host_linux_search_sidebar.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxMediaQueueWait => {
+                inner.host_linux_media_queue_wait.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxMediaWorker => {
+                inner.host_linux_media_worker.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxMediaLoad => {
+                inner.host_linux_media_load.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxMediaCacheHit => {
+                inner.host_linux_media_cache_hit.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxMediaDecode => {
+                inner.host_linux_media_decode.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxMediaPublish => {
+                inner.host_linux_media_publish.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxVaultDeriveKey => {
+                inner.host_linux_vault_derive_key.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxVaultOpen => {
+                inner.host_linux_vault_open.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxVaultCreate => {
+                inner.host_linux_vault_create.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxVaultPersist => {
+                inner.host_linux_vault_persist.record(duration, success);
+            }
+            AppPerformanceOperation::HostLinuxSettingsSave => {
+                inner.host_linux_settings_save.record(duration, success);
+            }
         }
     }
 
@@ -1076,6 +1388,196 @@ impl AppPerformanceTelemetry {
             }
             HostPerformanceOperation::ForegroundLocalReady => self.record(
                 AppPerformanceOperation::HostForegroundLocalReady,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxStartupBeforeVault => self.record(
+                AppPerformanceOperation::HostLinuxStartupBeforeVault,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxStartupAfterVault => self.record(
+                AppPerformanceOperation::HostLinuxStartupAfterVault,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxWindowInit => self.record(
+                AppPerformanceOperation::HostLinuxWindowInit,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxFontsInit => self.record(
+                AppPerformanceOperation::HostLinuxFontsInit,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxRuntimeBoot => self.record(
+                AppPerformanceOperation::HostLinuxRuntimeBoot,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxAccountLoad => self.record(
+                AppPerformanceOperation::HostLinuxAccountLoad,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxAccountSwitch => self.record(
+                AppPerformanceOperation::HostLinuxAccountSwitch,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxFrameUpdate => self.record(
+                AppPerformanceOperation::HostLinuxFrameUpdate,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxFrameLayout => self.record(
+                AppPerformanceOperation::HostLinuxFrameLayout,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxFrameDraw => self.record(
+                AppPerformanceOperation::HostLinuxFrameDraw,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxFramePresent => self.record(
+                AppPerformanceOperation::HostLinuxFramePresent,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxFramePostPresent => self.record(
+                AppPerformanceOperation::HostLinuxFramePostPresent,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxFrameUntilPresent => self.record(
+                AppPerformanceOperation::HostLinuxFrameUntilPresent,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxFrameIdleWait => self.record(
+                AppPerformanceOperation::HostLinuxFrameIdleWait,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxChatListLoad => self.record(
+                AppPerformanceOperation::HostLinuxChatListLoad,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxContactsLoad => self.record(
+                AppPerformanceOperation::HostLinuxContactsLoad,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxArchivedLoad => self.record(
+                AppPerformanceOperation::HostLinuxArchivedLoad,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxProfileLoad => self.record(
+                AppPerformanceOperation::HostLinuxProfileLoad,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxProfileRead => self.record(
+                AppPerformanceOperation::HostLinuxProfileRead,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxTimelineOpen => self.record(
+                AppPerformanceOperation::HostLinuxTimelineOpen,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxTimelinePage => self.record(
+                AppPerformanceOperation::HostLinuxTimelinePage,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxTimelineHandoff => self.record(
+                AppPerformanceOperation::HostLinuxTimelineHandoff,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxTimelineApply => self.record(
+                AppPerformanceOperation::HostLinuxTimelineApply,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxSendWorker => self.record(
+                AppPerformanceOperation::HostLinuxSendWorker,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxMessageOpWorker => self.record(
+                AppPerformanceOperation::HostLinuxMessageOpWorker,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxSearchGlobal => self.record(
+                AppPerformanceOperation::HostLinuxSearchGlobal,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxSearchSidebar => self.record(
+                AppPerformanceOperation::HostLinuxSearchSidebar,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxMediaQueueWait => self.record(
+                AppPerformanceOperation::HostLinuxMediaQueueWait,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxMediaWorker => self.record(
+                AppPerformanceOperation::HostLinuxMediaWorker,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxMediaLoad => self.record(
+                AppPerformanceOperation::HostLinuxMediaLoad,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxMediaCacheHit => self.record(
+                AppPerformanceOperation::HostLinuxMediaCacheHit,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxMediaDecode => self.record(
+                AppPerformanceOperation::HostLinuxMediaDecode,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxMediaPublish => self.record(
+                AppPerformanceOperation::HostLinuxMediaPublish,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxVaultDeriveKey => self.record(
+                AppPerformanceOperation::HostLinuxVaultDeriveKey,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxVaultOpen => self.record(
+                AppPerformanceOperation::HostLinuxVaultOpen,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxVaultCreate => self.record(
+                AppPerformanceOperation::HostLinuxVaultCreate,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxVaultPersist => self.record(
+                AppPerformanceOperation::HostLinuxVaultPersist,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::LinuxSettingsSave => self.record(
+                AppPerformanceOperation::HostLinuxSettingsSave,
                 duration,
                 success,
             ),
@@ -1187,6 +1689,44 @@ impl AppPerformanceTelemetry {
             media_download_plaintext_verify: inner.media_download_plaintext_verify.snapshot(),
             host_splash_ready: inner.host_splash_ready.snapshot(),
             host_foreground_local_ready: inner.host_foreground_local_ready.snapshot(),
+            host_linux_startup_before_vault: inner.host_linux_startup_before_vault.snapshot(),
+            host_linux_startup_after_vault: inner.host_linux_startup_after_vault.snapshot(),
+            host_linux_window_init: inner.host_linux_window_init.snapshot(),
+            host_linux_fonts_init: inner.host_linux_fonts_init.snapshot(),
+            host_linux_runtime_boot: inner.host_linux_runtime_boot.snapshot(),
+            host_linux_account_load: inner.host_linux_account_load.snapshot(),
+            host_linux_account_switch: inner.host_linux_account_switch.snapshot(),
+            host_linux_frame_update: inner.host_linux_frame_update.snapshot(),
+            host_linux_frame_layout: inner.host_linux_frame_layout.snapshot(),
+            host_linux_frame_draw: inner.host_linux_frame_draw.snapshot(),
+            host_linux_frame_present: inner.host_linux_frame_present.snapshot(),
+            host_linux_frame_post_present: inner.host_linux_frame_post_present.snapshot(),
+            host_linux_frame_until_present: inner.host_linux_frame_until_present.snapshot(),
+            host_linux_frame_idle_wait: inner.host_linux_frame_idle_wait.snapshot(),
+            host_linux_chat_list_load: inner.host_linux_chat_list_load.snapshot(),
+            host_linux_contacts_load: inner.host_linux_contacts_load.snapshot(),
+            host_linux_archived_load: inner.host_linux_archived_load.snapshot(),
+            host_linux_profile_load: inner.host_linux_profile_load.snapshot(),
+            host_linux_profile_read: inner.host_linux_profile_read.snapshot(),
+            host_linux_timeline_open: inner.host_linux_timeline_open.snapshot(),
+            host_linux_timeline_page: inner.host_linux_timeline_page.snapshot(),
+            host_linux_timeline_handoff: inner.host_linux_timeline_handoff.snapshot(),
+            host_linux_timeline_apply: inner.host_linux_timeline_apply.snapshot(),
+            host_linux_send_worker: inner.host_linux_send_worker.snapshot(),
+            host_linux_message_op_worker: inner.host_linux_message_op_worker.snapshot(),
+            host_linux_search_global: inner.host_linux_search_global.snapshot(),
+            host_linux_search_sidebar: inner.host_linux_search_sidebar.snapshot(),
+            host_linux_media_queue_wait: inner.host_linux_media_queue_wait.snapshot(),
+            host_linux_media_worker: inner.host_linux_media_worker.snapshot(),
+            host_linux_media_load: inner.host_linux_media_load.snapshot(),
+            host_linux_media_cache_hit: inner.host_linux_media_cache_hit.snapshot(),
+            host_linux_media_decode: inner.host_linux_media_decode.snapshot(),
+            host_linux_media_publish: inner.host_linux_media_publish.snapshot(),
+            host_linux_vault_derive_key: inner.host_linux_vault_derive_key.snapshot(),
+            host_linux_vault_open: inner.host_linux_vault_open.snapshot(),
+            host_linux_vault_create: inner.host_linux_vault_create.snapshot(),
+            host_linux_vault_persist: inner.host_linux_vault_persist.snapshot(),
+            host_linux_settings_save: inner.host_linux_settings_save.snapshot(),
         }
     }
 }

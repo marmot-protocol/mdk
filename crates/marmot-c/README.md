@@ -43,6 +43,12 @@ nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
 The catalog includes C-only compatibility shims; prefer the v4 audit configuration
 setter and the composable runtime options constructor for new integrations.
 
+Linux hosts can pass the appended `MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_*`
+values to `marmot_record_host_performance`. These stages export elapsed durations
+and sample counts through opt-in OTLP; they do not extend the C snapshot record.
+See the [diagnostics contract](../marmot-uniffi/README.md#localization-privacy-and-diagnostics).
+Existing operation values stay unchanged. Adopt new values with matching headers/libraries.
+
 ## What you get
 
 - `libmarmot_c.so` / `libmarmot_c.a` (cdylib + staticlib).

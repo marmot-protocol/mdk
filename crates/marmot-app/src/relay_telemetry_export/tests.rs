@@ -874,3 +874,210 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
         matches!(metric(&finished, "app_runtime_conversation_open_duration_ms"), ExportMetricValue::Histogram(h) if h.bucket_counts.iter().sum::<u64>() + h.overflow_count == 1)
     );
 }
+
+#[test]
+fn linux_host_metric_export() {
+    use crate::app_telemetry::{
+        AppPerformanceTelemetry, HostPerformanceOperation, HostPerformanceOutcome,
+    };
+    let telemetry = AppPerformanceTelemetry::default();
+    let stages = [
+        (
+            HostPerformanceOperation::LinuxStartupBeforeVault,
+            "app_host_linux_startup_before_vault_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxStartupAfterVault,
+            "app_host_linux_startup_after_vault_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxWindowInit,
+            "app_host_linux_window_init_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxFontsInit,
+            "app_host_linux_fonts_init_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxRuntimeBoot,
+            "app_host_linux_runtime_boot_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxAccountLoad,
+            "app_host_linux_account_load_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxAccountSwitch,
+            "app_host_linux_account_switch_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxFrameUpdate,
+            "app_host_linux_frame_update_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxFrameLayout,
+            "app_host_linux_frame_layout_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxFrameDraw,
+            "app_host_linux_frame_draw_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxFramePresent,
+            "app_host_linux_frame_present_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxFramePostPresent,
+            "app_host_linux_frame_post_present_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxFrameUntilPresent,
+            "app_host_linux_frame_until_present_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxFrameIdleWait,
+            "app_host_linux_frame_idle_wait_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxChatListLoad,
+            "app_host_linux_chat_list_load_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxContactsLoad,
+            "app_host_linux_contacts_load_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxArchivedLoad,
+            "app_host_linux_archived_load_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxProfileLoad,
+            "app_host_linux_profile_load_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxProfileRead,
+            "app_host_linux_profile_read_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxTimelineOpen,
+            "app_host_linux_timeline_open_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxTimelinePage,
+            "app_host_linux_timeline_page_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxTimelineHandoff,
+            "app_host_linux_timeline_handoff_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxTimelineApply,
+            "app_host_linux_timeline_apply_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxSendWorker,
+            "app_host_linux_send_worker_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxMessageOpWorker,
+            "app_host_linux_message_op_worker_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxSearchGlobal,
+            "app_host_linux_search_global_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxSearchSidebar,
+            "app_host_linux_search_sidebar_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxMediaQueueWait,
+            "app_host_linux_media_queue_wait_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxMediaWorker,
+            "app_host_linux_media_worker_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxMediaLoad,
+            "app_host_linux_media_load_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxMediaCacheHit,
+            "app_host_linux_media_cache_hit_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxMediaDecode,
+            "app_host_linux_media_decode_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxMediaPublish,
+            "app_host_linux_media_publish_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxVaultDeriveKey,
+            "app_host_linux_vault_derive_key_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxVaultOpen,
+            "app_host_linux_vault_open_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxVaultCreate,
+            "app_host_linux_vault_create_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxVaultPersist,
+            "app_host_linux_vault_persist_duration_ms",
+        ),
+        (
+            HostPerformanceOperation::LinuxSettingsSave,
+            "app_host_linux_settings_save_duration_ms",
+        ),
+    ];
+    for (operation, _) in stages {
+        telemetry.record_host_performance(
+            operation,
+            std::time::Duration::from_millis(3),
+            HostPerformanceOutcome::Success,
+        );
+        telemetry.record_host_performance(
+            operation,
+            std::time::Duration::from_millis(7),
+            HostPerformanceOutcome::Failure,
+        );
+    }
+    let snapshot = telemetry.snapshot();
+    let batch = build_export_batch_with_app_performance(
+        &RelayTelemetryRollup::default(),
+        &RelayLabelResolution::default(),
+        Some(&snapshot),
+    );
+    assert_eq!(
+        batch
+            .points
+            .iter()
+            .filter(|p| p.name.starts_with("app_host_linux_"))
+            .count(),
+        stages.len() * 2
+    );
+    for (_, name) in stages {
+        let point = batch.points.iter().find(|p| p.name == name).unwrap();
+        assert!(point.relay.is_none() && point.failure.is_none());
+        let ExportMetricValue::Histogram(histogram) = &point.value else {
+            panic!("expected histogram")
+        };
+        assert_eq!(histogram.sum_ms, 10);
+        assert_eq!(
+            histogram.bucket_counts.iter().sum::<u64>() + histogram.overflow_count,
+            2
+        );
+        let samples = name.replace("_duration_ms", "_samples");
+        assert!(
+            batch
+                .points
+                .iter()
+                .any(|p| p.name == samples && p.value == ExportMetricValue::Counter(2))
+        );
+    }
+}
