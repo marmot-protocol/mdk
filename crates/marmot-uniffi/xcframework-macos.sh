@@ -39,9 +39,10 @@ export CXXFLAGS_aarch64_apple_darwin="${CXXFLAGS_aarch64_apple_darwin:--mmacosx-
 # Target-scoped rather than RUSTFLAGS on purpose. Cargo treats a RUSTFLAGS env
 # var as replacing `[build] rustflags` from .cargo/config.toml rather than
 # merging with it, so a workspace-wide flag added later would be silently
-# dropped for this build alone. Scoping also keeps the flag off the host dylib
-# build below, whose target/release fingerprint is shared with xcframework.sh.
-export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="-C link-arg=-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+# dropped for this build alone. Apply this only to the archive invocation:
+# on Apple Silicon the host has the same triple, and exporting it would also
+# pass embed-bitcode=no to the thin-LTO uniffi-bindgen executable.
+MACOS_ARCHIVE_RUSTFLAGS="${CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS:+$CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS }-C link-arg=-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -C embed-bitcode=no"
 
 TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Keep production release behavior and debug-symbol policy in one source of truth.
@@ -83,7 +84,8 @@ cd "$WORKSPACE_DIR"
 
 if [[ "$MODE" == native ]]; then
   rustup target add "$MACOS_TARGET"
-  cargo build --locked --release --timings -p "$CRATE_NAME" --target "$MACOS_TARGET" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+  CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="$MACOS_ARCHIVE_RUSTFLAGS" \
+    cargo build --locked --release --timings -p "$CRATE_NAME" --target "$MACOS_TARGET" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
   exit 0
 fi
 
@@ -101,7 +103,8 @@ if [[ "$MODE" == all ]]; then
   # but passing --target keeps it in its own target dir and makes the
   # deployment-target flags apply, so keep it explicit.
   echo "==> Building macOS target ($MACOS_TARGET)"
-  cargo build --locked --release --timings -p "$CRATE_NAME" --target "$MACOS_TARGET" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+  CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="$MACOS_ARCHIVE_RUSTFLAGS" \
+    cargo build --locked --release --timings -p "$CRATE_NAME" --target "$MACOS_TARGET" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
   echo "==> Generating Swift bindings"
   cargo run --locked --release --timings -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
@@ -128,11 +131,14 @@ cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.h" "$BUILD_DIR/headers/"
 # XCFramework expects the modulemap to be named module.modulemap
 cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.modulemap"
 
-# The static library is packaged exactly as cargo produced it, matching
-# xcframework.sh. Do not strip it here: marmotkit-release-profile.env pins
-# strip=none and debug=0, and package-macos-artifacts.sh publishes that profile
-# as provenance, so a post-link strip would make the manifest describe an
-# artifact that is not the one shipped.
+# Keep strip=none/debug=0. Bitcode sanitization is not a symbol strip: Apple
+# rustc and the toolchain compiler_builtins rlib can leave __LLVM,__bitcode
+# in members. Remove those sections from every member, then package the
+# resulting native archive. Do not skip compiler_builtins by name.
+echo "==> Removing leftover Apple bitcode sections from cargo archive"
+python3 "$TOOL_DIR/release-profile-archive.py" --sanitize \
+  "$TARGET_DIR/$MACOS_TARGET/release/lib${LIB_BASENAME}.a"
+
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \
   -library "$TARGET_DIR/$MACOS_TARGET/release/lib${LIB_BASENAME}.a" -headers "$BUILD_DIR/headers" \

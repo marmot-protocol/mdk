@@ -38,6 +38,12 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # Without this, the build defaults to a very old iOS minimum and the link
 # step fails with missing __chkstk_darwin and friends.
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
+# Target-scoped rather than RUSTFLAGS: Cargo replaces [build] rustflags when
+# RUSTFLAGS is set. Apple rustc defaults to embed-bitcode=yes; that leaves
+# __LLVM,__bitcode in static archive members (including compiler_builtins)
+# and nearly doubled thin-LTO archive bytes on the exact-head measurement.
+export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="${CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS:+$CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS }-C embed-bitcode=no"
+export CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS="${CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS:+$CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS }-C embed-bitcode=no"
 
 TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Keep production release behavior and debug-symbol policy in one source of truth.
@@ -141,6 +147,14 @@ echo "==> Staging headers + modulemap for XCFramework"
 cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.h" "$BUILD_DIR/headers/"
 # XCFramework expects the modulemap to be named module.modulemap
 cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.modulemap"
+
+echo "==> Removing leftover Apple bitcode sections from cargo archives"
+# Not a symbol strip: strip=none/debug=0 stay in the published profile.
+# Walk every member, including compiler_builtins; do not skip names.
+python3 "$TOOL_DIR/release-profile-archive.py" --sanitize \
+  "$TARGET_DIR/aarch64-apple-ios/release/lib${LIB_BASENAME}.a"
+python3 "$TOOL_DIR/release-profile-archive.py" --sanitize \
+  "$TARGET_DIR/aarch64-apple-ios-sim/release/lib${LIB_BASENAME}.a"
 
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \

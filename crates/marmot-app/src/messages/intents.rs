@@ -15,6 +15,10 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
 };
 use cgka_traits::reporting::ReportReason;
+use cgka_traits::{
+    MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollType, poll_response_tags,
+    poll_tags,
+};
 use nostr::nips::nip21::Nip21;
 use serde_json::{Map, Value, json};
 
@@ -223,6 +227,16 @@ pub(crate) enum AppMessageIntent {
     Delete {
         target_message_id: String,
     },
+    Poll {
+        question: String,
+        options: Vec<String>,
+        poll_type: PollType,
+        ends_at: Option<u64>,
+    },
+    PollResponse {
+        poll_event_id: String,
+        option_ids: Vec<String>,
+    },
     Media {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
@@ -419,6 +433,28 @@ pub(crate) fn build_inner_event_with_media_reply(
             Ok(event(
                 MARMOT_APP_EVENT_KIND_DELETE,
                 vec![event_ref_tag(target_message_id)],
+                String::new(),
+            ))
+        }
+        AppMessageIntent::Poll {
+            question,
+            options,
+            poll_type,
+            ends_at,
+        } => {
+            let tags = poll_tags(created_at, question, options, *poll_type, *ends_at)
+                .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
+            Ok(event(MARMOT_APP_EVENT_KIND_POLL, tags, question.clone()))
+        }
+        AppMessageIntent::PollResponse {
+            poll_event_id,
+            option_ids,
+        } => {
+            let tags = poll_response_tags(poll_event_id, option_ids)
+                .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
+                tags,
                 String::new(),
             ))
         }
@@ -691,6 +727,8 @@ const RESERVED_APP_EVENT_KINDS: &[u64] = &[
     MARMOT_APP_EVENT_KIND_REACTION,
     MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_EDIT,
+    MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
+    MARMOT_APP_EVENT_KIND_POLL,
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
     MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
     MARMOT_APP_EVENT_KIND_AGENT_OPERATION,

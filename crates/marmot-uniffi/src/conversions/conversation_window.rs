@@ -387,6 +387,7 @@ fn presented_timeline_with_tokens(
     TimelineMessageRecordFfi {
         client_token: row.client_token.clone(),
         has_reports: row.has_reports,
+        poll: row.poll.clone().map(Into::into),
         edit: row.edit.clone().map(Into::into),
         message_id_hex: row.message_id_hex.clone(),
         source_message_id_hex: row.source_message_id_hex.clone(),
@@ -555,6 +556,7 @@ impl ConversationConversionCache {
             } else {
                 None
             },
+            poll: row.poll.clone(),
             reactions: Default::default(),
             edit: row.edit.clone(),
             has_reports: row.has_reports,
@@ -615,6 +617,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         media,
         agent_text_stream,
         group_system,
+        poll,
         reactions: _,
         edit,
         has_reports,
@@ -654,6 +657,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         (
             presented_custom_tags(row),
             if trusted { group_system.as_ref() } else { None },
+            poll,
         ),
     )
 }
@@ -793,6 +797,7 @@ mod tests {
                 event.provenance = marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState;
                 event
             }),
+            poll: None,
             edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,

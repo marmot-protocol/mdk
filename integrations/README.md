@@ -147,8 +147,10 @@ select a working directory under your home directory.
 ### Repeatable Agent Or CI Setup
 
 Use the immutable release URL and provide the authorized White Noise account
-explicitly. Terminal harnesses and OpenClaw use the welcomer entry for both
-invitation and prompt authorization.
+explicitly. Terminal harnesses use the welcomer entry for both invitation and
+prompt authorization. OpenClaw keeps those boundaries separate: `--allow-welcomer`
+is invite admission only, and inbound sender authorization is a distinct
+`senderPolicy` / `MARMOT_ALLOWED_USERS` configuration.
 
 Run this example in the same shell where `install_verified` above was defined.
 
@@ -299,10 +301,11 @@ Each host runtime keeps its own runtime state:
 
 Each integration also makes its own activation decision:
 
-- Hermes and OpenClaw are gateway/channel integrations. In multi-party groups
-  they default to mention-style activation and always reply in effective DMs.
-  They also support richer gateway features such as live previews, durable reply
-  routing, profile onboarding, and media handling.
+- Hermes and OpenClaw are gateway/channel integrations. Each applies its own
+  inbound sender ACL before activation. In multi-party groups they default to
+  mention-style activation and always reply in effective DMs. Activation cannot
+  widen sender authorization. They also support richer gateway features such as
+  live previews, durable reply routing, profile onboarding, and media handling.
 - `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` are pure harnesses. They currently support only
   `always` activation for prompt messages from explicitly allowed senders, and
   have no profile onboarding or live-preview behavior. Their shared runtime
@@ -333,7 +336,11 @@ admits multi-party groups). These account-scoped invite policies remain
 independent from each integration's sender and activation policy.
 
 Hermes and OpenClaw can mirror configured `allowFrom`/welcomer entries into
-`wn-agent`. Their sync path is config-driven and may reconcile the connector
+`wn-agent`. That mirroring is invite admission only. Hermes and OpenClaw each
+keep a separate inbound sender ACL (`MARMOT_ALLOWED_USERS` /
+`MARMOT_ALLOW_ALL_USERS`, plus OpenClaw `channels.marmot.senderPolicy`) and do
+not treat membership or welcomer status as authorization to invoke the agent.
+Their welcomer sync path is config-driven and may reconcile the connector
 allowlist to the configured set. All terminal harnesses require at least one
 allowed sender and install those senders into both the prompt allowlist and the
 `wn-agent` welcomer allowlist. Their startup mirroring is additive: removing a

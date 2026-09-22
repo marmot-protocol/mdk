@@ -4,8 +4,8 @@ use marmot_app::AppMessageQuery;
 
 use crate::Marmot;
 use crate::conversions::{
-    AppMessageRecordFfi, RetentionSweepReportFfi, SecureDeleteExpiredResultFfi, SendSummaryFfi,
-    group_id_from_hex,
+    AppMessageRecordFfi, PollTypeFfi, RetentionSweepReportFfi, SecureDeleteExpiredResultFfi,
+    SendSummaryFfi, group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 use crate::optional_group_id_hex;
@@ -202,6 +202,48 @@ impl Marmot {
         let summary = self
             .runtime
             .send_custom_event(&account_ref, &group_id, kind, tags, content)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Create an encrypted NIP-88 poll in a group conversation. Option ids use
+    /// `"0"` through `"9"`.
+    pub async fn create_poll(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        question: String,
+        options: Vec<String>,
+        poll_type: PollTypeFfi,
+        ends_at: Option<u64>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .create_poll(
+                &account_ref,
+                &group_id,
+                question,
+                options,
+                poll_type.into(),
+                ends_at,
+            )
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Replace this account's selection; accepted open polls remain votable after reclassification.
+    pub async fn cast_poll_vote(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        poll_event_id: String,
+        option_ids: Vec<String>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .cast_poll_vote(&account_ref, &group_id, poll_event_id, option_ids)
             .await?;
         Ok(summary.into())
     }

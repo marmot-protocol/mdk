@@ -1264,6 +1264,124 @@ async fn removed_member_applying_removal_commit_marks_local_copy_removed() {
     );
 }
 
+/// A copy this device was removed from must stay hydratable — the re-add path
+/// (`retry_rejoins_after_trusted_removal`) calls `ensure_hydrated` before it can
+/// install a replacement Welcome — so the session-open cheap pass still seeds it.
+/// What must differ from a live copy is the forensic trail and the live-member
+/// listing: a departed copy's open writes `hydrate_removed_group` where a live
+/// copy writes `hydrate_seed_group`, and it is not a group this device is a live
+/// member of, so nothing sweeps it for periodic maintenance.
+#[tokio::test]
+async fn reopened_removed_copy_audits_its_own_reason_and_is_not_a_live_member() {
+    let (mut alice, mut bob, bob_storage, removed_group, routed_commit) =
+        setup_removed_member(b"removed-copy-hydration").await;
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &removed_group);
+    assert!(
+        bob_storage.get_group(&removed_group).unwrap().removed,
+        "the fixture must leave bob's copy marked removed"
+    );
+
+    // A second group in the same storage that bob is still a member of, so the
+    // assertions below separate a departed copy from a live one instead of just
+    // describing an empty account.
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (live_group, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "still a member".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    drop(bob);
+
+    let audit_dir = tempfile::TempDir::new().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    let recorder =
+        marmot_forensics::JsonlRecorder::open(&audit_path, "bob-removed-copy".into()).unwrap();
+    let mut reopened = EngineBuilder::new(bob_storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"bob"))
+        .account_identity_proof_signer(proof_signer(b"bob"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .unwrap();
+    reopened.hydrate_stable_groups_from_storage().unwrap();
+
+    assert_eq!(
+        reopened.live_group_ids().unwrap(),
+        vec![live_group.clone()],
+        "a copy this device was removed from is not a live member"
+    );
+    assert!(
+        reopened.unhydrated_group_ids().contains(&removed_group),
+        "the departed copy must still be seeded for the re-add path to hydrate"
+    );
+
+    // Promotion draws the same distinction as the seed, and promoting the
+    // departed copy — which the re-add path must be able to do — still does not
+    // make it a member.
+    reopened.ensure_hydrated(&removed_group).unwrap();
+    assert!(!reopened.unhydrated_group_ids().contains(&removed_group));
+    assert_eq!(
+        reopened.live_group_ids().unwrap(),
+        vec![live_group.clone()],
+        "a promoted removed copy is still not a live member"
+    );
+
+    // The recorder flushes on drop.
+    drop(reopened);
+    let events: Vec<marmot_forensics::AuditEvent> = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let hydration_reasons = |group_id: &GroupId| -> Vec<String> {
+        let group_ref = hex::encode(group_id.as_slice());
+        events
+            .iter()
+            .filter(|event| event.group_ref.as_deref() == Some(group_ref.as_str()))
+            .filter_map(|event| match &event.kind {
+                marmot_forensics::AuditEventKind::EpochStateChanged { reason, .. } => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        hydration_reasons(&removed_group),
+        vec![
+            "hydrate_removed_group".to_string(),
+            "hydrate_removed_group".to_string()
+        ],
+        "a departed copy's seed and its promotion must both be distinguishable \
+         from a live one's"
+    );
+    assert_eq!(
+        hydration_reasons(&live_group),
+        vec!["hydrate_seed_group".to_string()],
+        "a live copy keeps the plain seed reason"
+    );
+}
+
 /// #376 regression (silent eviction): later group input for a group whose
 /// retained canonical state records our own removal classifies as
 /// `Stale {{ SelfEvicted }}` and performs "realizing removal"
@@ -4647,10 +4765,16 @@ async fn redelivery_of_a_retained_id_answers_buffered_and_moves_nothing() {
     let row_after_first = bob_storage.get_message(&routed_app.id).unwrap();
 
     let second = bob.ingest(routed_app.clone()).await.unwrap();
-    assert!(
-        matches!(second, IngestOutcome::Buffered { .. }),
+    // `Buffered.epoch` is the epoch recorded on the row the input is parked in,
+    // so the seam reports that row and nothing else.
+    assert_eq!(
+        second,
+        IngestOutcome::Buffered {
+            group_id: group_id.clone(),
+            epoch: row_after_first.epoch,
+        },
         "the durable dedup seam answers a retained row before the gate is \
-         reached; got {second:?}"
+         reached, reporting that row's epoch"
     );
     assert_eq!(
         bob_storage

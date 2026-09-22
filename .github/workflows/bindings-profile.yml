@@ -1,0 +1,388 @@
+name: MarmotKit Release Profile
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - rust-toolchain.toml
+      - .github/workflows/bindings-profile.yml
+      - crates/marmot-uniffi/marmotkit-release-profile.env
+      - crates/marmot-uniffi/release-profile-json.py
+      - crates/marmot-uniffi/release-profile-archive.py
+      - crates/marmot-uniffi/measure-release-profile.py
+      - crates/marmot-uniffi/test-release-profile.py
+      - crates/marmot-uniffi/test-native-archive.py
+      - crates/marmot-uniffi/kotlin-bindings.sh
+      - crates/marmot-uniffi/xcframework.sh
+      - crates/marmot-uniffi/xcframework-macos.sh
+      - crates/marmot-uniffi/package-ios-artifacts.sh
+      - crates/marmot-uniffi/package-macos-artifacts.sh
+      - crates/marmot-uniffi/validate-ios-artifact.sh
+      - crates/marmot-uniffi/validate-macos-artifact.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marmotkit-profile-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+  MACOSX_DEPLOYMENT_TARGET: "15.0"
+  OTLP_EXPORT: "1"
+  PRODUCT_ANALYTICS_EXPORT: "1"
+
+jobs:
+  linux-profile:
+    name: Linux Android and host profile measurements
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    outputs:
+      head_sha: ${{ steps.identity.outputs.head_sha }}
+
+    steps:
+      - name: Check out exact head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Record attributable head SHA
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse 'HEAD^{commit}')"
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: expected a full 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "Measured head $head_sha"
+
+      - name: Run inexpensive release-profile regressions
+        run: |
+          set -euo pipefail
+          python3 crates/marmot-uniffi/test-release-profile.py
+          python3 crates/marmot-uniffi/test-apple-privacy.py
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            i686-linux-android \
+            x86_64-linux-android
+          rustc --version
+          cargo --version
+
+      - name: Install Android NDK
+        shell: bash
+        env:
+          ANDROID_NDK_VERSION: 27.2.12479018
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$sdk_root" ]]; then
+            echo "error: ANDROID_SDK_ROOT or ANDROID_HOME must be set on the runner" >&2
+            exit 1
+          fi
+          sdkmanager_bin=""
+          for candidate in \
+            "$sdk_root/cmdline-tools/latest/bin/sdkmanager" \
+            "$sdk_root/cmdline-tools/bin/sdkmanager" \
+            "$sdk_root/tools/bin/sdkmanager"; do
+            if [[ -x "$candidate" ]]; then
+              sdkmanager_bin="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$sdkmanager_bin" ]] && command -v sdkmanager >/dev/null 2>&1; then
+            sdkmanager_bin="$(command -v sdkmanager)"
+          fi
+          if [[ -z "$sdkmanager_bin" ]]; then
+            echo "error: sdkmanager not found under $sdk_root" >&2
+            find "$sdk_root" -maxdepth 4 -type f -name sdkmanager -print >&2 || true
+            exit 1
+          fi
+          set +o pipefail
+          yes | "$sdkmanager_bin" --licenses >/dev/null
+          set -o pipefail
+          "$sdkmanager_bin" "ndk;$ANDROID_NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$sdk_root/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Measure host, Android ABIs, and CPU
+        env:
+          HEAD_SHA: ${{ steps.identity.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/marmotkit-profile"
+          python3 crates/marmot-uniffi/measure-release-profile.py \
+            --source-sha "$HEAD_SHA" \
+            --builder-sha "$HEAD_SHA" \
+            --host --android --cpu \
+            --require-android-reduction \
+            --work-dir target/release-profile-measure \
+            --diagnostics-dir "$RUNNER_TEMP/marmotkit-profile/diagnostics" \
+            --output "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.json" \
+            --markdown "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md"
+
+      - name: Generate host Kotlin bindings with candidate defaults
+        run: ./crates/marmot-uniffi/kotlin-bindings.sh
+
+      - name: Record Kotlin generation outputs
+        env:
+          HEAD_SHA: ${{ steps.identity.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          kotlin="crates/marmot-uniffi/output/android/kotlin/dev/ipf/marmotkit/marmot_uniffi.kt"
+          if [[ ! -s "$kotlin" ]]; then
+            echo "error: Kotlin generation produced an empty binding" >&2
+            exit 1
+          fi
+          {
+            echo "head_sha=$HEAD_SHA"
+            echo "kotlin_bytes=$(wc -c < "$kotlin")"
+            echo "kotlin_sha256=$(sha256sum "$kotlin" | awk '{print $1}')"
+          } > "$RUNNER_TEMP/marmotkit-profile/kotlin-generation.txt"
+
+      - name: Stage Linux diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/marmotkit-profile/diagnostics"
+          if [[ -d target/release-profile-measure/logs ]]; then
+            rm -rf "$RUNNER_TEMP/marmotkit-profile/diagnostics/logs"
+            cp -a target/release-profile-measure/logs "$RUNNER_TEMP/marmotkit-profile/diagnostics/logs"
+          fi
+          for variant in baseline candidate; do
+            if [[ -d "target/release-profile-measure/cpu-${variant}/criterion" ]]; then
+              mkdir -p "$RUNNER_TEMP/marmotkit-profile/diagnostics/cpu-${variant}"
+              rm -rf "$RUNNER_TEMP/marmotkit-profile/diagnostics/cpu-${variant}/criterion"
+              cp -a "target/release-profile-measure/cpu-${variant}/criterion" \
+                "$RUNNER_TEMP/marmotkit-profile/diagnostics/cpu-${variant}/criterion"
+            fi
+          done
+          {
+            echo "head_sha=${{ steps.identity.outputs.head_sha }}"
+            echo "job=${{ github.job }}"
+            rustc --version
+            cargo --version
+          } > "$RUNNER_TEMP/marmotkit-profile/diagnostics/toolchain.txt"
+
+      - name: Publish Linux measurement artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-profile-linux-${{ steps.identity.outputs.head_sha }}
+          path: ${{ runner.temp }}/marmotkit-profile
+          if-no-files-found: error
+
+      - name: Write Linux job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" ]]; then
+            cat "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Measurement markdown was not produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  macos-profile:
+    name: macOS Apple slice and package verification
+    runs-on: macos-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out exact head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Record attributable head SHA
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse 'HEAD^{commit}')"
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: expected a full 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "Measured head $head_sha"
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+          rustc --version
+          cargo --version
+          xcodebuild -version
+
+      - name: Verify native archive reconstruction and linking
+        run: python3 crates/marmot-uniffi/test-native-archive.py
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Measure Apple archive slices
+        env:
+          HEAD_SHA: ${{ steps.identity.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/marmotkit-profile"
+          python3 crates/marmot-uniffi/measure-release-profile.py \
+            --source-sha "$HEAD_SHA" \
+            --builder-sha "$HEAD_SHA" \
+            --apple \
+            --work-dir target/release-profile-measure \
+            --diagnostics-dir "$RUNNER_TEMP/marmotkit-profile/diagnostics" \
+            --output "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.json" \
+            --markdown "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md"
+
+      - name: Build iOS and macOS XCFrameworks
+        run: |
+          set -euo pipefail
+          ./crates/marmot-uniffi/xcframework.sh
+          ./crates/marmot-uniffi/xcframework-macos.sh
+
+      - name: Package private Apple artifacts
+        env:
+          HEAD_SHA: ${{ steps.identity.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/marmotkit-ios-dist" "$RUNNER_TEMP/marmotkit-macos-dist"
+          ./crates/marmot-uniffi/package-ios-artifacts.sh \
+            "profile-$HEAD_SHA" "marmotkit-profile-$HEAD_SHA" "$HEAD_SHA" \
+            "$RUNNER_TEMP/marmotkit-ios-dist" "$HEAD_SHA"
+          ./crates/marmot-uniffi/package-macos-artifacts.sh \
+            "profile-$HEAD_SHA" "marmotkit-profile-$HEAD_SHA" "$HEAD_SHA" \
+            "$RUNNER_TEMP/marmotkit-macos-dist" "$HEAD_SHA"
+          python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' \
+            "$RUNNER_TEMP/marmotkit-ios-dist/marmotkit-ios-profile-$HEAD_SHA.manifest.json"
+          python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' \
+            "$RUNNER_TEMP/marmotkit-macos-dist/marmotkit-macos-profile-$HEAD_SHA.manifest.json"
+
+      - name: Validate Apple archives and SwiftPM consumers
+        env:
+          HEAD_SHA: ${{ steps.identity.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          ./crates/marmot-uniffi/validate-ios-artifact.sh \
+            "$RUNNER_TEMP/marmotkit-ios-dist/MarmotKitFFI-profile-$HEAD_SHA.xcframework.zip" \
+            "$IPHONEOS_DEPLOYMENT_TARGET"
+          ./crates/marmot-uniffi/validate-macos-artifact.sh \
+            "$RUNNER_TEMP/marmotkit-macos-dist/MarmotKitFFI-macos-profile-$HEAD_SHA.xcframework.zip" \
+            "$MACOSX_DEPLOYMENT_TARGET"
+          ./crates/marmot-uniffi/validate-swift-package.sh \
+            crates/marmot-uniffi/output/MarmotKit.xcframework \
+            - \
+            crates/marmot-uniffi/output/MarmotKit.swift \
+            "$RUNNER_TEMP/marmotkit-local-ios-consumer"
+          ./crates/marmot-uniffi/validate-swift-package-macos.sh \
+            crates/marmot-uniffi/output/macos/MarmotKit.xcframework \
+            - \
+            crates/marmot-uniffi/output/macos/MarmotKit.swift \
+            "$RUNNER_TEMP/marmotkit-local-macos-consumer"
+
+      - name: Compare generated Swift and run privacy archives
+        env:
+          HEAD_SHA: ${{ steps.identity.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          ios_swift="$(shasum -a 256 crates/marmot-uniffi/output/MarmotKit.swift | awk '{print $1}')"
+          macos_swift="$(shasum -a 256 crates/marmot-uniffi/output/macos/MarmotKit.swift | awk '{print $1}')"
+          if [[ "$ios_swift" != "$macos_swift" ]]; then
+            echo "error: iOS and macOS jobs generated different Swift bindings" >&2
+            exit 1
+          fi
+          command -v xcodegen >/dev/null || brew install xcodegen
+          python3 crates/marmot-uniffi/test-apple-privacy.py
+          python3 crates/marmot-uniffi/validate-apple-archive.py ios \
+            "$RUNNER_TEMP/marmotkit-ios-dist/MarmotKitFFI-profile-$HEAD_SHA.xcframework.zip" \
+            "$RUNNER_TEMP/marmotkit-ios-dist/MarmotKit-profile-$HEAD_SHA.swift" \
+            "$RUNNER_TEMP/marmotkit-ios-privacy-archive" \
+            --privacy-manifest "$RUNNER_TEMP/marmotkit-ios-dist/PrivacyInfo-ios-profile-$HEAD_SHA.xcprivacy" \
+            --release-manifest "$RUNNER_TEMP/marmotkit-ios-dist/marmotkit-ios-profile-$HEAD_SHA.manifest.json" \
+            --privacy-dir crates/marmot-uniffi/apple-privacy \
+            --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
+          cp crates/marmot-uniffi/output/macos/MarmotKit.swift \
+            "$RUNNER_TEMP/MarmotKit-profile-$HEAD_SHA.swift"
+          python3 crates/marmot-uniffi/validate-apple-archive.py macos \
+            "$RUNNER_TEMP/marmotkit-macos-dist/MarmotKitFFI-macos-profile-$HEAD_SHA.xcframework.zip" \
+            "$RUNNER_TEMP/MarmotKit-profile-$HEAD_SHA.swift" \
+            "$RUNNER_TEMP/marmotkit-macos-privacy-archive" \
+            --privacy-manifest "$RUNNER_TEMP/marmotkit-macos-dist/PrivacyInfo-macos-profile-$HEAD_SHA.xcprivacy" \
+            --release-manifest "$RUNNER_TEMP/marmotkit-macos-dist/marmotkit-macos-profile-$HEAD_SHA.manifest.json" \
+            --privacy-dir crates/marmot-uniffi/apple-privacy \
+            --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
+          printf 'ios_swift_sha256=%s\nmacos_swift_sha256=%s\n' "$ios_swift" "$macos_swift" \
+            > "$RUNNER_TEMP/marmotkit-profile/swift-agreement.txt"
+
+      - name: Stage macOS diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/marmotkit-profile/diagnostics"
+          if [[ -d target/release-profile-measure/logs ]]; then
+            rm -rf "$RUNNER_TEMP/marmotkit-profile/diagnostics/logs"
+            cp -a target/release-profile-measure/logs "$RUNNER_TEMP/marmotkit-profile/diagnostics/logs"
+          fi
+          {
+            echo "head_sha=${{ steps.identity.outputs.head_sha }}"
+            echo "job=${{ github.job }}"
+            rustc --version
+            cargo --version
+            xcodebuild -version
+          } > "$RUNNER_TEMP/marmotkit-profile/diagnostics/toolchain.txt"
+          shopt -s nullglob
+          for manifest in \
+            "$RUNNER_TEMP"/marmotkit-ios-dist/*.manifest.json \
+            "$RUNNER_TEMP"/marmotkit-macos-dist/*.manifest.json; do
+            cp "$manifest" "$RUNNER_TEMP/marmotkit-profile/diagnostics/$(basename "$manifest")"
+          done
+
+      - name: Publish macOS measurement artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-profile-macos-${{ steps.identity.outputs.head_sha }}
+          path: ${{ runner.temp }}/marmotkit-profile
+          if-no-files-found: error
+
+      - name: Write macOS job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" ]]; then
+            cat "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Measurement markdown was not produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f "$RUNNER_TEMP/marmotkit-profile/swift-agreement.txt" ]]; then
+            cat "$RUNNER_TEMP/marmotkit-profile/swift-agreement.txt" >> "$GITHUB_STEP_SUMMARY"
+          fi

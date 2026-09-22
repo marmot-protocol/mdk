@@ -221,4 +221,13 @@ case "$installer_generated_identity_dry_run" in
     *) ;;
 esac
 
+case "$installer_dry_run" in
+    *"senderPolicy"* | *"MARMOT_ALLOWED_USERS"* ) ;;
+    *) echo "OpenClaw installer help/dry-run did not mention separate senderPolicy configuration" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"would not copy --allow-welcomer into senderPolicy"* ) ;;
+    *) echo "OpenClaw installer dry-run did not warn that welcomers are not sender grants" >&2; exit 1;;
+esac
+
 echo "OpenClaw dev script test passed"

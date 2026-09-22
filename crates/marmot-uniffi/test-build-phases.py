@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -49,7 +50,10 @@ elif name == "cargo":
         if "--target" in args:
             root /= args[args.index("--target") + 1]
         for suffix in ["a", "dylib", "so"]:
-            put(root / "release" / ("libmarmot_uniffi." + suffix))
+            path = root / "release" / ("libmarmot_uniffi." + suffix)
+            put(path)
+            if suffix == "a":
+                path.write_bytes(pathlib.Path(os.environ["BUILD_TEST_ARCHIVE"]).read_bytes())
 elif name == "xcodebuild":
     pathlib.Path(args[args.index("-output") + 1]).mkdir(parents=True)
 elif name == "llvm-readelf":
@@ -67,6 +71,11 @@ class BuildPhases(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # Assembly now validates real archive structure. Reuse the synthetic
+        # native Mach-O fixture instead of feeding the validator plain text.
+        fixtures = runpy.run_path(str(TOOLS / "test-release-profile.py"))
+        archive = self.root / "native.a"
+        fixtures["write_ar"](archive, [("obj.o", fixtures["macho64"](True, b"__TEXT"))])
         self.crate = self.root / "crates/marmot-uniffi"
         self.crate.mkdir(parents=True)
         for folder in ["apple-privacy", "kotlin-support"]:
@@ -79,7 +88,8 @@ class BuildPhases(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.root),
             PATH=f"{self.bin}:{os.environ['PATH']}",
             MARMOTKIT_WORKSPACE_DIR=str(self.root), MARMOTKIT_CRATE_DIR=str(self.crate),
-            BUILD_TEST_LOG=str(self.log), BUILD_TEST_TARGETS=" ".join(TARGETS + ANDROID),
+            BUILD_TEST_LOG=str(self.log), BUILD_TEST_ARCHIVE=str(archive),
+            BUILD_TEST_TARGETS=" ".join(TARGETS + ANDROID),
             CARGO_TARGET_DIR="target", OTLP_EXPORT="1", PRODUCT_ANALYTICS_EXPORT="1")
         ndk = self.root / "ndk"
         for host in ["darwin-x86_64", "linux-x86_64"]:
@@ -142,7 +152,7 @@ class BuildPhases(unittest.TestCase):
         self.run_phase("xcframework-macos.sh", "native")
         native = self.commands()[-1]
         self.assertIn("--target", native["args"])
-        self.assertEqual(native["macos_flags"], "-C link-arg=-mmacosx-version-min=15.0")
+        self.assertEqual(native["macos_flags"], "-C link-arg=-mmacosx-version-min=15.0 -C embed-bitcode=no")
         self.assertEqual(native["strip"], "none")
         self.log.unlink()
         self.run_phase("xcframework-macos.sh", "assemble")

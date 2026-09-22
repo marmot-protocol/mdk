@@ -152,3 +152,14 @@ hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e5
 # memory-security allocator emits one WARN for every mlock failure. Pin the
 # merged 4.17.0 amalgamation until a crates.io release contains that lineage.
 libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5ae7fdf83085c595fd54f977b3a56ccacabaf16b" }
+
+# Standard release profile for MarmotKit and other workspace release consumers.
+# Thin LTO with one codegen unit is the measured candidate; do not add a custom
+# release-size profile, fat LTO, linker-plugin LTO, panic=abort, or opt-level
+# change. Host and Apple archives keep strip = "none" so UniFFI metadata and
+# native archive members remain. Android JNI builds override strip=symbols on
+# those cargo invocations only.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "none"

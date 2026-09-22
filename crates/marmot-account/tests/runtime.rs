@@ -267,6 +267,28 @@ fn current_session(
     .unwrap()
 }
 
+/// [`current_session`] with the app runtime's deferred group hydration, so a
+/// reopen seeds stored groups without promoting them.
+fn deferred_current_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> AccountDeviceSession {
+    let keys = deterministic_nostr_keys(identity);
+    AccountDeviceSession::open(
+        SessionConfig::new(
+            path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(identity),
+            Box::new(MockPeeler),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+        .protocol_profile(ProtocolProfile::Current)
+        .defer_group_hydration(),
+    )
+    .unwrap()
+}
+
 fn session_with_registry(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,
@@ -2372,6 +2394,335 @@ async fn create_group_publishes_welcome_and_confirms_pending_on_ack() {
     assert_eq!(
         publishes[0].target.endpoints(),
         &[TransportEndpoint("wss://bob-inbox.example".into())]
+    );
+}
+
+/// A group the engine cannot serve yet must not stop periodic maintenance for
+/// every group behind it in the listing. A deferred open seeds every stored
+/// group into `live_group_ids` while `group_maintenance` still fails closed
+/// with the retryable `GroupNotHydrated`, so the per-group leg has to skip
+/// that group and keep sweeping.
+#[tokio::test]
+async fn unhydrated_group_does_not_abort_periodic_maintenance_for_other_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot unhydrated sweep key").unwrap();
+    let mut initial = AccountDeviceRuntime::new(
+        current_session(database.clone(), &key, b"alice-unhydrated-sweep"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    );
+    for name in ["first enrolled group", "second enrolled group"] {
+        initial
+            .create_group(CreateGroupRequest {
+                name: name.into(),
+                description: String::new(),
+                members: Vec::new(),
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    drop(initial);
+
+    // Promote only the second listed group, so the sweep meets a
+    // seeded-but-unhydrated group ahead of one whose rotation it owes.
+    let mut reopened = deferred_current_session(&database, &key, b"alice-unhydrated-sweep");
+    let listed = reopened.live_group_ids().unwrap();
+    assert_eq!(listed.len(), 2);
+    let (unhydrated, live) = (listed[0].clone(), listed[1].clone());
+    assert!(reopened.ensure_group_hydrated(&live).unwrap());
+    assert_eq!(reopened.unhydrated_group_ids(), vec![unhydrated]);
+
+    let mut runtime = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(31)),
+    );
+
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert!(
+        runtime
+            .session()
+            .group_maintenance(&live)
+            .unwrap()
+            .unwrap()
+            .next_periodic_rotation_at
+            .is_some(),
+        "the sweep must still schedule the live group's next rotation"
+    );
+}
+
+/// The obligation leg of the sweep reads an account-wide table with no
+/// liveness filter, and both of its group-scoped reads (the paused
+/// prepared-evolution probe and the `PendingPublication`/`Retry` lookup) go
+/// through the engine's live gate. An obligation minted against a group the
+/// engine will not serve — a seeded-but-unhydrated copy, or a permanently
+/// quarantined one — must therefore skip, not abort the leg for every
+/// obligation sorted behind it.
+#[tokio::test]
+async fn unhydrated_group_obligation_does_not_abort_the_sweep_for_other_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot unhydrated obligation key").unwrap();
+    let mut initial = AccountDeviceRuntime::new(
+        current_session(database.clone(), &key, b"alice-unhydrated-obligation"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    );
+    for name in ["first enrolled group", "second enrolled group"] {
+        initial
+            .create_group(CreateGroupRequest {
+                name: name.into(),
+                description: String::new(),
+                members: Vec::new(),
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    drop(initial);
+
+    let mut reopened = deferred_current_session(&database, &key, b"alice-unhydrated-obligation");
+    let listed = reopened.live_group_ids().unwrap();
+    assert_eq!(listed.len(), 2);
+    let (unhydrated, live) = (listed[0].clone(), listed[1].clone());
+    assert!(reopened.ensure_group_hydrated(&live).unwrap());
+    assert_eq!(reopened.unhydrated_group_ids(), vec![unhydrated.clone()]);
+
+    // The stuck obligation is created first, so the created_at sort puts it
+    // ahead of the one the sweep owes real work.
+    let stuck = cgka_traits::MessageId::new(vec![9; 32]);
+    let advancing = cgka_traits::MessageId::new(vec![11; 32]);
+    reopened
+        .put_maintenance_obligation(&cgka_traits::maintenance::MaintenanceObligation {
+            id: stuck.clone(),
+            group_id: unhydrated.clone(),
+            trigger: cgka_traits::MaintenanceTrigger::Periodic,
+            phase: cgka_traits::MaintenancePhase::Retry,
+            created_at: cgka_traits::Timestamp(100),
+            operational_target_at: None,
+            overdue: false,
+            eose_deadline_at: None,
+            grace_until: None,
+            quiet_since: None,
+            own_leaf_baseline_hash: None,
+            sampled_jitter_ms: 0,
+            not_before: None,
+            attempt_count: 0,
+            semantic_rearm_count: 0,
+            last_failure_code: None,
+        })
+        .unwrap();
+    reopened
+        .put_maintenance_obligation(&cgka_traits::maintenance::MaintenanceObligation {
+            id: advancing.clone(),
+            group_id: live.clone(),
+            trigger: cgka_traits::MaintenanceTrigger::Manual,
+            phase: cgka_traits::MaintenancePhase::Quiet,
+            created_at: cgka_traits::Timestamp(200),
+            operational_target_at: None,
+            overdue: false,
+            eose_deadline_at: None,
+            grace_until: None,
+            quiet_since: Some(cgka_traits::Timestamp(0)),
+            own_leaf_baseline_hash: Some(reopened.own_leaf_hash(&live).unwrap()),
+            sampled_jitter_ms: 0,
+            not_before: None,
+            attempt_count: 0,
+            semantic_rearm_count: 0,
+            last_failure_code: None,
+        })
+        .unwrap();
+
+    let mut runtime = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(31)),
+    );
+
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert_eq!(
+        obligation_phase(&runtime, &advancing),
+        cgka_traits::MaintenancePhase::Jitter,
+        "the live group's obligation must advance past the stuck one"
+    );
+    assert_eq!(
+        obligation_phase(&runtime, &stuck),
+        cgka_traits::MaintenancePhase::Retry,
+        "the skipped obligation keeps its phase and retries on a later tick"
+    );
+
+    // Paused maintenance takes the other gated read, on the same table.
+    runtime.pause_maintenance();
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        obligation_phase(&runtime, &stuck),
+        cgka_traits::MaintenancePhase::Retry
+    );
+}
+
+fn obligation_phase(
+    runtime: &SelfUpdateRuntime,
+    id: &cgka_traits::MessageId,
+) -> cgka_traits::MaintenancePhase {
+    runtime
+        .session()
+        .maintenance_obligation(id)
+        .unwrap()
+        .expect("the obligation must stay durable")
+        .phase
+}
+
+/// The obligation leg mints its work while the copy is live, and disenrollment
+/// is event-driven only. A removal this device never saw as an event therefore
+/// leaves a non-terminal obligation against a copy whose durable record is
+/// `removed`, and driving it calls a `SelfUpdate` the removed-copy send gate is
+/// guaranteed to refuse: `Retry` + `maintenance_send_failed`, uncapped, every
+/// tick forever. That is the field's `UseAfterEviction` self-update loop. The
+/// leg has to read the record and fail the obligation terminally instead — and
+/// nothing may mint a fresh one.
+#[tokio::test]
+async fn maintenance_fails_an_obligation_left_on_a_removed_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot removed obligation key").unwrap();
+    let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice-removed-obl");
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-removed-obl");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "removed obligation".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes[0].clone(),
+        other => panic!("expected FoundingGroupCreated publish work, got {other:?}"),
+    };
+    bob.ingest(welcome).await.unwrap();
+
+    let mut bob_runtime = AccountDeviceRuntime::new(
+        bob,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(5)),
+    );
+    // Bob's join already owes a post-join rotation, so a manual schedule while
+    // the copy is live returns that obligation's id rather than minting a
+    // second — and being accepted at all is the point.
+    let obligation_id = bob_runtime.schedule_manual_self_update(&group_id).unwrap();
+    let bob_id = bob_runtime.session().self_id();
+
+    // Alice removes bob, and bob's copy applies the commit through the raw
+    // session — so the runtime's event-driven disenrollment never sees it.
+    let removal = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob_id],
+        })
+        .await
+        .unwrap();
+    let commit = match &removal.publish[0] {
+        PublishWork::GroupEvolution { msg, .. } => msg.clone(),
+        other => panic!("expected GroupEvolution publish work, got {other:?}"),
+    };
+    bob_runtime
+        .session_mut()
+        .ingest(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..commit
+        })
+        .await
+        .unwrap();
+    // Settle through the session, not the runtime: the runtime's own drain is
+    // what runs the event-driven disenrollment, and the hazard is precisely a
+    // removal that reached the durable record without it.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS + 200,
+    ))
+    .await;
+    bob_runtime
+        .session_mut()
+        .advance_convergence(&group_id)
+        .await
+        .unwrap();
+
+    // The hazard is reachable: a terminal durable record under a live
+    // obligation.
+    assert!(
+        bob_runtime
+            .session()
+            .group_record(&group_id)
+            .unwrap()
+            .removed,
+        "the removal commit must have marked bob's local copy removed"
+    );
+    let phase_before = obligation_phase(&bob_runtime, &obligation_id);
+    assert!(
+        !matches!(
+            phase_before,
+            cgka_traits::MaintenancePhase::Complete | cgka_traits::MaintenancePhase::Failed
+        ),
+        "the obligation minted before the removal is still live: {phase_before:?}"
+    );
+
+    bob_runtime.run_due_maintenance().await.unwrap();
+
+    let obligation = bob_runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        obligation.phase,
+        cgka_traits::MaintenancePhase::Failed,
+        "a rotation no leaf can ever satisfy is terminal, not retryable"
+    );
+    assert_eq!(
+        obligation.last_failure_code.as_deref(),
+        Some("local_member_removed"),
+        "the sweep must reach the same verdict as the event-driven cleanup"
+    );
+    assert_eq!(
+        obligation.attempt_count, 0,
+        "the refusal must precede the send, not count as an attempt"
+    );
+    assert!(
+        bob_runtime.schedule_manual_self_update(&group_id).is_err(),
+        "a manual rotation on a terminal copy must be refused, not persisted"
     );
 }
 
