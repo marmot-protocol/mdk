@@ -24,6 +24,22 @@ adds a `nostr-sdk` backed `NostrSdkRelayClient`.
   SDK signer, publishes to specific relays, forwards SDK notifications into adapter deliveries, and exposes a redacted
   aggregate relay-health snapshot.
 
+## Recovery maintenance sessions
+
+`install_group_maintenance_recovery_subscription` accepts the account recovery owner's durable attempt serial and
+returns an opaque wire id. A replacement session must use a fresh serial, including after cancellation or reopen.
+Reusing a serial joins the same logical attempt; it is not a new first-EOSE boundary. Remove the session with
+`remove_group_maintenance_recovery_subscription` and its returned id. Failed or cancelled teardown retains retry intent.
+
+`subscription_endpoint_eose` reports EOSE only for the caller-supplied endpoint in that subscription's captured
+membership (`None` means unknown subscription or endpoint). EOSE can satisfy a maintenance first-boundary prerequisite;
+it does not establish exhaustive historical coverage or durable admission.
+
+Injected `NostrRelayClient` implementations opt in with `supports_scoped_subscriptions` and implement both
+`subscribe_scoped` and `unsubscribe_scoped` using the exact supplied wire id. The SDK implementation supports this with
+the existing pinned SDK. The default rejects recovery sessions before staging routes or teardown work. Existing
+`GroupMaintenance` values and legacy installation/removal APIs retain their shape and ids.
+
 ## What this crate does not do
 
 - No MLS peeling; that remains in `transport-nostr-peeler`.
