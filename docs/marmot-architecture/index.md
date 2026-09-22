@@ -118,7 +118,6 @@ observability → custom-extensions → current-state → direction.
 
 These are longer working documents. Go here when you need depth, not orientation.
 
-
 ### Protocol & architecture reference
 
 - **Doc:** [`cgka-engine-spec.md`](./cgka-engine-spec.md)
