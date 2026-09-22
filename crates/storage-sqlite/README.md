@@ -35,17 +35,44 @@ storage methods as adapters. The overflow marker task writes loss evidence only;
 account owner imports that evidence transactionally. A NULL imported count means that
 an observation has not been imported, including a valid zero-count loss marker.
 
-Attempt reservations fence demand and imported loss, survive reopen, and refuse unknown
-scope versions. They do not certify coverage. Runtime dispatch consolidation and qualified
-completion are subsequent integration work under [the recovery design](../../docs/marmot-architecture/further-context/account-recovery-ownership.md).
+Attempt reservations fence selected demand and imported loss, survive reopen, and refuse
+unknown scope versions. They do not certify coverage. `account_recovery/plan.rs` stores
+versioned frozen scopes and accepts owner-validated endpoint/admission checkpoints.
+History requires all designated scopes/endpoints; exclusions, EOSE and SDK seen state
+are insufficient. Known-event retention and the limited first maintenance boundary use
+separate predicates. A stale scope token rejects a multi-scope checkpoint before any
+progress is written. Domain updates may share the same `with_transaction` boundary.
+
+Migration 0093 adds the current route-policy snapshot and a unique explicit-history row.
+It preserves populated obligations, loss evidence, retry state, receipts, maintenance,
+inventory and cursors. Repeated serialized callers reuse the row without resetting retry;
+a stale detach cannot clear the current caller's urgency. Unexpected duplicate explicit
+rows make migration fail atomically; no demand is silently discarded.
+
+`account_recovery/loss.rs` keeps qualified loss completion separate from external plane
+acknowledgment. Capture exact token/count watermarks before execution. After qualified
+completion, acknowledge the matching live generation and finish its writers before
+calling `acknowledge_recovery_loss`. SQL cannot establish that external prerequisite.
+New evidence or a persistence failure prevents reclamation; the owner must compensate
+the live acknowledgment and call `restore_unacknowledged_recovery_loss` before new work.
+Call that restore method when constructing an owner as well. Zero-count loss is evidence.
 Legacy clear methods remain caller-directed retirement adapters, not completion proofs;
-they retain loss watermarks until the coordinated owner can prove safe reclamation.
-Duplicate/stale epoch observations join without resetting eligibility; receipt release
-is distinct new evidence. Notification loss imports a separate cause. Reservations
-fence selected obligations plus account-wide invalidation, so unrelated joins do not
-block an otherwise eligible selection.
-This foundation must land with that coordinated integration; an old binary refuses schema
-0092, and binary downgrade requires a pre-upgrade backup.
+retained legacy watermarks do not recreate explicitly retired demand.
+
+Physical receipt/inventory expiration, compaction and message release or route/group deletion bump
+the inventory revision in the same transaction. Positive admission and idempotent deletes
+do not invalidate proof. `retained_recovery_event` checks exact route, event and frozen
+window membership after the caller synchronizes release receipts; it does not certify
+successful decryption or engine readiness.
+
+**Merge gate:** this storage slice is stacked on #1983 and cannot ship independently.
+Runtime integration must replace competing dispatch/clear callers, provide qualified
+executor evidence and same-schema conservative handoff, and demonstrate bounded evidence
+reclamation under [the recovery design](../../docs/marmot-architecture/further-context/account-recovery-ownership.md).
+That integration, runtime cancellation-by-drop, policy/stagnation migration 0094 and
+SDK/acquisition changes are outside this slice. Old binaries refuse the upgraded schema;
+binary downgrade requires a pre-upgrade backup. Storage tests do not claim that the
+current production executor can supply exhaustive coverage.
 
 ## Replay-state validation
 

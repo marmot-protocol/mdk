@@ -1068,11 +1068,13 @@ fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> Sto
         params![hex::encode(id.as_slice())],
     )
     .storage()?;
-    conn.execute_cached(
-        "DELETE FROM transport_reconciliation_items WHERE event_id = ?1",
-        params![id.as_slice()],
-    )
-    .storage()?;
+    let removed_inventory = conn
+        .execute_cached(
+            "DELETE FROM transport_reconciliation_items WHERE event_id = ?1",
+            params![id.as_slice()],
+        )
+        .storage()?;
+    crate::account_recovery::invalidate_inventory_tx(conn, removed_inventory)?;
     Ok(())
 }
 

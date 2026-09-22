@@ -188,6 +188,8 @@ mod migration_0090_poll_response_edges;
 mod migration_0091_account_local_identity;
 #[path = "migrations/0092_account_recovery_owner.rs"]
 mod migration_0092_account_recovery_owner;
+#[path = "migrations/0093_recovery_route_snapshot.rs"]
+mod migration_0093_recovery_route_snapshot;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -664,6 +666,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0092_account_recovery_owner",
         apply: migration_0092_account_recovery_owner::apply,
     },
+    Migration {
+        version: 93,
+        name: "0093_recovery_route_snapshot",
+        apply: migration_0093_recovery_route_snapshot::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
@@ -1022,6 +1029,146 @@ mod tests {
             })
             .unwrap();
         assert_eq!(intent, [0xbb]);
+    }
+
+    fn recovery_completion_rows(
+        conn: &Connection,
+        table: &str,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn recovery_completion_migration_preserves_populated_state_and_rolls_back_interruption() {
+        fn interrupted(tx: &Transaction<'_>) -> StorageResult<()> {
+            migration_0093_recovery_route_snapshot::apply(tx)?;
+            Err(StorageError::Backend(
+                "injected completion migration interruption".into(),
+            ))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery-completion.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..91]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_state(label,updated_at) VALUES ('alice',100);
+            INSERT INTO cgka_groups(id,epoch,record) VALUES (x'aa',7,x'00');
+            INSERT INTO app_epoch_backfill_intents VALUES (x'aa',7,123);
+            INSERT INTO account_delivery_recovery VALUES ('alice',42,124,0);
+            INSERT INTO app_epoch_stall_evidence VALUES (x'aa',7,2,0,123000,123);
+            INSERT INTO cgka_released_transport_receipts VALUES (x'bb',x'aa',7);
+            INSERT INTO cgka_maintenance_obligations VALUES (x'01',x'aa',1,x'1234');
+            INSERT INTO transport_reconciliation_items VALUES (0,x'',zeroblob(32),120);
+            INSERT INTO transport_reconciliation_route_state VALUES (0,x'',119,zeroblob(32));
+            INSERT INTO transport_reconciliation_scheduler VALUES (1,0,x'');",
+        )
+        .unwrap();
+        run(&mut conn, &MIGRATIONS[..92]).unwrap();
+        conn.execute_batch("UPDATE account_recovery_state SET next_attempt=9,retry_ordinal=4,
+            retry_recorded_at_ms=1000,retry_delay_ms=15000,retry_not_before_ms=16000;
+            INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms,caller_origin,urgency)
+            VALUES ('explicit:existing',3,1000,1000,1,1);").unwrap();
+        let preserved = [
+            "account_recovery_obligations",
+            "account_recovery_scopes",
+            "account_delivery_loss_evidence",
+            "app_epoch_stall_evidence",
+            "cgka_released_transport_receipts",
+            "cgka_maintenance_obligations",
+            "transport_reconciliation_items",
+            "transport_reconciliation_route_state",
+            "transport_reconciliation_scheduler",
+        ];
+        let before: Vec<_> = preserved
+            .iter()
+            .map(|table| recovery_completion_rows(&conn, table))
+            .collect();
+        let retry_before = recovery_completion_rows(&conn, "account_recovery_state");
+        assert!(
+            apply_migration(
+                &mut conn,
+                &Migration {
+                    version: 93,
+                    name: "0093_recovery_route_snapshot",
+                    apply: interrupted
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(applied_name(&conn, 93).unwrap(), None);
+        assert!(
+            conn.prepare("SELECT route_snapshot FROM account_recovery_state")
+                .is_err()
+        );
+        assert_eq!(
+            recovery_completion_rows(&conn, "account_recovery_state"),
+            retry_before
+        );
+        for (table, expected) in preserved.iter().zip(&before) {
+            assert_eq!(
+                &recovery_completion_rows(&conn, table),
+                expected,
+                "{table} changed after rollback"
+            );
+        }
+        run_all(&mut conn).unwrap();
+        assert!(
+            run(&mut conn, &MIGRATIONS[..92]).is_err(),
+            "old runner must refuse schema 93"
+        );
+        drop(conn);
+        let mut conn = keyed_connection(&path);
+        assert_eq!(run_all(&mut conn).unwrap(), 0);
+        for (table, expected) in preserved.iter().zip(&before) {
+            assert_eq!(
+                &recovery_completion_rows(&conn, table),
+                expected,
+                "{table} changed after reopen"
+            );
+        }
+        let state = recovery_completion_rows(&conn, "account_recovery_state");
+        assert_eq!(
+            &state[0][..retry_before[0].len()],
+            retry_before[0].as_slice()
+        );
+        assert_eq!(state[0].last(), Some(&rusqlite::types::Value::Null));
+        assert!(conn.execute("INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms) VALUES ('explicit:second',3,1001,1001)",[]).is_err());
+        assert_eq!(
+            &recovery_completion_rows(&conn, "account_recovery_obligations"),
+            &before[0]
+        );
+    }
+
+    #[test]
+    fn recovery_completion_migration_refuses_duplicate_explicit_rows_without_losing_debt() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..92]).unwrap();
+        // The published foundation has no explicit-demand writer. Unexpected
+        // preexisting rows still fail closed rather than silently discarding debt.
+        conn.execute_batch(
+            "INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms)
+            VALUES ('explicit:first',3,1000,1000),('explicit:second',3,1001,1001);",
+        )
+        .unwrap();
+        let before = recovery_completion_rows(&conn, "account_recovery_obligations");
+        assert!(run_all(&mut conn).is_err());
+        assert_eq!(applied_name(&conn, 93).unwrap(), None);
+        assert!(
+            conn.prepare("SELECT route_snapshot FROM account_recovery_state")
+                .is_err()
+        );
+        assert_eq!(
+            recovery_completion_rows(&conn, "account_recovery_obligations"),
+            before
+        );
     }
 
     #[test]

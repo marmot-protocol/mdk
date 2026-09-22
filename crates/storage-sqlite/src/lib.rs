@@ -12,7 +12,12 @@ pub use group_system::{
 
 mod account_projection;
 mod account_recovery;
-pub use account_recovery::{RecoveryRetryState, RecoveryRevisionFence};
+pub use account_recovery::{
+    RecoveryCause, RecoveryDemand, RecoveryDemandTicket, RecoveryEligibility,
+    RecoveryEndpointCheckpoint, RecoveryLossCause, RecoveryLossWatermark, RecoveryPredicate,
+    RecoveryRequest, RecoveryRetryState, RecoveryRevisionFence, RecoveryScopeCheckpoint,
+    RecoveryScopeOutcome, RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
+};
 mod agent_stream_sequences;
 mod attachment_acquisition;
 mod attachment_history;
