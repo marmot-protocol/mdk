@@ -133,6 +133,13 @@ export async function startMarmotGatewayAccount(
   // Reconciliation is a non-atomic read-modify-write. Retain the per-account
   // serialization barrier even when the prior generation has been replaced;
   // detaching an unsettled writer could restore a revoked welcomer.
+  //
+  // The wait is bounded, not open-ended: every call a sync makes is a separate
+  // control request carrying the client's request timeout, so a pass takes at
+  // most one timeout per call it has left (a wn-agent wedged from the start
+  // fails it at the first). A wedged wn-agent therefore delays a replacement
+  // by at most the predecessor's remaining pass; it cannot strand it. Keep that
+  // timeout in place rather than weakening this barrier.
   await lane.syncTail.catch(() => undefined);
 
   const abortController = new AbortController();
