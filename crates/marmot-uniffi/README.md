@@ -511,7 +511,9 @@ Imported identities can use the durable preflight API instead of `login`:
 4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
    a proposal. Recommended relays append missing defaults to the observed list,
-   preserving existing NIP-65 roles. Invalid existing entries require an explicit
+   preserving existing NIP-65 roles and `ws://` onion entries. Onion entries stay
+   in the published list but are not dialed by the direct transport; an accessible
+   route is still required. Invalid existing entries require an explicit
    edit; they are never silently removed. Explicit relay selections replace the
    list. A missing discovery result is not global proof of absence: hosts must
    not automatically approve publication for imported identities.

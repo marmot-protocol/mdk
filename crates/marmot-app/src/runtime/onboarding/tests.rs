@@ -24,6 +24,7 @@ impl DirectoryRelayFetcher for Network {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        assert!(request.endpoints.iter().all(|e| !is_plaintext_onion(&e.0)));
         if self.fail_reads.load(Ordering::SeqCst)
             || (self.fail_index_only.load(Ordering::SeqCst)
                 && request
@@ -462,6 +463,7 @@ impl NostrRelayClient for Network {
         event: &NostrTransportEvent,
         _: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        assert!(endpoints.iter().all(|e| !is_plaintext_onion(&e.0)));
         self.attempts.lock().unwrap().push(event.clone());
         self.publishing.notify_one();
         if self.block_publish.load(Ordering::SeqCst) {
@@ -630,6 +632,57 @@ async fn defaults_append_relay_roles() {
             replaced.proposal.unwrap().read_relays,
             ["wss://edit.example"]
         );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn defaults_preserve_onion_relays() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        let tags = if step == OnboardingStep::Relays {
+            vec![
+                vec!["r".into(), "ws://read.onion".into(), "read".into()],
+                vec!["r".into(), "ws://write.onion".into(), "write".into()],
+            ]
+        } else {
+            vec![vec!["relay".into(), "ws://inbox.onion".into()]]
+        };
+        let event = signed(
+            &keys,
+            step.kind() as u16,
+            tags.clone(),
+            "",
+            unix_now_seconds(),
+        );
+        network.events.lock().unwrap().push(event.clone());
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.records[step.index()] = Some(event);
+        c.set(step, OnboardingStatus::NeedsInput, Vec::new());
+        manager.save_onboarding(&mut c).unwrap();
+        let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
+        assert_eq!(status, OnboardingStatus::NeedsInput);
+        assert_eq!(findings, vec![finding(OnboardingIssue::NoUsableRoute)]);
+
+        manager
+            .propose_onboarding_relays(&id, step, None)
+            .await
+            .unwrap();
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.approved = true;
+        manager.save_onboarding(&mut c).unwrap();
+        assert!(manager.publish_onboarding_repair(&mut c).await.unwrap());
+        let published = network.attempts.lock().unwrap().last().unwrap().clone();
+        for tag in tags {
+            assert!(published.tags.contains(&tag));
+        }
+        assert_eq!(
+            published.tags.len(),
+            1 + if step == OnboardingStep::Relays { 2 } else { 1 }
+        );
+        let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
+        assert_eq!(status, OnboardingStatus::Passed, "{findings:?}");
     }
     runtime.shutdown_and_close().await.unwrap();
 }

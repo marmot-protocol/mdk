@@ -2623,7 +2623,8 @@ pub async fn propose_onboarding_recommended_relays( &self, account_ref: String, 
 ```
 
 Append missing recommended relays to the observed list while preserving existing
-NIP-65 read/write roles. Invalid existing entries require an explicit edit.
+NIP-65 read/write roles and `ws://` onion entries. Onion entries are retained as
+declarations, not dialed by the direct transport. Invalid existing entries require an explicit edit.
 Proposal alone is not publication.
 
 [Source](src/commands/onboarding.rs#L207)

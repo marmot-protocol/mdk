@@ -1535,6 +1535,10 @@ impl AccountManager {
         let mut failures = Vec::new();
         let mut seen = HashSet::new();
         for c in classifications {
+            // Retain Tor declarations, but never send them to the direct dialer.
+            if is_plaintext_onion(&c.endpoint) {
+                continue;
+            }
             let issue = match c.policy {
                 RelayEndpointPolicy::Allowed => None,
                 RelayEndpointPolicy::Retired => Some(OnboardingIssue::RetiredRelay),
@@ -1734,6 +1738,9 @@ impl AccountManager {
                 .filter_map(|t| t.get(1).cloned())
                 .collect();
             for classified in self.app.relay_plane.classify_relay_endpoints(raw) {
+                if is_plaintext_onion(&classified.endpoint) {
+                    continue;
+                }
                 let issue = match classified.policy {
                     RelayEndpointPolicy::Allowed => continue,
                     RelayEndpointPolicy::Invalid => OnboardingIssue::InvalidRelay,
@@ -1772,7 +1779,9 @@ impl AccountManager {
                         )
                         .await;
                     findings.extend(failures);
-                    if completed == 0 || (step == OnboardingStep::Relays && state.relays.is_empty())
+                    if completed == 0
+                        || (step == OnboardingStep::Relays
+                            && state.relays.iter().all(|relay| is_plaintext_onion(relay)))
                     {
                         findings.push(finding(OnboardingIssue::NoUsableRoute));
                     }
@@ -1872,7 +1881,9 @@ impl AccountManager {
                 .relay_plane
                 .classify_relay_endpoints(all)
                 .iter()
-                .any(|v| v.policy != RelayEndpointPolicy::Allowed)
+                .any(|v| {
+                    v.policy != RelayEndpointPolicy::Allowed && !is_plaintext_onion(&v.endpoint)
+                })
         {
             return Err(onboarding_error());
         }
@@ -2220,6 +2231,12 @@ impl AccountManager {
             }
         }
     }
+}
+
+// A published declaration can retain Tor endpoints even without a Tor transport.
+fn is_plaintext_onion(endpoint: &str) -> bool {
+    nostr::RelayUrl::parse(endpoint)
+        .is_ok_and(|url| url.is_onion() && url.as_str().starts_with("ws://"))
 }
 
 fn validate_onboarding_record(event: &NostrTransportEvent) -> Vec<OnboardingFinding> {
