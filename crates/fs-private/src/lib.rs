@@ -235,7 +235,8 @@ impl PreparedDirectory {
                 error,
             )
         })?;
-        let mut directory = self.open_existing_private_subdirectory(name)?;
+        let mut directory =
+            self.open_existing_private_subdirectory(name, ExistingDirectoryMode::Enforce)?;
         directory.created = true;
         Ok(directory)
     }
@@ -285,9 +286,14 @@ impl PreparedDirectory {
     }
 
     /// Open an existing private subdirectory without following its name.
+    ///
+    /// `policy` makes any mode repair explicit at the call site. `Enforce`
+    /// applies the owner-only directory mode; `Preserve` leaves the existing
+    /// mode unchanged.
     pub fn open_existing_private_subdirectory(
         &self,
         name: &std::ffi::OsStr,
+        policy: ExistingDirectoryMode,
     ) -> io::Result<PreparedDirectory> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::fs::MetadataExt;
@@ -308,13 +314,15 @@ impl PreparedDirectory {
             ));
         }
         let directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
-        let mode = libc::mode_t::try_from(PRIVATE_DIR_MODE).expect("0700 fits mode_t");
-        if unsafe { libc::fchmod(directory.as_raw_fd(), mode) } != 0 {
-            return Err(io_context(
-                "set verified subdirectory mode",
-                &self.path.join(name),
-                io::Error::last_os_error(),
-            ));
+        if policy == ExistingDirectoryMode::Enforce {
+            let mode = libc::mode_t::try_from(PRIVATE_DIR_MODE).expect("0700 fits mode_t");
+            if unsafe { libc::fchmod(directory.as_raw_fd(), mode) } != 0 {
+                return Err(io_context(
+                    "set verified subdirectory mode",
+                    &self.path.join(name),
+                    io::Error::last_os_error(),
+                ));
+            }
         }
         let metadata = directory.metadata()?;
         Ok(PreparedDirectory {
@@ -2109,6 +2117,38 @@ mod unix_tests {
                 .try_acquire_private_exclusive_file_lease(name)
                 .expect("released lease can be reacquired"),
         );
+    }
+
+    #[test]
+    fn prepared_subdirectory_open_makes_mode_policy_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let root = prepare_directory_path(
+            dir.path(),
+            PRIVATE_DIR_MODE,
+            ExistingDirectoryMode::Preserve,
+        )
+        .unwrap();
+
+        drop(
+            root.open_existing_private_subdirectory(
+                std::ffi::OsStr::new("child"),
+                ExistingDirectoryMode::Preserve,
+            )
+            .unwrap(),
+        );
+        assert_eq!(mode_of(&child), 0o750);
+
+        drop(
+            root.open_existing_private_subdirectory(
+                std::ffi::OsStr::new("child"),
+                ExistingDirectoryMode::Enforce,
+            )
+            .unwrap(),
+        );
+        assert_eq!(mode_of(&child), PRIVATE_DIR_MODE);
     }
 
     #[test]

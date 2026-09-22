@@ -16,12 +16,14 @@
 //! lease. Mutations use private staging files, file sync, atomic replacement,
 //! and directory sync. A directory-sync failure fences that owner until the
 //! store is reopened because publication may already have committed.
-//! A cursor's boundary digest covers at most the final 64 KiB before its byte
-//! offset; stable device/inode identity detects pathname replacement, and a
-//! sealed segment is validated separately at its exact final length and digest.
-//! Already-acknowledged sealed history and registered prefixes verified in the
-//! current store lifetime are revalidated on reopen rather than rehashed for
-//! every preparation; live access still verifies the file identity and length.
+//! A cursor carries both a full acknowledged-prefix record-chain commitment and
+//! a boundary digest over at most the final 64 KiB before its byte offset.
+//! Stable device/inode identity detects pathname replacement. Sealed segments
+//! are checked at their exact final length and digest on first use in a store
+//! lifetime and again on reopen, rather than being rehashed for every prepared
+//! range; live access still verifies file identity and length. Acknowledgement
+//! and sealing independently validate the durable acknowledged-prefix
+//! commitment before they publish replacement metadata.
 
 mod recovery;
 mod state;

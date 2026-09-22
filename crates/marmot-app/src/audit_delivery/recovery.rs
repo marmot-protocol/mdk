@@ -137,7 +137,10 @@ pub(super) fn open_or_recover_empty_journal_directories(
     path: &Path,
 ) -> Result<JournalDirectories, AuditDeliveryError> {
     let root = open_generation_directory(path)?;
-    let segments = match root.open_existing_private_subdirectory(OsStr::new("segments")) {
+    let segments = match root.open_existing_private_subdirectory(
+        OsStr::new("segments"),
+        fs_private::ExistingDirectoryMode::Enforce,
+    ) {
         Ok(segments) => segments,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             let root_empty = root

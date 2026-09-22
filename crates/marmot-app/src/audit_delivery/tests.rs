@@ -39,6 +39,22 @@ fn reopen(root: &TempDir, journal: &JournalId) -> AuditDeliveryStore {
     AuditDeliveryStore::open(root.path(), journal.clone(), profile()).unwrap()
 }
 
+fn store_with_large_acknowledged_active_prefix()
+-> (TempDir, JournalId, SegmentId, AuditDeliveryStore, Vec<u8>) {
+    let (root, journal, segment, mut store) = store_with_segment(b"");
+    let mut payload = Vec::new();
+    for index in 0..9_u8 {
+        payload.extend(std::iter::repeat_n(b'a' + index, 9_000));
+        payload.push(b'\n');
+    }
+    append(&store, &segment, &payload);
+    let first = store.prepare_next().unwrap().unwrap();
+    assert_eq!(first.bodies().len(), 8);
+    assert!(first.end_offset() > 64 * 1024);
+    store.acknowledge(first.token()).unwrap();
+    (root, journal, segment, store, payload)
+}
+
 fn persisted_recovery_events(root: &TempDir, journal: &JournalId) -> u64 {
     let state_path = root
         .path()
@@ -529,6 +545,55 @@ fn live_prepare_and_seal_reject_same_inode_registered_prefix_rewrite() {
 }
 
 #[test]
+fn acknowledged_commitment_rejects_rewrites_older_than_the_boundary() {
+    let (_root, _journal, segment, mut store, mut payload) =
+        store_with_large_acknowledged_active_prefix();
+    let prepared = store.prepare_next().unwrap().unwrap();
+    let path = store.segment_path(&segment).unwrap();
+    let generation = path.parent().unwrap().parent().unwrap();
+    let state_before = fs::read(generation.join("state.json")).unwrap();
+    let inode = fs::metadata(&path).unwrap().ino();
+    payload[0] = b'z';
+    fs_private::write_private(&path, &payload).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert!(matches!(
+        store.acknowledge(prepared.token()),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+    assert_eq!(
+        fs::read(generation.join("state.json")).unwrap(),
+        state_before
+    );
+
+    let (_root, _journal, segment, mut store, mut payload) =
+        store_with_large_acknowledged_active_prefix();
+    let path = store.segment_path(&segment).unwrap();
+    let generation = path.parent().unwrap().parent().unwrap();
+    let manifest_before = fs::read(generation.join("manifest.json")).unwrap();
+    payload[0] = b'z';
+    fs_private::write_private(&path, &payload).unwrap();
+    assert!(matches!(
+        store.seal_active_segment(&segment),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+    assert_eq!(
+        fs::read(generation.join("manifest.json")).unwrap(),
+        manifest_before
+    );
+
+    let (root, journal, segment, store, mut payload) =
+        store_with_large_acknowledged_active_prefix();
+    let path = store.segment_path(&segment).unwrap();
+    drop(store);
+    payload[0] = b'z';
+    fs_private::write_private(&path, &payload).unwrap();
+    assert!(matches!(
+        AuditDeliveryStore::open(root.path(), journal, profile()),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+}
+
+#[test]
 fn empty_registered_segment_replacement_fails_recovery() {
     let (root, journal, segment, store) = store_with_segment(b"");
     let path = store.segment_path(&segment).unwrap();
@@ -571,6 +636,23 @@ fn j09_middle_change_in_prepared_range_is_detected() {
         b"aaaa\nzzzz\ncccc\n",
     )
     .unwrap();
+    assert!(matches!(
+        store.recover_prepared(),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+}
+
+#[test]
+fn truncated_prepared_range_is_reported_as_corrupt() {
+    let (_root, _journal, segment, mut store) = store_with_segment(b"");
+    append(&store, &segment, b"one\n");
+    store.prepare_next().unwrap().unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(store.segment_path(&segment).unwrap())
+        .unwrap()
+        .set_len(0)
+        .unwrap();
     assert!(matches!(
         store.recover_prepared(),
         Err(AuditDeliveryError::CorruptState)
@@ -848,6 +930,8 @@ fn j13_metadata_size_is_bounded_before_decode() {
     let mut segments = Vec::new();
     let mut cursors = Vec::new();
     let empty_digest = hex::encode(Sha256::digest([]));
+    let empty_acknowledged_digest =
+        hex::encode(Sha256::digest(b"marmot-audit-delivery-acknowledged-v1"));
     for index in 0..256 {
         let id = format!("segment-{index}");
         let segment_id = SegmentId::parse(id.clone()).unwrap();
@@ -869,6 +953,7 @@ fn j13_metadata_size_is_bounded_before_decode() {
             "segment_id": format!("segment-{index}"),
             "acknowledged_end": 0,
             "boundary_digest": empty_digest.clone(),
+            "acknowledged_digest": empty_acknowledged_digest.clone(),
         }));
     }
     fs_private::write_private(

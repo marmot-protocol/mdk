@@ -28,6 +28,7 @@ const MAX_SEGMENTS: usize = 256;
 const MAX_RECORDS_PER_RANGE: usize = 8;
 pub(super) const MAX_RANGE_BYTES: usize = 1024 * 1024;
 const BOUNDARY_DIGEST_BYTES: u64 = 64 * 1024;
+const ACKNOWLEDGED_DIGEST_DOMAIN: &[u8] = b"marmot-audit-delivery-acknowledged-v1";
 pub(super) const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +300,7 @@ struct SegmentCursor {
     segment_id: SegmentId,
     acknowledged_end: u64,
     boundary_digest: String,
+    acknowledged_digest: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -589,6 +591,7 @@ impl AuditDeliveryStore {
             segment_id,
             acknowledged_end: 0,
             boundary_digest: hex::encode(Sha256::digest([])),
+            acknowledged_digest: hex::encode(initial_acknowledged_digest()),
         });
         if let Err(error) = self.publish_state_value(&state) {
             self.recovery_required = true;
@@ -621,7 +624,9 @@ impl AuditDeliveryStore {
         validate_registered_shape(&file, entry)?;
         validate_registered_digest(&file, entry)?;
         let (length, digest) = file_length_and_digest(&file)?;
-        validate_acknowledged_boundary(&file, self.cursor(segment_id)?)?;
+        let cursor = self.cursor(segment_id)?;
+        validate_acknowledged_boundary(&file, cursor)?;
+        validate_acknowledged_digest(&file, cursor)?;
         validate_payload_framing(&file, length, true)?;
         sync_payload(&file, &mut self.faults)?;
 
@@ -751,11 +756,22 @@ impl AuditDeliveryStore {
             return Err(AuditDeliveryError::StaleToken);
         }
         // Re-verify the complete in-flight bytes immediately before advancing.
-        self.recover_prepared()?;
+        let recovered = self
+            .recover_prepared()?
+            .ok_or(AuditDeliveryError::CorruptState)?;
         let entry = self.segment(&prepared.segment_id)?;
         let file_name = segment_file_name(&entry.segment_id);
         let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
         validate_registered_shape(&file, entry)?;
+        let current_cursor = self.cursor(&prepared.segment_id)?;
+        validate_acknowledged_boundary(&file, current_cursor)?;
+        validate_acknowledged_digest(&file, current_cursor)?;
+        let previous_digest = decode_digest(&current_cursor.acknowledged_digest)?;
+        let (acknowledged_digest, acknowledged_end) =
+            extend_acknowledged_digest(previous_digest, prepared.start_offset, recovered.bodies())?;
+        if acknowledged_end != prepared.end_offset {
+            return Err(AuditDeliveryError::CorruptState);
+        }
         let boundary_digest = digest_boundary(&file, prepared.end_offset)?;
         let mut state = self.state.clone();
         state.revision = next_revision(state.revision)?;
@@ -766,6 +782,7 @@ impl AuditDeliveryStore {
             .ok_or(AuditDeliveryError::IncompleteState)?;
         cursor.acknowledged_end = prepared.end_offset;
         cursor.boundary_digest = hex::encode(boundary_digest);
+        cursor.acknowledged_digest = hex::encode(acknowledged_digest);
         state.prepared = None;
         self.publish_state_value(&state)?;
         self.state = state;
@@ -823,6 +840,7 @@ impl AuditDeliveryStore {
             let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
             self.validate_live_segment(&file, entry)?;
             validate_acknowledged_boundary(&file, cursor)?;
+            validate_acknowledged_digest(&file, cursor)?;
         }
         match self.state.health.status {
             HealthStatus::Clean => {}
@@ -907,6 +925,7 @@ impl AuditDeliveryStore {
             segment_id,
             acknowledged_end: 0,
             boundary_digest: hex::encode(Sha256::digest([])),
+            acknowledged_digest: hex::encode(initial_acknowledged_digest()),
         });
 
         let previous = std::mem::replace(&mut self.state, recovered.clone());
@@ -1233,6 +1252,121 @@ fn validate_acknowledged_boundary(
     Ok(())
 }
 
+fn initial_acknowledged_digest() -> [u8; 32] {
+    Sha256::digest(ACKNOWLEDGED_DIGEST_DOMAIN).into()
+}
+
+fn decode_digest(value: &str) -> Result<[u8; 32], AuditDeliveryError> {
+    hex::decode(value)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(AuditDeliveryError::CorruptState)
+}
+
+fn extend_acknowledged_digest(
+    mut digest: [u8; 32],
+    mut start: u64,
+    bodies: &[Vec<u8>],
+) -> Result<([u8; 32], u64), AuditDeliveryError> {
+    for body in bodies {
+        let body_length =
+            u64::try_from(body.len()).map_err(|_| AuditDeliveryError::CorruptState)?;
+        let end = start
+            .checked_add(body_length)
+            .and_then(|end| end.checked_add(1))
+            .ok_or(AuditDeliveryError::CorruptState)?;
+        let mut hasher = Sha256::new();
+        hasher.update(ACKNOWLEDGED_DIGEST_DOMAIN);
+        hasher.update(digest);
+        hasher.update(start.to_be_bytes());
+        hasher.update(end.to_be_bytes());
+        hasher.update(body_length.to_be_bytes());
+        hasher.update(body);
+        digest = hasher.finalize().into();
+        start = end;
+    }
+    Ok((digest, start))
+}
+
+fn validate_acknowledged_digest(
+    file: &File,
+    cursor: &SegmentCursor,
+) -> Result<(), AuditDeliveryError> {
+    let length = file
+        .metadata()
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "inspect acknowledged payload commitment",
+            source,
+        })?
+        .len();
+    if cursor.acknowledged_end > length {
+        return Err(AuditDeliveryError::CorruptState);
+    }
+
+    let mut file = file
+        .try_clone()
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "clone acknowledged payload commitment handle",
+            source,
+        })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "seek acknowledged payload commitment",
+            source,
+        })?;
+
+    let mut digest = initial_acknowledged_digest();
+    let mut remaining = cursor.acknowledged_end;
+    let mut offset = 0_u64;
+    let mut record_start = 0_u64;
+    let mut body = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    while remaining > 0 {
+        let amount = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| AuditDeliveryError::CorruptState)?;
+        file.read_exact(&mut buffer[..amount]).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::UnexpectedEof {
+                AuditDeliveryError::CorruptState
+            } else {
+                AuditDeliveryError::Filesystem {
+                    operation: "read acknowledged payload commitment",
+                    source,
+                }
+            }
+        })?;
+        for byte in &buffer[..amount] {
+            offset = offset
+                .checked_add(1)
+                .ok_or(AuditDeliveryError::CorruptState)?;
+            if *byte == b'\n' {
+                std::str::from_utf8(&body).map_err(|_| AuditDeliveryError::CorruptState)?;
+                let (next_digest, end) =
+                    extend_acknowledged_digest(digest, record_start, std::slice::from_ref(&body))?;
+                if end != offset {
+                    return Err(AuditDeliveryError::CorruptState);
+                }
+                digest = next_digest;
+                record_start = offset;
+                body.clear();
+            } else {
+                if body.len() + 1 >= MAX_RANGE_BYTES {
+                    return Err(AuditDeliveryError::CorruptState);
+                }
+                body.push(*byte);
+            }
+        }
+        remaining -= amount as u64;
+    }
+
+    if !body.is_empty()
+        || record_start != cursor.acknowledged_end
+        || digest != decode_digest(&cursor.acknowledged_digest)?
+    {
+        return Err(AuditDeliveryError::CorruptState);
+    }
+    Ok(())
+}
+
 fn digest_boundary(file: &File, end: u64) -> Result<[u8; 32], AuditDeliveryError> {
     let start = end.saturating_sub(BOUNDARY_DIGEST_BYTES);
     digest_range(file, start, end - start)
@@ -1280,9 +1414,19 @@ fn read_complete_range(
             source,
         })?
         .len();
+    if start > length {
+        return Err(AuditDeliveryError::CorruptState);
+    }
     let limit_end =
         exact_end.unwrap_or_else(|| length.min(start.saturating_add(MAX_RANGE_BYTES as u64)));
-    if start > limit_end || limit_end > length || limit_end - start > MAX_RANGE_BYTES as u64 {
+    if limit_end > length {
+        return Err(if exact_end.is_some() {
+            AuditDeliveryError::CorruptState
+        } else {
+            AuditDeliveryError::RangeTooLarge
+        });
+    }
+    if start > limit_end || limit_end - start > MAX_RANGE_BYTES as u64 {
         return Err(AuditDeliveryError::RangeTooLarge);
     }
     file.seek(SeekFrom::Start(start))
@@ -1290,42 +1434,57 @@ fn read_complete_range(
             operation: "seek payload range",
             source,
         })?;
-    let requested =
-        usize::try_from(limit_end - start).map_err(|_| AuditDeliveryError::RangeTooLarge)?;
-    let mut bytes = vec![0u8; requested];
-    file.read_exact(&mut bytes)
-        .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "read payload range",
-            source,
-        })?;
-
     let mut bodies = Vec::new();
-    let mut consumed = 0usize;
-    for newline in bytes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
-    {
-        if bodies.len() == MAX_RECORDS_PER_RANGE {
-            break;
+    let mut body = Vec::new();
+    let mut remaining = limit_end - start;
+    let mut consumed = 0_u64;
+    let mut complete_end = start;
+    let mut buffer = [0_u8; 16 * 1024];
+    while remaining > 0 {
+        let amount = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| AuditDeliveryError::RangeTooLarge)?;
+        file.read_exact(&mut buffer[..amount]).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::UnexpectedEof {
+                AuditDeliveryError::CorruptState
+            } else {
+                AuditDeliveryError::Filesystem {
+                    operation: "read payload range",
+                    source,
+                }
+            }
+        })?;
+        for byte in &buffer[..amount] {
+            consumed = consumed
+                .checked_add(1)
+                .ok_or(AuditDeliveryError::RangeTooLarge)?;
+            if *byte == b'\n' {
+                std::str::from_utf8(&body).map_err(|_| AuditDeliveryError::InvalidJsonl)?;
+                bodies.push(std::mem::take(&mut body));
+                complete_end = start + consumed;
+                if bodies.len() == MAX_RECORDS_PER_RANGE {
+                    if exact_end.is_some() && complete_end != limit_end {
+                        return Err(AuditDeliveryError::CorruptState);
+                    }
+                    return Ok((bodies, complete_end));
+                }
+            } else {
+                if body.len() + 1 >= MAX_RANGE_BYTES {
+                    return Err(AuditDeliveryError::RangeTooLarge);
+                }
+                body.push(*byte);
+            }
         }
-        let body = bytes[consumed..newline].to_vec();
-        std::str::from_utf8(&body).map_err(|_| AuditDeliveryError::InvalidJsonl)?;
-        bodies.push(body);
-        consumed = newline + 1;
-        if exact_end.is_some() && consumed == bytes.len() {
-            break;
-        }
+        remaining -= amount as u64;
     }
 
     if let Some(expected_end) = exact_end {
-        if start + consumed as u64 != expected_end || consumed != bytes.len() || bodies.is_empty() {
+        if complete_end != expected_end || !body.is_empty() || bodies.is_empty() {
             return Err(AuditDeliveryError::CorruptState);
         }
     } else if bodies.is_empty() && length.saturating_sub(start) >= MAX_RANGE_BYTES as u64 {
         return Err(AuditDeliveryError::RangeTooLarge);
     }
-    Ok((bodies, start + consumed as u64))
+    Ok((bodies, complete_end))
 }
 
 fn ordered_body_digest(bodies: &[Vec<u8>]) -> [u8; 32] {
