@@ -149,8 +149,9 @@ fn join_epoch_tx(
     Ok(())
 }
 
-/// Only a serialized worker observation chooses the current plane token.
-/// Random token values and callback write timestamps do not order generations.
+/// A serialized worker observation chooses the current live plane token.
+/// Imports also replace the compatibility pointer to fence an older clear;
+/// random tokens do not order generations and each retains its own watermark.
 pub(crate) fn arm_overflow_tx(
     conn: &Connection,
     label: &str,
@@ -159,10 +160,10 @@ pub(crate) fn arm_overflow_tx(
     now: i64,
 ) -> StorageResult<()> {
     // Import may have joined this generation before its queued control record
-    // reaches the worker. Adopting that already-covered identity is metadata,
-    // not another loss observation or permission to reset quiescence.
+    // reaches the worker. Changing the represented identity must fence old
+    // grants even though it grants no permission to reset quiescence.
     let adopted = conn.execute_cached(
-        "UPDATE account_recovery_obligations SET marker_token = ?2,
+        "UPDATE account_recovery_obligations SET marker_token = ?2, revision = revision + 1, state = 0,
              dropped_count = (SELECT imported_count FROM account_delivery_loss_evidence
                  WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2),
              pending_since = (SELECT pending_since FROM account_delivery_loss_evidence
@@ -174,6 +175,12 @@ pub(crate) fn arm_overflow_tx(
     ).storage()?;
     if adopted == 0 {
         join_loss_tx(conn, label, 0, token, dropped, now, true)?;
+    } else {
+        conn.execute_cached(
+            "UPDATE account_recovery_state SET loss_revision=loss_revision+1 WHERE singleton=1",
+            [],
+        )
+        .storage()?;
     }
     // Preserve what the worker already observed, even when this token's marker
     // callback has not committed yet. A delayed duplicate cannot rearm debt.
@@ -238,6 +245,40 @@ fn join_loss_tx(
     Ok(())
 }
 
+/// Token-only legacy retirement cannot certify other generations joined into
+/// the same account demand. Reconstitute those generations in this transaction;
+/// their imported watermark remains distinct from low-level retirement.
+pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageResult<bool> {
+    let rows = conn
+        .prepare_cached(
+            "SELECT marker_token,pending_since,dropped_count FROM account_delivery_loss_evidence
+         WHERE account_label=?1 AND cause=0
+           AND (legacy_retired_count IS NULL OR dropped_count>legacy_retired_count)
+         ORDER BY marker_token",
+        )
+        .storage()?
+        .query_map([label], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    for (token, since, dropped) in &rows {
+        join_loss_tx(conn, label, 0, *token, *dropped, *since, true)?;
+        conn.execute_cached(
+            "UPDATE account_delivery_loss_evidence SET imported_count=dropped_count
+            WHERE account_label=?1 AND cause=0 AND marker_token=?2",
+            params![label, token],
+        )
+        .storage()?;
+    }
+    Ok(!rows.is_empty())
+}
+
 /// Selection may cover a subset. Additional unrelated obligations do not
 /// invalidate it; account-wide loss/route/inventory fences remain conservative.
 fn selected_fence_matches(
@@ -300,7 +341,7 @@ impl SqliteAccountStorage {
             {
                 return Ok(None);
             }
-            let mut eligible = false;
+            let mut eligible = true;
             for (id, _) in &expected.obligations {
                 let unknown_format: bool = conn.query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM account_recovery_scopes
@@ -310,7 +351,7 @@ impl SqliteAccountStorage {
                 if unknown_format {
                     return Err(StorageError::Serialization("unsupported recovery scope format".into()));
                 }
-                eligible |= conn.query_row_cached(
+                eligible &= conn.query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
                      WHERE id = ?1 AND state = 0 AND (eligibility IN (0, 1) OR ?2))",
                     params![id.as_slice(), explicit_override], |row| row.get::<_, bool>(0),
@@ -384,7 +425,7 @@ impl SqliteAccountStorage {
             ).storage()?.query_map([label], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)))
                 .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
             for (cause, token, observed_at, dropped) in rows {
-                join_loss_tx(&conn, label, cause, token, dropped, observed_at, false)?;
+                join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
                 conn.execute_cached(
                     "UPDATE account_delivery_loss_evidence SET imported_count = ?3
                      WHERE account_label = ?1 AND cause = ?4 AND marker_token = ?2",
@@ -437,6 +478,178 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store.ensure_account_projection("alice").unwrap();
         store
+    }
+
+    #[test]
+    fn review_legacy_clear_preserves_each_generation_across_reopen() {
+        for (old, newer) in [(10, 90), (90, 10)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("loss.sqlite");
+            let key = SqlCipherKey::new("generation retirement test").unwrap();
+            {
+                let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+                store.ensure_account_projection("alice").unwrap();
+                store
+                    .mark_account_delivery_recovery("alice", old, 2)
+                    .unwrap();
+                store
+                    .record_account_delivery_loss("alice", newer, 15, 10)
+                    .unwrap();
+                store.synchronize_account_delivery_loss("alice").unwrap();
+                assert!(!store.clear_account_delivery_recovery("alice", old).unwrap());
+            }
+            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            store.synchronize_account_delivery_loss("alice").unwrap();
+            let pending = store.account_delivery_recovery("alice").unwrap().unwrap();
+            assert_eq!((pending.marker_token, pending.dropped_count), (newer, 15));
+            // A low-level retirement covers only its token, never all joined loss.
+            assert!(
+                !store
+                    .clear_account_delivery_recovery("alice", newer)
+                    .unwrap()
+            );
+            assert_eq!(
+                store
+                    .account_delivery_recovery("alice")
+                    .unwrap()
+                    .unwrap()
+                    .marker_token,
+                old
+            );
+            assert!(store.clear_account_delivery_recovery("alice", old).unwrap());
+            assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+            store
+                .record_account_delivery_loss("alice", newer, 15, 11)
+                .unwrap();
+            store.synchronize_account_delivery_loss("alice").unwrap();
+            assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+            store
+                .record_account_delivery_loss("alice", newer, 16, 12)
+                .unwrap();
+            store.synchronize_account_delivery_loss("alice").unwrap();
+            assert_eq!(
+                store
+                    .account_delivery_recovery("alice")
+                    .unwrap()
+                    .unwrap()
+                    .dropped_count,
+                16
+            );
+        }
+    }
+
+    #[test]
+    fn review_legacy_clear_rollback_preserves_retirement_and_pending_loss() {
+        let store = fixture();
+        store
+            .mark_account_delivery_recovery("alice", 10, 2)
+            .unwrap();
+        store
+            .record_account_delivery_loss("alice", 90, 15, 10)
+            .unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        let before = store.recovery_revision_fence().unwrap();
+        store.lock().unwrap().execute_batch("CREATE TRIGGER reject_rejoin BEFORE INSERT ON account_recovery_obligations BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        assert!(store.clear_account_delivery_recovery("alice", 90).is_err());
+        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        assert_eq!(
+            store
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .unwrap()
+                .marker_token,
+            90
+        );
+        assert!(store.lock().unwrap().query_row("SELECT legacy_retired_count IS NULL FROM account_delivery_loss_evidence WHERE marker_token=90",[],|r|r.get::<_,bool>(0)).unwrap());
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_rejoin")
+            .unwrap();
+        assert!(!store.clear_account_delivery_recovery("alice", 90).unwrap());
+        assert!(store.clear_account_delivery_recovery("alice", 10).unwrap());
+    }
+
+    #[test]
+    fn review_adoption_fences_prior_generation_without_resetting_quiescence() {
+        let store = fixture();
+        store
+            .mark_account_delivery_recovery("alice", 20, 4)
+            .unwrap();
+        store
+            .mark_account_delivery_recovery("alice", 10, 6)
+            .unwrap();
+        store
+            .mark_account_delivery_recovery("alice", 20, 4)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE account_recovery_obligations SET eligibility=3")
+            .unwrap();
+        let before = store.recovery_revision_fence().unwrap();
+        let retry = store.recovery_retry_state().unwrap();
+        store
+            .mark_account_delivery_recovery("alice", 10, 6)
+            .unwrap();
+        let after = store.recovery_revision_fence().unwrap();
+        assert!(after.loss_revision > before.loss_revision);
+        assert!(after.obligations[0].1 > before.obligations[0].1);
+        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT eligibility FROM account_recovery_obligations",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        assert!(
+            store
+                .reserve_recovery_attempt(&before, 1000, 15000, true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn review_mixed_selection_cannot_reserve_for_quiescent_demand() {
+        let store = fixture();
+        store.mark_account_delivery_recovery("alice", 1, 4).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE account_recovery_obligations SET eligibility=3;
+            INSERT INTO cgka_groups(id,epoch,record) VALUES(x'01',7,x'00')",
+            )
+            .unwrap();
+        store
+            .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: "01".into(),
+                stalled_epoch: 7,
+            }])
+            .unwrap();
+        let fence = store.recovery_revision_fence().unwrap();
+        let retry = store.recovery_retry_state().unwrap();
+        assert_eq!(fence.obligations.len(), 2);
+        assert!(
+            store
+                .reserve_recovery_attempt(&fence, 1000, 15000, false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert!(
+            store
+                .reserve_recovery_attempt(&fence, 1000, 15000, true)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -548,8 +761,9 @@ mod tests {
             10
         );
         assert_eq!(store.recovery_revision_fence().unwrap(), current);
-        // A previously unobserved token has no trustworthy generation ordering.
-        // Join its uncertainty conservatively, without replacing the current token.
+        // A newly imported token must replace the compatibility pointer so an
+        // older token-only clear fails. Its numerical value is not an ordering;
+        // all generations retain separate evidence and retirement watermarks.
         store
             .record_account_delivery_loss("alice", 80, 3, 30)
             .unwrap();
@@ -560,7 +774,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .marker_token,
-            10
+            80
         );
         assert!(store.recovery_revision_fence().unwrap().loss_revision > current.loss_revision);
     }
