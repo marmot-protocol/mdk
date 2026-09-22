@@ -8196,7 +8196,9 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 first_claim.event, spool_message_id=first_claim.message_id
             ),
         )
-        await asyncio.wait_for(handed.wait(), timeout=1)
+        # Wait for the actual handoff; disk-backed setup is not under test and
+        # can exceed one second on a contended CI runner.
+        await asyncio.wait_for(handed.wait(), timeout=10)
 
         await adapter.disconnect()
 
