@@ -80,22 +80,33 @@ jobs:
         run: |
           set -euo pipefail
           sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$sdk_root" ]]; then
+            echo "error: ANDROID_SDK_ROOT or ANDROID_HOME must be set on the runner" >&2
+            exit 1
+          fi
           sdkmanager_bin=""
-          for candidate in "$sdk_root/cmdline-tools/latest/bin/sdkmanager" \
-            "$sdk_root/cmdline-tools/bin/sdkmanager" "$sdk_root/tools/bin/sdkmanager"; do
-            [[ -x "$candidate" ]] && sdkmanager_bin="$candidate" && break
+          for candidate in \
+            "$sdk_root/cmdline-tools/latest/bin/sdkmanager" \
+            "$sdk_root/cmdline-tools/bin/sdkmanager" \
+            "$sdk_root/tools/bin/sdkmanager"; do
+            if [[ -x "$candidate" ]]; then
+              sdkmanager_bin="$candidate"
+              break
+            fi
           done
-          [[ -n "$sdkmanager_bin" ]] || sdkmanager_bin="$(command -v sdkmanager)"
+          if [[ -z "$sdkmanager_bin" ]] && command -v sdkmanager >/dev/null 2>&1; then
+            sdkmanager_bin="$(command -v sdkmanager)"
+          fi
+          if [[ -z "$sdkmanager_bin" ]]; then
+            echo "error: sdkmanager not found under $sdk_root" >&2
+            find "$sdk_root" -maxdepth 4 -type f -name sdkmanager -print >&2 || true
+            exit 1
+          fi
           set +o pipefail
           yes | "$sdkmanager_bin" --licenses >/dev/null
           set -o pipefail
           "$sdkmanager_bin" "ndk;$ANDROID_NDK_VERSION"
           echo "ANDROID_NDK_HOME=$sdk_root/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
-      - name: Restore trusted Cargo cache read-only
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: false
-          shared-key: marmotkit-profile-measurement-linux
       - name: Compare host, Android ABIs, and CPU
         env:
           SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
@@ -113,6 +124,8 @@ jobs:
             --markdown "$RUNNER_TEMP/marmotkit-profile-measurement/release-profile-measurements.md"
       - name: Collect Linux measurement diagnostics
         if: always()
+        env:
+          SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/marmotkit-profile-measurement/diagnostics"
@@ -127,7 +140,7 @@ jobs:
             fi
           done
           {
-            echo "source_sha=${{ needs.identity.outputs.source_sha }}"
+            echo "source_sha=$SOURCE_SHA"
             echo "workflow_run_id=$GITHUB_RUN_ID"
             rustc --version || true
             cargo --version || true
@@ -168,11 +181,6 @@ jobs:
           rustc --version
           cargo --version
           xcodebuild -version
-      - name: Restore trusted Cargo cache read-only
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: false
-          shared-key: marmotkit-profile-measurement-apple
       - name: Compare Apple archive slices
         env:
           SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
@@ -189,6 +197,8 @@ jobs:
             --markdown "$RUNNER_TEMP/marmotkit-profile-measurement/release-profile-measurements.md"
       - name: Collect Apple measurement diagnostics
         if: always()
+        env:
+          SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/marmotkit-profile-measurement/diagnostics"
@@ -197,7 +207,7 @@ jobs:
             cp -a target/release-profile-measure/logs "$out/logs"
           fi
           {
-            echo "source_sha=${{ needs.identity.outputs.source_sha }}"
+            echo "source_sha=$SOURCE_SHA"
             echo "workflow_run_id=$GITHUB_RUN_ID"
             rustc --version || true
             cargo --version || true

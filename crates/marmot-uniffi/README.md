@@ -452,9 +452,10 @@ gh workflow run bindings-profile-measurement.yml \
   -f source_sha="$(git rev-parse HEAD)"
 ```
 
-Use it when the release profile, Rust toolchain or measurement method changes,
-or when release/review evidence is requested. The selected SHA must already be
-fetchable from GitHub. The non-publishing run fails closed unless checkout
+Changes to the release profile, Rust toolchain or measurement method must run it
+and link the completed evidence before merge; also run it whenever release or
+review evidence is requested. The selected SHA must already be fetchable from
+GitHub. The non-publishing run fails closed unless checkout
 matches it exactly and uploads separate Linux/Android/CPU and Apple reports,
 hashes, raw Criterion output and build logs. A failed or incomplete surface
 keeps the final comparison check red.

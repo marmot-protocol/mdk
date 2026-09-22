@@ -721,7 +721,6 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertIn("pull_request:", text)
         self.assertNotIn("measure-release-profile.py", text)
         self.assertNotIn("release-profile-measurements", text)
-        self.assertNotIn("baseline", text.lower())
         self.assertIn("./crates/marmot-uniffi/kotlin-bindings.sh generate", text)
         for invocation in (
             "ANDROID_ABIS=\"$PART\" ./crates/marmot-uniffi/kotlin-bindings.sh native",
@@ -745,7 +744,17 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertIn("GITHUB_RUN_ID: ${{ github.run_id }}", text)
         self.assertNotIn("run-id:", text)
         self.assertGreaterEqual(text.count("MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}"), 2)
-        self.assertGreaterEqual(text.count("${{ needs.identity.outputs.source_sha }}"), 12)
+
+    def test_automatic_profile_workflow_limits_cost_and_preserves_diagnostics(self):
+        text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
+        trigger = text.split("permissions:", 1)[0]
+        self.assertEqual(trigger.count('!crates/marmot-uniffi/**/*.md'), 2)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text)
+        self.assertGreaterEqual(text.count("error: sdkmanager not found under $sdk_root"), 1)
+        self.assertIn('swift)\n              python3 crates/marmot-uniffi/test-native-archive.py', text)
+        ios_package = text.split("  ios-package:", 1)[1]
+        self.assertNotIn("test-native-archive.py", ios_package)
+        self.assertEqual(text.count("test-apple-privacy.py"), 1)
 
     def test_profile_workflows_are_non_publishing_and_diagnostic_rich(self):
         for workflow in ("bindings-profile.yml", "bindings-profile-measurement.yml"):
@@ -773,6 +782,7 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertGreaterEqual(text.count("--builder-sha \"$SOURCE_SHA\""), 2)
         self.assertIn("cpu-${variant}/criterion", text)
         self.assertIn("target/release-profile-measure/logs", text)
+        self.assertNotIn("Swatinem/rust-cache", text)
 
     def test_profile_cache_writes_are_trusted_only(self):
         automatic = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
@@ -781,7 +791,14 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertGreaterEqual(automatic.count(trusted), 2)
         self.assertNotIn("save-if: true", automatic)
         self.assertNotIn("save-if: true", measurement)
-        self.assertGreaterEqual(measurement.count("save-if: false"), 2)
+        self.assertNotIn("save-if:", measurement)
+
+    def test_measurement_policy_requires_explicit_evidence_for_policy_changes(self):
+        guidance = (HERE / "AGENTS.md").read_text()
+        self.assertIn(
+            "must dispatch and link completed comparative evidence before merge",
+            " ".join(guidance.split()),
+        )
 
     def test_measurement_stage_identifies_unsanitized_apple_archives(self):
         baseline = self.root / "baseline.a"

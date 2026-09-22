@@ -10,6 +10,7 @@ on:
       - .github/workflows/bindings-profile.yml
       - .github/workflows/bindings-profile-measurement.yml
       - crates/marmot-uniffi/**
+      - "!crates/marmot-uniffi/**/*.md"
   push:
     branches:
       - master
@@ -21,6 +22,7 @@ on:
       - .github/workflows/bindings-profile.yml
       - .github/workflows/bindings-profile-measurement.yml
       - crates/marmot-uniffi/**
+      - "!crates/marmot-uniffi/**/*.md"
   schedule:
     - cron: "37 3 * * 1"
   workflow_dispatch:
@@ -30,7 +32,7 @@ permissions:
 
 concurrency:
   group: marmotkit-profile-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -57,12 +59,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Record exact candidate identity
         id: identity
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          expected_sha="${{ github.event.pull_request.head.sha || github.sha }}"
           source_sha="$(git rev-parse 'HEAD^{commit}')"
-          if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ || "$source_sha" != "$expected_sha" ]]; then
+          if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ || "$source_sha" != "$EXPECTED_SHA" ]]; then
             echo "error: checkout did not resolve the exact requested candidate SHA" >&2
             exit 1
           fi
@@ -130,7 +133,10 @@ jobs:
         run: |
           set -euo pipefail
           case "$PART" in
-            swift) ./crates/marmot-uniffi/xcframework.sh generate ;;
+            swift)
+              python3 crates/marmot-uniffi/test-native-archive.py
+              ./crates/marmot-uniffi/xcframework.sh generate
+              ;;
             ios-device) ./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios ;;
             ios-simulator) ./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios-sim ;;
             macos) ./crates/marmot-uniffi/xcframework-macos.sh native ;;
@@ -208,11 +214,23 @@ jobs:
             exit 1
           fi
           sdkmanager_bin=""
-          for candidate in "$sdk_root/cmdline-tools/latest/bin/sdkmanager" \
-            "$sdk_root/cmdline-tools/bin/sdkmanager" "$sdk_root/tools/bin/sdkmanager"; do
-            [[ -x "$candidate" ]] && sdkmanager_bin="$candidate" && break
+          for candidate in \
+            "$sdk_root/cmdline-tools/latest/bin/sdkmanager" \
+            "$sdk_root/cmdline-tools/bin/sdkmanager" \
+            "$sdk_root/tools/bin/sdkmanager"; do
+            if [[ -x "$candidate" ]]; then
+              sdkmanager_bin="$candidate"
+              break
+            fi
           done
-          [[ -n "$sdkmanager_bin" ]] || sdkmanager_bin="$(command -v sdkmanager)"
+          if [[ -z "$sdkmanager_bin" ]] && command -v sdkmanager >/dev/null 2>&1; then
+            sdkmanager_bin="$(command -v sdkmanager)"
+          fi
+          if [[ -z "$sdkmanager_bin" ]]; then
+            echo "error: sdkmanager not found under $sdk_root" >&2
+            find "$sdk_root" -maxdepth 4 -type f -name sdkmanager -print >&2 || true
+            exit 1
+          fi
           set +o pipefail
           yes | "$sdkmanager_bin" --licenses >/dev/null
           set -o pipefail
@@ -379,9 +397,7 @@ jobs:
             target/aarch64-apple-ios/release/build-provenance.json \
             target/aarch64-apple-ios-sim/release/build-provenance.json
       - name: Sanitize and assemble iOS XCFramework
-        run: |
-          python3 crates/marmot-uniffi/test-native-archive.py
-          ./crates/marmot-uniffi/xcframework.sh assemble
+        run: ./crates/marmot-uniffi/xcframework.sh assemble
       - name: Package and validate iOS candidate
         env:
           SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
@@ -399,7 +415,6 @@ jobs:
             crates/marmot-uniffi/output/MarmotKit.xcframework - \
             crates/marmot-uniffi/output/MarmotKit.swift "$RUNNER_TEMP/marmotkit-profile-ios-consumer"
           command -v xcodegen >/dev/null || brew install xcodegen
-          python3 crates/marmot-uniffi/test-apple-privacy.py
           python3 crates/marmot-uniffi/validate-apple-archive.py ios \
             "$dist/MarmotKitFFI-$release_id.xcframework.zip" "$dist/MarmotKit-$release_id.swift" \
             "$RUNNER_TEMP/marmotkit-profile-ios-privacy-archive" \
@@ -486,7 +501,6 @@ jobs:
             crates/marmot-uniffi/output/macos/MarmotKit.xcframework - \
             crates/marmot-uniffi/output/macos/MarmotKit.swift "$RUNNER_TEMP/marmotkit-profile-macos-consumer"
           command -v xcodegen >/dev/null || brew install xcodegen
-          python3 crates/marmot-uniffi/test-apple-privacy.py
           cp crates/marmot-uniffi/output/macos/MarmotKit.swift "$RUNNER_TEMP/MarmotKit-$release_id.swift"
           python3 crates/marmot-uniffi/validate-apple-archive.py macos \
             "$dist/MarmotKitFFI-macos-$release_id.xcframework.zip" "$RUNNER_TEMP/MarmotKit-$release_id.swift" \

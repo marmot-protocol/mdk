@@ -17,7 +17,9 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
   baseline/candidate measurements.
 - Keep automatic exact-head packaging in `bindings-profile.yml`; comparative
   measurements belong in the explicit full-SHA `bindings-profile-measurement.yml`
-  dispatch and must retain host, Android, Apple, CPU and failure evidence.
+  dispatch and must retain host, Android, Apple, CPU and failure evidence. Changes
+  to the release profile, Rust toolchain or measurement methodology must dispatch
+  and link completed comparative evidence before merge.
 - Build scripts retain complete no-argument builds and expose generation/native/assembly phases for release CI.
   Keep `test-build-phases.py` covering phase isolation, required assembly inputs and deployment/strip behavior.
   Shared Swift generation feeds both Apple assemblers; transfer phase inputs only from the same workflow run.
