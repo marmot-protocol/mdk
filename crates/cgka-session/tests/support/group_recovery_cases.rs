@@ -1,6 +1,5 @@
 use super::*;
 use cgka_session::GroupRecoveryError;
-use cgka_traits::storage::{GroupStorage, MessageStorage, OutboundFanoutStorage};
 
 #[tokio::test]
 async fn recovery_replays_and_reopens() {
@@ -91,8 +90,10 @@ async fn recovery_replays_and_reopens() {
     .unwrap();
     assert_eq!(commit_only.report().recovered_epoch, 3);
     assert_eq!(commit_only.report().authenticated_deliveries, 0);
+    let mut missing_payloads = std::collections::HashSet::new();
     for n in 0..82 {
         let payload = app_payload_for(&alice, format!("missing {n}").as_bytes());
+        missing_payloads.insert(payload.clone());
         let sent = alice
             .send(SendIntent::AppMessage {
                 group_id: group.clone(),
@@ -125,18 +126,6 @@ async fn recovery_replays_and_reopens() {
         commit_only.apply_group_recovery(),
         Err(GroupRecoveryError::SourceChanged)
     ));
-    let live = SqliteAccountStorage::open_encrypted_with_options(&bob_path, &key, options.clone())
-        .unwrap();
-    // Model the host having committed the already-visible app projection.
-    let prior = live.list_pending_application_events().unwrap();
-    let ids = prior
-        .iter()
-        .filter_map(|e| match e {
-            GroupEvent::MessageReceived { message_id, .. } => Some(message_id.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    live.delete_pending_application_events(&ids).unwrap();
     // A frozen ambiguous publication must be resolved by the host first.
     let endpoint = cgka_traits::TransportEndpoint("memory://recovery".into());
     let mut fanout = cgka_traits::OutboundFanout::stage(
@@ -167,7 +156,7 @@ async fn recovery_replays_and_reopens() {
             },
         )
         .unwrap();
-    live.put_outbound_fanout(&fanout).unwrap();
+    bob.put_outbound_fanout(&fanout).unwrap();
     let blocked = AccountDeviceSession::prepare_group_recovery(
         config(&bob_path, &key, b"bob").storage_options(options.clone()),
         group.clone(),
@@ -180,10 +169,10 @@ async fn recovery_replays_and_reopens() {
         Err(GroupRecoveryError::UnsupportedPublication)
     ));
     assert_eq!(
-        live.outbound_fanout(fanout.message_id()).unwrap().unwrap(),
-        fanout
+        bob.outbound_fanouts_for_group(&group).unwrap(),
+        vec![fanout.clone()]
     );
-    live.delete_outbound_fanout(fanout.message_id()).unwrap();
+    bob.delete_outbound_fanout(fanout.message_id()).unwrap();
     let mut conflicting = history.clone();
     let mut collision = history[3].clone();
     collision.payload.push(0);
@@ -196,7 +185,7 @@ async fn recovery_replays_and_reopens() {
     )
     .await;
     assert!(matches!(rejected, Err(GroupRecoveryError::InvalidHistory)));
-    assert_eq!(live.get_group(&group).unwrap().epoch, EpochId(2));
+    assert_eq!(bob.group_record(&group).unwrap().epoch, EpochId(2));
     history.push(history[3].clone());
     history.reverse();
     let recovery = AccountDeviceSession::prepare_group_recovery(
@@ -210,7 +199,7 @@ async fn recovery_replays_and_reopens() {
     assert_eq!(recovery.report().original_epoch, 2);
     assert_eq!(recovery.report().recovered_epoch, 3);
     assert_eq!(recovery.report().authenticated_deliveries, 82);
-    assert_eq!(live.get_group(&group).unwrap().epoch, EpochId(2));
+    assert_eq!(bob.group_record(&group).unwrap().epoch, EpochId(2));
     drop(bob);
     recovery.apply_group_recovery().unwrap();
     let mut reopened = AccountDeviceSession::open(
@@ -218,11 +207,11 @@ async fn recovery_replays_and_reopens() {
     )
     .unwrap();
     assert_eq!(reopened.epoch(&group).unwrap(), EpochId(3));
-    let deliveries = live.list_pending_application_events().unwrap();
+    let deliveries = reopened.drain().events;
     assert_eq!(
         deliveries
             .iter()
-            .filter(|e| matches!(e, GroupEvent::MessageReceived { .. }))
+            .filter(|e| matches!(e, GroupEvent::MessageReceived { payload, .. } if missing_payloads.contains(payload)))
             .count(),
         82
     );
@@ -251,17 +240,7 @@ async fn recovery_replays_and_reopens() {
     // Model a prior rollback after a send at epoch 3. Rebuilding epoch 3
     // must not reset its sender ratchet even though the current tip is 2.
     drop(reopened);
-    let delivered_ids = deliveries
-        .iter()
-        .filter_map(|event| match event {
-            GroupEvent::MessageReceived { message_id, .. } => Some(message_id.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    live.delete_pending_application_events(&delivered_ids)
-        .unwrap();
-    live.rollback_group_state_to_snapshot(&group, "openmls-retained-anchor-2")
-        .unwrap();
+    inject_prior_rollback(&bob_path, &key, options.clone(), &group);
     let repeated = AccountDeviceSession::prepare_group_recovery(
         config(&bob_path, &key, b"bob").storage_options(options.clone()),
         group.clone(),
@@ -270,7 +249,27 @@ async fn recovery_replays_and_reopens() {
     )
     .await;
     assert!(matches!(repeated, Err(GroupRecoveryError::NoProgress)));
-    assert_eq!(live.get_group(&group).unwrap().epoch, EpochId(2));
+    let reopened =
+        AccountDeviceSession::open(config(&bob_path, &key, b"bob").storage_options(options))
+            .unwrap();
+    assert_eq!(reopened.epoch(&group).unwrap(), EpochId(2));
+}
+
+/// Fault injection only: no session operation intentionally rewinds below a used
+/// send epoch. Keep the refusal assertion at the session boundary, where the
+/// sender-ratchet safety policy lives; storage alone cannot test that policy.
+fn inject_prior_rollback(
+    path: &std::path::Path,
+    key: &SqlCipherKey,
+    options: storage_sqlite::SqliteStorageOptions,
+    group: &GroupId,
+) {
+    use cgka_traits::storage::MessageStorage;
+
+    SqliteAccountStorage::open_encrypted_with_options(path, key, options)
+        .unwrap()
+        .rollback_group_state_to_snapshot(group, "openmls-retained-anchor-2")
+        .unwrap();
 }
 
 #[tokio::test]
