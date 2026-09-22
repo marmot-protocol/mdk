@@ -1702,10 +1702,7 @@ exit 64
             .output()
             .expect("run codex --version");
         assert!(version.status.success());
-        eprintln!(
-            "real_codex_version={}",
-            String::from_utf8_lossy(&version.stdout).trim()
-        );
+        assert!(!String::from_utf8_lossy(&version.stdout).trim().is_empty());
 
         let attachment_root = tempfile::tempdir().unwrap();
         let notes = attachment_root.path().join("codex-attachment-smoke.txt");
