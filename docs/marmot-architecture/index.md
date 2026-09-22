@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-19
+updated: 2026-09-22
 tags: [marmot, architecture, index]
 ---
 
@@ -117,6 +117,11 @@ observability → custom-extensions → current-state → direction.
 ## Deeper reference — further-context
 
 These are longer working documents. Go here when you need depth, not orientation.
+
+- **Doc:** [`further-context/account-recovery-ownership.md`](./further-context/account-recovery-ownership.md)
+  - **What it covers:** Issue #1946 Phase A proposal: source ownership/replacement map,
+    authoritative recovery schema and migration, retry/completion contracts, evidence
+    policy, rollback and focused acceptance tests. Implementation requires the recorded design gate.
 
 ### Protocol & architecture reference
 

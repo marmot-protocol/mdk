@@ -7036,6 +7036,77 @@ mod tests {
         assert_eq!(relay.subscription_count(), subscriptions_after_replay);
     }
 
+    /// Phase-A characterization for #1946. Keep the same workload when the
+    /// recovery owner replaces this seam; then invert the bypass assertions.
+    #[cfg(feature = "test-policy-overrides")]
+    #[tokio::test]
+    async fn recovery_ownership_baseline_overflow_bypasses_epoch_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config()
+                .with_dev_epoch_backfill_eose_wait_ms(25)
+                .with_dev_epoch_backfill_retry_backoff_ms(300_000),
+        )
+        .with_test_relay_client(relay.clone());
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group = client
+            .create_group("ownership baseline", &[])
+            .await
+            .unwrap();
+        let epoch = client.group_mls_state(&group).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group,
+            epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        app.account_storage("alice")
+            .unwrap()
+            .mark_account_delivery_recovery("alice", 7, 1)
+            .unwrap();
+        client.delivery_overflow_recovery_pending = true;
+        client.delivery_overflow_recovery_marker_token = Some(7);
+        let (events, _subscriber) = broadcast::channel(16);
+        let shared = RuntimeSharedServices::default();
+        let before = relay.unfloored_account_subscription_count();
+        for (seam, expected_activations) in [
+            (EpochBackfillExecutionSeam::Maintenance, 2),
+            (EpochBackfillExecutionSeam::Receive, 3),
+        ] {
+            run_pending_epoch_backfill_reporting_arm(
+                &mut client,
+                &events,
+                "account-id",
+                "alice",
+                &shared,
+                seam,
+            )
+            .await
+            .unwrap();
+            assert!(client.epoch_backfill_retry_is_paced(seam));
+            assert_eq!(
+                relay.unfloored_account_subscription_count() - before,
+                expected_activations,
+                "baseline: the overflow executor bypasses the epoch cooldown",
+            );
+        }
+        assert!(client.has_pending_epoch_backfill());
+        assert!(client.delivery_overflow_recovery_pending);
+        assert_eq!(
+            app.relay_plane
+                .relay_health()
+                .await
+                .account_delivery_recovery_attempts,
+            2,
+        );
+    }
+
     #[tokio::test]
     async fn incomplete_delivery_overflow_recovery_does_not_fail_catch_up() {
         let dir = tempfile::tempdir().unwrap();
