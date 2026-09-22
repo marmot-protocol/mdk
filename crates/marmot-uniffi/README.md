@@ -510,7 +510,12 @@ Imported identities can use the durable preflight API instead of `login`:
    explicit `continue_onboarding_without`. Empty follow lists are valid.
 4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
-   a proposal. Profile fields left unset preserve their current values; an
+   a proposal. Recommended relays append missing defaults to the observed list,
+   preserving existing NIP-65 roles. Invalid existing entries require an explicit
+   edit; they are never silently removed. Explicit relay selections replace the
+   list. A missing discovery result is not global proof of absence: hosts must
+   not automatically approve publication for imported identities.
+   Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned
    snapshot revision to `approve_onboarding_repair`. For an inbox proposal use
    `read_relays` and an empty `write_relays`. `cancel_onboarding_repair` dismisses

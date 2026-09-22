@@ -541,6 +541,95 @@ async fn missing_relays(runtime: &MarmotAppRuntime, id: &str) {
     assert_eq!(snapshot.steps[2].status, OnboardingStatus::NeedsInput);
 }
 #[tokio::test]
+async fn defaults_append_relay_roles() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        let tags = if step == OnboardingStep::Relays {
+            vec![
+                vec!["r".into(), "wss://read.example".into(), "read".into()],
+                vec!["r".into(), "wss://write.example".into(), "write".into()],
+                vec!["r".into(), "wss://both.example".into()],
+                vec!["r".into(), "wss://default.example/".into(), "read".into()],
+            ]
+        } else {
+            vec![vec!["relay".into(), "wss://inbox.example".into()]]
+        };
+        let event = signed(&keys, step.kind() as u16, tags, "", unix_now_seconds());
+        let manager = runtime.accounts();
+        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        checkpoint.snapshot.proposal = None;
+        checkpoint.records[step.index()] = Some(event.clone());
+        checkpoint
+            .options
+            .default_relays
+            .push("wss://new.example".into());
+        checkpoint.set(step, OnboardingStatus::NeedsInput, Vec::new());
+        manager.save_onboarding(&mut checkpoint).unwrap();
+        let snapshot = manager
+            .propose_onboarding_relays(&id, step, None)
+            .await
+            .unwrap();
+        let proposal = snapshot.proposal.unwrap();
+        assert_eq!(proposal.previous_event_id, Some(event.id));
+        if step == OnboardingStep::Relays {
+            assert_eq!(
+                proposal.read_relays,
+                [
+                    "wss://read.example",
+                    "wss://both.example",
+                    "wss://default.example/",
+                    "wss://new.example"
+                ]
+            );
+            assert_eq!(
+                proposal.write_relays,
+                [
+                    "wss://write.example",
+                    "wss://both.example",
+                    "wss://new.example"
+                ]
+            );
+        } else {
+            assert_eq!(
+                proposal.read_relays,
+                [
+                    "wss://inbox.example",
+                    "wss://default.example",
+                    "wss://new.example"
+                ]
+            );
+            assert!(proposal.write_relays.is_empty());
+        }
+        let (tags, _, _) = relay_repair_event(&checkpoint, &proposal);
+        assert_eq!(
+            tags.len(),
+            if step == OnboardingStep::Relays { 5 } else { 3 }
+        );
+        // Explicit editor selections still replace rather than append.
+        let replaced = manager
+            .propose_onboarding_relays(
+                &id,
+                step,
+                Some((
+                    vec!["wss://edit.example".into()],
+                    if step == OnboardingStep::Relays {
+                        vec!["wss://edit.example".into()]
+                    } else {
+                        Vec::new()
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced.proposal.unwrap().read_relays,
+            ["wss://edit.example"]
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_discovery_never_authorizes_default_replacement() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     network.fail_reads.store(true, Ordering::SeqCst);

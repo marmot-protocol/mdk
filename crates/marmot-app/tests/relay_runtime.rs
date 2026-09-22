@@ -13076,9 +13076,21 @@ async fn onboarding_relay_repair_requires_approval_and_preserves_unrelated_tags(
         marmot_app::OnboardingStatus::NeedsInput
     );
     assert!(!snapshot.ready);
+    assert!(
+        runtime
+            .accounts()
+            .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+            .await
+            .is_err(),
+        "defaults must not silently remove the invalid entry"
+    );
     let proposal = runtime
         .accounts()
-        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .propose_onboarding_relays(
+            &id,
+            OnboardingStep::Relays,
+            Some((vec![url.clone()], vec![url.clone()])),
+        )
         .await
         .unwrap();
     assert!(matches!(

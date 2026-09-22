@@ -2622,7 +2622,9 @@ Explicitly skip an optional step where the current snapshot permits it.
 pub async fn propose_onboarding_recommended_relays( &self, account_ref: String, step: OnboardingStepFfi, ) -> Result<OnboardingSnapshotFfi, MarmotKitError>
 ```
 
-Prepare recommended relay changes for approval; proposal alone is not publication.
+Append missing recommended relays to the observed list while preserving existing
+NIP-65 read/write roles. Invalid existing entries require an explicit edit.
+Proposal alone is not publication.
 
 [Source](src/commands/onboarding.rs#L207)
 

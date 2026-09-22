@@ -1793,7 +1793,8 @@ impl AccountManager {
         (status, findings, Some(event))
     }
     /// Prepare a relay replacement without signing or publishing it. Passing
-    /// None uses the same recommended defaults supplied at identity creation.
+    /// None appends the recommended defaults to the observed list, preserving
+    /// existing read/write roles. Invalid existing entries require an explicit edit.
     /// For inbox lists use read_relays; write_relays must be empty.
     pub async fn propose_onboarding_relays(
         &self,
@@ -1814,16 +1815,42 @@ impl AccountManager {
         {
             return Err(onboarding_error());
         }
-        let (read_relays, write_relays) = selection.unwrap_or_else(|| {
-            (
-                c.options.default_relays.clone(),
+        let (read_relays, write_relays) = if let Some(selection) = selection {
+            selection
+        } else {
+            let mut reads = Vec::new();
+            let mut writes = Vec::new();
+            if let Some(event) = &c.records[step.index()] {
+                // Never turn an unparseable declaration into a defaults-only replacement.
+                if !validate_onboarding_record(event).is_empty() {
+                    return Err(onboarding_error());
+                }
+                let state =
+                    crate::relay_list_state_from_event(event).ok_or_else(onboarding_error)?;
                 if step == OnboardingStep::Relays {
-                    c.options.default_relays.clone()
+                    reads = state.read_relays;
+                    writes = state.write_relays;
                 } else {
-                    Vec::new()
-                },
-            )
-        });
+                    reads = state.relays;
+                }
+            }
+            let mut known = reads
+                .iter()
+                .chain(&writes)
+                .map(|relay| nostr::RelayUrl::parse(relay))
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|_| onboarding_error())?;
+            for relay in &c.options.default_relays {
+                if !known.insert(nostr::RelayUrl::parse(relay).map_err(|_| onboarding_error())?) {
+                    continue;
+                }
+                reads.push(relay.clone());
+                if step == OnboardingStep::Relays {
+                    writes.push(relay.clone());
+                }
+            }
+            (reads, writes)
+        };
         let all = read_relays
             .iter()
             .chain(&write_relays)
