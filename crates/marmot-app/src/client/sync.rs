@@ -157,6 +157,15 @@ impl TransportReconciliationWork {
                 .map(TransportReconciliationRoute::Group),
         }
     }
+
+    /// Whether this route carries history for one of `groups`. The local inbox
+    /// carries welcomes, never a group's own epoch history.
+    fn repairs_group_in(&self, groups: &HashSet<cgka_traits::GroupId>) -> bool {
+        match self {
+            Self::Inbox(_) => false,
+            Self::Group(group) => groups.contains(&group.group_id),
+        }
+    }
 }
 
 fn nostr_reconciliation_item(item: TransportReconciliationItem) -> AdapterReconciliationItem {
@@ -173,6 +182,43 @@ fn reconciliation_start_after_cursor(
     cursor
         .and_then(|cursor| routes.iter().position(|route| route > cursor))
         .unwrap_or(0)
+}
+
+/// Pick the routes one reconciliation pass reconciles, in the order it
+/// reconciles them.
+///
+/// The account-wide rotation resumes after the durable cursor so no route is
+/// starved. The groups `repairing` names are what an armed epoch-gap intent is
+/// missing history for, so they take the front of the pass but never all of it;
+/// the rotation fills the remaining budget and keeps advancing, because every
+/// attempted route moves the durable cursor.
+fn order_reconciliation_pass(
+    work: &mut Vec<TransportReconciliationWork>,
+    cursor: Option<&TransportReconciliationRoute>,
+    repairing: &HashSet<cgka_traits::GroupId>,
+    max_routes: usize,
+) {
+    work.sort_unstable_by_key(TransportReconciliationWork::route);
+    let route_keys = work
+        .iter()
+        .filter_map(TransportReconciliationWork::route)
+        .collect::<Vec<_>>();
+    let start = reconciliation_start_after_cursor(&route_keys, cursor);
+    if start > 0 {
+        work.rotate_left(start);
+    }
+    // `partition` keeps the rotation's order inside both halves, so which armed
+    // route leads still moves with the cursor.
+    let (mut armed, rest): (Vec<_>, Vec<_>) = work
+        .drain(..)
+        .partition(|item| item.repairs_group_in(repairing));
+    // Leave the rotation one slot. A device wedged in more groups than the pass
+    // holds stays armed for as long as it is wedged, and would otherwise pin
+    // the cursor and strip every other route of its by-id backstop.
+    armed.truncate(max_routes.saturating_sub(1));
+    work.extend(armed);
+    work.extend(rest);
+    work.truncate(max_routes);
 }
 
 fn transport_reconciliation_record(
@@ -886,7 +932,13 @@ impl AppClient {
     /// Synchronize before each inventory read, since routes await network I/O.
     /// With no routes there is no receipt decision to synchronize; this is not
     /// a standalone release-repair tick.
-    async fn reconcile_transport_history(&mut self, reconcile_until: u64) -> Result<(), AppError> {
+    /// `repairing` names the groups an epoch-gap intent is currently trying to
+    /// repair; their routes lead the pass.
+    async fn reconcile_transport_history(
+        &mut self,
+        reconcile_until: u64,
+        repairing: &HashSet<cgka_traits::GroupId>,
+    ) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         let routing = self.routing.snapshot();
         let mut work = Vec::with_capacity(routing.group_routes.len().saturating_add(1));
@@ -902,17 +954,13 @@ impl AppClient {
                 .filter(|route| route.transport_group_id.len() == 32)
                 .map(TransportReconciliationWork::Group),
         );
-        work.sort_unstable_by_key(TransportReconciliationWork::route);
         let cursor = storage.transport_reconciliation_route_cursor()?;
-        let route_keys = work
-            .iter()
-            .filter_map(TransportReconciliationWork::route)
-            .collect::<Vec<_>>();
-        let start = reconciliation_start_after_cursor(&route_keys, cursor.as_ref());
-        if start > 0 {
-            work.rotate_left(start);
-        }
-        work.truncate(TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
+        order_reconciliation_pass(
+            &mut work,
+            cursor.as_ref(),
+            repairing,
+            TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
+        );
 
         let mut attempted_routes = 0usize;
         let mut routes_failed = 0usize;
@@ -1180,9 +1228,10 @@ impl AppClient {
                 ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage)
             })?;
         if let Some(reconcile_until) = rebuild_since_secs {
+            let repairing = self.armed_epoch_backfill_groups();
             match timeout(
                 TRANSPORT_RECONCILIATION_QUANTUM,
-                self.reconcile_transport_history(reconcile_until),
+                self.reconcile_transport_history(reconcile_until, &repairing),
             )
             .await
             {
@@ -1695,9 +1744,14 @@ impl AppClient {
     /// the relays reporting end-of-stored-events instead of by silence, so a
     /// whole-account history query that is merely slow is not read as one that
     /// had nothing to send.
+    ///
+    /// `repairing` is the executing intent's armed groups: `begin_...` already
+    /// moved that intent out of `self`, so the reconciliation pass cannot find
+    /// it there and is told directly.
     async fn backfill_sdk_relay(
         &mut self,
         counts: &mut DrainCounts,
+        repairing: &HashSet<cgka_traits::GroupId>,
     ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
         let execution_quantum = self.epoch_backfill_execution_quantum();
         let completion = DrainCompletion::EndOfStoredEvents {
@@ -1709,7 +1763,7 @@ impl AppClient {
         // the older startup gap, in bounded account-scoped batches. Durable
         // ingestion shrinks the next difference; refused ids remain eligible.
         // This does not satisfy the EOSE gate or clear overflow markers.
-        self.reconcile_transport_history(unix_now_seconds())
+        self.reconcile_transport_history(unix_now_seconds(), repairing)
             .await
             .map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
@@ -1839,8 +1893,11 @@ impl AppClient {
         self.pending_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
         let mut counts = DrainCounts::default();
+        let repairing = self.armed_epoch_backfill_groups();
         if repair.is_some()
-            && let Err(source) = self.reconcile_transport_history(unix_now_seconds()).await
+            && let Err(source) = self
+                .reconcile_transport_history(unix_now_seconds(), &repairing)
+                .await
         {
             self.adapter.fail_delivery_overflow_recovery();
             return Err(ClassifiedSyncFailure::at_stage(
@@ -3560,6 +3617,17 @@ impl AppClient {
         self.pending_epoch_backfill.is_some() || !self.queued_epoch_backfills.is_empty()
     }
 
+    /// Every group an armed epoch-gap intent is waiting on, primary and queued.
+    /// Empty while an intent is executing: `begin_epoch_backfill_execution`
+    /// moved it out, and that run passes its own groups down instead.
+    fn armed_epoch_backfill_groups(&self) -> HashSet<cgka_traits::GroupId> {
+        self.pending_epoch_backfill
+            .iter()
+            .chain(self.queued_epoch_backfills.iter())
+            .flat_map(|pending| pending.groups.keys().cloned())
+            .collect()
+    }
+
     fn take_next_pending_epoch_backfill(&mut self) -> Option<PendingEpochBackfill> {
         self.pending_epoch_backfill
             .take()
@@ -4001,22 +4069,24 @@ impl AppClient {
                 let retry_ordinal = execution.retry_ordinal;
                 let eose_unconfirmed_ordinal = execution.eose_unconfirmed_ordinal;
                 let no_progress_ordinal = execution.no_progress_ordinal;
-                let (mut summary, verdict) = match self.backfill_sdk_relay(&mut counts).await {
-                    Ok(drained) => drained,
-                    Err(err) => {
-                        let terminal_error = err.source.privacy_safe_kind().to_string();
-                        self.finish_epoch_backfill_execution(
-                            execution,
-                            EpochBackfillActivationOutcome::Succeeded,
-                            Some(terminal_error),
-                            None,
-                            counts,
-                            false,
-                        );
-                        self.pending_failed_sync_summary.merge(err.partial_summary);
-                        return Err(err.source);
-                    }
-                };
+                let repairing = execution.pending.groups.keys().cloned().collect();
+                let (mut summary, verdict) =
+                    match self.backfill_sdk_relay(&mut counts, &repairing).await {
+                        Ok(drained) => drained,
+                        Err(err) => {
+                            let terminal_error = err.source.privacy_safe_kind().to_string();
+                            self.finish_epoch_backfill_execution(
+                                execution,
+                                EpochBackfillActivationOutcome::Succeeded,
+                                Some(terminal_error),
+                                None,
+                                counts,
+                                false,
+                            );
+                            self.pending_failed_sync_summary.merge(err.partial_summary);
+                            return Err(err.source);
+                        }
+                    };
                 let drained = match self.drain_pending_session_events().await {
                     Ok(drained) => drained,
                     Err(err) => {
@@ -4293,7 +4363,8 @@ impl AppClient {
         self.record_subscription_rebuild(None).await;
         // Reconcile SDK-cached history once. Later slices drain the same query;
         // reissuing it would replace the EOSE evidence we are waiting for.
-        self.reconcile_transport_history(unix_now_seconds())
+        let repairing = self.armed_epoch_backfill_groups();
+        self.reconcile_transport_history(unix_now_seconds(), &repairing)
             .await
             .map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
@@ -5616,8 +5687,9 @@ pub(crate) fn epoch_stall_now_ms() -> u64 {
 mod tests {
     use super::DrainCounts;
     use super::{
-        DrainVerdict, EpochBackfillReplayOutcome, backfill_drain_verdict,
-        epoch_backfill_terminal_rows, incomplete_full_history_repair,
+        DrainVerdict, EpochBackfillReplayOutcome, TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
+        TransportReconciliationWork, backfill_drain_verdict, epoch_backfill_terminal_rows,
+        incomplete_full_history_repair, order_reconciliation_pass,
         reconciliation_start_after_cursor, retry_backoff_for_ordinal,
         transport_reconciliation_record,
     };
@@ -6736,6 +6808,93 @@ mod tests {
         );
 
         assert_eq!(rows[0].1.local_epoch_after, Some(4));
+    }
+
+    /// A device wedged in more groups than one pass holds stays armed for as
+    /// long as it is wedged. Its routes must not take the whole pass, or the
+    /// durable cursor never advances and every other route — the local inbox
+    /// included — loses its by-id backstop for the duration.
+    #[test]
+    fn an_armed_intent_wider_than_the_pass_still_leaves_the_rotation_a_slot() {
+        let mut work = vec![TransportReconciliationWork::Inbox(Vec::new())];
+        work.extend((1..=6u8).map(|route| {
+            TransportReconciliationWork::Group(cgka_traits::TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![route; 16]),
+                transport_group_id: vec![route; 32],
+                endpoints: Vec::new(),
+            })
+        }));
+        let armed = (3..=6u8)
+            .map(|route| cgka_traits::GroupId::new(vec![route; 16]))
+            .collect::<std::collections::HashSet<_>>();
+
+        order_reconciliation_pass(
+            &mut work,
+            None,
+            &armed,
+            TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
+        );
+
+        let armed_routes = work
+            .iter()
+            .filter(|item| item.repairs_group_in(&armed))
+            .count();
+        assert_eq!(
+            armed_routes,
+            TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS - 1,
+            "the armed set must leave the rotation one slot"
+        );
+        assert!(
+            matches!(work.last(), Some(TransportReconciliationWork::Inbox(_))),
+            "the rotation keeps its slot, so the pass still advances the cursor"
+        );
+    }
+
+    /// The by-id pass an epoch-gap backfill runs ahead of its drain exists to
+    /// fetch history the account is missing. An armed intent names exactly the
+    /// groups that history belongs to, and the account-wide rotation lands on
+    /// them only by chance, so the pass takes them first and continues the
+    /// rotation over everything else.
+    #[test]
+    fn reconciliation_pass_takes_an_armed_backfill_route_ahead_of_the_rotation() {
+        let armed_group = cgka_traits::GroupId::new(vec![0xaa; 16]);
+        let mut work = vec![TransportReconciliationWork::Inbox(Vec::new())];
+        work.extend((1..=5u8).map(|route| {
+            TransportReconciliationWork::Group(cgka_traits::TransportGroupSubscription {
+                group_id: if route == 5 {
+                    armed_group.clone()
+                } else {
+                    cgka_traits::GroupId::new(vec![route; 16])
+                },
+                transport_group_id: vec![route; 32],
+                endpoints: Vec::new(),
+            })
+        }));
+
+        order_reconciliation_pass(
+            &mut work,
+            None,
+            &std::collections::HashSet::from([armed_group.clone()]),
+            TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
+        );
+
+        let selected = work
+            .iter()
+            .map(|item| match item {
+                TransportReconciliationWork::Inbox(_) => None,
+                TransportReconciliationWork::Group(group) => Some(group.group_id.clone()),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            vec![
+                Some(armed_group),
+                None,
+                Some(cgka_traits::GroupId::new(vec![1; 16])),
+                Some(cgka_traits::GroupId::new(vec![2; 16])),
+            ],
+            "the armed route leads the pass and the rotation keeps the rest"
+        );
     }
 
     #[test]
