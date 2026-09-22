@@ -3683,9 +3683,9 @@ impl MarmotApp {
         let label = account.label.as_str();
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
-        let delivery_overflow_recovery = self
-            .account_storage(label)?
-            .account_delivery_recovery(label)?;
+        let recovery_storage = self.account_storage(label)?;
+        recovery_storage.synchronize_account_delivery_loss(label)?;
+        let delivery_overflow_recovery = recovery_storage.account_delivery_recovery(label)?;
         let delivery_overflow_recovery_pending = delivery_overflow_recovery.is_some();
         let delivery_overflow_recovery_marker_token =
             delivery_overflow_recovery.map(|recovery| recovery.marker_token);
@@ -3770,7 +3770,12 @@ impl MarmotApp {
         let recovery_marker: relay_plane::AccountDeliveryRecoveryMarker =
             Arc::new(move |marker_token, dropped| {
                 recovery_storage
-                    .mark_account_delivery_recovery(&recovery_label, marker_token, dropped)
+                    .record_account_delivery_loss(
+                        &recovery_label,
+                        marker_token,
+                        dropped,
+                        unix_now_seconds(),
+                    )
                     .map_err(|error| {
                         if error.is_closed() {
                             relay_plane::AccountDeliveryRecoveryMarkerError::Closed

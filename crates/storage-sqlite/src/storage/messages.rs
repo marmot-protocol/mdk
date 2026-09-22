@@ -82,14 +82,21 @@ impl SqliteAccountStorage {
             for id in &ids {
                 retire_transport_receipts(&conn, &MessageId::new(id.clone()))?;
             }
+            let groups = conn.prepare_cached(
+                "SELECT group_id, MAX(epoch) FROM cgka_released_transport_receipts GROUP BY group_id",
+            ).storage()?.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)))
+                .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
+            for (group_id, epoch) in groups {
+                crate::account_recovery::arm_epoch_tx(
+                    &conn,
+                    &group_id,
+                    epoch,
+                    unix_now_seconds_i64(),
+                )?;
+            }
             conn.execute_cached(
-                "INSERT INTO app_epoch_backfill_intents(group_id, stalled_epoch, updated_at)
-                 SELECT group_id, MAX(epoch), ?1 FROM cgka_released_transport_receipts
-                 GROUP BY group_id
-                 ON CONFLICT(group_id) DO UPDATE SET
-                    stalled_epoch = MAX(app_epoch_backfill_intents.stalled_epoch, excluded.stalled_epoch),
-                    updated_at = excluded.updated_at",
-                params![unix_now_seconds_i64()],
+                "UPDATE account_recovery_state SET inventory_revision = inventory_revision + 1 WHERE singleton = 1",
+                [],
             ).storage()?;
             conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
                 .storage()?;

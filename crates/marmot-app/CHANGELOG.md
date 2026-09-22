@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- Restrict the account-local overflow marker writer to durable loss evidence. The account
+  mutation path imports that evidence into recovery demand; runtime dispatch consolidation
+  remains separate integration work. (#1946)
+
 ## 0.10.4 - 2026-09-20
 
 ### Fixed

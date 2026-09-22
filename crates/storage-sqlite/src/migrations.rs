@@ -186,6 +186,8 @@ mod migration_0089_local_submissions;
 mod migration_0090_poll_response_edges;
 #[path = "migrations/0091_account_local_identity.rs"]
 mod migration_0091_account_local_identity;
+#[path = "migrations/0092_account_recovery_owner.rs"]
+mod migration_0092_account_recovery_owner;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -657,6 +659,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0091_account_local_identity",
         apply: migration_0091_account_local_identity::apply,
     },
+    Migration {
+        version: 92,
+        name: "0092_account_recovery_owner",
+        apply: migration_0092_account_recovery_owner::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
@@ -1015,6 +1022,165 @@ mod tests {
             })
             .unwrap();
         assert_eq!(intent, [0xbb]);
+    }
+
+    #[test]
+    fn recovery_owner_migration_preserves_populated_demand_and_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery-owner.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..91]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_state(label, updated_at) VALUES ('alice', 100);
+             INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 7, x'00');
+             INSERT INTO app_epoch_backfill_intents VALUES (x'aa', 7, 123);
+             INSERT INTO cgka_groups(id, epoch, record) VALUES (x'abcd', 3, x'01');
+             INSERT INTO app_epoch_backfill_intents VALUES (x'abcd', 3, 122);
+             INSERT INTO account_delivery_recovery VALUES ('alice', 42, 124, 9);
+             INSERT INTO app_epoch_stall_evidence VALUES (x'aa', 7, 2, 0, 123000, 123);
+             INSERT INTO cgka_released_transport_receipts VALUES (x'bb', x'aa', 7);
+             INSERT INTO cgka_maintenance_obligations VALUES (x'01', x'aa', 1, x'1234');
+             INSERT INTO transport_reconciliation_items VALUES (0, x'', zeroblob(32), 120);
+             INSERT INTO transport_reconciliation_route_state VALUES (0, x'', 119, zeroblob(32));
+             INSERT INTO transport_reconciliation_scheduler VALUES (1, 0, x'');",
+        )
+        .unwrap();
+        let preserved = [
+            "app_epoch_stall_evidence",
+            "cgka_released_transport_receipts",
+            "cgka_maintenance_obligations",
+            "transport_reconciliation_items",
+            "transport_reconciliation_route_state",
+            "transport_reconciliation_scheduler",
+        ];
+        fn rows(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+        let before: Vec<_> = preserved.iter().map(|table| rows(&conn, table)).collect();
+        run_all(&mut conn).unwrap();
+        for (table, expected) in preserved.iter().zip(&before) {
+            assert_eq!(
+                &rows(&conn, table),
+                expected,
+                "{table} changed during migration"
+            );
+        }
+        let demands: Vec<(i64, Option<i64>, Option<i64>)> = conn
+            .prepare("SELECT cause, stalled_epoch, marker_token FROM account_recovery_obligations ORDER BY cause, stalled_epoch")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            demands,
+            vec![(0, None, Some(42)), (1, Some(3), None), (1, Some(7), None)]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM account_recovery_scopes WHERE snapshot_state = 0",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT dropped_count FROM account_delivery_loss_evidence",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            9
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT fruitless_completions FROM app_epoch_stall_evidence",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM cgka_released_transport_receipts",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            run(&mut conn, &MIGRATIONS[..91]).is_err(),
+            "old binary must refuse the new schema"
+        );
+        drop(conn);
+        let mut conn = keyed_connection(&path);
+        run_all(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM account_recovery_obligations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn recovery_owner_interrupted_migration_keeps_old_authority() {
+        fn fail_after_conversion(tx: &Transaction<'_>) -> StorageResult<()> {
+            migration_0092_account_recovery_owner::apply(tx)?;
+            Err(StorageError::Backend(
+                "injected migration interruption".into(),
+            ))
+        }
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..91]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_state(label, updated_at) VALUES ('alice', 100);
+             INSERT INTO account_delivery_recovery VALUES ('alice', 42, 124, 9);",
+        )
+        .unwrap();
+        let migration = Migration {
+            version: 92,
+            name: "0092_account_recovery_owner",
+            apply: fail_after_conversion,
+        };
+        assert!(apply_migration(&mut conn, &migration).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT marker_token FROM account_delivery_recovery",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            42
+        );
+        assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'account_recovery_obligations')", [], |r| r.get::<_, bool>(0)).unwrap());
+        assert_eq!(applied_name(&conn, 92).unwrap(), None);
+        run_all(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT marker_token FROM account_recovery_obligations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            42
+        );
     }
 
     #[test]
@@ -2922,7 +3088,7 @@ mod tests {
             "durable removal intent must survive projection group deletion"
         );
         assert_eq!(
-            foreign_key(&conn, "app_epoch_backfill_intents", "group_id"),
+            foreign_key(&conn, "account_recovery_obligations", "group_id"),
             Some(("cgka_groups".to_owned(), "CASCADE".to_owned())),
             "durable recovery intent must survive projection deletion but cascade with its protocol group"
         );

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Add schema 0092 recovery-ledger groundwork: migrate overflow and epoch demand, preserve
+  release/maintenance/inventory evidence, and provide restart-safe attempt reservations.
+  Legacy storage APIs use the new ledger. Runtime owner integration is still required. (#1946)
+
 ## 0.10.4 - 2026-09-20
 
 ### Fixed

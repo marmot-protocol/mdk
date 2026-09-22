@@ -11,6 +11,8 @@ pub use group_system::{
 };
 
 mod account_projection;
+mod account_recovery;
+pub use account_recovery::{RecoveryRetryState, RecoveryRevisionFence};
 mod agent_stream_sequences;
 mod attachment_acquisition;
 mod attachment_history;

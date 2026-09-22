@@ -934,13 +934,13 @@ impl AppClient {
         // The router's process-local fence already froze cursor advancement at
         // the omission. Re-observe the same token here so the queued signal is
         // also an idempotent storage boundary before recovery starts.
-        self.app
-            .account_storage(&self.state.label)?
-            .mark_account_delivery_recovery(
-                &self.state.label,
-                overflow.marker_token,
-                overflow.dropped,
-            )?;
+        let storage = self.app.account_storage(&self.state.label)?;
+        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        storage.mark_account_delivery_recovery(
+            &self.state.label,
+            overflow.marker_token,
+            overflow.dropped,
+        )?;
         self.delivery_overflow_recovery_pending = true;
         self.delivery_overflow_recovery_marker_token = Some(overflow.marker_token);
         tracing::warn!(
@@ -1079,6 +1079,7 @@ impl AppClient {
 
     fn clear_delivery_overflow_recovery(&mut self, marker_token: u64) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
+        storage.synchronize_account_delivery_loss(&self.state.label)?;
         let cleared = storage.clear_account_delivery_recovery(&self.state.label, marker_token)?;
         if cleared {
             self.delivery_overflow_recovery_pending = false;
