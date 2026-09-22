@@ -358,8 +358,23 @@ fn contains_tracing_macro(line: &str) -> bool {
     TRACING_MACROS.iter().any(|needle| {
         let is_bare_macro = !needle.contains("::");
         line.match_indices(needle).any(|(start, _)| {
-            line[..start].chars().next_back().is_none_or(|previous| {
-                !unicode_ident::is_xid_continue(previous) && (!is_bare_macro || previous != ':')
+            let prefix = &line[..start];
+            prefix.chars().next_back().is_none_or(|previous| {
+                if unicode_ident::is_xid_continue(previous) {
+                    return false;
+                }
+                if previous != ':' {
+                    return true;
+                }
+                if is_bare_macro {
+                    return false;
+                }
+
+                prefix.strip_suffix("::").is_some_and(|before_root| {
+                    before_root.chars().next_back().is_none_or(|previous| {
+                        !unicode_ident::is_xid_continue(previous) && previous != ':'
+                    })
+                })
             })
         })
     })
@@ -371,6 +386,7 @@ fn tracing_macro_scan_does_not_treat_compile_error_as_error() {
 compile_error!("unsupported platform");
 compiléerror!("unsupported platform");
 other::error!("not a tracing macro");
+other::tracing::error!("not the tracing crate");
 ::tracing::error!(target: "audit", method = "test", "expected root-qualified tracing call");
 tracing::error!(target: "audit", method = "test", "expected qualified tracing call");
 error!(target: "audit", method = "test", "expected tracing call");
@@ -378,10 +394,10 @@ error!(target: "audit", method = "test", "expected tracing call");
 
     let invocations = tracing_invocations(contents);
     assert_eq!(invocations.len(), 3);
-    assert_eq!(invocations[0].line, 5);
+    assert_eq!(invocations[0].line, 6);
     assert!(invocations[0].body.contains("::tracing::error!"));
-    assert_eq!(invocations[1].line, 6);
-    assert_eq!(invocations[2].line, 7);
+    assert_eq!(invocations[1].line, 7);
+    assert_eq!(invocations[2].line, 8);
 }
 
 #[test]
