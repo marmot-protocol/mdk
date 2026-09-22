@@ -94,10 +94,7 @@ impl SqliteAccountStorage {
                     unix_now_seconds_i64(),
                 )?;
             }
-            conn.execute_cached(
-                "UPDATE account_recovery_state SET inventory_revision = inventory_revision + 1 WHERE singleton = 1",
-                [],
-            ).storage()?;
+            crate::account_recovery::invalidate_inventory_tx(&conn)?;
             conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
                 .storage()?;
             Ok(ids.into_iter().map(MessageId::new).collect())
@@ -1068,13 +1065,7 @@ fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> Sto
         params![hex::encode(id.as_slice())],
     )
     .storage()?;
-    let removed_inventory = conn
-        .execute_cached(
-            "DELETE FROM transport_reconciliation_items WHERE event_id = ?1",
-            params![id.as_slice()],
-        )
-        .storage()?;
-    crate::account_recovery::invalidate_inventory_tx(conn, removed_inventory)?;
+    crate::account_recovery::delete_inventory_tx(conn, "event_id = ?1", params![id.as_slice()])?;
     Ok(())
 }
 

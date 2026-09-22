@@ -59,9 +59,14 @@ Call that restore method when constructing an owner as well. Zero-count loss is 
 Legacy clear methods remain caller-directed retirement adapters, not completion proofs;
 retained legacy watermarks do not recreate explicitly retired demand.
 
-Physical receipt/inventory expiration, compaction and message release or route/group deletion bump
-the inventory revision in the same transaction. Positive admission and idempotent deletes
-do not invalidate proof. `retained_recovery_event` checks exact route, event and frozen
+Inventory expiration, compaction and message release or route/group deletion bump the
+account inventory revision in the same transaction; reservations and plan installation
+check that revision. Installed proof is invalidated only for overlapping route/window
+scopes (and the exact event for known-event predicates). Unrelated or out-of-window
+retention churn cannot invalidate bounded completion or loss acknowledgment, including
+when a productive admission triggers compaction. Receipt-journal consumption keeps a
+conservative all-scope invalidation because its route/time may no longer be available.
+Idempotent deletes do not invalidate proof. `retained_recovery_event` checks exact route, event and frozen
 window membership after the caller synchronizes release receipts; it does not certify
 successful decryption or engine readiness.
 

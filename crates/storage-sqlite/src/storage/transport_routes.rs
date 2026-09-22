@@ -72,14 +72,11 @@ pub(super) fn delete_route(
 ) -> StorageResult<()> {
     store.connection.with_transaction(|| {
         let conn = store.lock()?;
-        let removed_inventory = conn
-            .execute_cached(
-                "DELETE FROM transport_reconciliation_items
-         WHERE route_kind = 1 AND route_id = ?1",
-                params![transport_group_id],
-            )
-            .storage()?;
-        crate::account_recovery::invalidate_inventory_tx(&conn, removed_inventory)?;
+        crate::account_recovery::delete_inventory_tx(
+            &conn,
+            "route_kind = 1 AND route_id = ?1",
+            params![transport_group_id],
+        )?;
         conn.execute_cached(
             "DELETE FROM transport_reconciliation_route_state
          WHERE route_kind = 1 AND route_id = ?1",
@@ -108,18 +105,15 @@ pub(super) fn delete_below_epoch(
 ) -> StorageResult<()> {
     store.connection.with_transaction(|| {
         let conn = store.lock()?;
-        let removed_inventory = conn
-            .execute_cached(
-                "DELETE FROM transport_reconciliation_items
-         WHERE route_kind = 1 AND route_id IN (
+        crate::account_recovery::delete_inventory_tx(
+            &conn,
+            "route_kind = 1 AND route_id IN (
              SELECT transport_group_id
              FROM cgka_transport_group_routes
              WHERE group_id = ?1 AND source_epoch < ?2
          )",
-                params![group_id.as_slice(), epoch_to_i64(cutoff)?],
-            )
-            .storage()?;
-        crate::account_recovery::invalidate_inventory_tx(&conn, removed_inventory)?;
+            params![group_id.as_slice(), epoch_to_i64(cutoff)?],
+        )?;
         conn.execute_cached(
             "DELETE FROM transport_reconciliation_route_state
          WHERE route_kind = 1 AND route_id IN (
@@ -156,18 +150,15 @@ pub(super) fn delete_for_group(
 ) -> StorageResult<()> {
     store.connection.with_transaction(|| {
         let conn = store.lock()?;
-        let removed_inventory = conn
-            .execute_cached(
-                "DELETE FROM transport_reconciliation_items
-         WHERE route_kind = 1 AND route_id IN (
+        crate::account_recovery::delete_inventory_tx(
+            &conn,
+            "route_kind = 1 AND route_id IN (
              SELECT transport_group_id
              FROM cgka_transport_group_routes
              WHERE group_id = ?1
          )",
-                params![group_id.as_slice()],
-            )
-            .storage()?;
-        crate::account_recovery::invalidate_inventory_tx(&conn, removed_inventory)?;
+            params![group_id.as_slice()],
+        )?;
         conn.execute_cached(
             "DELETE FROM transport_reconciliation_route_state
          WHERE route_kind = 1 AND route_id IN (

@@ -15,7 +15,7 @@ pub use plan::{
 use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64};
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Durable account-wide pacing, independent of any process's monotonic clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,12 +105,87 @@ fn revision_fence(conn: &Connection) -> StorageResult<RecoveryRevisionFence> {
     })
 }
 
-/// Invalidate coverage atomically with removal of retained inventory. Positive
-/// admissions and idempotent deletes leave this fence unchanged.
-pub(crate) fn invalidate_inventory_tx(conn: &Connection, removed: usize) -> StorageResult<()> {
+/// Delete inventory and invalidate only frozen scopes whose route/window (and,
+/// for a known-event predicate, exact event) overlap the removed input. The
+/// account revision still fences reservations and plan installation. Callers
+/// must already own the surrounding transaction. Predicates are internal SQL.
+pub(crate) fn delete_inventory_tx(
+    conn: &Connection,
+    predicate: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+) -> StorageResult<()> {
+    let select = format!(
+        "SELECT s.obligation_id,s.scope_id,s.scope_format,s.scope_payload
+         FROM account_recovery_scopes s
+         JOIN account_recovery_obligations o ON o.id=s.obligation_id
+         WHERE s.snapshot_state=1 AND EXISTS(
+             SELECT 1 FROM transport_reconciliation_items i WHERE ({predicate})
+             AND s.route_kind=i.route_kind
+             AND (s.route_kind=0 OR s.transport_group_id=i.route_id)
+             AND i.created_at>=COALESCE(s.since_seconds,0) AND i.created_at<=s.until_seconds
+             AND (o.predicate!=1 OR s.known_event_id=i.event_id))"
+    );
+    // Ordinary live admission usually has no installed recovery proof. Avoid
+    // opening the obligation/inventory join on that bounded hot path.
+    let has_scopes = conn
+        .query_row_cached("SELECT 1 FROM account_recovery_scopes", [], |row| {
+            row.get::<_, bool>(0)
+        })
+        .optional()
+        .storage()?
+        .is_some();
+    let affected = if has_scopes {
+        conn.prepare_cached(&select)
+            .storage()?
+            .query_map(parameters, |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?
+    } else {
+        Vec::new()
+    };
+    let removed = conn
+        .execute_cached(
+            &format!("DELETE FROM transport_reconciliation_items WHERE {predicate}"),
+            parameters,
+        )
+        .storage()?;
     if removed != 0 {
         conn.execute_cached(
             "UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1", [],
+        ).storage()?;
+        for (id, scope, format, payload) in affected {
+            let invalidated = plan::invalidate_retained_scope(format, &payload)?;
+            conn.execute_cached(
+                "UPDATE account_recovery_scopes SET scope_revision=scope_revision+1,scope_payload=?3
+                 WHERE obligation_id=?1 AND scope_id=?2",params![id,scope,invalidated],
+            ).storage()?;
+        }
+    }
+    Ok(())
+}
+
+/// Released receipt journals may outlive their inventory rows and contain no
+/// trustworthy route/time bound. Keep their original conservative invalidation
+/// contract, including already-qualified loss awaiting external acknowledgment.
+pub(crate) fn invalidate_inventory_tx(conn: &Connection) -> StorageResult<()> {
+    let rows = conn.prepare_cached(
+        "SELECT obligation_id,scope_id,scope_format,scope_payload FROM account_recovery_scopes WHERE snapshot_state=1",
+    ).storage()?.query_map([], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?,
+        row.get::<_,i64>(2)?,row.get::<_,Vec<u8>>(3)?))).storage()?
+        .collect::<Result<Vec<_>,_>>().storage()?;
+    conn.execute_cached("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1",[]).storage()?;
+    for (id, scope, format, payload) in rows {
+        conn.execute_cached(
+            "UPDATE account_recovery_scopes SET scope_revision=scope_revision+1,scope_payload=?3 WHERE obligation_id=?1 AND scope_id=?2",
+            params![id,scope,plan::invalidate_retained_scope(format,&payload)?],
         ).storage()?;
     }
     Ok(())
@@ -267,9 +342,18 @@ fn selected_fence_matches(
     current: &RecoveryRevisionFence,
     selected: &RecoveryRevisionFence,
 ) -> bool {
+    current.inventory_revision == selected.inventory_revision
+        && selected_completion_fence_matches(current, selected)
+}
+
+// Installed scopes carry their own inventory invalidation tokens. Global
+// inventory churn still fences installing a plan, but not unrelated completion.
+fn selected_completion_fence_matches(
+    current: &RecoveryRevisionFence,
+    selected: &RecoveryRevisionFence,
+) -> bool {
     current.loss_revision == selected.loss_revision
         && current.route_revision == selected.route_revision
-        && current.inventory_revision == selected.inventory_revision
         && !selected.obligations.is_empty()
         && selected
             .obligations

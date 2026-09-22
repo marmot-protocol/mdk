@@ -58,31 +58,24 @@ fn route_state_floor_tx(
     route_id: &[u8],
     configured_floor: i64,
 ) -> StorageResult<i64> {
-    tx.execute_cached(
-        "INSERT INTO transport_reconciliation_route_state (
+    let floor = tx
+        .query_row_cached(
+            "INSERT INTO transport_reconciliation_route_state (
              route_kind, route_id, inventory_since
          ) VALUES (?1, ?2, ?3)
          ON CONFLICT(route_kind, route_id) DO UPDATE SET
-             inventory_since = MAX(inventory_since, excluded.inventory_since)",
-        params![route_kind, route_id, configured_floor],
-    )
-    .storage()?;
-    let removed_inventory = tx
-        .execute_cached(
-            "DELETE FROM transport_reconciliation_items
-         WHERE route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
+             inventory_since = MAX(inventory_since, excluded.inventory_since)
+         RETURNING inventory_since",
             params![route_kind, route_id, configured_floor],
+            |row| row.get(0),
         )
         .storage()?;
-    crate::account_recovery::invalidate_inventory_tx(tx, removed_inventory)?;
-    tx.query_row_cached(
-        "SELECT inventory_since
-         FROM transport_reconciliation_route_state
-         WHERE route_kind = ?1 AND route_id = ?2",
-        params![route_kind, route_id],
-        |row| row.get(0),
-    )
-    .storage()
+    crate::account_recovery::delete_inventory_tx(
+        tx,
+        "route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
+        params![route_kind, route_id, configured_floor],
+    )?;
+    Ok(floor)
 }
 
 fn compact_route_tx(tx: &Transaction<'_>, route_kind: i64, route_id: &[u8]) -> StorageResult<()> {
@@ -110,14 +103,11 @@ fn compact_route_tx(tx: &Transaction<'_>, route_kind: i64, route_id: &[u8]) -> S
         return Ok(());
     };
     let compacted_floor = overflow_cutoff.saturating_add(1);
-    let removed_inventory = tx
-        .execute_cached(
-            "DELETE FROM transport_reconciliation_items
-         WHERE route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
-            params![route_kind, route_id, compacted_floor],
-        )
-        .storage()?;
-    crate::account_recovery::invalidate_inventory_tx(tx, removed_inventory)?;
+    crate::account_recovery::delete_inventory_tx(
+        tx,
+        "route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
+        params![route_kind, route_id, compacted_floor],
+    )?;
     tx.execute_cached(
         "UPDATE transport_reconciliation_route_state
          SET inventory_since = MAX(inventory_since, ?3)

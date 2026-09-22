@@ -128,7 +128,9 @@ impl SqliteAccountStorage {
                 "INSERT INTO account_recovery_obligations
                  (demand_key,cause,predicate,group_id,created_at_ms,updated_at_ms,caller_origin,urgency)
                  VALUES (?1,?2,?3,?4,?5,?5,?6,?6)
-                 ON CONFLICT(demand_key) DO NOTHING",
+                 ON CONFLICT(demand_key) DO UPDATE SET state=0,revision=revision+1,
+                     eligibility=0,updated_at_ms=excluded.updated_at_ms
+                 WHERE account_recovery_obligations.state=1 AND account_recovery_obligations.cause IN (4,5)",
                 params![key,cause,predicate,group,sqlite_integer(now_ms)?,caller],
             ).storage()?;
             let (id,revision): (Vec<u8>,i64) = conn.query_row_cached(
