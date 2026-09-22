@@ -48,7 +48,9 @@ use crate::config::CursorPersistence;
 /// difference.
 const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
 /// Four two-second route passes leave margin inside the account-wide quantum.
-/// The durable cursor starts the next pass after the last attempted route.
+/// The durable cursor starts the next pass after the rotation prefix the last
+/// pass covered, so it must hold at least two routes: see
+/// [`order_reconciliation_pass`].
 const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
 
 // ponytail: EOSE crosses a separate router task; retain a short quiet window
@@ -185,19 +187,32 @@ fn reconciliation_start_after_cursor(
 }
 
 /// Pick the routes one reconciliation pass reconciles, in the order it
-/// reconciles them.
+/// reconciles them, and report how far the account-wide rotation may advance.
 ///
 /// The account-wide rotation resumes after the durable cursor so no route is
 /// starved. The groups `repairing` names are what an armed epoch-gap intent is
 /// missing history for, so they take the front of the pass but never all of it;
-/// the rotation fills the remaining budget and keeps advancing, because every
-/// attempted route moves the durable cursor.
+/// the rotation fills the remaining budget.
+///
+/// Priority is a view on one pass; the cursor is durable fairness state over
+/// the whole route set, so it advances along the rotated sequence and not along
+/// the priority order. The returned route is the end of the longest prefix of
+/// that rotated sequence this pass covers: every route up to it is scheduled,
+/// so claiming it never claims a route the pass skipped, and because the first
+/// rotated route is always scheduled the claim always moves forward. That is
+/// what keeps an armed set wider than the pass from pinning the rotation on its
+/// own leading routes for as long as it stays armed.
+///
+/// The first rotated route is scheduled for every `max_routes` of 2 or more:
+/// the armed half never fills the pass, so the rotation always keeps the slot
+/// its own leading route needs. A one-route pass has no armed slot at all, and
+/// then an armed leading route is simply not covered and not claimed.
 fn order_reconciliation_pass(
     work: &mut Vec<TransportReconciliationWork>,
     cursor: Option<&TransportReconciliationRoute>,
     repairing: &HashSet<cgka_traits::GroupId>,
     max_routes: usize,
-) {
+) -> Option<TransportReconciliationRoute> {
     work.sort_unstable_by_key(TransportReconciliationWork::route);
     let route_keys = work
         .iter()
@@ -207,18 +222,32 @@ fn order_reconciliation_pass(
     if start > 0 {
         work.rotate_left(start);
     }
-    // `partition` keeps the rotation's order inside both halves, so which armed
-    // route leads still moves with the cursor.
+    // Re-read the keys after the rotation: this is the order the pass's
+    // fairness is measured in, before priority reorders anything.
+    let rotation = work
+        .iter()
+        .filter_map(TransportReconciliationWork::route)
+        .collect::<Vec<_>>();
     let (mut armed, rest): (Vec<_>, Vec<_>) = work
         .drain(..)
         .partition(|item| item.repairs_group_in(repairing));
     // Leave the rotation one slot. A device wedged in more groups than the pass
-    // holds stays armed for as long as it is wedged, and would otherwise pin
-    // the cursor and strip every other route of its by-id backstop.
+    // holds stays armed for as long as it is wedged, and would otherwise strip
+    // every other route — the local inbox included — of its by-id backstop.
     armed.truncate(max_routes.saturating_sub(1));
     work.extend(armed);
     work.extend(rest);
     work.truncate(max_routes);
+
+    // At most `max_routes` long, so a slice lookup beats hashing.
+    let scheduled = work
+        .iter()
+        .filter_map(TransportReconciliationWork::route)
+        .collect::<Vec<_>>();
+    rotation
+        .into_iter()
+        .take_while(|route| scheduled.contains(route))
+        .last()
 }
 
 fn transport_reconciliation_record(
@@ -955,12 +984,20 @@ impl AppClient {
                 .map(TransportReconciliationWork::Group),
         );
         let cursor = storage.transport_reconciliation_route_cursor()?;
-        order_reconciliation_pass(
+        let rotation_claim = order_reconciliation_pass(
             &mut work,
             cursor.as_ref(),
             repairing,
             TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
         );
+        // Claim the rotation before any network I/O, once for the whole pass.
+        // Claiming up front costs an interrupted pass its unattempted routes
+        // until the next lap, and buys the guarantee that no route this pass
+        // leads with — an armed one that never completes included — can pin
+        // every other route behind it on each restart.
+        if let Some(route) = rotation_claim {
+            storage.advance_transport_reconciliation_route_cursor(&route)?;
+        }
 
         let mut attempted_routes = 0usize;
         let mut routes_failed = 0usize;
@@ -974,10 +1011,6 @@ impl AppClient {
             let Some(route) = route_work.route() else {
                 continue;
             };
-            // Advance before network I/O. Cancellation or process death can
-            // defer this route until the next rotation, but cannot pin every
-            // subsequent route behind it on each restart.
-            storage.advance_transport_reconciliation_route_cursor(&route)?;
             let inventory = self
                 .transport_receipts()?
                 .inventory(&route, reconcile_until)?;
@@ -6847,6 +6880,64 @@ mod tests {
         assert!(
             matches!(work.last(), Some(TransportReconciliationWork::Inbox(_))),
             "the rotation keeps its slot, so the pass still advances the cursor"
+        );
+    }
+    /// Fairness under repetition. The pass caps how many armed routes it
+    /// takes, so a device armed for more groups than that cap must still reach
+    /// every armed route over successive passes. Production advances the
+    /// durable route cursor to the rotation progress the pass reports, so the
+    /// cursor a pass leaves behind is the one it returns.
+    #[test]
+    fn repeated_passes_reach_every_armed_route_beyond_the_pass_cap() {
+        let armed_ids = (3..=6u8)
+            .map(|route| cgka_traits::GroupId::new(vec![route; 16]))
+            .collect::<Vec<_>>();
+        let armed = armed_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let mut cursor: Option<storage_sqlite::TransportReconciliationRoute> = None;
+        let mut reached = std::collections::HashSet::new();
+        let passes = 16usize;
+
+        for _ in 0..passes {
+            // Production rebuilds the work set from the routing snapshot every
+            // pass; only the durable cursor carries across passes.
+            let mut work = vec![TransportReconciliationWork::Inbox(Vec::new())];
+            work.extend((3..=6u8).map(|route| {
+                TransportReconciliationWork::Group(cgka_traits::TransportGroupSubscription {
+                    group_id: cgka_traits::GroupId::new(vec![route; 16]),
+                    transport_group_id: vec![route; 32],
+                    endpoints: Vec::new(),
+                })
+            }));
+
+            let claim = order_reconciliation_pass(
+                &mut work,
+                cursor.as_ref(),
+                &armed,
+                TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
+            );
+
+            for item in &work {
+                if let TransportReconciliationWork::Group(group) = item {
+                    reached.insert(group.group_id.clone());
+                }
+            }
+            assert!(
+                claim.is_some(),
+                "a pass with routes must report rotation progress"
+            );
+            cursor = claim;
+        }
+
+        let starved = armed_ids
+            .iter()
+            .filter(|group_id| !reached.contains(*group_id))
+            .count();
+        assert_eq!(
+            starved, 0,
+            "every armed route must reconcile within {passes} passes, so the cap starves none"
         );
     }
 
