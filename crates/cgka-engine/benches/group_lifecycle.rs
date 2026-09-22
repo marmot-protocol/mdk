@@ -37,7 +37,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion};
 use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
 use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
@@ -1154,17 +1154,24 @@ fn bench_canonical_advance_with_history(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    report_storage_format_sizes,
-    bench_create_group,
-    bench_retained_anchor_snapshot,
-    bench_join_welcome,
-    bench_join_welcome_large_group,
-    bench_app_message_send,
-    bench_deferred_outbound_preflight_matrix,
-    bench_app_message_ingest,
-    bench_rejoin_welcome_with_history,
-    bench_canonical_advance_with_history
-);
-criterion_main!(benches);
+fn main() {
+    let mut criterion = Criterion::default().configure_from_args();
+    // Release-profile CPU comparisons need a successful scoped create_group
+    // invocation. Other groups in this file construct fixtures during
+    // registration, so a Criterion filter alone still runs them.
+    if std::env::var_os("MDK_RELEASE_PROFILE_CPU_ONLY").is_some() {
+        bench_create_group(&mut criterion);
+    } else {
+        report_storage_format_sizes(&mut criterion);
+        bench_create_group(&mut criterion);
+        bench_retained_anchor_snapshot(&mut criterion);
+        bench_join_welcome(&mut criterion);
+        bench_join_welcome_large_group(&mut criterion);
+        bench_app_message_send(&mut criterion);
+        bench_deferred_outbound_preflight_matrix(&mut criterion);
+        bench_app_message_ingest(&mut criterion);
+        bench_rejoin_welcome_with_history(&mut criterion);
+        bench_canonical_advance_with_history(&mut criterion);
+    }
+    criterion.final_summary();
+}

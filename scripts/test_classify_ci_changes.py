@@ -154,6 +154,20 @@ class ClassifyCiChangesTests(unittest.TestCase):
         result = classify([".github/workflows/ci.yml"])
         self.assertTrue(all(result.values()))
 
+    def test_bindings_profile_workflow_is_an_ios_specialist_path(self) -> None:
+        for path in (
+            ".github/workflows/bindings.yaml",
+            ".github/workflows/bindings-profile.yml",
+            ".github/workflows/bindings-profile-measurement.yml",
+        ):
+            with self.subTest(path=path):
+                result = classify([path])
+                self.assertTrue(result["run_full"])
+                self.assertTrue(result["run_ios"])
+                self.assertFalse(result["run_c"])
+                self.assertFalse(result["run_conformance"])
+                self.assertFalse(result["run_formal"])
+
     def test_plugin_only_changes_skip_native_binary_builds(self) -> None:
         paths = [
             "integrations/hermes/marmot/plugin.py",

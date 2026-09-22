@@ -13,6 +13,7 @@ use crate::{
     i64_to_u64, optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
 };
 pub use attention::AccountAttentionTotal;
+use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED, GROUP_SYSTEM_TYPE_MEMBER_ADDED,
@@ -1108,7 +1109,7 @@ fn dirty_unread_messages_are_covered_tx(
 /// (#822). Version 3 materializes per-message unread membership so incremental
 /// refreshes do not rescan the unread window. The persisted column keeps its legacy `mention_counts_version` name
 /// for schema compatibility, but now gates the complete derived-row contract.
-const CHAT_LIST_PROJECTION_VERSION: i64 = 3;
+const CHAT_LIST_PROJECTION_VERSION: i64 = 4;
 
 const CHAT_LIST_GROUP_ACTIVITY_TYPES: [&str; 5] = [
     GROUP_SYSTEM_TYPE_MEMBER_ADDED,
@@ -1128,7 +1129,7 @@ pub(crate) fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "({column_prefix}kind = {MARMOT_APP_EVENT_KIND_CHAT} OR \
+        "({column_prefix}kind IN ({MARMOT_APP_EVENT_KIND_CHAT}, {MARMOT_APP_EVENT_KIND_POLL}) OR \
          ({column_prefix}kind = {MARMOT_APP_EVENT_KIND_GROUP_SYSTEM} AND \
           {column_prefix}tags_json IN ({group_activity_tags}) AND \
           EXISTS (SELECT 1 FROM account_groups AS activity_group \
@@ -2701,7 +2702,8 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     })
 }
 
-fn conversation_kind(group_name: &str, member_count: Option<u64>) -> ChatConversationKind {
+/// Classify a conversation from the same inputs used by chat-list projection.
+pub fn conversation_kind(group_name: &str, member_count: Option<u64>) -> ChatConversationKind {
     if !group_name.trim().is_empty() {
         return ChatConversationKind::Group;
     }

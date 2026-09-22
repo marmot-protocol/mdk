@@ -17,6 +17,7 @@ fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
         client_token: None,
         has_reports: false,
         group_system: None,
+        poll: None,
         edit: None,
         message_id_hex: id.to_string(),
         source_message_id_hex: None,

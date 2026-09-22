@@ -123,6 +123,8 @@ analytics_features='["otlp-export"]'
 if [[ "${PRODUCT_ANALYTICS_EXPORT:-}" == "1" || "${PRODUCT_ANALYTICS_EXPORT:-}" == "true" ]]; then
   analytics_features='["otlp-export", "product-analytics-export"]'
 fi
+profile_json="$(python3 "$TOOL_DIR/release-profile-json.py")"
+python3 -c 'import json,sys; json.loads(sys.argv[1])' "$profile_json"
 cat > "$DIST_DIR/$manifest_name" <<EOF
 {
   "schema_version": 1,
@@ -139,16 +141,7 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
   "features": $analytics_features,
   "macos_targets": ["aarch64-apple-darwin"],
   "macos_deployment_target": "$deployment_target",
-  "rust_release_profile": {
-    "opt_level": "$CARGO_PROFILE_RELEASE_OPT_LEVEL",
-    "debug": "$CARGO_PROFILE_RELEASE_DEBUG",
-    "debug_assertions": false,
-    "overflow_checks": false,
-    "lto": $CARGO_PROFILE_RELEASE_LTO,
-    "codegen_units": $CARGO_PROFILE_RELEASE_CODEGEN_UNITS,
-    "panic": "$CARGO_PROFILE_RELEASE_PANIC",
-    "strip": "$CARGO_PROFILE_RELEASE_STRIP"
-  },
+  "rust_release_profile": $profile_json,
   "artifacts": {
     "$binary_name": {
       "sha256": "$binary_sha",
@@ -168,6 +161,7 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
   "contents": ["MarmotKit.xcframework", "MarmotKit.swift", "PrivacyInfo.xcprivacy", "manifest.json"]
 }
 EOF
+python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$DIST_DIR/$manifest_name"
 
 cp -R "$XCFRAMEWORK" "$bundle_dir/MarmotKit.xcframework"
 cp "$SWIFT_BINDING" "$bundle_dir/MarmotKit.swift"

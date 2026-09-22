@@ -2391,6 +2391,36 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Create an encrypted NIP-88 poll in a group conversation.
+    pub async fn create_poll(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        question: String,
+        options: Vec<String>,
+        poll_type: cgka_traits::PollType,
+        ends_at: Option<u64>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .create_poll(account_ref, group_id, question, options, poll_type, ends_at)
+            .await
+    }
+
+    /// Cast or replace this account's current selection for an accepted open
+    /// poll. A poll remains votable if the conversation is later classified as
+    /// direct.
+    pub async fn cast_poll_vote(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        poll_event_id: String,
+        option_ids: Vec<String>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .cast_poll_vote(account_ref, group_id, poll_event_id, option_ids)
+            .await
+    }
+
     pub async fn share_push_registration(
         &self,
         account_ref: &str,

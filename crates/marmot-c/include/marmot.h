@@ -672,6 +672,14 @@ typedef enum MarmotRetentionSweepStatus {
 } MarmotRetentionSweepStatus;
 
 /**
+ * NIP-88 poll selection mode.
+ */
+typedef enum MarmotPollType {
+  MARMOT_POLL_TYPE_SINGLE_CHOICE,
+  MARMOT_POLL_TYPE_MULTIPLE_CHOICE,
+} MarmotPollType;
+
+/**
  * Outcome class of a background collection.
  */
 typedef enum MarmotNotificationCollectionStatus {
@@ -3575,6 +3583,35 @@ typedef struct MarmotTimelineMessageQuery {
 } MarmotTimelineMessageQuery;
 
 /**
+ * One ordered poll option with its current authenticated vote count.
+ */
+typedef struct MarmotPollOptionResult {
+  char *id;
+  char *label;
+  uint64_t votes;
+} MarmotPollOptionResult;
+
+/**
+ * Deterministic latest-response projection for a kind-1068 poll.
+ */
+typedef struct MarmotPollProjection {
+  char *question;
+  struct MarmotPollOptionResult *options;
+  uintptr_t options_len;
+  enum MarmotPollType poll_type;
+  uint64_t participants;
+  char **local_selection;
+  uintptr_t local_selection_len;
+  char *creator;
+  bool has_ends_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t ends_at;
+  bool open;
+} MarmotPollProjection;
+
+/**
  * Preview of the message a timeline row replies to.
  */
 typedef struct MarmotTimelineReplyPreview {
@@ -3646,6 +3683,7 @@ typedef struct MarmotTimelineEditSummary {
 typedef struct MarmotTimelineMessageRecord {
   char *message_id_hex;
   bool has_reports;
+  struct MarmotPollProjection *poll;
   /**
    * Delivery marker for own (`direction == "sent"`) messages: NULL
    * while committed-but-undelivered (render as pending/failed),
@@ -8326,6 +8364,41 @@ MarmotStatus marmot_send_custom_event(const struct MarmotClient *client,
                                       uintptr_t tags_len,
                                       const char *content,
                                       struct MarmotSendSummary **out);
+
+/**
+ * Create an encrypted NIP-88 poll in a group conversation. Option ids use `"0"`
+ * through `"9"`. Free `out` with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * Strings must be valid; `options` must hold `options_len` valid strings (or
+ * be NULL with length 0); `poll_type` must be a valid `MarmotPollType`
+ * discriminant; `out` must be writable.
+ */
+MarmotStatus marmot_create_poll(const struct MarmotClient *client,
+                                const char *account_ref,
+                                const char *group_id_hex,
+                                const char *question,
+                                const char *const *options,
+                                uintptr_t options_len,
+                                uint32_t poll_type,
+                                uint8_t has_ends_at,
+                                uint64_t ends_at,
+                                struct MarmotSendSummary **out);
+
+/**
+ * Replace this account's selection; accepted open polls remain votable after reclassification.
+ *
+ * # Safety
+ * Strings must be valid; `option_ids` must hold `option_ids_len` valid strings
+ * (or be NULL with length 0); `out` must be writable.
+ */
+MarmotStatus marmot_cast_poll_vote(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   const char *group_id_hex,
+                                   const char *poll_event_id,
+                                   const char *const *option_ids,
+                                   uintptr_t option_ids_len,
+                                   struct MarmotSendSummary **out);
 
 /**
  * Classify relay endpoints against the dial-safety and retired-relay

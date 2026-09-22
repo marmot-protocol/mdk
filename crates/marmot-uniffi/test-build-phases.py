@@ -5,10 +5,12 @@ These tests check phase isolation and assembly inputs; real workflow consumers
 remain the authority for generated ABI and platform compatibility.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -49,7 +51,10 @@ elif name == "cargo":
         if "--target" in args:
             root /= args[args.index("--target") + 1]
         for suffix in ["a", "dylib", "so"]:
-            put(root / "release" / ("libmarmot_uniffi." + suffix))
+            path = root / "release" / ("libmarmot_uniffi." + suffix)
+            put(path)
+            if suffix == "a":
+                path.write_bytes(pathlib.Path(os.environ["BUILD_TEST_ARCHIVE"]).read_bytes())
 elif name == "xcodebuild":
     pathlib.Path(args[args.index("-output") + 1]).mkdir(parents=True)
 elif name == "llvm-readelf":
@@ -67,10 +72,16 @@ class BuildPhases(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # Assembly now validates real archive structure. Reuse the synthetic
+        # native Mach-O fixture instead of feeding the validator plain text.
+        fixtures = runpy.run_path(str(TOOLS / "test-release-profile.py"))
+        archive = self.root / "native.a"
+        fixtures["write_ar"](archive, [("obj.o", fixtures["macho64"](True, b"__TEXT"))])
         self.crate = self.root / "crates/marmot-uniffi"
         self.crate.mkdir(parents=True)
         for folder in ["apple-privacy", "kotlin-support"]:
             shutil.copytree(TOOLS / folder, self.crate / folder)
+        (self.crate / "marmotkit-release-profile.env").write_text("fixture profile\n")
         self.bin = self.root / ".cargo/bin"
         self.bin.mkdir(parents=True)
         for tool in ["cargo", "rustup", "xcodebuild"]:
@@ -79,7 +90,8 @@ class BuildPhases(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.root),
             PATH=f"{self.bin}:{os.environ['PATH']}",
             MARMOTKIT_WORKSPACE_DIR=str(self.root), MARMOTKIT_CRATE_DIR=str(self.crate),
-            BUILD_TEST_LOG=str(self.log), BUILD_TEST_TARGETS=" ".join(TARGETS + ANDROID),
+            BUILD_TEST_LOG=str(self.log), BUILD_TEST_ARCHIVE=str(archive),
+            BUILD_TEST_TARGETS=" ".join(TARGETS + ANDROID),
             CARGO_TARGET_DIR="target", OTLP_EXPORT="1", PRODUCT_ANALYTICS_EXPORT="1")
         ndk = self.root / "ndk"
         for host in ["darwin-x86_64", "linux-x86_64"]:
@@ -142,7 +154,7 @@ class BuildPhases(unittest.TestCase):
         self.run_phase("xcframework-macos.sh", "native")
         native = self.commands()[-1]
         self.assertIn("--target", native["args"])
-        self.assertEqual(native["macos_flags"], "-C link-arg=-mmacosx-version-min=15.0")
+        self.assertEqual(native["macos_flags"], "-C link-arg=-mmacosx-version-min=15.0 -C embed-bitcode=no")
         self.assertEqual(native["strip"], "none")
         self.log.unlink()
         self.run_phase("xcframework-macos.sh", "assemble")
@@ -193,7 +205,7 @@ class BuildPhases(unittest.TestCase):
             self.shim(self.bin / tool)
         (self.root / "ndk/source.properties").write_text("Pkg.Revision = 27.2.12479018\n")
         self.env.update(SOURCE_SHA="a" * 40, BUILDER_SHA="b" * 40,
-            GITHUB_ENV=str(self.root / "github-env"))
+            GITHUB_ENV=str(self.root / "github-env"), GITHUB_RUN_ID="12345")
         paths = [self.root / "provenance" / (part + ".json") for part in parts]
         for part, path in zip(parts, paths):
             self.provenance("record", part, path)
@@ -201,6 +213,11 @@ class BuildPhases(unittest.TestCase):
 
     def test_android_manifest_uses_observed_build_provenance(self):
         paths = self.record_inputs(["kotlin", "arm64-v8a", "armeabi-v7a", "x86", "x86_64"])
+        recorded = json.loads(paths[0].read_text())
+        expected_profile_hash = hashlib.sha256(
+            (TOOLS / "marmotkit-release-profile.env").read_bytes()
+        ).hexdigest()
+        self.assertEqual(recorded["release_profile_sha256"], expected_profile_hash)
         self.provenance("verify", "android", *paths)
         values = dict(line.split("=", 1) for line in Path(self.env["GITHUB_ENV"]).read_text().splitlines())
         self.assertEqual(values["MARMOTKIT_BUILD_ANDROID_NDK_HOME"], str(self.root / "ndk"))
@@ -214,8 +231,9 @@ class BuildPhases(unittest.TestCase):
         self.provenance("verify", "android", *paths[:-1], success=False)
         self.provenance("verify", "android", *paths[:-1], paths[1], success=False)
         original = json.loads(paths[-1].read_text())
-        for key in ["source_sha", "builder_sha", "rustc", "cargo", "android_ndk_home",
-                    "android_ndk_version", "android_api", "part"]:
+        for key in ["source_sha", "builder_sha", "workflow_run_id",
+                    "release_profile_sha256", "feature_set", "rustc", "cargo",
+                    "android_ndk_home", "android_ndk_version", "android_api", "part"]:
             with self.subTest(key=key):
                 paths[-1].write_text(json.dumps(original | {key: "different"}))
                 self.provenance("verify", "android", *paths, success=False)
@@ -230,6 +248,17 @@ class BuildPhases(unittest.TestCase):
                 data = json.loads(paths[0].read_text())
                 paths[0].write_text(json.dumps(data | {"cargo": "different"}))
                 self.provenance("verify", platform, *paths, success=False)
+
+    def test_snapshot_verification_hashes_the_builder_profile(self):
+        workflow = (TOOLS.parents[1] / ".github/workflows/bindings.yaml").read_text()
+        verify_steps = workflow.split("      - name: Verify build provenance\n")[1:]
+        self.assertEqual(len(verify_steps), 3)
+        for step in verify_steps:
+            step = step.split("      - name:", 1)[0]
+            self.assertNotIn(
+                "MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi",
+                step,
+            )
 
     def test_master_cache_warming_rejects_untrusted_source_ancestry(self):
         # Execute the workflow's actual identity script, rather than a copy of

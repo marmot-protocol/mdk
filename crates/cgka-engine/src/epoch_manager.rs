@@ -65,6 +65,12 @@ impl EpochManager {
             .collect()
     }
 
+    /// Drop both halves of a group's epoch bookkeeping: its `EpochState` entry
+    /// and the pending metas that index into it. Used by `forget_group_local`
+    /// (the group's rows are gone) and by the hydration-failure compensation
+    /// (`Engine::discard_hydration_side_effects`), whose refs can no longer
+    /// resolve. Prefer [`Self::clear_group_state`] where the pending lifecycle
+    /// must survive the retraction.
     pub(crate) fn forget_group(&mut self, group_id: &GroupId) {
         self.states.remove(group_id);
         self.pending.retain(|_, meta| &meta.group_id != group_id);
@@ -79,17 +85,20 @@ impl EpochManager {
     /// Drop a group's in-memory epoch entry: the retraction path for the
     /// session-open cheap pass's provisional `Stable` seed (mdk#1161).
     ///
-    /// Two callers only. `ensure_hydrated` retracts the seed immediately
+    /// One caller. `ensure_hydrated` retracts the seed immediately
     /// before running full per-group hydration, so hydration derives the real
     /// entry (`set_stable` / `restore_pending` / `restore_unrecoverable`)
     /// from exactly the entry-absent conditions the open-time loop always
     /// had — a projected-forward record mirror must not become the
-    /// `begin_pending` base. And `quarantine_stored_group_on_hydrate` clears
-    /// whatever entry remains when hydration fails, because a quarantined
-    /// group must have no epoch entry: `live_group_ids` filters on entry
-    /// presence, and every convergence/ingest gate treats "no state" as "not
-    /// live". Durable halt markers are unaffected:
-    /// `sync_unrecoverable_halt_from_storage` re-syncs them on demand.
+    /// `begin_pending` base. A hydration *failure* uses [`Self::forget_group`]
+    /// instead (through `Engine::discard_hydration_side_effects`): a
+    /// quarantined group must have no epoch entry — `live_group_ids` filters on
+    /// entry presence (over and above the durable terminal markers), and every
+    /// convergence/ingest gate treats "no state" as "not live" — and no pending
+    /// meta either, because a ref a partial hydration handed out can never
+    /// resolve once the entry it indexes is gone. Durable halt markers are
+    /// unaffected: `sync_unrecoverable_halt_from_storage` re-syncs them on
+    /// demand.
     pub(crate) fn clear_group_state(&mut self, group_id: &GroupId) {
         self.states.remove(group_id);
     }

@@ -59,20 +59,17 @@ const GATE_CLASSIFIER_STATES: [MessageState; 5] = [
     MessageState::Processed,
 ];
 
-/// Retry budget for a `PeelDeferred` row (mdk#339). Each unit is one
-/// actual re-peel attempt under a *changed* peel context (the fingerprint
-/// gate skips unchanged contexts entirely), so a legitimate future-epoch
-/// message would need to trail the group by this many context changes before
-/// its retained row is resource-refused and released. The same transport id
+/// Retry budget for a `PeelDeferred` row (mdk#339). Its unit is one distinct
+/// *live* peel context — the group's live epoch plus its retained anchor set —
+/// that this row failed to peel under (`live_context_attempts`, not the
+/// per-re-peel `distinct_context_attempts` beside it). The same transport id
 /// remains eligible if the transport delivers it again afterwards.
 ///
-/// The fingerprint now also moves on every newly stored commit, so a busy group
-/// spends this budget faster than one whose live epoch alone advances. It stays
-/// comfortable: a row would have to sit unreadable across 32 distinct commit
-/// contexts, and long before that it has fallen outside `max_rewind_commits`
-/// (pinned at 5 in v1), where it is terminal on horizon grounds regardless.
-/// Spending an attempt per commit is also the intended behavior, not a cost —
-/// each new commit is a genuinely new chance for the row to become readable.
+/// A live group advances its epoch on every commit, so a genuinely dead row is
+/// released after trailing 32 epochs — far past `max_rewind_commits` (pinned at
+/// 5 in v1), where it is terminal on horizon grounds regardless. On a pinned
+/// live context the budget stops bounding a row at all; residence and the
+/// per-group caps do. See `crates/cgka-engine/AGENTS.md`.
 pub const MAX_DEFERRED_PEEL_ATTEMPTS: u32 = 32;
 
 /// Maximum local residence for an opaque transport object. This is deliberately
@@ -308,6 +305,22 @@ fn previous_deferred_payload_bytes(
 
 /// `(source_epoch, digest)` of one stored commit in the convergence graph.
 type CommitEdge = (u64, [u8; 32]);
+
+/// The two nested peel contexts of a group, hashed in one walk.
+///
+/// `live` is what this device can offer a deferred row out of its own state:
+/// the group's live epoch and the retained anchor set. `full` adds the stored
+/// commit graph that candidate branch contexts are derived from, so it moves
+/// on every newly stored commit. Re-peeling under an unchanged `full` is
+/// guaranteed wasted work, which is why the sweep gate keys on it; the retry
+/// budget keys on `live`, because a deepening commit graph is a device
+/// crawling towards a row, not a chance it has spent. Both are charged: the
+/// re-peel is real work and stays visible as `distinct_context_attempts`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeferredPeelContext {
+    live: [u8; 32],
+    full: [u8; 32],
+}
 
 struct DeferredPeelCandidateCacheEntry {
     context_fingerprint: [u8; 32],
@@ -2160,7 +2173,7 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(DeferredPeelWorkResult::complete());
         }
 
-        let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
+        let context = self.deferred_peel_context(group_id)?;
         tracing::debug!(
             target: "cgka_engine::message_processor",
             method = "retry_deferred_peels",
@@ -2173,10 +2186,9 @@ impl<S: StorageProvider> Engine<S> {
         let unattempted = deferred
             .iter()
             .filter(|record| {
-                record
-                    .deferred_peel
-                    .as_ref()
-                    .is_none_or(|lifecycle| lifecycle.last_context_fingerprint != Some(fingerprint))
+                record.deferred_peel.as_ref().is_none_or(|lifecycle| {
+                    lifecycle.last_context_fingerprint != Some(context.full)
+                })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -2247,7 +2259,7 @@ impl<S: StorageProvider> Engine<S> {
             .get(group_id)
             .and_then(|state| state.candidate_cache.as_ref())
             .filter(|cached| {
-                cached.context_fingerprint == fingerprint
+                cached.context_fingerprint == context.full
                     && cached.durable_generation_fingerprint == durable_generation_fingerprint
             })
             .map(|cached| (Arc::clone(&cached.peel), Arc::clone(&cached.past_contexts)));
@@ -2332,9 +2344,9 @@ impl<S: StorageProvider> Engine<S> {
             self.storage
                 .put_deferred_peel_generation(&DeferredPeelGeneration {
                     group_id: group_id.clone(),
-                    context_fingerprint: fingerprint,
+                    context_fingerprint: context.full,
                 })?;
-            let cached_generation_fingerprint = Some(fingerprint);
+            let cached_generation_fingerprint = Some(context.full);
             let enumerated = Arc::new(enumerated);
             let past_contexts =
                 Arc::new(crate::message_processor::ingest::PastPeelContextCache::default());
@@ -2342,7 +2354,7 @@ impl<S: StorageProvider> Engine<S> {
                 .entry(group_id.clone())
                 .or_default()
                 .candidate_cache = Some(DeferredPeelCandidateCacheEntry {
-                context_fingerprint: fingerprint,
+                context_fingerprint: context.full,
                 durable_generation_fingerprint: cached_generation_fingerprint,
                 peel: Arc::clone(&enumerated),
                 past_contexts: Arc::clone(&past_contexts),
@@ -2388,7 +2400,7 @@ impl<S: StorageProvider> Engine<S> {
                 .deferred_peel
                 .as_ref()
                 .expect("deferred lifecycle normalized before sweep");
-            if lifecycle.distinct_context_attempts >= retry_budget {
+            if lifecycle.live_context_attempts >= retry_budget {
                 execution.consume_row();
                 attempted += 1;
                 self.release_deferred_peel_row(
@@ -2443,14 +2455,22 @@ impl<S: StorageProvider> Engine<S> {
                     .expect("deferred lifecycle remains normalized");
                 lifecycle.distinct_context_attempts =
                     lifecycle.distinct_context_attempts.saturating_add(1);
-                lifecycle.last_context_fingerprint = Some(fingerprint);
+                lifecycle.last_context_fingerprint = Some(context.full);
+                // A deepened commit graph is this device crawling towards the
+                // row, not a chance it has spent. Only a live context it has
+                // not already failed under costs the row budget.
+                if lifecycle.last_live_context_fingerprint != Some(context.live) {
+                    lifecycle.live_context_attempts =
+                        lifecycle.live_context_attempts.saturating_add(1);
+                    lifecycle.last_live_context_fingerprint = Some(context.live);
+                }
                 lifecycle.wall_high_water_ms = lifecycle.wall_high_water_ms.max(now.wall_ms);
                 self.storage.put_message(&retained)?;
             }
         }
 
-        let final_fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
-        if final_fingerprint != fingerprint {
+        let final_fingerprint = self.deferred_peel_context(group_id)?.full;
+        if final_fingerprint != context.full {
             self.invalidate_deferred_peel_candidate_cache(group_id);
         }
         let remaining = self
@@ -2562,7 +2582,7 @@ impl<S: StorageProvider> Engine<S> {
     /// branch work it describes cannot disagree.
     ///
     /// Deliberately unmemoized. A cached verdict would have to be validated
-    /// against `deferred_peel_context_fingerprint` to be trustworthy — the
+    /// against `deferred_peel_context` to be trustworthy — the
     /// candidate cache beside it is safe precisely because it is self-validating
     /// that way — and that fingerprint folds `stored_convergence_commit_digests`,
     /// which is the same full stored-message scan this probe is. So a correct
@@ -2866,7 +2886,7 @@ impl<S: StorageProvider> Engine<S> {
         // The app clamps ready wakes to 10 ms and backs off errors. Successful
         // zero-row slices remain ready; they must not wait for residence expiry.
         if !deferred.is_empty() {
-            let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
+            let fingerprint = self.deferred_peel_context(group_id)?.full;
             if deferred.iter().any(|record| {
                 record
                     .deferred_peel
@@ -2891,21 +2911,17 @@ impl<S: StorageProvider> Engine<S> {
         Ok(normalization_pending.then_some(0).or(earliest))
     }
 
-    /// Fingerprint of everything that can change a deferred peel's outcome:
-    /// the group's live epoch, the retained peel-snapshot set, and the stored
-    /// commit graph the sweep's candidate branch contexts are derived from.
-    /// While all three are unchanged, re-peeling a deferred row is guaranteed
-    /// wasted work.
+    /// Both halves of a deferred peel's context, from one storage walk.
     ///
     /// Anchors enter this by NAME, not by content — reading every anchor blob
     /// per fingerprint would cost more than the peels it saves. What makes a
     /// name sufficient is documented at
     /// `DeferredPeelCandidateCacheEntry::past_contexts`, whose cached contexts
     /// are the consumer that depends on it; change one and re-read the other.
-    fn deferred_peel_context_fingerprint(
+    fn deferred_peel_context(
         &mut self,
         group_id: &GroupId,
-    ) -> Result<[u8; 32], EngineError> {
+    ) -> Result<DeferredPeelContext, EngineError> {
         let epoch = self.epoch_manager.epoch(group_id).unwrap_or_default();
         let mut names: Vec<String> = self
             .available_past_peel_snapshots(group_id)?
@@ -2920,6 +2936,10 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update((name.len() as u64).to_be_bytes());
             hasher.update(name.as_bytes());
         }
+        // Everything hashed so far is the live half; fork it before the
+        // commit graph so the budget's unit costs no second storage walk.
+        let mut live = [0u8; 32];
+        live.copy_from_slice(&hasher.clone().finalize());
         // The stored commit graph is part of the peel context too: candidate
         // branch states are derived from it, so a newly retained rival commit
         // adds a readable context even though the live epoch and the retained
@@ -2934,9 +2954,9 @@ impl<S: StorageProvider> Engine<S> {
         for digest in digests {
             hasher.update(digest);
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&hasher.finalize());
-        Ok(out)
+        let mut full = [0u8; 32];
+        full.copy_from_slice(&hasher.finalize());
+        Ok(DeferredPeelContext { live, full })
     }
 
     /// `(source_epoch, digest)` of the stored commits that can contribute to

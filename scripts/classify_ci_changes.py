@@ -99,6 +99,8 @@ CLASSIFIED_WORKSPACE_CRATES = (
 
 SPECIALIST_EXACT_PATHS = {
     ".github/workflows/bindings.yaml",
+    ".github/workflows/bindings-profile.yml",
+    ".github/workflows/bindings-profile-measurement.yml",
     ".github/workflows/c-smoke-nightly.yml",
     ".github/workflows/convergence-hardening.yml",
     ".github/workflows/simulator-nightly.yml",
@@ -204,7 +206,12 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
     )
     run_ios = unclassified_path or workflow_changed or root_build_changed or any(
         _touches_crates(path, IOS_WORKSPACE_CRATES)
-        or path == ".github/workflows/bindings.yaml"
+        or path
+        in {
+            ".github/workflows/bindings.yaml",
+            ".github/workflows/bindings-profile.yml",
+            ".github/workflows/bindings-profile-measurement.yml",
+        }
         for path in normalized
     )
     run_formal = unclassified_path or workflow_changed or any(

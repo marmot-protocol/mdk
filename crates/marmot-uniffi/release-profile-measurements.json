@@ -1,0 +1,471 @@
+{
+  "android_reduction_gate": {
+    "deferred_to": "bindings-profile.yml linux lane --require-android-reduction",
+    "primary_arm_failures": [],
+    "required_locally": false,
+    "exact_head_ci": "linux-measurements.md on f469eb912664fc274734bcbe150eaefe97e72949; sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c"
+  },
+  "artifacts": [
+    {
+      "availability": "measured",
+      "baseline_bytes": 89634696,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "none"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": 67334168,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": -22300528,
+      "delta_percent": -24.88,
+      "kind": "host_generation_library",
+      "reason": "byte counts from dated exact-head CI report on f469eb912664fc274734bcbe150eaefe97e72949; object hashes were not retained",
+      "target": "host"
+    },
+    {
+      "availability": "measured",
+      "baseline_bytes": null,
+      "baseline_profile": null,
+      "baseline_sha256": null,
+      "candidate_bytes": 66900488,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": null,
+      "delta_percent": null,
+      "kind": "host_generation_library_default_features",
+      "reason": "candidate-only default-feature smoke from dated exact-head Linux CI; object hash was not retained",
+      "target": "host"
+    },
+    {
+      "availability": "measured",
+      "baseline_bytes": 52457072,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "symbols"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": 40879280,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "symbols"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": -11577792,
+      "delta_percent": -22.07,
+      "kind": "android_jni_so",
+      "reason": "byte counts from dated exact-head CI report on f469eb912664fc274734bcbe150eaefe97e72949; object hashes were not retained",
+      "target": "aarch64-linux-android"
+    },
+    {
+      "availability": "measured",
+      "baseline_bytes": 35919768,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "symbols"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": 29107768,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "symbols"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": -6812000,
+      "delta_percent": -18.96,
+      "kind": "android_jni_so",
+      "reason": "byte counts from dated exact-head CI report on f469eb912664fc274734bcbe150eaefe97e72949; object hashes were not retained",
+      "target": "armv7-linux-androideabi"
+    },
+    {
+      "availability": "measured",
+      "baseline_bytes": 64394492,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "symbols"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": 50012508,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "symbols"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": -14381984,
+      "delta_percent": -22.33,
+      "kind": "android_jni_so",
+      "reason": "byte counts from dated exact-head CI report on f469eb912664fc274734bcbe150eaefe97e72949; object hashes were not retained",
+      "target": "i686-linux-android"
+    },
+    {
+      "availability": "measured",
+      "baseline_bytes": 59169416,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "symbols"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": 47007320,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "symbols"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": -12162096,
+      "delta_percent": -20.55,
+      "kind": "android_jni_so",
+      "reason": "byte counts from dated exact-head CI report on f469eb912664fc274734bcbe150eaefe97e72949; object hashes were not retained",
+      "target": "x86_64-linux-android"
+    },
+    {
+      "availability": "measured",
+      "baseline_bytes": 178719288,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "none"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": 331185520,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": 152466232,
+      "delta_percent": 85.31,
+      "kind": "apple_static_archive",
+      "reason": "byte counts from dated exact-head CI report on f469eb912664fc274734bcbe150eaefe97e72949; object hashes were not retained",
+      "target": "aarch64-apple-ios"
+    },
+    {
+      "availability": "measured",
+      "baseline_bytes": 177476856,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "none"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": 330119400,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": 152642544,
+      "delta_percent": 86.01,
+      "kind": "apple_static_archive",
+      "reason": "byte counts from dated exact-head CI report on f469eb912664fc274734bcbe150eaefe97e72949; object hashes were not retained",
+      "target": "aarch64-apple-ios-sim"
+    },
+    {
+      "availability": "measured",
+      "baseline_bytes": 178431872,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "none"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": 330786824,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": 152354952,
+      "delta_percent": 85.39,
+      "kind": "apple_static_archive",
+      "reason": "byte counts from dated exact-head CI report on f469eb912664fc274734bcbe150eaefe97e72949; object hashes were not retained",
+      "target": "aarch64-apple-darwin"
+    }
+  ],
+  "builder_sha": "f469eb912664fc274734bcbe150eaefe97e72949",
+  "commands": [
+    {
+      "compile_seconds": null,
+      "name": "host-baseline",
+      "reason": "original compile duration overwritten by a later incremental cargo invocation",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/host-baseline"
+    },
+    {
+      "compile_seconds": null,
+      "name": "host-candidate",
+      "reason": "original compile duration overwritten by a later incremental cargo invocation",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/host-candidate"
+    },
+    {
+      "compile_seconds": null,
+      "features": [],
+      "name": "host-default-features-candidate",
+      "reason": "original compile duration overwritten by a later incremental cargo invocation",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/host-default-features"
+    },
+    {
+      "argv": [
+        "cargo",
+        "bench",
+        "--locked",
+        "--profile",
+        "release",
+        "-p",
+        "cgka-engine",
+        "--bench",
+        "group_lifecycle",
+        "--",
+        "create_group/",
+        "--sample-size",
+        "10",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "3",
+        "--noplot"
+      ],
+      "availability": "measured",
+      "compile_seconds": 178.15128054795787,
+      "name": "cpu-baseline",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/cpu-baseline"
+    },
+    {
+      "argv": [
+        "cargo",
+        "bench",
+        "--locked",
+        "--profile",
+        "release",
+        "-p",
+        "cgka-engine",
+        "--bench",
+        "group_lifecycle",
+        "--",
+        "create_group/",
+        "--sample-size",
+        "10",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "3",
+        "--noplot"
+      ],
+      "availability": "measured",
+      "compile_seconds": 222.71375241596252,
+      "name": "cpu-candidate",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/cpu-candidate"
+    }
+  ],
+  "cpu_collection_error": null,
+  "cpu_runs": [
+    {
+      "availability": "measured",
+      "benchmark": "create_group/1 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 4586157.592827381,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/1 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 4545186.371276455,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/8 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 10654346.761772487,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/32 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 32779736.114980154,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/32 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 32859614.871349208,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/8 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 10489064.875547618,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/1 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 4550597.922175926,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/1 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 4500167.989080688,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/8 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 10400413.103743386,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/32 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 30982631.37809524,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/32 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 31544647.57484127,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "availability": "measured",
+      "benchmark": "create_group/8 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": null,
+      "point_estimate": 10326794.82693783,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "dated exact-head linux-measurements.md (sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c)",
+      "reason": null,
+      "units": "ns",
+      "variant": "candidate"
+    }
+  ],
+  "cpu_slowdown_warnings": [],
+  "features": [
+    "otlp-export",
+    "product-analytics-export"
+  ],
+  "lock_sha256": "10de3ae2006a2283c43c6efb598db78b53da7b620af9057338b16fd8dfa6110e",
+  "native_acceptance": {
+    "android_apple_local": "unavailable on this Linux builder (no NDK, no Apple targets)",
+    "cpu_local": "dated exact-head Linux CI create_group rows; candidate faster on every collected row, no >5% slowdown",
+    "linux_ci_on_f469eb912664fc274734bcbe150eaefe97e72949": "Linux Android and host profile measurements succeeded; Android primary ARM ABIs shrank 19-22 percent; report sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c",
+    "macos_ci_on_f469eb912664fc274734bcbe150eaefe97e72949": "Apple slices measured (+85 percent archive growth) then Validate Apple archives failed on compiler_builtins __LLVM,__bitcode; report sha256 16a485692a20cf406f0aba644666cadd457e9cb996c083df3ef27df984b616e8",
+    "apple_growth_investigation": "Growth matches Apple rustc default embed-bitcode=yes (native+bitcode) plus a leftover 0xe80 __LLVM,__bitcode section in the Rust 1.97.1 iOS compiler_builtins rlib. Exact-head macOS CI on 2c1fd5b97bd16c9577e18a795564579c2902f909 then failed sanitization because those leftovers live as MH_OBJECT section fields inside a parent __TEXT load command. Exact-head macOS CI on e9fb5a8f577d2c6352d12eebf76111afbe8d6e01 then failed with unknown Mach-O load command 0x25 (LC_VERSION_MIN_IPHONEOS) after mid-file bitcode removal. This revision disables embed-bitcode on Apple Cargo invocations and sanitizes leftover Mach-O bitcode segments and section-level __LLVM leftovers without whitelisting members, while keeping offset-free load commands intact. This revision also merges origin/master 7d8bba365def75a66774f2b2036f839411010001. Profile-affecting MarmotKit sources and these dated bytes are unchanged except for that sanitizer repair. Fresh exact-head CI is required after publication."
+  },
+  "schema_version": 1,
+  "source_sha": "f469eb912664fc274734bcbe150eaefe97e72949",
+  "toolchains": {
+    "android_api": "26",
+    "android_ndk_home": "unavailable",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "xcodebuild": "unavailable"
+  }
+}

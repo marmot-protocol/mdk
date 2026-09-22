@@ -50,10 +50,39 @@
               "allowFrom": { "type": "array", "items": { "type": ["string", "number"] } }
             }
           },
+          "senderPolicy": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Account-global inbound sender ACL. Distinct from dm.allowFrom welcomer admission. Raw 64-character Marmot account hex only.",
+            "properties": {
+              "allowedUsers": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Exact 64-character Marmot account hex ids allowed to invoke the agent."
+              },
+              "allowAll": {
+                "type": "boolean",
+                "description": "Explicit opt-in to accept any authenticated non-self sender."
+              }
+            }
+          },
           "accounts": {
             "type": "object",
             "description": "Per-account configs for multi-account mode, keyed by account id.",
-            "additionalProperties": { "type": "object" }
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "senderPolicy": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "Account-global inbound sender ACL. Distinct from dm.allowFrom welcomer admission.",
+                  "properties": {
+                    "allowedUsers": { "type": "array", "items": { "type": "string" } },
+                    "allowAll": { "type": "boolean" }
+                  }
+                }
+              }
+            }
           }
         }
       },

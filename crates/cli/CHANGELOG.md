@@ -9,6 +9,46 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- OpenClaw Marmot now enforces an account-global inbound sender ACL before
+  queueing, onboarding, or agent-turn admission. Configure
+  `channels.marmot.senderPolicy` or the Hermes-compatible
+  `MARMOT_ALLOWED_USERS` / `MARMOT_ALLOW_ALL_USERS` environment fallback.
+  `dm.allowFrom` remains welcomer/invite admission only. Missing or invalid
+  sender policy is fail-closed and is not reported as a healthy channel.
+  A transient inbound setup failure no longer leaves the shared sender
+  authorizer stopped across the gateway retry, a replaced generation no
+  longer overwrites a healthy replacement's published authorizer status, and
+  host-supplied status snapshots cannot report connected while that policy is
+  unenforceable. Authenticated mutation events
+  (edits, deletions, and reactions) are authorized before they are buffered
+  as ambient context; unauthorized and self-authored mutations are denied
+  without buffering.
+
+### Changed
+
+- MarmotKit standard release builds now use thin LTO and one codegen unit, kept in lockstep between the
+  workspace profile and the builder-owned MarmotKit environment. Host and Apple archives still keep
+  symbols; Android JNI libraries still strip per invocation. Apple provenance records `lto` as JSON
+  `false` or `"thin"`.
+
+### Fixed
+
+- MarmotKit release-profile measurements now fail closed when `create_group` benchmarks error or
+  omit fresh Criterion estimates, including when stale results are already on disk. The Apple
+  archive helper classifies little-endian Mach-O magic correctly so embedded `__LLVM` / `__bitcode`
+  members are rejected without otool, and the non-publishing profile workflow uploads logs, raw
+  Criterion data, and toolchain versions even when a later step fails.
+- MarmotKit Apple archives no longer ship leftover LLVM bitcode. Apple Cargo invocations pass
+  `-C embed-bitcode=no`, and the packagers sanitize `__LLVM` / `__bitcode` segments and
+  MH_OBJECT section-level leftovers from every archive member (including toolchain
+  `compiler_builtins` objects) without skipping names or weakening the native-archive
+  validator. Rust's `llvm-objcopy` preserves native symbols and relocations;
+  Apple's `libtool` rebuilds the archive index. Archive flags are scoped away
+  from the host binding generator so they do not conflict with executable LTO.
+  This is not a symbol strip.
+
 ## [0.10.4] - 2026-09-20
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through

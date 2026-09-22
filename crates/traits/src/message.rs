@@ -705,11 +705,22 @@ pub struct DeferredPeelLifecycle {
     /// Durable deadline used only to reconstruct the monotonic deadline after
     /// restart. Backwards wall movement must never make this deadline earlier.
     pub residence_deadline_wall_ms: u64,
-    /// Number of distinct peel contexts actually consumed by this row.
+    /// Re-peels this row has actually performed: one per full peel context
+    /// (live state plus stored commit graph) it was offered. Work done, not
+    /// budget spent — the retry budget is `live_context_attempts`.
     pub distinct_context_attempts: u32,
-    /// Last `(epoch, retained snapshot set)` fingerprint attempted.
+    /// Last full peel-context fingerprint attempted — live context plus the
+    /// stored commit graph. Gates re-attempts; an unchanged one is wasted work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_context_fingerprint: Option<[u8; 32]>,
+    /// Distinct *live* peel contexts — the group's epoch plus its retained
+    /// anchor set — this row failed to peel under. The unit
+    /// `MAX_DEFERRED_PEEL_ATTEMPTS` is spent in.
+    #[serde(default)]
+    pub live_context_attempts: u32,
+    /// Last live peel context `live_context_attempts` was charged under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_live_context_fingerprint: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

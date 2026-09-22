@@ -671,6 +671,7 @@ pub(crate) fn notification_trigger_for_intent(
         AppMessageIntent::Chat { .. }
         | AppMessageIntent::Reply { .. }
         | AppMessageIntent::Media { .. }
+        | AppMessageIntent::Poll { .. }
         | AppMessageIntent::StreamFinal { .. } => {
             Some(notifications::NotificationTrigger::NewMessage)
         }
@@ -682,6 +683,7 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::DeleteReactions { .. }
         | AppMessageIntent::Edit { .. }
         | AppMessageIntent::Delete { .. }
+        | AppMessageIntent::PollResponse { .. }
         | AppMessageIntent::StreamStart { .. }
         | AppMessageIntent::AgentActivity { .. }
         | AppMessageIntent::AgentOperation { .. }

@@ -237,6 +237,7 @@ mod tests {
             client_token: None,
             has_reports: false,
             group_system: None,
+            poll: None,
             edit: None,
             message_id_hex: "11".repeat(32),
             source_message_id_hex: Some("22".repeat(32)),

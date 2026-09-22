@@ -366,9 +366,22 @@ branches, and a wide shallow fork cannot evict the deep branch that actually car
 *selection* is uncapped — a branch past the prefix can still win a pass and peels natively once adopted. Finally,
 failure to enumerate branches (missing anchor, missing own-commit checkpoint, exhausted budget) yields no contexts
 rather than an error — the pass, not this helper, owns every verdict. Because candidate branch
-states are part of the peel context, `deferred_peel_context_fingerprint` folds in the stored commit graph: a newly
+states are part of the peel context, `deferred_peel_context` folds in the stored commit graph: a newly
 retained rival commit adds a readable context even when the live epoch and retained-anchor set are unchanged, and
-without that term the sweep gate would stay armed exactly where it must not.
+without that term the sweep gate would stay armed exactly where it must not. That full fingerprint gates re-attempts
+and counts work done (`distinct_context_attempts`, one per re-peel — the conformance snapshot's structural-progress
+witness that a bounded generation is draining). **The retry budget is a different unit: `MAX_DEFERRED_PEEL_ATTEMPTS`
+is spent per distinct *live* peel context — live epoch plus retained-anchor set, the same walk's other half — counted
+in `live_context_attempts`, never per stored commit.** A victim wedged on its own branch reaches a rival row one
+commit per sweep generation; charging those generations releases the deep rows before the crawl arrives (the field's
+`8413db02`, 616 retry-budget releases). One live context costs one unit however long that crawl runs, and such rows
+stay bounded by residence and the per-group caps instead. Keep the two counters apart: collapsing them either
+over-charges the wedged victim or leaves a draining 975-row generation with no durable progress witness, which the
+simulator's 8-pass drain guard reads as a stalled scheduler. `distinct_context_attempts` keeps its name because it
+is a durable serde field: a Rust name that disagrees with the persisted one is its own trap, so read the doc comment,
+not the name. Pinned by
+`tests/deferred_peel_lifecycle.rs::wedged_victim_crawl_outlives_the_retry_budget` and its control
+`::advancing_live_epoch_spends_the_retry_budget_once_per_epoch`.
 
 **Contested-ness and contexts are separate answers.** That shared-source-epoch check is the *only* thing that decides
 whether the graph is contested, and `CandidateBranchPeel` carries it independently of the captured contexts, because
@@ -484,8 +497,9 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
 - **Two-phase hydration (mdk#1161): session open seeds, full hydration promotes.**
   `hydrate_stable_groups_from_storage` is the cheap seed pass: per stored group it reads only the durable record —
   no MLS load, snapshot list, or message scan — seeds a provisional `Stable(record.epoch)` entry so `live_group_ids`
-  keeps listing the group, restores disband/unrecoverable terminal state, seeds the inbound routing index from the
-  durable `transport_group_routes` table, and adds the group to `unhydrated_groups`. An unhydrated group fails closed
+  keeps listing the group (unless this device was removed from it, which that listing drops regardless), restores
+  disband/unrecoverable terminal state, seeds the inbound routing index from the durable `transport_group_routes`
+  table, and adds the group to `unhydrated_groups`. An unhydrated group fails closed
   through the same `ensure_group_live` chokepoint with the retryable `GroupNotHydrated` (never a partial view);
   `&mut` entry points (send, ingest, convergence drains) call `ensure_hydrated` first, which retracts the provisional
   seed, runs the full per-group hydration, and on failure quarantines with exact open-time parity (including removing
@@ -499,6 +513,31 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   amplification stays closed), removing an id only on successful indexing or the terminal no-routing-component
   disposition; MLS-load failures stay owned by hydration/quarantine. Route refreshes also retire durable rows the
   retained-history window (pinned v1 `max_rewind_commits`) has moved past, per routing-v1's overlap rule.
+- **A removed copy is seeded, audited apart, and is not a live member.** `Group.removed` is terminal for outbound work
+  but NOT inert like a disband tombstone: the re-add path (`group_lifecycle::retry_rejoins_after_trusted_removal`)
+  calls `ensure_hydrated` before `do_join_welcome`, #1858 keeps the copy's refused rows `Retryable`, and the #1840
+  ingest gate answers `Removed` off the durable record — so the cheap pass seeds a departed copy exactly like a live
+  one, epoch entry and routing included, and full hydration still promotes it. Only two things differ. Its hydration
+  rows carry `hydrate_removed_group` (cheap pass and promotion alike) rather than `hydrate_seed_group` /
+  `hydrate_stable_group`, because every *other* row a departed copy emits is indistinguishable from a live copy's and
+  the classifier needs to tell one device's every-open seed from the other's — except that a copy which is removed
+  *and* unrecoverable takes the `unrecoverable` arm first, so `hydrate_unrecoverable_group` outranks the removed
+  reason: the halt is the stronger fact. And it is absent from `live_group_ids`, which answers "groups this device is
+  a live member of" — both terminal reasons excluded, not just `Disbanded`: a copy that cannot send, rotate a leaf, or
+  converge owes no periodic maintenance, and the account sweep would otherwise mint a rotation obligation the
+  removed-copy send gate is guaranteed to refuse. So the app's `reconcile_live_engine_groups` no longer re-adds an
+  unprojected removed copy on its add-missing leg, and no longer repairs that copy's roster projection either; such a
+  copy surfaces again on re-add and nowhere else.
+- **Both legs of the account maintenance sweep skip a group the engine will not serve.** In
+  `marmot-account::run_due_maintenance`, the per-group rotation pass over `live_group_ids` and the account-wide
+  obligation pass (which has no liveness filter) both *skip* rather than abort on `GroupNotHydrated` from a
+  seeded-but-unhydrated copy under `defer_group_hydration` and `UnknownGroup` from a quarantined one: both are
+  retryable on a later tick, and one dead group must not stop key-package and periodic work for every group behind it
+  in the listing. The obligation pass additionally fails an obligation terminally with `local_member_removed` when the
+  durable record has gone terminal under it, and `schedule_manual_self_update` refuses a terminal record outright.
+  Obligations are minted while the copy is live and disenrollment is event-driven only, so a lost removal event
+  otherwise leaves the pass driving a `SelfUpdate` the send gate refuses, uncapped, every tick forever — the field's
+  `UseAfterEviction` self-update loop.
 - **The durable `Group::epoch` is a mirror of the epoch manager, and hydration seeds the epoch manager from it.**
   Because those two stores read each other across a restart, every mirror write belongs to the same durable unit as the
   MLS state change it projects, and every mirror failure propagates — never best-effort. Write the record inside the
