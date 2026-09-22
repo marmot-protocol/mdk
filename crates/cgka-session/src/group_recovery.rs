@@ -35,6 +35,7 @@ pub struct GroupRecoveryReport {
     pub unresolved_transport: usize,
 }
 
+/// Failures while preparing or promoting a recovered group.
 #[derive(Debug, thiserror::Error)]
 pub enum GroupRecoveryError {
     #[error(transparent)]
@@ -57,10 +58,12 @@ pub enum GroupRecoveryError {
         "group recovery did not authenticate progress beyond the original or previously sent epoch"
     )]
     NoProgress,
+    #[error("group recovery source changed; prepare again")]
+    SourceChanged,
 }
 
 /// Opaque, single-use candidate. Preparation never publishes transport work.
-/// Dropping it cancels promotion; encrypted backup/candidate files remain for
+/// Dropping it cancels promotion; encrypted candidate files remain for
 /// explicit host cleanup. Hosts must not edit those files.
 pub struct PreparedGroupRecovery {
     store: GroupRecoveryStore,
@@ -68,6 +71,7 @@ pub struct PreparedGroupRecovery {
 }
 
 impl PreparedGroupRecovery {
+    /// Evidence for the host's promotion decision; no candidate contents escape.
     pub fn report(&self) -> &GroupRecoveryReport {
         &self.report
     }
@@ -76,7 +80,14 @@ impl PreparedGroupRecovery {
     /// intervening account write rejects this candidate. Discard the old
     /// session and reopen after success to hydrate state and replay its outbox.
     pub fn apply_group_recovery(self) -> Result<GroupRecoveryReport, GroupRecoveryError> {
-        self.store.apply_group_recovery()?;
+        self.store
+            .apply_group_recovery()
+            .map_err(|error| match error {
+                cgka_traits::StorageError::RecoverySourceChanged => {
+                    GroupRecoveryError::SourceChanged
+                }
+                error => GroupRecoveryError::Storage(error),
+            })?;
         Ok(self.report)
     }
 }
@@ -90,10 +101,10 @@ impl AccountDeviceSession {
     /// or incomplete endpoint coverage before invoking this operation.
     ///
     /// First-version limits: no own commits or pending publication, and the
-    /// candidate must advance beyond the original tip and retained sends with authenticated app
-    /// deliveries. This also prevents reusing the original tip's outbound
+    /// candidate must advance beyond the original tip and retained sends through
+    /// authenticated commits. This also prevents reusing the original tip's outbound
     /// application ratchet after a rewind. Missing old keys remain unrecoverable.
-    /// Requires a Tokio runtime. Backup work is synchronous; invoke off the UI thread.
+    /// Requires a Tokio runtime. Database staging runs on its blocking pool.
     /// Keep the source account quiesced from preparation through promotion.
     pub async fn prepare_group_recovery(
         mut config: SessionConfig,
@@ -112,14 +123,25 @@ impl AccountDeviceSession {
         if !config.database_path.is_file() {
             return Err(GroupRecoveryError::InvalidHistory);
         }
-        let source =
-            SqliteAccountStorage::open_encrypted(&config.database_path, &config.database_key)?;
-        let store = GroupRecoveryStore::prepare_group_recovery(
-            source,
-            group.clone(),
-            directory,
-            SqlCipherKey::new(config.database_key.as_secret_str().to_owned())?,
-        )?;
+        let path = config.database_path.clone();
+        let key = SqlCipherKey::new(config.database_key.as_secret_str().to_owned())?;
+        let options = config.storage_options.clone();
+        let recovery_group = group.clone();
+        let candidate_path = directory.join("candidate.sqlite");
+        let staging_path = candidate_path.clone();
+        let store = tokio::task::spawn_blocking(move || {
+            let source =
+                SqliteAccountStorage::open_encrypted_with_options(path, &key, options.clone())?;
+            GroupRecoveryStore::prepare_group_recovery(
+                source,
+                recovery_group,
+                &staging_path,
+                key,
+                options,
+            )
+        })
+        .await
+        .map_err(|_| cgka_traits::StorageError::Backend("recovery staging task failed".into()))??;
         let source = store.candidate();
         let original = source.get_group(&group)?;
         if original.removed
@@ -244,7 +266,7 @@ impl AccountDeviceSession {
             })
             .collect();
         store.rewind_group(&anchor, &consumed)?;
-        config.database_path = directory.join("candidate.sqlite");
+        config.database_path = candidate_path;
         config.defer_group_hydration = true;
         // Diagnostic sinks from the live session must not observe unpublished
         // candidate state. The report is the candidate's only external output.
@@ -287,9 +309,10 @@ impl AccountDeviceSession {
             {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(
-                convergence.unwrap_or(10).clamp(1, 100),
-            ))
+            tokio::time::sleep(
+                Duration::from_millis(convergence.unwrap_or(10).max(1))
+                    .min(RECOVERY_DEADLINE.saturating_sub(started.elapsed())),
+            )
             .await;
         }
         let recovered = store.candidate().get_group(&group)?;
@@ -300,7 +323,7 @@ impl AccountDeviceSession {
             GroupEvent::MessageReceived { group_id, message_id, .. } if group_id == &group && !prior_outputs.contains(message_id))).count();
         // A prior rollback can leave sent ciphertext above the current tip.
         // Never promote a rebuilt sender ratchet from any known used epoch.
-        if recovered.epoch.0 <= last_sent_epoch || deliveries == 0 {
+        if recovered.epoch.0 <= last_sent_epoch {
             return Err(GroupRecoveryError::NoProgress);
         }
         let unresolved = store
@@ -320,6 +343,7 @@ impl AccountDeviceSession {
     }
 }
 
+/// Deduplicate exact transport inputs and reject conflicting event identities.
 fn add_input(
     inputs: &mut HashMap<MessageId, TransportMessage>,
     message: TransportMessage,
@@ -343,6 +367,7 @@ fn add_input(
     Ok(())
 }
 
+/// Reject replay that would require publishing; retain deliveries in the outbox.
 fn reject_publication(candidate: &mut AccountDeviceSession) -> Result<(), GroupRecoveryError> {
     if !candidate.engine.drain_auto_publish().is_empty()
         || !candidate.engine.drain_auto_proposals().is_empty()

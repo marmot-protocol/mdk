@@ -8,8 +8,17 @@ async fn recovery_replays_and_reopens() {
     let alice_path = root.path().join("alice.sqlite");
     let bob_path = root.path().join("bob.sqlite");
     let key = SqlCipherKey::new("recovery session test").unwrap();
+    let options = storage_sqlite::SqliteStorageOptions {
+        cipher_compatibility: 3,
+        cipher_memory_security: false,
+        journal_mode: storage_sqlite::SqliteJournalMode::Delete,
+        ..storage_sqlite::SqliteStorageOptions::default()
+    };
     let mut alice = AccountDeviceSession::open(config(&alice_path, &key, b"alice")).unwrap();
-    let mut bob = AccountDeviceSession::open(config(&bob_path, &key, b"bob")).unwrap();
+    let mut bob = AccountDeviceSession::open(
+        config(&bob_path, &key, b"bob").storage_options(options.clone()),
+    )
+    .unwrap();
     let created = alice
         .create_group(CreateGroupRequest {
             name: "recover".into(),
@@ -72,6 +81,16 @@ async fn recovery_replays_and_reopens() {
         }
         history.push(message);
     }
+    let commit_only = AccountDeviceSession::prepare_group_recovery(
+        config(&bob_path, &key, b"bob").storage_options(options.clone()),
+        group.clone(),
+        history[1..].to_vec(),
+        &root.path().join("commit-only"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(commit_only.report().recovered_epoch, 3);
+    assert_eq!(commit_only.report().authenticated_deliveries, 0);
     for n in 0..82 {
         let payload = app_payload_for(&alice, format!("missing {n}").as_bytes());
         let sent = alice
@@ -102,7 +121,12 @@ async fn recovery_replays_and_reopens() {
         other => panic!("unexpected own app: {other:?}"),
     };
     history.push(own_message);
-    let live = SqliteAccountStorage::open_encrypted(&bob_path, &key).unwrap();
+    assert!(matches!(
+        commit_only.apply_group_recovery(),
+        Err(GroupRecoveryError::SourceChanged)
+    ));
+    let live = SqliteAccountStorage::open_encrypted_with_options(&bob_path, &key, options.clone())
+        .unwrap();
     // Model the host having committed the already-visible app projection.
     let prior = live.list_pending_application_events().unwrap();
     let ids = prior
@@ -145,7 +169,7 @@ async fn recovery_replays_and_reopens() {
         .unwrap();
     live.put_outbound_fanout(&fanout).unwrap();
     let blocked = AccountDeviceSession::prepare_group_recovery(
-        config(&bob_path, &key, b"bob"),
+        config(&bob_path, &key, b"bob").storage_options(options.clone()),
         group.clone(),
         history.clone(),
         &root.path().join("pending"),
@@ -165,7 +189,7 @@ async fn recovery_replays_and_reopens() {
     collision.payload.push(0);
     conflicting.push(collision);
     let rejected = AccountDeviceSession::prepare_group_recovery(
-        config(&bob_path, &key, b"bob"),
+        config(&bob_path, &key, b"bob").storage_options(options.clone()),
         group.clone(),
         conflicting,
         &root.path().join("conflict"),
@@ -176,7 +200,7 @@ async fn recovery_replays_and_reopens() {
     history.push(history[3].clone());
     history.reverse();
     let recovery = AccountDeviceSession::prepare_group_recovery(
-        config(&bob_path, &key, b"bob"),
+        config(&bob_path, &key, b"bob").storage_options(options.clone()),
         group.clone(),
         history.clone(),
         &root.path().join("repair"),
@@ -189,7 +213,10 @@ async fn recovery_replays_and_reopens() {
     assert_eq!(live.get_group(&group).unwrap().epoch, EpochId(2));
     drop(bob);
     recovery.apply_group_recovery().unwrap();
-    let mut reopened = AccountDeviceSession::open(config(&bob_path, &key, b"bob")).unwrap();
+    let mut reopened = AccountDeviceSession::open(
+        config(&bob_path, &key, b"bob").storage_options(options.clone()),
+    )
+    .unwrap();
     assert_eq!(reopened.epoch(&group).unwrap(), EpochId(3));
     let deliveries = live.list_pending_application_events().unwrap();
     assert_eq!(
@@ -236,7 +263,7 @@ async fn recovery_replays_and_reopens() {
     live.rollback_group_state_to_snapshot(&group, "openmls-retained-anchor-2")
         .unwrap();
     let repeated = AccountDeviceSession::prepare_group_recovery(
-        config(&bob_path, &key, b"bob"),
+        config(&bob_path, &key, b"bob").storage_options(options.clone()),
         group.clone(),
         history,
         &root.path().join("used-epoch"),

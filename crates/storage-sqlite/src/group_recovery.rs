@@ -9,10 +9,7 @@ use cgka_traits::storage::{MessageStorage, StorageError, StorageProvider, Storag
 use cgka_traits::{GroupId, MessageId};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-use crate::{
-    SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, SqliteResultExt,
-    open_hardened_sqlcipher,
-};
+use crate::{SqlCipherKey, SqliteAccountStorage, SqliteResultExt, SqliteStorageOptions};
 
 /// A private encrypted candidate and its original account connection.
 ///
@@ -27,6 +24,7 @@ pub struct GroupRecoveryStore {
     fence: (i64, i64),
 }
 
+/// Capture writes through both this connection and other account connections.
 fn write_fence(conn: &Connection) -> StorageResult<(i64, i64)> {
     Ok((
         conn.query_row("PRAGMA main.data_version", [], |r| r.get(0))
@@ -37,47 +35,44 @@ fn write_fence(conn: &Connection) -> StorageResult<(i64, i64)> {
 }
 
 impl GroupRecoveryStore {
-    /// Make `before.sqlite` and `candidate.sqlite` inside a private directory.
+    /// Make a candidate at `path` in a private directory using the source options.
     /// Existing files are never overwritten. The host must quiesce account
     /// mutations; any intervening write makes promotion fail closed.
     pub fn prepare_group_recovery(
         source: SqliteAccountStorage,
         group: GroupId,
-        directory: &Path,
+        path: &Path,
         key: SqlCipherKey,
+        options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
+        let directory = path
+            .parent()
+            .ok_or_else(|| StorageError::Backend("invalid recovery path".into()))?;
         fs_private::create_dir_all_private(directory)
             .map_err(|_| StorageError::Backend("create private recovery directory".into()))?;
-        let before = directory.join("before.sqlite");
-        let path = directory.join("candidate.sqlite");
-        for file in [&before, &path] {
-            fs_private::create_new_private(file)
-                .map_err(|_| StorageError::Backend("create exclusive recovery file".into()))?;
-        }
+        fs_private::create_new_private(path)
+            .map_err(|_| StorageError::Backend("create exclusive recovery file".into()))?;
+        let candidate = SqliteAccountStorage::open_encrypted_with_options(path, &key, options)?;
         let fence = source.with_read_snapshot(|source| {
             let conn = source.lock()?;
-            // Force the read snapshot before copying either image.
+            // Force the read snapshot before copying the account.
             let _: i64 = conn
                 .query_row("SELECT count(*) FROM cgka_groups", [], |r| r.get(0))
                 .storage()?;
             let fence = write_fence(&conn)?;
-            for file in [&before, &path] {
-                let mut destination = Connection::open(file).storage()?;
-                open_hardened_sqlcipher(&destination, &key, SqlCipherHardening::live_cache())?;
-                rusqlite::backup::Backup::new(&conn, &mut destination)
-                    .storage()?
-                    .run_to_completion(128, std::time::Duration::from_millis(10), None)
-                    .storage()?;
-            }
+            let mut destination = candidate.lock()?;
+            rusqlite::backup::Backup::new(&conn, &mut destination)
+                .storage()?
+                .run_to_completion(128, std::time::Duration::from_millis(10), None)
+                .storage()?;
             Ok::<_, StorageError>(fence)
         })?;
-        let candidate = SqliteAccountStorage::open_encrypted(&path, &key)?;
         Ok(Self {
             source,
             candidate,
             group,
             key,
-            path,
+            path: path.to_owned(),
             fence,
         })
     }
@@ -147,11 +142,37 @@ impl GroupRecoveryStore {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
             if write_fence(&tx)? != self.fence {
-                return Err(StorageError::Backend(
-                    "recovery source changed; prepare again".into(),
-                ));
+                return Err(StorageError::RecoverySourceChanged);
             }
             let group = self.group.as_slice();
+            // Policies and local publication/terminal intent are host-owned.
+            // Refuse candidate changes instead of silently dropping replay effects.
+            for table in [
+                "cgka_convergence_policies",
+                "cgka_group_maintenance",
+                "cgka_maintenance_obligations",
+                "cgka_group_evolutions",
+                "cgka_disband_requests",
+                "cgka_disband_candidates",
+                "cgka_disband_tombstones",
+                "cgka_leave_requests",
+            ] {
+                let changed: bool = tx.query_row(
+                    &format!("SELECT EXISTS(SELECT * FROM main.{table} WHERE group_id=?1 EXCEPT SELECT * FROM recovery_candidate.{table} WHERE group_id=?1) OR EXISTS(SELECT * FROM recovery_candidate.{table} WHERE group_id=?1 EXCEPT SELECT * FROM main.{table} WHERE group_id=?1)"),
+                    [group], |row| row.get(0),
+                ).storage()?;
+                if changed {
+                    return Err(StorageError::Backend(
+                        "recovery changed host-owned group state".into(),
+                    ));
+                }
+            }
+            // Old stalled epochs no longer describe this group. App history,
+            // acquisition state and account-global dedup evidence remain live.
+            for table in ["app_epoch_backfill_intents", "app_epoch_stall_evidence"] {
+                tx.execute(&format!("DELETE FROM {table} WHERE group_id=?1"), [group])
+                    .storage()?;
+            }
             let mls_key = crate::openmls_storage::mls_group_key(&self.group)?;
             tx.execute("UPDATE cgka_groups SET (epoch,record)=(SELECT epoch,record FROM recovery_candidate.cgka_groups WHERE id=?1) WHERE id=?1", [group]).storage()?;
             for table in [
@@ -188,7 +209,7 @@ impl GroupRecoveryStore {
                 )?;
             }
             tx.execute("DELETE FROM cgka_messages WHERE group_id=?1 AND id IN (SELECT id FROM recovery_candidate.cgka_messages WHERE group_id=?1)", [group]).storage()?;
-            tx.execute("INSERT INTO cgka_messages (id,group_id,epoch,state,storage_format,record,payload,deferred_peel) SELECT id,group_id,epoch,state,storage_format,record,payload,deferred_peel FROM recovery_candidate.cgka_messages WHERE group_id=?1 ORDER BY insert_order", [group]).storage()?;
+            tx.execute("INSERT INTO cgka_messages (insert_order,id,group_id,epoch,state,storage_format,record,payload,deferred_peel) SELECT (SELECT coalesce(max(seq),0) FROM main.sqlite_sequence WHERE name='cgka_messages') + row_number() OVER (ORDER BY insert_order),id,group_id,epoch,state,storage_format,record,payload,deferred_peel FROM recovery_candidate.cgka_messages WHERE group_id=?1", [group]).storage()?;
             tx.execute(
                 "DELETE FROM pending_application_events WHERE group_id=?1",
                 [group],
@@ -227,12 +248,21 @@ mod tests {
     use cgka_traits::storage::GroupStorage;
     use cgka_traits::{EpochId, GroupEvent};
 
+    /// Stage an independent encrypted copy of the seeded account.
     fn stage(path: &Path, directory: &Path) -> GroupRecoveryStore {
         let key = SqlCipherKey::new("recovery storage test").unwrap();
         let source = SqliteAccountStorage::open_encrypted(path, &key).unwrap();
-        GroupRecoveryStore::prepare_group_recovery(source, gid(1), directory, key).unwrap()
+        GroupRecoveryStore::prepare_group_recovery(
+            source,
+            gid(1),
+            &directory.join("candidate.sqlite"),
+            key,
+            SqliteStorageOptions::default(),
+        )
+        .unwrap()
     }
 
+    /// Seed two groups so promotion can prove isolation.
     fn seed(path: &Path) -> SqliteAccountStorage {
         let store = SqliteAccountStorage::open_encrypted(
             path,
@@ -250,23 +280,26 @@ mod tests {
         store
     }
 
+    /// Add deliveries whose insertion order differs from their message IDs.
     fn advance(candidate: &SqliteAccountStorage) {
         candidate.put_group(&sample_group(gid(1), 4, 4)).unwrap();
         candidate.delete_message(&mid(1)).unwrap();
-        candidate
-            .put_message(&sample_message(mid(3), gid(1), 4))
-            .unwrap();
-        candidate
-            .put_pending_application_event(&GroupEvent::MessageReceived {
-                group_id: gid(1),
-                message_id: mid(3),
-                sender: member_id(1),
-                epoch: EpochId(4),
-                payload: b"recovered".to_vec(),
-                retention: None,
-                authority: None,
-            })
-            .unwrap();
+        for id in [3, 5, 4] {
+            candidate
+                .put_message(&sample_message(mid(id), gid(1), 4))
+                .unwrap();
+            candidate
+                .put_pending_application_event(&GroupEvent::MessageReceived {
+                    group_id: gid(1),
+                    message_id: mid(id),
+                    sender: member_id(1),
+                    epoch: EpochId(4),
+                    payload: b"recovered".to_vec(),
+                    retention: None,
+                    authority: None,
+                })
+                .unwrap();
+        }
     }
 
     #[test]
@@ -274,6 +307,22 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("source.sqlite");
         let live = seed(&path);
+        for group in [gid(1), gid(2)] {
+            live.lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO app_epoch_backfill_intents VALUES (?1,2,0)",
+                    [group.as_slice()],
+                )
+                .unwrap();
+            live.lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO app_epoch_stall_evidence VALUES (?1,2,1,0,0,0)",
+                    [group.as_slice()],
+                )
+                .unwrap();
+        }
         let recovery = stage(&path, &root.path().join("repair"));
         advance(recovery.candidate());
         // Force a candidate-only order that collides with the other group's
@@ -318,15 +367,35 @@ mod tests {
         );
         let conn = live.lock().unwrap();
         let matching:i64=conn.query_row("SELECT count(*) FROM pending_application_events p JOIN cgka_messages m ON m.id=p.message_id AND m.insert_order=p.message_insert_order",[],|r|r.get(0)).unwrap();
-        assert_eq!(matching, 1);
+        assert_eq!(matching, 3);
+        for table in ["app_epoch_backfill_intents", "app_epoch_stall_evidence"] {
+            let remaining: Vec<Vec<u8>> = conn
+                .prepare(&format!("SELECT group_id FROM {table}"))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(remaining, vec![gid(2).as_slice().to_vec()]);
+        }
+        let ids = conn
+            .prepare(
+                "SELECT id FROM cgka_messages WHERE group_id=?1 AND id != ?2 ORDER BY insert_order",
+            )
+            .unwrap()
+            .query_map(params![gid(1).as_slice(), mid(1).as_slice()], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            [mid(3), mid(5), mid(4)].map(|id| id.as_slice().to_vec())
+        );
         drop(conn);
-        let before = SqliteAccountStorage::open_encrypted(
-            root.path().join("repair/before.sqlite"),
-            &SqlCipherKey::new("recovery storage test").unwrap(),
-        )
-        .unwrap();
-        assert_eq!(before.get_group(&gid(1)).unwrap().epoch, EpochId(2));
-        let prefix = std::fs::read(root.path().join("repair/before.sqlite")).unwrap();
+        assert!(!root.path().join("repair/before.sqlite").exists());
+        let prefix = std::fs::read(root.path().join("repair/candidate.sqlite")).unwrap();
         assert_ne!(&prefix[..16], b"SQLite format 3\0");
         #[cfg(unix)]
         {
@@ -340,7 +409,7 @@ mod tests {
                 0o700
             );
             assert_eq!(
-                std::fs::metadata(root.path().join("repair/before.sqlite"))
+                std::fs::metadata(root.path().join("repair/candidate.sqlite"))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -359,10 +428,70 @@ mod tests {
         advance(recovery.candidate());
         live.put_message(&sample_message(mid(4), gid(2), 9))
             .unwrap();
-        assert!(recovery.apply_group_recovery().is_err());
+        assert!(matches!(
+            recovery.apply_group_recovery(),
+            Err(StorageError::RecoverySourceChanged)
+        ));
         assert_eq!(live.get_group(&gid(1)).unwrap().epoch, EpochId(2));
         assert!(live.get_message(&mid(4)).is_ok());
         assert!(live.list_pending_application_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_preserves_options() {
+        let root = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("recovery options").unwrap();
+        let options = SqliteStorageOptions {
+            cipher_compatibility: 3,
+            cipher_memory_security: false,
+            journal_mode: crate::SqliteJournalMode::Delete,
+            ..SqliteStorageOptions::default()
+        };
+        let live = SqliteAccountStorage::open_encrypted_with_options(
+            root.path().join("source.sqlite"),
+            &key,
+            options.clone(),
+        )
+        .unwrap();
+        live.put_group(&sample_group(gid(1), 2, 2)).unwrap();
+        let recovery = GroupRecoveryStore::prepare_group_recovery(
+            live.clone(),
+            gid(1),
+            &root.path().join("repair/candidate.sqlite"),
+            key,
+            options,
+        )
+        .unwrap();
+        let journal: String = recovery
+            .candidate()
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal, "delete");
+        advance(recovery.candidate());
+        recovery.apply_group_recovery().unwrap();
+        assert_eq!(live.get_group(&gid(1)).unwrap().epoch, EpochId(4));
+    }
+
+    #[test]
+    fn changed_host_state_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.sqlite");
+        let live = seed(&path);
+        let recovery = stage(&path, &root.path().join("repair"));
+        advance(recovery.candidate());
+        recovery
+            .candidate()
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_leave_requests VALUES (?1,x'00')",
+                [gid(1).as_slice()],
+            )
+            .unwrap();
+        assert!(recovery.apply_group_recovery().is_err());
+        assert_eq!(live.get_group(&gid(1)).unwrap().epoch, EpochId(2));
     }
 
     #[test]

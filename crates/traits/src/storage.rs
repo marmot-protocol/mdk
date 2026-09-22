@@ -32,6 +32,9 @@ use zeroize::Zeroizing;
 /// string-parse.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// Account writes invalidated a staged recovery. Prepare a new candidate.
+    #[error("recovery source changed; prepare again")]
+    RecoverySourceChanged,
     #[error("record not found")]
     NotFound,
     #[error("record already exists")]

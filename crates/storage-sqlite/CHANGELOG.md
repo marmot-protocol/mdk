@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- Add encrypted group-recovery staging through the `rusqlite` backup feature and
+  atomic, write-fenced promotion with message-order remapping and stale-epoch cleanup.
+
 ## 0.10.4 - 2026-09-20
 
 ### Fixed
