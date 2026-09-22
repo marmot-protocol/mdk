@@ -1193,6 +1193,18 @@ fn notification_traffic_class_is_deterministic_from_the_wire_kind() {
 }
 
 #[test]
+fn poll_notification_alerts_without_exposing_question_or_options() {
+    assert_eq!(
+        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_POLL),
+        Some(NotificationTrafficClass::Standard)
+    );
+    assert_eq!(
+        preview_text_for_kind(MARMOT_APP_EVENT_KIND_POLL, "Where should we meet?"),
+        None
+    );
+}
+
+#[test]
 fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
     use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY;
 

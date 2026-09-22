@@ -3,13 +3,13 @@
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    DeletionSourceFfi, GroupSystemEventFfi, GroupSystemEventProvenanceFfi,
-    RuntimeProjectionUpdateFfi, TimelineEditHistoryPageFfi, TimelineEditSummaryFfi,
-    TimelineEditVersionFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
-    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
-    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
-    TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
-    TimelineUserReactionFfi,
+    DeletionSourceFfi, GroupSystemEventFfi, GroupSystemEventProvenanceFfi, PollOptionResultFfi,
+    PollProjectionFfi, PollTypeFfi, RuntimeProjectionUpdateFfi, TimelineEditHistoryPageFfi,
+    TimelineEditSummaryFfi, TimelineEditVersionFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
+    TimelineRemoveReasonFfi, TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi,
+    TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
 };
 
 use super::chat_list::{MarmotChatListRow, MarmotChatListUpdateTrigger};
@@ -66,6 +66,46 @@ c_enum! {
         Unknown,
         Author,
         Admin,
+    }
+}
+
+c_enum! {
+    /// NIP-88 poll selection mode.
+    MarmotPollType from PollTypeFfi {
+        SingleChoice,
+        MultipleChoice,
+    }
+}
+
+impl MarmotPollType {
+    pub(crate) fn to_ffi(self) -> PollTypeFfi {
+        match self {
+            Self::SingleChoice => PollTypeFfi::SingleChoice,
+            Self::MultipleChoice => PollTypeFfi::MultipleChoice,
+        }
+    }
+}
+
+c_mirror! {
+    /// One ordered poll option with its current authenticated vote count.
+    MarmotPollOptionResult from PollOptionResultFfi {
+        str id,
+        str label,
+        copy votes: u64,
+    }
+}
+
+c_mirror! {
+    /// Deterministic latest-response projection for a kind-1068 poll.
+    MarmotPollProjection from PollProjectionFfi {
+        str question,
+        vec options/options_len: MarmotPollOptionResult,
+        copy poll_type: MarmotPollType,
+        copy participants: u64,
+        str_vec local_selection/local_selection_len,
+        str creator,
+        opt_copy has_ends_at/ends_at: u64,
+        copy open: bool,
     }
 }
 
@@ -153,6 +193,7 @@ c_mirror! {
     free marmot_timeline_message_record_free {
         str message_id_hex,
         copy has_reports: bool,
+        opt_rec poll: MarmotPollProjection,
         /// Delivery marker for own (`direction == "sent"`) messages: NULL
         /// while committed-but-undelivered (render as pending/failed),
         /// the published source event id once delivered. Always set for

@@ -1,3 +1,4 @@
+use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
@@ -125,7 +126,12 @@ impl AppClient {
             self.app
                 .record_account_app_event(&self.state.label, &message_projection)?
         };
-        if advance_read_marker && event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+        if advance_read_marker
+            && matches!(
+                event.kind,
+                MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
+            )
+        {
             let read_marker =
                 self.app
                     .mark_timeline_message_read(&self.state.label, &group_id_hex, &event.id);
@@ -447,7 +453,10 @@ impl AppClient {
     /// mutation whose trailing app-state write failed, and hydrate the durable
     /// roster-count projection introduced for chat-list classification.
     /// Quarantined groups are absent from `live_group_ids` and retain their
-    /// dedicated recovery path.
+    /// dedicated recovery path. So is a copy this device was removed from: its
+    /// add-missing leg no longer re-adds one, and its roster repair no longer
+    /// reaches one — a departed copy's projection is whatever the removal left,
+    /// until a re-add puts the group back in the listing.
     pub(crate) fn reconcile_live_engine_groups(&mut self) -> Result<bool, AppError> {
         let projected = self
             .state

@@ -182,6 +182,10 @@ mod migration_0085_attachment_partials;
 mod migration_0086_attachment_controls;
 #[path = "migrations/0089_local_submissions.rs"]
 mod migration_0089_local_submissions;
+#[path = "migrations/0090_poll_response_edges.rs"]
+mod migration_0090_poll_response_edges;
+#[path = "migrations/0091_account_local_identity.rs"]
+mod migration_0091_account_local_identity;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -642,6 +646,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 89,
         name: "0089_local_submissions",
         apply: migration_0089_local_submissions::apply,
+    },
+    Migration {
+        version: 90,
+        name: "0090_poll_response_edges",
+        apply: migration_0090_poll_response_edges::apply,
+    },
+    Migration {
+        version: 91,
+        name: "0091_account_local_identity",
+        apply: migration_0091_account_local_identity::apply,
     },
 ];
 
@@ -3444,6 +3458,68 @@ mod attachment_history_tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+}
+
+#[cfg(test)]
+mod poll_response_edge_tests {
+    use super::*;
+
+    #[test]
+    fn poll_response_upgrade_backfills_edges_and_removes_legacy_timeline_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let poll_migration = MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 90)
+            .unwrap();
+        run(&mut conn, &MIGRATIONS[..poll_migration]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, recorded_at, received_at
+             ) VALUES (
+                'group', 'response', 'received', 'alice', '', 1018,
+                '[[\"e\",\"poll\"],[\"response\",\"0\"]]', 2, 2
+             );
+             INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json
+             ) VALUES (
+                'group', 'response', 'received', 'alice', '', 1018,
+                '[[\"e\",\"poll\"],[\"response\",\"0\"]]', 2, 2, '[]'
+             );",
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let edge: (String, String, i64) = conn
+            .query_row(
+                "SELECT modifier_message_id_hex, target_message_id_hex, kind
+                 FROM message_modifier_edges",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(edge, ("response".into(), "poll".into(), 1018));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM message_timeline WHERE kind = 1018",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM app_events WHERE kind = 1018",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
         );
     }
 }

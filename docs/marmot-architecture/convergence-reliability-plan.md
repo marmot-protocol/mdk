@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-09-16
+updated: 2026-09-20
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -274,7 +274,7 @@ Categories:
 | ID | Constant | Value | Category | Intended effect | Failure behavior to verify | Final-state influence | Required evidence |
 | --- | --- | ---: | --- | --- | --- | --- | --- |
 | E1 | `MAX_CONVERGENCE_REPROCESSING_PASSES` | 16 passes | resource | Bounds recursive/in-call drain work | Remaining work stays durable/retryable and no partial result is called settled | intended no | End-to-end exhaustion and later-progress test |
-| E2 | `MAX_DEFERRED_PEEL_ATTEMPTS` | 32 changed contexts | resource | Releases repeatedly undecryptable retained rows as `resource_refused_retry_budget` | Same transport id remains refetch-eligible; the limit makes no validity or permanent-unreadability claim | may affect locally available input until refetch | Changed-context exhaustion, exact-ID redelivery, and missing-commit recovery |
+| E2 | `MAX_DEFERRED_PEEL_ATTEMPTS` | 32 live contexts | resource | Releases repeatedly undecryptable retained rows as `resource_refused_retry_budget`, spending one unit per distinct live peel context (group epoch plus retained anchor set) the row failed under, never per stored commit | Same transport id remains refetch-eligible; the limit makes no validity or permanent-unreadability claim. On a pinned live context — a device wedged on its own branch while it crawls a rival one — this is no longer a per-row re-peel bound at all, and residence (E8) plus the per-group caps (E3) are what bound the row | may affect locally available input until refetch | Live-context exhaustion, wedged-crawl survival, exact-ID redelivery, and missing-commit recovery |
 | E3 | `MAX_PEEL_DEFERRED_ROWS_PER_GROUP`; `MAX_PEEL_DEFERRED_BYTES_PER_GROUP`; `MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT` | 2,048 rows/group; 16 MiB/group; 64 MiB/account | resource | Bounds attacker-mintable undecryptable durable backlog by both object count and exact encoded storage bytes, including floods spread across groups | Over-cap input returns typed `ResourceRefused`, remains exact-ID eligible, and immediately arms history backfill; restart reconstructs exact sweepable usage before admission — rows in a group the deferred-peel sweep refuses to enter (quarantined or halted `Unrecoverable`) stay bounded by the per-group caps alone | may affect locally available input until refetch | Row flood and reclaim, group/account byte boundaries, restart reconstruction, 256/512/1,024 retained-history sweep, app backfill signal |
 | E4 | `MAX_DEFERRED_ROWS_PER_SWEEP` | 64 rows | resource, scheduler | Prevents deferred history or retained canonical applications monopolizing a background pass | Stable insertion order, durable peel fingerprints and terminal application dispositions carry progress across turns and restart; remaining canonical apps do not withhold queued sends | intended no | Backlog fairness, canonical-application handoff and restart tests |
 | E5 | `CANDIDATE_REPLAY_BUDGET_SLACK` | 4× | resource | Scales replay budget over linear commit/rewind estimate | `ReplayBudgetExceeded` fails closed without partial selection | intended no | Branch-explosion campaign and recovery policy test |

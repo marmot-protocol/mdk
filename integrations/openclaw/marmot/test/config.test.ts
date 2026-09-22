@@ -148,4 +148,24 @@ describe("resolveMarmotAccount", () => {
     expect(resolved.dmPolicy).toBe("allowlist");
     expect(resolved.allowFrom).toEqual(["aa", "bb"]);
   });
+
+  it("resolves senderPolicy atomically and does not infer owners from welcomers", () => {
+    const sender = "bb".repeat(32);
+    const missing = resolveMarmotAccount({ dm: { allowFrom: [sender] } }, null, deps({}));
+    expect(missing.senderPolicy.state).toBe("missing");
+    expect(missing.allowFrom).toEqual([sender]);
+
+    const fromEnv = resolveMarmotAccount(undefined, null, deps({ MARMOT_ALLOWED_USERS: sender }));
+    expect(fromEnv.senderPolicy).toMatchObject({ state: "allowlist", allowedUsers: [sender] });
+
+    const overridden = resolveMarmotAccount(
+      { senderPolicy: { allowedUsers: [] } },
+      null,
+      deps({ MARMOT_ALLOW_ALL_USERS: "true", MARMOT_ALLOWED_USERS: sender }),
+    );
+    expect(overridden.senderPolicy.state).toBe("missing");
+
+    const allowAll = resolveMarmotAccount({ senderPolicy: { allowAll: true } }, null, deps({}));
+    expect(allowAll.senderPolicy.state).toBe("allow_all");
+  });
 });

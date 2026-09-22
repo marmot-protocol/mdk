@@ -364,6 +364,9 @@ impl GroupStorage for FaultStorage {
     fn list_groups(&self) -> StorageResult<Vec<GroupId>> {
         self.inner.list_groups()
     }
+    fn list_group_records(&self) -> StorageResult<Vec<Group>> {
+        self.inner.list_group_records()
+    }
 }
 
 #[derive(Clone, Default)]

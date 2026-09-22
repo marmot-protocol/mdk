@@ -18,6 +18,7 @@ import {
   type InboundPluginApi,
 } from "../src/inbound-runtime.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
+import { testAllowlistAuthorizer } from "./sender-policy-fixtures.js";
 import {
   beginMarmotAccountLifecycle,
   markMarmotAllowlistSyncResult,
@@ -107,7 +108,8 @@ describe("startMarmotInbound", () => {
     // Disable profile onboarding so this exercises the dispatch path directly
     // (onboarding is on by default and would intercept the first message).
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(
@@ -148,12 +150,44 @@ describe("startMarmotInbound", () => {
     });
   });
 
+  it("denies an unlisted sender before onboarding or dispatch", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
+    const logs: string[] = [];
+    const unauthorized = inboundEvent("cc", "d1");
+    unauthorized.message.sender.account_id_hex = HEX32("99");
+    const api: InboundPluginApi = {
+      config: {
+        channels: {
+          marmot: {
+            profileNameOnboarding: true,
+            senderPolicy: { allowedUsers: [HEX32("bb")] },
+          },
+        },
+      },
+      logger: {
+        info: (message) => logs.push(message),
+        warn: (message) => logs.push(message),
+      },
+    };
+    const stop = startMarmotInbound(api, (message) => {
+      dispatched.push(message);
+    }, {
+      clientFactory: () => inboundStubClient([unauthorized]),
+    });
+    await waitFor(() => logs.some((line) => line.includes("reason=sender_not_allowed")));
+    expect(dispatched).toEqual([]);
+    expect(logs.join("\n")).not.toContain(HEX32("99"));
+    expect(logs.join("\n")).not.toContain(HEX32("bb"));
+    stop();
+  });
+
   it("keeps composed policy degradation after subscription acknowledgement", async () => {
     beginMarmotAccountLifecycle("default");
     markMarmotAllowlistSyncResult("default", { state: "failed", reason: "unverified" });
     const patches: Array<Record<string, unknown>> = [];
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(api, () => undefined, {
@@ -175,7 +209,8 @@ describe("startMarmotInbound", () => {
   it("signals setup failure so the gateway can retry without a duplicate subscription", async () => {
     const failures: number[] = [];
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const first = startMarmotInbound(api, () => undefined, {
@@ -270,7 +305,8 @@ describe("startMarmotInbound", () => {
     const hostPatches: Array<Record<string, unknown>> = [];
     const oldStop = startMarmotInbound(
       {
-        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
         logger: noopLogger,
       },
       () => undefined,
@@ -297,7 +333,8 @@ describe("startMarmotInbound", () => {
     let replacementSubscribes = 0;
     const replacementStop = startMarmotInbound(
       {
-        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
         logger: noopLogger,
       },
       () => undefined,
@@ -350,7 +387,8 @@ describe("startMarmotInbound", () => {
     let extraSubscribes = 0;
     const extraStop = startMarmotInbound(
       {
-        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
         logger: noopLogger,
       },
       () => undefined,
@@ -392,7 +430,8 @@ describe("startMarmotInbound", () => {
     let oldSubscribes = 0;
     const oldStop = startMarmotInbound(
       {
-        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
         logger: noopLogger,
       },
       () => undefined,
@@ -414,7 +453,8 @@ describe("startMarmotInbound", () => {
     let replacementSubscribes = 0;
     const replacementStop = startMarmotInbound(
       {
-        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
         logger: noopLogger,
       },
       () => undefined,
@@ -457,7 +497,8 @@ describe("startMarmotInbound", () => {
     const signal = new AbortController();
     const abortCount = (): number => getEventListeners(signal.signal, "abort").length;
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
 
@@ -518,7 +559,8 @@ describe("startMarmotInbound", () => {
     const mediaB = mediaRef(HEX32("b2"), "b.png");
     const dispatched: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { debounceMs: 10, profileNameOnboarding: false } } },
+      config: { channels: { marmot: { debounceMs: 10, profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(
@@ -580,7 +622,8 @@ describe("startMarmotInbound", () => {
     const stop = startMarmotInbound(
       {
         config: {
-          channels: { marmot: { debounceMs: 25, profileNameOnboarding: false } },
+          channels: { marmot: { debounceMs: 25, profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } },
         },
         logger: { info: () => undefined, warn: (message) => warnings.push(message) },
       },
@@ -605,7 +648,8 @@ describe("startMarmotInbound", () => {
   it("buffers every mutation type and attaches them to the next triggering message", async () => {
     const dispatched: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(api, (message) => {
@@ -695,10 +739,51 @@ describe("startMarmotInbound", () => {
     ]);
   });
 
+  it("does not buffer an unlisted mutation actor as ambient context", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, (message) => {
+      dispatched.push(message);
+    }, {
+      clientFactory: () =>
+        inboundStubClient([
+          {
+            type: "message_edited",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("e1"),
+            target_message_id_hex: HEX32("dd"),
+            actor: { account_id_hex: HEX32("99"), display_name: null, is_self: false },
+            replacement_text: "unauthorized",
+            recorded_at: 122,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "available",
+              text_excerpt: "before",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
+          },
+          inboundEvent("cc", "ff"),
+        ]),
+    });
+
+    await waitFor(() => dispatched.length > 0);
+    stop();
+
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]?.ambientContext ?? []).toEqual([]);
+  });
+
   it("keeps ambient context when a non-triggering message is gated out", async () => {
     const attempted: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(
@@ -764,7 +849,8 @@ describe("startMarmotInbound", () => {
       },
     }));
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(
@@ -862,7 +948,8 @@ describe("startMarmotInbound", () => {
     } as unknown as MarmotAgentControlClient;
     const dispatched: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(
@@ -901,7 +988,8 @@ describe("startMarmotInbound", () => {
       detail: `group-${index}`,
     }));
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(
@@ -931,7 +1019,8 @@ describe("startMarmotInbound", () => {
   it("buffers group state as structured next-turn context", async () => {
     const dispatched: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(api, (message) => {
@@ -963,7 +1052,8 @@ describe("startMarmotInbound", () => {
   it("invalidates the dispatcher's group-activation cache on a group_state_changed event", async () => {
     const invalidated: { accountIdHex: string; groupIdHex: string }[] = [];
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(api, () => {}, {
@@ -993,7 +1083,8 @@ describe("startMarmotInbound", () => {
     const cleared: string[] = [];
     let subscriptions = 0;
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(api, () => {}, {
@@ -1041,7 +1132,8 @@ describe("startMarmotInbound", () => {
     const cleared: string[] = [];
     let subscriptions = 0;
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(api, () => {}, {
@@ -1087,7 +1179,8 @@ describe("startMarmotInbound", () => {
   it("clears the whole group-activation cache on an inbound resync", async () => {
     let cleared = 0;
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(api, () => {}, {
@@ -1121,7 +1214,8 @@ describe("startMarmotInbound", () => {
     const gate = (id: string) => new Promise<void>((resolve) => gates.set(id, resolve));
 
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { debounceMs: 10, profileNameOnboarding: false } } },
+      config: { channels: { marmot: { debounceMs: 10, profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb"), HEX32("bc")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(
@@ -1164,7 +1258,8 @@ describe("startMarmotInbound", () => {
     const event = inboundEvent("cc", "d4");
     const dispatched: MarmotInboundMessage[] = [];
     const config = {
-      channels: { marmot: { debounceMs: 25, profileNameOnboarding: false } },
+      channels: { marmot: { debounceMs: 25, profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } },
     };
     const externalController = new AbortController();
     let releaseAccountList!: () => void;
@@ -1226,7 +1321,8 @@ describe("startMarmotInbound", () => {
     const event = inboundEvent("cc", "d4");
     const dispatched: MarmotInboundMessage[] = [];
     const config = {
-      channels: { marmot: { debounceMs: 25, profileNameOnboarding: false } },
+      channels: { marmot: { debounceMs: 25, profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } },
     };
     const firstStop = startMarmotInbound(
       { config, logger: noopLogger },
@@ -1326,6 +1422,7 @@ describe("startMarmotInbound with the real dispatcher cache", () => {
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
     });
     const events: AgentControlEvent[] = [
       inboundEvent("cc", "d1"),
@@ -1350,7 +1447,8 @@ describe("startMarmotInbound with the real dispatcher cache", () => {
       releaseNext = resolve;
     });
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(api, dispatch, {
@@ -1417,11 +1515,13 @@ describe("startMarmotInbound with the real dispatcher cache", () => {
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
     });
     let subscriptions = 0;
     const stop = startMarmotInbound(
       {
-        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        config: { channels: { marmot: { profileNameOnboarding: false,
+                senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
         logger: noopLogger,
       },
       dispatch,

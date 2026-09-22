@@ -20,6 +20,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 | [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
 | [Durable local sends](LOCAL-SENDS.md) | 0.10.4 early acceptance, exact optimistic-bubble correlation and retry semantics. |
+| [Polls](POLLS.md) | Encrypted NIP-88 creation, replacement votes, bounded validation and deterministic timeline results. |
 | [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership. |
 
 ### What MDK owns and what the host owns
@@ -73,7 +74,7 @@ All methods, including less common management/diagnostic operations, are listed 
 | Accounts and onboarding | Identity creation/import, setup readiness, local sign-in/out, wipe/export and external signers. Keep local removal, leaving groups, remote publication and wiping credentials distinct; inspect returned cleanup/send outcomes. Interactive onboarding is a persisted approval workflow, not a series of unconditional setters. |
 | Directory and profiles | Canonical member-reference parsing, safe names, cached identities, profile/relay refresh and user search. Cached reads and explicit network refresh are separate. Use prepared identity references on chat screens instead of per-row lookups. |
 | Groups and administration | Creation, staged/prepared images, invitations, membership/admin changes, retention, archive/leave/disband, recovery, quarantine and maintenance. Use current capabilities; a displayed roster is not authorization. Queued operations and uncertain publication require result-aware UI. |
-| Messages, edits and reactions | Send/reply/edit/custom events, reaction changes, deletion and edit history. Render effective prepared content and viewer reaction state; use raw history only when the feature needs it. |
+| Messages, edits, reactions and polls | Send/reply/edit/custom events, reaction changes, encrypted NIP-88 polls, deletion and edit history. Render effective prepared content and viewer reaction/poll state; use raw history only when the feature needs it. |
 | Moderation and blocking | Typed reports, individual dismissals, deletion-masked report targets and live block lists. Reports are not deletion evidence; the host designs moderation queue UI from the provided records. |
 | Screens, read state and drafts | Prepared bounded lists/conversations, account attention, read markers, manual unread, pins, mutes and revisioned composers. MDK owns persistent projection state; the host owns viewport/layout. |
 | Media and avatars | Sending/uploading media is separate from discovery, receiving, retained-byte access and decoding. Use original source slots and current opaque references; preserve rejected attachment positions. |
