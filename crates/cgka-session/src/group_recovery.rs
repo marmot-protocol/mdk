@@ -53,7 +53,9 @@ pub enum GroupRecoveryError {
     InvalidHistory,
     #[error("group recovery did not finish within its deadline")]
     Incomplete,
-    #[error("group recovery did not authenticate progress beyond the original epoch")]
+    #[error(
+        "group recovery did not authenticate progress beyond the original or previously sent epoch"
+    )]
     NoProgress,
 }
 
@@ -88,7 +90,7 @@ impl AccountDeviceSession {
     /// or incomplete endpoint coverage before invoking this operation.
     ///
     /// First-version limits: no own commits or pending publication, and the
-    /// candidate must advance beyond the original tip with authenticated app
+    /// candidate must advance beyond the original tip and retained sends with authenticated app
     /// deliveries. This also prevents reusing the original tip's outbound
     /// application ratchet after a rewind. Missing old keys remain unrecoverable.
     /// Requires a Tokio runtime. Backup work is synchronous; invoke off the UI thread.
@@ -168,6 +170,7 @@ impl AccountDeviceSession {
             .min_by_key(|(epoch, _)| *epoch)
             .ok_or(GroupRecoveryError::MissingAnchor)?;
         let mut consumed = Vec::new();
+        let mut last_sent_epoch = original.epoch.0;
         let mut inputs = HashMap::new();
         let other_routes: HashSet<_> = source
             .list_transport_group_routes()?
@@ -190,9 +193,19 @@ impl AccountDeviceSession {
             {
                 return Err(GroupRecoveryError::UnsupportedPublication);
             }
+            if row.state == MessageState::Sent {
+                last_sent_epoch = last_sent_epoch.max(row.epoch.0);
+            }
             if let Some(wire) = payload.as_openmls_wire() {
                 let projection = project_mls_message(&wire.payload)
                     .map_err(|_| GroupRecoveryError::InvalidHistory)?;
+                if payload.own_application_stamp().is_some() {
+                    last_sent_epoch = last_sent_epoch.max(
+                        projection
+                            .source_epoch
+                            .ok_or(GroupRecoveryError::InvalidHistory)?,
+                    );
+                }
                 if projection.kind == OpenMlsContentKind::Application
                     && (payload.own_application_stamp().is_some()
                         || (row.state == MessageState::Processed
@@ -285,7 +298,9 @@ impl AccountDeviceSession {
         }
         let deliveries = store.candidate().list_pending_application_events()?.iter().filter(|event|matches!(event,
             GroupEvent::MessageReceived { group_id, message_id, .. } if group_id == &group && !prior_outputs.contains(message_id))).count();
-        if recovered.epoch <= original.epoch || deliveries == 0 {
+        // A prior rollback can leave sent ciphertext above the current tip.
+        // Never promote a rebuilt sender ratchet from any known used epoch.
+        if recovered.epoch.0 <= last_sent_epoch || deliveries == 0 {
             return Err(GroupRecoveryError::NoProgress);
         }
         let unresolved = store

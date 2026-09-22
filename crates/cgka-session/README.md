@@ -54,8 +54,8 @@ This first version refuses removed/disbanded membership, missing anchors, retain
 commits, queued sends, and unfinished publications. Resolve those publications explicitly
 before recovery. In particular, an oversized event with unknown acknowledgements must not
 be silently discarded or reported as sent. Recovery requires authenticated application
-deliveries at a tip newer than the original epoch, preventing reuse of that tip’s send
-ratchet. It cannot recreate missing keys or promise recovery of every opaque event.
+deliveries at a tip newer than both the original epoch and every retained local send,
+preventing sender-ratchet reuse after an earlier rollback. It cannot recreate missing keys or promise recovery of every opaque event.
 Inputs are limited to 100,000 events and 512 MiB of payload; replay has a five-minute
 cooperative deadline. Cancellation or any preparation error leaves the source unchanged.
 

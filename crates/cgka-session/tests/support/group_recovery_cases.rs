@@ -178,7 +178,7 @@ async fn recovery_replays_and_reopens() {
     let recovery = AccountDeviceSession::prepare_group_recovery(
         config(&bob_path, &key, b"bob"),
         group.clone(),
-        history,
+        history.clone(),
         &root.path().join("repair"),
     )
     .await
@@ -221,6 +221,29 @@ async fn recovery_replays_and_reopens() {
             .iter()
             .any(|e| matches!(e, GroupEvent::MessageReceived { .. }))
     );
+    // Model a prior rollback after a send at epoch 3. Rebuilding epoch 3
+    // must not reset its sender ratchet even though the current tip is 2.
+    drop(reopened);
+    let delivered_ids = deliveries
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::MessageReceived { message_id, .. } => Some(message_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    live.delete_pending_application_events(&delivered_ids)
+        .unwrap();
+    live.rollback_group_state_to_snapshot(&group, "openmls-retained-anchor-2")
+        .unwrap();
+    let repeated = AccountDeviceSession::prepare_group_recovery(
+        config(&bob_path, &key, b"bob"),
+        group.clone(),
+        history,
+        &root.path().join("used-epoch"),
+    )
+    .await;
+    assert!(matches!(repeated, Err(GroupRecoveryError::NoProgress)));
+    assert_eq!(live.get_group(&group).unwrap().epoch, EpochId(2));
 }
 
 #[tokio::test]
