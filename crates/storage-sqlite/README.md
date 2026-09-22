@@ -234,3 +234,9 @@ for the full-row query versus 15.1 ms for metadata, avoiding 8 MiB of full paylo
 The query still enumerates all deferred metadata so an unattempted row beyond a previously
 attempted prefix remains visible. Candidate-graph cost and repeated zero-attempt wake pacing
 remain follow-up work in [#1715](https://github.com/marmot-protocol/mdk/issues/1715).
+
+Legacy token-only overflow retirement records a per-token retired watermark separately
+from import. Clearing one token restores any other joined generations and returns
+`false` while loss remains, preserving the runtime's pending flag across reopen.
+Late duplicate writers cannot resurrect a retired generation; increased counts can.
+The coordinated owner still owns qualified completion and bounded evidence reclamation.

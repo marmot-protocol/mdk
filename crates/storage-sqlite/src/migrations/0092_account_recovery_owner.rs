@@ -76,6 +76,8 @@ CREATE TABLE account_delivery_loss_evidence (
     pending_since INTEGER NOT NULL CHECK(typeof(pending_since) = 'integer' AND pending_since >= 0),
     dropped_count INTEGER NOT NULL CHECK(typeof(dropped_count) = 'integer' AND dropped_count >= 0),
     imported_count INTEGER CHECK(imported_count IS NULL OR (imported_count >= 0 AND imported_count <= dropped_count)),
+    legacy_retired_count INTEGER CHECK(legacy_retired_count IS NULL OR
+        (typeof(legacy_retired_count) = 'integer' AND legacy_retired_count >= 0 AND legacy_retired_count <= imported_count)),
     PRIMARY KEY(account_label, cause, marker_token)
 );
 
