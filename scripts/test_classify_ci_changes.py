@@ -158,6 +158,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
         for path in (
             ".github/workflows/bindings.yaml",
             ".github/workflows/bindings-profile.yml",
+            ".github/workflows/bindings-profile-measurement.yml",
         ):
             with self.subTest(path=path):
                 result = classify([path])

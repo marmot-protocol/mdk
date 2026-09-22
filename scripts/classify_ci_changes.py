@@ -100,6 +100,7 @@ CLASSIFIED_WORKSPACE_CRATES = (
 SPECIALIST_EXACT_PATHS = {
     ".github/workflows/bindings.yaml",
     ".github/workflows/bindings-profile.yml",
+    ".github/workflows/bindings-profile-measurement.yml",
     ".github/workflows/c-smoke-nightly.yml",
     ".github/workflows/convergence-hardening.yml",
     ".github/workflows/simulator-nightly.yml",
@@ -209,6 +210,7 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
         in {
             ".github/workflows/bindings.yaml",
             ".github/workflows/bindings-profile.yml",
+            ".github/workflows/bindings-profile-measurement.yml",
         }
         for path in normalized
     )

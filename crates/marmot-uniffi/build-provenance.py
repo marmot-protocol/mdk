@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Carry observed compiler identity from build jobs to release assemblers."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,24 @@ PARTS = {
 NDK_FIELDS = ("android_ndk_home", "android_ndk_version", "android_api")
 
 
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def feature_set():
+    def enabled(name):
+        return os.environ.get(name, "0").lower() in {"1", "true"}
+
+    return {
+        "otlp_export": enabled("OTLP_EXPORT"),
+        "product_analytics_export": enabled("PRODUCT_ANALYTICS_EXPORT"),
+    }
+
+
 def record(part, destination):
     workspace = os.environ["MARMOTKIT_WORKSPACE_DIR"]
     env = dict(os.environ, PATH=f"{Path.home()}/.cargo/bin:{os.environ['PATH']}")
@@ -23,8 +42,11 @@ def record(part, destination):
     def command(*args):
         return subprocess.check_output(args, cwd=workspace, env=env, text=True).strip()
 
+    profile = Path(__file__).with_name("marmotkit-release-profile.env")
     data = dict(part=part, source_sha=command("git", "rev-parse", "HEAD"),
                 builder_sha=os.environ["BUILDER_SHA"],
+                workflow_run_id=os.environ.get("GITHUB_RUN_ID", "local"),
+                release_profile_sha256=sha256(profile), feature_set=feature_set(),
                 rustc=command("rustc", "--version"), cargo=command("cargo", "--version"))
     if part in PARTS["android"] - {"kotlin"}:
         ndk = Path(os.environ["ANDROID_NDK_HOME"])
@@ -41,9 +63,16 @@ def verify(platform, paths):
     records = [json.loads(path.read_text()) for path in paths]
     if len(records) != len(PARTS[platform]) or {r["part"] for r in records} != PARTS[platform]:
         raise ValueError(f"expected exactly these build inputs: {sorted(PARTS[platform])}")
+    expected = {
+        "source_sha": os.environ["SOURCE_SHA"],
+        "builder_sha": os.environ["BUILDER_SHA"],
+        "workflow_run_id": os.environ.get("GITHUB_RUN_ID", "local"),
+        "release_profile_sha256": sha256(Path(__file__).with_name("marmotkit-release-profile.env")),
+        "feature_set": feature_set(),
+    }
     for record in records:
-        for key in ("source_sha", "builder_sha"):
-            if record[key] != os.environ[key.upper()]:
+        for key, value in expected.items():
+            if record[key] != value:
                 raise ValueError(f"{record['part']}: mismatched {key}")
 
     values = {}

@@ -434,6 +434,31 @@ validation and consumer linking are separate packaging checks.
 Changing crate types to enable effective LTO also requires revisiting the
 incompatible `embed-bitcode=no` flag and revalidating native Apple artifacts.
 
+The automatic `MarmotKit Release Profile` workflow is an exact-head packaging
+check, not a comparison benchmark. It builds Kotlin/Swift generation and every
+Android or Apple native target once in parallel, transfers those inputs only
+within the current workflow run, verifies their source, builder, toolchain,
+profile, feature and run provenance, then assembles and validates the Android,
+iOS and macOS candidate packages. Pull requests restore the trusted release
+cache read-only; only runs using the workflow from `master` may update it.
+
+Baseline-versus-candidate measurements are intentionally manual. Run the
+`MarmotKit Release Profile Measurements` workflow from `master` with the full
+lowercase SHA that needs fresh evidence:
+
+```sh
+gh workflow run bindings-profile-measurement.yml \
+  --ref master \
+  -f source_sha="$(git rev-parse HEAD)"
+```
+
+Use it when the release profile, Rust toolchain or measurement method changes,
+or when release/review evidence is requested. The selected SHA must already be
+fetchable from GitHub. The non-publishing run fails closed unless checkout
+matches it exactly and uploads separate Linux/Android/CPU and Apple reports,
+hashes, raw Criterion output and build logs. A failed or incomplete surface
+keeps the final comparison check red.
+
 ```sh
 # Inexpensive regressions, including provenance JSON and archive bitcode checks:
 python3 crates/marmot-uniffi/test-release-profile.py

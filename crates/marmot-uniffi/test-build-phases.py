@@ -203,7 +203,7 @@ class BuildPhases(unittest.TestCase):
             self.shim(self.bin / tool)
         (self.root / "ndk/source.properties").write_text("Pkg.Revision = 27.2.12479018\n")
         self.env.update(SOURCE_SHA="a" * 40, BUILDER_SHA="b" * 40,
-            GITHUB_ENV=str(self.root / "github-env"))
+            GITHUB_ENV=str(self.root / "github-env"), GITHUB_RUN_ID="12345")
         paths = [self.root / "provenance" / (part + ".json") for part in parts]
         for part, path in zip(parts, paths):
             self.provenance("record", part, path)
@@ -224,8 +224,9 @@ class BuildPhases(unittest.TestCase):
         self.provenance("verify", "android", *paths[:-1], success=False)
         self.provenance("verify", "android", *paths[:-1], paths[1], success=False)
         original = json.loads(paths[-1].read_text())
-        for key in ["source_sha", "builder_sha", "rustc", "cargo", "android_ndk_home",
-                    "android_ndk_version", "android_api", "part"]:
+        for key in ["source_sha", "builder_sha", "workflow_run_id",
+                    "release_profile_sha256", "feature_set", "rustc", "cargo",
+                    "android_ndk_home", "android_ndk_version", "android_api", "part"]:
             with self.subTest(key=key):
                 paths[-1].write_text(json.dumps(original | {key: "different"}))
                 self.provenance("verify", "android", *paths, success=False)
