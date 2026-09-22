@@ -187,11 +187,81 @@ int main(int argc, char **argv) {
         MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY, 125,
         MARMOT_HOST_PERFORMANCE_OUTCOME_CANCELLED);
     check(st == MARMOT_STATUS_OK, "conversation host timing accepted");
+    const MarmotHostPerformanceOperation host_stages[] = {
+        MARMOT_HOST_PERFORMANCE_OPERATION_WINDOW_INIT,
+        MARMOT_HOST_PERFORMANCE_OPERATION_FONTS_INIT,
+        MARMOT_HOST_PERFORMANCE_OPERATION_RUNTIME_INIT,
+        MARMOT_HOST_PERFORMANCE_OPERATION_ACCOUNT_LOAD,
+        MARMOT_HOST_PERFORMANCE_OPERATION_ACCOUNT_SWITCH,
+        MARMOT_HOST_PERFORMANCE_OPERATION_FRAME_UPDATE,
+        MARMOT_HOST_PERFORMANCE_OPERATION_FRAME_LAYOUT,
+        MARMOT_HOST_PERFORMANCE_OPERATION_FRAME_DRAW,
+        MARMOT_HOST_PERFORMANCE_OPERATION_FRAME_PRESENT,
+        MARMOT_HOST_PERFORMANCE_OPERATION_CHAT_LIST_LOAD,
+        MARMOT_HOST_PERFORMANCE_OPERATION_CONTACTS_LOAD,
+        MARMOT_HOST_PERFORMANCE_OPERATION_ARCHIVED_CHAT_LIST_LOAD,
+        MARMOT_HOST_PERFORMANCE_OPERATION_PROFILE_LOAD,
+        MARMOT_HOST_PERFORMANCE_OPERATION_PROFILE_READ,
+        MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_OPEN,
+        MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_PAGE,
+        MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_HANDOFF,
+        MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_APPLY,
+        MARMOT_HOST_PERFORMANCE_OPERATION_MESSAGE_SEND,
+        MARMOT_HOST_PERFORMANCE_OPERATION_MESSAGE_SEARCH,
+        MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_SEARCH,
+        MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_QUEUE_WAIT,
+        MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_PREPARE,
+        MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_LOAD,
+        MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_CACHE_READ,
+        MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_DECODE,
+        MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_APPLY,
+        MARMOT_HOST_PERFORMANCE_OPERATION_SETTINGS_SAVE,
+    };
+    for (uintptr_t i = 0; i < sizeof(host_stages) / sizeof(host_stages[0]); i++) {
+        st = marmot_record_host_performance(client, host_stages[i], i + 1,
+            MARMOT_HOST_PERFORMANCE_OUTCOME_FAILURE);
+        check(st == MARMOT_STATUS_OK, "shared host timing accepted");
+    }
     MarmotAppPerformanceSnapshot *performance = NULL;
     st = marmot_app_performance_snapshot(client, &performance);
     check(st == MARMOT_STATUS_OK && performance != NULL, "runtime performance snapshot");
     bool found_timing = false;
     if (performance != NULL) {
+        const MarmotAppPerformanceOperationSnapshot *host_timings[] = {
+            &performance->host_window_init,
+            &performance->host_fonts_init,
+            &performance->host_runtime_init,
+            &performance->host_account_load,
+            &performance->host_account_switch,
+            &performance->host_frame_update,
+            &performance->host_frame_layout,
+            &performance->host_frame_draw,
+            &performance->host_frame_present,
+            &performance->host_chat_list_load,
+            &performance->host_contacts_load,
+            &performance->host_archived_chat_list_load,
+            &performance->host_profile_load,
+            &performance->host_profile_read,
+            &performance->host_timeline_open,
+            &performance->host_timeline_page,
+            &performance->host_timeline_handoff,
+            &performance->host_timeline_apply,
+            &performance->host_message_send,
+            &performance->host_message_search,
+            &performance->host_conversation_search,
+            &performance->host_media_queue_wait,
+            &performance->host_media_prepare,
+            &performance->host_media_load,
+            &performance->host_media_cache_read,
+            &performance->host_media_decode,
+            &performance->host_media_apply,
+            &performance->host_settings_save,
+        };
+        for (uintptr_t i = 0; i < sizeof(host_timings) / sizeof(host_timings[0]); i++) {
+            check(host_timings[i]->attempts == 1 && host_timings[i]->failures == 1 &&
+                host_timings[i]->duration_ms.sum_ms == i + 1 &&
+                host_timings[i]->duration_ms.buckets_len > 0, "shared host timing snapshot");
+        }
         for (uintptr_t i = 0; i < performance->runtime_operations_len; i++) {
             const MarmotRuntimePerformanceSnapshot *timing = &performance->runtime_operations[i];
             if (strcmp(timing->operation, "host_conversation_composer_ready") == 0) {

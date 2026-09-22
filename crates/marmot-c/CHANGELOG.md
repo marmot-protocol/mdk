@@ -15,6 +15,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   header and library. Invalid events return zero; invalid pointers return an
   argument status.
 
+- Add 28 shared host-performance stages and their `host_*` snapshot fields, plus
+  ten Linux-specific timing operations. Existing operation discriminants remain
+  unchanged. `MarmotAppPerformanceSnapshot` grows; rebuild consumers against the
+  matching generated header and library. Its existing deep-free releases the new
+  histogram fields.
+
 - Add `marmot_create_poll`, `marmot_cast_poll_vote`, and structured poll projection records. This adds a nullable field
   to `MarmotTimelineMessageRecord`; poll creation follows canonical group-conversation classification, while an
   accepted open poll remains votable after reclassification. Regenerate and recompile with the matching header and

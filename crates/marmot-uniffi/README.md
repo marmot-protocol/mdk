@@ -137,13 +137,22 @@ remain the host's responsibility, including removal of downstream copies after l
 
 ### Localization, privacy and diagnostics
 
-`record_host_performance` also accepts 38 fixed `Linux*` stages for startup, frames,
-account/timeline work, search, media and vault/settings I/O. These elapsed spans
-include early/error returns. Opt-in OTLP export reports unlabeled
-`app_host_linux_*_duration_ms` histograms and `app_host_linux_*_samples` counters,
-without success/failure series. Linux distributions are available in Rust snapshots
-and OTLP, but omitted from `AppPerformanceSnapshotFfi`. The operation enum remains
-platform-independent; regenerate Swift/Kotlin bindings when adopting its new cases.
+`record_host_performance` accepts 28 shared host stages for runtime/UI initialization,
+accounts, lists, profiles, timelines, message sending/search, media and preferences.
+For example, `MessageSend` measures host task execution, `ConversationSearch` finds
+conversations containing matching messages, and `MediaApply` installs prepared
+media in the UI; it does not publish to a relay. See the
+[operation definitions](../marmot-app/src/app_telemetry.rs)
+for boundaries. Record only stages your client can observe. Nested stages overlap
+and must not be summed. Ten `Linux*` stages retain vault startup/storage,
+post-presentation/idle-loop and catch-all worker measurements.
+
+Shared stages appear in `AppPerformanceSnapshotFfi` as `host_*` fields. The ten
+Linux-specific distributions remain available through Rust snapshots and OTLP.
+All 38 stages export unlabeled `app_host_*_duration_ms` histograms and
+`app_host_*_samples` counters through opt-in OTLP, including early/error returns,
+without success/failure series. Snapshot outcomes still reflect the supplied outcome.
+Regenerate Swift/Kotlin bindings and pair them with the matching native library.
 
 Use typed presentation, capability, deletion and group-system fields rather than parsing English
 strings or guessing from membership counts. Clients localize fallback labels and system wording.

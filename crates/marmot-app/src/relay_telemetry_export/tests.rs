@@ -876,7 +876,7 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
 }
 
 #[test]
-fn linux_host_metric_export() {
+fn host_stage_metric_export() {
     use crate::app_telemetry::{
         AppPerformanceTelemetry, HostPerformanceOperation, HostPerformanceOutcome,
     };
@@ -891,40 +891,40 @@ fn linux_host_metric_export() {
             "app_host_linux_startup_after_vault_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxWindowInit,
-            "app_host_linux_window_init_duration_ms",
+            HostPerformanceOperation::WindowInit,
+            "app_host_window_init_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxFontsInit,
-            "app_host_linux_fonts_init_duration_ms",
+            HostPerformanceOperation::FontsInit,
+            "app_host_fonts_init_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxRuntimeBoot,
-            "app_host_linux_runtime_boot_duration_ms",
+            HostPerformanceOperation::RuntimeInit,
+            "app_host_runtime_init_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxAccountLoad,
-            "app_host_linux_account_load_duration_ms",
+            HostPerformanceOperation::AccountLoad,
+            "app_host_account_load_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxAccountSwitch,
-            "app_host_linux_account_switch_duration_ms",
+            HostPerformanceOperation::AccountSwitch,
+            "app_host_account_switch_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxFrameUpdate,
-            "app_host_linux_frame_update_duration_ms",
+            HostPerformanceOperation::FrameUpdate,
+            "app_host_frame_update_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxFrameLayout,
-            "app_host_linux_frame_layout_duration_ms",
+            HostPerformanceOperation::FrameLayout,
+            "app_host_frame_layout_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxFrameDraw,
-            "app_host_linux_frame_draw_duration_ms",
+            HostPerformanceOperation::FrameDraw,
+            "app_host_frame_draw_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxFramePresent,
-            "app_host_linux_frame_present_duration_ms",
+            HostPerformanceOperation::FramePresent,
+            "app_host_frame_present_duration_ms",
         ),
         (
             HostPerformanceOperation::LinuxFramePostPresent,
@@ -939,80 +939,80 @@ fn linux_host_metric_export() {
             "app_host_linux_frame_idle_wait_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxChatListLoad,
-            "app_host_linux_chat_list_load_duration_ms",
+            HostPerformanceOperation::ChatListLoad,
+            "app_host_chat_list_load_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxContactsLoad,
-            "app_host_linux_contacts_load_duration_ms",
+            HostPerformanceOperation::ContactsLoad,
+            "app_host_contacts_load_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxArchivedLoad,
-            "app_host_linux_archived_load_duration_ms",
+            HostPerformanceOperation::ArchivedChatListLoad,
+            "app_host_archived_chat_list_load_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxProfileLoad,
-            "app_host_linux_profile_load_duration_ms",
+            HostPerformanceOperation::ProfileLoad,
+            "app_host_profile_load_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxProfileRead,
-            "app_host_linux_profile_read_duration_ms",
+            HostPerformanceOperation::ProfileRead,
+            "app_host_profile_read_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxTimelineOpen,
-            "app_host_linux_timeline_open_duration_ms",
+            HostPerformanceOperation::TimelineOpen,
+            "app_host_timeline_open_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxTimelinePage,
-            "app_host_linux_timeline_page_duration_ms",
+            HostPerformanceOperation::TimelinePage,
+            "app_host_timeline_page_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxTimelineHandoff,
-            "app_host_linux_timeline_handoff_duration_ms",
+            HostPerformanceOperation::TimelineHandoff,
+            "app_host_timeline_handoff_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxTimelineApply,
-            "app_host_linux_timeline_apply_duration_ms",
+            HostPerformanceOperation::TimelineApply,
+            "app_host_timeline_apply_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxSendWorker,
-            "app_host_linux_send_worker_duration_ms",
+            HostPerformanceOperation::MessageSend,
+            "app_host_message_send_duration_ms",
         ),
         (
             HostPerformanceOperation::LinuxMessageOpWorker,
             "app_host_linux_message_op_worker_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxSearchGlobal,
-            "app_host_linux_search_global_duration_ms",
+            HostPerformanceOperation::MessageSearch,
+            "app_host_message_search_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxSearchSidebar,
-            "app_host_linux_search_sidebar_duration_ms",
+            HostPerformanceOperation::ConversationSearch,
+            "app_host_conversation_search_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxMediaQueueWait,
-            "app_host_linux_media_queue_wait_duration_ms",
+            HostPerformanceOperation::MediaQueueWait,
+            "app_host_media_queue_wait_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxMediaWorker,
-            "app_host_linux_media_worker_duration_ms",
+            HostPerformanceOperation::MediaPrepare,
+            "app_host_media_prepare_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxMediaLoad,
-            "app_host_linux_media_load_duration_ms",
+            HostPerformanceOperation::MediaLoad,
+            "app_host_media_load_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxMediaCacheHit,
-            "app_host_linux_media_cache_hit_duration_ms",
+            HostPerformanceOperation::MediaCacheRead,
+            "app_host_media_cache_read_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxMediaDecode,
-            "app_host_linux_media_decode_duration_ms",
+            HostPerformanceOperation::MediaDecode,
+            "app_host_media_decode_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxMediaPublish,
-            "app_host_linux_media_publish_duration_ms",
+            HostPerformanceOperation::MediaApply,
+            "app_host_media_apply_duration_ms",
         ),
         (
             HostPerformanceOperation::LinuxVaultDeriveKey,
@@ -1031,19 +1031,19 @@ fn linux_host_metric_export() {
             "app_host_linux_vault_persist_duration_ms",
         ),
         (
-            HostPerformanceOperation::LinuxSettingsSave,
-            "app_host_linux_settings_save_duration_ms",
+            HostPerformanceOperation::SettingsSave,
+            "app_host_settings_save_duration_ms",
         ),
     ];
-    for (operation, _) in stages {
+    for (index, (operation, _)) in stages.into_iter().enumerate() {
         telemetry.record_host_performance(
             operation,
-            std::time::Duration::from_millis(3),
+            std::time::Duration::from_millis(index as u64 + 3),
             HostPerformanceOutcome::Success,
         );
         telemetry.record_host_performance(
             operation,
-            std::time::Duration::from_millis(7),
+            std::time::Duration::from_millis(index as u64 + 7),
             HostPerformanceOutcome::Failure,
         );
     }
@@ -1053,25 +1053,22 @@ fn linux_host_metric_export() {
         &RelayLabelResolution::default(),
         Some(&snapshot),
     );
-    assert_eq!(
-        batch
-            .points
-            .iter()
-            .filter(|p| p.name.starts_with("app_host_linux_"))
-            .count(),
-        stages.len() * 2
-    );
-    for (_, name) in stages {
+    for (index, (_, name)) in stages.into_iter().enumerate() {
+        assert_eq!(batch.points.iter().filter(|p| p.name == name).count(), 1);
         let point = batch.points.iter().find(|p| p.name == name).unwrap();
         assert!(point.relay.is_none() && point.failure.is_none());
         let ExportMetricValue::Histogram(histogram) = &point.value else {
             panic!("expected histogram")
         };
-        assert_eq!(histogram.sum_ms, 10);
+        assert_eq!(histogram.sum_ms, index as u64 * 2 + 10);
         assert_eq!(
             histogram.bucket_counts.iter().sum::<u64>() + histogram.overflow_count,
             2
         );
+        let prefix = name.strip_suffix("_duration_ms").unwrap();
+        assert!(!batch.points.iter().any(|p| {
+            p.name == format!("{prefix}_successes") || p.name == format!("{prefix}_failures")
+        }));
         let samples = name.replace("_duration_ms", "_samples");
         assert!(
             batch
