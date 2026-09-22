@@ -16,10 +16,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   argument status.
 
 - Add 28 shared host-performance stages and their `host_*` snapshot fields, plus
-  ten Linux-specific timing operations. Existing operation discriminants remain
-  unchanged. `MarmotAppPerformanceSnapshot` grows; rebuild consumers against the
-  matching generated header and library. Its existing deep-free releases the new
-  histogram fields.
+  ten Linux-specific timing operations. The 28 shared C operation identifiers from
+  the Linux timing patch are renamed to platform-neutral names, such as
+  `MARMOT_HOST_PERFORMANCE_OPERATION_MESSAGE_SEND`, preserving their discriminant
+  values. The ten Linux-specific operations retain their names. Consumers using
+  the old identifiers must update their source and rebuild against the matching
+  generated header and library for the expanded `MarmotAppPerformanceSnapshot`.
+  Its existing deep-free releases the new histogram fields.
 
 - Add `marmot_create_poll`, `marmot_cast_poll_vote`, and structured poll projection records. This adds a nullable field
   to `MarmotTimelineMessageRecord`; poll creation follows canonical group-conversation classification, while an
