@@ -356,11 +356,11 @@ fn tracing_invocations(contents: &str) -> Vec<TraceInvocation> {
 
 fn contains_tracing_macro(line: &str) -> bool {
     TRACING_MACROS.iter().any(|needle| {
+        let is_bare_macro = !needle.contains("::");
         line.match_indices(needle).any(|(start, _)| {
-            line[..start]
-                .chars()
-                .next_back()
-                .is_none_or(|previous| previous != ':' && !unicode_ident::is_xid_continue(previous))
+            line[..start].chars().next_back().is_none_or(|previous| {
+                !unicode_ident::is_xid_continue(previous) && (!is_bare_macro || previous != ':')
+            })
         })
     })
 }
@@ -371,14 +371,17 @@ fn tracing_macro_scan_does_not_treat_compile_error_as_error() {
 compile_error!("unsupported platform");
 compiléerror!("unsupported platform");
 other::error!("not a tracing macro");
+::tracing::error!(target: "audit", method = "test", "expected root-qualified tracing call");
 tracing::error!(target: "audit", method = "test", "expected qualified tracing call");
 error!(target: "audit", method = "test", "expected tracing call");
 "#;
 
     let invocations = tracing_invocations(contents);
-    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations.len(), 3);
     assert_eq!(invocations[0].line, 5);
+    assert!(invocations[0].body.contains("::tracing::error!"));
     assert_eq!(invocations[1].line, 6);
+    assert_eq!(invocations[2].line, 7);
 }
 
 #[test]

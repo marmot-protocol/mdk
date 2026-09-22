@@ -401,27 +401,9 @@ impl PreparedDirectory {
         &self,
         name: &std::ffi::OsStr,
     ) -> io::Result<PrivateExclusiveFileLease> {
-        use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::ffi::OsStrExt;
 
-        let mut name_components = Path::new(name).components();
-        let single_normal = matches!(
-            (name_components.next(), name_components.next()),
-            (Some(std::path::Component::Normal(_)), None)
-        );
-        if !single_normal {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private lease name must be one non-empty path component",
-            ));
-        }
-        let name_c = CString::new(name.as_bytes()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private lease name contains a NUL byte",
-            )
-        })?;
+        let name_c = relative_component_c_string(name)?;
         let path = self.path.join(name);
         let descriptor = unsafe {
             libc::openat(
