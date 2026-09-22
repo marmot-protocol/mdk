@@ -12,9 +12,6 @@ use marmot_terminal_harness::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-const MINIMUM_ATTACHMENT_CODEX_VERSION: &str = "0.146.0";
-const MINIMUM_ATTACHMENT_CODEX_VERSION_PARTS: (u64, u64, u64) = (0, 146, 0);
-
 #[derive(Clone)]
 pub(crate) struct CodexBackend {
     bin: String,
@@ -103,14 +100,14 @@ async fn run_with_bin(
         error,
         observed_session: None,
     })?;
-    if !prepared.is_empty() {
-        verify_codex_attachment_capability(bin).await?;
-    }
     let images = prepared
         .iter()
         .filter(|attachment| attachment.native_image)
         .map(|attachment| attachment.source.path.clone())
         .collect::<Vec<_>>();
+    if !images.is_empty() {
+        verify_codex_image_capability(bin).await?;
+    }
     let mut environment = Vec::new();
     if let Some(request) = &artifact_output {
         let (suffix, artifact_env) = artifact_delivery_instructions(request, &cwd);
@@ -174,59 +171,44 @@ async fn run_with_bin(
     Ok(outcome)
 }
 
-async fn verify_codex_attachment_capability(bin: &str) -> Result<(), RunFailure> {
+async fn verify_codex_image_capability(bin: &str) -> Result<(), RunFailure> {
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::process::Command::new(bin)
-            .arg("--version")
+            .args(["exec", "--help"])
             .kill_on_drop(true)
             .output(),
     )
     .await
     .map_err(|_| RunFailure {
-        error: HarnessError::BackendTimedOut,
+        error: HarnessError::AttachmentBackendCapabilityProbeFailed {
+            capability: "native image input",
+        },
         observed_session: None,
     })?
     .map_err(|_| RunFailure {
         error: HarnessError::BackendSpawn,
         observed_session: None,
     })?;
-    if output.status.success()
-        && codex_attachment_version_supported(&String::from_utf8_lossy(&output.stdout))
-    {
+    let supports_images = [&output.stdout, &output.stderr]
+        .into_iter()
+        .any(|bytes| codex_exec_supports_images(&String::from_utf8_lossy(bytes)));
+    if output.status.success() && supports_images {
         return Ok(());
     }
     Err(RunFailure {
-        error: HarnessError::AttachmentBackendVersionUnsupported {
-            minimum: MINIMUM_ATTACHMENT_CODEX_VERSION,
+        error: HarnessError::AttachmentBackendCapabilityUnsupported {
+            capability: "native image input",
         },
         observed_session: None,
     })
 }
 
-fn codex_attachment_version_supported(output: &str) -> bool {
-    let mut fields = output.split_whitespace();
-    if fields.next() != Some("codex-cli") {
-        return false;
-    }
-    let Some(version) = fields.next() else {
-        return false;
-    };
-    if fields.next().is_some() {
-        return false;
-    }
-    let (core, prerelease) = version
-        .split_once('-')
-        .map_or((version, false), |(core, _)| (core, true));
-    let mut parts = core.split('.').map(str::parse::<u64>);
-    let (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let parsed = (major, minor, patch);
-    parsed > MINIMUM_ATTACHMENT_CODEX_VERSION_PARTS
-        || (parsed == MINIMUM_ATTACHMENT_CODEX_VERSION_PARTS && !prerelease)
+fn codex_exec_supports_images(output: &str) -> bool {
+    output.split_whitespace().any(|field| {
+        let field = field.trim_end_matches([',', ';']);
+        field == "--image" || field.starts_with("--image=") || field.starts_with("--image<")
+    })
 }
 
 struct PreparedAttachment<'a> {
@@ -254,7 +236,7 @@ fn prepare_attachments(
                 use std::os::unix::fs::OpenOptionsExt;
                 options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             }
-            let mut file = options
+            let file = options
                 .open(&attachment.path)
                 .map_err(|_| HarnessError::AttachmentInvalid)?;
             let metadata = file
@@ -263,9 +245,17 @@ fn prepare_attachments(
             if !metadata.file_type().is_file() || metadata.len() != attachment.size_bytes {
                 return Err(HarnessError::AttachmentInvalid);
             }
+            let read_limit = attachment
+                .size_bytes
+                .checked_add(1)
+                .ok_or(HarnessError::AttachmentInvalid)?;
             let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
+            file.take(read_limit)
+                .read_to_end(&mut bytes)
                 .map_err(|_| HarnessError::AttachmentInvalid)?;
+            if u64::try_from(bytes.len()).ok() != Some(attachment.size_bytes) {
+                return Err(HarnessError::AttachmentInvalid);
+            }
             let native_image = has_supported_image_signature(&bytes);
             if !native_image && !is_supported_staged_file(&bytes) {
                 return Err(HarnessError::AttachmentUnsupported);
@@ -616,32 +606,30 @@ mod tests {
     }
 
     #[test]
-    fn attachment_capability_requires_supported_codex_cli_version() {
-        assert!(codex_attachment_version_supported("codex-cli 0.146.0\n"));
-        assert!(codex_attachment_version_supported("codex-cli 0.200.1\n"));
-        assert!(codex_attachment_version_supported(
-            "codex-cli 1.0.0-beta.1\n"
+    fn codex_exec_help_reports_native_image_capability() {
+        assert!(codex_exec_supports_images(
+            "Options:\n  -i, --image <FILE>...  Optional images\n"
         ));
-        assert!(!codex_attachment_version_supported("codex-cli 0.145.9\n"));
-        assert!(!codex_attachment_version_supported(
-            "codex-cli 0.146.0-beta.1\n"
+        assert!(codex_exec_supports_images("Options:\n  --image=<FILE>\n"));
+        assert!(codex_exec_supports_images("Capabilities: --image, audio\n"));
+        assert!(!codex_exec_supports_images(
+            "Options:\n  -m, --model <MODEL>\n"
         ));
-        assert!(!codex_attachment_version_supported("codex-cli 0.146\n"));
-        assert!(!codex_attachment_version_supported("other-cli 0.146.0\n"));
+        assert!(!codex_exec_supports_images("--image-mode enabled\n"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn older_codex_cli_rejects_attachments_before_starting_a_turn() {
+    async fn codex_without_native_image_capability_rejects_images_before_starting_a_turn() {
         let root = tempfile::tempdir().unwrap();
-        let notes = root.path().join("notes.txt");
+        let image = root.path().join("image.png");
         let marker = root.path().join("turn-started");
-        let script = root.path().join("old-codex");
-        fs::write(&notes, b"notes").unwrap();
+        let script = root.path().join("codex-without-images");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nimage").unwrap();
         fs::write(
             &script,
             format!(
-                "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${{1:-}}\" = \"--version\" ]; then\n  printf '%s\\n' 'codex-cli 0.145.0'\n  exit 0\nfi\ntouch '{}'\nexit 64\n",
+                "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${{1:-}}\" = \"exec\" ] && [ \"${{2:-}}\" = \"--help\" ]; then\n  printf '%s\\n' 'Options:' '  --json'\n  exit 0\nfi\ntouch '{}'\nexit 64\n",
                 marker.display()
             ),
         )
@@ -662,7 +650,7 @@ mod tests {
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
             },
-            vec![attachment(&notes, "text/plain", "notes.txt")],
+            vec![attachment(&image, "image/png", "image.png")],
             tx,
         )
         .await
@@ -671,7 +659,9 @@ mod tests {
         assert!(
             matches!(
                 failure.error,
-                HarnessError::AttachmentBackendVersionUnsupported { minimum: "0.146.0" }
+                HarnessError::AttachmentBackendCapabilityUnsupported {
+                    capability: "native image input"
+                }
             ),
             "unexpected attachment capability failure: {:?}",
             failure.error
@@ -1108,8 +1098,8 @@ mod tests {
             format!(
                 r#"#!/usr/bin/env bash
 set -euo pipefail
-if [ "${{1:-}}" = "--version" ]; then
-  printf '%s\n' 'codex-cli 0.146.0'
+if [ "${{1:-}}" = "exec" ] && [ "${{2:-}}" = "--help" ]; then
+  printf '%s\n' 'Options:' '  -i, --image <FILE>...'
   exit 0
 fi
 if [ "$#" -ne 9 ] || [ "$1" != "exec" ] || [ "$2" != "resume" ] || \
@@ -1195,10 +1185,6 @@ printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":
             &script,
             r#"#!/usr/bin/env bash
 set -euo pipefail
-if [ "${1:-}" = "--version" ]; then
-  printf '%s\n' 'codex-cli 0.146.0'
-  exit 0
-fi
 if [ "$#" -ne 3 ] || [ "$1" != "exec" ] || [ "$2" != "--json" ] || [ "$3" != "-" ]; then
   printf 'unexpected args:' >&2
   printf ' <%s>' "$@" >&2
@@ -1291,7 +1277,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
         fs::write(
             &script,
             format!(
-                "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${{1:-}}\" = \"--version\" ]; then\n  printf '%s\\n' 'codex-cli 0.146.0'\n  exit 0\nfi\n{}\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"thread-private-files\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"read every accepted private file\"}}}}'\n",
+                "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${{1:-}}\" = \"exec\" ] && [ \"${{2:-}}\" = \"--help\" ]; then\n  printf '%s\\n' 'Options:' '  -i, --image <FILE>...'\n  exit 0\nfi\n{}\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"thread-private-files\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"read every accepted private file\"}}}}'\n",
                 comparisons.join("\n")
             ),
         )
@@ -1716,10 +1702,9 @@ exit 64
             .output()
             .expect("run codex --version");
         assert!(version.status.success());
-        let version_output = String::from_utf8_lossy(&version.stdout);
-        assert!(
-            codex_attachment_version_supported(&version_output),
-            "real attachment smoke requires Codex CLI {MINIMUM_ATTACHMENT_CODEX_VERSION} or newer; got {version_output:?}"
+        eprintln!(
+            "real_codex_version={}",
+            String::from_utf8_lossy(&version.stdout).trim()
         );
 
         let attachment_root = tempfile::tempdir().unwrap();
@@ -1736,9 +1721,8 @@ exit 64
                 idle_timeout: Duration::from_secs(30),
                 cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
                 session_id: None,
-                prompt: format!(
-                    "Read the staged non-image attachment and reply with exactly CODEX_ATTACHMENT_OK: {token} and nothing else."
-                ),
+                prompt: "Read the staged non-image attachment. Reply with CODEX_ATTACHMENT_OK: followed by the exact token contained in the file. The token is not present in this prompt."
+                    .to_owned(),
                 artifact_output: None,
             },
             vec![attachment(
@@ -1758,7 +1742,11 @@ exit 64
         while let Some(RunnerEvent::Text(text)) = rx.recv().await {
             reply.push_str(&text);
         }
-        assert_eq!(reply.trim(), format!("CODEX_ATTACHMENT_OK: {token}"));
+        let expected = format!("CODEX_ATTACHMENT_OK: {token}");
+        assert!(
+            reply.lines().any(|line| line.trim() == expected),
+            "real Codex did not return the token from the staged file: {reply:?}"
+        );
 
         let (resume_tx, mut resume_rx) = mpsc::channel(8);
         let resumed = run_with_bin(
@@ -1787,6 +1775,11 @@ exit 64
         while let Some(RunnerEvent::Text(text)) = resume_rx.recv().await {
             resumed_reply.push_str(&text);
         }
-        assert_eq!(resumed_reply.trim(), "CODEX_RESUME_OK");
+        assert!(
+            resumed_reply
+                .lines()
+                .any(|line| line.trim() == "CODEX_RESUME_OK"),
+            "real Codex did not confirm the resumed session: {resumed_reply:?}"
+        );
     }
 }
