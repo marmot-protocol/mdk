@@ -7075,9 +7075,17 @@ mod tests {
         let (events, _subscriber) = broadcast::channel(16);
         let shared = RuntimeSharedServices::default();
         let before = relay.unfloored_account_subscription_count();
-        for (seam, expected_activations) in [
-            (EpochBackfillExecutionSeam::Maintenance, 2),
-            (EpochBackfillExecutionSeam::Receive, 3),
+        for (seam, expected_activations, reason) in [
+            (
+                EpochBackfillExecutionSeam::Maintenance,
+                2,
+                "epoch replay chains straight into overflow",
+            ),
+            (
+                EpochBackfillExecutionSeam::Receive,
+                3,
+                "overflow runs again while the epoch replay is paced",
+            ),
         ] {
             run_pending_epoch_backfill_reporting_arm(
                 &mut client,
@@ -7093,7 +7101,7 @@ mod tests {
             assert_eq!(
                 relay.unfloored_account_subscription_count() - before,
                 expected_activations,
-                "baseline: the overflow executor bypasses the epoch cooldown",
+                "baseline: {reason}",
             );
         }
         assert!(client.has_pending_epoch_backfill());
