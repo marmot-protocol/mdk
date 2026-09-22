@@ -271,15 +271,52 @@ struct VerifiedPrefix {
     file_identity: FileIdentity,
     registered_length: u64,
     registered_digest: String,
+    file_version: FileVersion,
 }
 
 impl VerifiedPrefix {
-    fn matches(&self, entry: &SegmentEntry) -> bool {
+    fn matches(&self, entry: &SegmentEntry, file_version: &FileVersion) -> bool {
         self.segment_id == entry.segment_id
             && self.file_identity == entry.file_identity
             && self.registered_length == entry.registered_length
             && self.registered_digest == entry.registered_digest
+            && self.file_version == *file_version
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedAcknowledgedPrefix {
+    segment_id: SegmentId,
+    acknowledged_end: u64,
+    acknowledged_digest: String,
+    file_version: FileVersion,
+}
+
+impl VerifiedAcknowledgedPrefix {
+    fn matches(
+        &self,
+        segment_id: &SegmentId,
+        cursor: &SegmentCursor,
+        file_version: &FileVersion,
+    ) -> bool {
+        self.segment_id == *segment_id
+            && self.acknowledged_end == cursor.acknowledged_end
+            && self.acknowledged_digest == cursor.acknowledged_digest
+            && self.file_version == *file_version
+    }
+}
+
+// Process-local digest caches are valid only for this exact observed file
+// version. In particular, ctime prevents a same-inode rewrite with restored
+// length/mtime from inheriting an earlier digest proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileVersion {
+    identity: FileIdentity,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -348,8 +385,11 @@ pub struct AuditDeliveryStore {
     recovery_required: bool,
     faults: Faults,
     verified_prefix: Mutex<Option<VerifiedPrefix>>,
+    verified_acknowledged_prefix: Mutex<Option<VerifiedAcknowledgedPrefix>>,
     #[cfg(test)]
     registered_prefix_validations: AtomicUsize,
+    #[cfg(test)]
+    acknowledged_prefix_validations: AtomicUsize,
 }
 
 impl fmt::Debug for AuditDeliveryStore {
@@ -410,8 +450,11 @@ impl AuditDeliveryStore {
             recovery_required: false,
             faults,
             verified_prefix: Mutex::new(None),
+            verified_acknowledged_prefix: Mutex::new(None),
             #[cfg(test)]
             registered_prefix_validations: AtomicUsize::new(0),
+            #[cfg(test)]
+            acknowledged_prefix_validations: AtomicUsize::new(0),
         };
         store.publish_manifest()?;
         store.publish_state()?;
@@ -470,8 +513,11 @@ impl AuditDeliveryStore {
                     recovery_required: false,
                     faults: Faults::default(),
                     verified_prefix: Mutex::new(None),
+                    verified_acknowledged_prefix: Mutex::new(None),
                     #[cfg(test)]
                     registered_prefix_validations: AtomicUsize::new(0),
+                    #[cfg(test)]
+                    acknowledged_prefix_validations: AtomicUsize::new(0),
                 };
                 store.publish_manifest()?;
                 store.publish_state()?;
@@ -512,8 +558,11 @@ impl AuditDeliveryStore {
             recovery_required: false,
             faults: Faults::default(),
             verified_prefix: Mutex::new(None),
+            verified_acknowledged_prefix: Mutex::new(None),
             #[cfg(test)]
             registered_prefix_validations: AtomicUsize::new(0),
+            #[cfg(test)]
+            acknowledged_prefix_validations: AtomicUsize::new(0),
         };
         if recover_missing_initial_state {
             store.publish_state()?;
@@ -725,15 +774,9 @@ impl AuditDeliveryStore {
         let entry = self.segment(&prepared.segment_id)?;
         let file_name = segment_file_name(&entry.segment_id);
         let mut file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
-        self.validate_live_segment(&file, entry)?;
-        let (bodies, end_offset) =
-            read_complete_range(&mut file, prepared.start_offset, Some(prepared.end_offset))?;
-        if end_offset != prepared.end_offset
-            || hex::encode(ordered_body_digest(&bodies)) != prepared.ordered_body_digest
-        {
-            return Err(AuditDeliveryError::CorruptState);
-        }
-        let digest = ordered_body_digest(&bodies);
+        let file_version = self.validate_live_segment(&file, entry)?;
+        let (bodies, digest) = self.recover_prepared_from_file(&mut file, &prepared)?;
+        validate_file_version(&file, &file_version)?;
         Ok(Some(self.range_from_parts(prepared, bodies, digest)))
     }
 
@@ -745,6 +788,7 @@ impl AuditDeliveryStore {
             .prepared
             .clone()
             .ok_or(AuditDeliveryError::StaleToken)?;
+        validate_single_component(&prepared.attempt_id)?;
         self.validate_prepared_cursor(&prepared)?;
         if token.owner_epoch != self.owner_epoch
             || token.journal_id != self.state.journal_id
@@ -755,24 +799,24 @@ impl AuditDeliveryStore {
         {
             return Err(AuditDeliveryError::StaleToken);
         }
-        // Re-verify the complete in-flight bytes immediately before advancing.
-        let recovered = self
-            .recover_prepared()?
-            .ok_or(AuditDeliveryError::CorruptState)?;
         let entry = self.segment(&prepared.segment_id)?;
         let file_name = segment_file_name(&entry.segment_id);
-        let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
-        validate_registered_shape(&file, entry)?;
+        let mut file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
+        let file_version = self.validate_live_segment(&file, entry)?;
         let current_cursor = self.cursor(&prepared.segment_id)?;
         validate_acknowledged_boundary(&file, current_cursor)?;
-        validate_acknowledged_digest(&file, current_cursor)?;
+        self.validate_acknowledged_digest(&file, current_cursor, &file_version)?;
+        // Re-read the complete in-flight bytes from the same stable file
+        // version immediately before advancing.
+        let (bodies, _) = self.recover_prepared_from_file(&mut file, &prepared)?;
         let previous_digest = decode_digest(&current_cursor.acknowledged_digest)?;
         let (acknowledged_digest, acknowledged_end) =
-            extend_acknowledged_digest(previous_digest, prepared.start_offset, recovered.bodies())?;
+            extend_acknowledged_digest(previous_digest, prepared.start_offset, &bodies)?;
         if acknowledged_end != prepared.end_offset {
             return Err(AuditDeliveryError::CorruptState);
         }
         let boundary_digest = digest_boundary(&file, prepared.end_offset)?;
+        validate_file_version(&file, &file_version)?;
         let mut state = self.state.clone();
         state.revision = next_revision(state.revision)?;
         let cursor = state
@@ -786,6 +830,12 @@ impl AuditDeliveryStore {
         state.prepared = None;
         self.publish_state_value(&state)?;
         self.state = state;
+        self.remember_acknowledged_prefix(
+            &prepared.segment_id,
+            prepared.end_offset,
+            hex::encode(acknowledged_digest),
+            file_version,
+        );
         Ok(())
     }
 
@@ -817,6 +867,21 @@ impl AuditDeliveryStore {
         }
     }
 
+    fn recover_prepared_from_file(
+        &self,
+        file: &mut File,
+        prepared: &PreparedState,
+    ) -> Result<(Vec<Vec<u8>>, [u8; 32]), AuditDeliveryError> {
+        let (bodies, end_offset) =
+            read_complete_range(file, prepared.start_offset, Some(prepared.end_offset))?;
+        let digest = ordered_body_digest(&bodies);
+        if end_offset != prepared.end_offset || hex::encode(digest) != prepared.ordered_body_digest
+        {
+            return Err(AuditDeliveryError::CorruptState);
+        }
+        Ok((bodies, digest))
+    }
+
     fn validate_all(&self) -> Result<(), AuditDeliveryError> {
         if self.manifest.segments.len() > MAX_SEGMENTS {
             return Err(AuditDeliveryError::SegmentLimit);
@@ -838,9 +903,9 @@ impl AuditDeliveryStore {
             let cursor = self.cursor(&entry.segment_id)?;
             let file_name = segment_file_name(&entry.segment_id);
             let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
-            self.validate_live_segment(&file, entry)?;
+            let file_version = self.validate_live_segment(&file, entry)?;
             validate_acknowledged_boundary(&file, cursor)?;
-            validate_acknowledged_digest(&file, cursor)?;
+            self.validate_acknowledged_digest(&file, cursor, &file_version)?;
         }
         match self.state.health.status {
             HealthStatus::Clean => {}
@@ -857,22 +922,24 @@ impl AuditDeliveryStore {
         &self,
         file: &File,
         entry: &SegmentEntry,
-    ) -> Result<(), AuditDeliveryError> {
+    ) -> Result<FileVersion, AuditDeliveryError> {
         validate_registered_shape(file, entry)?;
+        let file_version = file_version(file)?;
         if self
             .verified_prefix
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .is_some_and(|verified| verified.matches(entry))
+            .is_some_and(|verified| verified.matches(entry, &file_version))
         {
-            return Ok(());
+            return Ok(file_version);
         }
 
         #[cfg(test)]
         self.registered_prefix_validations
             .fetch_add(1, Ordering::Relaxed);
         validate_registered_digest(file, entry)?;
+        validate_file_version(file, &file_version)?;
         *self
             .verified_prefix
             .lock()
@@ -881,8 +948,58 @@ impl AuditDeliveryStore {
             file_identity: entry.file_identity.clone(),
             registered_length: entry.registered_length,
             registered_digest: entry.registered_digest.clone(),
+            file_version: file_version.clone(),
         });
+        Ok(file_version)
+    }
+
+    fn validate_acknowledged_digest(
+        &self,
+        file: &File,
+        cursor: &SegmentCursor,
+        file_version: &FileVersion,
+    ) -> Result<(), AuditDeliveryError> {
+        if self
+            .verified_acknowledged_prefix
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|verified| verified.matches(&cursor.segment_id, cursor, file_version))
+        {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        self.acknowledged_prefix_validations
+            .fetch_add(1, Ordering::Relaxed);
+        validate_acknowledged_digest(file, cursor)?;
+        validate_file_version(file, file_version)?;
+        self.remember_acknowledged_prefix(
+            &cursor.segment_id,
+            cursor.acknowledged_end,
+            cursor.acknowledged_digest.clone(),
+            file_version.clone(),
+        );
         Ok(())
+    }
+
+    fn remember_acknowledged_prefix(
+        &self,
+        segment_id: &SegmentId,
+        acknowledged_end: u64,
+        acknowledged_digest: String,
+        file_version: FileVersion,
+    ) {
+        *self
+            .verified_acknowledged_prefix
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(VerifiedAcknowledgedPrefix {
+                segment_id: segment_id.clone(),
+                acknowledged_end,
+                acknowledged_digest,
+                file_version,
+            });
     }
 
     fn invalidate_verified_prefix(&self) {
@@ -890,11 +1007,20 @@ impl AuditDeliveryStore {
             .verified_prefix
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .verified_acknowledged_prefix
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     #[cfg(test)]
     pub(super) fn registered_prefix_validation_count(&self) -> usize {
         self.registered_prefix_validations.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn acknowledged_prefix_validation_count(&self) -> usize {
+        self.acknowledged_prefix_validations.load(Ordering::Relaxed)
     }
 
     fn recover_registration_gap(&mut self) -> Result<(), AuditDeliveryError> {
@@ -1219,6 +1345,33 @@ fn file_identity(file: &File) -> Result<FileIdentity, AuditDeliveryError> {
         device: metadata.dev(),
         inode: metadata.ino(),
     })
+}
+
+fn file_version(file: &File) -> Result<FileVersion, AuditDeliveryError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "inspect payload file version",
+            source,
+        })?;
+    Ok(FileVersion {
+        identity: FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+fn validate_file_version(file: &File, expected: &FileVersion) -> Result<(), AuditDeliveryError> {
+    if file_version(file)? != *expected {
+        return Err(AuditDeliveryError::CorruptState);
+    }
+    Ok(())
 }
 
 fn validate_file_identity(file: &File, expected: &FileIdentity) -> Result<(), AuditDeliveryError> {

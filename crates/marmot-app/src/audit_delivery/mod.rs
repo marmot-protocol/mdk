@@ -21,9 +21,13 @@
 //! Stable device/inode identity detects pathname replacement. Sealed segments
 //! are checked at their exact final length and digest on first use in a store
 //! lifetime and again on reopen, rather than being rehashed for every prepared
-//! range; live access still verifies file identity and length. Acknowledgement
-//! and sealing independently validate the durable acknowledged-prefix
-//! commitment before they publish replacement metadata.
+//! range. Live verification caches are bound to the observed device, inode,
+//! length, modification time, and change time, so an observed in-place mutation
+//! forces the corresponding full-prefix validation. The acknowledged-prefix
+//! commitment is then advanced incrementally after the current cached prefix is
+//! proved, rather than rehashed from byte zero for every range. Acknowledgement
+//! and sealing independently validate that durable commitment before they
+//! publish replacement metadata.
 
 mod recovery;
 mod state;

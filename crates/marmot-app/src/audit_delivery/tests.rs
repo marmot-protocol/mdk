@@ -117,6 +117,45 @@ fn sealed_segment_registered_prefix_is_hashed_once_while_draining() {
 
     assert_eq!(range_count, 3);
     assert_eq!(store.registered_prefix_validation_count(), 1);
+    assert_eq!(store.acknowledged_prefix_validation_count(), 1);
+}
+
+#[test]
+fn acknowledge_revalidates_a_cached_snapshot_after_same_inode_rewrite() {
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let segment = SegmentId::generate();
+    let mut store = AuditDeliveryStore::create(temporary.path(), journal, profile()).unwrap();
+    let payload = (0..17)
+        .map(|index| format!("record-{index:02}\n"))
+        .collect::<String>();
+    let path = store.segment_path(&segment).unwrap();
+    fs_private::write_private(&path, payload.as_bytes()).unwrap();
+    store
+        .register_segment(segment, SegmentStatus::Sealed)
+        .unwrap();
+
+    let prepared = store.prepare_next().unwrap().unwrap();
+    let generation = path.parent().unwrap().parent().unwrap();
+    let state_before = fs::read(generation.join("state.json")).unwrap();
+    let inode = fs::metadata(&path).unwrap().ino();
+    let mut rewritten = payload.into_bytes();
+    let unread = rewritten
+        .windows(b"record-10".len())
+        .position(|window| window == b"record-10")
+        .unwrap();
+    rewritten[unread] = b'R';
+    fs_private::write_private(&path, &rewritten).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+
+    assert!(matches!(
+        store.acknowledge(prepared.token()),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+    assert_eq!(
+        fs::read(generation.join("state.json")).unwrap(),
+        state_before
+    );
 }
 
 #[test]
