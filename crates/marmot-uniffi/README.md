@@ -434,6 +434,46 @@ Build all Android ABIs:
 The script keeps the host library's UniFFI metadata intact while stripping
 debug and static symbol sections from each packaged Android JNI library.
 
+Standard MarmotKit release builds use the workspace `[profile.release]` together with
+`marmotkit-release-profile.env`: `lto=thin`, `codegen-units=1`, `opt-level=3`,
+`debug=0`, `panic=unwind`, and `strip=none`. Android target invocations override only
+`CARGO_PROFILE_RELEASE_STRIP=symbols`. Apple target invocations add
+`-C embed-bitcode=no` and sanitize leftover `__LLVM` / `__bitcode` sections
+before packaging so shipped archives stay native; that is not a symbol strip.
+Sanitization requires the active Rust toolchain's `llvm-tools-preview` component
+(included by `rust-toolchain.toml`) and Xcode's `libtool`. It rebuilds symbol indexes
+and validates a temporary output before replacing the original archive.
+Those builder-owned settings are not a user-facing escape hatch; measurement
+scripts may override LTO and codegen units on direct Cargo commands for a
+controlled baseline comparison.
+These are configured profile values, not proof that Cargo applies LTO to every
+output: the mixed `rlib`/`cdylib`/`staticlib` binding target can suppress LTO.
+The measured reduction belongs to the combined profile, not to thin LTO alone.
+Apple measurement rows record pre-sanitization Cargo archive bytes and hashes,
+not final packaged-archive or linked application sizes. Native-only archive
+validation and consumer linking are separate packaging checks.
+Changing crate types to enable effective LTO also requires revisiting the
+incompatible `embed-bitcode=no` flag and revalidating native Apple artifacts.
+
+```sh
+# Inexpensive regressions, including provenance JSON and archive bitcode checks:
+python3 crates/marmot-uniffi/test-release-profile.py
+
+# On macOS: real archive reconstruction, embedded-bitcode removal and linking:
+python3 crates/marmot-uniffi/test-native-archive.py
+
+# Controlled host/Android/Apple/CPU comparison. Missing platforms are recorded as
+# unavailable, never as zero. Isolated target directories keep the two variants
+# from overwriting each other. `--cpu` fails if a benchmark invocation fails or
+# only stale Criterion estimates remain:
+python3 crates/marmot-uniffi/measure-release-profile.py \
+  --source-sha "$(git rev-parse HEAD)" \
+  --builder-sha "$(git rev-parse HEAD)" \
+  --host --cpu \
+  --output release-profile-measurements.json \
+  --markdown release-profile-measurements.md
+```
+
 To build a subset:
 
 ```sh
