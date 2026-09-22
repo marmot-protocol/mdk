@@ -190,10 +190,18 @@ async fn verify_codex_image_capability(bin: &str) -> Result<(), RunFailure> {
         error: HarnessError::BackendSpawn,
         observed_session: None,
     })?;
+    if !output.status.success() {
+        return Err(RunFailure {
+            error: HarnessError::AttachmentBackendCapabilityProbeFailed {
+                capability: "native image input",
+            },
+            observed_session: None,
+        });
+    }
     let supports_images = [&output.stdout, &output.stderr]
         .into_iter()
         .any(|bytes| codex_exec_supports_images(&String::from_utf8_lossy(bytes)));
-    if output.status.success() && supports_images {
+    if supports_images {
         return Ok(());
     }
     Err(RunFailure {
@@ -660,6 +668,57 @@ mod tests {
             matches!(
                 failure.error,
                 HarnessError::AttachmentBackendCapabilityUnsupported {
+                    capability: "native image input"
+                }
+            ),
+            "unexpected attachment capability failure: {:?}",
+            failure.error
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_codex_image_capability_probe_is_not_reported_as_unsupported() {
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("image.png");
+        let marker = root.path().join("turn-started");
+        let script = root.path().join("codex-failed-probe");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nimage").unwrap();
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${{1:-}}\" = \"exec\" ] && [ \"${{2:-}}\" = \"--help\" ]; then\n  printf '%s\\n' 'Options:' '  --image <FILE>'\n  exit 64\nfi\ntouch '{}'\nexit 64\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+
+        let failure = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: None,
+                prompt: "inspect".to_owned(),
+                artifact_output: None,
+            },
+            vec![attachment(&image, "image/png", "image.png")],
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                failure.error,
+                HarnessError::AttachmentBackendCapabilityProbeFailed {
                     capability: "native image input"
                 }
             ),
