@@ -113,80 +113,122 @@ pub(crate) fn delete_inventory_tx(
     conn: &Connection,
     predicate: &str,
     parameters: &[&dyn rusqlite::ToSql],
-) -> StorageResult<()> {
-    let select = format!(
-        "SELECT s.obligation_id,s.scope_id,s.scope_format,s.scope_payload
-         FROM account_recovery_scopes s
-         JOIN account_recovery_obligations o ON o.id=s.obligation_id
-         WHERE s.snapshot_state=1 AND EXISTS(
-             SELECT 1 FROM transport_reconciliation_items i WHERE ({predicate})
-             AND s.route_kind=i.route_kind
-             AND (s.route_kind=0 OR s.transport_group_id=i.route_id)
-             AND i.created_at>=COALESCE(s.since_seconds,0) AND i.created_at<=s.until_seconds
-             AND (o.predicate!=1 OR s.known_event_id=i.event_id))"
-    );
-    // Ordinary live admission usually has no installed recovery proof. Avoid
-    // opening the obligation/inventory join on that bounded hot path.
-    let has_scopes = conn
-        .query_row_cached("SELECT 1 FROM account_recovery_scopes", [], |row| {
-            row.get::<_, bool>(0)
-        })
+) -> StorageResult<usize> {
+    // This indexed no-op probe never reads the recovery tables. Ordinary live
+    // admission stays independent of the number of retained recovery scopes.
+    if conn
+        .query_row_cached(
+            &format!("SELECT 1 FROM transport_reconciliation_items WHERE {predicate}"),
+            parameters,
+            |_| Ok(()),
+        )
         .optional()
         .storage()?
-        .is_some();
-    let affected = if has_scopes {
-        conn.prepare_cached(&select)
-            .storage()?
-            .query_map(parameters, |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                ))
-            })
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?
-    } else {
-        Vec::new()
-    };
+        .is_none()
+    {
+        return Ok(0);
+    }
     let removed = conn
-        .execute_cached(
-            &format!("DELETE FROM transport_reconciliation_items WHERE {predicate}"),
-            parameters,
+        .prepare_cached(&format!(
+            "DELETE FROM transport_reconciliation_items WHERE {predicate}
+        RETURNING route_kind,route_id,event_id,created_at"
+        ))
+        .storage()?
+        .query_map(parameters, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    let count = removed.len();
+    let mut routes = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (kind, route, event, at) in removed {
+        routes.entry((kind, route)).or_default().push((at, event));
+    }
+    for items in routes.values_mut() {
+        items.sort_unstable();
+    }
+    conn.execute_cached("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1",[]).storage()?;
+    let rows=conn.prepare_cached("SELECT s.obligation_id,s.scope_id,s.scope_format,s.scope_payload,
+        s.route_kind,COALESCE(s.transport_group_id,x''),COALESCE(s.since_seconds,0),s.until_seconds,s.known_event_id,o.predicate
+        FROM account_recovery_scopes s JOIN account_recovery_obligations o ON o.id=s.obligation_id
+        WHERE s.snapshot_state=1 AND o.predicate!=2").storage()?
+        .query_map([],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,Vec<u8>>(3)?,
+            r.get::<_,i64>(4)?,r.get::<_,Vec<u8>>(5)?,r.get::<_,i64>(6)?,r.get::<_,i64>(7)?,r.get::<_,Option<Vec<u8>>>(8)?,r.get::<_,i64>(9)?)))
+        .storage()?.collect::<Result<Vec<_>,_>>().storage()?;
+    let mut affected = std::collections::BTreeSet::new();
+    for (id, scope, format, payload, kind, route, since, until, known, predicate) in rows {
+        let Some(items) = routes.get(&(kind, route)) else {
+            continue;
+        };
+        let lower = items.partition_point(|(at, _)| *at < since);
+        let upper = items.partition_point(|(at, _)| *at <= until);
+        if lower == upper
+            || (predicate == 1
+                && !items[lower..upper]
+                    .iter()
+                    .any(|(_, event)| known.as_ref() == Some(event)))
+        {
+            continue;
+        }
+        conn.execute_cached(
+            "UPDATE account_recovery_scopes SET scope_revision=scope_revision+1,scope_payload=?3
+            WHERE obligation_id=?1 AND scope_id=?2",
+            params![
+                id,
+                scope,
+                plan::invalidate_retained_scope(format, &payload)?
+            ],
         )
         .storage()?;
-    if removed != 0 {
-        conn.execute_cached(
-            "UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1", [],
-        ).storage()?;
-        for (id, scope, format, payload) in affected {
-            let invalidated = plan::invalidate_retained_scope(format, &payload)?;
-            conn.execute_cached(
-                "UPDATE account_recovery_scopes SET scope_revision=scope_revision+1,scope_payload=?3
-                 WHERE obligation_id=?1 AND scope_id=?2",params![id,scope,invalidated],
-            ).storage()?;
-        }
+        affected.insert(id);
+    }
+    for id in affected {
+        reopen_invalidated_obligation_tx(conn, &id)?;
+    }
+    Ok(count)
+}
+
+fn reopen_invalidated_obligation_tx(conn: &Connection, id: &[u8]) -> StorageResult<()> {
+    let (state, predicate) = conn
+        .query_row_cached(
+            "SELECT state,predicate FROM account_recovery_obligations WHERE id=?1",
+            [id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .storage()?;
+    if state == 1 && !plan::retained_predicate_qualifies(conn, id, predicate)? {
+        conn.execute_cached("UPDATE account_recovery_obligations SET state=0,eligibility=1,revision=revision+1 WHERE id=?1",[id]).storage()?;
     }
     Ok(())
 }
 
 /// Released receipt journals may outlive their inventory rows and contain no
-/// trustworthy route/time bound. Keep their original conservative invalidation
-/// contract, including already-qualified loss awaiting external acknowledgment.
+/// trustworthy route/time bound. Keep conservative invalidation for that case.
+/// Maintenance's observed session boundary is independent of retained inventory.
 pub(crate) fn invalidate_inventory_tx(conn: &Connection) -> StorageResult<()> {
     let rows = conn.prepare_cached(
-        "SELECT obligation_id,scope_id,scope_format,scope_payload FROM account_recovery_scopes WHERE snapshot_state=1",
+        "SELECT s.obligation_id,s.scope_id,s.scope_format,s.scope_payload FROM account_recovery_scopes s
+         JOIN account_recovery_obligations o ON o.id=s.obligation_id WHERE s.snapshot_state=1 AND o.predicate!=2",
     ).storage()?.query_map([], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?,
         row.get::<_,i64>(2)?,row.get::<_,Vec<u8>>(3)?))).storage()?
         .collect::<Result<Vec<_>,_>>().storage()?;
     conn.execute_cached("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1",[]).storage()?;
+    let mut affected = std::collections::BTreeSet::new();
     for (id, scope, format, payload) in rows {
         conn.execute_cached(
             "UPDATE account_recovery_scopes SET scope_revision=scope_revision+1,scope_payload=?3 WHERE obligation_id=?1 AND scope_id=?2",
             params![id,scope,plan::invalidate_retained_scope(format,&payload)?],
         ).storage()?;
+        affected.insert(id);
+    }
+    for id in affected {
+        reopen_invalidated_obligation_tx(conn, &id)?;
     }
     Ok(())
 }
@@ -821,7 +863,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute_batch(
-                "INSERT INTO cgka_released_transport_receipts VALUES (x'02', x'01', 7);
+                "INSERT INTO cgka_released_transport_receipts(id,group_id,epoch) VALUES (x'02', x'01', 7);
              CREATE TRIGGER fail_release_ack BEFORE DELETE ON cgka_released_transport_receipts
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )

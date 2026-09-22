@@ -221,13 +221,38 @@ pub(super) fn scopes_qualify(
     else {
         return Err(invalid_scope());
     };
+    scopes_qualify_where(conn, &obligation_id, predicate, |payload| {
+        attempt_serial.is_none_or(|serial| payload.attempt_serial == serial)
+            && payload.obligation_revision == *revision
+            && payload.loss_revision == expected.loss_revision
+            && payload.route_revision == expected.route_revision
+            && payload.inventory_revision == expected.inventory_revision
+    })
+}
+
+// Only used to re-check a previously satisfied predicate after proof removal;
+// this cannot establish new completion or bypass its captured fences.
+pub(super) fn retained_predicate_qualifies(
+    conn: &Connection,
+    id: &[u8],
+    predicate: i64,
+) -> StorageResult<bool> {
+    scopes_qualify_where(conn, id, predicate, |_| true)
+}
+
+fn scopes_qualify_where(
+    conn: &Connection,
+    obligation_id: &[u8],
+    predicate: i64,
+    valid_payload: impl Fn(&ScopePayloadV1) -> bool,
+) -> StorageResult<bool> {
     let rows = conn
         .prepare_cached(
             "SELECT snapshot_state, scope_format, scope_payload, known_event_id IS NOT NULL
                  FROM account_recovery_scopes WHERE obligation_id = ?1",
         )
         .storage()?
-        .query_map([obligation_id.as_slice()], |row| {
+        .query_map([obligation_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -247,11 +272,7 @@ pub(super) fn scopes_qualify(
             continue;
         };
         let payload = decode_scope(format, &bytes)?;
-        valid &= attempt_serial.is_none_or(|serial| payload.attempt_serial == serial)
-            && payload.obligation_revision == *revision
-            && payload.loss_revision == expected.loss_revision
-            && payload.route_revision == expected.route_revision
-            && payload.inventory_revision == expected.inventory_revision;
+        valid &= valid_payload(&payload);
         let qualified = payload_is_qualified(&payload, predicate, known_event);
         all_qualified &= qualified;
         any_qualified |= qualified;
@@ -633,6 +654,294 @@ mod tests {
     }
 
     #[test]
+    fn review_retirement_reopens_loss_and_history_without_forgiving_retry() {
+        for history in [false, true] {
+            let (store, mut fence, mut attempt, mut id) = fixture();
+            if history {
+                id = store
+                    .request_recovery(RecoveryRequest::IncrementalHistory, 2)
+                    .unwrap()
+                    .id;
+                fence = store.recovery_revision_fence().unwrap();
+                attempt = store
+                    .reserve_recovery_attempt(&fence, 20000, 30000, false)
+                    .unwrap()
+                    .unwrap()
+                    .attempt_serial;
+            }
+            let token = store
+                .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
+                .unwrap()
+                .unwrap()
+                .remove(0);
+            assert!(
+                store
+                    .checkpoint_recovery_obligation(
+                        &fence,
+                        attempt,
+                        id,
+                        &[checkpoint(&token, vec![covered("a"), covered("b")])],
+                        RecoveryEligibility::Retry
+                    )
+                    .unwrap()
+            );
+            let ticket = RecoveryDemandTicket {
+                id,
+                revision: fence
+                    .obligations
+                    .iter()
+                    .find(|(candidate, _)| *candidate == id)
+                    .unwrap()
+                    .1,
+            };
+            let retry = store.recovery_retry_state().unwrap();
+            store
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO transport_reconciliation_items VALUES(0,x'',zeroblob(32),5)",
+                )
+                .unwrap();
+            store
+                .connection
+                .with_transaction(|| {
+                    let conn = store.lock()?;
+                    delete_inventory_tx(&conn, "event_id=?1", params![[0u8; 32].as_slice()])?;
+                    Ok::<(), StorageError>(())
+                })
+                .unwrap();
+            assert!(
+                !store
+                    .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
+                    .unwrap()
+            );
+            let pending = store.pending_recovery_demands().unwrap();
+            let demand = pending
+                .iter()
+                .find(|d| d.ticket.id == id)
+                .expect("invalidated success must become selectable without restart");
+            assert!(demand.ticket.revision > ticket.revision);
+            assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        }
+    }
+
+    #[test]
+    fn review_retained_release_outside_goal_preserves_completion() {
+        use crate::storage::test_support::{sample_group, sample_message};
+        use cgka_traits::storage::{GroupStorage, MessageStorage};
+        use cgka_traits::{GroupId, MessageId};
+        for release_before_consumption in [false, true] {
+            let (store, fence, attempt, id) = fixture();
+            let token = store
+                .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
+                .unwrap()
+                .unwrap()
+                .remove(0);
+            let group = GroupId::new(vec![1]);
+            store.put_group(&sample_group(group.clone(), 1, 0)).unwrap();
+            let message = sample_message(MessageId::new(vec![0; 32]), group, 1);
+            store.put_message(&message).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO transport_reconciliation_items VALUES(0,x'',zeroblob(32),20)",
+                )
+                .unwrap();
+            if release_before_consumption {
+                store.release_message_for_replay(&message).unwrap();
+            } else {
+                store.lock().unwrap().execute_batch("INSERT INTO cgka_released_transport_receipts(id,group_id,epoch) VALUES(zeroblob(32),x'01',1)").unwrap();
+            }
+            assert_eq!(
+                store.consume_released_transport_receipts().unwrap().len(),
+                1
+            );
+            assert!(
+                store
+                    .checkpoint_recovery_obligation(
+                        &fence,
+                        attempt,
+                        id,
+                        &[checkpoint(&token, vec![covered("a"), covered("b")])],
+                        RecoveryEligibility::Retry
+                    )
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn review_retirement_preserves_alternate_known_copy_and_maintenance_boundary() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("INSERT INTO cgka_groups(id,epoch,record) VALUES(x'01',1,x'00')")
+            .unwrap();
+        let ticket = store
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: &[1],
+                    event_id: &[9; 32],
+                },
+                1,
+            )
+            .unwrap();
+        let fence = store.recovery_revision_fence().unwrap();
+        let attempt = store
+            .reserve_recovery_attempt(&fence, 1, 15000, false)
+            .unwrap()
+            .unwrap()
+            .attempt_serial;
+        let mut goals = Vec::new();
+        for route in [1u8, 2] {
+            let mut goal = plan(&["a", "b"]);
+            goal.scope_id = u64::from(route - 1);
+            goal.route_kind = 1;
+            goal.group_id = Some(vec![1]);
+            goal.transport_group_id = Some([route; 32]);
+            goal.known_event_id = Some([9; 32]);
+            goals.push(goal);
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO transport_reconciliation_items VALUES(1,?1,?2,5)",
+                    params![[route; 32].as_slice(), [9u8; 32].as_slice()],
+                )
+                .unwrap();
+        }
+        let tokens = store
+            .install_recovery_scope_plan(&fence, attempt, ticket.id, &goals)
+            .unwrap()
+            .unwrap();
+        let updates = tokens
+            .iter()
+            .map(|t| {
+                let mut c = checkpoint(t, vec![]);
+                c.retained_known_event = true;
+                c
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt,
+                    ticket.id,
+                    &updates,
+                    RecoveryEligibility::Retry
+                )
+                .unwrap()
+        );
+        for route in [1u8, 2] {
+            store
+                .connection
+                .with_transaction(|| {
+                    let conn = store.lock()?;
+                    delete_inventory_tx(&conn, "route_id=?1", params![[route; 32].as_slice()])?;
+                    Ok::<(), StorageError>(())
+                })
+                .unwrap();
+            assert_eq!(
+                store
+                    .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
+                    .unwrap(),
+                route == 1
+            );
+        }
+        let maintenance = store
+            .request_recovery(
+                RecoveryRequest::MaintenanceBoundary {
+                    group_id: &[1],
+                    job_id: &[1],
+                },
+                2,
+            )
+            .unwrap();
+        let mut fence = store.recovery_revision_fence().unwrap();
+        fence.obligations.retain(|(id, _)| *id == maintenance.id);
+        let attempt = store
+            .reserve_recovery_attempt(&fence, 20000, 30000, false)
+            .unwrap()
+            .unwrap()
+            .attempt_serial;
+        let token = store
+            .install_recovery_scope_plan(&fence, attempt, maintenance.id, &[plan(&["a", "b"])])
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        let mut boundary = covered("a");
+        boundary.outcome = RecoveryScopeOutcome::Unknown;
+        boundary.exhaustive = false;
+        boundary.admission_complete = false;
+        assert!(
+            store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt,
+                    maintenance.id,
+                    &[checkpoint(&token, vec![boundary])],
+                    RecoveryEligibility::Retry
+                )
+                .unwrap()
+        );
+        store
+            .connection
+            .with_transaction(|| {
+                let conn = store.lock()?;
+                invalidate_inventory_tx(&conn)
+            })
+            .unwrap();
+        assert!(
+            store
+                .recovery_obligation_is_satisfied(maintenance.id, maintenance.revision)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn review_live_admission_work_is_independent_of_retained_scope_count() {
+        use crate::query_work_test_support::{QUERY_MEASUREMENT, measure};
+        use crate::{TransportReconciliationItem, TransportReconciliationRoute};
+        let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+        let mut previous = None;
+        for count in [1, 1024] {
+            let (store, fence, attempt, id) = fixture();
+            store
+                .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
+                .unwrap()
+                .unwrap();
+            store.lock().unwrap().execute("WITH RECURSIVE n(x) AS(SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1)
+                INSERT INTO account_recovery_scopes(obligation_id,scope_id,route_kind,since_seconds,until_seconds,snapshot_state,scope_payload)
+                SELECT obligation_id,x,route_kind,since_seconds,until_seconds,snapshot_state,scope_payload FROM account_recovery_scopes,n WHERE scope_id=0",[count]).unwrap();
+            let item = TransportReconciliationItem {
+                event_id: [9; 32],
+                created_at: crate::unix_now_seconds(),
+            };
+            store
+                .record_transport_reconciliation_item(&TransportReconciliationRoute::Inbox, &item)
+                .unwrap();
+            let (_, steps) = measure(&store, || {
+                store
+                    .record_transport_reconciliation_item(
+                        &TransportReconciliationRoute::Inbox,
+                        &item,
+                    )
+                    .unwrap()
+            });
+            if let Some(old) = previous {
+                assert_eq!(
+                    steps, old,
+                    "live admission must not scan retained recovery scopes"
+                );
+            }
+            previous = Some(steps);
+        }
+    }
+
+    #[test]
     fn review_plan_install_rejects_unresolved_scope_left_behind() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let ticket = store
@@ -935,7 +1244,7 @@ mod tests {
                 .unwrap()
                 .execute_batch(
                     "INSERT INTO cgka_groups(id,epoch,record) VALUES (x'01',1,x'00');
-                INSERT INTO cgka_released_transport_receipts VALUES (zeroblob(32),x'01',1)",
+                INSERT INTO cgka_released_transport_receipts(id,group_id,epoch) VALUES (zeroblob(32),x'01',1)",
                 )
                 .unwrap();
             assert_eq!(

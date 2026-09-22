@@ -43,7 +43,8 @@ are insufficient. Known-event retention and the limited first maintenance bounda
 separate predicates. A stale scope token rejects a multi-scope checkpoint before any
 progress is written. Domain updates may share the same `with_transaction` boundary.
 
-Migration 0093 adds the current route-policy snapshot and a unique explicit-history row.
+Migration 0093 adds the current route-policy snapshot, a unique explicit-history row,
+and a receipt-journal flag recording whether inventory invalidation already ran.
 It preserves populated obligations, loss evidence, retry state, receipts, maintenance,
 inventory and cursors. Repeated serialized callers reuse the row without resetting retry;
 a stale detach cannot clear the current caller's urgency. Unexpected duplicate explicit
@@ -64,8 +65,13 @@ account inventory revision in the same transaction; reservations and plan instal
 check that revision. Installed proof is invalidated only for overlapping route/window
 scopes (and the exact event for known-event predicates). Unrelated or out-of-window
 retention churn cannot invalidate bounded completion or loss acknowledgment, including
-when a productive admission triggers compaction. Receipt-journal consumption keeps a
-conservative all-scope invalidation because its route/time may no longer be available.
+when a productive admission triggers compaction. Removing the last qualified proof
+reopens satisfied demand in the same transaction without forgiving account retry cost;
+an alternative known-event copy or independent maintenance boundary remains valid.
+Receipt release records scoped invalidation before deleting inventory. Consumption
+uses conservative invalidation only if neither inventory bounds nor that durable flag
+exist (including journal rows migrated from older schemas). No-op admission never
+scans recovery scopes.
 Idempotent deletes do not invalidate proof. `retained_recovery_event` checks exact route, event and frozen
 window membership after the caller synchronizes release receipts; it does not certify
 successful decryption or engine readiness.
@@ -77,7 +83,12 @@ reclamation under [the recovery design](../../docs/marmot-architecture/further-c
 That integration, runtime cancellation-by-drop, policy/stagnation migration 0094 and
 SDK/acquisition changes are outside this slice. Old binaries refuse the upgraded schema;
 binary downgrade requires a pre-upgrade backup. Storage tests do not claim that the
-current production executor can supply exhaustive coverage.
+current production executor can supply exhaustive coverage. Completed known-event
+rows require owner-managed reclamation after no ticket/grant can reference them;
+this bounded-lifetime gate must be demonstrated before activation. An unbounded
+`since = None` includes older retained input, so its retirement must invalidate proof.
+The owner must use finite automatic goals and preserve uncovered older-history debt;
+it must not silently clip an explicit full-history request to the retention floor.
 
 ## Replay-state validation
 

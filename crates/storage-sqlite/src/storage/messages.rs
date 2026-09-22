@@ -79,8 +79,11 @@ impl SqliteAccountStorage {
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?;
+            let mut unknown_bounds = false;
             for id in &ids {
-                retire_transport_receipts(&conn, &MessageId::new(id.clone()))?;
+                let invalidated:bool=conn.query_row_cached("SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",[id],|r|r.get(0)).storage()?;
+                let removed = retire_transport_receipts(&conn, &MessageId::new(id.clone()))?;
+                unknown_bounds |= removed == 0 && !invalidated;
             }
             let groups = conn.prepare_cached(
                 "SELECT group_id, MAX(epoch) FROM cgka_released_transport_receipts GROUP BY group_id",
@@ -94,7 +97,9 @@ impl SqliteAccountStorage {
                     unix_now_seconds_i64(),
                 )?;
             }
-            crate::account_recovery::invalidate_inventory_tx(&conn)?;
+            if unknown_bounds {
+                crate::account_recovery::invalidate_inventory_tx(&conn)?;
+            }
             conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
                 .storage()?;
             Ok(ids.into_iter().map(MessageId::new).collect())
@@ -305,7 +310,14 @@ impl MessageStorage for SqliteAccountStorage {
                     "released transport receipt journal is full".into(),
                 ));
             }
-            retire_transport_receipts(&conn, &record.id)?;
+            if retire_transport_receipts(&conn, &record.id)? == 0 {
+                crate::account_recovery::invalidate_inventory_tx(&conn)?;
+            }
+            conn.execute_cached(
+                "UPDATE cgka_released_transport_receipts SET inventory_invalidated=1 WHERE id=?1",
+                [record.id.as_slice()],
+            )
+            .storage()?;
             delete_message_on_connection(&conn, &record.id)
         };
         if self.connection.is_current_thread_transaction_owner() {
@@ -1059,14 +1071,13 @@ fn update_message_state_on_connection(
     Ok(())
 }
 
-fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
+fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<usize> {
     conn.execute_cached(
         "DELETE FROM seen_events WHERE event_id = ?1",
         params![hex::encode(id.as_slice())],
     )
     .storage()?;
-    crate::account_recovery::delete_inventory_tx(conn, "event_id = ?1", params![id.as_slice()])?;
-    Ok(())
+    crate::account_recovery::delete_inventory_tx(conn, "event_id = ?1", params![id.as_slice()])
 }
 
 /// Delete a protocol message and its not-yet-acknowledged application event on
