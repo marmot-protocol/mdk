@@ -1112,6 +1112,11 @@ mod tests {
             recovery_completion_rows(&conn, "account_recovery_state"),
             retry_before
         );
+        assert!(
+            conn.prepare("SELECT inventory_invalidated FROM cgka_released_transport_receipts")
+                .is_err(),
+            "interrupted migration must roll back the journal column too"
+        );
         for (table, expected) in preserved.iter().zip(&before) {
             assert_eq!(
                 &recovery_completion_rows(&conn, table),
@@ -1128,9 +1133,16 @@ mod tests {
         let mut conn = keyed_connection(&path);
         assert_eq!(run_all(&mut conn).unwrap(), 0);
         for (table, expected) in preserved.iter().zip(&before) {
+            let mut upgraded = expected.clone();
+            if *table == "cgka_released_transport_receipts" {
+                // Existing journals have no proof that invalidation ran.
+                for row in &mut upgraded {
+                    row.push(rusqlite::types::Value::Integer(0));
+                }
+            }
             assert_eq!(
                 &recovery_completion_rows(&conn, table),
-                expected,
+                &upgraded,
                 "{table} changed after reopen"
             );
         }
@@ -1214,9 +1226,16 @@ mod tests {
         let before: Vec<_> = preserved.iter().map(|table| rows(&conn, table)).collect();
         run_all(&mut conn).unwrap();
         for (table, expected) in preserved.iter().zip(&before) {
+            let mut upgraded = expected.clone();
+            if *table == "cgka_released_transport_receipts" {
+                // Existing journals have no proof that invalidation ran.
+                for row in &mut upgraded {
+                    row.push(rusqlite::types::Value::Integer(0));
+                }
+            }
             assert_eq!(
                 &rows(&conn, table),
-                expected,
+                &upgraded,
                 "{table} changed during migration"
             );
         }

@@ -310,7 +310,11 @@ impl MessageStorage for SqliteAccountStorage {
                     "released transport receipt journal is full".into(),
                 ));
             }
-            if retire_transport_receipts(&conn, &record.id)? == 0 {
+            let invalidated: bool = conn.query_row_cached(
+                "SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",
+                [record.id.as_slice()], |row| row.get(0),
+            ).storage()?;
+            if retire_transport_receipts(&conn, &record.id)? == 0 && !invalidated {
                 crate::account_recovery::invalidate_inventory_tx(&conn)?;
             }
             conn.execute_cached(
