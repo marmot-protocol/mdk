@@ -620,3 +620,32 @@ The node/tracing correction passed **9/9 focused tests**, no retries, including
 both failed process journeys and all four tracing audits. Log:
 `/tmp/mdk-1946-ci-owner/node-repair-focused.log`. Full final PR-CI simulator and
 repository gates are rerun on the signed successor before publication.
+
+### Final simulator CI correction verification
+
+All follow-up gates passed on signed source checkpoint `5b322e9904560721c4887c91cea01b397ea1f7bf`:
+
+- **simulator-all-pr-ci**: passed. Summary [ 549.237s] 509 tests run: 509 passed (2 slow), 42 skipped
+- **focused-convergence-regressions**: all five exact-selector commands passed (five tests).
+- **app-repair-compatibility**: passed. Summary [  21.957s] 58 tests run: 58 passed, 1697 skipped
+- **simulator-doc-tests**: command passed; no doctest cases are present.
+- **fast-ci**: passed. Complete formatting/static/documentation gates, workspace check and clippy for normal/diagnostic features, and release policy tests.
+
+The simulator selection is the union of every PR-CI smoke, offline-history,
+process and model lane, with repository exclusions unchanged, four test threads,
+and no retries. This covers the previously omitted app/process journeys, both
+1024-message offline-history cases, the node adapter, and the repository tracing
+audit. The corrected convergence recipe executes every exact selector; no empty
+selector is allowed. All 87 replacement-map entries resolve to existing tests,
+including the macro-generated interaction journey.
+
+The earlier 2,886-test affected-crate result remains pinned to `e5fa3221`; it does
+not silently move to this new source revision. This correction uses the complete
+PR-CI simulator selection plus affected app repair/error/owner compatibility and
+repository gates. Exact commands, revisions, UTC timestamps and exit codes are in
+`/tmp/mdk-1946-ci-owner/simulator-fix-1rrhgsoc/results.json` with adjacent logs.
+The verification runner was interrupted while compiling the app compatibility
+stage; it resumed on the same clean head, retaining completed stage logs and
+rerunning that unfinished stage before continuing. Dependency heads and the
+preserved original WIP are unchanged. The publication
+commit adds this evidence only; new-head remote CI is reported separately.
