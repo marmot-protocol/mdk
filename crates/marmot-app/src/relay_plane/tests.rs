@@ -1824,6 +1824,193 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
     relay_plane.shutdown().await;
 }
 
+async fn directory_live_auth_challenge(deny_read: bool) {
+    use futures::{SinkExt, StreamExt};
+    use nostr::prelude::{EventBuilder, Keys};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    let keys = Keys::generate();
+    let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"jack"}"#)
+        .sign_with_keys(&keys)
+        .unwrap();
+    let expected_id = profile.id.to_hex();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let auth_responses = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let requests = requests.clone();
+        let auth_responses = auth_responses.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if request[0] == "AUTH" {
+                    auth_responses.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                if request[0] != "REQ" {
+                    continue;
+                }
+                requests.fetch_add(1, Ordering::SeqCst);
+                let subscription = request[1].as_str().unwrap();
+                socket
+                    .send(Message::Text(r#"["AUTH","optional-challenge"]"#.into()))
+                    .await
+                    .unwrap();
+                let reply = if deny_read {
+                    serde_json::json!([
+                        "CLOSED",
+                        subscription,
+                        "auth-required: read requires login"
+                    ])
+                } else {
+                    serde_json::json!(["EVENT", subscription, profile])
+                };
+                socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .unwrap();
+                if !deny_read {
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!(["EOSE", subscription]).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+    };
+
+    let relay_plane = MarmotRelayPlane::full_history_with_loopback(true);
+    let mut events = relay_plane.subscribe_directory_events();
+    relay_plane
+        .sync_directory_user_subscriptions(
+            DirectorySyncPlan {
+                endpoints: vec![endpoint],
+                watched_user_count: 1,
+                batches: vec![DirectorySyncBatch {
+                    subscription_id: "directory_users_auth".to_owned(),
+                    authors: vec![keys.public_key().to_hex()],
+                    kinds: vec![0],
+                    since: None,
+                }],
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+    if deny_read {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = relay_plane.inner.directory.stats().await;
+                if stats.auth_required_routes == 1 && stats.active_subscriptions == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("auth-required CLOSE must remove healthy directory coverage");
+        assert!(
+            timeout(Duration::from_millis(200), events.recv())
+                .await
+                .is_err(),
+            "auth-required must not trigger a rebuild loop"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    } else {
+        let record = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let DirectoryRelayPlaneEvent::Record(record) = record else {
+            panic!("optional AUTH must not trigger a recovery rebuild");
+        };
+        assert_eq!(record.event.id, expected_id);
+        let stats = relay_plane.inner.directory.stats().await;
+        assert_eq!(stats.auth_required_routes, 0);
+        assert_eq!(stats.active_subscriptions, 1);
+    }
+    assert_eq!(auth_responses.load(Ordering::SeqCst), 0);
+    relay_plane.shutdown().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn anonymous_live_directory_auth_required_is_visible_without_retry_loop() {
+    directory_live_auth_challenge(true).await;
+}
+
+#[tokio::test]
+async fn anonymous_live_directory_accepts_event_after_optional_auth() {
+    directory_live_auth_challenge(false).await;
+}
+
+#[tokio::test]
+async fn directory_notification_lag_requests_refresh() {
+    let source: Arc<dyn RelayNotificationSource> = Arc::new(TestNotificationSource::lag_once());
+    let (sender, mut receiver) = broadcast::channel(4);
+    let directory = DirectoryRelayPlane::new(Arc::new(RecordingDirectoryFetcher::default()));
+    let task = spawn_directory_notification_forwarder(source, sender, directory);
+    assert!(matches!(
+        timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        DirectoryRelayPlaneEvent::RecoveryRequired
+    ));
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn directory_auth_required_blocks_only_the_rejecting_endpoint() {
+    let author = "11".repeat(32);
+    let id = "directory_users_shared";
+    let directory =
+        directory_plane_with_active_subscription(id, vec![author.clone()], vec![0]).await;
+    let blocked = RelayUrl::parse("wss://blocked.example").unwrap();
+    let healthy = RelayUrl::parse("wss://healthy.example").unwrap();
+    assert!(
+        directory
+            .set_subscription_endpoints(&[blocked.clone(), healthy.clone()])
+            .await
+    );
+    assert!(
+        !directory
+            .set_subscription_endpoints(&[blocked.clone(), healthy.clone()])
+            .await
+    );
+    assert!(directory.mark_auth_required(id, blocked.as_str()).await);
+    assert!(
+        !directory
+            .accepts_live_event_from(id, blocked.as_str(), &author, 0)
+            .await
+    );
+    assert!(
+        directory
+            .accepts_live_event_from(id, healthy.as_str(), &author, 0)
+            .await
+    );
+    let stats = directory.stats().await;
+    assert_eq!(stats.auth_required_routes, 1);
+    assert_eq!(stats.active_subscriptions, 1);
+
+    assert!(directory.mark_auth_required(id, healthy.as_str()).await);
+    let stats = directory.stats().await;
+    assert_eq!(stats.auth_required_routes, 2);
+    assert_eq!(stats.active_subscriptions, 0);
+}
+
 #[tokio::test]
 async fn directory_live_event_matching_active_subscription_is_accepted() {
     let author = "11".repeat(32);

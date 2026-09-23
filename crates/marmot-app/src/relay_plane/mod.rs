@@ -636,6 +636,8 @@ pub struct RelayPlaneHealth {
     pub account_delivery_recovery_elapsed_ms: u64,
     pub directory_inflight_fetches: usize,
     pub directory_active_subscriptions: usize,
+    #[serde(default)]
+    pub directory_auth_required_routes: usize,
     pub directory_completed_fetches: usize,
     pub directory_coalesced_waiters: usize,
     pub directory_failed_fetches: usize,
@@ -724,7 +726,7 @@ impl MarmotRelayPlane {
             adapter,
             Some(relay_client),
             Some(directory_client.clone()),
-            Arc::new(NostrSdkDirectoryRelayFetcher::new(directory_client)),
+            Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
             allow_loopback,
         )
     }
@@ -1151,6 +1153,11 @@ impl MarmotRelayPlane {
             .map_err(|_| "directory subscription connect relay timed out".to_owned())?
             .map_err(|_| "directory subscription connect relay failed".to_owned())?;
         }
+        let endpoints_changed = self
+            .inner
+            .directory
+            .set_subscription_endpoints(&relay_urls)
+            .await;
 
         let desired_ids = plan
             .batches
@@ -1158,13 +1165,20 @@ impl MarmotRelayPlane {
             .map(|batch| batch.subscription_id.clone())
             .collect::<HashSet<_>>();
         let (mut to_add, to_remove) = self.inner.directory.subscription_diff(&desired_ids).await;
-        if force_rebuild {
+        if force_rebuild || endpoints_changed {
             to_add = desired_ids;
         }
         for subscription_id in &to_remove {
             directory_client
                 .unsubscribe(&SubscriptionId::new(subscription_id.clone()))
                 .await;
+        }
+        if endpoints_changed {
+            for subscription_id in &to_add {
+                directory_client
+                    .unsubscribe(&SubscriptionId::new(subscription_id.clone()))
+                    .await;
+            }
         }
         // The validation filter persisted for every batch (added or already
         // active) is keyed on the same canonical-hex authors and kinds the SDK
@@ -1197,6 +1211,10 @@ impl MarmotRelayPlane {
             if !to_add.contains(&batch.subscription_id) {
                 continue;
             }
+            self.inner
+                .directory
+                .clear_auth_required(&batch.subscription_id)
+                .await;
             let mut filter = Filter::new()
                 .authors(authors)
                 .kinds(kinds)
@@ -1204,7 +1222,12 @@ impl MarmotRelayPlane {
             if let Some(since) = batch.since {
                 filter = filter.since(NostrTimestamp::from_secs(since));
             }
-            directory_client
+            let previous = self
+                .inner
+                .directory
+                .record_subscription_filter(batch.subscription_id.clone(), validation_filter)
+                .await;
+            if let Err(err) = directory_client
                 .subscribe_with_id_to(
                     relay_urls.clone(),
                     SubscriptionId::new(batch.subscription_id.clone()),
@@ -1212,13 +1235,14 @@ impl MarmotRelayPlane {
                     None,
                 )
                 .await
-                .map_err(|err| format!("directory subscription subscribe: {err}"))?;
-            subscriptions_created += usize::from(
+            {
                 self.inner
                     .directory
-                    .record_subscription_filter(batch.subscription_id.clone(), validation_filter)
-                    .await,
-            );
+                    .restore_failed_subscription_filter(&batch.subscription_id, previous)
+                    .await;
+                return Err(format!("directory subscription subscribe: {err}"));
+            }
+            subscriptions_created += usize::from(previous.is_none());
         }
 
         self.inner
@@ -1337,7 +1361,9 @@ impl MarmotRelayPlane {
                     .send(DirectoryRelayPlaneEvent::RecoveryRequired);
             }
             *forwarder = Some(spawn_directory_notification_forwarder(
-                client.clone(),
+                Arc::new(SdkRelayNotificationSource {
+                    client: client.clone(),
+                }),
                 self.inner.transport.directory_events.clone(),
                 self.inner.directory.clone(),
             ));
@@ -1505,6 +1531,7 @@ impl RelayPlaneHealth {
             account_delivery_recovery_elapsed_ms: account_delivery.recovery_elapsed_ms,
             directory_inflight_fetches: directory.inflight_fetches,
             directory_active_subscriptions: directory.active_subscriptions,
+            directory_auth_required_routes: directory.auth_required_routes,
             directory_completed_fetches: directory.completed_fetches,
             directory_coalesced_waiters: directory.coalesced_waiters,
             directory_failed_fetches: directory.failed_fetches,
@@ -1528,6 +1555,7 @@ impl RelayPlaneHealth {
             account_delivery_recovery_elapsed_ms: account_delivery.recovery_elapsed_ms,
             directory_inflight_fetches: directory.inflight_fetches,
             directory_active_subscriptions: directory.active_subscriptions,
+            directory_auth_required_routes: directory.auth_required_routes,
             directory_completed_fetches: directory.completed_fetches,
             directory_coalesced_waiters: directory.coalesced_waiters,
             directory_failed_fetches: directory.failed_fetches,
@@ -1630,13 +1658,12 @@ fn spawn_relay_notification_forwarder(
 /// receiver. A gap here invalidates directory coverage without interrupting
 /// an account's live delivery or attributing the loss to an account.
 fn spawn_directory_notification_forwarder(
-    client: NostrSdkClient,
+    source: Arc<dyn RelayNotificationSource>,
     events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     directory: DirectoryRelayPlane,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut receiver = client.notifications();
-        let mut restart_backoff = RelayNotificationRestartBackoff::default();
+        let mut receiver = source.notifications();
         loop {
             match receiver.recv().await {
                 Ok(RelayPoolNotification::Event {
@@ -1647,7 +1674,12 @@ fn spawn_directory_notification_forwarder(
                     let subscription_id = subscription_id.to_string();
                     if let Ok(event) = NostrTransportEvent::from_nostr_event(&event)
                         && directory
-                            .accepts_live_event(&subscription_id, &event.pubkey, event.kind)
+                            .accepts_live_event_from(
+                                &subscription_id,
+                                relay_url.as_str(),
+                                &event.pubkey,
+                                event.kind,
+                            )
                             .await
                     {
                         let _ = events.send(DirectoryRelayPlaneEvent::Record(
@@ -1656,6 +1688,27 @@ fn spawn_directory_notification_forwarder(
                                 event,
                             },
                         ));
+                    }
+                }
+                Ok(RelayPoolNotification::Message {
+                    relay_url,
+                    message:
+                        RelayMessage::Closed {
+                            subscription_id,
+                            message,
+                        },
+                }) if message.starts_with("auth-required:") => {
+                    if directory
+                        .mark_auth_required(subscription_id.as_str(), relay_url.as_str())
+                        .await
+                    {
+                        let count = directory.stats().await.auth_required_routes;
+                        tracing::warn!(
+                            target: "marmot_app::relay_plane",
+                            method = "spawn_directory_notification_forwarder",
+                            auth_required_routes = count,
+                            "anonymous directory request requires authentication",
+                        );
                     }
                 }
                 Ok(RelayPoolNotification::Shutdown) => break,
@@ -1670,12 +1723,7 @@ fn spawn_directory_notification_forwarder(
                     let _ = events.send(DirectoryRelayPlaneEvent::RecoveryRequired);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    if client.pool().is_shutdown() {
-                        break;
-                    }
-                    let _ = events.send(DirectoryRelayPlaneEvent::RecoveryRequired);
-                    tokio::time::sleep(restart_backoff.delay_after_failure(Duration::ZERO)).await;
-                    receiver = client.notifications();
+                    break;
                 }
             }
         }

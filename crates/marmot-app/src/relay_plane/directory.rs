@@ -101,6 +101,8 @@ struct DirectoryRelayPlaneState {
     inflight_completion:
         HashMap<DirectoryFetchKey, Vec<oneshot::Sender<DirectoryCompletionResult>>>,
     active_subscriptions: HashMap<String, DirectorySubscriptionFilter>,
+    active_endpoints: HashSet<String>,
+    auth_required: HashSet<(String, String)>,
     completed_fetches: usize,
     coalesced_waiters: usize,
     failed_fetches: usize,
@@ -113,6 +115,7 @@ struct DirectoryRelayPlaneState {
 pub(crate) struct DirectoryRelayStats {
     pub(crate) inflight_fetches: usize,
     pub(crate) active_subscriptions: usize,
+    pub(crate) auth_required_routes: usize,
     pub(crate) completed_fetches: usize,
     pub(crate) coalesced_waiters: usize,
     pub(crate) failed_fetches: usize,
@@ -348,7 +351,18 @@ impl DirectoryRelayPlane {
         let state = self.state.lock().await;
         DirectoryRelayStats {
             inflight_fetches: state.inflight.len() + state.inflight_completion.len(),
-            active_subscriptions: state.active_subscriptions.len(),
+            active_subscriptions: state
+                .active_subscriptions
+                .keys()
+                .filter(|id| {
+                    state.active_endpoints.iter().any(|endpoint| {
+                        !state
+                            .auth_required
+                            .contains(&((*id).clone(), endpoint.clone()))
+                    })
+                })
+                .count(),
+            auth_required_routes: state.auth_required.len(),
             completed_fetches: state.completed_fetches,
             coalesced_waiters: state.coalesced_waiters,
             failed_fetches: state.failed_fetches,
@@ -379,23 +393,67 @@ impl DirectoryRelayPlane {
         (to_add, to_remove)
     }
 
-    /// Record the validation filter immediately after its SDK subscription is
-    /// created, so a later batch failure cannot leave that live subscription
-    /// unknown to [`Self::accepts_live_event`].
+    pub(crate) async fn set_subscription_endpoints(&self, endpoints: &[RelayUrl]) -> bool {
+        let mut state = self.state.lock().await;
+        let next = endpoints.iter().map(ToString::to_string).collect();
+        let changed = !state.active_subscriptions.is_empty() && state.active_endpoints != next;
+        state.active_endpoints = next;
+        let active_endpoints = state.active_endpoints.clone();
+        state
+            .auth_required
+            .retain(|(_, endpoint)| active_endpoints.contains(endpoint));
+        changed
+    }
+
+    pub(crate) async fn clear_auth_required(&self, subscription_id: &str) {
+        self.state
+            .lock()
+            .await
+            .auth_required
+            .retain(|(id, _)| id != subscription_id);
+    }
+
+    pub(crate) async fn mark_auth_required(&self, subscription_id: &str, endpoint: &str) -> bool {
+        let mut state = self.state.lock().await;
+        if !state.active_endpoints.contains(endpoint)
+            || !state.active_subscriptions.contains_key(subscription_id)
+        {
+            return false;
+        }
+        state
+            .auth_required
+            .insert((subscription_id.to_owned(), endpoint.to_owned()))
+    }
+
+    /// Record the validation filter before issuing the SDK subscription so an
+    /// immediate EVENT cannot race ahead of local admission. A failed subscribe
+    /// restores the previous filter or removes a newly created one.
     pub(crate) async fn record_subscription_filter(
         &self,
         subscription_id: String,
         filter: DirectorySubscriptionFilter,
-    ) -> bool {
+    ) -> Option<DirectorySubscriptionFilter> {
         let mut state = self.state.lock().await;
-        let created = state
-            .active_subscriptions
-            .insert(subscription_id, filter)
-            .is_none();
-        if created {
+        let previous = state.active_subscriptions.insert(subscription_id, filter);
+        if previous.is_none() {
             state.subscriptions_created += 1;
         }
-        created
+        previous
+    }
+
+    pub(crate) async fn restore_failed_subscription_filter(
+        &self,
+        subscription_id: &str,
+        previous: Option<DirectorySubscriptionFilter>,
+    ) {
+        let mut state = self.state.lock().await;
+        if let Some(previous) = previous {
+            state
+                .active_subscriptions
+                .insert(subscription_id.to_owned(), previous);
+        } else if state.active_subscriptions.remove(subscription_id).is_some() {
+            state.subscriptions_created -= 1;
+        }
     }
 
     /// Complete a subscription sync whose newly created filters were already
@@ -414,6 +472,14 @@ impl DirectoryRelayPlane {
         state.completed_subscription_syncs += 1;
         state.subscriptions_removed += removed;
         state.active_subscriptions = desired;
+        let active_ids = state
+            .active_subscriptions
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        state
+            .auth_required
+            .retain(|(id, _)| active_ids.contains(id));
         Ok(DirectorySubscriptionSyncSummary {
             active_subscriptions: state.active_subscriptions.len(),
             subscriptions_created,
@@ -445,6 +511,14 @@ impl DirectoryRelayPlane {
         state.subscriptions_created += created;
         state.subscriptions_removed += removed;
         state.active_subscriptions = desired;
+        let active_ids = state
+            .active_subscriptions
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        state
+            .auth_required
+            .retain(|(id, _)| active_ids.contains(id));
         Ok(DirectorySubscriptionSyncSummary {
             active_subscriptions: state.active_subscriptions.len(),
             subscriptions_created: created,
@@ -462,17 +536,37 @@ impl DirectoryRelayPlane {
     /// rejected so a malicious or buggy relay cannot inject unsolicited
     /// directory-shaped events into the persistent search graph
     /// (mdk#709).
+    #[cfg(test)]
     pub(crate) async fn accepts_live_event(
         &self,
         subscription_id: &str,
         author: &str,
         kind: u64,
     ) -> bool {
-        let state = self.state.lock().await;
-        state
+        self.state
+            .lock()
+            .await
             .active_subscriptions
             .get(subscription_id)
             .is_some_and(|filter| filter.accepts(author, kind))
+    }
+
+    pub(crate) async fn accepts_live_event_from(
+        &self,
+        subscription_id: &str,
+        endpoint: &str,
+        author: &str,
+        kind: u64,
+    ) -> bool {
+        let state = self.state.lock().await;
+        state.active_endpoints.contains(endpoint)
+            && !state
+                .auth_required
+                .contains(&(subscription_id.to_owned(), endpoint.to_owned()))
+            && state
+                .active_subscriptions
+                .get(subscription_id)
+                .is_some_and(|filter| filter.accepts(author, kind))
     }
 }
 
