@@ -1733,6 +1733,15 @@ impl MarmotApp {
             recovery_policy,
         )?;
         recovery_owner.select_executor_mode(self.config.recovery_executor_mode);
+        if relay_plane
+            .subscription_rebuild_since(open.state.last_transport_timestamp)
+            .is_none()
+        {
+            self.account_storage(&open.state.label)?.request_recovery(
+                storage_sqlite::RecoveryRequest::IncrementalHistory,
+                client::recovery::wall_now_ms()?,
+            )?;
+        }
         let mut client = AppClient {
             recovery_owner,
             conversation_captures: Vec::new(),

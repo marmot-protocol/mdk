@@ -130,3 +130,9 @@ and superseded checks, and the remaining blocking acquisition limitations.
   reproduced the erroneous permanent epoch wait, then proved that three later
   capped windows select only epoch input, reopen preserves cost/quiescence,
   duplicate loss cannot rearm, and new loss rearms without bypassing cooldown.
+- Live route compensation: the existing regression reproduced a new demand
+  write preventing subscription restoration after a storage-delete failure.
+  Missing-cursor demand now joins once at owner construction; live-tail bounds
+  perform no storage mutation. The unchanged compensation regression passes,
+  as do all 16 owner tests with policy overrides. This preserves the primary
+  storage error and the attempted compensating route restoration.

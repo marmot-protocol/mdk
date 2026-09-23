@@ -924,15 +924,9 @@ impl AppClient {
         if since.is_some() {
             return Ok(since);
         }
-        // Missing/untrusted cursors and an explicitly unfloored legacy plane
-        // describe history demand. Registration still restores a bounded live
-        // tail immediately; only the recovery owner may launch that history.
-        self.app
-            .account_storage(&self.state.label)?
-            .request_recovery(
-                storage_sqlite::RecoveryRequest::IncrementalHistory,
-                unix_now_seconds().saturating_mul(1000),
-            )?;
+        // Owner construction joins missing-cursor history before exposing the
+        // client. Restoring a live tail must remain possible during storage
+        // compensation and never perform another demand write or acquisition.
         let lookback = self
             .relay_plane
             .subscription_rebuild_lookback_secs()
