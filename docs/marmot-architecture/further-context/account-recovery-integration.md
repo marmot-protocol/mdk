@@ -119,3 +119,14 @@ and superseded checks, and the remaining blocking acquisition limitations.
   inventory, not final acceptance evidence. It includes old EOSE-completion test
   expectations, cursor/overflow cases and worker lifecycle failures that still
   require diagnosis; they are not all classified as assertion updates.
+- Cause-aware outcomes: EOSE is Unknown coverage, not proof of unsupported
+  missing-epoch acquisition. Epoch and known-event debt keep capped retries;
+  queue/notification/explicit/incremental history retain debt in needs-deep-repair
+  after their bounded investigation ends without proof. The existing drain quantum
+  is the automatic investigation budget; it creates no new scheduling loop.
+  Transient unavailability remains retryable, proven unsupported/excluded capability
+  is distinct, and admission refusal waits for local relief/owner-paced probing.
+  Sixteen owner tests pass with policy overrides. The runtime regression first
+  reproduced the erroneous permanent epoch wait, then proved that three later
+  capped windows select only epoch input, reopen preserves cost/quiescence,
+  duplicate loss cannot rearm, and new loss rearms without bypassing cooldown.

@@ -3888,37 +3888,38 @@ impl AppClient {
             storage.synchronize_account_delivery_loss(&self.state.label)?;
             drop(self.transport_receipts()?);
             self.observe_recovery_route_policy()?;
-            // SDK 0.44's aggregate reconciliation result cannot establish an
-            // exhaustive bounded comparison. EOSE ends a session, not history
-            // debt. Keep an explicit capability wait after that investigation.
-            let (outcome, eligibility) = match verdict {
-                DrainVerdict::Complete => (
-                    storage_sqlite::RecoveryScopeOutcome::Unknown,
-                    storage_sqlite::RecoveryEligibility::WaitingCapability,
-                ),
-                DrainVerdict::Overflow => (
-                    storage_sqlite::RecoveryScopeOutcome::LossInvalidated,
-                    storage_sqlite::RecoveryEligibility::Retry,
-                ),
-                DrainVerdict::RepairCancelled => (
-                    storage_sqlite::RecoveryScopeOutcome::Cancelled,
-                    storage_sqlite::RecoveryEligibility::Retry,
-                ),
-                DrainVerdict::RepairDeadline => (
-                    storage_sqlite::RecoveryScopeOutcome::BudgetExhausted,
-                    storage_sqlite::RecoveryEligibility::NeedsDeepRepair,
-                ),
-                _ => (
-                    storage_sqlite::RecoveryScopeOutcome::Partial,
-                    storage_sqlite::RecoveryEligibility::Retry,
-                ),
-            };
-            let eligibility = if counts.refused > 0 {
-                storage_sqlite::RecoveryEligibility::WaitingCapacity
-            } else {
-                eligibility
+            // The current SDK's aggregate comparison is not a per-endpoint
+            // exhaustiveness/admission certificate. Keep Unknown distinct from
+            // Unsupported; eligibility also depends on the cause and whether
+            // this bounded investigation actually ended.
+            let outcome = match verdict {
+                DrainVerdict::Complete | DrainVerdict::CoverageUnproven => {
+                    storage_sqlite::RecoveryScopeOutcome::Unknown
+                }
+                DrainVerdict::Overflow => storage_sqlite::RecoveryScopeOutcome::LossInvalidated,
+                DrainVerdict::RepairCancelled => storage_sqlite::RecoveryScopeOutcome::Cancelled,
+                DrainVerdict::RepairDeadline
+                | DrainVerdict::NovelProgressQuantumYield
+                | DrainVerdict::NoProgressQuantumYield => {
+                    storage_sqlite::RecoveryScopeOutcome::BudgetExhausted
+                }
+                DrainVerdict::NoRelayEose | DrainVerdict::EoseTimeout => {
+                    storage_sqlite::RecoveryScopeOutcome::Unavailable
+                }
             };
             for obligation in grant.plan().expect("validated executor grant") {
+                let eligibility = super::recovery::eligibility_after_observation(
+                    obligation.cause,
+                    outcome,
+                    matches!(
+                        verdict,
+                        DrainVerdict::Complete
+                            | DrainVerdict::RepairDeadline
+                            | DrainVerdict::NovelProgressQuantumYield
+                            | DrainVerdict::NoProgressQuantumYield
+                    ),
+                    counts.refused > 0,
+                );
                 let checkpoints = obligation
                     .scopes
                     .iter()
@@ -3947,7 +3948,12 @@ impl AppClient {
                                     .iter()
                                     .map(|endpoint| storage_sqlite::RecoveryEndpointCheckpoint {
                                         endpoint: endpoint.clone(),
-                                        outcome,
+                                        outcome: if scope.goal.admitted_endpoints.contains(endpoint)
+                                        {
+                                            outcome
+                                        } else {
+                                            storage_sqlite::RecoveryScopeOutcome::Excluded
+                                        },
                                         exhaustive: false,
                                         admission_complete: false,
                                         first_boundary: false,

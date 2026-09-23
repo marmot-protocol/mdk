@@ -91,6 +91,39 @@ impl Drop for RecoveryLossAttemptGuard {
     }
 }
 
+/// An acquisition observation changes eligibility, never the completion predicate.
+/// Unknown history gets one bounded investigation per qualified demand revision;
+/// missing epoch/event input remains useful to retry unless incapability is known.
+pub(super) fn eligibility_after_observation(
+    cause: storage_sqlite::RecoveryCause,
+    outcome: storage_sqlite::RecoveryScopeOutcome,
+    investigation_ended: bool,
+    admission_refused: bool,
+) -> storage_sqlite::RecoveryEligibility {
+    use storage_sqlite::{
+        RecoveryCause as Cause, RecoveryEligibility as Eligibility, RecoveryScopeOutcome as Outcome,
+    };
+    if admission_refused {
+        return Eligibility::WaitingCapacity;
+    }
+    match outcome {
+        Outcome::Unsupported | Outcome::Excluded => Eligibility::WaitingCapability,
+        Outcome::Unknown | Outcome::BudgetExhausted
+            if investigation_ended
+                && matches!(
+                    cause,
+                    Cause::QueueLoss
+                        | Cause::NotificationLoss
+                        | Cause::ExplicitHistory
+                        | Cause::IncrementalHistory
+                ) =>
+        {
+            Eligibility::NeedsDeepRepair
+        }
+        _ => Eligibility::Retry,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RecoveryRetryPolicy {
     pub(crate) base: Duration,
@@ -1918,6 +1951,189 @@ mod tests {
             advanced.grace_until
         );
     }
+    #[test]
+    fn outcome_policy_distinguishes_unknown_input_from_proven_incapability() {
+        use storage_sqlite::{
+            RecoveryCause as C, RecoveryEligibility as E, RecoveryScopeOutcome as O,
+        };
+        assert_eq!(
+            eligibility_after_observation(C::EpochGap, O::Unknown, true, false),
+            E::Retry
+        );
+        assert_eq!(
+            eligibility_after_observation(C::KnownEvent, O::BudgetExhausted, true, false),
+            E::Retry
+        );
+        assert_eq!(
+            eligibility_after_observation(C::EpochGap, O::Unsupported, true, false),
+            E::WaitingCapability
+        );
+        assert_eq!(
+            eligibility_after_observation(C::QueueLoss, O::Unknown, false, false),
+            E::Retry
+        );
+        assert_eq!(
+            eligibility_after_observation(C::NotificationLoss, O::BudgetExhausted, true, false),
+            E::NeedsDeepRepair
+        );
+        assert_eq!(
+            eligibility_after_observation(C::QueueLoss, O::Unavailable, true, false),
+            E::Retry
+        );
+        assert_eq!(
+            eligibility_after_observation(C::QueueLoss, O::Unknown, true, true),
+            E::WaitingCapacity
+        );
+        assert_eq!(
+            eligibility_after_observation(C::Maintenance, O::Unknown, true, false),
+            E::Retry
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_history_is_bounded_while_epoch_input_remains_retryable() {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        use storage_sqlite::{RecoveryCause, RecoveryEligibility};
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group = client.create_group("retry policy", &[]).await.unwrap();
+        let epoch = client.group_mls_state(&group).unwrap().epoch;
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(group.as_slice()),
+                stalled_epoch: epoch,
+            }])
+            .unwrap();
+        storage
+            .mark_account_delivery_recovery("alice", 42, 1)
+            .unwrap();
+        client.delivery_overflow_recovery_pending = true;
+        client.delivery_overflow_recovery_marker_token = Some(42);
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        client
+            .execute_recovery_grant(grant, None, None)
+            .await
+            .unwrap();
+        let pending = storage.pending_recovery_demands().unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .find(|d| d.cause == RecoveryCause::EpochGap)
+                .unwrap()
+                .eligibility,
+            RecoveryEligibility::Retry,
+            "EOSE without a coverage certificate does not prove missing-epoch acquisition unsupported"
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .find(|d| d.cause == RecoveryCause::QueueLoss)
+                .unwrap()
+                .eligibility,
+            RecoveryEligibility::NeedsDeepRepair
+        );
+        assert!(client.delivery_overflow_recovery_pending);
+        let attempts = storage.recovery_retry_state().unwrap().attempt_serial;
+        for _ in 0..3 {
+            client
+                .recovery_owner
+                .test_advance_clock(Duration::from_secs(300));
+            let grant = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(
+                grant
+                    .plan()
+                    .unwrap()
+                    .iter()
+                    .all(|o| o.cause == RecoveryCause::EpochGap),
+                "expired cooldown cannot rearm unknown account-history debt"
+            );
+            client
+                .execute_recovery_grant(grant, None, None)
+                .await
+                .unwrap();
+        }
+        let retry = storage.recovery_retry_state().unwrap();
+        assert_eq!(retry.attempt_serial, attempts + 3);
+        let now = Instant::now();
+        let wall = client.recovery_owner.logical_now_ms(now).unwrap();
+        client.recovery_owner = AccountRecoveryOwner::open(&storage, wall, now, policy()).unwrap();
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        storage
+            .mark_account_delivery_recovery("alice", 42, 1)
+            .unwrap();
+        assert_eq!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .find(|d| d.cause == RecoveryCause::QueueLoss)
+                .unwrap()
+                .eligibility,
+            RecoveryEligibility::NeedsDeepRepair
+        );
+        storage
+            .mark_account_delivery_recovery("alice", 42, 2)
+            .unwrap();
+        assert_eq!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .find(|d| d.cause == RecoveryCause::QueueLoss)
+                .unwrap()
+                .eligibility,
+            RecoveryEligibility::Ready
+        );
+        assert!(
+            client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                )
+                .unwrap()
+                .is_none(),
+            "new loss does not forgive the account retry reservation"
+        );
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            grant
+                .plan()
+                .unwrap()
+                .iter()
+                .any(|o| o.cause == RecoveryCause::QueueLoss)
+        );
+    }
+
     // Synthetic exhaustive backend evidence, independent of EOSE. Production
     // legacy reconciliation cannot manufacture these endpoint certificates.
     fn qualify_test_obligation(
