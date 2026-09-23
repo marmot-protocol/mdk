@@ -1,4 +1,5 @@
 use cgka_traits::{GroupId, TransportEndpoint};
+use futures::{StreamExt, stream::FuturesUnordered};
 use std::collections::HashSet;
 
 use crate::AppError;
@@ -6,6 +7,11 @@ use crate::messages::AppMessageIntent;
 use crate::notifications;
 
 use super::AppClient;
+
+#[cfg(test)]
+mod tests;
+
+const PUSH_PUBLISH_CONCURRENCY: usize = 4;
 
 impl AppClient {
     pub(crate) async fn upsert_and_share_push_registration(
@@ -553,11 +559,11 @@ impl AppClient {
         }
         let signer = self.app.account_signer_for_summary(&account)?;
         let nostr_signer = signer.as_nostr_signer();
+        let fallback = self
+            .app
+            .relay_client_for_account_id(&account.account_id_hex, nostr_signer);
+        let mut first_error = None;
         for (server_pubkey_hex, records) in by_server {
-            let encrypted_tokens = records
-                .iter()
-                .map(|record| record.encrypted_token.clone())
-                .collect::<Vec<_>>();
             let endpoints =
                 self.notification_trigger_target_relays(&server_pubkey_hex, &records)?;
             let endpoints = self
@@ -572,38 +578,54 @@ impl AppClient {
                 // resort.
                 continue;
             }
-            for chunk in notifications::notification_trigger_chunks(&encrypted_tokens) {
-                let event =
-                    notifications::build_notification_gift_wrap(&server_pubkey_hex, chunk).await?;
-                let observation = self.app.product_analytics.begin(
-                    crate::ProductFamily::Notification,
-                    "trigger",
-                    crate::ProductUnit::Attempt,
-                );
-                let fallback = self
-                    .app
-                    .relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
-                let result = self
-                    .relay_plane
-                    .publish_signed_event(
-                        self.adapter.account_id(),
-                        fallback.as_ref(),
-                        &endpoints,
-                        &event,
-                        1,
-                    )
-                    .await;
-                if let Some(observation) = observation {
-                    observation.finish(if result.is_ok() {
-                        "confirmed"
-                    } else {
-                        "failure"
+            let encrypted_tokens = records
+                .into_iter()
+                .map(|record| record.encrypted_token)
+                .collect::<Vec<_>>();
+            let mut chunks = notifications::notification_trigger_chunks(&encrypted_tokens);
+            let server = &server_pubkey_hex;
+            let endpoints = &endpoints;
+            let fallback = fallback.as_ref();
+            // Keep each event's relay race independent; SDK batch pre-connect
+            // waits for every endpoint, including unreachable relay hints.
+            let mut publishes = FuturesUnordered::new();
+            loop {
+                while publishes.len() < PUSH_PUBLISH_CONCURRENCY {
+                    let Some(chunk) = chunks.next() else { break };
+                    publishes.push(async move {
+                        let event =
+                            notifications::build_notification_gift_wrap(server, chunk).await?;
+                        let observation = self.app.product_analytics.begin(
+                            crate::ProductFamily::Notification,
+                            "trigger",
+                            crate::ProductUnit::Attempt,
+                        );
+                        let result = self
+                            .adapter
+                            .publish_signed_event(fallback, endpoints, &event, 1)
+                            .await;
+                        if let Some(observation) = observation {
+                            observation.finish(if result.is_ok() {
+                                "confirmed"
+                            } else {
+                                "failure"
+                            });
+                        }
+                        result.map(|_| ()).map_err(AppError::Transport)
                     });
                 }
-                result.map_err(AppError::Transport)?;
+                let Some(result) = publishes.next().await else {
+                    break;
+                };
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Relays to publish the gift-wrapped trigger to for `server_pubkey_hex`.

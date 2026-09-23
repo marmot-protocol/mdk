@@ -254,20 +254,39 @@ fn kind_446_content_is_bounded_to_32_encrypted_tokens() {
     );
 }
 
-#[test]
-fn kind_446_trigger_chunks_split_33_encrypted_tokens() {
-    let tokens =
-        vec![vec![7_u8; PUSH_ENCRYPTED_TOKEN_LEN]; PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS + 1];
-    let chunks = notification_trigger_chunks(&tokens).collect::<Vec<_>>();
-    assert_eq!(
-        chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
-        vec![PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS, 1]
-    );
-    assert!(
-        chunks
-            .into_iter()
-            .all(|chunk| build_notification_rumor_content(chunk).is_ok())
-    );
+#[tokio::test]
+async fn push_chunks_round_trip_at_wire_size_boundary() {
+    let server = Keys::generate();
+    let tokens = (0..20)
+        .map(|index| vec![index as u8; PUSH_ENCRYPTED_TOKEN_LEN])
+        .collect::<Vec<_>>();
+    let oversized = build_notification_gift_wrap(&server.public_key().to_hex(), &tokens)
+        .await
+        .unwrap()
+        .to_verified_nostr_event()
+        .unwrap();
+    assert!(serde_json::to_vec(&oversized).unwrap().len() > 65_536);
+
+    let mut received = Vec::new();
+    let mut chunk_sizes = Vec::new();
+    for chunk in notification_trigger_chunks(&tokens) {
+        let wrap = build_notification_gift_wrap(&server.public_key().to_hex(), chunk)
+            .await
+            .unwrap();
+        let event = wrap.to_verified_nostr_event().unwrap();
+        assert!(serde_json::to_vec(&event).unwrap().len() <= 65_536);
+        let gift = nostr::nips::nip59::extract_rumor(&server, &event).unwrap();
+        assert_eq!(
+            gift.rumor.kind,
+            Kind::Custom(KIND_MARMOT_NOTIFICATION_RUMOR as u16)
+        );
+        let content = BASE64_STANDARD.decode(gift.rumor.content).unwrap();
+        assert_eq!(content.len() % PUSH_ENCRYPTED_TOKEN_LEN, 0);
+        chunk_sizes.push(content.len() / PUSH_ENCRYPTED_TOKEN_LEN);
+        received.extend(content);
+    }
+    assert_eq!(chunk_sizes, [19, 1]);
+    assert_eq!(received, tokens.concat());
 }
 
 #[tokio::test]
