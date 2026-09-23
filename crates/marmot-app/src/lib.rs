@@ -3795,11 +3795,10 @@ impl MarmotApp {
         let recovery_storage = self.account_storage(label)?;
         let recovery_label = label.to_owned();
         let recovery_marker: relay_plane::AccountDeliveryRecoveryMarker =
-            Arc::new(move |cause, marker_token, dropped| {
+            Arc::new(move |marker_token, dropped| {
                 recovery_storage
-                    .record_account_recovery_loss(
+                    .record_account_delivery_loss(
                         &recovery_label,
-                        cause,
                         marker_token,
                         dropped,
                         unix_now_seconds(),

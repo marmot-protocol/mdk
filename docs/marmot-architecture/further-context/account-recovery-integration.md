@@ -73,3 +73,12 @@ and superseded checks, and the remaining blocking acquisition limitations.
   It proves no activation/cost change during cooldown, fresh session afterward,
   and identical grace deadline throughout. All 10 owner tests pass with default
   policy; the restoration regression also passes with policy overrides.
+- Loss-writer authority: three red regressions reproduced off-worker notification
+  persistence, stopped count-growth persistence, and normal-close loss invention.
+  Queue callbacks now have a queue-only type; one account-local writer persists
+  count growth independently of queued control signals. Typed lag is worker-written
+  with a fresh zero-count incident token; ordinary close does not create demand.
+  All 46 relay-plane tests pass, including replacement, stale-writer and router
+  control/count races. The notification replacement regression now exercises the
+  actual worker receive boundary rather than assigning notification writes to the
+  queue callback. Live-attempt cancellation and cursor handoff are the next section.

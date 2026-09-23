@@ -134,7 +134,7 @@ async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identit
     let first = overflow.start_recovery(1);
     assert!(overflow.start_marker_persistence());
     overflow
-        .persist_marker_before_drop(Arc::new(|_, _, _| Ok(())))
+        .persist_marker_before_drop(Arc::new(|_, _| Ok(())))
         .await;
     let elapsed_ms = overflow.finish_recovery(first).unwrap();
     overflow.record_recovery_success(elapsed_ms);
@@ -174,7 +174,7 @@ async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let observed_attempts = attempts.clone();
-    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
         observed_attempts.fetch_add(1, Ordering::SeqCst);
         Err(AccountDeliveryRecoveryMarkerError::Closed)
     });
@@ -207,7 +207,7 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     let marker: AccountDeliveryRecoveryMarker = {
         let entered = entered.clone();
         let release = release.clone();
-        Arc::new(move |_, _, _| {
+        Arc::new(move |_, _| {
             entered.store(true, Ordering::SeqCst);
             while !release.load(Ordering::SeqCst) {
                 std::thread::yield_now();
@@ -1463,7 +1463,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
     let marker_attempts = Arc::new(AtomicUsize::new(0));
     let marker_flag = marker_persisted.clone();
     let attempts = marker_attempts.clone();
-    let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+    let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(AccountDeliveryRecoveryMarkerError::Retryable);
         }
@@ -2096,71 +2096,205 @@ fn publish_report_preserves_fallback_message_id() {
 
 #[tokio::test]
 async fn notification_loss_is_durable_and_survives_receiver_replacement() {
-    let relay = Arc::new(RecordingRelayClient::default());
-    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
-    let account = MemberId::new(vec![0xA1; 32]);
-    let storage = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
-    storage.ensure_account_projection("alice").unwrap();
-    let evidence = storage.clone();
-    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |cause, token, count| {
-        evidence
-            .record_account_recovery_loss("alice", cause, token, count, 1)
-            .map_err(|_| AccountDeliveryRecoveryMarkerError::Retryable)
-    });
-    let adapter = plane.account_adapter_with_recovery_marker(
-        account.clone(),
-        relay.clone(),
-        Some(marker.clone()),
-    );
+    use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::default(),
+    )
+    .with_test_relay_client(relay);
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let storage = app.account_storage("alice").unwrap();
+    let account = client.adapter.account_id().clone();
+    app.relay_plane
+        .set_account_delivery_recovery_marker_for_test(
+            &account,
+            Arc::new(|_, _| panic!("notification lag must never use the queue writer")),
+        );
     recover_relay_notification_forwarder(
-        &plane.inner.transport,
+        &app.relay_plane.inner.transport,
         RelayNotificationConsumerExit::Lagged(0),
     );
-    let loss = adapter.pending_delivery_overflow().unwrap();
+    let loss = client.adapter.pending_delivery_overflow().unwrap();
     assert_eq!(loss.dropped, 0);
     assert_eq!(loss.notification_losses, 1);
     assert!(
-        timeout(Duration::from_secs(1), adapter.receive())
-            .await
+        storage
+            .recovery_loss_watermarks(
+                "alice",
+                storage_sqlite::RecoveryLossCause::NotificationConsumer
+            )
             .unwrap()
-            .unwrap()
-            .is_none()
+            .is_empty()
     );
-    let replacement = plane.account_adapter_with_recovery_marker(account, relay, Some(marker));
-    assert!(Arc::ptr_eq(
-        &adapter.delivery_overflow,
-        &replacement.delivery_overflow
+    // The real worker receive boundary persists the typed lag before returning
+    // the close signal that causes receiver replacement.
+    assert!(matches!(
+        client.receive_next_delivery().await,
+        Err(crate::AppError::TransportClosed)
     ));
-    timeout(Duration::from_secs(2), async {
-        while !replacement.delivery_overflow.marker_barrier_complete() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    storage.synchronize_account_delivery_loss("alice").unwrap();
-    let pending = storage.pending_recovery_demands().unwrap();
-    assert_eq!(pending.len(), 1);
-    assert!(pending[0].cause == storage_sqlite::RecoveryCause::NotificationLoss);
+    let evidence = storage
+        .recovery_loss_watermarks(
+            "alice",
+            storage_sqlite::RecoveryLossCause::NotificationConsumer,
+        )
+        .unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert!(
+        storage
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .any(|d| d.cause == storage_sqlite::RecoveryCause::NotificationLoss)
+    );
     assert!(
         storage
             .account_delivery_recovery("alice")
             .unwrap()
             .is_none()
     );
-    let old = replacement.start_delivery_overflow_recovery(loss.marker_token);
+    let prior = client.adapter.delivery_overflow.clone();
+    drop(client);
+    let mut replacement = client_on_app_relay_plane(&app, "alice").await;
+    assert!(Arc::ptr_eq(&prior, &replacement.adapter.delivery_overflow));
+    let attempt = replacement
+        .adapter
+        .start_delivery_overflow_recovery(loss.marker_token);
+    recover_relay_notification_forwarder(
+        &app.relay_plane.inner.transport,
+        RelayNotificationConsumerExit::Closed,
+    );
+    assert_eq!(
+        replacement
+            .adapter
+            .delivery_overflow
+            .inner
+            .lock()
+            .unwrap()
+            .notification_losses,
+        1
+    );
+    recover_relay_notification_forwarder(
+        &app.relay_plane.inner.transport,
+        RelayNotificationConsumerExit::Lagged(1),
+    );
+    assert!(
+        replacement
+            .adapter
+            .finish_delivery_overflow_recovery(attempt)
+            .is_none()
+    );
+    replacement.adapter.fail_delivery_overflow_recovery();
+    let newer = replacement.adapter.pending_delivery_overflow().unwrap();
+    assert_eq!(newer.notification_losses, 2);
+    assert_ne!(newer.notification_token, loss.notification_token);
+    assert!(matches!(
+        replacement.receive_next_delivery().await,
+        Err(crate::AppError::TransportClosed)
+    ));
+    assert_eq!(
+        storage
+            .recovery_loss_watermarks(
+                "alice",
+                storage_sqlite::RecoveryLossCause::NotificationConsumer
+            )
+            .unwrap()
+            .len(),
+        2
+    );
+    app.relay_plane.shutdown().await;
+}
+
+#[test]
+fn loss_authority_notification_cannot_claim_the_queue_writer() {
+    let overflow = AccountDeliveryOverflowState::default();
+    overflow.record_notification_loss();
+    assert!(
+        !overflow.start_marker_persistence(),
+        "notification incidents must be persisted by the account worker"
+    );
+}
+
+#[tokio::test]
+async fn loss_authority_persists_count_growth_after_the_first_queue_write() {
+    let overflow = AccountDeliveryOverflowState::default();
+    overflow.record_drop(1);
+    assert!(overflow.start_marker_persistence());
+    overflow
+        .persist_marker_before_drop(Arc::new(|_, _| Ok(())))
+        .await;
+    let original = overflow.pending_snapshot().unwrap();
+    overflow.record_drop(1);
+    assert!(
+        overflow.start_marker_persistence(),
+        "new count must reach durable evidence"
+    );
+    let observed = Arc::new(AtomicUsize::new(0));
+    let count = observed.clone();
+    overflow
+        .persist_marker_before_drop(Arc::new(move |token, dropped| {
+            assert_eq!(token, original.marker_token);
+            count.store(dropped as usize, Ordering::SeqCst);
+            Ok(())
+        }))
+        .await;
+    assert_eq!(observed.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn loss_authority_normal_close_does_not_invent_notification_loss() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let adapter =
+        plane.account_adapter_with_recovery_marker(MemberId::new(vec![0xA2; 32]), relay, None);
     recover_relay_notification_forwarder(
         &plane.inner.transport,
         RelayNotificationConsumerExit::Closed,
     );
-    assert!(replacement.finish_delivery_overflow_recovery(old).is_none());
-    replacement.fail_delivery_overflow_recovery();
-    assert_eq!(
-        replacement
-            .pending_delivery_overflow()
-            .unwrap()
-            .notification_losses,
-        2
-    );
+    assert!(adapter.pending_delivery_overflow().is_none());
     plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn loss_authority_router_updates_a_marker_with_its_control_already_queued() {
+    let overflow = Arc::new(AccountDeliveryOverflowState::default());
+    let (sender, mut receiver) = mpsc::channel(2);
+    let latest = Arc::new(AtomicUsize::new(0));
+    let observed = latest.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, count| {
+        observed.store(count as usize, Ordering::SeqCst);
+        Ok(())
+    });
+    let signal = overflow.record_drop(1);
+    persist_queue_loss(&sender, &overflow, marker.clone(), signal);
+    timeout(Duration::from_secs(2), async {
+        while sender.capacity() == 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let signal = overflow.record_drop(1);
+    assert!(signal.is_none(), "existing control record remains queued");
+    persist_queue_loss(&sender, &overflow, marker, signal);
+    timeout(Duration::from_secs(2), async {
+        while latest.load(Ordering::SeqCst) != 2 || !overflow.marker_barrier_complete() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let AccountDeliveryEvent::Overflow { generation } = receiver.recv().await.unwrap() else {
+        panic!("control record")
+    };
+    assert_eq!(overflow.consume_signal(generation).dropped, 2);
+    assert!(
+        receiver.try_recv().is_err(),
+        "count updates do not enqueue duplicate controls"
+    );
 }

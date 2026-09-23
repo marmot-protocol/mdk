@@ -12362,13 +12362,18 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let attempts = marker_attempts.clone();
         let storage = app.account_storage("alice").unwrap();
         let marker: crate::relay_plane::AccountDeliveryRecoveryMarker =
-            Arc::new(move |_cause, marker_token, dropped| {
+            Arc::new(move |marker_token, dropped| {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if !release.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable);
                 }
                 storage
-                    .mark_account_delivery_recovery("alice", marker_token, dropped)
+                    .record_account_delivery_loss(
+                        "alice",
+                        marker_token,
+                        dropped,
+                        unix_now_seconds(),
+                    )
                     .map_err(|error| {
                         if error.is_closed() {
                             crate::relay_plane::AccountDeliveryRecoveryMarkerError::Closed

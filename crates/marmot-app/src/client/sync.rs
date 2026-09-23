@@ -962,11 +962,12 @@ impl AppClient {
             storage.record_account_recovery_loss(
                 &self.state.label,
                 storage_sqlite::RecoveryLossCause::NotificationConsumer,
-                overflow.marker_token,
-                overflow.notification_losses,
+                overflow.notification_token,
+                0,
                 unix_now_seconds(),
             )?;
             storage.synchronize_account_delivery_loss(&self.state.label)?;
+            self.adapter.notification_loss_persisted(overflow);
         }
         self.delivery_overflow_recovery_pending = true;
         self.delivery_overflow_recovery_marker_token = Some(overflow.marker_token);
@@ -1736,11 +1737,12 @@ impl AppClient {
         &mut self,
     ) -> Result<crate::relay_plane::AccountDeliveryReceive, AppError> {
         loop {
-            let received = self
-                .adapter
-                .receive_account_delivery()
-                .await?
-                .ok_or(AppError::TransportClosed)?;
+            let Some(received) = self.adapter.receive_account_delivery().await? else {
+                if let Some(loss) = self.adapter.pending_delivery_overflow() {
+                    self.observe_delivery_overflow(loss)?;
+                }
+                return Err(AppError::TransportClosed);
+            };
             let delivery = match received {
                 crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) => delivery,
                 crate::relay_plane::AccountDeliveryReceive::Overflow(overflow) => {
