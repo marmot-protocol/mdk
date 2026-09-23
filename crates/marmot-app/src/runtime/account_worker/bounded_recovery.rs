@@ -68,17 +68,58 @@ pub(super) fn prepare(
 ) -> Result<Option<Plan>, AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
     let demands = storage.pending_recovery_demands()?;
-    let Some(required) = demands
-        .iter()
-        .find(|demand| {
-            demand.cause == storage_sqlite::RecoveryCause::KnownEvent
-                && demand.group_id.is_some()
-                && demand.known_event_id.is_some()
-        })
-        .map(|demand| demand.ticket.id)
-    else {
+    let Some(demand) = demands.iter().find(|demand| {
+        demand.cause == storage_sqlite::RecoveryCause::KnownEvent
+            && demand.group_id.is_some()
+            && demand.known_event_id.is_some()
+    }) else {
         return Ok(None);
     };
+    // A reservation changes durable cooldown even if the resulting grant is
+    // dropped. Decline unsupported route shapes before asking the owner to
+    // reserve; leave the full endpoint set eligible for the legacy executor.
+    storage.synchronize_account_delivery_loss(&client.state.label)?;
+    client.observe_recovery_route_policy()?;
+    let routing = client.routing.snapshot();
+    let routes = routing
+        .group_routes
+        .iter()
+        .filter(|route| demand.group_id.as_deref() == Some(route.group_id.as_slice()))
+        .collect::<Vec<_>>();
+    let Some(route) = routes.first().filter(|_| routes.len() == 1) else {
+        return Ok(None);
+    };
+    let mut required_endpoints = route
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.0.clone())
+        .collect::<Vec<_>>();
+    let stored = storage.recovery_scope_snapshots(demand.ticket.id)?;
+    if stored.len() > 1
+        || stored.iter().any(|scope| {
+            scope.plan.route_kind != 1
+                || scope
+                    .plan
+                    .transport_group_id
+                    .as_ref()
+                    .map(|id| id.as_slice())
+                    != Some(route.transport_group_id.as_slice())
+        })
+    {
+        return Ok(None);
+    }
+    for scope in stored {
+        required_endpoints.extend(scope.plan.required_endpoints);
+    }
+    required_endpoints.sort();
+    required_endpoints.dedup();
+    let admitted = client.adapter.recovery_admitted_endpoints(&route.endpoints);
+    if required_endpoints.is_empty()
+        || required_endpoints.len() > MAX_ENDPOINTS
+        || required_endpoints != admitted
+    {
+        return Ok(None);
+    }
     // Reserve process capacity before spending the owner's durable attempt.
     // No waiter or completed result can exist without a credit.
     let Ok(credit) = ACQUISITION_CREDITS.try_acquire() else {
@@ -86,7 +127,8 @@ pub(super) fn prepare(
     };
     // The owner selects one predicate for this request without changing the
     // configured executor mode for unrelated recovery work.
-    let Some(grant) = client.authorize_account_recovery_for(None, seam, Some(required))? else {
+    let Some(grant) = client.authorize_account_recovery_for(None, seam, Some(demand.ticket.id))?
+    else {
         return Ok(None);
     };
     let Some(obligation) = grant.plan().and_then(|plan| plan.first()) else {

@@ -126,20 +126,24 @@ bytes or temporary conversion allocations.
 
 The path never treats EOSE as history coverage. A known event qualifies only
 after its exact eligible input has a durable receipt or valid terminal
-disposition and the owner's fence accepts the checkpoint. Partial results,
-failed admission and stale fences leave demand pending. Unsupported returns
-without a legacy replay fallback. The controlled worker regression uses two
-endpoints and an event published while its destination worker is stopped; it
-checks that a send, another account and live subscription count remain
-available while the exact-ID request waits, then checks durable recovery from
-duplicate relay copies.
+disposition. The owner fences checkpoint evidence against new loss and route
+state. Partial results do not clear unretained demand; saturated responses and
+stale fences leave it pending. Unsupported returns without a legacy replay
+fallback. Unsupported scope shapes, including a third required relay, are
+declined before spending retry authority and retain their full legacy scope.
+Controlled worker regressions cover a queued send, incoming and other-account
+projection, stable live subscriptions, duplicate relay copies, saturation,
+partial results, stale loss/route evidence, shutdown after a durable prefix,
+storage reopen, and two already-retained epoch inputs progressing while a
+separate request waits.
 
 `RuntimeSharedServices::bounded_group_recovery_enabled` defaults to false and
 has no public production setter. The production SDK backend is now available,
-but enabling this worker path requires an integrated two-relay regression
-against that backend covering cancellation, partial and
-saturated results, reopen, stale generation/loss/route evidence, local backlog
-progress and measured protocol bytes. The legacy `execute_recovery_grant` path
+but enabling this worker path requires the same integrated two-relay cases
+against actual SDK sessions, including cancellation, partial and saturated
+results, reopen, stale generation/loss/route evidence, local backlog progress
+and measured protocol-byte/duplicate baselines. The legacy
+`execute_recovery_grant` path
 still owns general epoch, overflow, explicit and unknown-history recovery; it
 remains worker-held and can still wait for EOSE. This exact-ID slice does not
 establish unknown-history discovery, bandwidth optimality or the original
