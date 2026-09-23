@@ -83,6 +83,7 @@ mod collector_host_safety;
 pub mod product_analytics;
 pub use product_analytics::*;
 mod audit_log;
+pub mod audit_otlp_sender;
 mod chat_presentation;
 mod client;
 mod config;
