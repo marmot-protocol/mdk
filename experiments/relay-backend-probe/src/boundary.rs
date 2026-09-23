@@ -425,11 +425,14 @@ async fn adapter_boundary_keeps_account_sessions_distinct() {
     ] {
         tokio::time::timeout(DEADLINE, async {
             loop {
-                if let Some(NotificationUpdate::Notification(ClientNotification::Event {
+                if let NotificationUpdate::Notification(ClientNotification::Event {
                     subscription_id,
                     event,
                     ..
-                })) = stream.next().await
+                }) = stream
+                    .next()
+                    .await
+                    .expect("account notification stream closed before live delivery")
                     && &subscription_id == expected_id
                     && event.id == expected_event
                 {
@@ -466,11 +469,14 @@ async fn adapter_boundary_keeps_account_sessions_distinct() {
     relay.add_event(after_cancel.clone()).await.unwrap();
     tokio::time::timeout(DEADLINE, async {
         loop {
-            if let Some(NotificationUpdate::Notification(ClientNotification::Event {
+            if let NotificationUpdate::Notification(ClientNotification::Event {
                 subscription_id,
                 event,
                 ..
-            })) = a_notifications.next().await
+            }) = a_notifications
+                .next()
+                .await
+                .expect("Alice notification stream closed after cancellation")
                 && subscription_id == a_live_id
                 && event.id == after_cancel.id
             {

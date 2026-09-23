@@ -230,10 +230,13 @@ async fn large_event_byte_limit_and_cancellation_leave_live_interest_operating()
     relay.add_event(live_event.clone()).await.unwrap();
     timeout(Duration::from_secs(1), async {
         loop {
-            if let Some(NotificationUpdate::Notification(RelayNotification::Event {
+            if let NotificationUpdate::Notification(RelayNotification::Event {
                 subscription_id,
                 event,
-            })) = notifications.next().await
+            }) = notifications
+                .next()
+                .await
+                .expect("live notification stream closed after cancellation")
                 && subscription_id == live_id
                 && event.id == live_event.id
             {
