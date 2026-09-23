@@ -349,6 +349,20 @@ impl AccountRecoveryOwner {
         now: Instant,
         explicit: Option<&mut ExplicitRecoveryPermit>,
     ) -> StorageResult<Option<AttemptGrant>> {
+        self.select_authorized_attempt_for(storage, readiness, now, explicit, None)
+    }
+
+    /// A bounded executor may accept only its exact selected obligation. The
+    /// owner still applies its normal ordering and pacing; a different winner
+    /// returns before a retry reservation is spent.
+    pub(crate) fn select_authorized_attempt_for(
+        &mut self,
+        storage: &SqliteAccountStorage,
+        readiness: RecoveryReadiness,
+        now: Instant,
+        explicit: Option<&mut ExplicitRecoveryPermit>,
+        required: Option<[u8; 16]>,
+    ) -> StorageResult<Option<AttemptGrant>> {
         if self.active.upgrade().is_some() {
             return Ok(None);
         }
@@ -388,7 +402,7 @@ impl AccountRecoveryOwner {
             {
                 return Ok::<_, StorageError>(None);
             }
-            if self.mode == RecoveryExecutorMode::Normal {
+            if self.mode == RecoveryExecutorMode::Normal && required.is_none() {
                 let maintenance = self
                     .maintenance_observations
                     .values()
@@ -445,6 +459,13 @@ impl AccountRecoveryOwner {
                     .take(1)
                     .map(|(_, _, id, revision)| (id, revision))
                     .collect();
+            }
+            if required.is_some_and(|id| {
+                comparison_revision.is_some()
+                    || fence.obligations.len() != 1
+                    || fence.obligations[0].0 != id
+            }) {
+                return Ok(None);
             }
             let reservation = storage.reserve_recovery_work(
                 &fence,
@@ -1109,8 +1130,17 @@ impl AppClient {
     /// consumer before selecting a revision-fenced immutable history plan.
     pub(crate) fn authorize_account_recovery(
         &mut self,
+        explicit: Option<&mut ExplicitRecoveryPermit>,
+        seam: marmot_forensics::EpochBackfillExecutionSeam,
+    ) -> Result<Option<AttemptGrant>, AppError> {
+        self.authorize_account_recovery_for(explicit, seam, None)
+    }
+
+    pub(crate) fn authorize_account_recovery_for(
+        &mut self,
         mut explicit: Option<&mut ExplicitRecoveryPermit>,
         seam: marmot_forensics::EpochBackfillExecutionSeam,
+        required: Option<[u8; 16]>,
     ) -> Result<Option<AttemptGrant>, AppError> {
         // Wake collection retains the loaded live floor and leaves recovery
         // debt/pacing to an Advance runtime. Only the separate full-history
@@ -1163,12 +1193,22 @@ impl AppClient {
         } else {
             RecoveryReadiness::Waiting
         };
-        let selected = self.recovery_owner.select_authorized_attempt(
-            &storage,
-            readiness,
-            Instant::now(),
-            explicit.as_deref_mut(),
-        )?;
+        let selected = if let Some(required) = required {
+            self.recovery_owner.select_authorized_attempt_for(
+                &storage,
+                readiness,
+                Instant::now(),
+                explicit.as_deref_mut(),
+                Some(required),
+            )?
+        } else {
+            self.recovery_owner.select_authorized_attempt(
+                &storage,
+                readiness,
+                Instant::now(),
+                explicit.as_deref_mut(),
+            )?
+        };
         self.record_unavailable_epoch_observation(&storage)?;
         let Some(mut grant) = selected else {
             return Ok(None);
@@ -1539,6 +1579,32 @@ mod tests {
         let now = Instant::now();
         let owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
         (storage, owner, now)
+    }
+
+    #[test]
+    fn bounded_executor_does_not_spend_an_unrelated_owner_selection() {
+        let (storage, mut owner, now) = fixture();
+        assert_eq!(owner.mode, RecoveryExecutorMode::Normal);
+        assert!(
+            owner
+                .select_authorized_attempt_for(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    now,
+                    None,
+                    Some([99; 16]),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 0);
+        assert_eq!(owner.mode, RecoveryExecutorMode::Normal);
+        assert!(
+            owner
+                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                .unwrap()
+                .is_some()
+        );
     }
 
     fn policy() -> RecoveryRetryPolicy {

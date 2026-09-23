@@ -107,3 +107,40 @@ rejected before I/O.
 This integration adds the production SDK acquisition and account-scoped loss
 bridge. It adds no recovery executor, durable retry policy, schema migration,
 or public binding.
+
+## #1947 P5 controlled worker slice
+
+The account worker now has an inactive, controlled-backend path for one exact
+known kind-445 event in one group. It uses the existing recovery owner's
+conservative selection and durable attempt reservation, keeping the frozen
+scope token, route/loss/inventory fences and exact event ID in the worker.
+The relay request runs in a separate task through `acquire_history`; its result
+returns to the same worker for peeler/engine receipt and storage admission.
+Two process-wide credits are reserved before an attempt and held until pending
+admission and the guarded checkpoint finish. One account has at most one job.
+The fixture limits each request to two endpoints, one requested ID, 16 retained
+events and 128 KiB of serialized event JSON per endpoint, with a five-second
+request deadline. The worker admits one event per turn and yields between
+completed units. These SDK request budgets do not bound parser buffers, wire
+bytes or temporary conversion allocations.
+
+The path never treats EOSE as history coverage. A known event qualifies only
+after its exact eligible input has a durable receipt or valid terminal
+disposition and the owner's fence accepts the checkpoint. Partial results,
+failed admission and stale fences leave demand pending. Unsupported returns
+without a legacy replay fallback. The controlled worker regression uses two
+endpoints and an event published while its destination worker is stopped; it
+checks that a send, another account and live subscription count remain
+available while the exact-ID request waits, then checks durable recovery from
+duplicate relay copies.
+
+`RuntimeSharedServices::bounded_group_recovery_enabled` defaults to false and
+has no public production setter. The production SDK backend is now available,
+but enabling this worker path requires an integrated two-relay regression
+against that backend covering cancellation, partial and
+saturated results, reopen, stale generation/loss/route evidence, local backlog
+progress and measured protocol bytes. The legacy `execute_recovery_grant` path
+still owns general epoch, overflow, explicit and unknown-history recovery; it
+remains worker-held and can still wait for EOSE. This exact-ID slice does not
+establish unknown-history discovery, bandwidth optimality or the original
+phone/NSE outcome.

@@ -2320,6 +2320,43 @@ fn recover_relay_notification_forwarder_scoped(
 }
 
 impl MarmotRelayPlaneAccountAdapter {
+    /// A request-scoped history read. The caller keeps its recovery grant and
+    /// admission credit; this method only applies the normal relay safety
+    /// policy before handing the owned request to the transport backend.
+    pub(crate) async fn acquire_history(
+        &self,
+        mut request: transport_nostr_adapter::NostrAcquisitionRequest,
+        cancellation: transport_nostr_adapter::NostrAcquisitionCancellation,
+    ) -> Result<
+        transport_nostr_adapter::NostrAcquisitionResult,
+        transport_nostr_adapter::NostrAcquisitionError,
+    > {
+        if request.account_id != self.account_id {
+            return Err(transport_nostr_adapter::NostrAcquisitionError::InvalidRequest);
+        }
+        let original = request.endpoints.clone();
+        let checked = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_activation(TransportAccountActivation {
+                account_id: self.account_id.clone(),
+                inbox_endpoints: original.clone(),
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .map_err(|_| transport_nostr_adapter::NostrAcquisitionError::InvalidRequest)?;
+        if checked.inbox_endpoints != original {
+            return Err(transport_nostr_adapter::NostrAcquisitionError::InvalidRequest);
+        }
+        request.endpoints = checked.inbox_endpoints;
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .acquire_history(request, cancellation)
+            .await
+    }
     /// Explicit catch-up must reissue even settled, matching subscriptions.
     /// Cancellation leaves reuse disabled until an activation succeeds.
     pub(crate) async fn require_fresh_activation(&self) {

@@ -327,6 +327,9 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
+    /// Off until the production SDK acquisition backend passes its two-relay
+    /// conformance gate. Controlled worker fixtures opt in explicitly.
+    pub(crate) bounded_group_recovery_enabled: Arc<AtomicBool>,
     local_submission_wakeups: watch::Sender<()>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
@@ -419,6 +422,7 @@ impl MessageSubscriptionSeenIds {
 impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
+            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             local_submission_wakeups: watch::channel(()).0,
             attachment_updates: watch::channel(()).0,
@@ -466,6 +470,7 @@ impl RuntimeSharedServices {
             lifecycle.clone(),
         );
         Self {
+            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
             local_submission_wakeups: watch::channel(()).0,

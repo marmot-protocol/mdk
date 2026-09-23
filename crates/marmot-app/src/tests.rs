@@ -492,6 +492,12 @@ fn legacy_inline_group_image_create_rejects_oversized_input_before_canonical_cre
 
 #[derive(Default)]
 pub(crate) struct ScriptedPushRelayClient {
+    pub(crate) acquisition_result:
+        std::sync::Mutex<Option<transport_nostr_adapter::NostrAcquisitionResult>>,
+    pub(crate) acquisition_calls: std::sync::atomic::AtomicUsize,
+    pub(crate) acquisition_block: std::sync::atomic::AtomicBool,
+    pub(crate) acquisition_entered: tokio::sync::Notify,
+    pub(crate) acquisition_release: tokio::sync::Notify,
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
@@ -695,6 +701,15 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
 }
 
 impl ScriptedPushRelayClient {
+    pub(crate) fn last_published_group_event(&self) -> Option<NostrTransportEvent> {
+        self.published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .cloned()
+    }
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
@@ -957,6 +972,43 @@ impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
+    async fn acquire_history(
+        &self,
+        request: transport_nostr_adapter::NostrAcquisitionRequest,
+        cancellation: transport_nostr_adapter::NostrAcquisitionCancellation,
+    ) -> Result<
+        transport_nostr_adapter::NostrAcquisitionResult,
+        transport_nostr_adapter::NostrAcquisitionError,
+    > {
+        request.validate()?;
+        self.acquisition_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.acquisition_entered.notify_one();
+        if self
+            .acquisition_block
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tokio::select! {
+                _ = self.acquisition_release.notified() => {},
+                _ = cancellation.cancelled() => {
+                    return Ok(transport_nostr_adapter::NostrAcquisitionResult {
+                        endpoints: request.endpoints.into_iter().map(|endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {
+                            endpoint,
+                            session_generation: None,
+                            events: Vec::new(),
+                            end: transport_nostr_adapter::NostrAcquisitionEnd::Cancelled,
+                            stats: Default::default(),
+                        }).collect(),
+                    });
+                }
+            }
+        }
+        self.acquisition_result
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)
+    }
     fn supports_scoped_subscriptions(&self) -> bool {
         true
     }

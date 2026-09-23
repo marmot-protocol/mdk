@@ -2,6 +2,7 @@
 //! and the runtime-event publishing helpers the loop drives.
 
 mod attachments;
+mod bounded_recovery;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
@@ -1139,7 +1140,31 @@ async fn run_app_runtime_account_worker(
         });
 
     let mut yield_to_convergence = false;
+    let mut bounded_recovery: Option<bounded_recovery::Job> = None;
+    let mut yield_to_bounded_admission = false;
     'worker: loop {
+        // Activation is deliberately test-only until #1358 supplies and
+        // qualifies the real backend. This is the actual worker dispatch seam:
+        // the grant is captured here, while only the owned request crosses the
+        // network await. The active owner lease prevents legacy overlap.
+        if shared
+            .bounded_group_recovery_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && bounded_recovery.is_none()
+        {
+            match bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance) {
+                Ok(Some(plan)) => {
+                    bounded_recovery = Some(bounded_recovery::Job::start(&client, plan))
+                }
+                Ok(None) => {}
+                Err(error) => publish_app_runtime_account_error(
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    account_error_message("bounded recovery preparation failed", &error),
+                ),
+            }
+        }
         let ready_command = ready_command_index(&pending, &media_http);
         tokio::select! {
             biased;
@@ -1148,6 +1173,12 @@ async fn run_app_runtime_account_worker(
             }
             _ = &mut shutdown => {
                 return;
+            }
+            completed = async {
+                bounded_recovery.as_mut().expect("bounded task exists").wait().await
+            }, if bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
+                bounded_recovery.as_mut().expect("bounded task exists").accept(completed);
+                yield_to_bounded_admission = true;
             }
             recovered = async {
                 let recovery = welcome_recovery
@@ -1202,8 +1233,10 @@ async fn run_app_runtime_account_worker(
                     Some(command) => Some(command),
                     None => commands.recv().await,
                 }
-            }, if !yield_to_convergence || !scheduled_convergence.has_ready() => {
+            }, if (!yield_to_convergence || !scheduled_convergence.has_ready())
+                && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
+                yield_to_bounded_admission = true;
                 match command {
                     Some(command) => {
                         let command = match command {
@@ -1273,8 +1306,10 @@ async fn run_app_runtime_account_worker(
                     None => return,
                 }
             }
-            _ = scheduled_convergence.timer.as_mut() => {
+            _ = scheduled_convergence.timer.as_mut(), if !yield_to_bounded_admission
+                || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
                 yield_to_convergence = false;
+                yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence);
                 // Recovery owns the live client, but member/roster reads can
@@ -1382,7 +1417,39 @@ async fn run_app_runtime_account_worker(
 
                 phase.finish(TelemetryOutcome::Success);
             }
+            _ = async {}, if yield_to_bounded_admission
+                && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
+                let job = bounded_recovery.as_mut().expect("bounded admission job exists");
+                for _ in 0..bounded_recovery::MAX_ADMISSION_PER_TURN {
+                    match job.admit_one(&mut client).await {
+                        Ok(summary) => {
+                            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                            publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
+                            schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                        }
+                        Err(error) => {
+                            publish_app_runtime_account_error(&events, &account_id_hex, &account_label,
+                                account_error_message("bounded recovery admission failed", &error));
+                            // The durable demand and successfully admitted prefix survive.
+                            bounded_recovery = None;
+                            break;
+                        }
+                    }
+                }
+                if bounded_recovery.as_ref().is_some_and(|job| job.ready() && !job.has_input())
+                    && let Some(job) = bounded_recovery.take()
+                    && let Err(error) = job.finish(&mut client) {
+                        publish_app_runtime_account_error(&events, &account_id_hex, &account_label,
+                            account_error_message("bounded recovery checkpoint failed", &error));
+                }
+                yield_to_bounded_admission = false;
+            }
+            _ = sleep(bounded_recovery::ADMISSION_YIELD_DELAY), if !yield_to_bounded_admission
+                && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
+                yield_to_bounded_admission = true;
+            }
             received = client.receive_next_delivery() => {
+                yield_to_bounded_admission = true;
                 // Only the transport wait participates in `select!`. Once a
                 // delivery has been claimed, finish ingest + incidental
                 // publish + projection as one uncancelled worker operation;
@@ -5834,6 +5901,203 @@ mod tests {
             pending.pop_front(),
             Some(AccountWorkerCommand::ConnectivityRestored { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn bounded_known_group_acquisition_wait_keeps_worker_and_live_subscriptions_available() {
+        use storage_sqlite::RecoveryRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime
+            .shared_services()
+            .bounded_group_recovery_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.publish_key_package("bob").await.unwrap();
+        let group = runtime
+            .create_group_with_options(
+                "alice",
+                "bounded",
+                std::slice::from_ref(&bob.account_id_hex),
+                AppCreateGroupOptions {
+                    relays: Some(vec![
+                        "wss://relay.example".into(),
+                        "wss://relay-two.example".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        runtime
+            .accounts()
+            .workers
+            .lock()
+            .await
+            .remove(&bob.account_id_hex)
+            .unwrap()
+            .shutdown()
+            .await;
+        runtime
+            .send_message("alice", &group, b"known but unreceived".to_vec())
+            .await
+            .unwrap();
+        let historical = relay
+            .last_published_group_event()
+            .expect("real group ciphertext was published");
+        let event_id: [u8; 32] = hex::decode(&historical.id).unwrap().try_into().unwrap();
+        let storage = app.account_storage("bob").unwrap();
+        let group_route = match historical.to_transport_message().unwrap().envelope {
+            cgka_traits::transport::TransportEnvelope::GroupMessage { transport_group_id } => {
+                storage_sqlite::TransportReconciliationRoute::Group(
+                    transport_group_id.try_into().unwrap(),
+                )
+            }
+            _ => unreachable!("published event is group ciphertext"),
+        };
+        assert!(
+            !storage
+                .retained_recovery_event(&group_route, &event_id, None, historical.created_at)
+                .unwrap(),
+            "the controlled SDK has seen this ID, but MDK has not retained it"
+        );
+        runtime.reconcile_accounts().await.unwrap();
+        storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &event_id,
+                },
+                crate::client::recovery::wall_now_ms().unwrap(),
+            )
+            .unwrap();
+        *relay.acquisition_result.lock().unwrap() =
+            Some(transport_nostr_adapter::NostrAcquisitionResult {
+                endpoints:
+                    ["wss://relay.example", "wss://relay-two.example"]
+                        .into_iter()
+                        .map(
+                            |endpoint| {
+                                transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint: cgka_traits::TransportEndpoint(endpoint.into()),
+                    session_generation: Some(1),
+                    events: vec![historical.clone()],
+                    end: transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
+                    stats: Default::default(),
+                }
+                            },
+                        )
+                        .collect(),
+            });
+        relay
+            .acquisition_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let commands = runtime.accounts().worker_commands("bob").await.unwrap();
+        let (respond, advanced) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::AdvanceRecoveryClock {
+                elapsed: Duration::from_secs(600),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), advanced)
+            .await
+            .unwrap()
+            .unwrap();
+        let (respond, response) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), relay.acquisition_entered.notified())
+            .await
+            .expect("owner-authorized acquisition starts");
+        let subscriptions = relay.subscription_count();
+        timeout(
+            Duration::from_secs(5),
+            runtime.send_message("bob", &group, b"live while history waits".to_vec()),
+        )
+        .await
+        .expect("queued send must not wait for EOSE")
+        .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if app.messages("alice").unwrap().iter().any(|message| {
+                    message.group_id_hex == hex::encode(&group)
+                        && message.plaintext == "live while history waits"
+                }) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live projection continues while history waits");
+        let bob_commands = runtime.accounts().worker_commands("alice").await.unwrap();
+        let (respond, response) = oneshot::channel();
+        bob_commands
+            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .unwrap();
+        timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            relay.subscription_count(),
+            subscriptions,
+            "bounded history does not rebuild live interests"
+        );
+        assert_eq!(
+            relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.known_event_id == Some(event_id))
+        );
+        relay.acquisition_release.notify_one();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .all(|demand| demand.known_event_id != Some(event_id))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("known event becomes durably disposed after duplicate copies");
+        assert!(
+            storage
+                .retained_recovery_event(&group_route, &event_id, None, historical.created_at)
+                .unwrap()
+        );
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
