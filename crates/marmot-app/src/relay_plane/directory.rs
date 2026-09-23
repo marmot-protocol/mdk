@@ -580,8 +580,10 @@ impl DirectoryRelayPlane {
         kind: u64,
     ) -> bool {
         let state = self.state.lock().await;
+        // Pending rebuild means coverage is unknown and a retry is still owed.
+        // A signed, filter-matching EVENT can arrive before SDK subscribe
+        // returns; retain that positive observation without claiming coverage.
         state.active_endpoints.contains(endpoint)
-            && !state.pending_rebuild.contains(subscription_id)
             && !state
                 .auth_required
                 .contains(&(subscription_id.to_owned(), endpoint.to_owned()))

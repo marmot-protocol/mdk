@@ -1972,6 +1972,88 @@ async fn directory_subscribe_error_restores_filter_and_keeps_rebuild_pending() {
     assert!(!directory.accepts_live_event(id, &new_author, 0).await);
 }
 
+#[tokio::test]
+async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
+    use nostr::prelude::{EventBuilder, Keys};
+
+    let keys = Keys::generate();
+    let id = "directory_users_immediate";
+    let endpoint = RelayUrl::parse("wss://relay.example").unwrap();
+    let directory =
+        directory_plane_with_active_subscription(id, vec![keys.public_key().to_hex()], vec![0])
+            .await;
+    directory
+        .set_subscription_endpoints(std::slice::from_ref(&endpoint))
+        .await;
+    directory
+        .mark_rebuild_pending(&[id.to_owned()].into_iter().collect())
+        .await;
+    let previous = directory
+        .record_subscription_filter(
+            id.to_owned(),
+            DirectorySubscriptionFilter::new(vec![keys.public_key().to_hex()], vec![0]),
+        )
+        .await;
+    let source = Arc::new(TestNotificationSource {
+        sender: broadcast::channel(8).0,
+        subscriptions: AtomicUsize::new(0),
+        preload_lag: false,
+        panic_first: AtomicBool::new(false),
+    });
+    let (sender, mut events) = broadcast::channel(8);
+    let forwarder =
+        spawn_directory_notification_forwarder(source.clone(), sender, directory.clone());
+    timeout(Duration::from_secs(2), async {
+        while source.subscriptions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"immediate"}"#)
+        .sign_with_keys(&keys)
+        .unwrap();
+    source.send(RelayPoolNotification::Event {
+        relay_url: endpoint.clone(),
+        subscription_id: SubscriptionId::new(id),
+        event: Box::new(profile.clone()),
+    });
+    let record = timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let DirectoryRelayPlaneEvent::Record(record) = record else {
+        panic!("immediate matching event must be forwarded while subscribe is still pending");
+    };
+    assert_eq!(record.event.id, profile.id.to_hex());
+    assert_eq!(directory.stats().await.active_subscriptions, 0);
+
+    directory
+        .restore_failed_subscription_filter(id, previous)
+        .await;
+    let (to_add, _) = directory
+        .subscription_diff(&[id.to_owned()].into_iter().collect())
+        .await;
+    assert!(to_add.contains(id));
+    assert_eq!(directory.stats().await.active_subscriptions, 0);
+    assert!(directory.mark_auth_required(id, endpoint.as_str()).await);
+    source.send(RelayPoolNotification::Event {
+        relay_url: endpoint,
+        subscription_id: SubscriptionId::new(id),
+        event: Box::new(profile),
+    });
+    source.send(RelayPoolNotification::Shutdown);
+    timeout(Duration::from_secs(2), forwarder)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed)
+    ));
+}
+
 async fn directory_live_auth_challenge(deny_read: bool) {
     use futures::{SinkExt, StreamExt};
     use nostr::prelude::{EventBuilder, Keys};
