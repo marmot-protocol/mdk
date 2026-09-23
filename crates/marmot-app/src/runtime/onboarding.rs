@@ -417,6 +417,35 @@ fn finding(issue: OnboardingIssue) -> OnboardingFinding {
         endpoint: None,
     }
 }
+
+fn evaluated_onboarding_status(
+    findings: &[OnboardingFinding],
+    relay_status: Option<OnboardingStatus>,
+) -> OnboardingStatus {
+    // Endpoint health is advisory once a safe, directionally complete route
+    // has answered. Structural defects stay blocking and an internal task
+    // interruption is retryable, not evidence of a usable route.
+    if findings.iter().any(|finding| {
+        matches!(
+            finding.issue,
+            OnboardingIssue::Malformed | OnboardingIssue::TooManyRelays
+        )
+    }) {
+        OnboardingStatus::NeedsInput
+    } else if relay_status.is_some()
+        && findings
+            .iter()
+            .any(|finding| finding.issue == OnboardingIssue::Interrupted)
+    {
+        OnboardingStatus::RetryableFailure
+    } else if let Some(status) = relay_status {
+        status
+    } else if findings.is_empty() {
+        OnboardingStatus::Passed
+    } else {
+        OnboardingStatus::NeedsInput
+    }
+}
 fn onboarding_error() -> AppError {
     AppError::OnboardingActionUnavailable
 }
@@ -1721,6 +1750,7 @@ impl AccountManager {
             );
         }
         let mut findings = validate_onboarding_record(&event);
+        let mut relay_status = None;
         if step.relay() {
             let name = if step == OnboardingStep::Relays {
                 "r"
@@ -1733,7 +1763,13 @@ impl AccountManager {
                 .filter(|t| t.first().is_some_and(|v| v == name))
                 .filter_map(|t| t.get(1).cloned())
                 .collect();
-            for classified in self.app.relay_plane.classify_relay_endpoints(raw) {
+            let classifications = self.app.relay_plane.classify_relay_endpoints(raw);
+            let allowed: HashSet<String> = classifications
+                .iter()
+                .filter(|classified| classified.policy == RelayEndpointPolicy::Allowed)
+                .map(|classified| classified.endpoint.trim().to_owned())
+                .collect();
+            for classified in classifications {
                 let issue = match classified.policy {
                     RelayEndpointPolicy::Allowed => continue,
                     RelayEndpointPolicy::Invalid => OnboardingIssue::InvalidRelay,
@@ -1747,19 +1783,31 @@ impl AccountManager {
             }
             let state = crate::relay_list_state_from_event(&event);
             if let Some(state) = state {
-                let mut endpoints = state.relays.clone();
-                if step == OnboardingStep::Relays {
-                    for endpoint in state.read_relays {
-                        if !endpoints.contains(&endpoint) {
-                            endpoints.push(endpoint);
+                let has_read_route = step == OnboardingStep::InboxRelays
+                    || state
+                        .read_relays
+                        .iter()
+                        .any(|endpoint| allowed.contains(endpoint.trim()));
+                let has_write_or_inbox_route = state
+                    .relays
+                    .iter()
+                    .any(|endpoint| allowed.contains(endpoint.trim()));
+                if !has_read_route || !has_write_or_inbox_route {
+                    findings.push(finding(OnboardingIssue::NoUsableRoute));
+                    relay_status = Some(OnboardingStatus::NeedsInput);
+                } else {
+                    let mut endpoints = state.relays;
+                    if step == OnboardingStep::Relays {
+                        for endpoint in state.read_relays {
+                            if !endpoints.contains(&endpoint) {
+                                endpoints.push(endpoint);
+                            }
                         }
                     }
-                }
-                if endpoints.is_empty() {
-                    findings.push(finding(OnboardingIssue::NoUsableRoute));
-                } else {
                     // EOSE proves an actual query completed, not merely a TCP
-                    // connection. Publication is independently confirmed below.
+                    // connection. The declaration supplies read/write roles;
+                    // one completed check on an allowed declared route proves
+                    // the minimum local-use capability without editing it.
                     let (_, failures, completed) = self
                         .inspect_onboarding_relays(
                             &c.snapshot.account_id_hex,
@@ -1772,20 +1820,19 @@ impl AccountManager {
                         )
                         .await;
                     findings.extend(failures);
-                    if completed == 0 || (step == OnboardingStep::Relays && state.relays.is_empty())
-                    {
+                    if completed == 0 {
                         findings.push(finding(OnboardingIssue::NoUsableRoute));
+                        relay_status = Some(OnboardingStatus::RetryableFailure);
+                    } else {
+                        relay_status = Some(OnboardingStatus::Passed);
                     }
                 }
             } else {
                 findings.push(finding(OnboardingIssue::Malformed));
+                relay_status = Some(OnboardingStatus::NeedsInput);
             }
         }
-        let status = if findings.is_empty() {
-            OnboardingStatus::Passed
-        } else {
-            OnboardingStatus::NeedsInput
-        };
+        let status = evaluated_onboarding_status(&findings, relay_status);
         if !failures.is_empty() {
             findings.push(finding(OnboardingIssue::DiscoveryIncomplete));
             findings.extend(failures);
