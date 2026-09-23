@@ -72,7 +72,7 @@ def validate_batch(raw):
     try:
         if not 0 < len(raw) <= MAX_WIRE_BYTES:
             raise ValueError
-        value = strict_json(raw)
+        value = strict_json(raw.decode("utf-8"))
         if type(value) is not dict or set(value) != {"resourceLogs"}:
             raise ValueError
         resources = value["resourceLogs"]
@@ -189,8 +189,9 @@ def make_sink(url):
                 if response.status == 204 and not raw:
                     return "full"
         except urllib.error.HTTPError as error:
-            # Loki can accept a subset before returning a 4xx, including 429.
-            if 400 <= error.code < 500:
+            # Ordinary rate-limit 429 drops the request; rare 429 paths can
+            # accept a prefix, so a retry may duplicate that prefix.
+            if 400 <= error.code < 500 and error.code != 429:
                 return "blocked"
         except (OSError, http.client.HTTPException, ValueError, RecursionError):
             pass
@@ -250,11 +251,20 @@ def make_server(token, sink, *, clock_ns=time.time_ns):
                 if not 0 < length <= MAX_WIRE_BYTES:
                     self.reply(413 if length > MAX_WIRE_BYTES else 400, {})
                     return
-                raw = self.rfile.read(length)
-                if len(raw) != length:
-                    raise ValueError
-                bodies = validate_batch(raw)
             except (ValueError, OSError):
+                self.reply(400, {})
+                return
+            try:
+                raw = self.rfile.read(length)
+            except OSError:
+                self.reply(503, {})
+                return
+            if len(raw) != length:
+                self.reply(503, {})
+                return
+            try:
+                bodies = validate_batch(raw)
+            except ValueError:
                 self.reply(400, {})
                 return
             # This is the only side-effect boundary. All records are validated first.

@@ -69,6 +69,9 @@ class ReceiverTests(unittest.TestCase):
                     owner.rows.extend(rows[:-1])
                     raw = b"synthetic downstream rejection"
                     self.send_response(400 if owner.mode == "partial" else 429)
+                elif owner.mode == "throttle":
+                    raw = b"synthetic tenant rate limit"
+                    self.send_response(429)
                 elif owner.mode == "fail_after_prefix":
                     owner.rows.extend(rows[:1])
                     raw = b""
@@ -194,6 +197,8 @@ class ReceiverTests(unittest.TestCase):
     def test_invalid_envelopes_and_limits_make_no_downstream_call(self):
         valid = encode_batch([synthetic(1)])
         variants = [
+            valid.decode("utf-8").encode("utf-16"),
+            b"\xef\xbb\xbf" + valid,
             valid.replace(b'"resourceLogs":', b'"resourceLogs":[],"resourceLogs":', 1),
             valid.replace(b'"scopeLogs":', b'"scopeLogs":[],"scopeLogs":', 1),
             valid.replace(b'"logRecords":', b'"logRecords":[],"logRecords":', 1),
@@ -241,11 +246,47 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(self.post(encode_batch(bodies)), (409, {}))
         self.assertEqual([row[1] for row in self.readback()], bodies[:-1])
 
-    def test_downstream_429_with_accepted_prefix_blocks_the_batch(self):
+    def test_downstream_429_retries_and_can_duplicate_an_accepted_prefix(self):
         self.mode = "partial_throttle"
         bodies = [synthetic(i) for i in range(3)]
-        self.assertEqual(self.post(encode_batch(bodies)), (409, {}))
+        raw = encode_batch(bodies)
+        self.assertEqual(self.post(raw), (503, {}))
         self.assertEqual([row[1] for row in self.readback()], bodies[:-1])
+        self.mode = "normal"
+        self.assertEqual(self.post(raw), (200, {}))
+        self.assertEqual([row[1] for row in self.readback()], bodies[:-1] + bodies)
+
+    def test_downstream_429_without_acceptance_is_retryable(self):
+        self.mode = "throttle"
+        raw = encode_batch([synthetic(1)])
+        self.assertEqual(self.post(raw), (503, {}))
+        self.assertEqual(self.readback(), [])
+        self.mode = "normal"
+        self.assertEqual(self.post(raw), (200, {}))
+        self.assertEqual([row[1] for row in self.readback()], [synthetic(1)])
+
+    def test_short_and_stalled_request_reads_are_retryable(self):
+        raw = encode_batch([synthetic(1)])
+        for close_write in (True, False):
+            with self.subTest(close_write=close_write):
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", self.receiver.server_port, timeout=5
+                )
+                try:
+                    connection.putrequest("POST", "/v1/logs")
+                    connection.putheader("Authorization", "Bearer test-token")
+                    connection.putheader("Content-Type", "application/json")
+                    connection.putheader("Content-Length", str(len(raw)))
+                    connection.endheaders()
+                    connection.send(raw[:-1])
+                    if close_write:
+                        connection.sock.shutdown(socket.SHUT_WR)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 503)
+                    self.assertEqual(json.loads(response.read()), {})
+                finally:
+                    connection.close()
+        self.assertEqual(self.calls, 0)
 
     def test_uncertain_downstream_acceptance_is_retryable_and_can_duplicate(self):
         self.mode = "fail_after_prefix"

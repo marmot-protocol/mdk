@@ -6,8 +6,9 @@ one. The existing Goggles upload and tracker path is unchanged.
 
 ## Request and validation
 
-`POST /v1/logs` uses `Content-Type: application/json`, exactly one
-`Content-Length`, no compression or transfer encoding, and
+`POST /v1/logs` uses UTF-8 JSON without a BOM,
+`Content-Type: application/json`, exactly one `Content-Length`, no compression
+or transfer encoding, and
 `Authorization: Bearer <dedicated audit token>`. The harness binds loopback and
 reads the token from a named environment variable. Missing or wrong credentials
 return 401 before body processing. A deployment needs TLS and ingress/access
@@ -51,18 +52,20 @@ receiver response after that write can cause an exact-body duplicate on retry.
 | Receiver result | Future MDK action |
 | --- | --- |
 | HTTP 200 `{}` | Advance the prepared range cursor after its local durable acknowledgement commit. |
-| HTTP 409 (downstream 4xx, including 400 or 429) | Retain and block the whole range for explicit reconciliation; Loki may have accepted a subset. |
-| HTTP 503, timeout, connection loss, or other transient 5xx | Retain and retry the exact range with bounded backoff; accepted prefixes may duplicate. |
-| Receiver HTTP 400/413, 401/403, other terminal 4xx, malformed success, or any other 2xx | Retain and block until input, credential, or configuration is corrected. |
+| HTTP 409 (downstream 4xx except 429) | Retain and block the whole range for explicit reconciliation; Loki may have accepted a subset. |
+| HTTP 503, timeout, connection loss, or other transient 5xx | Retain and retry the exact range with bounded backoff; accepted prefixes may duplicate. This includes downstream 429 and short or stalled receiver body reads. |
+| Receiver HTTP 400/413, 401, other terminal 4xx, malformed success, or any other 2xx | Retain and block until input, credential, or configuration is corrected. |
 
 Loki's push API has no OTLP `partialSuccess` body. Its
 [distributor](https://github.com/grafana/loki/blob/main/pkg/distributor/distributor.go)
-can write valid entries and then return 400 for rejected entries, or 429 when
-some streams are accepted.
-The receiver maps any downstream 4xx to 409 without copying Loki's error body;
-this blocks even a 429 that may have written nothing. An unexpected downstream
-2xx, 5xx, malformed response, or exception becomes 503. A 5xx or connection
-failure may also follow accepted writes. The receiver **never** reports full
+can write valid entries and then return 400 for rejected entries. Ordinary
+tenant rate-limit 429 drops the whole request, while an IngestLimits 429 can
+follow acceptance of some streams. The receiver maps downstream 429 to 503 so
+throttling can recover; retries of the rare accepted prefix can duplicate it.
+Other downstream 4xx responses become 409 without copying Loki's error body.
+An unexpected downstream 2xx, 5xx, malformed response, or exception becomes
+503. A 5xx or connection failure may also follow accepted writes. The receiver
+**never** reports full
 success after a known or uncertain partial acceptance. Without a receipt ledger
 or an atomic downstream transaction, this stack cannot provide exactly-once
 delivery or identify the accepted subset. Loki 204 is API acceptance, not a
@@ -89,6 +92,11 @@ uv run --with 'jsonschema==4.25.1' python scripts/audit-otlp-receiver/receiver.p
   --token-env AUDIT_CONTRACT_TEST_TOKEN
 ```
 
-The printed listener URL is also loopback and ephemeral. Production Alloy/Loki
-configuration, Goggles ingestion, MDK runtime ownership, client bindings,
-retention, and a real Loki durability/readback gate require separate work.
+The printed listener URL is also loopback and ephemeral. The intended production
+implementer is a dedicated validating audit gateway that enforces this contract
+and pushes directly to Loki. A generic Alloy OTLP endpoint does not satisfy the
+validation and response boundary. This Python server is only an isolated
+reference harness; the MDK sender must remain inactive until the gateway is
+available. Production Alloy/Loki configuration, Goggles ingestion, MDK runtime
+ownership, client bindings, retention, and a real Loki durability/readback gate
+require separate work.
