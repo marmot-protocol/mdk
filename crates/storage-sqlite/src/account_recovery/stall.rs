@@ -84,7 +84,8 @@ impl SqliteAccountStorage {
             }
             // An absent or epoch-mismatched detector row cannot be invented by
             // arbitrary ciphertext, a completed unrelated scope or this timer.
-            let prior: Option<(i64,i64,bool,i64,Option<Vec<u8>>,i64,Option<i64>)> = conn.query_row_cached(
+            type StallEvidenceRow = (i64, i64, bool, i64, Option<Vec<u8>>, i64, Option<i64>);
+            let prior: Option<StallEvidenceRow> = conn.query_row_cached(
                 "SELECT stalled_epoch,fruitless_completions,fruitless_reported,last_arm_at_ms,
                  qualified_certificate,last_engine_observation,last_sample_at_ms
                  FROM app_epoch_stall_evidence WHERE group_id=?1", [group],

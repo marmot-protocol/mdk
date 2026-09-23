@@ -3712,13 +3712,11 @@ impl AppClient {
             && let Some(verdict) =
                 drain_verdict.filter(|verdict| *verdict != DrainVerdict::Complete)
         {
-            return result.and_then(|summary| {
-                Err(incomplete_full_history_repair(
-                    summary,
-                    verdict,
-                    self.delivery_loss_blocks_cursor(),
-                ))
-            });
+            return Err(incomplete_full_history_repair(
+                result?,
+                verdict,
+                self.delivery_loss_blocks_cursor(),
+            ));
         }
         result
     }

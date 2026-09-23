@@ -326,3 +326,9 @@ and superseded checks, and the remaining blocking acquisition limitations.
   failure category (formerly carried by `BlockingTask`); the privacy-safe error
   classification regression passes with the explicit incomplete case included.
   This is an adapter correction, not an expanded simulator/campaign workstream.
+
+- Final lint cleanup: default and diagnostics-feature clippy pass after naming
+  the stored stall row type, propagating the existing repair error without a
+  large-error closure, and simplifying a test boolean comparison. Runtime error
+  priority and test assertions are unchanged. Full `fast-ci` and the combined
+  suites will run on the following frozen signed checkpoint.

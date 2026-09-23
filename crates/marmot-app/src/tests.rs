@@ -12638,13 +12638,12 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         release_marker.store(true, std::sync::atomic::Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if app
+                if !app
                     .account_storage("alice")
                     .unwrap()
                     .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
                     .unwrap()
                     .is_empty()
-                    == false
                 {
                     break;
                 }
