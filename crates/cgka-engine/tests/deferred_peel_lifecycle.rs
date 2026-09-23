@@ -2248,6 +2248,34 @@ async fn publish_cycle_replay_does_not_classify_rows_that_stay_parked() {
     }
 }
 
+/// Retained-anchor contexts one publish-cycle replay derives over a backlog of
+/// `backlog` unreadable rows.
+async fn replay_context_derivations(backlog: usize) -> u64 {
+    let (mut carol, _carol_storage, group_id, _parked) =
+        carol_parked_behind_retained_anchors(backlog).await;
+    let pending = stage_publish_halting_ingest(&mut carol, &group_id).await;
+    let before = carol.engine_metrics();
+    carol.publish_failed(pending).await.unwrap();
+    carol.engine_metrics().past_peel_context_derivations - before.past_peel_context_derivations
+}
+
+/// Deriving a retained anchor's peel context rewinds live group state. A
+/// replay offers the same anchors to every row it retries, so it pays that
+/// rewind once per anchor, never once per parked row.
+#[tokio::test]
+async fn publish_cycle_replay_derives_each_anchor_context_once() {
+    let single_row = replay_context_derivations(1).await;
+    assert!(
+        single_row > 0,
+        "the fixture must leave anchors below the tip for the replay to try"
+    );
+    assert_eq!(
+        replay_context_derivations(8).await,
+        single_row,
+        "a longer backlog must not re-derive the same anchors"
+    );
+}
+
 /// If account accounting was initialized by group A, a later deferral in
 /// group B is charged incrementally. Group B's first sweep must reconcile that
 /// contribution rather than adding the same durable bytes again.

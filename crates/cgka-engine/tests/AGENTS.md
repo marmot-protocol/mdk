@@ -58,7 +58,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `deferred_peel_lifecycle.rs`
   - **Owns:** Durable deferred retry lifecycles, generation barriers, capacity limits, context-cache invalidation,
-    foreground budgets, and background work/time budgets with restart and eventual-completion checks.
+    foreground budgets, and background work/time budgets with restart and eventual-completion checks. Also the
+    publish-cycle replay's cost: rows it keeps parked are not lineage-classified, and each retained anchor's context
+    is derived once per replay rather than once per row.
 
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, retained-anchor behavior, and the canonical

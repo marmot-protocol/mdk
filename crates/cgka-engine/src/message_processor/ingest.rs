@@ -68,11 +68,12 @@ pub(crate) struct DeferredPeelSweep<'a> {
     past_contexts: Option<&'a PastPeelContextCache>,
 }
 
-/// Secret-bearing, single-group cache owned by one deferred-peel candidate
-/// generation, never persisted. Each entry derives from one immutable retained
-/// anchor, so it outlives a bounded slice; the owning generation is dropped
-/// whenever canonical context changes. Inactive snapshots are cached as None;
-/// failures are not cached and can be retried normally.
+/// Secret-bearing, single-group cache held in the group's deferred-peel state
+/// and never persisted. Each entry derives from one retained anchor, so it
+/// outlives a bounded slice or a replay; the state drops it whenever canonical
+/// context changes (see `DeferredPeelGroupState::past_peel_contexts`).
+/// Inactive snapshots are cached as None; failures are not cached and can be
+/// retried normally.
 #[derive(Default)]
 pub(super) struct PastPeelContextCache {
     contexts: Mutex<PastPeelContexts>,
@@ -2870,9 +2871,10 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// Branch contexts come first because they need no storage access at all —
     /// they are owned values whose exporter secret was derived while the
-    /// candidate state was materialized. A bounded sweep lazily materializes
-    /// each historical anchor once, restores live state, and reuses the owned
-    /// context until that sweep ends. Live ingest has no cross-message cache.
+    /// candidate state was materialized. A sweep or a publish-cycle replay
+    /// passes the group's cache, so each historical anchor is materialized
+    /// once, live state restored, and the owned context reused until canonical
+    /// state changes. Live ingest has no cross-message cache.
     async fn try_peel_group_message_from_recovery_contexts(
         &self,
         msg: &TransportMessage,
