@@ -15,7 +15,7 @@ use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::transport_adapter::TransportEndpointRejectionCategory;
-use cgka_traits::{GroupId, SecretBytes, TransportAdapterError, TransportEndpoint};
+use cgka_traits::{GroupId, MemberId, SecretBytes, TransportAdapterError, TransportEndpoint};
 use futures::stream::{FuturesUnordered, StreamExt};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
@@ -283,7 +283,7 @@ struct AccountTeardownGuard<'a> {
 #[derive(Clone)]
 struct TrackedWorkerReaper {
     account_id: String,
-    handle: Arc<Mutex<JoinHandle<()>>>,
+    handle: Arc<Mutex<JoinHandle<Result<(), AppError>>>>,
 }
 
 impl<'a> AccountTeardownGuard<'a> {
@@ -5815,10 +5815,15 @@ impl AccountManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for (account_id, worker) in workers {
+                let relay_plane = self.shared.relay_plane().clone();
+                let retired_account = account_id.clone();
                 reapers.push(TrackedWorkerReaper {
                     account_id,
                     handle: Arc::new(Mutex::new(tokio::spawn(async move {
                         worker.shutdown().await;
+                        let member = MemberId::new(hex::decode(retired_account)?);
+                        relay_plane.deactivate_account_context(&member).await?;
+                        Ok(())
                     }))),
                 });
             }
@@ -5836,8 +5841,13 @@ impl AccountManager {
         for reaper in reapers {
             let mut handle = reaper.handle.lock().await;
             let completed = handle.is_finished();
-            if completed {
-                let _ = (&mut *handle).await;
+            if completed && let Ok(Err(error)) = (&mut *handle).await {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "finish_worker_reapers",
+                    error_kind = error.privacy_safe_kind(),
+                    "account transport retirement failed",
+                );
             }
             drop(handle);
             if completed {
@@ -5871,21 +5881,18 @@ impl AccountManager {
             .collect::<Vec<_>>();
         for reaper in reapers {
             let mut handle = reaper.handle.lock().await;
-            if handle.is_finished() {
-                let _ = (&mut *handle).await;
-            } else if tokio::time::timeout_at(deadline, &mut *handle)
+            let result = tokio::time::timeout_at(deadline, &mut *handle)
                 .await
-                .is_err()
-            {
-                return Err(AppError::BlockingTask(
-                    "account worker cleanup still in progress".into(),
-                ));
-            }
+                .map_err(|_| {
+                    AppError::BlockingTask("account worker cleanup still in progress".into())
+                })?;
             drop(handle);
             self.worker_reapers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .retain(|tracked| !Arc::ptr_eq(&tracked.handle, &reaper.handle));
+            result
+                .map_err(|_| AppError::BlockingTask("account worker cleanup failed".into()))??;
         }
         Ok(())
     }
@@ -5900,7 +5907,14 @@ impl AccountManager {
                 .cloned();
             let Some(reaper) = reaper else { break };
             let mut handle = reaper.handle.lock().await;
-            let _ = (&mut *handle).await;
+            if let Ok(Err(error)) = (&mut *handle).await {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "finish_worker_reapers_unbounded",
+                    error_kind = error.privacy_safe_kind(),
+                    "account transport retirement failed",
+                );
+            }
             drop(handle);
             self.worker_reapers
                 .lock()

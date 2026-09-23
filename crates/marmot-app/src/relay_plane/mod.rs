@@ -990,6 +990,34 @@ impl MarmotRelayPlane {
         Ok(())
     }
 
+    /// Retire a stopped account worker's subscriptions and immutable SDK
+    /// authenticator before a replacement worker can register a fresh signer.
+    pub(crate) async fn deactivate_account_context(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<(), TransportAdapterError> {
+        account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
+        self.inner
+            .transport
+            .adapter
+            .deactivate_account(account_id)
+            .await?;
+        if let Some(sdk) = &self.inner.transport.sdk_relay_client {
+            sdk.remove_account(account_id).await;
+        }
+        if let Some(handle) = self
+            .inner
+            .transport
+            .account_notification_forwarders
+            .lock()
+            .await
+            .remove(account_id)
+        {
+            handle.abort();
+        }
+        Ok(())
+    }
+
     pub async fn relay_health(&self) -> RelayPlaneHealth {
         let directory = self.inner.directory.stats().await;
         let forwarder = self
@@ -1888,6 +1916,13 @@ fn spawn_relay_notification_supervisor_scoped(
                         || transport.shutting_down.load(Ordering::SeqCst)
                         || source.is_shutdown()
                     {
+                        if matches!(outcome.exit, RelayNotificationConsumerExit::Lagged(_)) {
+                            recover_relay_notification_forwarder_scoped(
+                                &transport,
+                                outcome.exit,
+                                account_id.as_ref(),
+                            );
+                        }
                         break;
                     }
                     recover_relay_notification_forwarder_scoped(
@@ -1975,6 +2010,21 @@ async fn run_relay_notification_consumer(
 /// Keep reading the SDK receiver while account delivery or telemetry awaits.
 /// The bounded queue is an event lane; a full queue becomes a typed gap before
 /// the reader can block, and the watch control lane advances independently.
+fn abandoned_notification_lane<T>(
+    sender: &mpsc::Sender<T>,
+    in_flight: &AtomicBool,
+    source: &dyn RelayNotificationSource,
+) -> RelayNotificationConsumerExit {
+    let abandoned = (sender.max_capacity() - sender.capacity()) as u64
+        + u64::from(in_flight.load(Ordering::SeqCst));
+    if abandoned > 0 {
+        source.record_loss(abandoned);
+        RelayNotificationConsumerExit::Lagged(abandoned)
+    } else {
+        RelayNotificationConsumerExit::Closed
+    }
+}
+
 async fn run_relay_notification_consumer_scoped(
     mut receiver: RelayNotificationStream,
     adapter: NostrTransportAdapter,
@@ -1983,11 +2033,16 @@ async fn run_relay_notification_consumer_scoped(
 ) -> RelayNotificationConsumerOutcome {
     const EVENT_QUEUE_CAPACITY: usize = 256;
     let (sender, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let worker_in_flight = in_flight.clone();
     let mut worker = tokio::spawn(async move {
         while let Some(notification) = event_rx.recv().await {
+            worker_in_flight.store(true, Ordering::SeqCst);
             if handle_relay_notification(notification, &adapter, account_id.as_ref()).await {
+                worker_in_flight.store(false, Ordering::SeqCst);
                 return true;
             }
+            worker_in_flight.store(false, Ordering::SeqCst);
         }
         false
     });
@@ -1996,27 +2051,38 @@ async fn run_relay_notification_consumer_scoped(
         tokio::select! {
             worker_result = &mut worker => {
                 drop(abort_on_drop);
+                let exit = abandoned_notification_lane(&sender, &in_flight, source.as_ref());
                 return RelayNotificationConsumerOutcome {
                     receiver,
-                    exit: if matches!(worker_result, Ok(true)) {
+                    exit: if exit == RelayNotificationConsumerExit::Closed && matches!(worker_result, Ok(true)) {
                         RelayNotificationConsumerExit::Shutdown
                     } else {
-                        RelayNotificationConsumerExit::Closed
+                        exit
                     },
                 };
             }
             update = receiver.next() => match update {
                 Some(NotificationUpdate::Notification(notification)) => {
                     if matches!(notification, ClientNotification::Shutdown) {
+                        let abandoned = (sender.max_capacity() - sender.capacity()) as u64
+                            + u64::from(in_flight.load(Ordering::SeqCst));
+                        if abandoned > 0 {
+                            source.record_loss(abandoned);
+                        }
                         return RelayNotificationConsumerOutcome {
                             receiver,
-                            exit: RelayNotificationConsumerExit::Shutdown,
+                            exit: if abandoned > 0 {
+                                RelayNotificationConsumerExit::Lagged(abandoned)
+                            } else {
+                                RelayNotificationConsumerExit::Shutdown
+                            },
                         };
                     }
                     if let Err(error) = sender.try_send(notification) {
                         let skipped = match error {
                             mpsc::error::TrySendError::Full(_) => {
                                 1 + sender.max_capacity().saturating_sub(sender.capacity()) as u64
+                                    + u64::from(in_flight.load(Ordering::SeqCst))
                             }
                             mpsc::error::TrySendError::Closed(_) => 1,
                         };
@@ -2028,16 +2094,30 @@ async fn run_relay_notification_consumer_scoped(
                     }
                 }
                 Some(NotificationUpdate::Lagged { skipped }) => {
-                    source.record_loss(skipped);
+                    let abandoned = skipped
+                        .saturating_add((sender.max_capacity() - sender.capacity()) as u64)
+                        .saturating_add(u64::from(in_flight.load(Ordering::SeqCst)));
+                    source.record_loss(abandoned);
                     return RelayNotificationConsumerOutcome {
                         receiver,
-                        exit: RelayNotificationConsumerExit::Lagged(skipped),
+                        exit: RelayNotificationConsumerExit::Lagged(abandoned),
                     };
                 }
-                None => return RelayNotificationConsumerOutcome {
-                    receiver,
-                    exit: RelayNotificationConsumerExit::Closed,
-                },
+                None => {
+                    let abandoned = (sender.max_capacity() - sender.capacity()) as u64
+                        + u64::from(in_flight.load(Ordering::SeqCst));
+                    if abandoned > 0 {
+                        source.record_loss(abandoned);
+                    }
+                    return RelayNotificationConsumerOutcome {
+                        receiver,
+                        exit: if abandoned > 0 {
+                            RelayNotificationConsumerExit::Lagged(abandoned)
+                        } else {
+                            RelayNotificationConsumerExit::Closed
+                        },
+                    };
+                }
             }
         }
     }
@@ -2608,29 +2688,9 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         }
         let mut activation = self.incremental_activation.lock().await;
         *activation = None;
-        account_deliveries_write(&self.relay_plane.inner.transport.account_deliveries)
-            .remove(account_id);
         self.relay_plane
-            .inner
-            .transport
-            .adapter
-            .deactivate_account(account_id)
-            .await?;
-        if let Some(sdk) = &self.relay_plane.inner.transport.sdk_relay_client {
-            sdk.remove_account(account_id).await;
-        }
-        if let Some(handle) = self
-            .relay_plane
-            .inner
-            .transport
-            .account_notification_forwarders
-            .lock()
+            .deactivate_account_context(account_id)
             .await
-            .remove(account_id)
-        {
-            handle.abort();
-        }
-        Ok(())
     }
 
     async fn publish(

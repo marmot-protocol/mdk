@@ -3368,6 +3368,10 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             .is_none(),
         "restart reconciliation must preserve every deleted group"
     );
+    runtime
+        .publish_key_package(&alice_id)
+        .await
+        .expect("retiring Bob's signer must not disrupt Alice's transport");
 
     // A full routing rebuild for unrelated account activity must preserve the
     // hidden live routes that can receive a future resurrection message.

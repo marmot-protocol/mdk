@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,6 +12,7 @@ use cgka_traits::{
     TransportPublishFailure, collapse_publish_failure_summaries,
 };
 use futures::StreamExt;
+use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     AcquisitionEnd as SdkAcquisitionEnd, AcquisitionLimits as SdkAcquisitionLimits, Client,
     ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder, EventId, Filter,
@@ -18,7 +20,7 @@ use nostr_sdk::prelude::{
     RelayStatus, RelayUrl, ReqTarget, SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions,
     Tag, Timestamp as NostrTimestamp,
 };
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
 use transport_nostr_peeler::{
@@ -836,40 +838,30 @@ impl NostrSdkRelayClient {
     /// queue. The task exits when the relay pool shuts down.
     pub fn spawn_notification_forwarder(&self, adapter: NostrTransportAdapter) -> JoinHandle<()> {
         let client = self.client.clone();
+        let loss = self.clone();
         tokio::spawn(async move {
-            let mut notifications = client.notifications();
-            while let Some(notification) = notifications.next().await {
-                match notification {
-                    ClientNotification::Event {
-                        relay_url,
-                        subscription_id,
-                        event,
-                    } => {
-                        if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                            tracing::trace!(
-                                target: "transport_nostr_adapter::sdk_client",
-                                method = "spawn_notification_forwarder",
-                                "forwarding SDK relay event"
-                            );
-                            let _ = adapter
-                                .handle_relay_event(NostrRelayEvent {
-                                    endpoint: TransportEndpoint(relay_url.to_string()),
-                                    subscription_id: Some(subscription_id.to_string()),
-                                    event,
-                                })
-                                .await;
-                        }
-                    }
-                    ClientNotification::Message { relay_url, message } => match *message {
-                        RelayMessage::Event {
+            loss.notification_receiver_replaced();
+            const EVENT_QUEUE_CAPACITY: usize = 256;
+            let (sender, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+            let in_flight = Arc::new(AtomicBool::new(false));
+            let worker_in_flight = in_flight.clone();
+            let mut worker = tokio::spawn(async move {
+                while let Some(notification) = event_rx.recv().await {
+                    worker_in_flight.store(true, Ordering::SeqCst);
+                    match notification {
+                        ClientNotification::Event {
+                            relay_url,
                             subscription_id,
                             event,
                         } => {
-                            // Every relay copy is telemetry only; delivery uses
-                            // the SDK's deduplicated Event notification above.
                             if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                                adapter
-                                    .observe_relay_event(NostrRelayEvent {
+                                tracing::trace!(
+                                    target: "transport_nostr_adapter::sdk_client",
+                                    method = "spawn_notification_forwarder",
+                                    "forwarding SDK relay event"
+                                );
+                                let _ = adapter
+                                    .handle_relay_event(NostrRelayEvent {
                                         endpoint: TransportEndpoint(relay_url.to_string()),
                                         subscription_id: Some(subscription_id.to_string()),
                                         event,
@@ -877,19 +869,88 @@ impl NostrSdkRelayClient {
                                     .await;
                             }
                         }
-                        RelayMessage::EndOfStoredEvents(subscription_id) => {
-                            adapter
-                                .handle_relay_eose(
-                                    TransportEndpoint(relay_url.to_string()),
-                                    subscription_id.to_string(),
-                                )
-                                .await;
+                        ClientNotification::Message { relay_url, message } => match *message {
+                            RelayMessage::Event {
+                                subscription_id,
+                                event,
+                            } => {
+                                // Every relay copy is telemetry only; delivery uses
+                                // the SDK's deduplicated Event notification above.
+                                if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
+                                    adapter
+                                        .observe_relay_event(NostrRelayEvent {
+                                            endpoint: TransportEndpoint(relay_url.to_string()),
+                                            subscription_id: Some(subscription_id.to_string()),
+                                            event,
+                                        })
+                                        .await;
+                                }
+                            }
+                            RelayMessage::EndOfStoredEvents(subscription_id) => {
+                                adapter
+                                    .handle_relay_eose(
+                                        TransportEndpoint(relay_url.to_string()),
+                                        subscription_id.to_string(),
+                                    )
+                                    .await;
+                            }
+                            _ => {}
+                        },
+                        ClientNotification::Shutdown => {
+                            worker_in_flight.store(false, Ordering::SeqCst);
+                            break;
                         }
-                        _ => {}
-                    },
-                    ClientNotification::Shutdown => break,
+                    }
+                    worker_in_flight.store(false, Ordering::SeqCst);
+                }
+            });
+            let mut notifications = client.notifications_with_gaps();
+            loop {
+                let update = tokio::select! {
+                    _ = &mut worker => {
+                        let abandoned = (sender.max_capacity() - sender.capacity()) as u64
+                            + u64::from(in_flight.load(Ordering::SeqCst));
+                        if abandoned > 0 {
+                            loss.record_notification_gap(abandoned);
+                        }
+                        return;
+                    }
+                    update = notifications.next() => update,
+                };
+                let Some(update) = update else { break };
+                match update {
+                    NotificationUpdate::Notification(ClientNotification::Shutdown) => break,
+                    NotificationUpdate::Notification(notification) => {
+                        if sender.try_send(notification).is_err() {
+                            // The blocked event worker may also hold one item.
+                            let abandoned = 1
+                                + (sender.max_capacity() - sender.capacity()) as u64
+                                + u64::from(in_flight.load(Ordering::SeqCst));
+                            loss.record_notification_gap(abandoned);
+                            worker.abort();
+                            let _ = worker.await;
+                            return;
+                        }
+                    }
+                    NotificationUpdate::Lagged { skipped } => {
+                        let abandoned = skipped
+                            .saturating_add((sender.max_capacity() - sender.capacity()) as u64)
+                            .saturating_add(u64::from(in_flight.load(Ordering::SeqCst)));
+                        loss.record_notification_gap(abandoned);
+                        worker.abort();
+                        let _ = worker.await;
+                        return;
+                    }
                 }
             }
+            let abandoned = (sender.max_capacity() - sender.capacity()) as u64
+                + u64::from(in_flight.load(Ordering::SeqCst));
+            if abandoned > 0 {
+                loss.record_notification_gap(abandoned);
+                worker.abort();
+            }
+            drop(sender);
+            let _ = worker.await;
         })
     }
 
@@ -2402,8 +2463,8 @@ fn relay_rejection_endpoint_failure(
 mod tests {
     use super::*;
     use crate::{NostrKeyPackagePublication, SubscriptionAttempt};
-    use cgka_traits::Timestamp;
     use cgka_traits::engine::KeyPackage;
+    use cgka_traits::{Timestamp, TransportAdapter};
     use futures::{SinkExt, StreamExt};
     use nostr_relay_builder::MockRelay;
     use nostr_sdk::prelude::{DatabaseEventStatus, EventBuilder, FinalizeEvent, Keys, Kind, Tag};
@@ -2680,6 +2741,92 @@ mod tests {
         assert!(root.notification_loss_for_account(&bob_id).await.is_err());
         assert_eq!(alice_watch.borrow().as_ref().unwrap().cumulative_skipped, 6);
         root.shutdown_accounts().await;
+    }
+
+    #[tokio::test]
+    async fn public_forwarder_reports_loss_while_delivery_is_blocked() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let account = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+        let mut loss = sdk.notification_loss().unwrap();
+        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account,
+                inbox_endpoints: vec![endpoint],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+        // Reserve every adapter delivery slot. The forwarder's event worker
+        // blocks, while its loss-aware SDK reader must keep running.
+        let held_delivery_slots = adapter
+            .delivery_tx
+            .reserve_many(crate::DELIVERY_BUFFER)
+            .await
+            .unwrap();
+        for index in 0..400 {
+            let event = EventBuilder::new(Kind::GiftWrap, format!("blocked-{index}"))
+                .tag(Tag::public_key(keys.public_key()))
+                .finalize(&keys)
+                .unwrap();
+            relay.add_event(event).await.unwrap();
+        }
+        timeout(Duration::from_secs(10), async {
+            loop {
+                loss.changed().await.unwrap();
+                if loss
+                    .borrow_and_update()
+                    .as_ref()
+                    .is_some_and(|gap| gap.cumulative_skipped > 0)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("loss watch advances while event delivery is blocked");
+        assert!(loss.borrow().as_ref().unwrap().cumulative_skipped > 0);
+        drop(held_delivery_slots);
+        timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("lossy forwarder exits after recording its gap")
+            .unwrap();
+        let generation = loss
+            .borrow_and_update()
+            .as_ref()
+            .unwrap()
+            .receiver_generation;
+        let replacement = sdk.spawn_notification_forwarder(adapter);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                loss.changed().await.unwrap();
+                if loss
+                    .borrow_and_update()
+                    .as_ref()
+                    .unwrap()
+                    .receiver_generation
+                    > generation
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("replacement advances the control generation");
+        assert_eq!(
+            loss.borrow().as_ref().unwrap().receiver_generation,
+            generation + 1
+        );
+        sdk.client.shutdown().await;
+        timeout(Duration::from_secs(2), replacement)
+            .await
+            .expect("replacement exits on shutdown")
+            .unwrap();
     }
 
     fn signed_sdk_from_client(client: Client, keys: Keys) -> NostrSdkRelayClient {

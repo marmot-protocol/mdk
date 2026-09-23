@@ -388,6 +388,52 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
 }
 
 #[tokio::test]
+async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
+    let sdk = NostrSdkRelayClient::multi_account();
+    let alice_keys = nostr::prelude::Keys::generate();
+    let bob_keys = nostr::prelude::Keys::generate();
+    let alice = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+    let bob = MemberId::new(bob_keys.public_key().to_bytes().to_vec());
+    let alice_client = sdk
+        .register_account(alice.clone(), Arc::new(alice_keys))
+        .await
+        .unwrap();
+    sdk.register_account(bob.clone(), Arc::new(bob_keys))
+        .await
+        .unwrap();
+    let alice_loss = sdk.notification_loss_for_account(&alice).await.unwrap();
+    let bob_loss = sdk.notification_loss_for_account(&bob).await.unwrap();
+    let source = SdkRelayNotificationSource {
+        client: alice_client.client().clone(),
+        loss: Some(alice_client),
+    };
+    let (sender, _receiver) = mpsc::channel(4);
+    sender.try_send(RelayPoolNotification::Shutdown).unwrap();
+    sender.try_send(RelayPoolNotification::Shutdown).unwrap();
+    let in_flight = AtomicBool::new(true);
+    let failed_worker = tokio::spawn(async { panic!("forced event worker failure") });
+    assert!(failed_worker.await.unwrap_err().is_panic());
+    let exit = abandoned_notification_lane(&sender, &in_flight, &source);
+    assert_eq!(exit, RelayNotificationConsumerExit::Lagged(3));
+    assert_eq!(alice_loss.borrow().as_ref().unwrap().cumulative_skipped, 3);
+    assert!(bob_loss.borrow().is_none());
+
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+    let bob_adapter = plane.account_adapter(bob, relay);
+    recover_relay_notification_forwarder_scoped(&plane.inner.transport, exit, Some(&alice));
+    assert_eq!(
+        alice_adapter
+            .pending_delivery_overflow()
+            .unwrap()
+            .notification_losses,
+        1
+    );
+    assert!(bob_adapter.pending_delivery_overflow().is_none());
+}
+
+#[tokio::test]
 async fn notification_recovery_closes_only_account_delivery() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
