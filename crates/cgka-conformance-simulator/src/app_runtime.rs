@@ -2520,6 +2520,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::RuntimeStopping
         | AppError::TransportClosed
         | AppError::AccountCatchUp(_)
+        | AppError::FullHistoryRepairIncomplete { .. }
         | AppError::RelayDirectory(_)
         | AppError::Publish(_)
         | AppError::BlobStore(_)
@@ -2879,6 +2880,10 @@ mod tests {
         assert!(!denied.message.contains(marker));
         for failure in [
             AppError::RuntimeBusy,
+            AppError::FullHistoryRepairIncomplete {
+                reason: marmot_app::FullHistoryRepairIncompleteReason::CoverageUnproven,
+                delivery_loss_pending: true,
+            },
             AppError::AccountWorkerResponseTimedOut,
             AppError::ChatPresentationNotReady,
             AppError::AgentStreamSendFailed(Box::new(AppError::Publish(marker.into()))),

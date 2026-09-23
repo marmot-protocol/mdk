@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-19
+updated: 2026-09-23
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -103,16 +103,21 @@ membership and permits fresh messages to recreate the chat. The Rust runtime, Un
 must close group views/subscriptions and clear host-owned media caches. Existing published or already in-flight
 network traffic cannot be recalled. Transport cleanup failures retry without undoing the committed local deletion.
 
-Explicit app full-history repair now retains one activation and strict endpoint EOSE coverage across checkpointed
-work quanta, with a 60-second cooperative overall budget and safe-boundary cancellation. Incomplete overflow
-recovery remains durable and generation-checked. Snapshot reads can run during the wait; mutations retain account
-FIFO ordering. This continuation does not isolate engine or network execution from the account worker.
+One durable owner now authorizes account-history acquisition from startup, receive, maintenance, convergence and
+explicit repair. Coalesced demand keeps independent completion predicates and shared retry eligibility across reopen.
+Full-history repair retains one activation across checkpointed work quanta, with a 60-second cooperative overall
+budget and safe-boundary cancellation. EOSE alone is not qualified history coverage; the current SDK reports honest
+incomplete outcomes. Loss retirement requires qualified admission and an exact live acknowledgment, with cursor
+safety and durable debt preserved on failure. Snapshot reads can run during the wait; mutations retain account FIFO
+ordering. Network waits remain on the account worker; nonblocking acquisition/scheduling belongs to #1947.
+See the [owner integration ledger](../further-context/account-recovery-integration.md) for the acceptance matrix,
+same-schema conservative mode, coordinated migration landing and approved unresolved-watermark retention exception.
 
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must
 explicitly confirm replacing that MLS state; local message history remains. `group_recovery_status` exposes offers,
-pending/failed inviter recovery, and an `automatic_recovery_failed` warning after repeated relay-confirmed full-history
-replays recover nothing. Local self-updates cannot clear a latched warning. Rust runtime, UniFFI, and C expose query, confirm, and decline commands. Hosts must display the
+pending/failed inviter recovery, and an `automatic_recovery_failed` warning from distinct paced local observations
+with qualified history evidence while the engine remains stalled. EOSE or repeated replay alone cannot mint that evidence. Local self-updates cannot clear a latched warning. Rust runtime, UniFFI, and C expose query, confirm, and decline commands. Hosts must display the
 Welcome author and request explicit consent; these commands do not infer consent from ordinary invite acceptance.
 See [invitation recovery](../invitation-recovery.md) for persistence, retry, and integration contracts.
 

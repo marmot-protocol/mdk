@@ -320,3 +320,9 @@ and superseded checks, and the remaining blocking acquisition limitations.
   was removed and the probe restricted to tests. The next run found one remaining
   test reference to the removed field; `aebad88a` corrects it to inspect owner mode.
   Neither failed run is acceptance evidence; full checks are rerunning.
+
+- Workspace integration: exhaustive simulator classification initially rejected
+  the new `FullHistoryRepairIncomplete` variant. It now retains the prior resource
+  failure category (formerly carried by `BlockingTask`); the privacy-safe error
+  classification regression passes with the explicit incomplete case included.
+  This is an adapter correction, not an expanded simulator/campaign workstream.
