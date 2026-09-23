@@ -7,8 +7,9 @@ use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, Event, Filter, Kind, PublicKey, RelayMessage, RelayNotification,
-    RelayStatus, RelayUrl, ReqTarget, SubscribeAutoCloseOptions, SubscriptionId,
+    AcquisitionEnd, AcquisitionLimits, Client as NostrSdkClient, Event, Filter, Kind, PublicKey,
+    RelayMessage, RelayNotification, RelayStatus, RelayUrl, ReqTarget, SubscribeAutoCloseOptions,
+    SubscriptionId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
@@ -25,9 +26,7 @@ const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 pub(crate) enum DirectoryInspectionError {
     Unreachable,
     TimedOut,
-    #[allow(dead_code)] // Retained for the onboarding inspection contract.
     AuthenticationRequired,
-    #[allow(dead_code)] // Retained for the onboarding inspection contract.
     PaymentRequired,
     Restricted,
     InvalidRequest,
@@ -748,7 +747,6 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
         use DirectoryInspectionError::*;
-        use nostr_sdk::prelude::ReqExitPolicy;
         // The signer belongs to this request only, never to a shared mutable
         // directory client that could authenticate as another account.
         let builder = NostrSdkClient::builder();
@@ -777,8 +775,8 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         .await
         .map_err(|_| TimedOut)?
         .map_err(|_| Unreachable)?;
-        let relay = client
-            .relay(url)
+        client
+            .relay(url.clone())
             .await
             .map_err(|_| Unreachable)?
             .ok_or(Unreachable)?;
@@ -798,24 +796,42 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             }
             .kind(Kind::from(kind))
             .limit(query.limit);
-            let events = relay
-                .fetch_events(filter)
-                .timeout(DIRECTORY_RELAY_FETCH_WAIT)
-                .policy(ReqExitPolicy::ExitOnEOSE)
+            // A successful empty fetch can hide a CLOSED terminal. The bounded
+            // SDK acquisition retains that typed outcome and its wire reason.
+            let report = client
+                .acquire_events(
+                    ReqTarget::single(&url, [filter]),
+                    AcquisitionLimits::new(
+                        1,
+                        query.limit.saturating_add(1).max(1),
+                        16 * 1024 * 1024,
+                        DIRECTORY_RELAY_FETCH_WAIT,
+                    ),
+                )
+                .await;
+            let report = report
+                .map_err(|_| Unreachable)?
+                .finish()
                 .await
-                .map_err(|error| {
-                    use nostr_sdk::prelude::ErrorKind;
-                    match error.kind() {
-                        ErrorKind::Timeout => TimedOut,
-                        ErrorKind::Rejected | ErrorKind::Policy => Restricted,
-                        _ => Unreachable,
-                    }
-                })?;
+                .map_err(|_| Unreachable)?;
+            let result = report.relays.get(&url).ok_or(Unreachable)?;
+            match &result.end {
+                AcquisitionEnd::Completed => {}
+                AcquisitionEnd::AuthenticationFailed => return Err(AuthenticationRequired),
+                AcquisitionEnd::Rejected(reason) | AcquisitionEnd::RelayClosed(reason) => {
+                    return Err(directory_closed_reason(reason));
+                }
+                AcquisitionEnd::TimedOut => return Err(TimedOut),
+                AcquisitionEnd::ItemBudgetExceeded
+                | AcquisitionEnd::ByteBudgetExceeded
+                | AcquisitionEnd::ExitLimitReached => return Err(Restricted),
+                _ => return Err(Unreachable),
+            }
             if query.kind == 1059 {
                 continue;
             } // Read probe only; do not retain inbox payloads.
-            for event in events {
-                if let Some(event) = validated_directory_event(&event, &query) {
+            for event in &result.events {
+                if let Some(event) = validated_directory_event(event, &query) {
                     records.push(DirectoryRelayEventRecord {
                         endpoints: request.endpoints.clone(),
                         event,
@@ -870,6 +886,17 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         }
         client.shutdown().await;
         Ok(outcome)
+    }
+}
+
+fn directory_closed_reason(reason: &str) -> DirectoryInspectionError {
+    use DirectoryInspectionError::*;
+    if reason.starts_with("auth-required:") {
+        AuthenticationRequired
+    } else if reason.starts_with("payment-required:") {
+        PaymentRequired
+    } else {
+        Restricted
     }
 }
 
@@ -1132,6 +1159,58 @@ mod tests {
                 .await;
             assert_eq!(result.is_ok(), succeeds);
             assert!(fetcher.client.relays().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn inspection_preserves_auth_and_payment_closed_reasons() {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        for (reason, expected) in [
+            (
+                "auth-required: sign in",
+                DirectoryInspectionError::AuthenticationRequired,
+            ),
+            (
+                "payment-required: pay",
+                DirectoryInspectionError::PaymentRequired,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if request[0] == "REQ" {
+                        let closed = serde_json::json!(["CLOSED", request[1], reason]);
+                        socket
+                            .send(Message::Text(closed.to_string().into()))
+                            .await
+                            .unwrap();
+                    }
+                }
+            });
+            let author = nostr::prelude::Keys::generate().public_key().to_hex();
+            let request = DirectoryFetchRequest::new(
+                vec![endpoint],
+                vec![DirectoryEventQuery::new(0, vec![author], 1)],
+            )
+            .unwrap();
+            let result = timeout(
+                Duration::from_secs(5),
+                NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, None),
+            )
+            .await
+            .expect("inspection completes");
+            server.abort();
+            assert_eq!(result, Err(expected));
         }
     }
 
