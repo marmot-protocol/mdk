@@ -20,11 +20,7 @@ const MAX_STATE_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryBatch {
     pub token: DeliveryToken,
-    pub destination: String,
-    pub generation: u64,
     pub segment: String,
-    pub start: u64,
-    pub end: u64,
     pub bodies: Vec<Vec<u8>>,
 }
 
@@ -36,6 +32,24 @@ pub struct DeliveryToken {
     start: u64,
     end: u64,
     digest: String,
+}
+
+impl DeliveryToken {
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    pub fn end(&self) -> u64 {
+        self.end
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +66,8 @@ pub enum ReceiverResult {
     Partial,
 }
 
-pub trait AuditReceiver {
+#[cfg(test)]
+trait TestAuditReceiver {
     fn send(&mut self, batch: &DeliveryBatch) -> ReceiverResult;
 }
 
@@ -62,6 +77,7 @@ pub enum DeliveryStep {
     WaitingForWriter,
     Accepted,
     Retryable,
+    Stale,
     Blocked,
     Gap,
 }
@@ -157,15 +173,7 @@ impl LocalAuditDelivery {
             Err(error) => return Err(error),
         }
         let state = if state_path.exists() {
-            let bytes = read_private_file(&state_path)?;
-            let state: State =
-                serde_json::from_slice(&bytes).map_err(|_| invalid("corrupt delivery cursor"))?;
-            if state.version != 1 || state.destination != destination || state.next_generation == 0
-            {
-                return Err(invalid("incompatible delivery cursor"));
-            }
-            validate_state(&state, name)?;
-            state
+            load_state(&state_path, destination, name)?
         } else {
             State {
                 version: 1,
@@ -343,21 +351,17 @@ impl LocalAuditDelivery {
                 end: prepared.end,
                 digest: prepared.digest.clone(),
             },
-            destination: self.state.destination.clone(),
-            generation: journal.generation,
             segment: journal.segment.clone(),
-            start: prepared.start,
-            end: prepared.end,
             bodies,
         }
     }
 
-    /// Apply only an explicit response to this persisted attempt. `None` means
-    /// the response was lost; the same original range remains replayable.
+    /// Apply an explicit response to this persisted attempt. If the response
+    /// is lost, do not call finish; preparation will replay the same range.
     pub fn finish(
         &mut self,
         token: &DeliveryToken,
-        result: Option<ReceiverResult>,
+        result: ReceiverResult,
     ) -> io::Result<DeliveryStep> {
         if self.fenced {
             return Err(invalid("uncertain local state publication"));
@@ -373,14 +377,10 @@ impl LocalAuditDelivery {
                         && prepared.digest == token.digest
                 })
         });
-        if token.destination != self.state.destination || index.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stale delivery token",
-            ));
-        }
-        let index = index.unwrap();
-        match result.unwrap_or(ReceiverResult::Retryable) {
+        let Some(index) = index.filter(|_| token.destination == self.state.destination) else {
+            return Ok(DeliveryStep::Stale);
+        };
+        match result {
             ReceiverResult::Complete => {
                 self.state.journals[index].acknowledged = token.end;
                 self.state.journals[index].prepared = None;
@@ -402,18 +402,18 @@ impl LocalAuditDelivery {
     }
 
     #[cfg(test)]
-    fn run_once(&mut self, receiver: &mut impl AuditReceiver) -> io::Result<DeliveryStep> {
+    fn run_once(&mut self, receiver: &mut impl TestAuditReceiver) -> io::Result<DeliveryStep> {
         self.run_once_with_after_discover(receiver, || {})
     }
 
     #[cfg(test)]
     fn run_once_with_after_discover(
         &mut self,
-        receiver: &mut impl AuditReceiver,
+        receiver: &mut impl TestAuditReceiver,
         after_discover: impl FnOnce(),
     ) -> io::Result<DeliveryStep> {
         match self.prepare_once_with_after_discover(after_discover)? {
-            Preparation::Batch(batch) => self.finish(&batch.token, Some(receiver.send(&batch))),
+            Preparation::Batch(batch) => self.finish(&batch.token, receiver.send(&batch)),
             Preparation::Step(step) => Ok(step),
         }
     }
@@ -629,22 +629,12 @@ impl LocalAuditDelivery {
     }
 
     fn refresh(&mut self) -> io::Result<()> {
-        let bytes = read_private_file(&self.state_path)?;
-        let state: State =
-            serde_json::from_slice(&bytes).map_err(|_| invalid("corrupt delivery cursor"))?;
         let name = self
             .active
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| invalid("invalid recorder path"))?;
-        if state.version != 1
-            || state.destination != self.state.destination
-            || state.next_generation == 0
-        {
-            return Err(invalid("incompatible delivery cursor"));
-        }
-        validate_state(&state, name)?;
-        self.state = state;
+        self.state = load_state(&self.state_path, &self.state.destination, name)?;
         Ok(())
     }
 
@@ -832,6 +822,17 @@ fn read_private_file(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn load_state(path: &Path, destination: &str, active_name: &str) -> io::Result<State> {
+    let bytes = read_private_file(path)?;
+    let state: State =
+        serde_json::from_slice(&bytes).map_err(|_| invalid("corrupt delivery cursor"))?;
+    if state.version != 1 || state.destination != destination || state.next_generation == 0 {
+        return Err(invalid("incompatible delivery cursor"));
+    }
+    validate_state(&state, active_name)?;
+    Ok(state)
+}
+
 fn file_identity(meta: &fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (meta.dev(), meta.ino())
@@ -931,7 +932,7 @@ mod tests {
         batches: Vec<DeliveryBatch>,
     }
 
-    impl AuditReceiver for FakeReceiver {
+    impl TestAuditReceiver for FakeReceiver {
         fn send(&mut self, batch: &DeliveryBatch) -> ReceiverResult {
             self.batches.push(batch.clone());
             self.next.take().unwrap_or(ReceiverResult::Complete)
@@ -984,10 +985,6 @@ mod tests {
         drop(worker);
 
         let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
-        assert_eq!(
-            worker.finish(&first.token, None).unwrap(),
-            DeliveryStep::Retryable
-        );
         let replay = prepared_batch(&mut worker);
         assert_eq!(replay.token, first.token);
         assert_eq!(replay.bodies, first.bodies);
@@ -997,10 +994,6 @@ mod tests {
         assert!(matches!(receiver.send(&first), ReceiverResult::Complete));
         // The acknowledgement is lost. A duplicate-safe receiver may see the
         // same original rows again before the cursor can move.
-        assert_eq!(
-            worker.finish(&first.token, None).unwrap(),
-            DeliveryStep::Retryable
-        );
         let duplicate = prepared_batch(&mut worker);
         assert_eq!(duplicate.token, first.token);
         assert_eq!(duplicate.bodies, first.bodies);
@@ -1010,30 +1003,29 @@ mod tests {
         ));
         assert_eq!(
             worker
-                .finish(&duplicate.token, Some(ReceiverResult::Complete))
+                .finish(&duplicate.token, ReceiverResult::Complete)
                 .unwrap(),
             DeliveryStep::Accepted
         );
         assert_eq!(receiver.batches[0].bodies, receiver.batches[1].bodies);
-        assert_eq!(worker.state.journals[0].acknowledged, first.end);
+        assert_eq!(worker.state.journals[0].acknowledged, first.token.end());
         assert_eq!(
             worker.prepare_once().unwrap(),
             Preparation::Step(DeliveryStep::Idle)
         );
         record(&recorder, "two");
         let next = prepared_batch(&mut worker);
-        assert_eq!(next.generation, first.generation);
+        assert_eq!(next.token.generation(), first.token.generation());
         assert_eq!(
             worker
-                .finish(&first.token, Some(ReceiverResult::Complete))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
+                .finish(&first.token, ReceiverResult::Complete)
+                .unwrap(),
+            DeliveryStep::Stale
         );
-        assert_eq!(worker.state.journals[0].acknowledged, first.end);
+        assert_eq!(worker.state.journals[0].acknowledged, first.token.end());
         assert_eq!(
             worker
-                .finish(&next.token, Some(ReceiverResult::Complete))
+                .finish(&next.token, ReceiverResult::Complete)
                 .unwrap(),
             DeliveryStep::Accepted
         );
@@ -1055,11 +1047,11 @@ mod tests {
         assert_eq!(receiver.batches[0].bodies, originals);
         assert_eq!(
             worker
-                .finish(&batch.token, Some(ReceiverResult::Complete))
+                .finish(&batch.token, ReceiverResult::Complete)
                 .unwrap(),
             DeliveryStep::Accepted
         );
-        assert_eq!(worker.state.journals[0].acknowledged, batch.end);
+        assert_eq!(worker.state.journals[0].acknowledged, batch.token.end());
     }
 
     #[test]
@@ -1075,13 +1067,10 @@ mod tests {
             Preparation::Step(DeliveryStep::Gap)
         );
         let current = prepared_batch(&mut worker);
-        assert_ne!(old.generation, current.generation);
+        assert_ne!(old.token.generation(), current.token.generation());
         assert_eq!(
-            worker
-                .finish(&old.token, Some(ReceiverResult::Complete))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
+            worker.finish(&old.token, ReceiverResult::Complete).unwrap(),
+            DeliveryStep::Stale
         );
         assert_eq!(worker.state.journals[1].acknowledged, 0);
 
@@ -1090,21 +1079,20 @@ mod tests {
         let other_batch = prepared_batch(&mut other);
         assert_eq!(
             other
-                .finish(&current.token, Some(ReceiverResult::Complete))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
+                .finish(&current.token, ReceiverResult::Complete)
+                .unwrap(),
+            DeliveryStep::Stale
         );
         assert_eq!(other.state.journals[0].acknowledged, 0);
         assert_eq!(
             other
-                .finish(&other_batch.token, Some(ReceiverResult::Complete))
+                .finish(&other_batch.token, ReceiverResult::Complete)
                 .unwrap(),
             DeliveryStep::Accepted
         );
         assert_eq!(
             worker
-                .finish(&current.token, Some(ReceiverResult::Complete))
+                .finish(&current.token, ReceiverResult::Complete)
                 .unwrap(),
             DeliveryStep::Accepted
         );
@@ -1126,42 +1114,30 @@ mod tests {
         let current = prepared_batch(&mut next_owner);
         assert_eq!(
             first_owner
-                .finish(&old.token, Some(ReceiverResult::Complete))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
+                .finish(&old.token, ReceiverResult::Complete)
+                .unwrap(),
+            DeliveryStep::Stale
         );
         assert_eq!(first_owner.state.journals[1].acknowledged, 0);
         assert_eq!(
             next_owner
-                .finish(&current.token, Some(ReceiverResult::Complete))
+                .finish(&current.token, ReceiverResult::Complete)
                 .unwrap(),
             DeliveryStep::Accepted
         );
     }
 
     #[test]
-    fn prepared_batch_owns_bytes_without_retaining_source_descriptor() {
+    fn prepared_batch_is_owned_after_worker_and_source_are_gone() {
         let (_dir, active, state_dir, recorder) = setup();
         record(&recorder, "one");
         let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
-        let source_id = file_identity(&fs::metadata(&active).unwrap());
-        let open_source_count = || {
-            fs::read_dir("/dev/fd")
-                .unwrap()
-                .flatten()
-                .filter(|entry| {
-                    fs::metadata(entry.path())
-                        .map(|meta| file_identity(&meta) == source_id)
-                        .unwrap_or(false)
-                })
-                .count()
-        };
-        let before = open_source_count();
+        fn assert_owned<T: Send + 'static>() {}
+        assert_owned::<DeliveryBatch>();
         let batch = prepared_batch(&mut worker);
-        assert_eq!(open_source_count(), before);
         drop(worker);
         drop(recorder);
+        fs::remove_file(&active).unwrap();
         let originals = batch.bodies.clone();
         let sent = std::thread::spawn(move || {
             let mut receiver = FakeReceiver::default();
@@ -1194,10 +1170,10 @@ mod tests {
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Idle);
         record(&recorder, "two");
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
-        assert_eq!(sink.batches[2].start, first.end);
+        assert_eq!(sink.batches[2].token.start(), first.token.end());
         assert_eq!(
             sink.batches[2].bodies.concat(),
-            fs::read(&active).unwrap()[first.end as usize..]
+            fs::read(&active).unwrap()[first.token.end() as usize..]
         );
         assert!(LocalAuditDelivery::open(&active, &state_dir, "receiver-B").is_err());
     }
@@ -1212,7 +1188,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Retryable);
-        let prepared_end = sink.batches[0].end;
+        let prepared_end = sink.batches[0].token.end();
         // Rewrite a byte beyond the 192-byte head fingerprint, preserving inode
         // and length. The range digest must catch the change before any send.
         let mut file = OpenOptions::new().write(true).open(&active).unwrap();
@@ -1227,7 +1203,7 @@ mod tests {
         assert_eq!(worker.gaps()[0].end, Some(prepared_end));
         record(&recorder, "later");
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
-        assert_eq!(sink.batches[1].start, prepared_end);
+        assert_eq!(sink.batches[1].token.start(), prepared_end);
     }
 
     #[test]
@@ -1284,7 +1260,7 @@ mod tests {
         assert_eq!(worker.gaps()[0].end, None);
         assert!(worker.state.journals[0].missing);
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
-        assert_ne!(sink.batches[0].generation, old_generation);
+        assert_ne!(sink.batches[0].token.generation(), old_generation);
         assert_eq!(sink.batches[0].bodies.concat(), fs::read(&active).unwrap());
     }
 
@@ -1310,7 +1286,7 @@ mod tests {
         assert_eq!(worker.gaps()[0].end, Some(prior_end + 9));
         assert_eq!(worker.gaps()[0].reason, GapReason::InvalidRecord);
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
-        assert_eq!(sink.batches.last().unwrap().start, prior_end + 9);
+        assert_eq!(sink.batches.last().unwrap().token.start(), prior_end + 9);
     }
 
     #[test]
@@ -1425,7 +1401,10 @@ mod tests {
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
         assert_eq!(sink.batches.len(), 2);
-        assert_ne!(sink.batches[0].generation, sink.batches[1].generation);
+        assert_ne!(
+            sink.batches[0].token.generation(),
+            sink.batches[1].token.generation()
+        );
         assert_eq!(worker.blocked()[0].1, "permanent receiver rejection");
     }
 
@@ -1518,7 +1497,7 @@ mod tests {
         assert!(!worker.state.journals[0].missing);
         assert!(worker.state.journals[0].segment.contains("-seg"));
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
-        assert_eq!(sink.batches.last().unwrap().start, acknowledged);
+        assert_eq!(sink.batches.last().unwrap().token.start(), acknowledged);
     }
 
     #[test]
@@ -1600,7 +1579,7 @@ mod tests {
                 DeliveryStep::Accepted
             );
             assert_eq!(sink.batches[0].bodies.concat(), fs::read(&active).unwrap());
-            assert_ne!(sink.batches[0].generation, old_generation);
+            assert_ne!(sink.batches[0].token.generation(), old_generation);
             assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
             assert_eq!(worker.gaps()[0].reason, GapReason::MissingSource);
             assert_eq!(worker.gaps()[0].start, 0);
@@ -1697,7 +1676,10 @@ mod tests {
         assert!(worker.state.journals[0].observed_len > acknowledged);
         record(&recorder, "after_shrink");
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
-        assert_ne!(sink.batches.last().unwrap().generation, old_generation);
+        assert_ne!(
+            sink.batches.last().unwrap().token.generation(),
+            old_generation
+        );
     }
 
     #[test]

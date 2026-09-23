@@ -52,11 +52,13 @@ reload the current cursor so a second owner cannot make a stale in-memory
 completion valid. Cursor and gap updates use a private staged file, file sync,
 rename, and parent directory sync. If publication is uncertain, the
 instance fences further work. On restart, a prepared range is re-read and
-compared with its range digest before the receiver sees it. `finish` rejects a
-token whose destination, generation, or persisted range no longer matches. It
-does not reopen the source: an explicit complete acceptance of the owned batch
-can advance its cursor even if the source changed during the send. Retryable or
-missing results keep the exact attempt for replay; permanent or partial results
+compared with its range digest before the receiver sees it. `finish` returns
+`Stale` for a token whose destination, generation, or persisted range no longer
+matches. It does not reopen the source: an explicit complete acceptance of the
+owned batch
+can advance its cursor even if the source changed during the send. Retryable
+results, or a missing response for which `finish` is not called, keep the exact
+attempt for replay; permanent or partial results
 block only that journal. A lost acceptance response can duplicate rows on retry,
 so the eventual receiver must handle duplicate original rows.
 An interrupted staging write is discarded on restart because the rename is
@@ -87,8 +89,8 @@ lines, destructive clear, partial rejection, rotation during discovery and
 between discovery and reopening, simulated inode reuse, and
 observed unprepared tail truncation, corrupt or oversized cursor. The local
 reader also tests restart after prepare, lost acknowledgement, duplicate-safe
-retry, completion after source change, stale tokens, and absence of a retained
-source descriptor in the returned batch. It has no HTTP, runtime scheduling,
-root-lease acquisition, retention,
-capacity cleanup, receiver validation, or investigation reader integration.
+retry, completion after source change, stale tokens, and use of the owned batch
+after the worker and source are gone. It has no HTTP, runtime scheduling,
+root-lease acquisition, retention, capacity cleanup, receiver validation, or
+investigation reader integration.
 Those require the later receiver and lifecycle steps before production use.
