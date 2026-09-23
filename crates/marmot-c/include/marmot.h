@@ -8746,6 +8746,31 @@ MarmotStatus marmot_report_message(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
+ * Verify a BIP-340 signature over an already computed 32-byte digest.
+ * Invalid hex, lengths, keys, and signatures return success with `*out = 0`.
+ * No client or account is required.
+ *
+ * # Safety
+ * Strings must be valid NUL-terminated UTF-8 and `out` must be writable.
+ * Inputs are borrowed and never retained.
+ */
+MarmotStatus marmot_verify_bip340_signature(const char *public_key_hex,
+                                            const char *message_hex,
+                                            const char *signature_hex,
+                                            uint8_t *out);
+
+/**
+ * Verify a public Nostr event's canonical ID and BIP-340 signature.
+ * Invalid event JSON returns success with `*out = 0`. No client is required.
+ * The caller must enforce application-specific author, kind, and tag policy.
+ *
+ * # Safety
+ * `event_json` must be valid NUL-terminated UTF-8 and `out` writable.
+ * Input is borrowed and never retained.
+ */
+MarmotStatus marmot_verify_public_nostr_event_json(const char *event_json, uint8_t *out);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *

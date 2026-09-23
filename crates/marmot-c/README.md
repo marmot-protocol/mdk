@@ -7,6 +7,12 @@ any raw-FFI consumer (Zig, Nim, Go, Odin, Lua, PHP, …).
 
 Start with the [shared binding integration guide](../marmot-uniffi/README.md#integration-guide-and-api-reference)
 for runtime lifecycle, screen contracts, API selection, localization and upgrade policy.
+`marmot_verify_public_nostr_event_json` and `marmot_verify_bip340_signature`
+are stateless public-event checks: they require no client, return `uint8_t`
+results through required out-pointers, and return `MARMOT_STATUS_OK` with zero
+for malformed or invalid cryptographic input. Null/invalid UTF-8 pointers are
+argument errors. Callers still enforce their author, kind, tag, and JSON-size
+policy. These additive functions require a matching regenerated header/library.
 Use the [complete C symbol reference](API-REFERENCE.md) for every function declaration,
 including ownership helpers, and the [shared method reference](../marmot-uniffi/API-REFERENCE.md)
 for runtime purposes and recommended alternatives to older screen paths.

@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Stateless `marmot_verify_public_nostr_event_json` and
+  `marmot_verify_bip340_signature` C APIs backed by the same Nostr/libsecp256k1
+  verifier as the UniFFI bindings. They add no client state, but require the
+  matching regenerated header and library. Invalid signatures return zero;
+  invalid pointers return an argument status.
+
 - Add `marmot_create_poll`, `marmot_cast_poll_vote`, and structured poll projection records. This adds a nullable field
   to `MarmotTimelineMessageRecord`; poll creation follows canonical group-conversation classification, while an
   accepted open poll remains votable after reclassification. Regenerate and recompile with the matching header and
