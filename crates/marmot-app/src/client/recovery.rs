@@ -174,7 +174,6 @@ impl RecoveryRetryPolicy {
 pub(crate) struct AttemptGrant {
     pub(crate) reservation: RecoveryRetryState,
     pub(crate) fence: RecoveryRevisionFence,
-    pub(crate) mode: RecoveryExecutorMode,
     pub(crate) seam: marmot_forensics::EpochBackfillExecutionSeam,
     plan: Vec<GrantedObligation>,
     pub(super) inventory: Vec<FrozenRecoveryInventory>,
@@ -430,7 +429,6 @@ impl AccountRecoveryOwner {
         Ok(Some(AttemptGrant {
             reservation,
             fence,
-            mode: self.mode,
             seam: marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             plan: Vec::new(),
             inventory: Vec::new(),
@@ -1337,7 +1335,7 @@ mod tests {
             .select_authorized_attempt(&storage, RecoveryReadiness::Unknown, now, None)
             .unwrap()
             .unwrap();
-        assert_eq!(grant.mode, RecoveryExecutorMode::Normal);
+        assert_eq!(owner.mode, RecoveryExecutorMode::Normal);
         assert!(!owner.select_executor_mode(RecoveryExecutorMode::Conservative));
         drop(grant);
         assert!(owner.select_executor_mode(RecoveryExecutorMode::Conservative));
@@ -1356,7 +1354,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(grant.mode, RecoveryExecutorMode::Conservative);
+        assert_eq!(owner.mode, RecoveryExecutorMode::Conservative);
         drop(grant);
         assert!(owner.select_executor_mode(RecoveryExecutorMode::Normal));
         assert_eq!(storage.recovery_revision_fence().unwrap(), before);
@@ -2568,7 +2566,7 @@ mod tests {
                     )
                     .unwrap()
                     .unwrap();
-                assert_eq!(grant.mode, RecoveryExecutorMode::Normal);
+                assert_eq!(client.recovery_owner.mode, RecoveryExecutorMode::Normal);
                 assert_eq!(grant.loss.len(), 2);
                 for obligation in grant.plan().unwrap() {
                     qualify_test_obligation(&storage, &grant, obligation);

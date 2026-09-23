@@ -356,6 +356,7 @@ impl AccountDeliveryOverflowState {
         true
     }
 
+    #[cfg(test)]
     fn marker_barrier_complete(&self) -> bool {
         let state = self
             .inner
