@@ -3945,6 +3945,27 @@ impl AppClient {
                 }
             };
             for obligation in grant.plan().expect("validated executor grant") {
+                // A selected group can lack any executable route even though
+                // another obligation made the account ready. Preserve that
+                // debt until capability/policy changes instead of probing it
+                // forever on unrelated account readiness.
+                let outcome = if obligation
+                    .scopes
+                    .iter()
+                    .all(|scope| scope.goal.admitted_endpoints.is_empty())
+                {
+                    if obligation
+                        .scopes
+                        .iter()
+                        .all(|scope| scope.goal.route_kind == 2)
+                    {
+                        storage_sqlite::RecoveryScopeOutcome::Unsupported
+                    } else {
+                        storage_sqlite::RecoveryScopeOutcome::Excluded
+                    }
+                } else {
+                    outcome
+                };
                 let eligibility = super::recovery::eligibility_after_observation(
                     obligation.cause,
                     outcome,

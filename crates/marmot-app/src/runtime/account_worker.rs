@@ -6833,92 +6833,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_epoch_backfill_eose_records_correlated_incomplete_attempt() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(AuditLogSettings { enabled: true })
-            .unwrap();
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("successful epoch backfill audit", &[])
+    async fn pending_epoch_backfill_records_correlated_qualified_and_incomplete_attempts() {
+        for qualified in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay_and_config(
+                dir.path(),
+                "wss://relay.example".to_owned(),
+                bounded_epoch_backfill_config(),
+            )
+            .with_test_relay_client(relay.clone());
+            app.set_audit_log_settings(AuditLogSettings { enabled: true })
+                .unwrap();
+            let _eose =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let group_id = client
+                .create_group("successful epoch backfill audit", &[])
+                .await
+                .unwrap();
+            let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+            client.apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            );
+
+            if qualified {
+                client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
+            }
+            let (events, _subscriber) = broadcast::channel(4);
+            let shared = RuntimeSharedServices::default();
+            run_pending_epoch_backfill_reporting_arm(
+                &mut client,
+                &events,
+                "account-id",
+                "alice",
+                &shared,
+                EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
 
-        let (events, _subscriber) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        run_pending_epoch_backfill_reporting_arm(
-            &mut client,
-            &events,
-            "account-id",
-            "alice",
-            &shared,
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
-        )
-        .await
-        .unwrap();
-
-        let rows: Vec<serde_json::Value> = app
-            .audit_log_files()
-            .unwrap()
-            .into_iter()
-            .flat_map(|file| {
-                std::fs::read_to_string(file.path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let attempt_id = rows
-            .iter()
-            .find(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
-            .and_then(|row| row["context"]["operation_id"].as_str())
-            .expect("owner attempt must carry operation_id");
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
-                .count(),
-            1
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
-                .count(),
-            0
-        );
-        assert!(
-            rows.iter()
-                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
-                .count()
-                == 1
-        );
-        assert!(rows.iter().all(|row| {
-            !matches!(
-                row["kind"]["type"].as_str(),
-                Some(
-                    "epoch_stall_backfill_started"
-                        | "epoch_stall_backfill_completed"
-                        | "epoch_stall_backfill_failed"
-                )
-            ) || row["context"]["operation_id"].as_str() == Some(attempt_id)
-        }));
+            let rows: Vec<serde_json::Value> = app
+                .audit_log_files()
+                .unwrap()
+                .into_iter()
+                .flat_map(|file| {
+                    std::fs::read_to_string(file.path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let attempt_id = rows
+                .iter()
+                .find(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+                .and_then(|row| row["context"]["operation_id"].as_str())
+                .expect("owner attempt must carry operation_id");
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
+                    .count(),
+                usize::from(qualified)
+            );
+            assert!(
+                rows.iter()
+                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+                    .count()
+                    == usize::from(!qualified)
+            );
+            assert!(rows.iter().all(|row| {
+                !matches!(
+                    row["kind"]["type"].as_str(),
+                    Some(
+                        "epoch_stall_backfill_started"
+                            | "epoch_stall_backfill_completed"
+                            | "epoch_stall_backfill_failed"
+                    )
+                ) || row["context"]["operation_id"].as_str() == Some(attempt_id)
+            }));
+        }
     }
 
     #[tokio::test]
@@ -6931,7 +6937,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
         .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(AuditLogSettings { enabled: true })
@@ -7005,6 +7011,12 @@ mod tests {
         .unwrap();
         assert!(client.has_pending_epoch_backfill());
         let subscriptions_after_replay = relay.subscription_count();
+        let retry = app
+            .account_storage("alice")
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap();
+        assert_eq!(retry.attempt_serial, 2);
 
         run_pending_epoch_backfill_reporting_arm(
             &mut client,
@@ -7017,6 +7029,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(relay.subscription_count(), subscriptions_after_replay);
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap(),
+            retry
+        );
     }
 
     /// The Phase-A workload: epoch and overflow join one owner reservation;

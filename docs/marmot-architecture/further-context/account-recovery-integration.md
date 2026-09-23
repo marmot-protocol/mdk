@@ -228,3 +228,16 @@ and superseded checks, and the remaining blocking acquisition limitations.
   acknowledgment and retires it. During writer retry the process-local fence
   freezes the cursor; the writer persists evidence only, the serialized owner
   imports demand, and reopen preserves the pending loss and old cursor.
+- Deferral and independent completion audit: a new red regression reproduced
+  missing unavailable-epoch diagnostics. The owner now retains one private
+  32-byte digest, emits an unchanged decision once, and preserves changed observed
+  epochs at equal cardinality. The fixture reopens a real orphaned group into
+  quarantine; an initial fixture omitted the group FK, then another had not yet
+  performed hydration. The final regression passes. Positive qualified-success
+  lifecycle correlation and independent completion also pass. A strengthened
+  independent-scope regression reproduced endless eligibility for a group with
+  no executable route; it now waits for capability/policy change while preserving
+  its debt. The worker failure/retry regression also passes after replacing its
+  accidental zero-backoff fixture with a real cooldown and exact retry assertions.
+  All 17 owner tests passed before the final no-route eligibility adjustment;
+  combined verification must include that adjustment.

@@ -242,6 +242,7 @@ pub(crate) struct AccountRecoveryOwner {
     monotonic_anchor: Instant,
     active: Weak<()>,
     active_admission: Weak<RecoveryAdmissionSnapshot>,
+    last_unavailable_epoch_observation: Option<[u8; 32]>,
     policy: RecoveryRetryPolicy,
     mode: RecoveryExecutorMode,
     // At most the two loss causes. These are captured CAS inputs, never an
@@ -284,6 +285,7 @@ impl AccountRecoveryOwner {
             monotonic_anchor: monotonic_now,
             active: Weak::new(),
             active_admission: Weak::new(),
+            last_unavailable_epoch_observation: None,
             policy,
             mode: RecoveryExecutorMode::Normal,
             pending_loss_acknowledgments: Vec::new(),
@@ -880,6 +882,55 @@ impl AppClient {
         Ok(true)
     }
 
+    /// Preserve epoch-sensitive deferral diagnostics without restoring a second
+    /// dispatcher or retaining another pending-group vector. The digest is
+    /// private process state; no identity or digest is emitted in telemetry.
+    fn record_unavailable_epoch_observation(
+        &mut self,
+        storage: &SqliteAccountStorage,
+    ) -> Result<(), AppError> {
+        use sha2::{Digest, Sha256};
+        let retry = storage.recovery_retry_state()?;
+        let mut digest = Sha256::new();
+        digest.update(b"mdk-recovery-unavailable-epoch-v1");
+        digest.update(retry.ordinal.to_be_bytes());
+        let mut unavailable = false;
+        for demand in storage
+            .pending_recovery_demands()?
+            .into_iter()
+            .filter(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
+        {
+            let observed = demand.group_id.as_ref().and_then(|id| {
+                self.runtime
+                    .group_record(&cgka_traits::GroupId::new(id.clone()))
+                    .ok()
+                    .map(|record| record.epoch.0)
+            });
+            unavailable |= observed.is_none();
+            digest.update(demand.ticket.id);
+            digest.update(demand.ticket.revision.to_be_bytes());
+            for epoch in [demand.stalled_epoch, observed] {
+                digest.update([u8::from(epoch.is_some())]);
+                digest.update(epoch.unwrap_or(0).to_be_bytes());
+            }
+        }
+        let snapshot = unavailable.then(|| <[u8; 32]>::from(digest.finalize()));
+        if snapshot != self.recovery_owner.last_unavailable_epoch_observation {
+            self.recovery_owner.last_unavailable_epoch_observation = snapshot;
+            if unavailable {
+                self.record_epoch_stall_backfill_deferred(
+                    marmot_forensics::EpochBackfillDeferredReason::GroupEpochUnavailable,
+                    retry.ordinal.saturating_sub(1),
+                    &marmot_forensics::AuditEventContext {
+                        operation_id: Some(format!("recovery-{}", retry.attempt_serial)),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Worker-only boundary: import loss and synchronize the existing receipt
     /// consumer before selecting a revision-fenced immutable history plan.
     pub(crate) fn authorize_account_recovery(
@@ -928,13 +979,14 @@ impl AppClient {
         } else {
             RecoveryReadiness::Waiting
         };
-        let Some(mut grant) = self.recovery_owner.select_authorized_attempt(
+        let selected = self.recovery_owner.select_authorized_attempt(
             &storage,
             readiness,
             Instant::now(),
             explicit,
-        )?
-        else {
+        )?;
+        self.record_unavailable_epoch_observation(&storage)?;
+        let Some(mut grant) = selected else {
             return Ok(None);
         };
         grant.seam = seam;

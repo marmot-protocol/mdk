@@ -4669,6 +4669,86 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
     });
 }
 
+/// Decision diagnostics preserve the full observed-epoch distinction, even
+/// when the number of pending groups has not changed.
+#[test]
+fn owner_deferral_deduplicates_identical_observations_but_keeps_epoch_changes() {
+    run_composed_app_runtime_test("owner-deferral-evidence", || async {
+        use cgka_traits::storage::GroupStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, client, group) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
+        )
+        .await;
+        let storage = app.account_storage("alice").unwrap();
+        let phantom = cgka_traits::GroupId::new(hex::decode("deadbeef").unwrap());
+        let mut orphan = storage.get_group(&group).unwrap();
+        orphan.id = phantom;
+        storage.put_group(&orphan).unwrap();
+        storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: "deadbeef".into(),
+                stalled_epoch: 1,
+            }])
+            .unwrap();
+        // Reopen attempts actual hydration of the orphaned group, making its
+        // epoch unavailable without corrupting the valid group's session.
+        drop(client);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            client
+                .group_mls_state(&cgka_traits::GroupId::new(hex::decode("deadbeef").unwrap()))
+                .is_err()
+        );
+        for _ in 0..4 {
+            drop(
+                client
+                    .authorize_account_recovery(
+                        None,
+                        marmot_forensics::EpochBackfillExecutionSeam::Receive,
+                    )
+                    .unwrap(),
+            );
+        }
+        let rows = recorded_audit_rows(&app);
+        assert_eq!(
+            recorded_rows_of_kind(&rows, "epoch_stall_backfill_deferred").len(),
+            1
+        );
+        let retry = storage.recovery_retry_state().unwrap();
+        let mut record = storage.get_group(&group).unwrap();
+        record.epoch = cgka_traits::EpochId(record.epoch.0 + 1);
+        storage.put_group(&record).unwrap();
+        for _ in 0..4 {
+            assert!(
+                client
+                    .authorize_account_recovery(
+                        None,
+                        marmot_forensics::EpochBackfillExecutionSeam::Receive
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        let rows = recorded_audit_rows(&app);
+        let deferred = recorded_rows_of_kind(&rows, "epoch_stall_backfill_deferred");
+        assert_eq!(
+            deferred.len(),
+            2,
+            "same cardinality with a changed observed epoch is new evidence"
+        );
+        assert!(
+            deferred
+                .iter()
+                .all(|row| row["kind"]["reason"] == "group_epoch_unavailable")
+        );
+    });
+}
+
 #[test]
 fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
     run_composed_app_runtime_test("owner-unresolved-scope", || async {
@@ -4709,6 +4789,7 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
                     .all(|scope| scope.goal.route_kind == 2)
         }));
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
         client
             .execute_recovery_grant(grant, None, None)
             .await
@@ -4716,8 +4797,35 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
         assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
         assert_eq!(
             storage.pending_epoch_backfill_intents().unwrap().len(),
-            2,
-            "EOSE cannot silently erase either unresolved or merely unproven history"
+            1,
+            "qualified real-group coverage cannot erase the unsupported group's debt"
+        );
+        assert_eq!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.group_id.as_deref() == Some(phantom.as_slice()))
+                .unwrap()
+                .eligibility,
+            storage_sqlite::RecoveryEligibility::WaitingCapability
+        );
+        client
+            .recovery_owner
+            .test_advance_clock(Duration::from_secs(300));
+        assert!(matches!(
+            client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                )
+                .await
+                .unwrap(),
+            crate::EpochBackfillRunOutcome::Deferred
+        ));
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            1,
+            "a timer cannot investigate a group with no acquisition route repeatedly"
         );
         let rows = recorded_audit_rows(&app);
         assert_eq!(
