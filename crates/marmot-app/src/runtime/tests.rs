@@ -2789,8 +2789,7 @@ async fn cancelled_startup_is_reaped() {
 
     let retrying = manager.clone();
     let mut lookup = tokio::spawn(async move { retrying.worker_commands("alice").await });
-    // The requested account waits for its old session guard, while unrelated
-    // accounts still reconcile without waiting for that cleanup.
+    // The requested lookup waits for its old session guard.
     let premature = timeout(Duration::from_millis(50), &mut lookup).await;
     proceed.send(()).unwrap();
     assert!(premature.is_err());
@@ -2833,6 +2832,41 @@ async fn finished_worker_is_replaced_on_first_requested_lookup() {
         .expect("finished worker is replaced on first lookup");
     assert!(!replacement.same_channel(&old_commands));
     assert!(manager.workers.lock().await[&account.account_id_hex].ready);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finished_worker_is_replaced_on_first_batch_reconcile() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let account = app.account_home().create_account("alice").expect("account");
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let handle = tokio::spawn(async {});
+    tokio::task::yield_now().await;
+    assert!(handle.is_finished());
+    let (shutdown, _shutdown_rx) = oneshot::channel();
+    let (old_commands, _old_receiver) = mpsc::channel(1);
+    manager.workers.lock().await.insert(
+        account.account_id_hex.clone(),
+        ManagedAccountWorker {
+            ready: true,
+            handle,
+            commands: old_commands.clone(),
+            media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
+            shutdown,
+        },
+    );
+
+    timeout(Duration::from_secs(5), runtime.reconcile_accounts())
+        .await
+        .expect("batch reconcile completes")
+        .expect("finished worker is replaced in the same batch");
+    let replacement = manager
+        .worker_commands("alice")
+        .await
+        .expect("ready worker");
+    assert!(!replacement.same_channel(&old_commands));
     runtime.shutdown().await;
 }
 
@@ -3144,6 +3178,27 @@ async fn stuck_worker_reap_does_not_block_a_healthy_account() {
             .await
             .expect("later reconcile must not wait for Alice's cleanup")
             .is_err()
+    );
+    let attempts_before_wait = runtime.app_performance_snapshot().account_open.attempts;
+    let first_lookup = timeout(Duration::from_secs(12), manager.worker_commands("alice"))
+        .await
+        .expect("targeted cleanup wait is bounded")
+        .expect_err("Alice's old worker still holds the replacement fence");
+    assert!(matches!(first_lookup, AppError::BlockingTask(_)));
+    manager
+        .startup_retries
+        .lock()
+        .unwrap()
+        .extend_deadline_for_test(&alice.account_id_hex, Duration::from_secs(60));
+    let second_lookup = timeout(Duration::from_secs(1), manager.worker_commands("alice"))
+        .await
+        .expect("cleanup timeout enters retry backoff")
+        .expect_err("Alice is deferred while cleanup is stuck");
+    assert!(matches!(second_lookup, AppError::BlockingTask(_)));
+    assert_eq!(
+        runtime.app_performance_snapshot().account_open.attempts,
+        attempts_before_wait,
+        "a stuck cleanup must not start a replacement worker"
     );
     release_tx.send(()).expect("release stuck worker");
     manager

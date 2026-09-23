@@ -6278,17 +6278,28 @@ impl AccountManager {
                     stale_workers,
                 )
             };
-            // Worker task teardown releases AppClient's account-session guard.
-            // Reap stale tasks before opening replacements for the same labels.
-            self.register_worker_reapers(stale_workers);
+            // Finished tasks have already released their session guards and
+            // can be joined immediately. Register still-running tasks before
+            // any await so cancellation cannot lose their cleanup handles.
+            let (finished_workers, running_workers): (Vec<_>, Vec<_>) = stale_workers
+                .into_iter()
+                .partition(|(_, worker)| worker.handle.is_finished());
+            self.register_worker_reapers(running_workers);
+            for (_, worker) in finished_workers {
+                worker.shutdown().await;
+            }
             if let Some(account_id) = target_account_id {
                 let retry_allowed = self
                     .startup_retries
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .allows(account_id, tokio::time::Instant::now());
-                if retry_allowed {
-                    self.ensure_worker_reaped(account_id).await?;
+                if retry_allowed && let Err(error) = self.ensure_worker_reaped(account_id).await {
+                    self.startup_retries
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .fail(account_id.to_owned(), tokio::time::Instant::now());
+                    return Err(error);
                 }
             }
             let pending_reapers = self.finish_worker_reapers().await;
