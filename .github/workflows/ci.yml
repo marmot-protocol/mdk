@@ -1058,6 +1058,15 @@ jobs:
           python3 -m py_compile scripts/hermes_marmot_configure_gateway.py integrations/hermes/tests/marmot/e2e_gateway_auth.py
           integrations/hermes/tests/marmot/test_dev_scripts.sh
 
+      - name: Pinned Hermes presence host contracts
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/hermes-installer-auth/env.sh"
+          HERMES_PRESENCE_CONTRACT=1 PYTHONPATH="$HERMES_AGENT_REPO" \
+            "$HERMES_AGENT_REPO/.venv/bin/python" -m unittest discover \
+            -s integrations/hermes/tests/marmot -p test_presence_host_contract.py -v
+
       - name: Real Hermes authorization and deterministic Marmot E2E
         run: |
           set -euo pipefail

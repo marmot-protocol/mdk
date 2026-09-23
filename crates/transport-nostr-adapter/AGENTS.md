@@ -65,3 +65,8 @@ for reconnect/backoff and relay status mechanics.
 cargo test -p transport-nostr-adapter
 cargo test -p transport-nostr-adapter --features sdk
 ```
+
+- Recovery maintenance ids include the owner's durable attempt serial. A duplicate install joins only a live session;
+  after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.
+  Never clear `maintenance_attempt_high_water` while the adapter lives: CLOSE and route removal cannot recall late EOSE.
+  Only recovery installs use the scoped client API; preserve the legacy maintenance subscribe/cleanup path.

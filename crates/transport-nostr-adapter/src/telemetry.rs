@@ -91,6 +91,10 @@ impl RelayIndexRegistry {
         index
     }
 
+    pub(crate) fn existing_index_for(&self, endpoint: &TransportEndpoint) -> Option<RelayIndex> {
+        self.indices.get(&relay_index_key(endpoint)).copied()
+    }
+
     /// Resolve an opaque index back to its relay endpoint, if one is assigned.
     ///
     /// This is the only reverse mapping in the module. It exists solely for the
@@ -674,6 +678,18 @@ impl RelaySyncTelemetry {
             .get(subscription_id)
             .or_else(|| self.staged.subscriptions.get(subscription_id))
             .map(|subscription| subscription.relays.values().any(|relay| relay.eose_seen))
+    }
+
+    pub(crate) fn subscription_endpoint_eose(
+        &self,
+        subscription_id: &str,
+        relay: RelayIndex,
+    ) -> Option<bool> {
+        self.subscriptions
+            .get(subscription_id)
+            .or_else(|| self.staged.subscriptions.get(subscription_id))
+            .and_then(|subscription| subscription.relays.get(&relay))
+            .map(|progress| progress.eose_seen)
     }
 
     /// Aggregate, privacy-safe snapshot of subscription sync timing.
