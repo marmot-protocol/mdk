@@ -209,3 +209,15 @@ and superseded checks, and the remaining blocking acquisition limitations.
   timing fixtures accidentally requested zero backoff; their final versions use
   an explicit long interval and advance only the owner clock. The replacement
   CSV records the durable-owner guarantees replacing detector rearm assertions.
+- Worker integration: four focused policy-override regressions pass. Startup
+  coalesces incremental/epoch/loss demand; receive, maintenance and post-convergence
+  preserve its reservation; one genuine explicit caller adds exactly one attempt.
+  Two actual scheduled convergence passes service runnable input and queued reads
+  while durable loss remains in cooldown, with unchanged retry and subscription
+  counts. A gap discovered during ordinary catch-up is replayed on the existing
+  maintenance tick without later live traffic; its below-floor event is admitted
+  and EOSE remains incomplete. The duplicate-only quantum still yields to queued
+  commands. Initial quiet-gap assertions ran before the activation barrier and
+  incorrectly counted incremental grants as epoch audit rows; final assertions
+  use durable admission and the actual epoch audit contract. A test-only worker
+  clock command changes no storage and grants no execution authority.

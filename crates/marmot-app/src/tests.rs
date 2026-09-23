@@ -1391,7 +1391,7 @@ async fn inject_epoch_gap_probe(app: &MarmotApp, event: NostrTransportEvent) {
 }
 
 #[test]
-fn explicit_catch_up_arms_and_replays_without_later_traffic() {
+fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
     run_composed_app_runtime_test("explicit-catch-up-backfill", || async {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -1401,7 +1401,7 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
         let mut app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
         .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
@@ -1466,17 +1466,44 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
             .await;
         }
 
-        // The next two blocked subscribes are the complete unfloored replay.
-        // Without the post-CatchUp replay seam the catch-up task returns after
-        // the first release and this wait times out: the regression's RED signal.
-        relay.block_next_subscribes(2);
+        // The caller spent its one permit on the floored activation. Newly
+        // discovered debt waits for the owner; no nested activation is allowed.
         relay.release_subscribe();
+        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, catch_up)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let retry = storage.recovery_retry_state().unwrap();
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            unfloored_before
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
+        );
+        relay.block_next_subscribes(2);
+        runtime
+            .advance_recovery_clock_for_test("alice", Duration::from_secs(300))
+            .await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::time::resume();
         tokio::time::timeout(
             EXPLICIT_CATCH_UP_BACKFILL_DEADLINE,
             relay.wait_for_blocked_subscribes(4),
         )
         .await
-        .expect("armed explicit catch-up must park one complete unfloored replay");
+        .expect("the existing maintenance tick must service quiet pending debt");
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            retry.attempt_serial + 1
+        );
 
         // Model the relay's stored-event response to that unfloored REQ. The
         // target is older than the persisted cursor's 120-second floor and is
@@ -1489,17 +1516,6 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
         let below_floor_target_id = below_floor_target.id.clone();
         inject_epoch_gap_probe(&app, below_floor_target).await;
         relay.release_subscribe();
-
-        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, catch_up)
-            .await
-            .expect("explicit catch-up must finish after replay activation")
-            .expect("catch-up task must not panic")
-            .expect("explicit catch-up must report replay success");
-        assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            unfloored_before + 1,
-            "the arming catch-up must issue exactly one account-wide replay",
-        );
 
         tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, async {
             loop {
@@ -1518,11 +1534,11 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
         .await
         .expect("the below-floor target must be ingested without later traffic");
 
-        runtime.catch_up_accounts().await.unwrap();
+        runtime.drain_in_flight_work().await.unwrap();
         assert_eq!(
             relay.unfloored_account_subscription_count(),
             unfloored_before + 1,
-            "consumed evidence must not trigger a second full-history replay",
+            "the owner-issued replay has no nested follow-up"
         );
         let final_local_epoch = runtime
             .group_mls_state("alice", &group_id)
@@ -1550,50 +1566,36 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
             .iter()
             .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
             .collect();
-        let completed_rows: Vec<_> = audit_rows
+        let failed_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
+            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
             .collect();
-        assert_eq!(
-            armed_rows.len(),
-            1,
-            "explicit catch-up must arm exactly once: {audit_rows:?}"
-        );
+        assert_eq!(armed_rows.len(), 1);
         assert_eq!(
             started_rows.len(),
             1,
-            "explicit catch-up must start exactly one replay attempt: {audit_rows:?}"
+            "one epoch-history attempt; incremental grants do not emit epoch audit rows"
         );
+        let completed_rows: Vec<_> = failed_rows
+            .into_iter()
+            .filter(|row| {
+                row["context"]["operation_id"] == started_rows[0]["context"]["operation_id"]
+            })
+            .collect();
+        assert_eq!(completed_rows.len(), 1);
         assert_eq!(
-            completed_rows.len(),
-            1,
-            "explicit catch-up must complete exactly one replay attempt: {audit_rows:?}"
+            completed_rows[0]["kind"]["error_kind"],
+            "history_coverage_unproven"
         );
-        let attempt_id = armed_rows[0]["context"]["operation_id"]
-            .as_str()
-            .expect("armed row must carry operation_id");
-        assert_eq!(
-            started_rows[0]["context"]["operation_id"].as_str(),
-            Some(attempt_id)
-        );
-        assert_eq!(
-            completed_rows[0]["context"]["operation_id"].as_str(),
-            Some(attempt_id)
-        );
-        assert_eq!(
-            started_rows[0]["kind"]["seam"].as_str(),
-            Some("explicit_catch_up")
-        );
-        assert_eq!(
-            completed_rows[0]["kind"]["activation_outcome"].as_str(),
-            Some("succeeded")
-        );
-        assert_eq!(completed_rows[0]["kind"]["retry_ordinal"], 0);
+        assert_eq!(started_rows[0]["kind"]["seam"], "maintenance");
+        assert_eq!(completed_rows[0]["kind"]["activation_outcome"], "succeeded");
+        assert!(completed_rows[0]["kind"]["deliveries"].as_u64().unwrap() >= 1);
         assert!(
-            completed_rows[0]["kind"]["deliveries"]
-                .as_u64()
-                .is_some_and(|deliveries| deliveries >= 1),
-            "the terminal row must count the below-floor delivery"
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
         );
         let audited_epoch_before = completed_rows[0]["kind"]["local_epoch_before"]
             .as_u64()
@@ -2475,7 +2477,7 @@ fn account_worker_services_local_command_after_duplicate_backfill_quantum() {
         let config = MarmotAppConfig::default()
             .with_dev_epoch_backfill_eose_wait_ms(30_000)
             .with_dev_epoch_backfill_execution_quantum_ms(400)
-            .with_dev_epoch_backfill_retry_backoff_ms(1_500);
+            .with_dev_epoch_backfill_retry_backoff_ms(60_000);
         let mut app =
             MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
                 .with_test_relay_client(relay.clone());
@@ -2528,14 +2530,19 @@ fn account_worker_services_local_command_after_duplicate_backfill_quantum() {
             inject_epoch_gap_probe(&app, probe).await;
         }
 
-        relay.block_next_subscribes(2);
         relay.release_subscribe();
+        catch_up.await.unwrap().unwrap();
+        // A second genuine caller joins the now-durable gap. It gets one
+        // authorized unfloored attempt; a single caller never gets two.
+        relay.block_next_subscribes(2);
+        let catch_up_runtime = runtime.clone();
+        let catch_up = tokio::spawn(async move { catch_up_runtime.catch_up_accounts().await });
         tokio::time::timeout(
             EXPLICIT_CATCH_UP_BACKFILL_DEADLINE,
             relay.wait_for_blocked_subscribes(4),
         )
         .await
-        .expect("armed catch-up must enter its unfloored replay");
+        .unwrap();
         let (stop, pump) = redelivery_pump(
             &app,
             duplicate.expect("one arm probe"),
@@ -2571,7 +2578,10 @@ fn account_worker_services_local_command_after_duplicate_backfill_quantum() {
         let _ = pump.await;
 
         let rows = recorded_audit_rows(&app);
-        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        let failed: Vec<_> = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed")
+            .into_iter()
+            .filter(|row| row["kind"]["error_kind"] == "backfill_drain_no_progress_quantum_yield")
+            .collect();
         assert_eq!(failed.len(), 1);
         assert_eq!(
             failed[0]["kind"]["error_kind"].as_str(),

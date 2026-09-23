@@ -469,6 +469,12 @@ pub(crate) enum AccountWorkerCommand {
     },
     /// Count seeded groups the session has not fully hydrated yet, without
     /// promoting them on demand (mdk#1337 regression probe).
+    /// Controlled-clock fixture; changes no durable row and grants no I/O.
+    #[cfg(test)]
+    AdvanceRecoveryClock {
+        elapsed: Duration,
+        respond: oneshot::Sender<()>,
+    },
     #[cfg(test)]
     UnhydratedGroupCount {
         respond: oneshot::Sender<usize>,
@@ -3228,6 +3234,12 @@ fn account_worker_command_future<'a>(
             false
         }),
         #[cfg(test)]
+        AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond } => Box::pin(async move {
+            client.recovery_owner.test_advance_clock(elapsed);
+            let _ = respond.send(());
+            true
+        }),
+        #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => Box::pin(async move {
             let count = client.runtime.session().unhydrated_group_ids().len();
             let _ = respond.send(count);
@@ -5801,9 +5813,10 @@ mod tests {
             "wss://relay.example",
             crate::MarmotAppConfig::default()
                 .with_dev_settlement_quiescence_ms(100)
-                .with_dev_scheduled_convergence_delay_ms(60_000),
+                .with_dev_scheduled_convergence_delay_ms(60_000)
+                .with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
-        .with_test_relay_client(relay);
+        .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
         runtime.reconcile_accounts().await.unwrap();
@@ -5863,6 +5876,13 @@ mod tests {
             .unwrap()
             .shutdown()
             .await;
+        // Lost history remains independent of the runnable local passes. The
+        // account already owes the cooldown reserved by catch-up.
+        let retry = storage.recovery_retry_state().unwrap();
+        let activations = relay.subscription_count();
+        storage
+            .record_account_delivery_loss("bob", 771, 1, crate::unix_now_seconds())
+            .unwrap();
         let first_pass = Arc::new(tokio::sync::Barrier::new(2));
         runtime
             .shared_services()
@@ -5921,6 +5941,23 @@ mod tests {
         })
         .await
         .expect("recovery must not starve the queued commands");
+        assert_eq!(
+            storage.recovery_retry_state().unwrap(),
+            retry,
+            "both actual scheduled convergence passes preserve history retry cost"
+        );
+        assert_eq!(
+            relay.subscription_count(),
+            activations,
+            "post-convergence and maintenance cannot bypass the owner cooldown"
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|d| d.cause == storage_sqlite::RecoveryCause::QueueLoss)
+        );
         runtime.drain_in_flight_work().await.unwrap();
         runtime.shutdown_and_close().await.unwrap();
     }
@@ -7021,11 +7058,15 @@ mod tests {
         let (events, _subscriber) = broadcast::channel(16);
         let shared = RuntimeSharedServices::default();
         let before = relay.unfloored_account_subscription_count();
+        client
+            .sync_with_stage_telemetry(&shared.app_performance_telemetry(), false)
+            .await
+            .unwrap();
         for (seam, expected_activations, reason) in [
             (
                 EpochBackfillExecutionSeam::Maintenance,
                 1,
-                "compatible epoch and overflow demand share one activation",
+                "startup joined compatible epoch, incremental and overflow demand in one activation",
             ),
             (
                 EpochBackfillExecutionSeam::Receive,
@@ -7056,6 +7097,50 @@ mod tests {
                 "{reason}",
             );
         }
+        let retry = app
+            .account_storage("alice")
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap();
+        client
+            .advance_convergence_after_runtime_sync(&group)
+            .await
+            .unwrap();
+        run_pending_epoch_backfill_reporting_arm(
+            &mut client,
+            &events,
+            "account-id",
+            "alice",
+            &shared,
+            EpochBackfillExecutionSeam::Maintenance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap(),
+            retry
+        );
+        assert_eq!(relay.unfloored_account_subscription_count() - before, 1);
+        client
+            .sync_with_classified_partial_progress()
+            .await
+            .unwrap();
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            2
+        );
+        assert_eq!(
+            relay.unfloored_account_subscription_count() - before,
+            2,
+            "one genuine explicit caller spends one override without a nested overflow replay"
+        );
         assert!(client.has_pending_epoch_backfill());
         assert!(client.delivery_overflow_recovery_pending);
         assert_eq!(
@@ -7063,7 +7148,7 @@ mod tests {
                 .relay_health()
                 .await
                 .account_delivery_recovery_attempts,
-            1,
+            2,
         );
     }
 
