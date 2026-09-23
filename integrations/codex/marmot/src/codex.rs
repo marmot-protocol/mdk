@@ -290,10 +290,7 @@ fn is_supported_staged_file(bytes: &[u8]) -> bool {
 }
 
 fn is_text(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).is_ok_and(|text| {
-        text.chars()
-            .all(|character| matches!(character, '\n' | '\r' | '\t') || !character.is_control())
-    })
+    std::str::from_utf8(bytes).is_ok_and(|text| !text.contains('\0'))
 }
 
 fn is_pdf(bytes: &[u8]) -> bool {
@@ -921,6 +918,16 @@ mod tests {
     }
 
     #[test]
+    fn ansi_coloured_log_is_staged_as_text() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("build.log");
+        fs::write(&log, b"\x1b[31merror\x1b[0m\x0c\n").unwrap();
+        let batch = [attachment(&log, "text/plain", "build.log")];
+        let prepared = prepare_attachments(&batch).unwrap();
+        assert!(!prepared[0].native_image);
+    }
+
+    #[test]
     fn attachment_matrix_stages_documents_audio_and_archives_but_rejects_opaque_binary() {
         let root = tempfile::tempdir().unwrap();
         let text = root.path().join("notes.txt");
@@ -936,7 +943,7 @@ mod tests {
         fs::write(&audio, b"RIFF\x04\x00\x00\x00WAVEdata").unwrap();
         fs::write(&archive, b"PK\x03\x04archive").unwrap();
         fs::write(&opaque, b"\x00\x9f\xff\x80opaque").unwrap();
-        fs::write(&control_text, b"\x01\x02\x03").unwrap();
+        fs::write(&control_text, b"\x01\x02\x00").unwrap();
         fs::write(&truncated_mp3, b"\xff\xe0").unwrap();
         fs::write(&non_audio_ogg, b"OggS\x00not-an-audio-page").unwrap();
 

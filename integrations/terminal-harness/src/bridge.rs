@@ -2118,6 +2118,10 @@ async fn handle_backend_run_failure(
                 config.spec.reply_prefix, config.spec.display_name, config.spec.bin_env_name
             )
         }
+        HarnessError::AttachmentInvalid => format!(
+            "[{}] the staged attachment changed or is invalid; retry the upload. No backend turn was started.",
+            config.spec.reply_prefix
+        ),
         HarnessError::AttachmentUnsupported => format!(
             "[{}] {} does not support this attachment batch; no backend turn was started.",
             config.spec.reply_prefix, config.spec.display_name
@@ -4759,6 +4763,39 @@ mod tests {
             recovery.get("invalid").await.unwrap().status,
             RecoveryStatus::Pending
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_attachment_before_spawn_does_not_persist_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let sessions = SessionStore::load(home.join("sessions.json"), &home).unwrap();
+        let recovery = RecoveryStore::load(home.join("recovery.json")).unwrap();
+        let config = test_config(&home);
+        sessions
+            .record_session("group1", "existing-session".to_owned(), home.clone())
+            .await
+            .unwrap();
+        let known_session = sessions.get("group1").await.unwrap();
+        let reply = handle_backend_run_failure(
+            FailureRecoveryContext {
+                config: &config,
+                sessions: &sessions,
+                recovery: &recovery,
+            },
+            "group1",
+            Some(&known_session),
+            home,
+            "prompt".to_owned(),
+            Vec::new(),
+            &RunFailure {
+                error: HarnessError::AttachmentInvalid,
+                observed_session: None,
+            },
+        )
+        .await;
+        assert!(reply.contains("No backend turn was started."));
+        assert!(recovery.get("group1").await.is_none());
     }
 
     #[tokio::test]

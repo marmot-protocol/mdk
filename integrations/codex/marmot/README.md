@@ -177,7 +177,7 @@ All attachments from one Marmot message are downloaded in message order, copied 
 | File class | Byte-level recognition | Codex delivery |
 | --- | --- | --- |
 | Native images | PNG, JPEG, GIF, or WebP signature | Ordered native `--image` argument plus staged-file manifest entry |
-| Text and source | Complete file is valid UTF-8 and contains no control character except tab, carriage return, or line feed | Staged-file manifest entry |
+| Text and source | Complete file is valid UTF-8 and contains no NUL byte (ANSI-coloured logs are accepted) | Staged-file manifest entry |
 | PDF | `%PDF-` signature | Staged-file manifest entry |
 | Audio | WAV, MP3, or FLAC header; or an Ogg first packet identifying Vorbis, Opus, or FLAC | Staged-file manifest entry |
 | Archives | ZIP, gzip, bzip2, xz, 7z, RAR, or ustar-format tar signature | Staged-file manifest entry |
