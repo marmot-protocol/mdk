@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -309,6 +309,8 @@ pub struct NostrSdkRelayClient {
     #[cfg(test)]
     publish_release_attempts: Arc<Mutex<HashMap<RelayUrl, usize>>>,
     #[cfg(test)]
+    forwarder_event_entered: Arc<AtomicBool>,
+    #[cfg(test)]
     publish_relay_pin_failure_stage: Arc<AtomicU8>,
     /// Relays that explicitly rejected NIP-77 are skipped for the rest of this
     /// process. Transient connection failures are never cached here.
@@ -325,6 +327,27 @@ pub struct NostrSdkRelayClient {
     /// the adapter drives during activation and the clone the app holds observe
     /// the same log.
     registration_log: Arc<Mutex<HashMap<MemberId, HashMap<RelayUrl, bool>>>>,
+}
+
+/// An aborted public forwarder must not detach a blocked delivery child. It
+/// also preserves evidence for any work abandoned by that abrupt teardown.
+struct ForwarderWorkerGuard {
+    abort: tokio::task::AbortHandle,
+    pending: Arc<AtomicU64>,
+    loss: NostrSdkRelayClient,
+    loss_accounted: bool,
+}
+
+impl Drop for ForwarderWorkerGuard {
+    fn drop(&mut self) {
+        if !self.loss_accounted {
+            let abandoned = self.pending.load(Ordering::SeqCst);
+            if abandoned > 0 {
+                self.loss.record_notification_gap(abandoned);
+            }
+        }
+        self.abort.abort();
+    }
 }
 
 struct ScopedPublishRelayLease {
@@ -400,6 +423,8 @@ impl NostrSdkRelayClient {
             publish_connect_attempts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             publish_release_attempts: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            forwarder_event_entered: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
             reconciliation_unsupported_relays: Arc::new(RwLock::new(HashSet::new())),
@@ -843,11 +868,16 @@ impl NostrSdkRelayClient {
             loss.notification_receiver_replaced();
             const EVENT_QUEUE_CAPACITY: usize = 256;
             let (sender, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-            let in_flight = Arc::new(AtomicBool::new(false));
-            let worker_in_flight = in_flight.clone();
+            let pending = Arc::new(AtomicU64::new(0));
+            let worker_pending = pending.clone();
+            #[cfg(test)]
+            let forwarder_event_entered = loss.forwarder_event_entered.clone();
             let mut worker = tokio::spawn(async move {
                 while let Some(notification) = event_rx.recv().await {
-                    worker_in_flight.store(true, Ordering::SeqCst);
+                    #[cfg(test)]
+                    if matches!(notification, ClientNotification::Event { .. }) {
+                        forwarder_event_entered.store(true, Ordering::SeqCst);
+                    }
                     match notification {
                         ClientNotification::Event {
                             relay_url,
@@ -897,19 +927,25 @@ impl NostrSdkRelayClient {
                             _ => {}
                         },
                         ClientNotification::Shutdown => {
-                            worker_in_flight.store(false, Ordering::SeqCst);
+                            worker_pending.fetch_sub(1, Ordering::SeqCst);
                             break;
                         }
                     }
-                    worker_in_flight.store(false, Ordering::SeqCst);
+                    worker_pending.fetch_sub(1, Ordering::SeqCst);
                 }
             });
+            let mut worker_guard = ForwarderWorkerGuard {
+                abort: worker.abort_handle(),
+                pending: pending.clone(),
+                loss: loss.clone(),
+                loss_accounted: false,
+            };
             let mut notifications = client.notifications_with_gaps();
             loop {
                 let update = tokio::select! {
                     _ = &mut worker => {
-                        let abandoned = (sender.max_capacity() - sender.capacity()) as u64
-                            + u64::from(in_flight.load(Ordering::SeqCst));
+                        worker_guard.loss_accounted = true;
+                        let abandoned = pending.load(Ordering::SeqCst);
                         if abandoned > 0 {
                             loss.record_notification_gap(abandoned);
                         }
@@ -921,11 +957,11 @@ impl NostrSdkRelayClient {
                 match update {
                     NotificationUpdate::Notification(ClientNotification::Shutdown) => break,
                     NotificationUpdate::Notification(notification) => {
+                        pending.fetch_add(1, Ordering::SeqCst);
                         if sender.try_send(notification).is_err() {
-                            // The blocked event worker may also hold one item.
-                            let abandoned = 1
-                                + (sender.max_capacity() - sender.capacity()) as u64
-                                + u64::from(in_flight.load(Ordering::SeqCst));
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                            let abandoned = 1 + pending.load(Ordering::SeqCst);
+                            worker_guard.loss_accounted = true;
                             loss.record_notification_gap(abandoned);
                             worker.abort();
                             let _ = worker.await;
@@ -933,9 +969,8 @@ impl NostrSdkRelayClient {
                         }
                     }
                     NotificationUpdate::Lagged { skipped } => {
-                        let abandoned = skipped
-                            .saturating_add((sender.max_capacity() - sender.capacity()) as u64)
-                            .saturating_add(u64::from(in_flight.load(Ordering::SeqCst)));
+                        let abandoned = skipped.saturating_add(pending.load(Ordering::SeqCst));
+                        worker_guard.loss_accounted = true;
                         loss.record_notification_gap(abandoned);
                         worker.abort();
                         let _ = worker.await;
@@ -943,8 +978,8 @@ impl NostrSdkRelayClient {
                     }
                 }
             }
-            let abandoned = (sender.max_capacity() - sender.capacity()) as u64
-                + u64::from(in_flight.load(Ordering::SeqCst));
+            let abandoned = pending.load(Ordering::SeqCst);
+            worker_guard.loss_accounted = true;
             if abandoned > 0 {
                 loss.record_notification_gap(abandoned);
                 worker.abort();
@@ -1581,7 +1616,12 @@ impl NostrSdkRelayClient {
             return Ok(true);
         }
 
-        if self.client.relays().await.contains_key(endpoint) {
+        if let Some(relay) = self.client.relays().await.get(endpoint) {
+            // A prior bounded history request may have registered this relay
+            // with READ only. Publication is now explicitly requested, so
+            // enable WRITE on that same compatible account connection. This
+            // does not add READ to a one-shot write-only publication relay.
+            relay.capabilities().add(RelayCapabilities::WRITE);
             return Ok(false);
         }
 
@@ -2542,6 +2582,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_registered_relay_can_later_publish_without_subscription() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let endpoint = TransportEndpoint(url.to_string());
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let sdk = signed_sdk(keys);
+
+        let history = timeout(
+            Duration::from_secs(5),
+            sdk.acquire_history(
+                acquisition_request(account_id, url.clone(), vec![[0x42; 32]], 4, 100_000),
+                NostrAcquisitionCancellation::new(),
+            ),
+        )
+        .await
+        .expect("history request completes")
+        .unwrap();
+        assert_eq!(history.endpoints.len(), 1);
+        let registered = sdk.client.relays().await.get(&url).cloned().unwrap();
+        assert!(registered.capabilities().load().can_read());
+        assert!(!registered.capabilities().load().can_write());
+
+        let outcome = timeout(
+            Duration::from_secs(5),
+            sdk.publish_event(
+                std::slice::from_ref(&endpoint),
+                &signed_group_event_dto(),
+                1,
+            ),
+        )
+        .await
+        .expect("publication completes")
+        .expect("history-only relay is upgraded for the requested publication");
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(outcome.accepted[0].endpoint, endpoint);
+        assert!(registered.capabilities().load().can_write());
+        assert_eq!(sdk.relay_health().await.total_relays, 1);
+        sdk.client.shutdown().await;
+        relay.shutdown();
+    }
+
+    #[tokio::test]
     async fn production_acquisition_cancel_and_drop_preserve_live_interest() {
         use tokio::sync::mpsc;
         use tokio_tungstenite::tungstenite::Message;
@@ -2827,6 +2910,77 @@ mod tests {
             .await
             .expect("replacement exits on shutdown")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborting_public_forwarder_cancels_blocked_delivery_child() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let account = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+        let loss = sdk.notification_loss().unwrap();
+        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account,
+                inbox_endpoints: vec![endpoint],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+        let held_delivery_slots = adapter
+            .delivery_tx
+            .reserve_many(crate::DELIVERY_BUFFER)
+            .await
+            .unwrap();
+        let event = EventBuilder::new(Kind::GiftWrap, "blocked before parent abort")
+            .tag(Tag::public_key(keys.public_key()))
+            .finalize(&keys)
+            .unwrap();
+        relay.add_event(event).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !sdk.forwarder_event_entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder worker starts the relay event");
+
+        forwarder.abort();
+        assert!(forwarder.await.unwrap_err().is_cancelled());
+        assert!(
+            loss.borrow()
+                .as_ref()
+                .is_some_and(|gap| gap.cumulative_skipped >= 1),
+            "aborted work advances the independent loss watch"
+        );
+        let replacement = sdk.spawn_notification_forwarder(adapter.clone());
+        drop(held_delivery_slots);
+        assert!(
+            timeout(Duration::from_millis(200), adapter.receive())
+                .await
+                .is_err(),
+            "the cancelled child must not deliver the old event after receiver replacement"
+        );
+        let fresh = EventBuilder::new(Kind::GiftWrap, "after parent replacement")
+            .tag(Tag::public_key(keys.public_key()))
+            .finalize(&keys)
+            .unwrap();
+        relay.add_event(fresh).await.unwrap();
+        timeout(Duration::from_secs(5), adapter.receive())
+            .await
+            .expect("replacement forwarder delivers new work")
+            .unwrap()
+            .expect("fresh relay event is delivered");
+        sdk.client.shutdown().await;
+        timeout(Duration::from_secs(2), replacement)
+            .await
+            .expect("replacement exits on shutdown")
+            .unwrap();
+        relay.shutdown();
     }
 
     fn signed_sdk_from_client(client: Client, keys: Keys) -> NostrSdkRelayClient {
