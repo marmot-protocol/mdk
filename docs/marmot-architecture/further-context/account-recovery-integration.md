@@ -67,3 +67,9 @@ and superseded checks, and the remaining blocking acquisition limitations.
   tests pass, as do all 6 demand/waiter storage tests. The test compares every
   pending identity across reopen (including startup demand), not an assumed count.
   Full feature-gated cancellation/admitted-prefix and worker tests remain required.
+- Cancellation checkpoint `4c76e363`: feature-gated admitted-prefix cancellation
+  and stale-EOSE isolation also pass. Maintenance restoration now uses a controlled
+  retry deadline instead of a 5 ms sleep that default builds intentionally ignore.
+  It proves no activation/cost change during cooldown, fresh session afterward,
+  and identical grace deadline throughout. All 10 owner tests pass with default
+  policy; the restoration regression also passes with policy overrides.

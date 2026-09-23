@@ -1340,7 +1340,7 @@ mod tests {
         let app = crate::MarmotApp::with_relay_and_config(
             directory.path(),
             "wss://relay.example",
-            bounded_epoch_backfill_config(),
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
@@ -1461,7 +1461,27 @@ mod tests {
             .remove_group_maintenance_subscription(&new_id)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        let retry = storage.recovery_retry_state().unwrap();
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert!(
+            !client
+                .post_join_maintenance_subscriptions
+                .contains_key(&group),
+            "physical session loss cannot bypass the shared retry deadline"
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(
+            storage
+                .maintenance_obligation(&job.id)
+                .unwrap()
+                .unwrap()
+                .grace_until,
+            advanced.grace_until
+        );
+        client.recovery_owner.test_advance_to_retry(&storage);
         client
             .advance_post_join_maintenance_subscriptions()
             .await
