@@ -352,3 +352,24 @@ and superseded checks, and the remaining blocking acquisition limitations.
   Temporary diagnostic probes were removed. All 24 owner/API compatibility tests
   pass, including unchanged prompt-invite, reconnect, overflow and ordinary
   registration failure/retry regressions. The complete stack must be rerun.
+
+- Review address checkpoint: Cursor/Grok reviewed draft #1992 at `81c2bb53`
+  and identified maintenance widening incremental floors and transient effects
+  before successful plan freeze. Both are fixed. Maintenance uses its separate
+  scoped REQ; maintenance-only activation keeps the live floor. A rejected freeze
+  retains observations, the caller override, durable debt and reserved retry cost;
+  stale observations cannot suppress a successor or complete its predicate. Loss
+  snapshots and inventory preparation precede transient commitment. A rejected
+  plan reports an error instead of masquerading as no work due.
+  All 20 owner tests pass with policy overrides, including both new regressions.
+  Restoring only the old floor calculation makes the final new regression fail
+  with an unfloored inbox; restoring the fix preserves the exact passing source.
+  Claude Code 2.1.280/Opus 5.5 stalled without a review and was stopped/reaped
+  after over 22 minutes (exit 143); this is a failed reviewer, not approval.
+  One review/address round is being completed; no second round was launched.
+- Three-crate run on `5a6811a28f2f2f79a1cf741412a64203497b3577`:
+  1082 passed, 2 failed, 8 skipped. Both failures are populated-migration
+  comparisons that did not account for migration 0094's appended columns.
+  This run is not combined acceptance evidence. The migration corrections below
+  must retain every legacy value and assert that new qualified evidence starts
+  empty, including interrupted upgrade and reopen.

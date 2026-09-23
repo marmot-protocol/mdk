@@ -3745,13 +3745,30 @@ impl AppClient {
         // A coalesced activation covers the oldest selected goal. Incremental
         // callers keep their existing cursor floor and quiet-drain contract;
         // joining gap/loss/repair demand deliberately widens that same grant.
-        let since = obligations
-            .iter()
-            .flat_map(|obligation| &obligation.scopes)
-            .map(|scope| scope.goal.since_seconds)
-            .collect::<Option<Vec<_>>>()
-            .and_then(|bounds| bounds.into_iter().min())
-            .map(cgka_traits::transport::Timestamp);
+        let since = {
+            let mut history = obligations
+                .iter()
+                .filter(|obligation| obligation.cause != storage_sqlite::RecoveryCause::Maintenance)
+                .peekable();
+            if history.peek().is_none() {
+                self.subscription_rebuild_since().map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::TransportActivation,
+                    )
+                })?
+            } else {
+                history
+                    .flat_map(|obligation| &obligation.scopes)
+                    .map(|scope| scope.goal.since_seconds)
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|bounds| bounds.into_iter().min())
+                    .map(cgka_traits::transport::Timestamp)
+            }
+        };
+        // Maintenance has its own scoped unfloored REQ. It cannot widen the
+        // broad live activation; only selected history/loss goals may do so.
         // Maintenance installs a temporary subscription and observes its first
         // boundary later under the domain's existing deadline. Sharing that
         // prerequisite must not turn ordinary incremental catch-up into a
