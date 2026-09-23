@@ -14,6 +14,8 @@ struct State {
     next_id: u64,
     global_blocks: usize,
     accounts: HashMap<String, AccountState>,
+    #[cfg(test)]
+    delete_queued_signal: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -42,6 +44,30 @@ pub(crate) struct AuditExportMutation {
 }
 
 impl AuditExportLifecycle {
+    #[cfg(test)]
+    pub(crate) fn signal_next_delete_queued_for_test(
+        &self,
+        signal: tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .delete_queued_signal = Some(signal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_delete_queued_for_test(&self) {
+        if let Some(signal) = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .delete_queued_signal
+            .take()
+        {
+            let _ = signal.send(());
+        }
+    }
+
     pub(crate) fn reserve(&self, account: &str, destination: &str) -> Option<AuditExportAttempt> {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if state.global_blocks > 0 {

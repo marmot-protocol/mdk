@@ -6651,15 +6651,20 @@ impl AccountManager {
                 // A send error means the worker channel is closed, so its
                 // session — and thus any file handle — is gone; fall through to
                 // a direct removal, which is then safe.
-                if commands
+                let queued = commands
                     .send(AccountWorkerCommand::DeleteAuditLog {
                         path: path.clone(),
                         respond,
                     })
                     .await
-                    .is_ok()
-                    && account_worker_response(response).await?
-                {
+                    .is_ok();
+                #[cfg(test)]
+                if queued {
+                    self.app
+                        .audit_export_lifecycle
+                        .notify_delete_queued_for_test();
+                }
+                if queued && account_worker_response(response).await? {
                     // The live recorder owned this file and rotated it: old
                     // file gone, fresh file already recording.
                     return Ok(AuditLogDeleteOutcome {

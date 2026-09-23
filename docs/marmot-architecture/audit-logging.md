@@ -21,7 +21,7 @@ The retained deterministic hashes, raw group/message/transport identifiers, time
 
 | Surface | Current state |
 | --- | --- |
-| Local JSONL recording | Implemented by `marmot-forensics::JsonlRecorder`, installed into each `AccountDeviceSession` only when app-level `AuditLogSettings.enabled` is true before that account session opens. |
+| Local JSONL recording | Implemented by `marmot-forensics::JsonlRecorder`, installed when app-level `AuditLogSettings.enabled` is true at account-session open or hot-swapped into running account workers by the runtime setter. |
 | Default behavior | Off. Without an installed recorder, the engine uses `NoopRecorder` and emits no JSONL records. |
 | File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v4`; the line-level JSON Schema is [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json). |
 | Local file location | `<account_dir>/audit-<engine_id>-v4.jsonl` for app-opened account sessions, sealed into `-seg<NNNNNN>` siblings at 1 MiB. Exclusive-root startup deletes recognized v1/v2/v3 files and segments. |
@@ -49,7 +49,7 @@ Audit logging is controlled by `AuditLogSettings`:
 
 | Field | Meaning |
 | --- | --- |
-| `enabled` | Whether future account sessions should install a JSONL recorder. Default `false`. |
+| `enabled` | Whether new account sessions install a JSONL recorder; the runtime setter also updates running account workers. Default `false`. |
 
 The setting is persisted in shared SQLite:
 

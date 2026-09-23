@@ -471,6 +471,70 @@ async fn deleting_one_account_file_does_not_cancel_another_account() {
 }
 
 #[tokio::test]
+async fn queued_worker_delete_still_fences_after_its_caller_is_cancelled() {
+    let f = Fixture::new();
+    let held_worker = Arc::new(tokio::sync::Barrier::new(2));
+    f.runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(held_worker.clone());
+    f.runtime.start().await.unwrap();
+    held_worker.wait().await;
+
+    let (queued, queued_signal) = oneshot::channel();
+    f.app
+        .audit_export_lifecycle
+        .signal_next_delete_queued_for_test(queued);
+    let runtime = f.runtime.clone();
+    let path = f.active.to_string_lossy().into_owned();
+    let delete = tokio::spawn(async move { runtime.delete_audit_log_file(&path).await });
+    queued_signal.await.unwrap();
+    delete.abort();
+    assert!(delete.await.unwrap_err().is_cancelled());
+
+    let (endpoint, observed, release, server) = held_receiver(200).await;
+    let sender = test_sender(endpoint);
+    let runtime = f.runtime.clone();
+    let mut attempt = tokio::spawn(async move {
+        runtime
+            .send_audit_otlp_once("alice", &sender)
+            .await
+            .unwrap()
+    });
+    request_or_completed(observed, &mut attempt).await;
+    let prepared = f.cursor();
+
+    // The queued command must finish before the sentinel Drain in worker FIFO.
+    let commands = f.runtime.accounts().worker_commands("alice").await.unwrap();
+    let (respond, drained) = oneshot::channel();
+    commands
+        .send(super::super::AccountWorkerCommand::Drain { respond })
+        .await
+        .unwrap();
+    held_worker.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), drained)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !std::fs::read_to_string(&f.active)
+            .unwrap()
+            .contains("one original body")
+    );
+
+    release.send(()).unwrap();
+    assert_eq!(
+        attempt.await.unwrap(),
+        AuditOtlpAttemptOutcome::Sent {
+            receiver: AuditOtlpSendResult::Complete,
+            local: None,
+        }
+    );
+    server.await.unwrap();
+    assert_eq!(f.cursor(), prepared);
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn terminal_close_releases_root_before_stalled_http_and_late_success_cannot_finish() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(200).await;

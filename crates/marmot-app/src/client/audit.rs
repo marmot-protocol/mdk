@@ -406,6 +406,14 @@ impl AppClient {
         path: &std::path::Path,
     ) -> Result<bool, AppError> {
         if self.runtime.session().audit_log_path().as_deref() == Some(path) {
+            // The requester may have been cancelled after queueing this worker
+            // command. Fence the destructive rotation where it actually runs,
+            // independent of the requester's mutation guard.
+            let account = self.app.account_home().account(&self.state.label)?;
+            let _audit_export_mutation = self
+                .app
+                .audit_export_lifecycle
+                .mutate_account(&account.account_id_hex);
             self.runtime.session().rotate_audit_log()?;
             Ok(true)
         } else {
