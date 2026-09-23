@@ -12,7 +12,9 @@ sdk = ["dep:nostr-sdk"]
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 cgka-traits.workspace = true
+futures.workspace = true
 hex.workspace = true
 nostr.workspace = true
 nostr-sdk = { workspace = true, optional = true }
@@ -25,7 +27,6 @@ tracing.workspace = true
 transport-nostr-peeler.workspace = true
 
 [dev-dependencies]
-futures.workspace = true
 nostr-relay-builder.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
 tokio-tungstenite = "0.26"

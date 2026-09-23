@@ -1,11 +1,14 @@
 use crate::error::to_peeler_error;
 use crate::event::decode_hex_exact;
+use crate::signer::{MarmotNostrSigner, SdkSigner};
 use crate::{
     DEFAULT_EXPORTER_LABEL, EXPIRATION_TAG, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE,
     KIND_MARMOT_WELCOME_RUMOR, KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_CONTENT_MIN_LEN,
     NOSTR_GROUP_KEY_LEN, NostrTransportEvent, RECIPIENT_TAG,
 };
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -15,9 +18,11 @@ use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessa
 use cgka_traits::types::{GroupId, MemberId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use nostr::{EventBuilder, Keys, Kind, NostrSigner, PublicKey, RelayUrl, Tag, UnsignedEvent};
+use nostr::nips::nip59::GiftWrapBuilder;
+use nostr::prelude::{
+    EventBuilder, FinalizeEvent, FinalizeEventAsync, FinalizeUnsignedEvent, Keys, Kind, PublicKey,
+    RelayUrl, Tag, Timestamp as NostrTimestamp, UnsignedEvent,
+};
 use rand::RngCore;
 use std::sync::Arc;
 
@@ -39,7 +44,7 @@ const GROUP_AAD: &[u8] = b"";
 #[derive(Clone, Debug)]
 pub struct NostrMlsPeeler {
     exporter_label: String,
-    welcome_signer: Option<Arc<dyn NostrSigner>>,
+    welcome_signer: Option<Arc<dyn MarmotNostrSigner>>,
 }
 
 impl NostrMlsPeeler {
@@ -68,13 +73,20 @@ impl NostrMlsPeeler {
     /// from the account-device layer that already owns local identity keys.
     pub fn with_welcome_signer<T>(mut self, signer: T) -> Self
     where
-        T: NostrSigner + 'static,
+        T: MarmotNostrSigner + 'static,
     {
         self.welcome_signer = Some(Arc::new(signer));
         self
     }
 
-    fn welcome_signer(&self) -> Result<&Arc<dyn NostrSigner>, PeelerError> {
+    /// Attach an already type-erased account signer without wrapping it in a
+    /// second `Arc` or changing the identity used for welcome decryption.
+    pub fn with_welcome_signer_arc(mut self, signer: Arc<dyn MarmotNostrSigner>) -> Self {
+        self.welcome_signer = Some(signer);
+        self
+    }
+
+    fn welcome_signer(&self) -> Result<&Arc<dyn MarmotNostrSigner>, PeelerError> {
         self.welcome_signer
             .as_ref()
             .ok_or_else(|| PeelerError::MissingContext {
@@ -141,15 +153,9 @@ impl NostrMlsPeeler {
         // call and sign here so the adapter publishes the event as-is rather
         // than re-signing it with the account signer.
         let ephemeral = Keys::generate();
-        let mut tags = vec![Tag::custom(
-            nostr::TagKind::custom(GROUP_TAG),
-            [hex::encode(group_id)],
-        )];
+        let mut tags = vec![Tag::custom(GROUP_TAG, [hex::encode(group_id)])];
         if let Some(expiration) = metadata.and_then(GroupMessageMetadata::expiration_timestamp) {
-            tags.push(Tag::custom(
-                nostr::TagKind::custom(EXPIRATION_TAG),
-                [expiration.to_string()],
-            ));
+            tags.push(Tag::custom(EXPIRATION_TAG, [expiration.to_string()]));
         }
         // Package E (#630 cross-client): bind the outer kind-445 `created_at` to
         // the inner app event's sender-authenticated `created_at` so the sender
@@ -159,10 +165,10 @@ impl NostrMlsPeeler {
         let mut builder =
             EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content).tags(tags);
         if let Some(created_at) = metadata.and_then(GroupMessageMetadata::outer_created_at) {
-            builder = builder.custom_created_at(nostr::Timestamp::from_secs(created_at));
+            builder = builder.custom_created_at(NostrTimestamp::from_secs(created_at));
         }
         let signed = builder
-            .sign_with_keys(&ephemeral)
+            .finalize(&ephemeral)
             .map_err(|e| PeelerError::WrapFailed(format!("ephemeral kind-445 sign: {e}")))?;
         let event = NostrTransportEvent::from_nostr_event(&signed).map_err(to_peeler_error)?;
         event.to_transport_message().map_err(to_peeler_error)
@@ -245,9 +251,10 @@ impl TransportPeeler for NostrMlsPeeler {
         }
         ensure_welcome_routing_matches(&event, msg)?;
         let gift_wrap = event.to_verified_nostr_event().map_err(to_peeler_error)?;
-        let unwrapped = nostr::nips::nip59::extract_rumor(signer, &gift_wrap)
-            .await
-            .map_err(map_nip59_error)?;
+        let unwrapped =
+            nostr::nips::nip59::extract_rumor_async(&SdkSigner(signer.clone()), &gift_wrap)
+                .await
+                .map_err(map_nip59_error)?;
 
         if unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR) {
             return Err(PeelerError::Malformed(format!(
@@ -349,16 +356,17 @@ impl TransportPeeler for NostrMlsPeeler {
         )
         .tags([
             Tag::custom(
-                nostr::TagKind::custom(KEY_PACKAGE_EVENT_TAG),
+                KEY_PACKAGE_EVENT_TAG,
                 [hex::encode(metadata.key_package_event_id.as_slice())],
             ),
             Tag::custom(
-                nostr::TagKind::custom(WELCOME_RELAYS_TAG),
+                WELCOME_RELAYS_TAG,
                 metadata.relays.iter().map(|relay| relay.as_str()),
             ),
         ])
-        .build(sender_pubkey);
-        let gift_wrap = EventBuilder::gift_wrap(signer, &recipient_pubkey, rumor, [])
+        .finalize_unsigned(sender_pubkey);
+        let gift_wrap = GiftWrapBuilder::new(recipient_pubkey, rumor)
+            .finalize_async(&SdkSigner(signer.clone()))
             .await
             .map_err(|e| PeelerError::WrapFailed(format!("NIP-59 gift wrap: {e}")))?;
         let event = NostrTransportEvent::from_nostr_event(&gift_wrap).map_err(to_peeler_error)?;
@@ -490,15 +498,10 @@ fn ensure_welcome_routing_matches(
     }
 }
 
-fn map_nip59_error(err: nostr::nips::nip59::Error) -> PeelerError {
-    match err {
-        nostr::nips::nip59::Error::NotGiftWrap => {
-            PeelerError::Malformed("Nostr event was not a gift wrap".into())
-        }
-        nostr::nips::nip59::Error::SenderMismatch
-        | nostr::nips::nip59::Error::Signer(_)
-        | nostr::nips::nip59::Error::Event(_) => PeelerError::DecryptFailed,
-    }
+fn map_nip59_error(_err: nostr::error::Error) -> PeelerError {
+    // The outer kind is checked before unwrap. Remaining errors are failed
+    // verification/decryption; never disclose SDK error text to the caller.
+    PeelerError::DecryptFailed
 }
 
 #[cfg(test)]
@@ -663,10 +666,10 @@ mod tests {
             BASE64_STANDARD.encode([0u8; NOSTR_GROUP_CONTENT_MIN_LEN]),
         )
         .tags([
-            Tag::custom(nostr::TagKind::custom(GROUP_TAG), [hex::encode(&group_id)]),
-            Tag::custom(nostr::TagKind::custom("e"), ["11".repeat(32)]),
+            Tag::custom(GROUP_TAG, [hex::encode(&group_id)]),
+            Tag::custom("e", ["11".repeat(32)]),
         ])
-        .sign_with_keys(&Keys::generate())
+        .finalize(&Keys::generate())
         .expect("sign structurally invalid kind-445");
         let event = NostrTransportEvent::from_nostr_event(&signed).expect("map signed event");
         let msg = TransportMessage {
@@ -1038,7 +1041,6 @@ mod tests {
         );
         let unwrapped =
             nostr::nips::nip59::extract_rumor(&receiver, &event.to_verified_nostr_event().unwrap())
-                .await
                 .unwrap();
         assert_eq!(
             peeled.content,
@@ -1171,9 +1173,10 @@ mod tests {
     async fn welcome_peel_rejects_authentic_non_welcome_rumor() {
         let sender = sender_keys();
         let receiver = receiver_keys();
-        let rumor = EventBuilder::text_note("not a Marmot welcome").build(sender.public_key());
-        let gift_wrap = EventBuilder::gift_wrap(&sender, &receiver.public_key(), rumor, [])
-            .await
+        let rumor = EventBuilder::new(Kind::TextNote, "not a Marmot welcome")
+            .finalize_unsigned(sender.public_key());
+        let gift_wrap = GiftWrapBuilder::new(receiver.public_key(), rumor)
+            .finalize(&sender)
             .unwrap();
         let wrapped = NostrTransportEvent::from_nostr_event(&gift_wrap)
             .unwrap()
@@ -1211,9 +1214,7 @@ mod tests {
             .unwrap()
             .to_verified_nostr_event()
             .unwrap();
-        let unwrapped = nostr::nips::nip59::extract_rumor(&receiver, &gift_wrap)
-            .await
-            .expect("unwrap");
+        let unwrapped = nostr::nips::nip59::extract_rumor(&receiver, &gift_wrap).expect("unwrap");
         assert_eq!(
             rumor_single_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG).unwrap(),
             hex::encode(metadata.key_package_event_id.as_slice()).as_str()
@@ -1355,8 +1356,8 @@ mod tests {
     /// of the `e` tag and one `relays` tag per entry of `relays_tags`, used to
     /// exercise receiver-side metadata validation.
     async fn welcome_rumor_gift_wrap(
-        sender: &nostr::Keys,
-        receiver: &nostr::Keys,
+        sender: &Keys,
+        receiver: &Keys,
         key_package_tags: usize,
         relays_tags: &[&[&str]],
     ) -> TransportMessage {
@@ -1367,24 +1368,21 @@ mod tests {
         let mut tags = Vec::new();
         for _ in 0..key_package_tags {
             tags.push(Tag::custom(
-                nostr::TagKind::custom(KEY_PACKAGE_EVENT_TAG),
+                KEY_PACKAGE_EVENT_TAG,
                 [hex::encode(
                     sample_welcome_metadata().key_package_event_id.as_slice(),
                 )],
             ));
         }
         for relays in relays_tags {
-            tags.push(Tag::custom(
-                nostr::TagKind::custom(WELCOME_RELAYS_TAG),
-                relays.iter().copied(),
-            ));
+            tags.push(Tag::custom(WELCOME_RELAYS_TAG, relays.iter().copied()));
         }
         if !tags.is_empty() {
             builder = builder.tags(tags);
         }
-        let rumor = builder.build(sender.public_key());
-        let gift_wrap = EventBuilder::gift_wrap(sender, &receiver.public_key(), rumor, [])
-            .await
+        let rumor = builder.finalize_unsigned(sender.public_key());
+        let gift_wrap = GiftWrapBuilder::new(receiver.public_key(), rumor)
+            .finalize(sender)
             .unwrap();
         NostrTransportEvent::from_nostr_event(&gift_wrap)
             .unwrap()
@@ -1394,11 +1392,8 @@ mod tests {
 
     fn signed_group_transport_message(group_id: &[u8], content: &str) -> TransportMessage {
         let signed = EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content)
-            .tags([Tag::custom(
-                nostr::TagKind::custom(GROUP_TAG),
-                [hex::encode(group_id)],
-            )])
-            .sign_with_keys(&Keys::generate())
+            .tags([Tag::custom(GROUP_TAG, [hex::encode(group_id)])])
+            .finalize(&Keys::generate())
             .expect("sign kind-445");
         NostrTransportEvent::from_nostr_event(&signed)
             .unwrap()
@@ -1416,18 +1411,15 @@ mod tests {
         }
     }
 
-    fn sender_keys() -> nostr::Keys {
-        nostr::Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
-            .unwrap()
+    fn sender_keys() -> Keys {
+        Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e").unwrap()
     }
 
-    fn receiver_keys() -> nostr::Keys {
-        nostr::Keys::parse("7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
-            .unwrap()
+    fn receiver_keys() -> Keys {
+        Keys::parse("7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e").unwrap()
     }
 
-    fn wrong_receiver_keys() -> nostr::Keys {
-        nostr::Keys::parse("5b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
-            .unwrap()
+    fn wrong_receiver_keys() -> Keys {
+        Keys::parse("5b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e").unwrap()
     }
 }

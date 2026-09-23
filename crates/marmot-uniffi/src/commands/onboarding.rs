@@ -322,7 +322,7 @@ mod tests {
         let app = MarmotApp::with_relay(root.path(), relay_url.clone());
         let runtime = app.runtime();
         let kit = Marmot { app, runtime };
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let id = keys.public_key().to_hex();
         let snapshot = kit
             .begin_onboarding(
@@ -391,7 +391,7 @@ mod tests {
             runtime: app.runtime(),
             app,
         };
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let id = keys.public_key().to_hex();
         kit.begin_onboarding(
             keys.secret_key().to_bech32().unwrap(),

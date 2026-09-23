@@ -68,8 +68,12 @@ pub trait AccountSecretStore: Send + Sync {
     fn has_secret_for_account_id(&self, _account_id_hex: &str) -> AccountHomeResult<bool> {
         Ok(false)
     }
-    fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()>;
-    fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys>;
+    fn write_secret(
+        &self,
+        account: &AccountSummary,
+        keys: &nostr::prelude::Keys,
+    ) -> AccountHomeResult<()>;
+    fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::prelude::Keys>;
     fn remove_secret(&self, account: &AccountSummary) -> AccountHomeResult<()>;
 }
 
@@ -98,7 +102,11 @@ impl AccountSecretStore for LocalFileSecretStore {
         Ok(self.secret_path(label).exists())
     }
 
-    fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()> {
+    fn write_secret(
+        &self,
+        account: &AccountSummary,
+        keys: &nostr::prelude::Keys,
+    ) -> AccountHomeResult<()> {
         // Move the plaintext hex directly into a zeroizing field before JSON
         // serialization so no crate-owned String copy is dropped unwiped.
         write_secret_json(
@@ -111,14 +119,14 @@ impl AccountSecretStore for LocalFileSecretStore {
         )
     }
 
-    fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys> {
+    fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::prelude::Keys> {
         let secret: StoredAccountSecret = read_secret_json(self.secret_path(&account.label))?;
         if secret.backend != LOCAL_FILE_SECRET_BACKEND {
             return Err(AccountHomeError::UnsupportedSecretBackend(
                 secret.backend.clone(),
             ));
         }
-        nostr::Keys::parse(secret.secret_key_hex.as_str())
+        nostr::prelude::Keys::parse(secret.secret_key_hex.as_str())
             .map_err(|_| AccountHomeError::InvalidSecretKey)
     }
 
@@ -211,7 +219,7 @@ impl KeychainSecretStore {
     fn migrate_legacy_ios_secret(
         &self,
         account: &AccountSummary,
-    ) -> AccountHomeResult<nostr::Keys> {
+    ) -> AccountHomeResult<nostr::prelude::Keys> {
         let legacy_secret = match self
             .legacy_entry_for_account(&account.account_id_hex)?
             .get_password()
@@ -224,7 +232,7 @@ impl KeychainSecretStore {
             }
             Err(err) => return Err(map_keyring_error(err)),
         };
-        let keys = nostr::Keys::parse(legacy_secret.as_str())
+        let keys = nostr::prelude::Keys::parse(legacy_secret.as_str())
             .map_err(|_| AccountHomeError::InvalidSecretKey)?;
 
         write_keyring_secret(
@@ -278,7 +286,11 @@ impl AccountSecretStore for KeychainSecretStore {
         }
     }
 
-    fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()> {
+    fn write_secret(
+        &self,
+        account: &AccountSummary,
+        keys: &nostr::prelude::Keys,
+    ) -> AccountHomeResult<()> {
         let secret_key_hex = Zeroizing::new(keys.secret_key().to_secret_hex());
         write_keyring_secret(
             &self.service_name,
@@ -289,14 +301,14 @@ impl AccountSecretStore for KeychainSecretStore {
         Ok(())
     }
 
-    fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys> {
+    fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::prelude::Keys> {
         match self
             .entry_for_account(&account.account_id_hex)?
             .get_password()
         {
             Ok(secret_key) => {
                 let secret_key = Zeroizing::new(secret_key);
-                let keys = nostr::Keys::parse(secret_key.as_str())
+                let keys = nostr::prelude::Keys::parse(secret_key.as_str())
                     .map_err(|_| AccountHomeError::InvalidSecretKey)?;
                 self.cleanup_legacy_ios_secret(&account.account_id_hex);
                 Ok(keys)
@@ -407,7 +419,7 @@ mod tests {
     fn local_file_remove_secret_scrubs_and_unlinks_the_secret_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFileSecretStore::new(dir.path());
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let secret_hex = keys.secret_key().to_secret_hex();
         let account = AccountSummary {
             label: "scrub-me".to_owned(),

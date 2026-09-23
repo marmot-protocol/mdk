@@ -23,7 +23,7 @@ use cgka_traits::{
     TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSubscription,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportWireMetadata,
 };
-use nostr::RelayUrl;
+use nostr::prelude::RelayUrl;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -477,6 +477,17 @@ pub trait NostrRelayClient: Send + Sync {
         Err(NostrAcquisitionError::Unsupported)
     }
 
+    /// Select one account receiver when a client owns several immutable
+    /// authentication contexts. A single coalescing watch cannot carry
+    /// independent cumulative watermarks for multiple accounts.
+    async fn notification_loss_for_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        self.notification_loss()
+    }
+
     async fn subscribe(&self, subscription: NostrSubscription)
     -> Result<(), TransportAdapterError>;
 
@@ -530,6 +541,58 @@ pub trait NostrRelayClient: Send + Sync {
         event: &NostrTransportEvent,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError>;
+
+    /// Publish using the immutable authentication context selected by the
+    /// operation's account identity. An implementation without account
+    /// contexts must reject this call explicitly; it must never infer the
+    /// context from the event's author (kind-445 authors are ephemeral).
+    async fn publish_event_for_account(
+        &self,
+        _account_id: &MemberId,
+        _endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        Err(TransportAdapterError::Publish(
+            "account-scoped publication unsupported".to_owned(),
+        ))
+    }
+
+    /// Ordered account-scoped batch; the default remains fail-closed for
+    /// clients that do not implement the account-aware single-event method.
+    async fn publish_events_for_account(
+        &self,
+        account_id: &MemberId,
+        requests: &[NostrEventPublishRequest],
+    ) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(
+                self.publish_event_for_account(
+                    account_id,
+                    &request.endpoints,
+                    &request.event,
+                    request.required_acks,
+                )
+                .await,
+            );
+        }
+        outcomes
+    }
+
+    async fn publish_events_for_account_with_timings(
+        &self,
+        account_id: &MemberId,
+        requests: &[NostrEventPublishRequest],
+    ) -> NostrPublishBatch {
+        let started_at = Instant::now();
+        let outcomes = self.publish_events_for_account(account_id, requests).await;
+        let elapsed = started_at.elapsed();
+        NostrPublishBatch {
+            request_durations: vec![elapsed; outcomes.len()],
+            outcomes,
+        }
+    }
 
     /// Publish an ordered batch through one client lifecycle.
     ///
@@ -619,6 +682,16 @@ impl NostrTransportAdapter {
     ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
     {
         self.relay_client.notification_loss()
+    }
+
+    pub async fn notification_loss_for_account(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        self.relay_client
+            .notification_loss_for_account(account_id)
+            .await
     }
 
     pub async fn metrics(&self) -> NostrAdapterMetrics {
@@ -1440,7 +1513,12 @@ impl TransportAdapter for NostrTransportAdapter {
         self.state.write().await.record_publish_attempt();
         let outcome = match self
             .relay_client
-            .publish_event(request.target.endpoints(), &event, request.required_acks)
+            .publish_event_for_account(
+                &request.account_id,
+                request.target.endpoints(),
+                &event,
+                request.required_acks,
+            )
             .await
         {
             Ok(outcome) => {

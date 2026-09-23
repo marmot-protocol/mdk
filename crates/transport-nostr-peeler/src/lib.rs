@@ -15,10 +15,12 @@
 mod error;
 mod event;
 mod peeler;
+mod signer;
 
 pub use error::NostrPeelerError;
 pub use event::NostrTransportEvent;
 pub use peeler::NostrMlsPeeler;
+pub use signer::{MarmotNostrSigner, MarmotSignerError, SdkSigner, SignerFuture};
 
 /// Nostr kind used by Marmot group messages.
 pub const KIND_MARMOT_GROUP_MESSAGE: u64 = 445;

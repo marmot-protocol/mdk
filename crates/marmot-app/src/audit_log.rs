@@ -1913,7 +1913,7 @@ mod tests {
         assert_eq!(revealed.len(), 63);
         assert!(revealed.starts_with("nsec1"));
         assert_eq!(
-            nostr::Keys::parse(revealed.as_str())
+            nostr::prelude::Keys::parse(revealed.as_str())
                 .unwrap()
                 .public_key()
                 .to_hex(),

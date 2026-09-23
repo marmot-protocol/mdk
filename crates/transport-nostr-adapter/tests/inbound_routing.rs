@@ -9,7 +9,8 @@ use cgka_traits::{
     TransportEndpoint, TransportGroupSubscription, TransportGroupSync, TransportPublishRequest,
     TransportPublishTarget,
 };
-use nostr::RelayUrl;
+use nostr::nips::nip59::GiftWrapBuilder;
+use nostr::prelude::{FinalizeEvent, FinalizeUnsignedEvent, Kind, RelayUrl};
 use tokio::sync::{Barrier, Notify};
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
@@ -314,6 +315,16 @@ impl FakeRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for FakeRelayClient {
+    async fn publish_event_for_account(
+        &self,
+        _account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        self.publish_event(endpoints, event, required_acks).await
+    }
+
     fn supports_scoped_subscriptions(&self) -> bool {
         true
     }
@@ -1655,14 +1666,9 @@ async fn resolve_relay_labels_maps_observed_indices_to_endpoints() {
         TransportEndpoint("wss://group-a.example".into()),
         TransportEndpoint("wss://group-b.example".into()),
     ];
-    let canonical_endpoints = endpoints.clone().map(|endpoint| {
-        TransportEndpoint(
-            nostr::Url::from(
-                RelayUrl::parse(endpoint.as_str()).expect("test relay URL should parse"),
-            )
-            .to_string(),
-        )
-    });
+    let canonical_endpoints = endpoints
+        .clone()
+        .map(|endpoint| TransportEndpoint(format!("{}/", endpoint.as_str().trim_end_matches('/'))));
 
     // Observing per-relay copies assigns opaque indices in first-seen order.
     for endpoint in &endpoints {
@@ -2800,12 +2806,14 @@ async fn publish_group_message_sends_nostr_event_to_target_endpoints() {
 async fn signed_welcome_event_becomes_account_inbox_delivery() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay);
-    let sender =
-        nostr::Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
-            .unwrap();
-    let receiver =
-        nostr::Keys::parse("7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
-            .unwrap();
+    let sender = nostr::prelude::Keys::parse(
+        "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e",
+    )
+    .unwrap();
+    let receiver = nostr::prelude::Keys::parse(
+        "7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e",
+    )
+    .unwrap();
     let account_id = MemberId::new(receiver.public_key().to_bytes().to_vec());
     let inbox_endpoint = TransportEndpoint("wss://inbox.example".into());
 
@@ -2819,9 +2827,10 @@ async fn signed_welcome_event_becomes_account_inbox_delivery() {
         .await
         .expect("activation succeeds");
 
-    let rumor = nostr::EventBuilder::text_note("not yet peeled here").build(sender.public_key());
-    let gift_wrap = nostr::EventBuilder::gift_wrap(&sender, &receiver.public_key(), rumor, [])
-        .await
+    let rumor = nostr::prelude::EventBuilder::new(Kind::TextNote, "not yet peeled here")
+        .finalize_unsigned(sender.public_key());
+    let gift_wrap = GiftWrapBuilder::new(receiver.public_key(), rumor)
+        .finalize(&sender)
         .unwrap();
     let event = NostrTransportEvent::from_nostr_event(&gift_wrap).unwrap();
 
@@ -2993,12 +3002,14 @@ async fn group_event_routes_despite_trailing_slash_mismatch() {
 async fn welcome_event_routes_despite_trailing_slash_mismatch() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay);
-    let sender =
-        nostr::Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
-            .unwrap();
-    let receiver =
-        nostr::Keys::parse("7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
-            .unwrap();
+    let sender = nostr::prelude::Keys::parse(
+        "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e",
+    )
+    .unwrap();
+    let receiver = nostr::prelude::Keys::parse(
+        "7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e",
+    )
+    .unwrap();
     let account_id = MemberId::new(receiver.public_key().to_bytes().to_vec());
     // Stored verbatim (no trailing slash); inbound carries the RelayUrl slash.
     let stored_inbox = TransportEndpoint("wss://inbox.example".into());
@@ -3015,9 +3026,10 @@ async fn welcome_event_routes_despite_trailing_slash_mismatch() {
         .await
         .expect("activation succeeds");
 
-    let rumor = nostr::EventBuilder::text_note("not yet peeled here").build(sender.public_key());
-    let gift_wrap = nostr::EventBuilder::gift_wrap(&sender, &receiver.public_key(), rumor, [])
-        .await
+    let rumor = nostr::prelude::EventBuilder::new(Kind::TextNote, "not yet peeled here")
+        .finalize_unsigned(sender.public_key());
+    let gift_wrap = GiftWrapBuilder::new(receiver.public_key(), rumor)
+        .finalize(&sender)
         .unwrap();
     let event = NostrTransportEvent::from_nostr_event(&gift_wrap).unwrap();
 

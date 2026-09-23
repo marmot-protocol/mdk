@@ -8,13 +8,13 @@
 
 use std::collections::BTreeSet;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::{MessageId, TransportEndpoint};
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };

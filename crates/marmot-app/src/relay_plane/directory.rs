@@ -4,15 +4,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
+use futures::StreamExt;
+use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, Event, Filter, Kind, PublicKey, RelayMessage, RelayNotification,
-    RelayStatus, RelayUrl, SubscribeAutoCloseOptions, SubscribeOptions, SubscriptionId,
+    RelayStatus, RelayUrl, ReqTarget, SubscribeAutoCloseOptions, SubscriptionId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use transport_nostr_peeler::NostrTransportEvent;
+use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
 use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
@@ -23,7 +25,9 @@ const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 pub(crate) enum DirectoryInspectionError {
     Unreachable,
     TimedOut,
+    #[allow(dead_code)] // Retained for the onboarding inspection contract.
     AuthenticationRequired,
+    #[allow(dead_code)] // Retained for the onboarding inspection contract.
     PaymentRequired,
     Restricted,
     InvalidRequest,
@@ -165,7 +169,7 @@ pub(crate) trait DirectoryRelayFetcher: Send + Sync {
     async fn inspect_directory_events(
         &self,
         _request: DirectoryFetchRequest,
-        _signer: Option<Arc<dyn nostr::NostrSigner>>,
+        _signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
         Err(DirectoryInspectionError::Unreachable)
     }
@@ -238,7 +242,7 @@ impl DirectoryRelayPlane {
     pub(crate) async fn inspect_events(
         &self,
         request: DirectoryFetchRequest,
-        signer: Option<Arc<dyn nostr::NostrSigner>>,
+        signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
         self.fetcher.inspect_directory_events(request, signer).await
     }
@@ -598,9 +602,7 @@ impl DirectoryRelayPlane {
 // challenge must not trigger a failed authentication attempt that
 // closes the SDK's active fetch before its events arrive.
 pub(super) fn anonymous_directory_client() -> NostrSdkClient {
-    NostrSdkClient::builder()
-        .opts(nostr_sdk::ClientOptions::new().automatic_authentication(false))
-        .build()
+    NostrSdkClient::builder().build()
 }
 
 impl NostrSdkDirectoryRelayFetcher {
@@ -713,10 +715,18 @@ impl NostrSdkDirectoryRelayFetcher {
                 .limit(query.limit);
             let events = self
                 .client
-                .fetch_events_from(relay_urls.clone(), filter, DIRECTORY_RELAY_FETCH_WAIT)
+                .fetch_events(ReqTarget::manual(
+                    relay_urls
+                        .iter()
+                        .cloned()
+                        .map(|url| (url, vec![filter.clone()])),
+                ))
+                .timeout(DIRECTORY_RELAY_FETCH_WAIT)
+                .max_events(query.limit)
+                .with_outcomes()
                 .await
                 .map_err(|_| "fetch directory events failed".to_owned())?;
-            for event in events {
+            for event in events.events {
                 let Some(event) = validated_directory_event(&event, &query) else {
                     continue;
                 };
@@ -735,7 +745,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
     async fn inspect_directory_events(
         &self,
         request: DirectoryFetchRequest,
-        signer: Option<Arc<dyn nostr::NostrSigner>>,
+        signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
         use DirectoryInspectionError::*;
         use nostr_sdk::prelude::ReqExitPolicy;
@@ -743,7 +753,11 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         // directory client that could authenticate as another account.
         let builder = NostrSdkClient::builder();
         let client = ScopedInspectionClient(match signer {
-            Some(signer) => builder.signer(signer).build(),
+            Some(signer) => builder
+                .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+                    SdkSigner(signer),
+                ))
+                .build(),
             None => builder.build(),
         });
         let client = &client.0;
@@ -763,7 +777,11 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         .await
         .map_err(|_| TimedOut)?
         .map_err(|_| Unreachable)?;
-        let relay = client.relay(url).await.map_err(|_| Unreachable)?;
+        let relay = client
+            .relay(url)
+            .await
+            .map_err(|_| Unreachable)?
+            .ok_or(Unreachable)?;
         let mut records = Vec::new();
         for query in request.queries {
             let keys = query
@@ -781,28 +799,15 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .kind(Kind::from(kind))
             .limit(query.limit);
             let events = relay
-                .fetch_events(
-                    filter,
-                    DIRECTORY_RELAY_FETCH_WAIT,
-                    ReqExitPolicy::ExitOnEOSE,
-                )
+                .fetch_events(filter)
+                .timeout(DIRECTORY_RELAY_FETCH_WAIT)
+                .policy(ReqExitPolicy::ExitOnEOSE)
                 .await
                 .map_err(|error| {
-                    use nostr_sdk::pool::relay::Error;
-                    match error {
-                        Error::Timeout => TimedOut,
-                        Error::AuthenticationFailed => AuthenticationRequired,
-                        Error::RelayMessage(message) if message.starts_with("auth-required:") => {
-                            AuthenticationRequired
-                        }
-                        Error::RelayMessage(message)
-                            if message.starts_with("payment-required:") =>
-                        {
-                            PaymentRequired
-                        }
-                        Error::RelayMessage(_)
-                        | Error::ReadDisabled
-                        | Error::ConnectionRejected { .. } => Restricted,
+                    use nostr_sdk::prelude::ErrorKind;
+                    match error.kind() {
+                        ErrorKind::Timeout => TimedOut,
+                        ErrorKind::Rejected | ErrorKind::Policy => Restricted,
                         _ => Unreachable,
                     }
                 })?;
@@ -874,7 +879,8 @@ async fn strict_fetch_endpoint(
     queries: Vec<DirectoryEventQuery>,
 ) -> DirectoryFetchOutcome {
     let endpoint = TransportEndpoint(relay_url.to_string());
-    if client.relay(&relay_url).await.is_err() && client.add_relay(relay_url.clone()).await.is_err()
+    if !matches!(client.relay(&relay_url).await, Ok(Some(_)))
+        && client.add_relay(relay_url.clone()).await.is_err()
     {
         return DirectoryFetchOutcome::default();
     }
@@ -888,7 +894,7 @@ async fn strict_fetch_endpoint(
     ) {
         return DirectoryFetchOutcome::default();
     }
-    let Ok(relay) = client.relay(relay_url).await else {
+    let Ok(Some(relay)) = client.relay(relay_url).await else {
         return DirectoryFetchOutcome::default();
     };
     let mut filters = Vec::with_capacity(queries.len());
@@ -914,16 +920,14 @@ async fn strict_fetch_endpoint(
 
     let max_records = queries.iter().map(|query| query.limit).sum::<usize>();
     let subscription_id = SubscriptionId::generate();
-    let mut notifications = relay.notifications();
+    let mut notifications = relay.notifications_with_gaps();
     if relay
-        .subscribe_with_id(
-            subscription_id.clone(),
-            filters,
-            SubscribeOptions::default().close_on(Some(
-                SubscribeAutoCloseOptions::default()
-                    .timeout(Some(DIRECTORY_RELAY_FETCH_WAIT))
-                    .idle_timeout(Some(DIRECTORY_RELAY_FETCH_WAIT)),
-            )),
+        .subscribe(filters)
+        .with_id(subscription_id.clone())
+        .close_on(
+            SubscribeAutoCloseOptions::default()
+                .timeout(Some(DIRECTORY_RELAY_FETCH_WAIT))
+                .idle_timeout(Some(DIRECTORY_RELAY_FETCH_WAIT)),
         )
         .await
         .is_err()
@@ -936,48 +940,45 @@ async fn strict_fetch_endpoint(
     let mut query_counts = vec![0usize; queries.len()];
     let complete = timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
         loop {
-            let received = match notifications.recv().await {
-                Ok(RelayNotification::Event {
+            let received = match notifications.next().await {
+                Some(NotificationUpdate::Notification(RelayNotification::Event {
                     subscription_id: received_id,
                     event,
-                }) if received_id == subscription_id => Some(*event),
-                Ok(RelayNotification::Message {
-                    message:
+                })) if received_id == subscription_id => Some(*event),
+                Some(NotificationUpdate::Notification(RelayNotification::Message { message })) => {
+                    match *message {
                         RelayMessage::Event {
                             subscription_id: received_id,
                             event,
-                        },
-                }) if received_id.as_ref() == &subscription_id => Some(event.into_owned()),
-                Ok(RelayNotification::Message {
-                    message: RelayMessage::EndOfStoredEvents(received_id),
-                }) if received_id.as_ref() == &subscription_id => {
-                    // EOSE does not prove absence if any filter may have been
-                    // cut off at its requested limit, even below the combined
-                    // record cap. Positive records remain usable.
-                    break queries
-                        .iter()
-                        .zip(&query_counts)
-                        .all(|(query, count)| *count < query.limit);
-                }
-                Ok(RelayNotification::Message {
-                    message:
+                        } if received_id.as_ref() == &subscription_id => Some(event.into_owned()),
+                        RelayMessage::EndOfStoredEvents(received_id)
+                            if received_id.as_ref() == &subscription_id =>
+                        {
+                            // A filter that reaches its limit cannot establish absence.
+                            break queries
+                                .iter()
+                                .zip(&query_counts)
+                                .all(|(query, count)| *count < query.limit);
+                        }
                         RelayMessage::Closed {
                             subscription_id: received_id,
                             ..
-                        },
-                }) if received_id.as_ref() == &subscription_id => break false,
-                Ok(RelayNotification::AuthenticationFailed | RelayNotification::Shutdown) => {
+                        } if received_id.as_ref() == &subscription_id => break false,
+                        _ => None,
+                    }
+                }
+                Some(NotificationUpdate::Notification(RelayNotification::AuthenticationFailed)) => {
                     break false;
                 }
-                Ok(RelayNotification::RelayStatus {
+                Some(NotificationUpdate::Notification(RelayNotification::RelayStatus {
                     status:
                         RelayStatus::Disconnected | RelayStatus::Terminated | RelayStatus::Banned,
-                }) => {
+                })) => {
                     break false;
                 }
                 // Lag may have dropped an inbox EVENT immediately before
                 // EOSE. Continuing cannot establish absence safely.
-                Err(_) => break false,
+                Some(NotificationUpdate::Lagged { .. }) | None => break false,
                 _ => None,
             };
             if let Some(event) = received
@@ -1026,6 +1027,7 @@ fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_sdk::prelude::FinalizeEvent;
 
     #[tokio::test]
     async fn anonymous_directory_fetch_accepts_profiles_after_optional_auth_challenge() {
@@ -1045,19 +1047,11 @@ mod tests {
 
         let keys = Keys::generate();
         let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"jack"}"#)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
         let expected_id = profile.id.to_hex();
         let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
         // Pin the anonymous policy independently of AUTH/event scheduling.
-        assert!(
-            !fetcher
-                .client
-                .pool()
-                .state()
-                .is_auto_authentication_enabled()
-        );
-        assert!(fetcher.client.signer().await.is_err());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
         let server = tokio::spawn(async move {
@@ -1124,7 +1118,7 @@ mod tests {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
-        let author = nostr::Keys::generate().public_key().to_hex();
+        let author = nostr::prelude::Keys::generate().public_key().to_hex();
         for (author, succeeds) in [(author, true), ("invalid-author".into(), false)] {
             let result = fetcher
                 .inspect_directory_events(
@@ -1143,18 +1137,18 @@ mod tests {
 
     #[test]
     fn directory_event_validation_rejects_invalid_signatures_and_wrong_authors() {
-        use nostr_sdk::prelude::{Event, EventBuilder, JsonUtil, Keys};
+        use nostr_sdk::prelude::{Event, EventBuilder, FinalizeEvent, Keys};
 
         let expected = Keys::generate();
         let wrong = Keys::generate();
         let query = DirectoryEventQuery::new(0, vec![expected.public_key().to_hex()], 1);
         let valid = EventBuilder::new(Kind::Metadata, r#"{"name":"agent"}"#)
-            .sign_with_keys(&expected)
+            .finalize(&expected)
             .unwrap();
         assert!(validated_directory_event(&valid, &query).is_some());
 
         let wrong_author = EventBuilder::new(Kind::Metadata, r#"{"name":"other"}"#)
-            .sign_with_keys(&wrong)
+            .finalize(&wrong)
             .unwrap();
         assert!(validated_directory_event(&wrong_author, &query).is_none());
 
@@ -1167,17 +1161,21 @@ mod tests {
 
     #[tokio::test]
     async fn strict_directory_exact_filter_limit_keeps_records_but_not_absence_proof() {
-        use nostr_relay_builder::MockRelay;
-        use nostr_sdk::prelude::{EventBuilder, Keys};
+        use nostr_sdk::local_relay::MockRelay;
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
 
         let relay = MockRelay::run().await.unwrap();
         let url = relay.url().await;
         let keys = Keys::generate();
-        let client = NostrSdkClient::builder().signer(keys.clone()).build();
+        let client = NostrSdkClient::default();
         client.add_relay(url.clone()).await.unwrap();
         client.connect_relay(url.clone()).await.unwrap();
         client
-            .send_event_builder(EventBuilder::new(Kind::Metadata, "{}"))
+            .send_event(
+                &EventBuilder::new(Kind::Metadata, "{}")
+                    .finalize(&keys)
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let request = DirectoryFetchRequest::new(

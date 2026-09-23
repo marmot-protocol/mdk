@@ -56,7 +56,8 @@ use marmot_account::{
     TransportRoutingPolicy,
 };
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, EventBuilder, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag,
+    Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -1272,7 +1273,7 @@ struct OpenAppAccount {
     state: AccountState,
     delivery_overflow_recovery_pending: bool,
     delivery_overflow_recovery_marker_token: Option<u64>,
-    signer: Arc<dyn nostr::NostrSigner>,
+    signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
 }
 
 struct AppAccountSessionGuard {
@@ -2027,7 +2028,9 @@ impl MarmotApp {
             "contact list",
             "profile metadata",
         ];
-        let batch = relay_client.publish_events_with_timings(&requests).await;
+        let batch = relay_client
+            .publish_events_for_account_with_timings(&account_id, &requests)
+            .await;
         let outcomes = batch.outcomes;
         if outcomes.len() != record_kinds.len() {
             return Err(AppError::Publish(format!(
@@ -2357,7 +2360,10 @@ impl MarmotApp {
                 required_acks: 1,
             });
         }
-        for outcome in relay_client.publish_events(&requests).await {
+        for outcome in relay_client
+            .publish_events_for_account(&account_id, &requests)
+            .await
+        {
             if outcome?.accepted.is_empty() {
                 return Err(AppError::Publish(
                     "relay acknowledged zero account relay-list events".to_owned(),
@@ -3718,7 +3724,7 @@ impl MarmotApp {
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(nostr_signer.clone());
+        let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer.clone());
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // load_state/account_storage above completed the first database open.
         // Serialize any remaining key-migration probe with other openers.
@@ -4530,6 +4536,7 @@ impl MarmotApp {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let account_id_hex = account.account_id_hex;
+        let account_id = MemberId::new(hex::decode(&account_id_hex)?);
         let mut results = targets
             .iter()
             .map(|target| KeyPackageDeletionResult {
@@ -4596,7 +4603,9 @@ impl MarmotApp {
         if !requests.is_empty() {
             let relay_client =
                 self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
-            let outcomes = relay_client.publish_events(&requests).await;
+            let outcomes = relay_client
+                .publish_events_for_account(&account_id, &requests)
+                .await;
             for (index, outcome) in request_indices.into_iter().zip(outcomes) {
                 results[index].result = match outcome {
                     Ok(outcome) if !outcome.accepted.is_empty() => Ok(outcome.accepted.len()),
@@ -6184,7 +6193,7 @@ impl MarmotApp {
     fn relay_client_for_account_id(
         &self,
         account_id_hex: &str,
-        signer: Arc<dyn nostr::NostrSigner>,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
         #[cfg(test)]
         if let Some(client) = &self.test_relay_client {
@@ -6200,8 +6209,16 @@ impl MarmotApp {
         clients
             .entry(account_id_hex.to_owned())
             .or_insert_with(|| {
-                let client = NostrSdkClient::builder().signer(signer).build();
-                Arc::new(NostrSdkRelayClient::new(client))
+                let client = NostrSdkClient::builder()
+                    .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+                        transport_nostr_peeler::SdkSigner(signer.clone()),
+                    ))
+                    .build();
+                let account_id =
+                    MemberId::new(hex::decode(account_id_hex).expect("validated account identity"));
+                Arc::new(NostrSdkRelayClient::with_account_signer(
+                    client, account_id, signer,
+                ))
             })
             .clone()
     }
@@ -6350,11 +6367,16 @@ impl MarmotApp {
     }
 }
 
-pub(crate) fn external_signer_public_key_error(error: nostr::SignerError) -> AppError {
+pub(crate) fn external_signer_public_key_error(
+    error: transport_nostr_peeler::MarmotSignerError,
+) -> AppError {
     external_signer_error(error, "external signer public key")
 }
 
-pub(crate) fn external_signer_error(error: nostr::SignerError, context: &str) -> AppError {
+pub(crate) fn external_signer_error(
+    error: transport_nostr_peeler::MarmotSignerError,
+    context: &str,
+) -> AppError {
     if error.to_string().contains(EXTERNAL_SIGNER_REJECTED) {
         AppError::ExternalSignerRejected
     } else {
@@ -6668,13 +6690,14 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             .get_public_key()
             .await
             .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
-        let unsigned = EventBuilder::new(
+        let mut unsigned = EventBuilder::new(
             Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16),
             unsigned_dto.content,
         )
         .tags(tags)
         .custom_created_at(NostrTimestamp::from_secs(publication.created_at.0))
-        .build(public_key);
+        .finalize_unsigned(public_key);
+        unsigned.ensure_id();
         let signed = signer
             .sign_event(unsigned)
             .await

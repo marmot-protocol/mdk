@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{MemberId, MessageId, TransportAdapterError, TransportEndpoint};
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::{NostrPublishOutcome, NostrRelayClient};

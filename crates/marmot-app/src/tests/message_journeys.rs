@@ -83,6 +83,16 @@ impl NostrRelayClient for CrashRelay {
         }
         result
     }
+
+    async fn publish_event_for_account(
+        &self,
+        _account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        self.publish_event(endpoints, event, required_acks).await
+    }
 }
 
 #[tokio::test]

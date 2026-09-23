@@ -1243,8 +1243,9 @@ impl AppClient {
         // withhold gift-wrapped welcomes from unauthenticated subscribers.
         let activation_started = Instant::now();
         self.relay_plane
-            .set_transport_signer(self.transport_signer.clone())
-            .await;
+            .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())
+            .await
+            .map_err(|error| (SyncFailureStage::TransportActivation, error.into()))?;
         let rebuild_since = self
             .subscription_rebuild_since()
             .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
@@ -2599,7 +2600,7 @@ impl AppClient {
             // blocks the normal ingress peeler is sufficient.
             if storage.has_blocked_users()? {
                 let account = client.app.account_home().account(&client.state.label)?;
-                let peeler = transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer(
+                let peeler = transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer_arc(
                     client
                         .app
                         .account_signer_for_summary(&account)?
@@ -3852,8 +3853,15 @@ impl AppClient {
         });
         self.pending_runtime_group_subscription_refresh = true;
         self.relay_plane
-            .set_transport_signer(self.transport_signer.clone())
-            .await;
+            .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())
+            .await
+            .map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error.into(),
+                    SyncFailureStage::TransportActivation,
+                )
+            })?;
         self.adapter.require_fresh_activation().await;
         let activation_started = Instant::now();
         let activation = self.runtime.activate_transport(since).await;

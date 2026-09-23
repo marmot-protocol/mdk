@@ -1,5 +1,5 @@
 use super::*;
-use nostr::secp256k1::{Keypair, Secp256k1, ecdh::SharedSecret};
+use secp256k1::{Keypair, Secp256k1, ecdh::SharedSecret};
 
 fn server_secret() -> SecretKey {
     let secp = Secp256k1::new();
@@ -148,7 +148,7 @@ fn fcm_token_encryption_uses_platform_byte_0x02() {
 fn push_key_derivation_uses_raw_shared_point_x_coordinate() {
     let server_secret = SecretKey::from_slice(&[0x11; 32]).unwrap();
     let peer_secret = SecretKey::from_slice(&[0x22; 32]).unwrap();
-    let peer_public = SecpPublicKey::from_secret_key_global(&peer_secret);
+    let peer_public = SecpPublicKey::from_secret_key(&Secp256k1::new(), &peer_secret);
 
     let shared_x = secp256k1_ecdh_x(&peer_public, &server_secret);
     let raw_x_key = push_encryption_key(&shared_x).unwrap();
@@ -283,10 +283,8 @@ async fn kind_446_rumor_only_carries_version_tag_and_no_routing_metadata() {
         .unwrap();
     let event = wrap.to_verified_nostr_event().unwrap();
 
-    let server_keys = Keys::new(nostr::SecretKey::from(secret));
-    let UnwrappedGift { rumor, .. } = UnwrappedGift::from_gift_wrap(&server_keys, &event)
-        .await
-        .unwrap();
+    let server_keys = Keys::new(nostr::prelude::SecretKey::from(secret));
+    let UnwrappedGift { rumor, .. } = UnwrappedGift::from_gift_wrap(&server_keys, &event).unwrap();
 
     assert_eq!(
         rumor.kind,
@@ -836,7 +834,7 @@ fn mention_classification_uses_receiver_p_tag() {
 
 #[test]
 fn mention_classification_normalizes_npub_p_tags() {
-    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let receiver = nostr::prelude::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
     let message = received_chat("hi", vec![vec!["p".to_owned(), npub]]);
 
@@ -845,7 +843,7 @@ fn mention_classification_normalizes_npub_p_tags() {
 
 #[test]
 fn mention_classification_uses_inline_nip27_entities() {
-    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let receiver = nostr::prelude::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
     let nprofile = crate::nprofile_for_account_id(&receiver, &[]).unwrap();
 
@@ -884,9 +882,9 @@ fn mention_classification_ignores_non_chat_p_tags() {
 
 #[test]
 fn message_text_mentions_account_matches_message_mentions_account() {
-    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let receiver = nostr::prelude::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
-    let other = nostr::Keys::generate().public_key().to_hex();
+    let other = nostr::prelude::Keys::generate().public_key().to_hex();
 
     let cases = [
         // p-tag hex mention.
@@ -938,14 +936,14 @@ fn mention_classification_covers_bare_npub_mention() {
     // `nostr:` scheme and no `p`-tag). It must still classify as a mention so
     // `is_mention` / unread-mention surfaces fire. Regression for
     // mdk#617.
-    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let receiver = nostr::prelude::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
 
     let message = received_chat(&format!("hey @{npub} ping"), Vec::new());
     assert!(message_mentions_account(&message, &receiver));
 
     // A bare `@npub1…` for a different account is not a mention of `receiver`.
-    let other = nostr::Keys::generate().public_key().to_hex();
+    let other = nostr::prelude::Keys::generate().public_key().to_hex();
     let other_npub = crate::npub_for_account_id(&other).unwrap();
     let other_message = received_chat(&format!("hey @{other_npub} ping"), Vec::new());
     assert!(!message_mentions_account(&other_message, &receiver));
@@ -953,7 +951,7 @@ fn mention_classification_covers_bare_npub_mention() {
 
 #[test]
 fn mention_classification_uses_p_tag_for_mentions_beyond_inline_scan_cap() {
-    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let receiver = nostr::prelude::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
     let cap = cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
     let plaintext = format!("{} @{npub}", "a".repeat(cap + 1));
@@ -1387,7 +1385,7 @@ fn signed_removal_record(
 
 fn sign_token_record_with_event_kind(record: &mut GroupPushTokenRecord, keys: &Keys, kind: u16) {
     let proof_event = record.owner_proof_event_with_kind(kind).unwrap();
-    let signed = proof_event.clone().sign_with_keys(keys).unwrap();
+    let signed = nostr::prelude::SignEvent::sign_event(keys, proof_event.clone()).unwrap();
     record.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed).unwrap();
 }
 
@@ -1400,17 +1398,17 @@ fn sign_removal_record_with_event_kind(
     let proof_event = record
         .owner_proof_event_with_kind(group_id_hex, kind)
         .unwrap();
-    let signed = proof_event.clone().sign_with_keys(keys).unwrap();
+    let signed = nostr::prelude::SignEvent::sign_event(keys, proof_event.clone()).unwrap();
     record.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed).unwrap();
 }
 
 fn sign_token_record_raw_legacy(record: &mut GroupPushTokenRecord, keys: &Keys) {
-    let message = Message::from_digest(record.signing_digest().unwrap());
-    let keypair = Keypair::from_secret_key(SECP256K1, keys.secret_key());
+    let message = record.signing_digest().unwrap();
+    let keypair = Keypair::from_secret_key(&Secp256k1::new(), keys.secret_key());
     record.owner_sig = hex::encode(
-        SECP256K1
+        Secp256k1::new()
             .sign_schnorr_no_aux_rand(&message, &keypair)
-            .serialize(),
+            .to_byte_array(),
     );
 }
 
@@ -1419,12 +1417,12 @@ fn sign_removal_record_raw_legacy(
     group_id_hex: &str,
     keys: &Keys,
 ) {
-    let message = Message::from_digest(record.signing_digest(group_id_hex).unwrap());
-    let keypair = Keypair::from_secret_key(SECP256K1, keys.secret_key());
+    let message = record.signing_digest(group_id_hex).unwrap();
+    let keypair = Keypair::from_secret_key(&Secp256k1::new(), keys.secret_key());
     record.owner_sig = hex::encode(
-        SECP256K1
+        Secp256k1::new()
             .sign_schnorr_no_aux_rand(&message, &keypair)
-            .serialize(),
+            .to_byte_array(),
     );
 }
 
@@ -1551,7 +1549,7 @@ fn removal_owner_proofs_follow_the_same_profile_matrix() {
 fn removal_kind_451_vector_matches_the_adopted_spec() {
     let mut secret = [0_u8; 32];
     secret[31] = 3;
-    let keys = Keys::new(nostr::SecretKey::from_slice(&secret).unwrap());
+    let keys = Keys::new(nostr::prelude::SecretKey::from_slice(&secret).unwrap());
     let group_id_hex: String = (0_u8..32).map(|byte| format!("{byte:02x}")).collect();
     let record = PushTokenRemovalRecord {
         member_id_hex: keys.public_key().to_hex(),
@@ -2169,10 +2167,8 @@ async fn group_state_wake_keeps_kind_446_context_free() {
         .await
         .unwrap();
     let event = wrap.to_verified_nostr_event().unwrap();
-    let server_keys = Keys::new(nostr::SecretKey::from(secret));
-    let UnwrappedGift { rumor, .. } = UnwrappedGift::from_gift_wrap(&server_keys, &event)
-        .await
-        .unwrap();
+    let server_keys = Keys::new(nostr::prelude::SecretKey::from(secret));
+    let UnwrappedGift { rumor, .. } = UnwrappedGift::from_gift_wrap(&server_keys, &event).unwrap();
     let tag_slices: Vec<&[String]> = rumor.tags.iter().map(|tag| tag.as_slice()).collect();
     assert_eq!(
         tag_slices,

@@ -357,11 +357,14 @@ mod tests {
             fn write_secret(
                 &self,
                 account: &AccountSummary,
-                keys: &nostr::Keys,
+                keys: &nostr::prelude::Keys,
             ) -> AccountHomeResult<()> {
                 self.0.write_secret(account, keys)
             }
-            fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys> {
+            fn load_secret(
+                &self,
+                account: &AccountSummary,
+            ) -> AccountHomeResult<nostr::prelude::Keys> {
                 self.0.load_secret(account)
             }
             fn remove_secret(&self, _account: &AccountSummary) -> AccountHomeResult<()> {

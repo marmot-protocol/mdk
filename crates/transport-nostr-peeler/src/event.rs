@@ -4,7 +4,7 @@ use crate::{
 };
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::types::{MemberId, MessageId};
-use nostr::{Event, JsonUtil};
+use nostr::prelude::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -321,6 +321,8 @@ pub(crate) fn decode_hex_exact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::nips::nip59::GiftWrapBuilder;
+    use nostr::prelude::{EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, Tag};
 
     #[test]
     fn kind_445_event_maps_to_group_transport_message() {
@@ -472,15 +474,15 @@ mod tests {
     #[tokio::test]
     async fn signed_kind_1059_event_maps_to_welcome_transport_message() {
         let sender =
-            nostr::Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
+            Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
                 .unwrap();
         let receiver =
-            nostr::Keys::parse("7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
+            Keys::parse("7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
                 .unwrap();
-        let rumor =
-            nostr::EventBuilder::text_note("not a Marmot welcome").build(sender.public_key());
-        let gift_wrap = nostr::EventBuilder::gift_wrap(&sender, &receiver.public_key(), rumor, [])
-            .await
+        let rumor = EventBuilder::new(Kind::TextNote, "not a Marmot welcome")
+            .finalize_unsigned(sender.public_key());
+        let gift_wrap = GiftWrapBuilder::new(receiver.public_key(), rumor)
+            .finalize(&sender)
             .unwrap();
         let event = NostrTransportEvent::from_nostr_event(&gift_wrap).unwrap();
 
@@ -648,16 +650,10 @@ mod tests {
         // `computed_id`, so the local NIP-01 id computation must agree with the
         // Nostr SDK's — including for content that needs JSON escaping.
         let content = "line\nbreak \"quote\" back\\slash tab\t unicode ✨ control \u{1}";
-        let signed = nostr::EventBuilder::new(
-            nostr::Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16),
-            content,
-        )
-        .tags([nostr::Tag::custom(
-            nostr::TagKind::custom("h"),
-            [hex::encode([0x99; 32])],
-        )])
-        .sign_with_keys(&nostr::Keys::generate())
-        .expect("sign kind-445");
+        let signed = EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content)
+            .tags([Tag::custom("h", [hex::encode([0x99; 32])])])
+            .finalize(&Keys::generate())
+            .expect("sign kind-445");
 
         let dto = NostrTransportEvent::from_nostr_event(&signed).unwrap();
 
