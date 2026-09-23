@@ -3,35 +3,25 @@
 //! This uses the same Rust Nostr/libsecp256k1 stack as MDK's transport path.
 //! It does not require an account, runtime, relay connection, or secret key.
 
-use nostr::secp256k1::{Message, SECP256K1, XOnlyPublicKey, schnorr::Signature};
 use nostr::{Event, JsonUtil};
 
-/// Verify a BIP-340 signature over an already computed 32-byte message digest.
-/// Malformed hex, lengths, public keys, and signatures fail closed.
-pub fn verify_bip340_signature(
-    public_key_hex: &str,
-    message_hex: &str,
-    signature_hex: &str,
-) -> bool {
-    if public_key_hex.len() != 64 || message_hex.len() != 64 || signature_hex.len() != 128 {
+// The digest-only verifier is retained for the BIP-340 reference vectors, not
+// exported to hosts: public-event consumers must also verify the canonical ID.
+#[cfg(test)]
+fn verify_bip340_signature(public_key_hex: &str, message_hex: &str, signature_hex: &str) -> bool {
+    use nostr::secp256k1::{Message, SECP256K1, XOnlyPublicKey, schnorr::Signature};
+
+    let (mut public_key, mut message, mut signature) = ([0u8; 32], [0u8; 32], [0u8; 64]);
+    if hex::decode_to_slice(public_key_hex, &mut public_key).is_err()
+        || hex::decode_to_slice(message_hex, &mut message).is_err()
+        || hex::decode_to_slice(signature_hex, &mut signature).is_err()
+    {
         return false;
     }
-    let Ok(public_key) = hex::decode(public_key_hex) else {
-        return false;
-    };
-    let Ok(message) = hex::decode(message_hex) else {
-        return false;
-    };
-    let Ok(signature) = hex::decode(signature_hex) else {
-        return false;
-    };
-    let Ok(message) = <[u8; 32]>::try_from(message.as_slice()) else {
-        return false;
-    };
-    let Ok(public_key) = XOnlyPublicKey::from_slice(&public_key) else {
-        return false;
-    };
-    let Ok(signature) = Signature::from_slice(&signature) else {
+    let (Ok(public_key), Ok(signature)) = (
+        XOnlyPublicKey::from_slice(&public_key),
+        Signature::from_slice(&signature),
+    ) else {
         return false;
     };
     SECP256K1

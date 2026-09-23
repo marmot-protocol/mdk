@@ -3140,34 +3140,6 @@ pub unsafe extern "C" fn marmot_report_message(
     })
 }
 
-/// Verify a BIP-340 signature over an already computed 32-byte digest.
-/// Invalid hex, lengths, keys, and signatures return success with `*out = 0`.
-/// No client or account is required.
-///
-/// # Safety
-/// Strings must be valid NUL-terminated UTF-8 and `out` must be writable.
-/// Inputs are borrowed and never retained.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_verify_bip340_signature(
-    public_key_hex: *const c_char,
-    message_hex: *const c_char,
-    signature_hex: *const c_char,
-    out: *mut u8,
-) -> MarmotStatus {
-    ffi_guard(|| {
-        try_arg!(unsafe { crate::preflight_out(out) });
-        let public_key = try_arg!(unsafe { required_str(public_key_hex) });
-        let message = try_arg!(unsafe { required_str(message_hex) });
-        let signature = try_arg!(unsafe { required_str(signature_hex) });
-        unsafe {
-            *out = u8::from(marmot_uniffi::verify_bip340_signature(
-                public_key, message, signature,
-            ));
-        }
-        MarmotStatus::Ok
-    })
-}
-
 /// Verify a public Nostr event's canonical ID and BIP-340 signature.
 /// Invalid event JSON returns success with `*out = 0`. No client is required.
 /// The caller must enforce application-specific author, kind, and tag policy.
@@ -3197,29 +3169,7 @@ mod nostr_verification_tests {
     use std::{ffi::CString, ptr};
 
     #[test]
-    fn stateless_verifiers_clear_outputs_and_fail_closed() {
-        let vector = include_str!("../../marmot-app/tests/fixtures/bip340_vectors_0_14.csv")
-            .lines()
-            .find(|line| line.starts_with("0,"))
-            .unwrap();
-        let fields: Vec<&str> = vector.split(',').collect();
-        let public_key = CString::new(fields[1]).unwrap();
-        let message = CString::new(fields[2]).unwrap();
-        let signature = CString::new(fields[3]).unwrap();
-        let mut verified = 0u8;
-        assert_eq!(
-            unsafe {
-                marmot_verify_bip340_signature(
-                    public_key.as_ptr(),
-                    message.as_ptr(),
-                    signature.as_ptr(),
-                    &raw mut verified,
-                )
-            },
-            MarmotStatus::Ok
-        );
-        assert_eq!(verified, 1);
-
+    fn public_event_verifier_clears_outputs_and_fails_closed() {
         let signed_event = EventBuilder::new(Kind::TextNote, "public C event")
             .sign_with_keys(&Keys::generate())
             .unwrap();
@@ -3259,33 +3209,6 @@ mod nostr_verification_tests {
                 marmot_verify_public_nostr_event_json(invalid_utf8.as_ptr().cast(), &raw mut out)
             },
             MarmotStatus::InvalidUtf8
-        );
-        assert_eq!(out, 0);
-
-        out = 1;
-        assert_eq!(
-            unsafe {
-                marmot_verify_bip340_signature(
-                    malformed.as_ptr(),
-                    malformed.as_ptr(),
-                    malformed.as_ptr(),
-                    &raw mut out,
-                )
-            },
-            MarmotStatus::Ok
-        );
-        assert_eq!(out, 0);
-        out = 1;
-        assert_eq!(
-            unsafe {
-                marmot_verify_bip340_signature(
-                    ptr::null(),
-                    malformed.as_ptr(),
-                    malformed.as_ptr(),
-                    &raw mut out,
-                )
-            },
-            MarmotStatus::NullPointer
         );
         assert_eq!(out, 0);
     }

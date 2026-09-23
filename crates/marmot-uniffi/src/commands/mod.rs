@@ -32,7 +32,7 @@ pub use group::{
     PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi,
 };
 pub use media::parse_media_imeta_tag;
-pub use nostr_verification::{verify_bip340_signature, verify_public_nostr_event_json};
+pub use nostr_verification::verify_public_nostr_event_json;
 pub use onboarding::OnboardingSubscription;
 
 mod product_analytics;

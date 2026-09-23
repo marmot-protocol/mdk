@@ -4120,21 +4120,6 @@ See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handlin
 <details>
 <summary>Stateless public-event verification</summary>
 
-### `verify_bip340_signature`
-
-```rust
-pub fn verify_bip340_signature( public_key_hex: String, message_hex: String, signature_hex: String, ) -> bool
-```
-
-Verify a BIP-340 Schnorr signature over a caller-computed 32-byte digest using
-MDK's Nostr/libsecp256k1 stack. This stateless helper needs no `Marmot` object,
-account, relay connection, or secret key. The arguments are hex-encoded x-only
-public key, digest, and signature; malformed values or verification failure
-return `false`. Prefer full-event verification below when an event JSON body is
-available, because this helper does not check a Nostr event's canonical ID.
-
-[Source](src/commands/nostr_verification.rs#L6)
-
 ### `verify_public_nostr_event_json`
 
 ```rust
@@ -4147,6 +4132,6 @@ for malformed JSON or failed verification. It does not establish an allowed
 author, kind, tag, relay provenance, or MLS group-membership policy; the host
 must enforce those separately and bound any untrusted JSON before passing it.
 
-[Source](src/commands/nostr_verification.rs#L18)
+[Source](src/commands/nostr_verification.rs#L7)
 
 </details>

@@ -7,11 +7,11 @@ Host-controlled automatic downloads use the [host-managed attachment contract](A
 ## Integration guide and API reference
 
 This is the current integration entry point for Swift/iOS, Swift/macOS and Kotlin/Android.
-The stateless `verifyPublicNostrEventJson` and `verifyBip340Signature` helpers
-verify public events and 32-byte-digest signatures through MDK's Nostr/libsecp256k1
-stack without constructing an account or supplying a secret key. A host must still
-enforce its own allowed authors, kinds, tags, and input-size limits. Malformed
-input and invalid signatures return `false`; these helpers do not authenticate
+The stateless `verifyPublicNostrEventJson` helper verifies public events through
+MDK's Nostr/libsecp256k1 stack without constructing an account or supplying a
+secret key. It checks both the canonical event ID and signature. A host must
+still enforce its own allowed authors, kinds, tags, and input-size limits.
+Malformed input and invalid signatures return `false`; it does not authenticate
 an MLS group message or replace MDK's relay ingestion checks.
 The [C guide](../marmot-c/README.md) adds ABI ownership and blocking-call rules for C and raw FFI hosts.
 Read the documentation at the tag matching your binaries; `master` can describe unreleased APIs.

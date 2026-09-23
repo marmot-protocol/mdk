@@ -7,7 +7,7 @@ any raw-FFI consumer (Zig, Nim, Go, Odin, Lua, PHP, …).
 
 Start with the [shared binding integration guide](../marmot-uniffi/README.md#integration-guide-and-api-reference)
 for runtime lifecycle, screen contracts, API selection, localization and upgrade policy.
-`marmot_verify_public_nostr_event_json` and `marmot_verify_bip340_signature`
+`marmot_verify_public_nostr_event_json`
 are stateless public-event checks: they require no client, return `uint8_t`
 results through required out-pointers, and return `MARMOT_STATUS_OK` with zero
 for malformed or invalid cryptographic input. Null/invalid UTF-8 pointers are
