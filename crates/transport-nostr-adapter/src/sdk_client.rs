@@ -1318,11 +1318,24 @@ impl NostrSdkRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for NostrSdkRelayClient {
+    fn supports_scoped_subscriptions(&self) -> bool {
+        true
+    }
     async fn subscribe(
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
-        let plan = Self::plan_subscription(&subscription)?;
+        let id = subscription.subscription_id();
+        self.subscribe_scoped(subscription, id).await
+    }
+
+    async fn subscribe_scoped(
+        &self,
+        subscription: NostrSubscription,
+        subscription_id: String,
+    ) -> Result<(), TransportAdapterError> {
+        let mut plan = Self::plan_subscription(&subscription)?;
+        plan.subscription_id = SubscriptionId::new(subscription_id);
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
             method = "subscribe",
@@ -1406,7 +1419,17 @@ impl NostrRelayClient for NostrSdkRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
-        let plan = Self::plan_subscription(&subscription)?;
+        let id = subscription.subscription_id();
+        self.unsubscribe_scoped(subscription, id).await
+    }
+
+    async fn unsubscribe_scoped(
+        &self,
+        subscription: NostrSubscription,
+        subscription_id: String,
+    ) -> Result<(), TransportAdapterError> {
+        let mut plan = Self::plan_subscription(&subscription)?;
+        plan.subscription_id = SubscriptionId::new(subscription_id);
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
             method = "unsubscribe",

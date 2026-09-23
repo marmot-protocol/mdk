@@ -1,9 +1,13 @@
 import { getEventListeners } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import { createServer, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-runtime";
 
-import type { MarmotAgentControlClient } from "../src/client.js";
+import { MarmotAgentControlClient } from "../src/client.js";
 import type { ResolvedMarmotAccount } from "../src/config.js";
 import {
   allowlistRetryDelayMs,
@@ -91,12 +95,14 @@ vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
 const { inboundRuntimeActual } = vi.hoisted(() => ({
   inboundRuntimeActual: {} as {
     startMarmotInbound?: typeof startMarmotInboundExport;
+    syncMarmotAllowlist?: typeof import("../src/inbound-runtime.js").syncMarmotAllowlist;
   },
 }));
 
 vi.mock("../src/inbound-runtime.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/inbound-runtime.js")>();
   inboundRuntimeActual.startMarmotInbound = actual.startMarmotInbound;
+  inboundRuntimeActual.syncMarmotAllowlist = actual.syncMarmotAllowlist;
   return {
     ...actual,
     syncMarmotAllowlist: vi.fn(async (_api: InboundPluginApi, options = {}) => {
@@ -602,6 +608,97 @@ describe("startMarmotGatewayAccount", () => {
     abortReplacement.abort();
     await replacement.stop();
     await replacementRun;
+  });
+
+  it("bounds the barrier by the control request timeout when wn-agent is wedged", async () => {
+    const realSync = inboundRuntimeActual.syncMarmotAllowlist;
+    if (!realSync) {
+      throw new Error("expected unmocked syncMarmotAllowlist");
+    }
+    // A wedged wn-agent: accepts every connection, reads it, never replies.
+    const dir = await mkdtemp(join(tmpdir(), "wedged-"));
+    const socketPath = join(dir, "wn.sock");
+    const held: Socket[] = [];
+    const server = createServer((socket) => {
+      held.push(socket);
+      socket.on("data", () => {});
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    const order: string[] = [];
+
+    try {
+      const abortOld = new AbortController();
+      const oldRun = startMarmotGatewayAccount(
+        gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
+          accountId: "work",
+          abortSignal: abortOld.signal,
+        }),
+        {
+          // The production sync and client, against the wedged socket. Only the
+          // timeout is shortened from the client default so the test stays fast.
+          syncAllowlist: async (api) => {
+            const result = await realSync(
+              {
+                ...api,
+                config: { channels: { marmot: { dm: { allowFrom: ["11".repeat(32)] } } } },
+              },
+              {
+                clientFactory: () =>
+                  new MarmotAgentControlClient({ socketPath, authToken: "t", requestTimeoutMs: 200 }),
+              },
+            );
+            order.push("predecessor settled");
+            return result;
+          },
+        },
+      );
+      // The predecessor's request must genuinely be in flight on the wedged
+      // socket before the replacement starts, or this proves nothing.
+      await vi.waitFor(() => {
+        expect(held.length).toBeGreaterThan(0);
+      });
+
+      lifecycleByAccount.delete("work");
+      const abortReplacement = new AbortController();
+      const replacementRun = startMarmotGatewayAccount(
+        gatewayContext(account({ marmotAccountIdHex: "aa".repeat(32) }), {
+          accountId: "work",
+          abortSignal: abortReplacement.signal,
+        }),
+        {
+          syncAllowlist: async () => {
+            order.push("replacement reconciled");
+            return { state: "unmanaged" };
+          },
+        },
+      );
+
+      // Bounded: the predecessor's request times out, which ends its pass and
+      // releases the barrier. Serialized: the replacement reconciles only after.
+      await vi.waitFor(
+        () => {
+          expect(order).toEqual(["predecessor settled", "replacement reconciled"]);
+        },
+        // Well past the 200ms request timeout, and inside the test timeout so a
+        // regression reports this ordering rather than a bare test timeout.
+        { timeout: 3_000 },
+      );
+      const replacement = await waitForLifecycle("work");
+      expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({ running: true });
+
+      await oldRun;
+      abortOld.abort();
+      abortReplacement.abort();
+      await replacement.stop();
+      await replacementRun;
+    } finally {
+      for (const socket of held) {
+        socket.destroy();
+      }
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("releases failed inbound attempts before retrying through the real runtime", async () => {

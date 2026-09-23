@@ -13,6 +13,9 @@ serde_json.workspace = true
 sha2.workspace = true
 web-time.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 jsonschema.workspace = true
 tempfile.workspace = true

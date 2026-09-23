@@ -77,6 +77,8 @@ def _live_adapter() -> Optional["MarmotPlatformAdapter"]:
 DEFAULT_SOCKET_HOME = "~/.marmot"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
 TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
+_PRESENCE_OWNER: ContextVar[Optional[object]] = ContextVar("marmot_presence_owner", default=None)
+
 _TURN_PARENT_MESSAGE_ID_HEX: ContextVar[Optional[str]] = ContextVar(
     "marmot_turn_parent_message_id_hex",
     default=None,
@@ -1389,6 +1391,224 @@ class MarmotLiveStream:
             )
 
 
+PRESENCE_REACTIONS = {
+    "accepted": "👀", "thinking": "⏳", "completed": "✅",
+    "failed": "❌", "superseded": "➡️",
+}
+PRESENCE_CONSTRUCTION = ("🛠️", "🔨", "⚙️", "🧱")
+PRESENCE_BASE_INTERVAL = 120.0
+PRESENCE_MAX_INTERVAL = 600.0
+PRESENCE_MAX_GROUPS = 256
+PRESENCE_RETRY_DELAYS = (0.0, 0.25, 1.0)
+
+
+class _PresenceGroup:
+    def __init__(self, owner: object, target: str):
+        self.owner = owner
+        self.target = self.anchor = target
+        self.mode = "accepted"
+        self.index = 0
+        self.active_tools = 0
+        self.ended = False
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+        self.worker: Optional[asyncio.Task] = None
+        self.timer: Optional[asyncio.Task] = None
+        self.shown: Optional[tuple[str, str, bool]] = None
+
+
+class PresenceReactions:
+    """Bounded cosmetic state; no network work runs inline with a turn hook."""
+
+    def __init__(self, adapter: Any, extra: Dict[str, Any]):
+        self.adapter = adapter
+        self.enabled = extra.get("presence_reactions") is True
+        self.emojis = dict(PRESENCE_REACTIONS)
+        configured = extra.get("presence_emojis") or {}
+        if isinstance(configured, dict):
+            for state in self.emojis:
+                value = configured.get(state)
+                if self._valid_emoji(value):
+                    self.emojis[state] = value
+        construction = configured.get("construction") if isinstance(configured, dict) else None
+        self.construction = (
+            tuple(construction) if isinstance(construction, list) and 1 <= len(construction) <= 16
+            and all(self._valid_emoji(value) for value in construction) else PRESENCE_CONSTRUCTION
+        )
+        self.groups: OrderedDict[str, _PresenceGroup] = OrderedDict()
+        self.tasks: set[asyncio.Task] = set()
+        self.sleep = asyncio.sleep  # Injectable timer clock for deterministic tests.
+        self.closed = False
+
+    @staticmethod
+    def _valid_emoji(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip()) and len(value) <= 64 and not any(
+            ord(char) < 32 or ord(char) == 127 for char in value
+        )
+
+    @staticmethod
+    def _target(value: Any) -> Optional[str]:
+        try:
+            return _normalize_hex(value)
+        except AgentControlError:
+            logger.debug("Marmot presence ignored invalid anchor")
+            return None
+
+    def _spawn(self, coroutine: Any) -> asyncio.Task:
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    def start(self, chat_id: str, message_id: str, owner: object) -> None:
+        if not self.enabled or self.closed:
+            return
+        target = self._target(message_id)
+        group = self._target(chat_id)
+        if not target or not group:
+            return
+        state = self.groups.get(group)
+        if state is not None and state.owner is owner:
+            return
+        if state is None:
+            if len(self.groups) >= PRESENCE_MAX_GROUPS:
+                idle = next((key for key, item in self.groups.items()
+                             if item.ended and (item.worker is None or item.worker.done())), None)
+                if idle is None:
+                    logger.debug("Marmot presence group capacity reached")
+                    return
+                self.groups.pop(idle)
+            state = _PresenceGroup(owner, target)
+            self.groups[group] = state
+        else:
+            self._cancel_timer(state)
+            if not state.ended:
+                self._enqueue(group, state, state.target, self.emojis["superseded"], True)
+            state.owner, state.target, state.anchor = owner, target, target
+            state.mode, state.index, state.ended = "accepted", 0, False
+            state.active_tools = 0
+        self._enqueue(group, state, target, self.emojis["accepted"])
+
+    def retarget(self, group: str, target: str) -> None:
+        state = self.groups.get(group)
+        if not self.enabled or self.closed or state is None or state.ended:
+            return
+        target = self._target(target)
+        if target and target != state.target:
+            state.target = target
+            emoji = (self.construction[state.index] if state.mode == "tool"
+                     else self.emojis[state.mode])
+            self._enqueue(group, state, target, emoji)
+
+    def status(self, group: str, working: bool, owner: object = None) -> None:
+        state = self.groups.get(group)
+        if not self.enabled or self.closed or state is None or state.ended:
+            return
+        if owner is not None and state.owner is not owner:
+            return
+        if working:
+            state.active_tools += 1
+        else:
+            state.active_tools = max(0, state.active_tools - 1)
+            if state.active_tools or state.mode == "thinking":
+                return
+        self._cancel_timer(state)
+        state.mode = "tool" if working else "thinking"
+        state.index = 0
+        emoji = self.construction[0] if working else self.emojis["thinking"]
+        self._enqueue(group, state, state.target, emoji)
+        if working:
+            state.timer = self._spawn(self._cycle(group, state))
+
+    async def _cycle(self, group: str, state: _PresenceGroup) -> None:
+        delay = PRESENCE_BASE_INTERVAL
+        try:
+            while not state.ended and state.mode == "tool":
+                await self.sleep(delay)
+                state.index = (state.index + 1) % len(self.construction)
+                self._enqueue(group, state, state.target, self.construction[state.index])
+                delay = min(delay * 2, PRESENCE_MAX_INTERVAL)
+        except asyncio.CancelledError:
+            pass
+
+    def finish(self, group: str, owner: object, outcome: str) -> None:
+        state = self.groups.get(group)
+        if not self.enabled or self.closed or state is None or state.ended or state.owner is not owner:
+            return
+        self._cancel_timer(state)
+        state.ended = True
+        emoji = self.emojis["completed"] if outcome == "success" else (
+            self.emojis["failed"] if outcome == "failure" else None
+        )
+        self._enqueue(group, state, state.anchor, emoji, True)
+
+    @staticmethod
+    def _cancel_timer(state: _PresenceGroup) -> None:
+        if state.timer is not None:
+            state.timer.cancel()
+            state.timer = None
+
+    def _enqueue(self, group: str, state: _PresenceGroup, target: str,
+                 emoji: Optional[str], terminal: bool = False) -> None:
+        if state.queue.full():
+            # Cosmetic transitions may coalesce under overload; never build an
+            # unbounded backlog behind an unavailable daemon.
+            while not state.queue.empty():
+                state.queue.get_nowait()
+                state.queue.task_done()
+        state.queue.put_nowait((target, emoji, terminal))
+        if state.worker is None or state.worker.done():
+            state.worker = self._spawn(self._drain(group, state))
+
+    async def _operation(self, add: bool, group: str, target: str, emoji: str) -> bool:
+        for delay in PRESENCE_RETRY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                method = self.adapter._add_reaction if add else self.adapter._remove_reaction
+                if await asyncio.wait_for(method(group, target, emoji), timeout=5):
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        logger.debug("Marmot presence operation exhausted bounded retries")
+        return False
+
+    async def _drain(self, group: str, state: _PresenceGroup) -> None:
+        try:
+            while not state.queue.empty():
+                target, emoji, terminal = await state.queue.get()
+                try:
+                    desired = (target, emoji, terminal) if emoji else None
+                    if state.shown == desired:
+                        continue
+                    if state.shown and not state.shown[2]:
+                        if not await self._operation(False, group, state.shown[0], state.shown[1]):
+                            continue  # Avoid stacking transient reactions after a failed removal.
+                    state.shown = None
+                    if emoji:
+                        # Track even an uncertain add, so a later transition can
+                        # remove it after a lost acknowledgment.
+                        state.shown = desired
+                        await self._operation(True, group, target, emoji)
+                finally:
+                    state.queue.task_done()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("Marmot presence worker failed")
+
+    async def close(self) -> None:
+        self.closed = True
+        tasks = tuple(self.tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.tasks.clear()
+        self.groups.clear()
+
+
 class MarmotPlatformAdapter(BasePlatformAdapter):
     """Hermes adapter that exposes Marmot groups as a platform."""
 
@@ -1495,6 +1715,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._last_chat_stream: Dict[str, MarmotLiveStream] = {}
         self._tool_progress_events: OrderedDict[str, set[str]] = OrderedDict()
         self._tool_progress_replies: Dict[str, Optional[str]] = {}
+        self._presence = PresenceReactions(self, extra)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Client-side inbound dedupe: wn-agent can re-emit the same inbound
         # message (rapid catch-up after subscribe, or across a reconnect); drop
@@ -1664,6 +1885,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     self._run_inbound_spool_retry_loop()
                 )
             self._inbound_spool_wakeup.set()
+            self._presence.closed = False
             self._listener_task = asyncio.create_task(self._consume_inbound_loop())
             self._mark_connected()
             return True
@@ -1843,6 +2065,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.error("Marmot inbound debounce disconnect release failed", exc_info=True)
         finally:
             self._debounce_release_pending.clear()
+        await self._presence.close()
         await self._inbound_queue.cancel_all()
         await self._retry_inbound_dispatch_dispositions()
         await self._retry_ambient_outcomes()
@@ -2043,6 +2266,41 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
 
+    @property
+    def supports_status_text(self) -> bool:
+        # Hermes' live-status hook emits every tool.started/tool.completed,
+        # even when permanent tool-progress messages are disabled.
+        return self._presence.enabled
+
+    def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
+        loop = self._loop
+        owner = _PRESENCE_OWNER.get()
+        if not self._presence.enabled or loop is None or not loop.is_running() or owner is None:
+            return
+        # The gateway calls this from its agent thread. Never retain or log the
+        # status phrase; only its presence (tool active vs between tools) matters.
+        try:
+            loop.call_soon_threadsafe(self._presence.status, chat_id, text is not None, owner)
+        except RuntimeError:
+            logger.debug("Marmot presence scheduling skipped during shutdown")
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        self._capture_loop()
+        # The host invokes this hook before its message-handler authorization.
+        # Leave dispatch to the host, but require explicit authorization before
+        # creating or replacing externally visible presence (and its owner).
+        authorization_check = getattr(self, "_is_sender_authorized", None)
+        if not self._presence.enabled or authorization_check is None:
+            return
+        source = event.source
+        if authorization_check(source.user_id, source.chat_type, source.chat_id) is not True:
+            return
+        _PRESENCE_OWNER.set(event)
+        self._presence.start(event.source.chat_id, event.message_id, event)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        self._presence.finish(event.source.chat_id, event, getattr(outcome, "value", outcome))
+
     def supports_draft_streaming(
         self,
         chat_type: Optional[str] = None,
@@ -2080,6 +2338,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             return super().render_message_event(event, sink)
 
         if isinstance(event, MessageChunk):
+            chat_id = getattr(sink, "chat_id", "")
+            presence = self._presence.groups.get(chat_id)
+            if presence is not None and presence.mode != "tool" and event.text:
+                self.set_status_text(chat_id, None)
             if event.text:
                 sink.on_delta(event.text)
             return
@@ -3372,6 +3634,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 # replying to (mirrors dispatch.ts replyToMessageIdHex = inbound id).
                 message_id=message_id_hex,
             )
+            # Activation is not authorization. Use the host's full authorization
+            # callback; absent/unknown decisions must not move an active indicator.
+            authorization_check = getattr(self, "_is_sender_authorized", None)
+            if (self._presence.enabled and authorization_check is not None
+                    and authorization_check(source.user_id, source.chat_type, source.chat_id) is True):
+                self._presence.retarget(group_id_hex, message_id_hex)
             hermes_event = MessageEvent(
                 text=str(event.get("text") or ""),
                 message_type=MessageType.TEXT,

@@ -40,8 +40,8 @@ use cgka_traits::{
     TransportEndpointReceipt, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
     TransportPublishTarget,
 };
-use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditTransportWire, MessageArtifactKind, PublishRelayFailure,
 };
@@ -3864,8 +3864,18 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
-        self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
-            .await?;
+        let outcome = fanout.outcome();
+        // A receipt persisted before cancellation can still be below quorum.
+        // Finish that pass before releasing its Welcome continuation. Once a
+        // pass settles, the existing exposure rule still prevents rollback of
+        // a commit that reached peers even if its acknowledgement goal failed.
+        if !outcome.mls_confirmation_required
+            || outcome.accepted_targets >= fanout.request().required_acks.max(1)
+            || outcome.fanout_complete
+        {
+            self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
+                .await?;
+        }
         let endpoints = fanout.request().target.endpoints().to_vec();
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
         let due = fanout
@@ -3892,19 +3902,39 @@ where
             // one-awaited-ack-at-a-time serialization.
             let adapter = &self.adapter;
             let account_id = fanout.request().account_id.clone();
-            let attempts = due.iter().map(|&index| {
-                let attempt = TransportPublishRequest {
-                    account_id: account_id.clone(),
-                    message: fanout.request().message.clone(),
-                    target: publish_target_with_endpoints(
-                        &fanout.request().target,
-                        vec![endpoints[index].clone()],
-                    ),
-                    required_acks: 1,
+            let mut accepted = fanout.outcome().accepted_targets;
+            let ack_goal = fanout.request().required_acks.max(1);
+            // A retry after confirmation must finish its outstanding attempts;
+            // otherwise an already-met quorum would cancel every retry.
+            let finish_retries = accepted >= ack_goal;
+            let mut attempts = due
+                .iter()
+                .map(|&index| {
+                    let attempt = TransportPublishRequest {
+                        account_id: account_id.clone(),
+                        message: fanout.request().message.clone(),
+                        target: publish_target_with_endpoints(
+                            &fanout.request().target,
+                            vec![endpoints[index].clone()],
+                        ),
+                        required_acks: 1,
+                    };
+                    async move { (index, adapter.publish(attempt).await) }
+                })
+                .collect::<FuturesUnordered<_>>();
+            loop {
+                // Drain immediately ready receipts after reaching quorum, but
+                // do not hold confirmation or Welcomes behind a stalled relay.
+                // Unfinished attempts stay durable and scheduler-visible for
+                // exact-event retry, including after cancellation or restart.
+                let next = if accepted >= ack_goal && !finish_retries {
+                    attempts.next().now_or_never().flatten()
+                } else {
+                    attempts.next().await
                 };
-                async move { (index, adapter.publish(attempt).await) }
-            });
-            for (index, result) in futures::future::join_all(attempts).await {
+                let Some((index, result)) = next else {
+                    break;
+                };
                 let endpoint = endpoints[index].clone();
                 let failure = match result {
                     Ok(report) => {
@@ -3914,7 +3944,7 @@ where
                             .iter()
                             .any(|receipt| receipt.endpoint == endpoint)
                         {
-                            fanout.mark_target_accepted(index)?;
+                            accepted += usize::from(fanout.mark_target_accepted(index)?);
                             None
                         } else {
                             Some(
@@ -3944,8 +3974,24 @@ where
                 if let Some(failure) = failure {
                     fanout.record_target_failure(index, failure)?;
                 }
+                self.session.put_outbound_fanout(&fanout)?;
             }
-            self.session.put_outbound_fanout(&fanout)?;
+            if !attempts.is_empty() {
+                // Cancelled publishes may have reached a relay. Back off their
+                // exact-event retries instead of immediately blocking the worker again.
+                for &index in &due {
+                    if fanout.target_status(index)
+                        == Some(cgka_traits::FanoutTargetStatus::Attempting)
+                    {
+                        fanout.record_target_failure(
+                            index,
+                            ambiguous_endpoint_failure(endpoints[index].clone()),
+                        )?;
+                    }
+                }
+                self.session.put_outbound_fanout(&fanout)?;
+            }
+            drop(attempts);
             let report = frozen_fanout_report(&fanout);
             // Record this artifact before confirmation releases any frozen
             // Welcome continuations, preserving transport chronology in the
