@@ -345,6 +345,14 @@ explicit authorized withdrawal, never the result of unavailable coverage. No deb
 is marked satisfied to stop traffic. Test zero additional activations across
 multiple capped retry windows and reopen, followed by each permitted rearm cause.
 
+Approved #1992 amendment: cold startup may join one bounded retained-inventory
+comparison even while older coverage is parked. Its durable singleton shares the
+same owner, reservation and retry cost. Per-route servicing never completes
+coverage or acknowledges loss. The live timestamp cutoff and retained-inventory
+floor are distinct; see
+[the concrete comparison amendment](account-recovery-incremental-comparison-proposal.md)
+for mixed-result settlement, repeated-start behavior and acceptance tests.
+
 Apply that eligibility rule by cause, without changing completion predicates:
 
 - An epoch-gap attempt with no admitted input, transient failure, or a legacy EOSE

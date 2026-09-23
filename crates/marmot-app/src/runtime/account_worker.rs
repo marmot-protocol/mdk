@@ -470,10 +470,14 @@ pub(crate) enum AccountWorkerCommand {
     /// Count seeded groups the session has not fully hydrated yet, without
     /// promoting them on demand (mdk#1337 regression probe).
     /// Controlled-clock fixture; changes no durable row and grants no I/O.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-policy-overrides"))]
     AdvanceRecoveryClock {
         elapsed: Duration,
         respond: oneshot::Sender<()>,
+    },
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    RecoveryRetrySnapshot {
+        respond: oneshot::Sender<(storage_sqlite::RecoveryRetryState, Duration, bool)>,
     },
     #[cfg(test)]
     UnhydratedGroupCount {
@@ -2599,6 +2603,15 @@ async fn handle_startup_hydration_command(
                     .await;
             }
         }
+        #[cfg(any(test, feature = "test-policy-overrides"))]
+        AccountWorkerCommand::RecoveryRetrySnapshot { respond } => {
+            let storage = client.app.account_storage(&client.state.label).unwrap();
+            let _ = respond.send((
+                storage.recovery_retry_state().unwrap(),
+                client.recovery_owner.test_retry_remaining(&storage),
+                storage.recovery_comparison().unwrap().pending(),
+            ));
+        }
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => {
             let count = client.runtime.session().unhydrated_group_ids().len();
@@ -3233,10 +3246,20 @@ fn account_worker_command_future<'a>(
             );
             false
         }),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-policy-overrides"))]
         AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond } => Box::pin(async move {
             client.recovery_owner.test_advance_clock(elapsed);
             let _ = respond.send(());
+            true
+        }),
+        #[cfg(any(test, feature = "test-policy-overrides"))]
+        AccountWorkerCommand::RecoveryRetrySnapshot { respond } => Box::pin(async move {
+            let storage = client.app.account_storage(&client.state.label).unwrap();
+            let _ = respond.send((
+                storage.recovery_retry_state().unwrap(),
+                client.recovery_owner.test_retry_remaining(&storage),
+                storage.recovery_comparison().unwrap().pending(),
+            ));
             true
         }),
         #[cfg(test)]

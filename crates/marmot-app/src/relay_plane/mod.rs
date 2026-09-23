@@ -2061,6 +2061,16 @@ impl MarmotRelayPlaneAccountAdapter {
             .await
     }
 
+    /// Operational capability identity only; SDK presence proves neither
+    /// endpoint availability nor exhaustive historical coverage.
+    pub(crate) fn recovery_comparison_capability_key(&self) -> &'static [u8] {
+        if self.relay_plane.inner.transport.sdk_relay_client.is_some() {
+            b"sdk-bounded-comparison-v1"
+        } else {
+            b"no-sdk-reconciliation-v1"
+        }
+    }
+
     pub(crate) fn recovery_admitted_endpoints(
         &self,
         endpoints: &[TransportEndpoint],

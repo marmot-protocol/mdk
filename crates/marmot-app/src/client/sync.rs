@@ -59,6 +59,12 @@ const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
 // until delivery and EOSE can share an ordered receive lane.
 const EOSE_QUIET_WAIT: Duration = Duration::from_millis(100);
 
+#[cfg(test)]
+pub(super) type TestComparisonResult = Result<
+    Option<transport_nostr_adapter::NostrReconciliationSummary>,
+    cgka_traits::TransportAdapterError,
+>;
+
 /// Overall explicit repair budget, distinct from each checkpointed drain quantum.
 /// Checked at safe boundaries; an admitted ingest/checkpoint is always finished.
 /// Leave headroom inside the public worker RPC deadline for setup and cleanup.
@@ -984,10 +990,19 @@ impl AppClient {
     pub(super) fn freeze_recovery_inventory(
         &mut self,
         goals: &mut [([u8; 16], Vec<storage_sqlite::RecoveryScopePlan>)],
-    ) -> Result<Vec<super::recovery::FrozenRecoveryInventory>, AppError> {
+    ) -> Result<
+        (
+            Vec<super::recovery::FrozenRecoveryInventory>,
+            Option<TransportReconciliationRoute>,
+        ),
+        AppError,
+    > {
         let storage = self.app.account_storage(&self.state.label)?;
         let mut work = Vec::new();
         for scope in goals.iter().flat_map(|(_, scopes)| scopes) {
+            if scope.admitted_endpoints.is_empty() {
+                continue;
+            }
             let endpoints = scope
                 .admitted_endpoints
                 .iter()
@@ -1019,9 +1034,6 @@ impl AppClient {
             &self.armed_epoch_backfill_groups(),
             TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
         );
-        if let Some(route) = rotation_claim {
-            storage.advance_transport_reconciliation_route_cursor(&route)?;
-        }
         let receipts = self.transport_receipts()?;
         let mut frozen = Vec::new();
         for work in work {
@@ -1064,7 +1076,7 @@ impl AppClient {
                 });
             }
         }
-        Ok(frozen)
+        Ok((frozen, rotation_claim))
     }
 
     /// Execute only the route membership, bounds and retained local ids captured
@@ -1072,7 +1084,16 @@ impl AppClient {
     async fn reconcile_transport_history(
         &mut self,
         frozen: &[super::recovery::FrozenRecoveryInventory],
-    ) -> Result<(), AppError> {
+    ) -> Result<
+        Vec<(
+            TransportReconciliationRoute,
+            storage_sqlite::RecoveryComparisonOutcome,
+        )>,
+        AppError,
+    > {
+        use storage_sqlite::RecoveryComparisonOutcome as Outcome;
+        let deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
+        let mut outcomes = Vec::new();
         let storage = self.app.account_storage(&self.state.label)?;
         let mut attempted_routes = 0usize;
         let mut routes_failed = 0usize;
@@ -1083,43 +1104,75 @@ impl AppClient {
         let mut received_items = 0usize;
 
         for inventory in frozen {
+            if tokio::time::Instant::now() >= deadline {
+                // Never turn the route budget into an unbounded sweep. This
+                // unattempted route retains coverage debt, not a claimed success.
+                outcomes.push((inventory.route.clone(), Outcome::ServicedPartial));
+                continue;
+            }
             attempted_routes += 1;
             let progress = StoredReconciliationProgress::new(&storage, &inventory.route);
-            let result = match &inventory.work {
-                TransportReconciliationWork::Inbox(endpoints) => {
-                    self.adapter
-                        .reconcile_inbox_history(
-                            endpoints.clone(),
-                            &inventory.items,
-                            inventory.since,
-                            inventory.until,
-                            &progress,
-                        )
-                        .await
+            let result = tokio::time::timeout_at(deadline, async {
+                #[cfg(test)]
+                if let Some(results) = &mut self.test_comparison_results {
+                    if let Some(delay) = self.test_comparison_delay {
+                        tokio::time::sleep(delay).await;
+                    }
+                    return results
+                        .pop_front()
+                        .expect("one scripted result per selected comparison route");
                 }
-                TransportReconciliationWork::Group(group) => {
-                    self.adapter
-                        .reconcile_group_history(
-                            group.clone(),
-                            &inventory.items,
-                            inventory.since,
-                            inventory.until,
-                            &progress,
-                        )
-                        .await
+                match &inventory.work {
+                    TransportReconciliationWork::Inbox(endpoints) => {
+                        self.adapter
+                            .reconcile_inbox_history(
+                                endpoints.clone(),
+                                &inventory.items,
+                                inventory.since,
+                                inventory.until,
+                                &progress,
+                            )
+                            .await
+                    }
+                    TransportReconciliationWork::Group(group) => {
+                        self.adapter
+                            .reconcile_group_history(
+                                group.clone(),
+                                &inventory.items,
+                                inventory.since,
+                                inventory.until,
+                                &progress,
+                            )
+                            .await
+                    }
                 }
-            };
-            match result {
-                Ok(Some(summary)) => {
+            })
+            .await;
+            let outcome = match result {
+                Ok(Ok(Some(summary))) => {
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
                     remote_items += summary.remote_items;
                     received_items += summary.received_items;
+                    if summary.relays_failed > 0 {
+                        Outcome::TransientFailure
+                    } else {
+                        Outcome::ServicedUnknown
+                    }
                 }
-                Ok(None) => {}
-                Err(_) if progress.retired.load(Ordering::Relaxed) => routes_retired += 1,
-                Err(_) => routes_failed += 1,
-            }
+                // The plane returns None only when no SDK reconciliation
+                // backend exists. Missing exhaustive proof returns Some, not None.
+                Ok(Ok(None)) => Outcome::Unsupported,
+                Ok(Err(_)) if progress.retired.load(Ordering::Relaxed) => {
+                    routes_retired += 1;
+                    Outcome::ServicedPartial
+                }
+                Ok(Err(_)) | Err(_) => {
+                    routes_failed += 1;
+                    Outcome::TransientFailure
+                }
+            };
+            outcomes.push((inventory.route.clone(), outcome));
         }
 
         tracing::info!(
@@ -1134,7 +1187,7 @@ impl AppClient {
             received_items,
             "completed transport set reconciliation"
         );
-        Ok(())
+        Ok(outcomes)
     }
 
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
@@ -1307,29 +1360,19 @@ impl AppClient {
                     )
                 })?;
         }
-        let storage = self
-            .app
-            .account_storage(&self.state.label)
-            .map_err(|error| {
+        if self.app.cursor_persistence() == CursorPersistence::Advance
+            && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
+        {
+            self.request_bounded_comparison().map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
                     SyncSummary::default(),
                     error,
                     SyncFailureStage::StatePersist,
                 )
             })?;
-        if self.app.cursor_persistence() == CursorPersistence::Advance {
-            storage
-                .request_recovery(
-                    storage_sqlite::RecoveryRequest::IncrementalHistory,
-                    unix_now_seconds().saturating_mul(1000),
-                )
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error.into(),
-                        SyncFailureStage::StatePersist,
-                    )
-                })?;
+            if !explicit {
+                self.comparison_startup_requested = true;
+            }
         }
         let mut caller = ExplicitRecoveryPermit::default();
         let grant = self
@@ -3549,6 +3592,7 @@ impl AppClient {
         self.drop_terminal_epoch_backfill_intents();
         let storage = self.app.account_storage(&self.state.label)?;
         if storage.pending_recovery_demands()?.is_empty()
+            && !storage.recovery_comparison()?.pending()
             && self.pending_recovery_arm_writes.is_empty()
             && self.pending_recovery_capacity_writes.is_empty()
         {
@@ -3560,13 +3604,15 @@ impl AppClient {
             return Ok(EpochBackfillRunOutcome::Deferred);
         };
         let selected = grant.fence.obligations.clone();
+        let comparison_selected = grant.comparison_revision.is_some();
         match self.execute_recovery_grant(grant, None, None).await {
             Ok(summary) => {
-                let complete = selected.iter().all(|(id, revision)| {
-                    storage
-                        .recovery_obligation_is_satisfied(*id, *revision)
-                        .unwrap_or(false)
-                });
+                let complete = !comparison_selected
+                    && selected.iter().all(|(id, revision)| {
+                        storage
+                            .recovery_obligation_is_satisfied(*id, *revision)
+                            .unwrap_or(false)
+                    });
                 Ok(if complete {
                     EpochBackfillRunOutcome::Completed(summary)
                 } else {
@@ -3758,15 +3804,22 @@ impl AppClient {
         drain_verdict: &mut Option<DrainVerdict>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let obligations = grant.plan().expect("validated executor grant");
-        // A coalesced activation covers the oldest selected goal. Incremental
-        // callers keep their existing cursor floor and quiet-drain contract;
-        // joining gap/loss/repair demand deliberately widens that same grant.
+        // A bounded comparison freezes acquisition separately from historical
+        // goals. Coalesced broad debt receives only this partial investigation:
+        // it cannot widen the ordinary live cutoff, and remains pending. A
+        // coverage-only grant can still select the older historical range.
         let since = {
             let mut history = obligations
                 .iter()
                 .filter(|obligation| obligation.cause != storage_sqlite::RecoveryCause::Maintenance)
                 .peekable();
-            if history.peek().is_none() {
+            if grant.comparison_plan.is_some() {
+                grant
+                    .comparison_plan
+                    .as_ref()
+                    .and_then(|plan| plan.live_since_seconds)
+                    .map(cgka_traits::transport::Timestamp)
+            } else if history.peek().is_none() {
                 self.subscription_rebuild_since().map_err(|error| {
                     ClassifiedSyncFailure::at_stage(
                         SyncSummary::default(),
@@ -3878,31 +3931,21 @@ impl AppClient {
                     .insert(group, (subscription, route));
             }
         }
-        // Ordinary incremental catch-up and maintenance installation previously
-        // needed only their subscription/drain boundary. Inventory comparison
-        // can block on an unsupported relay for its full budget; introducing
-        // that wait here would hold live post-join delivery behind history work.
-        // Omitting comparison grants no qualified completion evidence.
-        if !quiet_prerequisites {
-            match timeout(
-                TRANSPORT_RECONCILIATION_QUANTUM,
-                self.reconcile_transport_history(&grant.inventory),
-            )
-            .await
-            {
-                Ok(result) => result.map_err(|error| {
+        // Routine below-live-cutoff discovery runs only with a frozen owner
+        // comparison request. The retained-inventory floor still bounds it.
+        let comparison_outcomes = if grant.comparison_revision.is_some() || !quiet_prerequisites {
+            self.reconcile_transport_history(&grant.inventory)
+                .await
+                .map_err(|error| {
                     ClassifiedSyncFailure::at_stage(
                         SyncSummary::default(),
                         error,
                         SyncFailureStage::Unknown,
                     )
-                })?,
-                Err(_) => {
-                    tracing::debug!(target:"marmot_app::recovery", method="execute_recovery_grant",
-                    "bounded comparison yielded with history demand pending")
-                }
-            }
-        }
+                })?
+        } else {
+            Vec::new()
+        };
         let (mut summary, verdict) = if let Some(control) = repair {
             self.drain_full_history_repair(counts, control).await?
         } else if quiet_prerequisites {
@@ -3955,6 +3998,44 @@ impl AppClient {
                     storage_sqlite::RecoveryScopeOutcome::Unavailable
                 }
             };
+            if let (Some(revision), Some(plan)) =
+                (grant.comparison_revision, &grant.comparison_plan)
+            {
+                use storage_sqlite::RecoveryComparisonOutcome as Comparison;
+                let outcomes = plan
+                    .routes
+                    .iter()
+                    .map(|scope| {
+                        let route = if scope.route_kind == 0 {
+                            TransportReconciliationRoute::Inbox
+                        } else {
+                            TransportReconciliationRoute::Group(
+                                scope.transport_group_id.expect("frozen comparison route"),
+                            )
+                        };
+                        let observed = comparison_outcomes
+                            .iter()
+                            .find(|(candidate, _)| *candidate == route)
+                            .map_or(Comparison::ServicedPartial, |(_, outcome)| *outcome);
+                        let observed = if counts.refused > 0 && observed != Comparison::Unsupported
+                        {
+                            Comparison::TransientFailure
+                        } else {
+                            observed
+                        };
+                        (scope.scope_id, observed)
+                    })
+                    .collect::<Vec<_>>();
+                let unsupported = (!outcomes.is_empty()
+                    && outcomes.iter().all(|(_, o)| *o == Comparison::Unsupported))
+                .then_some(self.adapter.recovery_comparison_capability_key());
+                storage.settle_recovery_comparison(
+                    revision,
+                    grant.reservation.attempt_serial,
+                    &outcomes,
+                    unsupported,
+                )?;
+            }
             for obligation in grant.plan().expect("validated executor grant") {
                 // A selected group can lack any executable route even though
                 // another obligation made the account ready. Preserve that

@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-18
+updated: 2026-09-23
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -215,3 +215,15 @@ Timer ticks and duplicate joins do not rearm it. New loss/policy evidence or a
 serialized explicit caller can authorize another bounded investigation, subject
 to the shared owner. Missing epoch/event input uses the capped durable retry policy;
 local convergence eligibility remains independent of that network cooldown.
+
+### Recovery comparison slot (#1992 amendment)
+
+Migration 0095 adds exactly one coalescing operational comparison row per account,
+sharing the existing recovery retry state. Its frozen descriptor and failed-route
+subset contain at most the existing four-route pass budget; no per-startup or
+per-attempt history accumulates. Receipts remain in the existing 16,384-item,
+30-day per-route inventory, and the active grant owns the bounded in-memory copy.
+Transiently failed selected routes stay pending; serviced or unattempted routes
+never erase unresolved coverage. Retained inventory may be narrower than older
+coverage debt. This adds no disk-cap claim for the previously approved unresolved
+loss-generation watermark exception.

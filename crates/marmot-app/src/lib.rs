@@ -1745,7 +1745,12 @@ impl MarmotApp {
         let mut client = AppClient {
             #[cfg(test)]
             test_recovery_evidence: None,
+            #[cfg(test)]
+            test_comparison_results: None,
+            #[cfg(test)]
+            test_comparison_delay: None,
             recovery_owner,
+            comparison_startup_requested: false,
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,

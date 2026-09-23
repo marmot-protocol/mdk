@@ -21,15 +21,12 @@ token 12 is outstanding. No production retirement guarantee was relaxed.
 
 ## Required completion matrix
 
-The combined run found an unresolved compatibility boundary: automatic recovery
-of late history below the cursor after cold restart. The owner currently parks
-that unprovable history as designed, which prevents the old bounded comparison
-from running on unchanged reopen. This is unfinished integration, not merely
-validation remaining. The other focused results below do not establish readiness.
-The user chose to preserve automatic recovery and requested the concrete bounded-
-comparison amendment in `account-recovery-incremental-comparison-proposal.md`. Its
-schema/runtime changes are specified but not implemented; all other architecture
-constraints remain in force.
+The approved bounded-comparison amendment is implemented in two checkpoints.
+The original automatic restart journeys now pass with their delivery and retained-
+inventory assertions preserved. Mixed outcomes, cancellation, shared pacing and
+unsupported capability have focused storage/runtime coverage. Combined readiness
+still requires the final complete affected-crate run and repository gates below;
+focused green results do not establish it.
 
 | Acceptance boundary | Implemented behavior and files | Acceptance evidence |
 | --- | --- | --- |
@@ -42,8 +39,8 @@ constraints remain in force.
 | Evidence and escalation | `client/epoch_stall.rs` has no replay authority; `client/recovery.rs` and storage `account_recovery/stall.rs` sample distinct qualified local observations; migration 0094 persists sample identity | `qualified_local_observations_escalate_without_replay_and_survive_reorg`; `qualified_stall_rejects_new_loss_route_and_inventory_changes`; `qualified_stall_transaction_failure_and_clock_rebase_never_forge_samples`; detector anti-spoofing suite |
 | Bounded state and investigation | Constant-memory loss snapshot; grant-owned admissions; completed known-event metadata reclaimed; unknown broad-history investigation quiesces with debt retained | `completed_known_event_metadata_waits_for_grant_release_then_is_reclaimed`; `unknown_history_is_bounded_while_epoch_input_remains_retryable`; storage loss snapshot/import tests; approved unresolved-watermark disk exception in runtime-state-bounds.md |
 | Populated migration and conservative mode | #1983/#1987 preserve old debt and atomic completion; one-obligation mode uses the same ledger/executor, including cross-grant loss acknowledgment | Populated/interrupted migration tests; `readiness_wait_and_mode_handoff_preserve_pending_state_and_retry_cost`; `conservative_grants_do_not_coalesce_or_buy_an_extra_retry`; conservative partial-proof/reopen/ack regressions |
-| Automatic below-floor recovery | **Failing / amendment specified, implementation pending:** parked incremental history suppresses the previous cold-restart comparison; `client/recovery.rs`, `client/sync.rs`, storage recovery records and the existing worker due tick are the concrete affected boundaries | `cold_restart_reconciles_backlog_below_since_floor`; `stalled_epoch_backfill_still_arms_after_route_reconciliation`; no assertion weakening or cooldown bypass accepted |
-| Combined readiness | **Blocked by the preceding behavior:** 2865/2868 passed on `3fcb8236`; the separate frozen-wake failure is fixed in the following focused checkpoint | Review findings fixed; full affected suite and final gates must pass after the remaining behavior is resolved |
+| Automatic recovery below the live cutoff, within inventory window | **Implemented / focused tests pass:** migration 0095 and the shared owner slot authorize bounded comparison independently of parked coverage. Runtime joins startup/catch-up once; mixed failures remain pending and the existing tick services them | `cold_restart_reconciles_backlog_below_since_floor`; `stalled_epoch_backfill_still_arms_after_route_reconciliation`; no assertion weakening or cooldown bypass accepted |
+| Combined readiness | **Final suite pending:** historical `3fcb8236` failures are preserved below; the corresponding focused journeys now pass | Run all affected crates, default-policy compatibility, simulator, doctests and `just fast-ci` on the final code before pushing |
 
 ## Source ownership and replacement inventory
 
@@ -83,7 +80,7 @@ constraints remain in force.
   into qualified coverage. Production escalation requires actual qualified evidence;
   the test backend's finite certificate is not a production capability claim.
 
-The 78-row `account-recovery-integration-tests.csv` maps removed/substantially
+The 80-row `account-recovery-integration-tests.csv` maps removed/substantially
 rewritten regressions to current tests and separates deliberate completion-policy
 changes from preserved delivery, cancellation, retry, cursor and stale-evidence
 assertions. The original checkpoint inventory is immutable historical evidence.
@@ -456,3 +453,36 @@ This is the first of the two agreed implementation checkpoints, not a completion
 claim. The unchanged `since_floor` runtime journeys remain unresolved until the
 second checkpoint. Full affected-crate suites and final repository checks remain
 required after that integration.
+
+## Amendment implementation — checkpoint 2
+
+Checkpoint 1 is signed `ffd8cd5429361c186c42ff9e446db1b0ff3f6de9`. Runtime
+startup and explicit catch-up now join the slot; ordinary polling, maintenance
+and reconnect preparation do not. The existing tick services pending work. Mixed
+route results retain the failed subset under shared pacing. An interrupted route
+remains retryable; unstarted routes retain coverage debt without a new sweep.
+Known absent SDK capability parks the slot, and an actual operational-capability
+change can rearm it without resetting cost. Frozen wake remains excluded.
+
+The original restart pair and unchanged frozen-cursor journey passed **3/3** in
+`comparison-runtime-journeys-three.log`. The epoch companion first reproduced an
+extra payload because a coalesced epoch goal widened startup acquisition. Frozen
+comparison bounds now govern that partial pass; the epoch goal stays pending.
+No delivery, durable-inventory or no-redownload assertion was relaxed. The test
+clock proves no reservation before the shared deadline, then advances elapsed
+time and waits for the existing automatic tick. Terminology now distinguishes
+the live subscription cutoff from the inventory retention/compaction floor.
+
+The final focused selection passed **37/37**, including mixed-route execution,
+activation cancellation, interrupted versus unstarted routes, repeated requests
+against unsupported capability, explicit full-history repair isolation, and all
+owner/comparison regressions. Log: `comparison-checkpoint-two-final.log`. A new
+duplicate-settlement assertion failed before the final guard was added, then
+passed. Explicit full-history repair excludes bounded comparison from its grant
+so an outstanding startup request cannot narrow its supported range.
+
+The 3/3 journey run predates the final duplicate-settlement, capability-observation
+and full-repair isolation guards; the 37/37 run includes them. Affected-crate
+clippy passed before those guards. All will be refreshed in the frozen complete
+stack run rather than treating earlier focused results as final acceptance.
+The two original restart tests add two rows to the replacement map (80 total).

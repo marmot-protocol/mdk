@@ -188,6 +188,7 @@ pub(crate) struct AttemptGrant {
     plan: Vec<GrantedObligation>,
     pub(super) comparison_revision: Option<u64>,
     pub(super) comparison_plan: Option<storage_sqlite::RecoveryComparisonPlan>,
+    pub(super) rotation_claim: Option<storage_sqlite::TransportReconciliationRoute>,
     pub(super) inventory: Vec<FrozenRecoveryInventory>,
     loss: Vec<GrantedLoss>,
     _live: Arc<()>,
@@ -306,7 +307,7 @@ impl AccountRecoveryOwner {
 
     /// Wall clock is sampled only on open. Later wall-clock corrections cannot
     /// repeatedly reopen the authorization gate within this process.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-policy-overrides"))]
     pub(crate) fn test_retry_remaining(&self, storage: &SqliteAccountStorage) -> Duration {
         Duration::from_millis(
             storage
@@ -323,7 +324,7 @@ impl AccountRecoveryOwner {
         self.wall_anchor_ms += self.test_retry_remaining(storage).as_millis() as u64;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-policy-overrides"))]
     pub(crate) fn test_advance_clock(&mut self, elapsed: Duration) {
         self.wall_anchor_ms += elapsed.as_millis() as u64;
     }
@@ -361,6 +362,9 @@ impl AccountRecoveryOwner {
         let mut fence = storage.recovery_eligible_revision_fence(immediate)?;
         let comparison = storage.recovery_comparison()?;
         let mut comparison_revision = (comparison.pending()
+            && !explicit
+                .as_ref()
+                .is_some_and(|permit| permit.full_history_requested)
             && (immediate
                 || comparison
                     .blocked_route_revision
@@ -464,6 +468,7 @@ impl AccountRecoveryOwner {
             plan: Vec::new(),
             comparison_revision,
             comparison_plan: None,
+            rotation_claim: None,
             inventory: Vec::new(),
             loss: Vec::new(),
             _live: live,
@@ -542,6 +547,9 @@ impl AccountRecoveryOwner {
                             StorageError::Serialization("missing comparison plan".into()).into(),
                         );
                     }
+                }
+                if let Some(route) = &grant.rotation_claim {
+                    storage.advance_transport_reconciliation_route_cursor(route)?;
                 }
                 Ok(frozen)
             });
@@ -658,6 +666,76 @@ impl From<StorageError> for FreezeError {
 }
 
 impl AppClient {
+    pub(super) fn comparison_route_goals(
+        &self,
+        until: u64,
+    ) -> Result<Vec<RecoveryScopePlan>, AppError> {
+        let routing = self.routing.snapshot();
+        let mut goals = Vec::new();
+        let mut push = |group_id: Option<Vec<u8>>,
+                        transport_group_id: Option<[u8; 32]>,
+                        endpoints: &[cgka_traits::TransportEndpoint]| {
+            let mut required = endpoints
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect::<Vec<_>>();
+            required.sort();
+            required.dedup();
+            goals.push(RecoveryScopePlan {
+                scope_id: goals.len() as u64,
+                route_kind: u8::from(group_id.is_some()),
+                route_role: 0,
+                group_id,
+                transport_group_id,
+                // This is the inventory window, distinct from the newer live
+                // subscription cutoff. Compaction can raise the actual floor.
+                since_seconds: Some(
+                    until.saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS),
+                ),
+                until_seconds: until,
+                known_event_id: None,
+                inventory_floor: None,
+                required_endpoints: required,
+                admitted_endpoints: self.adapter.recovery_admitted_endpoints(endpoints),
+            });
+        };
+        push(None, None, &routing.local_inbox_endpoints);
+        let mut routes = routing.group_routes.iter().collect::<Vec<_>>();
+        routes.sort_by(|a, b| {
+            a.group_id
+                .as_slice()
+                .cmp(b.group_id.as_slice())
+                .then(a.transport_group_id.cmp(&b.transport_group_id))
+        });
+        for route in routes {
+            let id = route
+                .transport_group_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| StorageError::Serialization("invalid comparison route".into()))?;
+            push(
+                Some(route.group_id.as_slice().to_vec()),
+                Some(id),
+                &route.endpoints,
+            );
+        }
+        Ok(goals)
+    }
+
+    pub(super) fn request_bounded_comparison(&mut self) -> Result<(), AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        drop(self.transport_receipts()?);
+        self.observe_recovery_route_policy()?;
+        let now = wall_now_ms()?;
+        let goals = self.comparison_route_goals(now / 1000)?;
+        storage.observe_recovery_comparison_capability(
+            self.adapter.recovery_comparison_capability_key(),
+        )?;
+        storage.join_recovery_comparison(&rand::random(), now, &goals)?;
+        Ok(())
+    }
+
     pub(super) async fn install_granted_post_join_subscriptions(
         &mut self,
         grant: &AttemptGrant,
@@ -1289,7 +1367,64 @@ impl AppClient {
                 });
             }
         }
-        let inventory = self.freeze_recovery_inventory(&mut goals)?;
+        let comparison = storage.recovery_comparison()?;
+        let mut comparison_goals = if grant.comparison_revision.is_some() {
+            self.comparison_route_goals(comparison.requested_until_seconds)?
+        } else {
+            Vec::new()
+        };
+        if let Some(prior) = comparison
+            .plan
+            .filter(|plan| plan.fence.route_revision == grant.fence.route_revision)
+            && !prior.retry_routes.is_empty()
+            && !comparison_goals.is_empty()
+        {
+            let retrying = comparison_goals
+                .iter()
+                .filter(|goal| {
+                    prior.routes.iter().any(|old| {
+                        prior.retry_routes.contains(&old.scope_id)
+                            && old.route_kind == goal.route_kind
+                            && old.transport_group_id == goal.transport_group_id
+                            && old.group_id == goal.group_id
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !retrying.is_empty() {
+                comparison_goals = retrying;
+            }
+        }
+        let (inventory, rotation_claim) = if grant.comparison_revision.is_some() {
+            self.freeze_recovery_inventory(&mut [([0; 16], comparison_goals.clone())])?
+        } else {
+            self.freeze_recovery_inventory(&mut goals)?
+        };
+        grant.rotation_claim = rotation_claim;
+        if grant.comparison_revision.is_some() {
+            let mut routes = Vec::new();
+            for item in &inventory {
+                if let Some(goal) = comparison_goals.iter().find(|goal| match item.route {
+                    storage_sqlite::TransportReconciliationRoute::Inbox => goal.route_kind == 0,
+                    storage_sqlite::TransportReconciliationRoute::Group(id) => {
+                        goal.transport_group_id == Some(id)
+                    }
+                }) {
+                    let mut goal = goal.clone();
+                    goal.since_seconds = Some(item.since);
+                    goal.until_seconds = item.until;
+                    goal.inventory_floor = Some(item.since);
+                    routes.push(goal);
+                }
+            }
+            routes.sort_by_key(|r| r.scope_id);
+            grant.comparison_plan = Some(storage_sqlite::RecoveryComparisonPlan {
+                fence: grant.fence.clone(),
+                live_since_seconds: self.subscription_rebuild_since()?.map(|t| t.0),
+                routes,
+                retry_routes: Vec::new(),
+            });
+        }
         let Some(mut grant) = self
             .recovery_owner
             .freeze_plan(&storage, grant, goals, explicit)?
@@ -1298,6 +1433,7 @@ impl AppClient {
                 StorageError::Backend("recovery plan changed before activation".into()).into(),
             );
         };
+
         grant.inventory = inventory;
         grant.loss = loss;
         Ok(Some(grant))
@@ -3634,6 +3770,348 @@ mod tests {
         assert!(!permit.spent);
         assert_eq!(storage.recovery_scope_snapshots(id).unwrap().len(), before);
         assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
+        assert!(storage.recovery_comparison().unwrap().pending());
+    }
+
+    #[tokio::test]
+    async fn comparison_runtime_retries_failed_route_without_reissuing_successful_sibling() {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        for mode in [
+            RecoveryExecutorMode::Normal,
+            RecoveryExecutorMode::Conservative,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            crate::AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_test_relay_client(relay.clone());
+            let _pump =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            let mut client = client_on_app_relay_plane(&app, "alice").await;
+            client.recovery_owner.select_executor_mode(mode);
+            client.create_group("comparison routes", &[]).await.unwrap();
+            client.request_bounded_comparison().unwrap();
+            let storage = app.account_storage("alice").unwrap();
+            let grant = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Startup,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(grant.inventory.len(), 2);
+            client.test_comparison_results = Some(
+                grant
+                    .inventory
+                    .iter()
+                    .map(|inventory| {
+                        Ok(Some(transport_nostr_adapter::NostrReconciliationSummary {
+                            relays_succeeded: 1,
+                            // Even one failed endpoint keeps the entire group route
+                            // retryable when the backend has only aggregate results.
+                            relays_failed: usize::from(matches!(
+                                inventory.route,
+                                storage_sqlite::TransportReconciliationRoute::Group(_)
+                            )),
+                            ..Default::default()
+                        }))
+                    })
+                    .collect(),
+            );
+            client
+                .execute_recovery_grant(grant, None, None)
+                .await
+                .unwrap();
+            assert!(client.test_comparison_results.as_ref().unwrap().is_empty());
+            let pending = storage.recovery_comparison().unwrap();
+            assert!(pending.pending());
+            let plan = pending.plan.unwrap();
+            assert_eq!(plan.retry_routes.len(), 1);
+            assert_eq!(
+                plan.routes
+                    .iter()
+                    .find(|r| r.scope_id == plan.retry_routes[0])
+                    .unwrap()
+                    .route_kind,
+                1
+            );
+            let cost = storage.recovery_retry_state().unwrap();
+            assert!(
+                client
+                    .authorize_account_recovery(
+                        None,
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(storage.recovery_retry_state().unwrap(), cost);
+            client.recovery_owner.test_advance_to_retry(&storage);
+            let retry = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                retry.inventory.len(),
+                1,
+                "successful inbox must not consume another route attempt"
+            );
+            assert!(matches!(
+                retry.inventory[0].route,
+                storage_sqlite::TransportReconciliationRoute::Group(_)
+            ));
+            client.test_comparison_results = Some(
+                [Ok(Some(
+                    transport_nostr_adapter::NostrReconciliationSummary {
+                        relays_succeeded: 1,
+                        ..Default::default()
+                    },
+                ))]
+                .into(),
+            );
+            client
+                .execute_recovery_grant(retry, None, None)
+                .await
+                .unwrap();
+            assert!(!storage.recovery_comparison().unwrap().pending());
+            assert!(
+                storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .any(
+                        |d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory
+                            && d.eligibility
+                                == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+                    )
+            );
+            let revision = storage.recovery_comparison().unwrap().revision;
+            let cost = storage.recovery_retry_state().unwrap();
+            for _ in 0..3 {
+                client
+                    .recovery_owner
+                    .test_advance_clock(Duration::from_secs(300));
+                client
+                    .sync_automatically_with_partial_progress()
+                    .await
+                    .unwrap();
+                client.prepare_transport().await.unwrap();
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                storage.recovery_comparison().unwrap().revision,
+                revision,
+                "ticks, reconnect preparation and polling cannot create a request"
+            );
+            assert_eq!(storage.recovery_retry_state().unwrap(), cost);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_comparison_executor_keeps_intent_cost_and_parked_coverage() {
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.request_bounded_comparison().unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let grant = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .unwrap();
+        let cost = storage.recovery_retry_state().unwrap();
+        let revision = grant.comparison_revision.unwrap();
+        relay.block_next_subscribe();
+        let mut execution = Box::pin(client.execute_recovery_grant(grant, None, None));
+        tokio::select! {
+            _ = relay.wait_for_blocked_subscribe() => {},
+            result = &mut execution => panic!("executor completed before cancellation: {}", result.is_ok()),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("activation did not reach cancellation boundary"),
+        }
+        drop(execution);
+        assert!(client.recovery_owner.active.upgrade().is_none());
+        let slot = storage.recovery_comparison().unwrap();
+        assert!(slot.pending());
+        assert_eq!(slot.revision, revision);
+        assert_eq!(storage.recovery_retry_state().unwrap(), cost);
+        assert!(
+            client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .all(|d| d.eligibility == storage_sqlite::RecoveryEligibility::NeedsDeepRepair)
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_comparison_backend_stays_parked_across_new_startup_requests() {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.request_bounded_comparison().unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let grant = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .unwrap();
+        client
+            .execute_recovery_grant(grant, None, None)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .recovery_comparison()
+                .unwrap()
+                .blocked_route_revision
+                .is_some()
+        );
+        let cost = storage.recovery_retry_state().unwrap();
+        for _ in 0..3 {
+            client
+                .recovery_owner
+                .test_advance_clock(Duration::from_secs(300));
+            client.request_bounded_comparison().unwrap();
+            assert!(
+                client
+                    .authorize_account_recovery(
+                        None,
+                        marmot_forensics::EpochBackfillExecutionSeam::Startup
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(storage.recovery_retry_state().unwrap(), cost);
+        assert!(storage.recovery_comparison().unwrap().pending());
+    }
+
+    #[tokio::test]
+    async fn comparison_quantum_keeps_interrupted_route_retryable_and_unattempted_coverage_pending()
+    {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.create_group("comparison budget", &[]).await.unwrap();
+        client.request_bounded_comparison().unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let grant = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.inventory.len(), 2);
+        let first = grant.inventory[0].route.clone();
+        client.test_comparison_results =
+            Some([Ok(Some(Default::default())), Ok(Some(Default::default()))].into());
+        client.test_comparison_delay = Some(Duration::from_secs(60));
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            client.execute_recovery_grant(grant, None, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let slot = storage.recovery_comparison().unwrap();
+        assert!(slot.pending());
+        let plan = slot.plan.unwrap();
+        assert_eq!(plan.retry_routes.len(), 1);
+        let retry = plan
+            .routes
+            .iter()
+            .find(|r| r.scope_id == plan.retry_routes[0])
+            .unwrap();
+        assert!(match first {
+            storage_sqlite::TransportReconciliationRoute::Inbox => retry.route_kind == 0,
+            storage_sqlite::TransportReconciliationRoute::Group(id) =>
+                retry.transport_group_id == Some(id),
+        });
+        assert_eq!(
+            client.test_comparison_results.as_ref().unwrap().len(),
+            2,
+            "the second route was never started"
+        );
+        let debt = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+            .unwrap();
+        assert_eq!(
+            storage
+                .recovery_scope_snapshots(debt.ticket.id)
+                .unwrap()
+                .len(),
+            2,
+            "unattempted route coverage cannot disappear"
+        );
+        assert_eq!(
+            debt.eligibility,
+            storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+        );
+    }
+
+    #[test]
+    fn explicit_full_history_keeps_its_range_when_comparison_is_pending() {
+        let (storage, mut owner, now) = fixture();
+        storage
+            .join_recovery_comparison(&[1; 16], 1_000_000, &[comparison_goal()])
+            .unwrap();
+        let mut permit = ExplicitRecoveryPermit::full_history();
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, Some(&mut permit))
+            .unwrap()
+            .unwrap();
+        assert!(
+            grant.comparison_revision.is_none(),
+            "bounded startup intent cannot narrow an explicit full repair"
+        );
+        assert!(!grant.fence.obligations.is_empty());
         assert!(storage.recovery_comparison().unwrap().pending());
     }
 }

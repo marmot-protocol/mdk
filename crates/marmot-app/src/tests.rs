@@ -739,7 +739,7 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn block_next_subscribe(&self) {
+    pub(crate) fn block_next_subscribe(&self) {
         self.block_next_subscribe
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -786,7 +786,7 @@ impl ScriptedPushRelayClient {
             .count()
     }
 
-    async fn wait_for_blocked_subscribe(&self) {
+    pub(crate) async fn wait_for_blocked_subscribe(&self) {
         self.subscribe_started.notified().await;
     }
 

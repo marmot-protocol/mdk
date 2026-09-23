@@ -334,7 +334,13 @@ pub struct AppClient {
     /// Never enabled by EOSE or by the production SDK adapter.
     #[cfg(test)]
     pub(crate) test_recovery_evidence: Option<recovery::TestRecoveryEvidence>,
+    #[cfg(test)]
+    pub(super) test_comparison_results:
+        Option<std::collections::VecDeque<sync::TestComparisonResult>>,
+    #[cfg(test)]
+    pub(super) test_comparison_delay: Option<std::time::Duration>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
+    pub(super) comparison_startup_requested: bool,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,

@@ -73,11 +73,10 @@ fn read(conn: &Connection) -> StorageResult<RecoveryComparison> {
 }
 
 fn validate_plan(plan: &RecoveryComparisonPlan) -> StorageResult<()> {
-    if plan.routes.is_empty()
-        || plan
-            .routes
-            .windows(2)
-            .any(|r| r[0].scope_id >= r[1].scope_id)
+    if plan
+        .routes
+        .windows(2)
+        .any(|r| r[0].scope_id >= r[1].scope_id)
         || plan.routes.iter().any(|r| {
             r.route_kind > 1
                 || r.since_seconds.is_none_or(|since| since > r.until_seconds)
@@ -277,7 +276,8 @@ impl SqliteAccountStorage {
             let conn = self.lock()?;
             let slot = read(&conn)?;
             let retry = retry_state(&conn)?;
-            if slot.frozen_revision != revision
+            if slot.settled_revision >= revision
+                || slot.frozen_revision != revision
                 || slot.attempt_serial != attempt
                 || attempt == 0
                 || retry.attempt_serial != attempt
@@ -317,7 +317,7 @@ impl SqliteAccountStorage {
             let conn = self.lock()?;
             let slot = read(&conn)?;
             let Some(mut frozen) = slot.plan else { return Ok(false); };
-            if attempt == 0 || slot.attempt_serial != attempt || slot.frozen_revision != revision
+            if slot.settled_revision >= revision || attempt == 0 || slot.attempt_serial != attempt || slot.frozen_revision != revision
                 || retry_state(&conn)?.attempt_serial != attempt
                 || !work_fence_matches(&revision_fence(&conn)?, &frozen.fence, true)
                 || !plan::no_unimported_loss(&conn)? { return Ok(false); }
@@ -475,6 +475,16 @@ mod tests {
             .unwrap()
         );
         assert!(!s.recovery_comparison().unwrap().pending());
+        assert!(
+            !s.settle_recovery_comparison(
+                revision,
+                next,
+                &[(1, RecoveryComparisonOutcome::TransientFailure)],
+                None
+            )
+            .unwrap(),
+            "a duplicate settlement cannot rewrite a serviced opportunity"
+        );
         let debt = s.pending_recovery_demands().unwrap();
         assert_eq!(debt.len(), 1);
         assert_eq!(debt[0].eligibility, RecoveryEligibility::NeedsDeepRepair);

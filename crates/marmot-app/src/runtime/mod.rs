@@ -1361,8 +1361,9 @@ impl MarmotAppRuntime {
         self.accounts.clone()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn advance_recovery_clock_for_test(&self, account: &str, elapsed: Duration) {
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub async fn advance_recovery_clock_for_test(&self, account: &str, elapsed: Duration) {
         let commands = self.accounts.worker_commands(account).await.unwrap();
         let (respond, response) = oneshot::channel();
         commands
@@ -1370,6 +1371,21 @@ impl MarmotAppRuntime {
             .await
             .unwrap();
         response.await.unwrap();
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub async fn recovery_retry_snapshot_for_test(
+        &self,
+        account: &str,
+    ) -> (storage_sqlite::RecoveryRetryState, Duration, bool) {
+        let commands = self.accounts.worker_commands(account).await.unwrap();
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::RecoveryRetrySnapshot { respond })
+            .await
+            .unwrap();
+        response.await.unwrap()
     }
 
     pub fn shared_services(&self) -> RuntimeSharedServices {

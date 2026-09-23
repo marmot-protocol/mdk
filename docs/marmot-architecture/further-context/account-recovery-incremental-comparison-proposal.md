@@ -131,8 +131,11 @@ with their first runtime consumer in #1992, not extracted into another storage P
 Normal mode may coalesce a comparison with eligible coverage in one reservation.
 A **comparison-only** grant uses the ordinary floored live subscription and the
 bounded set-comparison path; parked coverage cannot widen that activation to
-`since = None`. A legitimately selected broad recovery obligation can still
-require its own broader activation. Maintenance retains its existing limited
+`since = None`. When coalesced with comparison, a broad recovery goal receives only the frozen
+bounded investigation and remains pending unless independently qualified. Its goal
+cannot widen that pass's live cutoff. A subsequent coverage-only grant may still
+require its own broader activation under the shared pacing. This preserves the
+restart regressions without clearing epoch-gap debt to suppress traffic. Maintenance retains its existing limited
 boundary, session restoration and grace timing.
 
 Conservative mode selects one work item, treating the comparison slot as one item
