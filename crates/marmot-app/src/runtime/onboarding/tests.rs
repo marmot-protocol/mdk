@@ -240,14 +240,12 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
     let (_directory, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
     let pending = manager.onboarding_snapshot(&id).unwrap().unwrap();
-    let class =
-        SyncFailureClassification::new(SyncFailureStage::AccountWorker, SyncErrorClass::Storage);
     let now = tokio::time::Instant::now();
     manager
         .startup_retries
         .lock()
         .unwrap()
-        .fail(id.clone(), now, class);
+        .fail(id.clone(), now);
     assert!(
         manager
             .retry_onboarding_step(&id, OnboardingStep::Follows)
@@ -299,7 +297,7 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
         .startup_retries
         .lock()
         .unwrap()
-        .fail(id.clone(), now, class);
+        .fail(id.clone(), now);
     let changed = manager
         .set_onboarding_discovery_relays(&id, vec!["wss://alternate.example".into()])
         .await

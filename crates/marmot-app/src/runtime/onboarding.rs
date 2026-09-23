@@ -1150,10 +1150,7 @@ impl AccountManager {
             }
             Err(error) => return Err(error.into()),
         };
-        self.startup_retries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear(&snapshot.account_id_hex);
+        self.clear_startup_retry(&snapshot.account_id_hex);
         self.reconcile_locked_report()
             .await?
             .for_account(&snapshot.account_id_hex)?;
@@ -1214,10 +1211,7 @@ impl AccountManager {
             }
             Err(error) => return Err(error.into()),
         };
-        self.startup_retries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear(&snapshot.account_id_hex);
+        self.clear_startup_retry(&snapshot.account_id_hex);
         self.reconcile_locked_report()
             .await?
             .for_account(&snapshot.account_id_hex)?;

@@ -8,8 +8,6 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::SyncFailureClassification;
-
 const RETRY_BASE: Duration = Duration::from_secs(1);
 /// A failed worker is eligible again on the next trigger after at most 60 s.
 const RETRY_CAP: Duration = Duration::from_secs(60);
@@ -18,8 +16,6 @@ const RETRY_CAP: Duration = Duration::from_secs(60);
 pub(super) struct StartupFailure {
     failures: u32,
     retry_at: Instant,
-    #[allow(dead_code)]
-    classification: SyncFailureClassification,
 }
 
 #[derive(Default)]
@@ -34,12 +30,7 @@ impl WorkerStartupRetries {
             .is_none_or(|failure| now >= failure.retry_at)
     }
 
-    pub(super) fn fail(
-        &mut self,
-        account_id: String,
-        now: Instant,
-        classification: SyncFailureClassification,
-    ) {
+    pub(super) fn fail(&mut self, account_id: String, now: Instant) {
         let failures = self
             .failures
             .get(&account_id)
@@ -51,7 +42,6 @@ impl WorkerStartupRetries {
             StartupFailure {
                 failures,
                 retry_at: now + delay,
-                classification,
             },
         );
     }
@@ -81,19 +71,13 @@ impl WorkerStartupRetries {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SyncErrorClass, SyncFailureStage};
-
     #[test]
     fn retry_delay_is_per_account_capped_and_success_resets_it() {
         let mut retries = WorkerStartupRetries::default();
         let now = Instant::now();
-        let class = SyncFailureClassification::new(
-            SyncFailureStage::AccountWorker,
-            SyncErrorClass::StorageBusy,
-        );
         assert!(retries.allows("alice", now));
         for (attempt, expected_seconds) in [1, 2, 4, 8, 16, 32, 60, 60].into_iter().enumerate() {
-            retries.fail("alice".into(), now, class);
+            retries.fail("alice".into(), now);
             let deadline = now + Duration::from_secs(expected_seconds);
             assert!(
                 !retries.allows("alice", deadline - Duration::from_nanos(1)),
@@ -103,7 +87,7 @@ mod tests {
             assert!(retries.allows("bob", now));
         }
         retries.clear("alice");
-        retries.fail("alice".into(), now, class);
+        retries.fail("alice".into(), now);
         assert!(retries.allows("alice", now + Duration::from_secs(1)));
         assert!(!retries.allows("alice", now + Duration::from_millis(999)));
     }
@@ -112,12 +96,8 @@ mod tests {
     fn suppression_does_not_extend_an_accounts_deadline() {
         let mut retries = WorkerStartupRetries::default();
         let now = Instant::now();
-        let class = SyncFailureClassification::new(
-            SyncFailureStage::AccountWorker,
-            SyncErrorClass::Timeout,
-        );
-        retries.fail("alice".into(), now, class);
-        retries.fail("bob".into(), now + Duration::from_millis(500), class);
+        retries.fail("alice".into(), now);
+        retries.fail("bob".into(), now + Duration::from_millis(500));
         for _ in 0..100 {
             assert!(!retries.allows("alice", now + Duration::from_millis(999)));
         }
@@ -130,12 +110,8 @@ mod tests {
     fn ineligible_account_loses_old_failure_without_affecting_another() {
         let mut retries = WorkerStartupRetries::default();
         let now = Instant::now();
-        let class = SyncFailureClassification::new(
-            SyncFailureStage::AccountWorker,
-            SyncErrorClass::Storage,
-        );
-        retries.fail("alice".into(), now, class);
-        retries.fail("bob".into(), now, class);
+        retries.fail("alice".into(), now);
+        retries.fail("bob".into(), now);
         retries.retain_eligible(&["bob".to_owned()].into_iter().collect());
         assert!(retries.allows("alice", now));
         assert!(!retries.allows("bob", now));

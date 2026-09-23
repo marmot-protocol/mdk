@@ -2787,17 +2787,25 @@ async fn cancelled_startup_is_reaped() {
         worker.commands.clone()
     };
 
-    let retrying = manager.clone();
-    let mut lookup = tokio::spawn(async move { retrying.worker_commands("alice").await });
-    // Reaping must wait for the abandoned open to release its session guard.
-    let premature = timeout(Duration::from_millis(50), &mut lookup).await;
-    proceed.send(()).unwrap();
-    assert!(premature.is_err());
-    let commands = timeout(Duration::from_secs(10), lookup)
+    // A cancelled startup remains fenced without holding the global worker
+    // transaction while its old session is still open.
+    let premature = timeout(Duration::from_secs(1), manager.worker_commands("alice"))
         .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        .expect("lookup returns promptly")
+        .expect_err("abandoned open must not admit a replacement");
+    assert!(matches!(premature, AppError::BlockingTask(_)));
+    proceed.send(()).unwrap();
+    let commands = timeout(Duration::from_secs(10), async {
+        loop {
+            match manager.worker_commands("alice").await {
+                Ok(commands) => break commands,
+                Err(AppError::BlockingTask(_)) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected replacement error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("replacement opens after the old session releases");
     assert!(!commands.same_channel(&old_commands));
     assert!(manager.workers.lock().await[&account.account_id_hex].ready);
     runtime.shutdown().await;
@@ -2826,7 +2834,16 @@ async fn reconcile_failure_waits_for_sibling_and_preserves_its_session() {
     );
 
     alice_proceed.send(()).expect("release alice open result");
-    tokio::task::yield_now().await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if runtime.app_performance_snapshot().account_open.attempts == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Alice's failure is observed before Bob is released");
     assert!(
         !reconcile.is_finished(),
         "reconcile must consume Bob's pending readiness result"
@@ -3048,19 +3065,65 @@ async fn stuck_worker_reap_does_not_block_a_healthy_account() {
         .await
         .get(&bob.account_id_hex)
         .is_some_and(|w| w.ready);
-    release_tx.send(()).expect("release stuck worker");
     let error = outcome
-        .expect("cleanup budget must release the global transaction")
+        .expect("unrelated cleanup must not hold the global transaction")
         .expect_err("Alice remains fenced while her worker exits");
     assert!(matches!(error, AppError::BlockingTask(_)));
     assert!(
         bob_ready,
         "Bob must start while Alice's cleanup is unfinished"
     );
+    assert!(
+        timeout(Duration::from_secs(1), manager.reconcile())
+            .await
+            .expect("later reconcile must not wait for Alice's cleanup")
+            .is_err()
+    );
+    release_tx.send(()).expect("release stuck worker");
     manager
         .restart_account(&alice.account_id_hex)
         .await
         .expect("Alice starts after cleanup");
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deactivation_waits_for_worker_abort_before_committing_sign_out() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let alice = app
+        .account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app);
+    let manager = runtime.accounts();
+    let (shutdown, _shutdown_rx) = oneshot::channel();
+    let (commands, _commands_rx) = mpsc::channel(1);
+    manager.workers.lock().await.insert(
+        alice.account_id_hex.clone(),
+        ManagedAccountWorker {
+            ready: true,
+            handle: tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+            commands,
+            media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
+            shutdown,
+        },
+    );
+
+    timeout(Duration::from_secs(8), manager.deactivate_account("alice"))
+        .await
+        .expect("abort and reaper must finish after the worker's grace period")
+        .expect("ordinary slow shutdown must not fail deactivation");
+    assert!(manager.resolve("alice").unwrap().signed_out);
+    assert!(
+        !manager
+            .workers
+            .lock()
+            .await
+            .contains_key(&alice.account_id_hex)
+    );
     runtime.shutdown().await;
 }
 
@@ -3256,6 +3319,59 @@ async fn catch_up_does_not_retry_a_closed_worker_response() {
 
     assert!(matches!(error, AppError::TransportClosed));
     worker.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn catch_up_error_from_ready_account_takes_precedence_over_sibling_backoff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let alice = app
+        .account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let bob = app
+        .account_home()
+        .create_account("bob")
+        .expect("create bob");
+    let runtime = MarmotAppRuntime::new(app);
+    let manager = runtime.accounts();
+    {
+        let mut retries = manager.startup_retries.lock().unwrap();
+        retries.fail(alice.account_id_hex.clone(), tokio::time::Instant::now());
+        retries.extend_deadline_for_test(&alice.account_id_hex, Duration::from_secs(60));
+    }
+
+    let (shutdown, mut shutdown_rx) = oneshot::channel();
+    let (commands, mut receiver) = mpsc::channel(1);
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                command = receiver.recv() => match command {
+                    Some(AccountWorkerCommand::CatchUp { respond }) => drop(respond),
+                    Some(_) => panic!("unexpected worker command"),
+                    None => break,
+                }
+            }
+        }
+    });
+    manager.workers.lock().await.insert(
+        bob.account_id_hex,
+        ManagedAccountWorker {
+            ready: true,
+            handle,
+            commands,
+            media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
+            shutdown,
+        },
+    );
+
+    let error = manager
+        .catch_up_accounts()
+        .await
+        .expect_err("Bob's failed catch-up must surface");
+    assert!(matches!(error, AppError::TransportClosed));
+    runtime.shutdown().await;
 }
 
 #[test]

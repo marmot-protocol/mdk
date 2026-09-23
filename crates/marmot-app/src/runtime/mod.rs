@@ -5793,7 +5793,8 @@ impl AccountManager {
     }
 
     async fn finish_worker_reapers(&self) -> HashSet<String> {
-        let deadline = tokio::time::Instant::now() + APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT;
+        // Observe unrelated cleanup without making it hold the global worker
+        // transaction. An unfinished reaper still fences its own account.
         let reapers = self
             .worker_reapers
             .lock()
@@ -5801,14 +5802,10 @@ impl AccountManager {
             .clone();
         for reaper in reapers {
             let mut handle = reaper.handle.lock().await;
-            let completed = if handle.is_finished() {
+            let completed = handle.is_finished();
+            if completed {
                 let _ = (&mut *handle).await;
-                true
-            } else {
-                tokio::time::timeout_at(deadline, &mut *handle)
-                    .await
-                    .is_ok()
-            };
+            }
             drop(handle);
             if completed {
                 self.worker_reapers
@@ -5823,6 +5820,41 @@ impl AccountManager {
             .iter()
             .map(|reaper| reaper.account_id.clone())
             .collect()
+    }
+
+    async fn ensure_worker_reaped(&self, account_id: &str) -> Result<(), AppError> {
+        // The worker gets five seconds to stop gracefully, then aborts and
+        // releases its session guard. Give that abort a separate five-second
+        // margin, while keeping a truly uncooperative task fenced and tracked.
+        let deadline =
+            tokio::time::Instant::now() + APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT.saturating_mul(2);
+        let reapers = self
+            .worker_reapers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|reaper| reaper.account_id == account_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for reaper in reapers {
+            let mut handle = reaper.handle.lock().await;
+            if handle.is_finished() {
+                let _ = (&mut *handle).await;
+            } else if tokio::time::timeout_at(deadline, &mut *handle)
+                .await
+                .is_err()
+            {
+                return Err(AppError::BlockingTask(
+                    "account worker cleanup still in progress".into(),
+                ));
+            }
+            drop(handle);
+            self.worker_reapers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|tracked| !Arc::ptr_eq(&tracked.handle, &reaper.handle));
+        }
+        Ok(())
     }
 
     async fn finish_worker_reapers_unbounded(&self) {
@@ -5885,15 +5917,7 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
-        if self
-            .finish_worker_reapers()
-            .await
-            .contains(&account.account_id_hex)
-        {
-            return Err(AppError::BlockingTask(
-                "account worker cleanup still in progress".into(),
-            ));
-        }
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
         let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
         async {
             self.shared
@@ -5903,15 +5927,7 @@ impl AccountManager {
             let worker = self.workers.lock().await.remove(&account.account_id_hex);
             if let Some(worker) = worker {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
-                if self
-                    .finish_worker_reapers()
-                    .await
-                    .contains(&account.account_id_hex)
-                {
-                    return Err(AppError::BlockingTask(
-                        "account worker cleanup still in progress".into(),
-                    ));
-                }
+                self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
             // Evict every in-memory handle and warm flag for this label BEFORE
             // the account directory is deleted. Otherwise the cached account
@@ -5922,10 +5938,7 @@ impl AccountManager {
             self.app
                 .remove_account_key_package_artifacts(&account.label)?;
             self.app.account_home().remove_account(&account.label)?;
-            self.startup_retries
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clear(&account.account_id_hex);
+            self.clear_startup_retry(&account.account_id_hex);
             // The account no longer exists on this device, so the host callback
             // handle it registered must not outlive it. This runs only after
             // the removal commit point: a removal that failed leaves the
@@ -5999,29 +6012,13 @@ impl AccountManager {
             return Err(AppError::AccountSetupKeyPackageRecoveryAvailable);
         }
 
-        if self
-            .finish_worker_reapers()
-            .await
-            .contains(&account.account_id_hex)
-        {
-            return Err(AppError::BlockingTask(
-                "account worker cleanup still in progress".into(),
-            ));
-        }
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
 
         let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
         async {
             if let Some(worker) = self.workers.lock().await.remove(&account.account_id_hex) {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
-                if self
-                    .finish_worker_reapers()
-                    .await
-                    .contains(&account.account_id_hex)
-                {
-                    return Err(AppError::BlockingTask(
-                        "account worker cleanup still in progress".into(),
-                    ));
-                }
+                self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
             self.app.drop_account_caches(&account.label);
             self.app
@@ -6060,41 +6057,22 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
-        if self
-            .finish_worker_reapers()
-            .await
-            .contains(&account.account_id_hex)
-        {
-            return Err(AppError::BlockingTask(
-                "account worker cleanup still in progress".into(),
-            ));
-        }
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
         let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
         async {
+            let worker = self.workers.lock().await.remove(&account.account_id_hex);
+            if let Some(worker) = worker {
+                self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
+                self.ensure_worker_reaped(&account.account_id_hex).await?;
+            }
             self.app
                 .account_home()
                 .set_account_signed_out(&account.label, true)?;
-            self.startup_retries
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clear(&account.account_id_hex);
+            self.clear_startup_retry(&account.account_id_hex);
             self.shared
                 .attachment_permissions
                 .forget_account(&account.account_id_hex);
             self.shared.attachment_cancellations.send_modify(|_| {});
-            let worker = self.workers.lock().await.remove(&account.account_id_hex);
-            if let Some(worker) = worker {
-                self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
-                if self
-                    .finish_worker_reapers()
-                    .await
-                    .contains(&account.account_id_hex)
-                {
-                    return Err(AppError::BlockingTask(
-                        "account worker cleanup still in progress".into(),
-                    ));
-                }
-            }
             self.app.drop_account_caches(&account.label);
             Ok(())
         }
@@ -6141,10 +6119,7 @@ impl AccountManager {
             .app
             .account_home()
             .set_account_signed_out(account_ref, false)?;
-        self.startup_retries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear(&account.account_id_hex);
+        self.clear_startup_retry(&account.account_id_hex);
         self.reconcile_locked_report()
             .await?
             .for_account(&account.account_id_hex)?;
@@ -6190,6 +6165,10 @@ impl AccountManager {
 
     async fn reset_startup_retry(&self, account_id: &str) {
         let _worker_transaction = self.worker_transactions.lock().await;
+        self.clear_startup_retry(account_id);
+    }
+
+    fn clear_startup_retry(&self, account_id: &str) {
         self.startup_retries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6287,15 +6266,6 @@ impl AccountManager {
             {
                 let mut workers = self.workers.lock().await;
                 for account in pending {
-                    if pending_reapers.contains(&account.account_id_hex) {
-                        report.failures.insert(
-                            account.account_id_hex,
-                            AppError::BlockingTask(
-                                "account worker cleanup still in progress".into(),
-                            ),
-                        );
-                        continue;
-                    }
                     if workers.contains_key(&account.account_id_hex)
                         || self.account_is_tearing_down(&account.account_id_hex)
                     {
@@ -6316,6 +6286,15 @@ impl AccountManager {
                             account.account_id_hex,
                             AppError::BlockingTask(
                                 "account worker startup retry deferred by backoff".into(),
+                            ),
+                        );
+                        continue;
+                    }
+                    if pending_reapers.contains(&account.account_id_hex) {
+                        report.failures.insert(
+                            account.account_id_hex,
+                            AppError::BlockingTask(
+                                "account worker cleanup still in progress".into(),
                             ),
                         );
                         continue;
@@ -6420,18 +6399,11 @@ impl AccountManager {
                     self.startup_retries
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .fail(
-                            account_id.clone(),
-                            tokio::time::Instant::now(),
-                            classification.expect("failed worker has classification"),
-                        );
+                        .fail(account_id.clone(), tokio::time::Instant::now());
                     failed_account_ids.push(account_id.clone());
                     report.failures.insert(account_id, error);
                 } else {
-                    self.startup_retries
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clear(&account_id);
+                    self.clear_startup_retry(&account_id);
                 }
             }
             if !failed_account_ids.is_empty() {
@@ -6466,17 +6438,15 @@ impl AccountManager {
             .into_iter()
             .find(|account| account.account_id_hex == account_id_hex)
             .ok_or_else(|| AccountHomeError::UnknownAccount(account_id_hex.to_owned()))?;
-        self.startup_retries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear(&account.account_id_hex);
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
         let worker = self.workers.lock().await.remove(account_id_hex);
         if let Some(worker) = worker {
             // The worker owns the AppClient and its account-session guard.
             // Await teardown before reconcile opens the replacement.
             self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
-            let _ = self.finish_worker_reapers().await;
+            self.ensure_worker_reaped(&account.account_id_hex).await?;
         }
+        self.clear_startup_retry(&account.account_id_hex);
         self.reconcile_locked_report()
             .await?
             .for_account(&account.account_id_hex)
@@ -6494,8 +6464,8 @@ impl AccountManager {
             let commands = self.running_account_commands().await;
             let accounts_considered = commands.len();
             let catch_up_result = self.catch_up_account_commands(commands).await;
-            reconcile_result?;
             catch_up_result?;
+            reconcile_result?;
             Ok(CatchUpAccountsSummary {
                 accounts_considered,
             })
@@ -7298,10 +7268,7 @@ impl AccountManager {
             .await?;
         let account = self.resolve(account_ref)?;
         let _worker_transaction = self.worker_transactions.lock().await;
-        self.startup_retries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear(&account.account_id_hex);
+        self.clear_startup_retry(&account.account_id_hex);
         self.reconcile_locked_report()
             .await?
             .for_account(&account.account_id_hex)
