@@ -138,21 +138,23 @@ remain the host's responsibility, including removal of downstream copies after l
 ### Localization, privacy and diagnostics
 
 `record_host_performance` accepts 28 shared host stages for runtime/UI initialization,
-accounts, lists, profiles, timelines, message sending/search, media and preferences.
-For example, `MessageSend` measures host task execution, `ConversationSearch` finds
-conversations containing matching messages, and `MediaApply` installs prepared
-media in the UI; it does not publish to a relay. See the
-[operation definitions](../marmot-app/src/app_telemetry.rs)
-for boundaries. Record only stages your client can observe. Nested stages overlap
-and must not be summed. Ten `Linux*` stages retain vault startup/storage,
-post-presentation/idle-loop and catch-all worker measurements.
+accounts, lists, profiles, timelines, sending/search, media and preferences, plus
+nine Linux-specific vault/startup and event-loop stages. `MessageSend` covers host
+send task execution, including attachment work. `ConversationSearch` finds
+conversations containing matching messages. `MediaApply` installs prepared media
+in the UI; this is UI resource application, not network publication.
 
-Shared stages appear in `AppPerformanceSnapshotFfi` as `host_*` fields. The ten
-Linux-specific distributions remain available through Rust snapshots and OTLP.
-All 38 stages export unlabeled `app_host_*_duration_ms` histograms and
-`app_host_*_samples` counters through opt-in OTLP, including early/error returns,
-without success/failure series. Snapshot outcomes still reflect the supplied outcome.
-Regenerate Swift/Kotlin bindings and pair them with the matching native library.
+All stages are readable by their `host_*` operation name in the existing
+`AppPerformanceSnapshotFfi.runtime_operations` array, including the Linux stages.
+They use the runtime registry's `app_runtime_host_*` OTLP series with the same
+started/completed counters, five outcomes, histogram and live gauges. Hosts report
+the actual outcome; merely leaving a scope does not establish success. These
+completed-duration reports have no live observation, so their live gauges are zero.
+Record only stages your client can observe. Nested stages overlap and must not be
+summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
+[metric catalog](../../docs/marmot-architecture/telemetry.md#registered-host-stage-metrics).
+Regenerate Swift/Kotlin bindings with the matching library to adopt the new enum
+cases; the snapshot record fields and constructors are unchanged.
 
 Use typed presentation, capability, deletion and group-system fields rather than parsing English
 strings or guessing from membership counts. Clients localize fallback labels and system wording.

@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-10
+updated: 2026-09-23
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -297,9 +297,17 @@ sum phase percentiles or treat SDK projection and host render timings as a singl
 histograms are process-local, with no per-message correlation identifiers or persisted timing journal.
 
 OTLP host milestones use the closed `HostPerformanceOperation` enum without caller-supplied metric names or labels.
-For app-specific measurements such as inbox layout, image decoding, or navigation, use `record_host_timing` with a
-registered product event name. This consent-gated path sends duration buckets and outcomes to Aptabase; it does not
-add OTLP series or local app-performance snapshot fields. See the [registration example](usage-diagnostics.md#custom-host-timings).
+Reviewed stages such as `FrameLayout`, `MediaDecode` and `TimelineOpen` now also use this path: comparable host
+performance needs fixed-bucket distributions in local snapshots and opt-in OTLP, which `record_host_timing` does not
+provide. The stages are registered in `RuntimePerformanceOperation`, so their metrics and binding exposure follow
+the existing runtime registry. Shared and Linux-specific stages are all readable through `runtime_operations`; no
+per-stage snapshot fields or caller-defined names are added. See the [catalog](#registered-host-stage-metrics).
+
+For app-specific product measurements outside this reviewed list, continue using `record_host_timing` with a
+registered product event name. That separate consent-gated path sends duration buckets and outcomes to Aptabase;
+it does not add OTLP series or app-performance snapshot entries. See the
+[registration example](usage-diagnostics.md#custom-host-timings). Hosts must report the actual outcome in both paths,
+including early/error returns; do not report success merely because a scope exited.
 
 The `app_account_sync_failures` and `app_account_catch_up_failures` counters are the only app-performance metrics with
 metric attributes. Every failed attempt emits exactly one point in a bounded classification bucket:
@@ -660,6 +668,74 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 Current implementation note: publish telemetry is device-wide attempts/successes/failures. It is not currently
 per-relay or per-Nostr-kind, even though the relay observability design doc names those as desired future ranking
 signals.
+
+### Registered host-stage metrics
+
+The following 37 operations extend the existing runtime registry. Each is exposed as an entry in
+`AppPerformanceSnapshot.runtime_operations` and the corresponding UniFFI/C arrays, including all nine Linux stages.
+They are opt-in OTLP diagnostics under the same consent/export gate as other app-performance series.
+
+| Runtime operation name | Scope |
+| --- | --- |
+| `host_linux_startup_before_vault` | Linux-specific |
+| `host_linux_startup_after_vault` | Linux-specific |
+| `host_window_init` | Shared across clients |
+| `host_fonts_init` | Shared across clients |
+| `host_runtime_init` | Shared across clients |
+| `host_account_load` | Shared across clients |
+| `host_account_switch` | Shared across clients |
+| `host_frame_update` | Shared across clients |
+| `host_frame_layout` | Shared across clients |
+| `host_frame_draw` | Shared across clients |
+| `host_frame_present` | Shared across clients |
+| `host_linux_frame_post_present` | Linux-specific |
+| `host_linux_frame_until_present` | Linux-specific |
+| `host_linux_frame_idle_wait` | Linux-specific |
+| `host_chat_list_load` | Shared across clients |
+| `host_contacts_load` | Shared across clients |
+| `host_archived_chat_list_load` | Shared across clients |
+| `host_profile_load` | Shared across clients |
+| `host_profile_read` | Shared across clients |
+| `host_timeline_open` | Shared across clients |
+| `host_timeline_page` | Shared across clients |
+| `host_timeline_handoff` | Shared across clients |
+| `host_timeline_apply` | Shared across clients |
+| `host_message_send` | Shared across clients |
+| `host_message_search` | Shared across clients |
+| `host_conversation_search` | Shared across clients |
+| `host_media_queue_wait` | Shared across clients |
+| `host_media_prepare` | Shared across clients |
+| `host_media_load` | Shared across clients |
+| `host_media_cache_read` | Shared across clients |
+| `host_media_decode` | Shared across clients |
+| `host_media_apply` | Shared across clients |
+| `host_linux_vault_derive_key` | Linux-specific |
+| `host_linux_vault_open` | Linux-specific |
+| `host_linux_vault_create` | Linux-specific |
+| `host_linux_vault_persist` | Linux-specific |
+| `host_settings_save` | Shared across clients |
+
+For each operation `<op>` above, the registry generates these series with no metric attributes:
+
+| Metric | Type | Source in the runtime operation snapshot |
+| --- | --- | --- |
+| `app_runtime_<op>_started` | Counter | `started` |
+| `app_runtime_<op>_completed` | Counter | `completed` |
+| `app_runtime_<op>_successes` | Counter | `successes` |
+| `app_runtime_<op>_failures` | Counter | `failures` |
+| `app_runtime_<op>_cancelled` | Counter | `cancelled` |
+| `app_runtime_<op>_timeouts` | Counter | `timeouts` |
+| `app_runtime_<op>_not_ready` | Counter | `not_ready` (host outcome `Unavailable`) |
+| `app_runtime_<op>_duration_ms` | Histogram | `duration_ms` |
+| `app_runtime_<op>_in_flight` | Gauge | `in_flight` |
+| `app_runtime_<op>_oldest_tracked_in_flight_ms` | Gauge | `oldest_tracked_in_flight_ms` |
+| `app_runtime_<op>_untracked_in_flight` | Gauge | `untracked_in_flight` |
+
+`record_host_performance` supplies a completed duration, so each call increments both `started` and `completed`,
+records exactly one of the five outcomes, and adds one histogram observation. It does not create a live observation;
+the three live gauges stay zero for these host-reported stages. There is no separate `_samples` series.
+Snapshot and export outcomes agree. Hosts record only observable, applicable stages; nested stages overlap and
+must not be summed. See the [operation boundaries](../../crates/marmot-app/src/app_telemetry.rs).
 
 ### OTLP encoding
 

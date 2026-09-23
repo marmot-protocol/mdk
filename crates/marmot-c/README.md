@@ -43,15 +43,12 @@ nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
 The catalog includes C-only compatibility shims; prefer the v4 audit configuration
 setter and the composable runtime options constructor for new integrations.
 
-`marmot_record_host_performance` accepts shared host stages such as
-`MARMOT_HOST_PERFORMANCE_OPERATION_MESSAGE_SEND`, `CONVERSATION_SEARCH` and
-`MEDIA_APPLY` (with the same prefix). The 28 shared stages also appear as `host_*`
-fields in `MarmotAppPerformanceSnapshot`. Ten Linux-specific stages remain
-OTLP-only at the binding boundary. See the
-[diagnostics contract](../marmot-uniffi/README.md#localization-privacy-and-diagnostics).
-Existing operation values stay unchanged. The expanded snapshot changes the C
-record layout; rebuild consumers with matching headers and libraries and release
-snapshots with `marmot_app_performance_snapshot_free`.
+`marmot_record_host_performance` accepts 28 shared and nine Linux-specific host
+stages. Read all of them by their `host_*` operation name in the existing
+`MarmotAppPerformanceSnapshot.runtime_operations` array. The snapshot layout and
+existing operation values are unchanged. Adopt new operations with matching
+headers/libraries and free snapshots with `marmot_app_performance_snapshot_free`.
+See the [diagnostics contract](../marmot-uniffi/README.md#localization-privacy-and-diagnostics).
 
 ## What you get
 

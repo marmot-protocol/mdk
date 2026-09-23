@@ -32,7 +32,6 @@ pub enum HostPerformanceOperationFfi {
     TimelineHandoff,
     TimelineApply,
     MessageSend,
-    LinuxMessageOpWorker,
     MessageSearch,
     ConversationSearch,
     MediaQueueWait,
@@ -170,9 +169,10 @@ impl From<marmot_app::AppPerformanceOperationSnapshot> for AppPerformanceOperati
 /// Aggregate counters and fixed-bucket histograms per reviewed operation only:
 /// no account, group, message, relay, URL, pubkey, payload, or key material.
 ///
-/// The conversion exhaustively reviews `marmot_app::AppPerformanceSnapshot`.
-/// Shared host distributions cross this boundary. Linux-specific distributions
-/// are exported through OTLP only; adding a phase requires an explicit FFI decision.
+/// The field-per-operation layout is deliberate: it mirrors
+/// `marmot_app::AppPerformanceSnapshot` exactly, so adding a phase to the app
+/// telemetry fails this conversion's exhaustive struct literal until the FFI
+/// surface is reviewed and updated in lockstep.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AppPerformanceSnapshotFfi {
     pub runtime_operations: Vec<RuntimePerformanceSnapshotFfi>,
@@ -265,40 +265,14 @@ pub struct AppPerformanceSnapshotFfi {
     pub media_download_plaintext_verify: AppPerformanceOperationSnapshotFfi,
     pub host_splash_ready: AppPerformanceOperationSnapshotFfi,
     pub host_foreground_local_ready: AppPerformanceOperationSnapshotFfi,
-    pub host_window_init: AppPerformanceOperationSnapshotFfi,
-    pub host_fonts_init: AppPerformanceOperationSnapshotFfi,
-    pub host_runtime_init: AppPerformanceOperationSnapshotFfi,
-    pub host_account_load: AppPerformanceOperationSnapshotFfi,
-    pub host_account_switch: AppPerformanceOperationSnapshotFfi,
-    pub host_frame_update: AppPerformanceOperationSnapshotFfi,
-    pub host_frame_layout: AppPerformanceOperationSnapshotFfi,
-    pub host_frame_draw: AppPerformanceOperationSnapshotFfi,
-    pub host_frame_present: AppPerformanceOperationSnapshotFfi,
-    pub host_chat_list_load: AppPerformanceOperationSnapshotFfi,
-    pub host_contacts_load: AppPerformanceOperationSnapshotFfi,
-    pub host_archived_chat_list_load: AppPerformanceOperationSnapshotFfi,
-    pub host_profile_load: AppPerformanceOperationSnapshotFfi,
-    pub host_profile_read: AppPerformanceOperationSnapshotFfi,
-    pub host_timeline_open: AppPerformanceOperationSnapshotFfi,
-    pub host_timeline_page: AppPerformanceOperationSnapshotFfi,
-    pub host_timeline_handoff: AppPerformanceOperationSnapshotFfi,
-    pub host_timeline_apply: AppPerformanceOperationSnapshotFfi,
-    pub host_message_send: AppPerformanceOperationSnapshotFfi,
-    pub host_message_search: AppPerformanceOperationSnapshotFfi,
-    pub host_conversation_search: AppPerformanceOperationSnapshotFfi,
-    pub host_media_queue_wait: AppPerformanceOperationSnapshotFfi,
-    pub host_media_prepare: AppPerformanceOperationSnapshotFfi,
-    pub host_media_load: AppPerformanceOperationSnapshotFfi,
-    pub host_media_cache_read: AppPerformanceOperationSnapshotFfi,
-    pub host_media_decode: AppPerformanceOperationSnapshotFfi,
-    pub host_media_apply: AppPerformanceOperationSnapshotFfi,
-    pub host_settings_save: AppPerformanceOperationSnapshotFfi,
 }
 
 impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
     fn from(value: marmot_app::AppPerformanceSnapshot) -> Self {
         // Destructure the source with no `..` so a new
-        // `AppPerformanceSnapshot` field requires an explicit FFI decision.
+        // `AppPerformanceSnapshot` field fails compilation here — not just
+        // when the destination record is edited — until the FFI surface is
+        // reviewed and grows the same field in lockstep.
         let marmot_app::AppPerformanceSnapshot {
             runtime_operations,
             app_start,
@@ -383,45 +357,6 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             media_download_plaintext_verify,
             host_splash_ready,
             host_foreground_local_ready,
-            host_window_init,
-            host_fonts_init,
-            host_runtime_init,
-            host_account_load,
-            host_account_switch,
-            host_frame_update,
-            host_frame_layout,
-            host_frame_draw,
-            host_frame_present,
-            host_chat_list_load,
-            host_contacts_load,
-            host_archived_chat_list_load,
-            host_profile_load,
-            host_profile_read,
-            host_timeline_open,
-            host_timeline_page,
-            host_timeline_handoff,
-            host_timeline_apply,
-            host_message_send,
-            host_message_search,
-            host_conversation_search,
-            host_media_queue_wait,
-            host_media_prepare,
-            host_media_load,
-            host_media_cache_read,
-            host_media_decode,
-            host_media_apply,
-            host_settings_save,
-            // Linux-specific distributions remain available through Rust and OTLP.
-            host_linux_startup_before_vault: _,
-            host_linux_startup_after_vault: _,
-            host_linux_frame_post_present: _,
-            host_linux_frame_until_present: _,
-            host_linux_frame_idle_wait: _,
-            host_linux_message_op_worker: _,
-            host_linux_vault_derive_key: _,
-            host_linux_vault_open: _,
-            host_linux_vault_create: _,
-            host_linux_vault_persist: _,
         } = value;
         Self {
             runtime_operations: runtime_operations.into_iter().map(Into::into).collect(),
@@ -509,34 +444,6 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             media_download_plaintext_verify: media_download_plaintext_verify.into(),
             host_splash_ready: host_splash_ready.into(),
             host_foreground_local_ready: host_foreground_local_ready.into(),
-            host_window_init: host_window_init.into(),
-            host_fonts_init: host_fonts_init.into(),
-            host_runtime_init: host_runtime_init.into(),
-            host_account_load: host_account_load.into(),
-            host_account_switch: host_account_switch.into(),
-            host_frame_update: host_frame_update.into(),
-            host_frame_layout: host_frame_layout.into(),
-            host_frame_draw: host_frame_draw.into(),
-            host_frame_present: host_frame_present.into(),
-            host_chat_list_load: host_chat_list_load.into(),
-            host_contacts_load: host_contacts_load.into(),
-            host_archived_chat_list_load: host_archived_chat_list_load.into(),
-            host_profile_load: host_profile_load.into(),
-            host_profile_read: host_profile_read.into(),
-            host_timeline_open: host_timeline_open.into(),
-            host_timeline_page: host_timeline_page.into(),
-            host_timeline_handoff: host_timeline_handoff.into(),
-            host_timeline_apply: host_timeline_apply.into(),
-            host_message_send: host_message_send.into(),
-            host_message_search: host_message_search.into(),
-            host_conversation_search: host_conversation_search.into(),
-            host_media_queue_wait: host_media_queue_wait.into(),
-            host_media_prepare: host_media_prepare.into(),
-            host_media_load: host_media_load.into(),
-            host_media_cache_read: host_media_cache_read.into(),
-            host_media_decode: host_media_decode.into(),
-            host_media_apply: host_media_apply.into(),
-            host_settings_save: host_settings_save.into(),
         }
     }
 }
@@ -576,7 +483,6 @@ impl From<HostPerformanceOperationFfi> for marmot_app::HostPerformanceOperation 
             HostPerformanceOperationFfi::TimelineHandoff => Self::TimelineHandoff,
             HostPerformanceOperationFfi::TimelineApply => Self::TimelineApply,
             HostPerformanceOperationFfi::MessageSend => Self::MessageSend,
-            HostPerformanceOperationFfi::LinuxMessageOpWorker => Self::LinuxMessageOpWorker,
             HostPerformanceOperationFfi::MessageSearch => Self::MessageSearch,
             HostPerformanceOperationFfi::ConversationSearch => Self::ConversationSearch,
             HostPerformanceOperationFfi::MediaQueueWait => Self::MediaQueueWait,
@@ -668,39 +574,16 @@ mod tests {
     }
 
     #[test]
-    fn shared_host_stages_roundtrip() {
+    fn host_stages_cross_bindings() {
         let telemetry = marmot_app::AppPerformanceTelemetry::default();
-        let operations = [
-            HostPerformanceOperationFfi::WindowInit,
-            HostPerformanceOperationFfi::FontsInit,
-            HostPerformanceOperationFfi::RuntimeInit,
-            HostPerformanceOperationFfi::AccountLoad,
-            HostPerformanceOperationFfi::AccountSwitch,
-            HostPerformanceOperationFfi::FrameUpdate,
-            HostPerformanceOperationFfi::FrameLayout,
-            HostPerformanceOperationFfi::FrameDraw,
-            HostPerformanceOperationFfi::FramePresent,
-            HostPerformanceOperationFfi::ChatListLoad,
-            HostPerformanceOperationFfi::ContactsLoad,
-            HostPerformanceOperationFfi::ArchivedChatListLoad,
-            HostPerformanceOperationFfi::ProfileLoad,
-            HostPerformanceOperationFfi::ProfileRead,
-            HostPerformanceOperationFfi::TimelineOpen,
-            HostPerformanceOperationFfi::TimelinePage,
-            HostPerformanceOperationFfi::TimelineHandoff,
-            HostPerformanceOperationFfi::TimelineApply,
-            HostPerformanceOperationFfi::MessageSend,
-            HostPerformanceOperationFfi::MessageSearch,
-            HostPerformanceOperationFfi::ConversationSearch,
-            HostPerformanceOperationFfi::MediaQueueWait,
-            HostPerformanceOperationFfi::MediaPrepare,
-            HostPerformanceOperationFfi::MediaLoad,
-            HostPerformanceOperationFfi::MediaCacheRead,
-            HostPerformanceOperationFfi::MediaDecode,
-            HostPerformanceOperationFfi::MediaApply,
-            HostPerformanceOperationFfi::SettingsSave,
+        let stages = [
+            (HostPerformanceOperationFfi::MediaApply, "host_media_apply"),
+            (
+                HostPerformanceOperationFfi::LinuxVaultOpen,
+                "host_linux_vault_open",
+            ),
         ];
-        for (index, operation) in operations.into_iter().enumerate() {
+        for (index, (operation, _)) in stages.into_iter().enumerate() {
             telemetry.record_host_performance(
                 operation.into(),
                 Duration::from_millis(index as u64 + 1),
@@ -708,41 +591,13 @@ mod tests {
             );
         }
         let snapshot: AppPerformanceSnapshotFfi = telemetry.snapshot().into();
-        for (index, stage) in [
-            &snapshot.host_window_init,
-            &snapshot.host_fonts_init,
-            &snapshot.host_runtime_init,
-            &snapshot.host_account_load,
-            &snapshot.host_account_switch,
-            &snapshot.host_frame_update,
-            &snapshot.host_frame_layout,
-            &snapshot.host_frame_draw,
-            &snapshot.host_frame_present,
-            &snapshot.host_chat_list_load,
-            &snapshot.host_contacts_load,
-            &snapshot.host_archived_chat_list_load,
-            &snapshot.host_profile_load,
-            &snapshot.host_profile_read,
-            &snapshot.host_timeline_open,
-            &snapshot.host_timeline_page,
-            &snapshot.host_timeline_handoff,
-            &snapshot.host_timeline_apply,
-            &snapshot.host_message_send,
-            &snapshot.host_message_search,
-            &snapshot.host_conversation_search,
-            &snapshot.host_media_queue_wait,
-            &snapshot.host_media_prepare,
-            &snapshot.host_media_load,
-            &snapshot.host_media_cache_read,
-            &snapshot.host_media_decode,
-            &snapshot.host_media_apply,
-            &snapshot.host_settings_save,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            assert_eq!(stage.attempts, 1);
-            assert_eq!(stage.failures, 1);
+        for (index, (_, name)) in stages.into_iter().enumerate() {
+            let stage = snapshot
+                .runtime_operations
+                .iter()
+                .find(|s| s.operation == name)
+                .unwrap();
+            assert_eq!((stage.started, stage.completed, stage.failures), (1, 1, 1));
             assert_eq!(stage.duration_ms.sum_ms, index as u64 + 1);
         }
     }

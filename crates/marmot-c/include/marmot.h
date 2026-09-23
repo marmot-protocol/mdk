@@ -1035,7 +1035,6 @@ typedef enum MarmotHostPerformanceOperation {
   MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_HANDOFF,
   MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_APPLY,
   MARMOT_HOST_PERFORMANCE_OPERATION_MESSAGE_SEND,
-  MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_MESSAGE_OP_WORKER,
   MARMOT_HOST_PERFORMANCE_OPERATION_MESSAGE_SEARCH,
   MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_SEARCH,
   MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_QUEUE_WAIT,
@@ -4127,34 +4126,6 @@ typedef struct MarmotAppPerformanceSnapshot {
   struct MarmotAppPerformanceOperationSnapshot host_foreground_local_ready;
   struct MarmotRuntimePerformanceSnapshot *runtime_operations;
   uintptr_t runtime_operations_len;
-  struct MarmotAppPerformanceOperationSnapshot host_window_init;
-  struct MarmotAppPerformanceOperationSnapshot host_fonts_init;
-  struct MarmotAppPerformanceOperationSnapshot host_runtime_init;
-  struct MarmotAppPerformanceOperationSnapshot host_account_load;
-  struct MarmotAppPerformanceOperationSnapshot host_account_switch;
-  struct MarmotAppPerformanceOperationSnapshot host_frame_update;
-  struct MarmotAppPerformanceOperationSnapshot host_frame_layout;
-  struct MarmotAppPerformanceOperationSnapshot host_frame_draw;
-  struct MarmotAppPerformanceOperationSnapshot host_frame_present;
-  struct MarmotAppPerformanceOperationSnapshot host_chat_list_load;
-  struct MarmotAppPerformanceOperationSnapshot host_contacts_load;
-  struct MarmotAppPerformanceOperationSnapshot host_archived_chat_list_load;
-  struct MarmotAppPerformanceOperationSnapshot host_profile_load;
-  struct MarmotAppPerformanceOperationSnapshot host_profile_read;
-  struct MarmotAppPerformanceOperationSnapshot host_timeline_open;
-  struct MarmotAppPerformanceOperationSnapshot host_timeline_page;
-  struct MarmotAppPerformanceOperationSnapshot host_timeline_handoff;
-  struct MarmotAppPerformanceOperationSnapshot host_timeline_apply;
-  struct MarmotAppPerformanceOperationSnapshot host_message_send;
-  struct MarmotAppPerformanceOperationSnapshot host_message_search;
-  struct MarmotAppPerformanceOperationSnapshot host_conversation_search;
-  struct MarmotAppPerformanceOperationSnapshot host_media_queue_wait;
-  struct MarmotAppPerformanceOperationSnapshot host_media_prepare;
-  struct MarmotAppPerformanceOperationSnapshot host_media_load;
-  struct MarmotAppPerformanceOperationSnapshot host_media_cache_read;
-  struct MarmotAppPerformanceOperationSnapshot host_media_decode;
-  struct MarmotAppPerformanceOperationSnapshot host_media_apply;
-  struct MarmotAppPerformanceOperationSnapshot host_settings_save;
 } MarmotAppPerformanceSnapshot;
 
 typedef struct MarmotUsageDiagnosticsSettings {

@@ -876,176 +876,68 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
 }
 
 #[test]
-fn host_stage_metric_export() {
+fn host_stages_use_registry() {
     use crate::app_telemetry::{
-        AppPerformanceTelemetry, HostPerformanceOperation, HostPerformanceOutcome,
+        AppPerformanceTelemetry, HostPerformanceOperation as Host,
+        HostPerformanceOutcome as Outcome, RuntimePerformanceOperation as Op,
     };
     let telemetry = AppPerformanceTelemetry::default();
     let stages = [
         (
-            HostPerformanceOperation::LinuxStartupBeforeVault,
-            "app_host_linux_startup_before_vault_duration_ms",
+            Host::LinuxStartupBeforeVault,
+            Op::HostLinuxStartupBeforeVault,
         ),
-        (
-            HostPerformanceOperation::LinuxStartupAfterVault,
-            "app_host_linux_startup_after_vault_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::WindowInit,
-            "app_host_window_init_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::FontsInit,
-            "app_host_fonts_init_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::RuntimeInit,
-            "app_host_runtime_init_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::AccountLoad,
-            "app_host_account_load_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::AccountSwitch,
-            "app_host_account_switch_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::FrameUpdate,
-            "app_host_frame_update_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::FrameLayout,
-            "app_host_frame_layout_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::FrameDraw,
-            "app_host_frame_draw_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::FramePresent,
-            "app_host_frame_present_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::LinuxFramePostPresent,
-            "app_host_linux_frame_post_present_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::LinuxFrameUntilPresent,
-            "app_host_linux_frame_until_present_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::LinuxFrameIdleWait,
-            "app_host_linux_frame_idle_wait_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::ChatListLoad,
-            "app_host_chat_list_load_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::ContactsLoad,
-            "app_host_contacts_load_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::ArchivedChatListLoad,
-            "app_host_archived_chat_list_load_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::ProfileLoad,
-            "app_host_profile_load_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::ProfileRead,
-            "app_host_profile_read_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::TimelineOpen,
-            "app_host_timeline_open_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::TimelinePage,
-            "app_host_timeline_page_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::TimelineHandoff,
-            "app_host_timeline_handoff_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::TimelineApply,
-            "app_host_timeline_apply_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::MessageSend,
-            "app_host_message_send_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::LinuxMessageOpWorker,
-            "app_host_linux_message_op_worker_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::MessageSearch,
-            "app_host_message_search_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::ConversationSearch,
-            "app_host_conversation_search_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::MediaQueueWait,
-            "app_host_media_queue_wait_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::MediaPrepare,
-            "app_host_media_prepare_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::MediaLoad,
-            "app_host_media_load_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::MediaCacheRead,
-            "app_host_media_cache_read_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::MediaDecode,
-            "app_host_media_decode_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::MediaApply,
-            "app_host_media_apply_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::LinuxVaultDeriveKey,
-            "app_host_linux_vault_derive_key_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::LinuxVaultOpen,
-            "app_host_linux_vault_open_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::LinuxVaultCreate,
-            "app_host_linux_vault_create_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::LinuxVaultPersist,
-            "app_host_linux_vault_persist_duration_ms",
-        ),
-        (
-            HostPerformanceOperation::SettingsSave,
-            "app_host_settings_save_duration_ms",
-        ),
+        (Host::LinuxStartupAfterVault, Op::HostLinuxStartupAfterVault),
+        (Host::WindowInit, Op::HostWindowInit),
+        (Host::FontsInit, Op::HostFontsInit),
+        (Host::RuntimeInit, Op::HostRuntimeInit),
+        (Host::AccountLoad, Op::HostAccountLoad),
+        (Host::AccountSwitch, Op::HostAccountSwitch),
+        (Host::FrameUpdate, Op::HostFrameUpdate),
+        (Host::FrameLayout, Op::HostFrameLayout),
+        (Host::FrameDraw, Op::HostFrameDraw),
+        (Host::FramePresent, Op::HostFramePresent),
+        (Host::LinuxFramePostPresent, Op::HostLinuxFramePostPresent),
+        (Host::LinuxFrameUntilPresent, Op::HostLinuxFrameUntilPresent),
+        (Host::LinuxFrameIdleWait, Op::HostLinuxFrameIdleWait),
+        (Host::ChatListLoad, Op::HostChatListLoad),
+        (Host::ContactsLoad, Op::HostContactsLoad),
+        (Host::ArchivedChatListLoad, Op::HostArchivedChatListLoad),
+        (Host::ProfileLoad, Op::HostProfileLoad),
+        (Host::ProfileRead, Op::HostProfileRead),
+        (Host::TimelineOpen, Op::HostTimelineOpen),
+        (Host::TimelinePage, Op::HostTimelinePage),
+        (Host::TimelineHandoff, Op::HostTimelineHandoff),
+        (Host::TimelineApply, Op::HostTimelineApply),
+        (Host::MessageSend, Op::HostMessageSend),
+        (Host::MessageSearch, Op::HostMessageSearch),
+        (Host::ConversationSearch, Op::HostConversationSearch),
+        (Host::MediaQueueWait, Op::HostMediaQueueWait),
+        (Host::MediaPrepare, Op::HostMediaPrepare),
+        (Host::MediaLoad, Op::HostMediaLoad),
+        (Host::MediaCacheRead, Op::HostMediaCacheRead),
+        (Host::MediaDecode, Op::HostMediaDecode),
+        (Host::MediaApply, Op::HostMediaApply),
+        (Host::LinuxVaultDeriveKey, Op::HostLinuxVaultDeriveKey),
+        (Host::LinuxVaultOpen, Op::HostLinuxVaultOpen),
+        (Host::LinuxVaultCreate, Op::HostLinuxVaultCreate),
+        (Host::LinuxVaultPersist, Op::HostLinuxVaultPersist),
+        (Host::SettingsSave, Op::HostSettingsSave),
     ];
     for (index, (operation, _)) in stages.into_iter().enumerate() {
-        telemetry.record_host_performance(
-            operation,
-            std::time::Duration::from_millis(index as u64 + 3),
-            HostPerformanceOutcome::Success,
-        );
-        telemetry.record_host_performance(
-            operation,
-            std::time::Duration::from_millis(index as u64 + 7),
-            HostPerformanceOutcome::Failure,
-        );
+        for outcome in [
+            Outcome::Success,
+            Outcome::Failure,
+            Outcome::Cancelled,
+            Outcome::Timeout,
+            Outcome::Unavailable,
+        ] {
+            telemetry.record_host_performance(
+                operation,
+                std::time::Duration::from_millis(index as u64 + 1),
+                outcome,
+            );
+        }
     }
     let snapshot = telemetry.snapshot();
     let batch = build_export_batch_with_app_performance(
@@ -1053,28 +945,43 @@ fn host_stage_metric_export() {
         &RelayLabelResolution::default(),
         Some(&snapshot),
     );
-    for (index, (_, name)) in stages.into_iter().enumerate() {
-        assert_eq!(batch.points.iter().filter(|p| p.name == name).count(), 1);
-        let point = batch.points.iter().find(|p| p.name == name).unwrap();
-        assert!(point.relay.is_none() && point.failure.is_none());
-        let ExportMetricValue::Histogram(histogram) = &point.value else {
+    for (index, (_, operation)) in stages.into_iter().enumerate() {
+        let stage = snapshot
+            .runtime_operations
+            .iter()
+            .find(|s| s.operation == operation)
+            .unwrap();
+        assert_eq!((stage.started, stage.completed, stage.in_flight), (5, 5, 0));
+        assert_eq!(
+            [
+                stage.successes,
+                stage.failures,
+                stage.cancelled,
+                stage.timeouts,
+                stage.not_ready
+            ],
+            [1; 5]
+        );
+        let names = operation.metric_names();
+        for (name, expected) in names[..7].iter().zip([5, 5, 1, 1, 1, 1, 1]) {
+            let points: Vec<_> = batch.points.iter().filter(|p| p.name == *name).collect();
+            assert_eq!(points.len(), 1);
+            assert!(points[0].relay.is_none() && points[0].failure.is_none());
+            assert_eq!(points[0].value, ExportMetricValue::Counter(expected));
+        }
+        let histogram = batch.points.iter().find(|p| p.name == names[7]).unwrap();
+        assert!(histogram.relay.is_none() && histogram.failure.is_none());
+        let ExportMetricValue::Histogram(histogram) = &histogram.value else {
             panic!("expected histogram")
         };
-        assert_eq!(histogram.sum_ms, index as u64 * 2 + 10);
+        assert_eq!(histogram.sum_ms, (index as u64 + 1) * 5);
         assert_eq!(
             histogram.bucket_counts.iter().sum::<u64>() + histogram.overflow_count,
-            2
+            5
         );
-        let prefix = name.strip_suffix("_duration_ms").unwrap();
-        assert!(!batch.points.iter().any(|p| {
-            p.name == format!("{prefix}_successes") || p.name == format!("{prefix}_failures")
-        }));
-        let samples = name.replace("_duration_ms", "_samples");
-        assert!(
-            batch
-                .points
-                .iter()
-                .any(|p| p.name == samples && p.value == ExportMetricValue::Counter(2))
-        );
+        for name in &names[8..] {
+            let point = batch.points.iter().find(|p| p.name == *name).unwrap();
+            assert_eq!(point.value, ExportMetricValue::Gauge(0.0));
+        }
     }
 }
