@@ -103,6 +103,16 @@ async fn set_transport_signer_arms_the_sdk_client_for_nip42_auth() {
         sdk.client().signer().await.is_ok(),
         "the transport client must hold a signer to answer NIP-42 AUTH"
     );
+    let directory_client = plane
+        .inner
+        .transport
+        .directory_client
+        .as_ref()
+        .expect("sdk-backed plane has an anonymous directory client");
+    assert!(
+        directory_client.signer().await.is_err(),
+        "directory queries must never borrow the transport signer's credentials"
+    );
 }
 
 #[test]
@@ -300,13 +310,9 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
     let _ = notifications.send(RelayPoolNotification::Shutdown);
     let _ = notifications.send(RelayPoolNotification::Shutdown);
 
-    let outcome = run_relay_notification_consumer(
-        receiver,
-        relay_plane.inner.transport.adapter.clone(),
-        relay_plane.inner.transport.directory_events.clone(),
-        relay_plane.inner.directory.clone(),
-    )
-    .await;
+    let outcome =
+        run_relay_notification_consumer(receiver, relay_plane.inner.transport.adapter.clone())
+            .await;
 
     assert_eq!(
         outcome.exit,
@@ -317,8 +323,6 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
     let resumed = run_relay_notification_consumer(
         outcome.receiver,
         relay_plane.inner.transport.adapter.clone(),
-        relay_plane.inner.transport.directory_events.clone(),
-        relay_plane.inner.directory.clone(),
     )
     .await;
     assert_eq!(
@@ -329,7 +333,7 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
 }
 
 #[tokio::test]
-async fn notification_recovery_closes_account_delivery_and_signals_directory_rebuild() {
+async fn notification_recovery_closes_only_account_delivery() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account = MemberId::new(vec![0xA1; 32]);
@@ -349,10 +353,12 @@ async fn notification_recovery_closes_account_delivery_and_signals_directory_reb
             .is_none(),
         "closing the producer must drive the account worker into its existing reconnect path"
     );
-    assert!(matches!(
-        directory_events.recv().await,
-        Ok(DirectoryRelayPlaneEvent::RecoveryRequired)
-    ));
+    assert!(
+        timeout(Duration::from_millis(20), directory_events.recv())
+            .await
+            .is_err(),
+        "account receiver loss must not invalidate the independent directory receiver"
+    );
 
     let health = relay_plane
         .inner
@@ -521,11 +527,8 @@ async fn notification_supervisor_restarts_after_consumer_panic() {
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account_adapter = relay_plane.account_adapter(MemberId::new(vec![0xA1; 32]), relay);
     let source = Arc::new(TestNotificationSource::panic_once());
-    let supervisor = spawn_relay_notification_supervisor(
-        source.clone(),
-        relay_plane.inner.transport.clone(),
-        relay_plane.inner.directory.clone(),
-    );
+    let supervisor =
+        spawn_relay_notification_supervisor(source.clone(), relay_plane.inner.transport.clone());
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -1757,15 +1760,27 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
     let sdk_subscriptions = relay_plane
         .inner
         .transport
-        .sdk_relay_client
+        .directory_client
         .as_ref()
         .unwrap()
-        .client()
         .subscriptions()
         .await;
     assert!(
         sdk_subscriptions.contains_key(&SubscriptionId::new(subscription_id.clone())),
         "the first SDK subscription must be live before the later batch fails"
+    );
+    assert!(
+        !relay_plane
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .unwrap()
+            .client()
+            .subscriptions()
+            .await
+            .contains_key(&SubscriptionId::new(subscription_id.clone())),
+        "directory read filters must never be installed on the account transport client"
     );
     assert!(
         relay_plane
@@ -1774,6 +1789,36 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
             .accepts_live_event(&subscription_id, &author, 0)
             .await,
         "the validation filter must be committed for every live SDK subscription"
+    );
+
+    relay_plane
+        .sync_directory_user_subscriptions(
+            DirectorySyncPlan {
+                endpoints: Vec::new(),
+                watched_user_count: 0,
+                batches: Vec::new(),
+            },
+            false,
+        )
+        .await
+        .expect("empty plan removes stale directory interests");
+    assert!(
+        !relay_plane
+            .inner
+            .transport
+            .directory_client
+            .as_ref()
+            .unwrap()
+            .subscriptions()
+            .await
+            .contains_key(&SubscriptionId::new(subscription_id.clone()))
+    );
+    assert!(
+        !relay_plane
+            .inner
+            .directory
+            .accepts_live_event(&subscription_id, &author, 0)
+            .await
     );
 
     relay_plane.shutdown().await;
@@ -1938,11 +1983,8 @@ async fn supervised_notification_lag_recovers_later_inbound_exactly_once() {
         .unwrap();
 
     let source = Arc::new(TestNotificationSource::lag_once());
-    let supervisor = spawn_relay_notification_supervisor(
-        source.clone(),
-        relay_plane.inner.transport.clone(),
-        relay_plane.inner.directory.clone(),
-    );
+    let supervisor =
+        spawn_relay_notification_supervisor(source.clone(), relay_plane.inner.transport.clone());
 
     timeout(Duration::from_secs(2), async {
         while relay_plane

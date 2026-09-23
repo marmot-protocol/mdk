@@ -479,7 +479,7 @@ impl DirectoryRelayPlane {
 // Public directory reads have no account signer. An optional NIP-42
 // challenge must not trigger a failed authentication attempt that
 // closes the SDK's active fetch before its events arrive.
-fn anonymous_directory_client() -> NostrSdkClient {
+pub(super) fn anonymous_directory_client() -> NostrSdkClient {
     NostrSdkClient::builder()
         .opts(nostr_sdk::ClientOptions::new().automatic_authentication(false))
         .build()
