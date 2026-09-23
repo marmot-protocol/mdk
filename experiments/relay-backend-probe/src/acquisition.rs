@@ -23,6 +23,7 @@ enum RequestEnd {
     ReceiverClosed,
     AuthenticationFailed,
     Rejected,
+    RelayClosed,
     SetupFailed,
 }
 
@@ -51,6 +52,7 @@ impl BatchEvidence {
             AcquisitionEnd::ReceiverClosed => RequestEnd::ReceiverClosed,
             AcquisitionEnd::AuthenticationFailed => RequestEnd::AuthenticationFailed,
             AcquisitionEnd::Rejected(_) => RequestEnd::Rejected,
+            AcquisitionEnd::RelayClosed(_) => RequestEnd::RelayClosed,
             AcquisitionEnd::Failed(_) => RequestEnd::SetupFailed,
         };
         Self {

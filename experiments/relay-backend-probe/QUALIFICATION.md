@@ -7,7 +7,7 @@ fork SDK. It is an opt-in Cargo workspace. MDK's production dependency graph,
 recovery owner, scheduler, peeler, schema, and bindings are not changed here.
 Only loopback WebSocket relays and synthetic signed events are used.
 The qualified SDK integration revision is
-`53a3fa447068bdd010606cd368d4ccad456eb761`.
+`0efbb4ee20cd2d48ff9ffc19d307ec5a3658d6b9`.
 
 The test-only `CandidateRelay` implements the existing `NostrRelayClient`
 subscription and publication seam, and the test activates accounts through
@@ -53,6 +53,7 @@ mean durable MDK admission or complete historical coverage.
 | `Cancelled` / `TimedOut` | `Cancelled` / `TimedOut` | Incomplete, preserve partial events. |
 | `Disconnected` / `ReceiveLoss` / `ReceiverClosed` | Corresponding typed values | Incomplete; loss count is receiver-local, not unique events. |
 | `AuthenticationFailed` / `Rejected` / `Failed` | `AuthenticationFailed` / `Rejected` / `SetupFailed` | Incomplete; no string matching. |
+| `RelayClosed` | `RelayClosed` | An unprefixed CLOSED interrupted this request; incomplete even if the relay sent EOSE before a grace interval elapsed. |
 
 The existing production `NostrRelayClient` trait has no acquisition or
 notification-gap method. The projection is therefore a proposed adapter
@@ -143,3 +144,8 @@ replacement starts. The legacy fetch and stream await paths preserve partial
 results on timeout and disconnect; their reporting variants retain typed
 terminal outcomes. The active MDK regression passed twelve consecutive local
 runs at this final SDK pin.
+
+The final SDK review fix keeps an early unprefixed `CLOSED` distinct from
+policy completion and reports rejected negentropy download batches as failed
+while retaining partial reconciliation evidence. The probe maps `RelayClosed`
+without treating it as durable admission or historical coverage.
