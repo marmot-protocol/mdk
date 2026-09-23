@@ -7,7 +7,7 @@ fork SDK. It is an opt-in Cargo workspace. MDK's production dependency graph,
 recovery owner, scheduler, peeler, schema, and bindings are not changed here.
 Only loopback WebSocket relays and synthetic signed events are used.
 The qualified SDK integration revision is
-`26a42e043474860fb0b0dbc1eb4ab34bc2c661fb`.
+`5a5dafa85aa4ce7842afc4614b34c7a493d346f3`.
 
 The test-only `CandidateRelay` implements the existing `NostrRelayClient`
 subscription and publication seam, and the test activates accounts through
