@@ -946,8 +946,29 @@ impl MarmotApp {
     /// orphaned. A missing file is treated as success.
     pub(crate) fn remove_audit_log_file(&self, path: &Path) -> Result<(), AppError> {
         // This lower-level entry point is also used outside the runtime's
-        // async deletion path. Keep its removal fenced as well.
-        let _mutation = self.audit_export_lifecycle.mutate_all();
+        // async deletion path. Fence the owning account even when its file
+        // is already missing; fall back to a global fence if ownership is
+        // uncertain.
+        let owner = path
+            .parent()
+            .and_then(|parent| fs::canonicalize(parent).ok())
+            .and_then(|parent| {
+                self.account_home()
+                    .accounts()
+                    .ok()?
+                    .into_iter()
+                    .find_map(|account| {
+                        (fs::canonicalize(self.account_dir(&account.label))
+                            .ok()
+                            .as_deref()
+                            == Some(parent.as_path()))
+                        .then_some(account.account_id_hex)
+                    })
+            });
+        let _mutation = match owner {
+            Some(account) => self.audit_export_lifecycle.mutate_account(&account),
+            None => self.audit_export_lifecycle.mutate_all(),
+        };
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),

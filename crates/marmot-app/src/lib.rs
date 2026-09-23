@@ -5360,10 +5360,6 @@ impl MarmotApp {
     /// error is returned once all of them have been closed.
     pub fn close_storage(&self) -> Result<(), AppError> {
         let started_at = Instant::now();
-        // Cancel export completions at the start of direct app close too.
-        // A local admission already running may finish first; HTTP never holds
-        // that admission and cannot delay the storage writer below.
-        self.audit_export_lifecycle.invalidate_all();
         // Exclusive for the whole teardown. The `storage_closed` flag alone
         // would not make this atomic: two concurrent closes could interleave so
         // that one released the root lease and returned while the other was
@@ -5378,7 +5374,6 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
-        self.audit_export_lifecycle.invalidate_all();
         self.presentation_signals.catalog_changed();
         let mut first_error = None;
         let mut closed = 0usize;

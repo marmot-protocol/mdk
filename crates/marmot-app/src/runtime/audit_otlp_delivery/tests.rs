@@ -136,37 +136,6 @@ async fn request_or_completed<T: std::fmt::Debug>(
     }
 }
 
-#[test]
-fn presend_recheck_rejects_a_changed_prepared_source() {
-    let f = Fixture::new();
-    let account = f.app.account_home().account("alice").unwrap();
-    let attempt = f
-        .app
-        .audit_export_lifecycle
-        .reserve(&account.account_id_hex, DEST)
-        .unwrap();
-    let active = f.app.audit_delivery_active_path(&account.label).unwrap();
-    let state_dir = f
-        .app
-        .account_dir(&account.label)
-        .join("audit-otlp-delivery");
-    let Preparation::Batch(batch) = LocalAuditDelivery::open(&active, &state_dir, DEST)
-        .unwrap()
-        .prepare_once()
-        .unwrap()
-    else {
-        panic!("real recorder should yield a prepared batch");
-    };
-    assert!(prepared_batch_still_matches(&f.app, &account.label, &attempt, &batch).unwrap());
-
-    let original = std::fs::read_to_string(&active).unwrap();
-    let changed = original.replace("one original body", "one replaced body");
-    assert_ne!(changed, original);
-    assert_eq!(changed.len(), original.len());
-    std::fs::write(&active, changed).unwrap();
-    assert!(!prepared_batch_still_matches(&f.app, &account.label, &attempt, &batch).unwrap());
-}
-
 #[tokio::test]
 async fn real_recorder_exact_bodies_success_and_partial_block() {
     let f = Fixture::new();
@@ -471,6 +440,37 @@ async fn runtime_delete_direct_delete_and_account_removal_cancel_late_success() 
 }
 
 #[tokio::test]
+async fn deleting_one_account_file_does_not_cancel_another_account() {
+    let f = Fixture::new();
+    f.app.account_home().create_account("bob").unwrap();
+    let recorder = f.app.build_audit_recorder("bob", true);
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "bob's body".into(),
+        },
+    ));
+    drop(recorder);
+
+    let (endpoint, observed, release, server) = held_receiver(200).await;
+    let sender = test_sender(endpoint);
+    let runtime = f.runtime.clone();
+    let mut task =
+        tokio::spawn(async move { runtime.send_audit_otlp_once("bob", &sender).await.unwrap() });
+    request_or_completed(observed, &mut task).await;
+    f.app.remove_audit_log_file(&f.active).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(
+        task.await.unwrap(),
+        AuditOtlpAttemptOutcome::Sent {
+            receiver: AuditOtlpSendResult::Complete,
+            local: Some(DeliveryStep::Accepted),
+        }
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn terminal_close_releases_root_before_stalled_http_and_late_success_cannot_finish() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(200).await;
@@ -506,6 +506,33 @@ async fn terminal_close_releases_root_before_stalled_http_and_late_success_canno
     server.await.unwrap();
     assert_eq!(f.cursor(), prepared);
     replacement.close_storage().unwrap();
+}
+
+#[tokio::test]
+async fn direct_app_close_rejects_a_late_response() {
+    let f = Fixture::new();
+    let (endpoint, observed, release, server) = held_receiver(200).await;
+    let sender = test_sender(endpoint);
+    let runtime = f.runtime.clone();
+    let mut task = tokio::spawn(async move {
+        runtime
+            .send_audit_otlp_once("alice", &sender)
+            .await
+            .unwrap()
+    });
+    request_or_completed(observed, &mut task).await;
+    let prepared = f.cursor();
+    f.app.close_storage().unwrap();
+    release.send(()).unwrap();
+    assert_eq!(
+        task.await.unwrap(),
+        AuditOtlpAttemptOutcome::Sent {
+            receiver: AuditOtlpSendResult::Complete,
+            local: None,
+        }
+    );
+    server.await.unwrap();
+    assert_eq!(f.cursor(), prepared);
 }
 
 #[tokio::test]

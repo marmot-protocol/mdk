@@ -1,8 +1,6 @@
 //! One explicit audit export attempt. No scheduler or native activation.
 
-use marmot_forensics::local_delivery::{
-    DeliveryBatch, DeliveryStep, LocalAuditDelivery, Preparation,
-};
+use marmot_forensics::local_delivery::{DeliveryStep, LocalAuditDelivery, Preparation};
 
 use crate::audit_otlp_sender::{AuditOtlpSendResult, AuditOtlpSender};
 use crate::{AppError, MarmotApp};
@@ -87,14 +85,10 @@ impl MarmotAppRuntime {
             let lifecycle = lifecycle.clone();
             let account_id = account_id.clone();
             let account_label = account_label.clone();
-            let expected = batch.clone();
             move || {
                 let live = app
                     .with_audit_export_admission(&attempt, || {
-                        if !check_live(&app, &lifecycle, &account_id, &account_label)? {
-                            return Ok(false);
-                        }
-                        prepared_batch_still_matches(&app, &account_label, &attempt, &expected)
+                        check_live(&app, &lifecycle, &account_id, &account_label)
                     })?
                     .unwrap_or(false);
                 Ok((attempt, live))
@@ -142,18 +136,6 @@ impl MarmotAppRuntime {
         };
         Ok(AuditOtlpAttemptOutcome::Sent { receiver, local })
     }
-}
-
-fn prepared_batch_still_matches(
-    app: &MarmotApp,
-    account_label: &str,
-    attempt: &crate::audit_export_lifecycle::AuditExportAttempt,
-    expected: &DeliveryBatch,
-) -> Result<bool, AppError> {
-    let active = app.audit_delivery_active_path(account_label)?;
-    let state_dir = app.account_dir(account_label).join("audit-otlp-delivery");
-    let mut owner = LocalAuditDelivery::open(active, state_dir, attempt.destination())?;
-    Ok(matches!(owner.prepare_once()?, Preparation::Batch(current) if current == *expected))
 }
 
 fn check_live(

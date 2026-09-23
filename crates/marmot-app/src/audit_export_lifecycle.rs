@@ -1,7 +1,7 @@
 //! Process-local admission for explicit audit export attempts.
 //!
-//! Only local prepare/finish work holds `storage_lifecycle` and this mutex.
-//! The in-flight reservation is just an identity: HTTP owns no local guard.
+//! Local prepare/finish holds `storage_lifecycle` and the account's local-work
+//! gate. The in-flight reservation is just an identity: HTTP owns no guard.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,7 @@ struct State {
 struct AccountState {
     active: Option<Active>,
     blocks: usize,
+    local_work: Arc<Mutex<()>>,
 }
 
 struct Active {
@@ -80,41 +81,43 @@ impl AuditExportLifecycle {
         attempt: &AuditExportAttempt,
         work: impl FnOnce() -> T,
     ) -> Option<T> {
+        let local_work = {
+            let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            let account = state.accounts.get(&attempt.account)?;
+            if !state.allows(attempt) {
+                return None;
+            }
+            account.local_work.clone()
+        };
+        let _local_work = local_work.lock().unwrap_or_else(|p| p.into_inner());
         let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        let active = state.accounts.get(&attempt.account)?.active.as_ref()?;
-        if state.global_blocks > 0
-            || active.id != attempt.id
-            || !active.valid
-            || active.destination != attempt.destination
-        {
+        if !state.allows(attempt) {
             return None;
         }
-        // Serialize local work with consent and deletion mutations. This is
-        // never called around a network request.
+        drop(state);
+        // Hold only this account's local-work gate across file and database
+        // I/O. Global state is never locked while the closure runs.
         Some(work())
-    }
-
-    pub(crate) fn invalidate_all(&self) {
-        self.invalidate_all_with(|| ());
-    }
-
-    pub(crate) fn invalidate_all_with<T>(&self, action: impl FnOnce() -> T) -> T {
-        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        for account in state.accounts.values_mut() {
-            if let Some(active) = &mut account.active {
-                active.valid = false;
-            }
-        }
-        action()
     }
 
     pub(crate) fn mutate_all(&self) -> AuditExportMutation {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         state.global_blocks += 1;
-        for account in state.accounts.values_mut() {
-            if let Some(active) = &mut account.active {
-                active.valid = false;
-            }
+        let local_work = state
+            .accounts
+            .values_mut()
+            .map(|account| {
+                if let Some(active) = &mut account.active {
+                    active.valid = false;
+                }
+                account.local_work.clone()
+            })
+            .collect::<Vec<_>>();
+        drop(state);
+        // No admitted prepare/finish can still be mutating a cursor when the
+        // caller proceeds to change global recording consent.
+        for gate in local_work {
+            drop(gate.lock().unwrap_or_else(|p| p.into_inner()));
         }
         AuditExportMutation {
             lifecycle: self.clone(),
@@ -129,10 +132,29 @@ impl AuditExportLifecycle {
         if let Some(active) = &mut entry.active {
             active.valid = false;
         }
+        let local_work = entry.local_work.clone();
+        drop(state);
+        // The blocker is already visible to new admissions. Drain only this
+        // account's admitted local work before destructive mutation begins.
+        drop(local_work.lock().unwrap_or_else(|p| p.into_inner()));
         AuditExportMutation {
             lifecycle: self.clone(),
             account: Some(account.to_owned()),
         }
+    }
+}
+
+impl State {
+    fn allows(&self, attempt: &AuditExportAttempt) -> bool {
+        self.global_blocks == 0
+            && self.accounts.get(&attempt.account).is_some_and(|account| {
+                account.blocks == 0
+                    && account.active.as_ref().is_some_and(|active| {
+                        active.id == attempt.id
+                            && active.valid
+                            && active.destination == attempt.destination
+                    })
+            })
     }
 }
 
