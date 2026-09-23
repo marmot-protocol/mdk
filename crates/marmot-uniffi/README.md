@@ -511,9 +511,10 @@ Imported identities can use the durable preflight API instead of `login`:
 4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
    a proposal. Recommended relays append missing defaults to the observed list,
-   preserving every original relay tag, including private-network, onion,
+   preserving every original relay tag, including private-network, `ws://` and `wss://` onion,
    retired, and unparseable entries. Dial policy filters connections, not published
-   declarations. Defaults are deduplicated against raw tags, including unknown roles.
+   declarations. Both onion schemes require a Tor transport and are excluded from direct dialing.
+   Defaults are deduplicated against raw tags, including unknown roles.
    If every default already has a read-only or unknown role, the general-relay step
    offers explicit editing instead of recommending an append that cannot add a write route.
    Relay findings are advisory once a usable outbox/inbox route is

@@ -683,9 +683,13 @@ async fn defaults_preserve_relay_tags() {
             vec![
                 vec!["r".into(), "ws://read.onion".into(), "read".into()],
                 vec!["r".into(), "ws://write.onion".into(), "write".into()],
+                vec!["r".into(), "wss://secure.onion".into(), "write".into()],
             ]
         } else {
-            vec![vec!["relay".into(), "ws://inbox.onion".into()]]
+            vec![
+                vec!["relay".into(), "ws://inbox.onion".into()],
+                vec!["relay".into(), "wss://inbox.onion".into()],
+            ]
         };
         let tag_name = if step == OnboardingStep::Relays {
             "r"
@@ -934,6 +938,7 @@ async fn proposal_requires_route() {
         manager.save_onboarding(&mut c).unwrap();
         for unsupported in [
             "ws://relay.onion",
+            "wss://relay.onion",
             "wss://100.64.0.2",
             "wss://relay.nostr.band",
         ] {

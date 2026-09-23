@@ -1571,7 +1571,7 @@ impl AccountManager {
         let mut seen = HashSet::new();
         for c in classifications {
             // Retain Tor declarations, but never send them to the direct dialer.
-            if is_plaintext_onion(&c.endpoint) {
+            if is_onion_relay(&c.endpoint) {
                 continue;
             }
             let issue = match c.policy {
@@ -1775,7 +1775,7 @@ impl AccountManager {
                 .filter_map(|t| t.get(1).cloned())
                 .collect();
             for classified in self.app.relay_plane.classify_relay_endpoints(raw) {
-                if is_plaintext_onion(&classified.endpoint) {
+                if is_onion_relay(&classified.endpoint) {
                     continue;
                 }
                 let issue = match classified.policy {
@@ -1912,31 +1912,31 @@ impl AccountManager {
             .chain(&write_relays)
             .cloned()
             .collect::<Vec<_>>();
-        if all.is_empty()
-            || (!c.append_relays
-                && (all.iter().collect::<HashSet<_>>().len() > MAX_RELAYS
-                    || all
-                        .iter()
-                        .any(|relay| nostr::RelayUrl::parse(relay).is_err())
-                    || self
-                        .app
-                        .relay_plane
-                        .classify_relay_endpoints(all.clone())
-                        .iter()
-                        .any(|v| v.policy != RelayEndpointPolicy::Allowed)))
-            || (step == OnboardingStep::Relays && write_relays.is_empty())
-            || (step == OnboardingStep::InboxRelays && !write_relays.is_empty())
-            || self
-                .app
-                .relay_plane
-                .classify_relay_endpoints(if step == OnboardingStep::Relays {
-                    write_relays.clone()
-                } else {
-                    read_relays.clone()
-                })
-                .iter()
-                .all(|v| v.policy != RelayEndpointPolicy::Allowed)
-        {
+        let invalid_selection = !c.append_relays
+            && (all.iter().collect::<HashSet<_>>().len() > MAX_RELAYS
+                || all
+                    .iter()
+                    .any(|relay| nostr::RelayUrl::parse(relay).is_err())
+                || self
+                    .app
+                    .relay_plane
+                    .classify_relay_endpoints(all.clone())
+                    .iter()
+                    .any(|v| v.policy != RelayEndpointPolicy::Allowed));
+        let invalid_roles = (step == OnboardingStep::Relays && write_relays.is_empty())
+            || (step == OnboardingStep::InboxRelays && !write_relays.is_empty());
+        let routes = if step == OnboardingStep::Relays {
+            &write_relays
+        } else {
+            &read_relays
+        };
+        let has_route = self
+            .app
+            .relay_plane
+            .classify_relay_endpoints(routes.clone())
+            .iter()
+            .any(|v| v.policy == RelayEndpointPolicy::Allowed);
+        if all.is_empty() || invalid_selection || invalid_roles || !has_route {
             return Err(onboarding_error());
         }
         c.snapshot.proposal = Some(OnboardingRepairProposal {
@@ -2294,9 +2294,12 @@ impl AccountManager {
 }
 
 // A published declaration can retain Tor endpoints even without a Tor transport.
-fn is_plaintext_onion(endpoint: &str) -> bool {
+fn is_onion_relay(endpoint: &str) -> bool {
     url::Url::parse(endpoint).is_ok_and(|url| {
-        url.scheme() == "ws" && url.domain().is_some_and(|host| host.ends_with(".onion"))
+        matches!(url.scheme(), "ws" | "wss")
+            && url
+                .domain()
+                .is_some_and(|host| host.trim_end_matches('.').ends_with(".onion"))
     })
 }
 

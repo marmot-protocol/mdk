@@ -222,7 +222,7 @@ impl RelaySafetyPolicy {
 /// endpoints arrive from signed routing components and relay-list events, so a
 /// poisoned record must not steer the relay pool at internal services (SSRF;
 /// see `docs/marmot-architecture/overview/dial-safety.md`). A `wss://` DOMAIN
-/// host is accepted here: nostr-sdk owns DNS resolution and the WebSocket, so
+/// host other than `.onion` is accepted here: nostr-sdk owns DNS resolution and the WebSocket, so
 /// resolve-time validation cannot be pinned at this layer — an accepted LOW
 /// residual, per the dial-safety note. Error strings stay URL-free.
 fn reject_unsafe_relay_host(url: &RelayUrl, allow_loopback: bool) -> Result<(), String> {
@@ -236,6 +236,7 @@ enum RelayEndpointRejection {
     PlaintextPublic,
     NonPublicAddress,
     Localhost,
+    TorRequired,
 }
 
 impl RelayEndpointRejection {
@@ -243,9 +244,10 @@ impl RelayEndpointRejection {
         match self {
             Self::Invalid => RelayEndpointPolicy::Invalid,
             Self::Retired => RelayEndpointPolicy::Retired,
-            Self::PlaintextPublic | Self::NonPublicAddress | Self::Localhost => {
-                RelayEndpointPolicy::Unsafe
-            }
+            Self::PlaintextPublic
+            | Self::NonPublicAddress
+            | Self::Localhost
+            | Self::TorRequired => RelayEndpointPolicy::Unsafe,
         }
     }
 
@@ -258,6 +260,7 @@ impl RelayEndpointRejection {
             }
             Self::NonPublicAddress => "relay endpoint host is not a public address",
             Self::Localhost => "relay endpoint host must not be localhost",
+            Self::TorRequired => "onion relay endpoints require a Tor transport",
         }
     }
 }
@@ -281,6 +284,9 @@ fn evaluate_relay_url(url: &RelayUrl, allow_loopback: bool) -> Result<(), RelayE
         Host::Ipv6(addr) => reject_non_public_ip(IpAddr::V6(addr), allow_loopback)
             .map_err(|_| RelayEndpointRejection::NonPublicAddress),
         Host::Domain(domain) => {
+            if domain.trim_end_matches('.').ends_with(".onion") {
+                return Err(RelayEndpointRejection::TorRequired);
+            }
             if is_loopback_host(Host::Domain(domain)) && !allow_loopback {
                 return Err(RelayEndpointRejection::Localhost);
             }
@@ -501,6 +507,40 @@ mod tests {
                     .sanitize_endpoints(endpoints(&[url]), "test")
                     .is_err(),
                 "{url} must stay rejected even with the dev opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn onion_relays_require_tor() {
+        for policy in [
+            RelaySafetyPolicy::default(),
+            RelaySafetyPolicy::with_allow_loopback(true),
+        ] {
+            for url in [
+                "ws://relay.onion",
+                "wss://relay.onion",
+                "wss://RELAY.ONION.",
+            ] {
+                assert_eq!(
+                    policy.classify_endpoint(url.into()).policy,
+                    RelayEndpointPolicy::Unsafe
+                );
+                assert!(
+                    policy
+                        .sanitize_endpoints(endpoints(&[url]), "test")
+                        .is_err()
+                );
+                assert!(
+                    policy
+                        .retain_safe_endpoints(endpoints(&[url]), "test")
+                        .is_empty()
+                );
+            }
+            assert!(
+                policy
+                    .sanitize_endpoints(endpoints(&["wss://relay.onion.example"]), "test")
+                    .is_ok()
             );
         }
     }
