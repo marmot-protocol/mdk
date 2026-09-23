@@ -1399,7 +1399,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(single.fence.obligations.len(), 1);
-        assert_eq!(single.mode, RecoveryExecutorMode::Conservative);
+        assert_eq!(owner.mode, RecoveryExecutorMode::Conservative);
         drop(single);
         assert!(owner.select_executor_mode(RecoveryExecutorMode::Normal));
         assert!(
