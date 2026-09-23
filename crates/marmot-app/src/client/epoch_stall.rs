@@ -119,7 +119,7 @@ pub(crate) const EPOCH_STALL_BACKFILL_THRESHOLD: usize = 8;
 /// raw transport id, so a flood costs a sender nothing), and a saturated cap
 /// answers `ResourceRefused` to the account-wide replay's own fetch for the
 /// group too. That refusal lands in the drain's refused set, so
-/// `rearm_refused_groups` (historical test fixture) clears the very latch the arm
+/// `clear_suppression_for_test` (historical test fixture) clears the very latch the arm
 /// just set, and the next refusal takes the counted
 /// [`GroupStall::arm`] branch instead of the paced one. A flood therefore walks
 /// a group to this threshold in a run of retry backoffs rather than a run of
@@ -577,7 +577,7 @@ impl GroupStall {
     /// Whether this group may spend a paced re-arm now.
     ///
     /// `armed_at_epoch == Some(self.epoch)` is load-bearing:
-    /// `mark_replayed` (historical test fixture) latches `fired_at_epoch` for every
+    /// `seed_suppression_for_test` (historical test fixture) latches `fired_at_epoch` for every
     /// tracked group without setting `armed_at_epoch`, so without this conjunct
     /// a group that never armed would re-arm out of another group's replay
     /// suppression.
@@ -658,14 +658,6 @@ impl EpochStallDetector {
         self
     }
 
-    /// Select the qualified local-observation reporting threshold instead of
-    /// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
-    #[cfg(test)]
-    pub(crate) fn with_fruitless_completion_threshold(mut self, threshold: u32) -> Self {
-        self.fruitless_completion_threshold = threshold;
-        self
-    }
-
     /// The distinct-undecryptable count at which this detector arms a backfill.
     /// Reported on the `epoch_stall_backfill_armed` audit row so the row is
     /// honest even when the detector was built with a non-default threshold
@@ -698,35 +690,16 @@ impl EpochStallDetector {
     /// once cost one replay, not N. A group re-arms only when its epoch advances
     /// and it stalls again at the new epoch.
     #[cfg(test)]
-    pub(crate) fn mark_replayed(&mut self) {
+    pub(crate) fn seed_suppression_for_test(&mut self) {
         for stall in self.groups.values_mut() {
             stall.fired_at_epoch = Some(stall.epoch);
         }
     }
 
-    /// Clear the replay-suppression latch for the groups a completed replay
-    /// fetched history for and could not retain.
-    ///
-    /// Withholding `mark_replayed` (historical test fixture) on a fruitless replay re-arms
-    /// *bystanders* only. It cannot re-arm the group that caused the replay:
-    /// that group latched `fired_at_epoch` itself in [`GroupStall::arm`], which
-    /// writes the same value `mark_replayed` would have. Nothing else clears it
-    /// — [`GroupStall::observe_epoch`] clears only on a *different* epoch, and
-    /// the epoch cannot move without the very commit the replay failed to
-    /// retain. So without this, one fruitless replay permanently ends automatic
-    /// repair for that group: the refused object is neither marked seen nor
-    /// allowed past the relay `since` floor, and the armed backfill is the only
-    /// automatic path that re-serves it.
-    ///
-    /// Scoped to the refusals *this* drain counted rather than swept
-    /// account-wide: a group the replay refused nothing for learned nothing from
-    /// it, and clearing its latch would re-arm on evidence that does not exist.
-    ///
-    /// The run itself is untouched — `armed_at_epoch`, `arms` and `escalated`
-    /// all survive — so a group that keeps re-arming still escalates exactly
-    /// once per unrecovered run rather than restarting its count.
+    /// Historical projection fixture: clearing suppression represents a
+    /// newly observed refusal. Production retry eligibility belongs to SQL.
     #[cfg(test)]
-    pub(crate) fn rearm_refused_groups(&mut self, groups: &HashSet<GroupId>) {
+    pub(crate) fn clear_suppression_for_test(&mut self, groups: &HashSet<GroupId>) {
         for group_id in groups {
             if let Some(stall) = self.groups.get_mut(group_id) {
                 stall.fired_at_epoch = None;
@@ -1348,7 +1321,7 @@ mod tests {
 
         // Storm-collapse suppression covers tracked groups only, so a first arm
         // surviving it proves the passage created no entry to suppress.
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
         assert_eq!(
             detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(14), T0),
             BackfillDecision::Arm,
@@ -1461,7 +1434,7 @@ mod tests {
             detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
             BackfillDecision::Skip
         );
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
 
         // A passage the device already made, re-reported: no movement at all.
         detector.observe_epoch_passage(&g, EpochId(8), EpochId(10));
@@ -1511,7 +1484,7 @@ mod tests {
             BackfillDecision::Arm
         );
         let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e, T0);
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
 
         // B stalls at the next two epochs. Its run starts at the first of those
         // arms: the suppression it inherited was never a repair attempt of its
@@ -1599,40 +1572,6 @@ mod tests {
             detector
                 .observe_resource_refusal(g, EpochId(20), T0)
                 .arms_backfill()
-        );
-    }
-
-    #[test]
-    fn mark_replayed_collapses_a_storm_of_simultaneously_stuck_groups() {
-        let mut detector = stall_detector(3);
-        let a = group(0x0A);
-        let b = group(0x0B);
-        let e = EpochId(19);
-
-        // Group A crosses the threshold and the caller runs ONE account-wide
-        // replay (which re-fetches every group's history, B included).
-        let _ = detector.observe_undecryptable(a.clone(), "a1".into(), e, T0);
-        let _ = detector.observe_undecryptable(a.clone(), "a2".into(), e, T0);
-        assert!(
-            detector
-                .observe_undecryptable(a.clone(), "a3".into(), e, T0)
-                .arms_backfill()
-        );
-
-        // Group B was accumulating undecryptables at the same epoch in the same
-        // drain but had not yet crossed the threshold.
-        let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e, T0);
-        let _ = detector.observe_undecryptable(b.clone(), "b2".into(), e, T0);
-
-        detector.mark_replayed();
-
-        // B crossing the threshold after the replay must NOT trigger a second
-        // one: the single replay already covered it.
-        assert!(
-            !detector
-                .observe_undecryptable(b.clone(), "b3".into(), e, T0)
-                .arms_backfill(),
-            "one account-wide replay should cover every stuck group at this epoch"
         );
     }
 
@@ -1893,7 +1832,7 @@ mod tests {
         let mut detector = EpochStallDetector::new(2, 3).with_wedge_rearm_interval_ms(HOUR_MS);
         let g = group(0x01);
         let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
 
         assert_eq!(
             detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0 + HOUR_MS * 5),
@@ -1902,7 +1841,7 @@ mod tests {
         );
     }
 
-    /// The same guard on the refusal path. `mark_replayed` latches
+    /// The same guard on the refusal path. `seed_suppression_for_test` latches
     /// `fired_at_epoch` for every tracked group without setting
     /// `armed_at_epoch`, and a refusal reaching that latch must read it as
     /// another group's suppression rather than as an arm of its own.
@@ -1911,7 +1850,7 @@ mod tests {
         let mut detector = EpochStallDetector::new(2, 3).with_wedge_rearm_interval_ms(HOUR_MS);
         let g = group(0x01);
         let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
 
         assert_eq!(
             detector.observe_resource_refusal(g.clone(), EpochId(10), T0 + HOUR_MS * 5),
@@ -1997,7 +1936,7 @@ mod tests {
     /// deferred-peel cap breaks exactly that: the cap is one minted traffic can
     /// fill by itself (mdk#339), it answers `ResourceRefused` to the replay's
     /// own fetch for the group as well as to live traffic, and
-    /// `rearm_refused_groups` (historical test fixture) then clears the latch the
+    /// `clear_suppression_for_test` (historical test fixture) then clears the latch the
     /// arm just set. The next refusal takes the counted branch rather than the
     /// paced one, so the loop refusal -> arm -> fruitless replay -> unlatch
     /// walks straight to [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] with no epoch
@@ -2019,7 +1958,7 @@ mod tests {
                 EpochId(10),
                 T0 + turn * 15_000,
             ));
-            detector.rearm_refused_groups(&refused);
+            detector.clear_suppression_for_test(&refused);
         }
 
         assert_eq!(

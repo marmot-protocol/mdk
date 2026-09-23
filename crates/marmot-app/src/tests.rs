@@ -2189,17 +2189,12 @@ fn unpersisted_unknown_group_stream_is_no_progress_and_paced() {
             !client.seen_events_index.contains(&event_id),
             "an unpersisted object must remain fetchable"
         );
-        assert!(
-            client
-                .app
-                .account_storage(&client.state.label)
-                .unwrap()
-                .recovery_retry_state()
-                .unwrap()
-                .attempt_serial
-                > 0,
-            "an unproductive quantum must earn the retry cooldown"
-        );
+        let storage = app.account_storage("alice").unwrap();
+        let retry = storage.recovery_retry_state().unwrap();
+        let subscriptions = relay.subscription_count();
+        assert_eq!(retry.attempt_serial, 1);
+        assert_eq!(retry.ordinal, 1);
+        assert_eq!(retry.not_before_ms - retry.recorded_at_ms, 60_000);
         assert!(matches!(
             client
                 .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Receive)
@@ -2207,6 +2202,8 @@ fn unpersisted_unknown_group_stream_is_no_progress_and_paced() {
                 .expect("a paced seam is not a failure"),
             crate::EpochBackfillRunOutcome::Deferred
         ));
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(relay.subscription_count(), subscriptions);
         assert_eq!(
             bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
             BackfillDecision::Arm,
@@ -2255,7 +2252,13 @@ fn duplicate_only_quanta_retain_the_eose_coverage_gate() {
             crate::unix_now_seconds(),
             "duplicates-must-not-unlock-coverage",
         );
-        client.remember_seen_event(duplicate.id.clone());
+        inject_epoch_gap_probe(&app, duplicate.clone()).await;
+        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) =
+            client.receive_next_delivery().await.unwrap()
+        else {
+            panic!("expected the original delivery");
+        };
+        client.ingest_received_delivery(*delivery).await.unwrap();
         let (stop, pump) = redelivery_pump(
             &app,
             duplicate,
@@ -2302,22 +2305,38 @@ fn duplicate_only_quanta_retain_the_eose_coverage_gate() {
             .expect("EOSE-confirmed continuation runs");
         assert!(matches!(
             outcome,
+            crate::EpochBackfillRunOutcome::Incomplete(_)
+        ));
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "EOSE alone still cannot certify coverage"
+        );
+        client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
+        let outcome = client
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
             crate::EpochBackfillRunOutcome::Completed(_)
         ));
         assert!(!client.has_pending_epoch_backfill());
 
         let rows = recorded_audit_rows(&app);
         let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
-        assert_eq!(failed.len(), DUPLICATE_QUANTA as usize + 1);
-        assert!(failed.iter().all(|row| {
+        assert_eq!(failed.len(), DUPLICATE_QUANTA as usize + 2);
+        assert!(failed[..failed.len() - 1].iter().all(|row| {
             row["kind"]["error_kind"].as_str() == Some("backfill_drain_no_progress_quantum_yield")
         }));
+        assert_eq!(
+            failed.last().unwrap()["kind"]["error_kind"],
+            "history_coverage_unproven"
+        );
         let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
         assert_eq!(completed.len(), 1);
-        assert_eq!(
-            completed[0]["kind"]["completion_kind"].as_str(),
-            Some("end_of_stored_events")
-        );
+        assert_eq!(completed[0]["kind"]["completion_kind"].as_str(), None);
     });
 }
 
@@ -12862,14 +12881,6 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let runtime = MarmotAppRuntime::new(app);
-        // Notification loss now preserves recovery debt through reconnect.
-        // Supply the relay boundary for the later explicit catch-up without
-        // treating it as qualified history coverage or clearing that debt.
-        let _eose_pump = scripted_eose_pump(
-            runtime.shared_services().relay_plane().clone(),
-            relay.clone(),
-            every_subscription,
-        );
         runtime.start().await.unwrap();
 
         wait_for_inbox_subscriptions(&relay, &account_id, 1).await;
@@ -12959,6 +12970,14 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
         );
         assert!(!recovery_a.is_finished());
         assert!(!recovery_b.is_finished());
+        // All preceding live reopens ran with EOSE withheld. Only the two
+        // genuine catch-up callers below receive a boundary; it still cannot
+        // certify or clear their independent loss debt.
+        let _eose_pump = scripted_eose_pump(
+            runtime.shared_services().relay_plane().clone(),
+            relay.clone(),
+            every_subscription,
+        );
         relay.release_subscribe();
 
         recovery_a.await.unwrap().unwrap();
@@ -18912,15 +18931,15 @@ fn epoch_stall_test_now_ms() -> u64 {
 /// unpeelable object is *retained* (`TransportDeferred`); at it the engine drops
 /// the object unpersisted and keeps its id out of its own seen cache, so
 /// transport redelivery is the only path back to it.
-struct UndecryptableProbeRoute {
+pub(crate) struct UndecryptableProbeRoute {
     account_id_hex: String,
-    group_id: cgka_traits::GroupId,
+    pub(crate) group_id: cgka_traits::GroupId,
     nostr_group_id_hex: String,
 }
 
 impl UndecryptableProbeRoute {
     /// One kind-445 delivery for this group's route whose body cannot peel.
-    fn probe(&self, created_at: u64, marker: &str) -> cgka_traits::TransportDelivery {
+    pub(crate) fn probe(&self, created_at: u64, marker: &str) -> cgka_traits::TransportDelivery {
         cgka_traits::TransportDelivery {
             account_id: MemberId::new(hex::decode(&self.account_id_hex).unwrap()),
             group_id_hint: Some(self.group_id.clone()),
@@ -18983,7 +19002,7 @@ async fn group_at_the_undecryptable_retention_cap_with_config(
 /// [`UndecryptableProbeRoute`]'s group with its retained-undecryptable backlog
 /// still empty, for the tests that need probes to be *retained*
 /// (`IngestOutcome::TransportDeferred`) rather than refused.
-async fn undecryptable_probe_route(
+pub(crate) async fn undecryptable_probe_route(
     dir: &tempfile::TempDir,
     relay: &Arc<ScriptedPushRelayClient>,
     config: MarmotAppConfig,

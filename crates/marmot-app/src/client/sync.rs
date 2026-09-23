@@ -26,14 +26,17 @@ use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
     AccountState, AppError, AppMessageProjection, AppPerformanceTelemetry, ClassifiedSyncFailure,
-    EPOCH_BACKFILL_EOSE_WAIT, EPOCH_BACKFILL_EXECUTION_QUANTUM, EPOCH_BACKFILL_RETRY_BACKOFF,
-    EPOCH_BACKFILL_RETRY_BACKOFF_CAP, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership,
-    SyncFailure, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
+    EPOCH_BACKFILL_EOSE_WAIT, EPOCH_BACKFILL_EXECUTION_QUANTUM, SDK_DRAIN_WAIT,
+    SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
+    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
 use marmot_forensics::{
-    AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillCompletionKind,
-    EpochBackfillDeferredReason, EpochBackfillExecutionSeam, EpochStallBackfillTrigger,
+    AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillExecutionSeam,
+    EpochStallBackfillTrigger,
 };
+
+#[cfg(test)]
+use marmot_forensics::EpochBackfillCompletionKind;
 
 use super::AppClient;
 use super::audit::EpochBackfillTerminalAudit;
@@ -284,13 +287,12 @@ struct EpochBackfillReplayOutcome {
     error_kind: Option<String>,
     completion_kind: Option<EpochBackfillCompletionKind>,
     counts: DrainCounts,
-    succeeded: bool,
 }
 
-/// Result of checking the pending epoch-gap replay queue at one execution seam.
+/// Result of asking the account owner to service pending recovery demand.
 ///
-/// `Deferred` is intentionally distinct from `NotPending`: explicit catch-up
-/// already completed its ordinary floored sync before checking this queue, so
+/// `Deferred` is intentionally distinct from `NotPending`: existing demand
+/// may be waiting for cooldown, local capacity, or acquisition capability, so
 /// the worker may still return success while retaining the deferred recovery
 /// intent and its audit trail. Explicit full-history repair instead uses this
 /// distinction to try any queued runnable intent before falling back to its
@@ -357,8 +359,8 @@ impl DrainCompletion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrainVerdict {
     /// Every endpoint-scoped attempt in the activation's frozen route snapshot
-    /// reached end-of-stored-events and the relays then went quiet: the
-    /// account's stored history was served in full.
+    /// reached end-of-stored-events and the relays then went quiet. This is a
+    /// drain boundary, not exhaustive history or durable-admission proof.
     Complete,
     /// The silence budget ran out with stored history still unconfirmed, though
     /// some relay did reach end-of-stored-events.
@@ -402,39 +404,12 @@ impl DrainVerdict {
         }
     }
 
-    /// What the completed audit row should claim about this drain.
-    fn completion_kind(self) -> Option<EpochBackfillCompletionKind> {
-        match self {
-            Self::Complete => Some(EpochBackfillCompletionKind::EndOfStoredEvents),
-            Self::EoseTimeout
-            | Self::NoRelayEose
-            | Self::Overflow
-            | Self::NovelProgressQuantumYield
-            | Self::NoProgressQuantumYield
-            | Self::RepairDeadline
-            | Self::RepairCancelled
-            | Self::CoverageUnproven => None,
-        }
-    }
-
     fn quantum_yield(counts: &DrainCounts) -> Self {
         if counts.durable_deliveries() > 0 {
             Self::NovelProgressQuantumYield
         } else {
             Self::NoProgressQuantumYield
         }
-    }
-
-    fn spends_eose_attempt(self) -> bool {
-        matches!(self, Self::EoseTimeout | Self::NoRelayEose)
-    }
-
-    fn made_novel_progress(self) -> bool {
-        self == Self::NovelProgressQuantumYield
-    }
-
-    fn made_no_progress(self) -> bool {
-        self == Self::NoProgressQuantumYield
     }
 }
 
@@ -1959,18 +1934,6 @@ impl AppClient {
         }
     }
 
-    #[cfg(test)]
-    fn epoch_backfill_retry_backoff(&self, retry_ordinal: u64) -> Duration {
-        let base = if cfg!(feature = "test-policy-overrides")
-            && let Some(ms) = self.app.config.dev_epoch_backfill_retry_backoff_ms
-        {
-            Duration::from_millis(ms)
-        } else {
-            EPOCH_BACKFILL_RETRY_BACKOFF
-        };
-        retry_backoff_for_ordinal(base, retry_ordinal)
-    }
-
     /// Whether this seam must leave a pending intent alone for now.
     ///
     /// The receive seam runs pending recovery after every inbound ingest, so an
@@ -2002,13 +1965,6 @@ impl AppClient {
             return Duration::from_millis(ms);
         }
         EPOCH_BACKFILL_EOSE_WAIT
-    }
-
-    /// The EOSE budget for durable account-delivery overflow repair. It shares
-    /// today's configured value with epoch backfill, but remains a distinct
-    /// policy seam so either recovery mechanism can be tuned independently.
-    fn delivery_overflow_eose_wait(&self) -> Duration {
-        self.epoch_backfill_eose_wait()
     }
 
     /// Maximum wall-clock quantum one backfill drain owns the account worker.
@@ -3516,9 +3472,8 @@ impl AppClient {
                 .unwrap_or(true)
     }
 
-    /// Every group an armed epoch-gap intent is waiting on, primary and queued.
-    /// Empty while an intent is executing: `begin_epoch_backfill_execution`
-    /// moved it out, and that run passes its own groups down instead.
+    /// Current group-scoped debt, including obligations held by a live grant.
+    /// This inspection does not authorize acquisition or infer completion.
     fn armed_epoch_backfill_groups(&self) -> HashSet<cgka_traits::GroupId> {
         self.app
             .account_storage(&self.state.label)
@@ -5486,16 +5441,6 @@ fn backfill_drain_verdict(eose: AccountSubscriptionEose) -> DrainVerdict {
     }
 }
 
-/// Doubling backoff from `base`, capped at [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`]
-/// (or `base` itself when a test override exceeds the cap). Pure so the
-/// schedule is table-testable without a client.
-#[cfg(test)]
-fn retry_backoff_for_ordinal(base: Duration, retry_ordinal: u64) -> Duration {
-    let doubling = 1_u32 << retry_ordinal.min(8);
-    base.saturating_mul(doubling)
-        .min(EPOCH_BACKFILL_RETRY_BACKOFF_CAP.max(base))
-}
-
 /// Wall clock for the epoch-stall detector's two time gates.
 ///
 /// Wall clock rather than [`Instant`] because both gates have to survive a
@@ -5514,17 +5459,13 @@ mod tests {
         DrainVerdict, EpochBackfillReplayOutcome, TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
         TransportReconciliationWork, backfill_drain_verdict, epoch_backfill_terminal_rows,
         incomplete_full_history_repair, order_reconciliation_pass,
-        reconciliation_start_after_cursor, retry_backoff_for_ordinal,
-        transport_reconciliation_record,
+        reconciliation_start_after_cursor, transport_reconciliation_record,
     };
     use crate::tests::{
         ScriptedPushRelayClient, armed_group_ids, bounded_epoch_backfill_config,
         client_on_app_relay_plane, make_group_terminal,
     };
-    use crate::{
-        EPOCH_BACKFILL_RETRY_BACKOFF, EPOCH_BACKFILL_RETRY_BACKOFF_CAP, MarmotApp,
-        SyncFailureStage, SyncSummary,
-    };
+    use crate::{MarmotApp, SyncFailureStage, SyncSummary};
     use marmot_account::AccountHome;
     use marmot_forensics::EpochBackfillActivationOutcome;
     use std::collections::HashMap;
@@ -6546,22 +6487,18 @@ mod tests {
     async fn a_replay_that_ends_terminal_escalates_nothing_and_leaves_no_evidence() {
         use crate::client::epoch_stall::BackfillDecision;
         use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
-        for disbanded in [false, true] {
+        for (disbanded, admit_prefix) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let dir = tempfile::tempdir().unwrap();
-            AccountHome::open(dir.path())
-                .create_account("alice")
-                .unwrap();
-            let app = MarmotApp::with_relay_and_config(
-                dir.path(),
-                "wss://backfill.example",
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let (app, mut client, route) = crate::tests::undecryptable_probe_route(
+                &dir,
+                &relay,
                 bounded_epoch_backfill_config(),
             )
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-            let mut client = client_on_app_relay_plane(&app, "alice").await;
-            let group = client
-                .create_group("terminal mid attempt", &[])
-                .await
-                .unwrap();
+            .await;
+            let group = route.group_id.clone();
             let epoch = client.group_mls_state(&group).unwrap().epoch;
             let storage = app.account_storage("alice").unwrap();
             let _ = client.epoch_stall.observe_resource_refusal(
@@ -6580,6 +6517,17 @@ mod tests {
                 .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
                 .unwrap()
                 .unwrap();
+            let admitted_id = if admit_prefix {
+                let delivery = route.probe(
+                    crate::unix_now_seconds().saturating_sub(1),
+                    "terminal-admitted-prefix",
+                );
+                let id = hex::encode(delivery.message.id.as_slice());
+                client.ingest_received_delivery(delivery).await.unwrap();
+                Some(id)
+            } else {
+                None
+            };
             make_group_terminal(&client, &group, disbanded);
             client.drop_terminal_epoch_backfill_intents();
             assert!(!qualify_epoch_obligation(&storage, &grant, &group));
@@ -6587,6 +6535,12 @@ mod tests {
             assert!(client.epoch_stall.wedge_evidence(&group).is_none());
             assert!(storage.epoch_stall_evidence().unwrap().is_empty());
             assert!(storage.pending_epoch_backfill_intents().unwrap().is_empty());
+            if let Some(id) = admitted_id {
+                assert!(
+                    app.load_state("alice").unwrap().seen_events.contains(&id),
+                    "terminal retirement cannot discard the admitted prefix"
+                );
+            }
         }
     }
 
@@ -6668,7 +6622,6 @@ mod tests {
             error_kind: Some("backfill_drain_eose_timeout".to_string()),
             completion_kind: None,
             counts: DrainCounts::default(),
-            succeeded: false,
         }
     }
 
@@ -6921,31 +6874,6 @@ mod tests {
         );
         delivery.group_id_hint = None;
         assert_eq!(transport_reconciliation_record(&account, &delivery), None);
-    }
-
-    #[test]
-    fn the_retry_backoff_doubles_from_its_base_and_caps() {
-        // The production schedule the reviewer probed by hand: 15s, 30s, 60s,
-        // 120s, 240s, then pinned at the 5-minute cap — and the shift is
-        // clamped so absurd ordinals cannot overflow.
-        let base = EPOCH_BACKFILL_RETRY_BACKOFF;
-        let expect_secs = [15, 30, 60, 120, 240, 300, 300, 300];
-        for (ordinal, secs) in expect_secs.iter().enumerate() {
-            assert_eq!(
-                retry_backoff_for_ordinal(base, ordinal as u64),
-                Duration::from_secs(*secs),
-                "ordinal {ordinal}"
-            );
-        }
-        assert_eq!(
-            retry_backoff_for_ordinal(base, u64::MAX),
-            EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
-            "the shift clamp must hold for absurd ordinals"
-        );
-        // A test override larger than the cap stays at its own base rather
-        // than being shrunk by the cap.
-        let oversized = EPOCH_BACKFILL_RETRY_BACKOFF_CAP * 2;
-        assert_eq!(retry_backoff_for_ordinal(oversized, 0), oversized);
     }
 
     #[test]

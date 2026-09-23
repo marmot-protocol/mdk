@@ -7243,6 +7243,7 @@ mod tests {
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
 
+        let before = relay.unfloored_account_subscription_count();
         let (events, _subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
         let (command_tx, mut commands) = mpsc::channel(1);
@@ -7264,9 +7265,14 @@ mod tests {
             client.has_pending_epoch_backfill(),
             "ordinary catch-up cannot certify complete historical coverage",
         );
-        assert!(
-            relay.subscription_count() >= 2,
-            "the owner must activate the coalesced account scope",
+        assert_eq!(relay.unfloored_account_subscription_count(), before + 1);
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            1
         );
         drop(command_tx);
     }
@@ -7345,79 +7351,96 @@ mod tests {
 
     #[tokio::test]
     async fn full_history_repair_consumes_prearmed_backfill_without_replaying_twice() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_test_relay_client(relay.clone());
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("full-history epoch backfill", &[])
-            .await
-            .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        let subscriptions_before_repair = relay.subscription_count();
+        for qualified in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay_and_config(
+                dir.path(),
+                "wss://relay.example".to_owned(),
+                bounded_epoch_backfill_config(),
+            )
+            .with_test_relay_client(relay.clone());
+            let _eose =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let group_id = client
+                .create_group("full-history epoch backfill", &[])
+                .await
+                .unwrap();
+            let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+            client.apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            );
+            if qualified {
+                client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
+            }
+            let subscriptions_before_repair = relay.subscription_count();
 
-        let (events, _subscriber) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        let (respond, response) = oneshot::channel();
-        let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
-        let (media_http_worker_lifetime, _) = watch::channel(());
-        let media_http = MediaHttpContext {
-            product: Default::default(),
-            tx: media_http_tx,
-            permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
-            prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
-            worker_lifetime: media_http_worker_lifetime,
-        };
-        let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
-        let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
-        handle_account_worker_command(
-            &mut client,
-            AccountWorkerCommand::RepairFullHistory { respond },
-            AccountWorkerCommandContext {
-                commands: &mut unused_commands,
-                pending: &mut unused_pending,
-                app: &app,
-                events: &events,
-                account_id_hex: "account-id",
-                account_label: "alice",
-                shared: &shared,
-                media_http: &media_http,
-                scheduled_convergence: &mut scheduled_convergence,
-            },
-        )
-        .await;
+            let (events, _subscriber) = broadcast::channel(4);
+            let shared = RuntimeSharedServices::default();
+            let (respond, response) = oneshot::channel();
+            let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
+            let (media_http_worker_lifetime, _) = watch::channel(());
+            let media_http = MediaHttpContext {
+                product: Default::default(),
+                tx: media_http_tx,
+                permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+                prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                worker_lifetime: media_http_worker_lifetime,
+            };
+            let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
+            let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
+            handle_account_worker_command(
+                &mut client,
+                AccountWorkerCommand::RepairFullHistory { respond },
+                AccountWorkerCommandContext {
+                    commands: &mut unused_commands,
+                    pending: &mut unused_pending,
+                    app: &app,
+                    events: &events,
+                    account_id_hex: "account-id",
+                    account_label: "alice",
+                    shared: &shared,
+                    media_http: &media_http,
+                    scheduled_convergence: &mut scheduled_convergence,
+                },
+            )
+            .await;
 
-        let failure = response.await.unwrap().unwrap_err();
-        assert!(
-            failure
-                .to_string()
-                .contains("full_history_coverage_unproven"),
-            "{failure}"
-        );
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "the coalesced attempt cannot discharge a separate unproven predicate",
-        );
-        assert_eq!(
-            relay.subscription_count(),
-            subscriptions_before_repair + 2,
-            "one activation serves the coalesced demands without a second replay",
-        );
+            let result = response.await.unwrap();
+            if qualified {
+                result.unwrap();
+                assert!(!client.has_pending_epoch_backfill());
+            } else {
+                let failure = result.unwrap_err();
+                assert!(
+                    failure
+                        .to_string()
+                        .contains("full_history_coverage_unproven"),
+                    "{failure}"
+                );
+                assert!(client.has_pending_epoch_backfill());
+            }
+            assert_eq!(
+                app.account_storage("alice")
+                    .unwrap()
+                    .recovery_retry_state()
+                    .unwrap()
+                    .attempt_serial,
+                1
+            );
+            assert_eq!(
+                relay.subscription_count(),
+                subscriptions_before_repair + 2,
+                "one activation serves the coalesced demands without a second replay",
+            );
+        }
     }
 
     #[tokio::test]

@@ -241,3 +241,14 @@ and superseded checks, and the remaining blocking acquisition limitations.
   accidental zero-backoff fixture with a real cooldown and exact retry assertions.
   All 17 owner tests passed before the final no-route eligibility adjustment;
   combined verification must include that adjustment.
+- Replacement-test cleanup: obsolete retry/EOSE helper implementations are
+  removed. The actual owner now has the extreme-ordinal/cap checks; 39 detector
+  tests preserve projection and evidence rules with explicit test-only state
+  fixtures. A real admitted prefix survives both terminal outcomes while old
+  completion is rejected; the zero-prefix variants remain. Repeated duplicate
+  quanta, an unpersisted stream with exact cooldown/cost, explicit prearmed
+  catch-up with exact activation count, and positive/negative worker repair all
+  pass. The reconnect regression also passes with EOSE withheld through every
+  live reopen and host wake. The four lifecycle/readiness failures seen in the
+  broader cargo-test run pass unchanged in isolation; the repository uses
+  process-isolated nextest for its combined CI run, which remains required.

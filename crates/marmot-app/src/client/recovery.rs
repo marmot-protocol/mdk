@@ -1208,6 +1208,33 @@ mod tests {
     }
 
     #[test]
+    fn owner_retry_policy_caps_extreme_ordinals_and_validates_bounds() {
+        assert_eq!(policy().delay_ms(u64::MAX).unwrap(), 300_000);
+        let oversized = RecoveryRetryPolicy {
+            base: Duration::from_secs(600),
+            cap: Duration::from_secs(600),
+        };
+        assert_eq!(oversized.delay_ms(0).unwrap(), 600_000);
+        assert_eq!(oversized.delay_ms(u64::MAX).unwrap(), 600_000);
+        assert!(
+            RecoveryRetryPolicy {
+                base: Duration::ZERO,
+                ..policy()
+            }
+            .delay_ms(0)
+            .is_err()
+        );
+        assert!(
+            RecoveryRetryPolicy {
+                base: Duration::from_secs(301),
+                ..policy()
+            }
+            .delay_ms(0)
+            .is_err()
+        );
+    }
+
+    #[test]
     fn automatic_attempts_share_one_durable_exponential_schedule() {
         let (storage, mut owner, now) = fixture();
         for (index, seconds) in [0, 15, 45, 105, 225, 465, 765].into_iter().enumerate() {
