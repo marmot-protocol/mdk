@@ -56,8 +56,11 @@ the commit point. If the first-byte fingerprint changes for a matching
 device/inode, the reader retires the old generation, records an unknown-extent
 missing-source gap for unaccepted bytes, and registers the current file as a
 new generation. This also covers filesystem inode reuse after a destructive
-clear. A prepared-range digest mismatch records a bounded gap before passing
-that range.
+clear. If a journal loses a previously observed, unprepared tail while keeping
+the same inode and head, the reader likewise records an unknown-extent gap and
+starts a new generation; it never replaces the old observed high-water mark
+with the shorter length. A prepared-range digest mismatch records a bounded
+gap before passing that range.
 
 Gap records carry journal generation, segment, byte extent (or unknown end),
 and a fixed reason. Complete malformed or oversized lines are skipped to their
@@ -67,13 +70,14 @@ Changing a prepared range records a gap before passing its bytes. Destructive
 clear of an unaccepted file records an unknown-extent missing-source gap. Gap
 and blocked status are exposed to the caller. A source that moves between
 discovery and reopening returns a retryable step for that journal; the next
-discovery reconciles its segment and active names. Other journals can continue.
+discovery reconciles its segment and active names, including numbered segments.
+Other journals can continue.
 
 The fake receiver tests cover real recorder append, size rotation, restart,
 retry, acceptance, changed range, active torn tail, malformed and oversized
 lines, destructive clear, partial rejection, rotation during discovery and
 between discovery and reopening, simulated inode reuse, and
-corrupt or oversized cursor. The local
+observed unprepared tail truncation, corrupt or oversized cursor. The local
 reader has no HTTP, runtime scheduling, root-lease acquisition, retention,
 capacity cleanup, receiver validation, or investigation reader integration.
 Those require the later receiver and lifecycle steps before production use.
