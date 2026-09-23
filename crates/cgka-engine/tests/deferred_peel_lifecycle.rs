@@ -2174,6 +2174,80 @@ async fn replay_still_retires_a_deferred_row_it_resolves() {
     ));
 }
 
+/// Carol follows alice to epoch 3, retaining the anchors of the epochs she
+/// left, then alice moves on to epoch 4 without her and sends `backlog`
+/// application messages carol cannot read under any state she holds.
+async fn carol_parked_behind_retained_anchors(
+    backlog: usize,
+) -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    Vec<TransportMessage>,
+) {
+    let (mut alice, mut carol, carol_storage, _peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs().await;
+    carol.ingest(commit2).await.unwrap();
+    carol.ingest(commit3).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+
+    let (_withheld_commit, pending) = evolution(
+        alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("alice moves on alone".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+
+    let mut parked = Vec::with_capacity(backlog);
+    for index in 0..backlog {
+        let message = send_app(&mut alice, &group_id, &format!("sealed ahead {index}")).await;
+        assert!(matches!(
+            carol.ingest(message.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        parked.push(message);
+    }
+    // The background sweep tries the whole backlog under this context, as it
+    // would long before the user next sends.
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    (carol, carol_storage, group_id, parked)
+}
+
+/// A publish-cycle replay only keeps an unreadable row's retry lifecycle; it
+/// reports no verdict on the row. Classifying each row that stays parked
+/// would rescan the stored commit graph once per row for an answer nobody
+/// reads, on every publish.
+#[tokio::test]
+async fn publish_cycle_replay_does_not_classify_rows_that_stay_parked() {
+    let (mut carol, carol_storage, group_id, parked) =
+        carol_parked_behind_retained_anchors(8).await;
+
+    let pending = stage_publish_halting_ingest(&mut carol, &group_id).await;
+    let before = carol.engine_metrics();
+    carol.publish_failed(pending).await.unwrap();
+    let after = carol.engine_metrics();
+
+    assert_eq!(
+        after.deferred_lineage_classifications, before.deferred_lineage_classifications,
+        "the replay must not classify rows it only keeps parked"
+    );
+    for message in &parked {
+        assert_eq!(
+            carol_storage.get_message(&message.id).unwrap().state,
+            MessageState::PeelDeferred,
+            "an unreadable row stays parked for a later context"
+        );
+    }
+}
+
 /// If account accounting was initialized by group A, a later deferral in
 /// group B is charged incrementally. Group B's first sweep must reconcile that
 /// contribution rather than adding the same durable bytes again.

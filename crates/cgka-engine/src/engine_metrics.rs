@@ -671,7 +671,8 @@ pub struct EngineMetricsSnapshot {
     /// Deferred-peel retry sweeps invoked, including empty or gated sweeps.
     pub deferred_peel_sweeps: u64,
     /// Group graph classifications requested by live transport deferrals.
-    /// Retry sweeps consume no lineage report and must not increment this count.
+    /// Retry sweeps and publish-cycle replays consume no lineage report and
+    /// must not increment this count.
     pub deferred_lineage_classifications: u64,
     /// Candidate-branch enumerations actually performed (cache misses).
     pub deferred_peel_candidate_enumerations: u64,

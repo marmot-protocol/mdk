@@ -3565,6 +3565,8 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
+        use ingest::GroupMessageIngestOutcome::{Deferred, Outcome};
+
         // Only states the loop below can act on; the storage backend skips
         // fetching and decoding terminal/record-only rows entirely, which
         // keeps a re-join from re-parsing the group's whole message history.
@@ -3591,27 +3593,32 @@ impl<S: StorageProvider> Engine<S> {
             };
             let was_peel_deferred = record.state == MessageState::PeelDeferred;
             match self
-                .ingest_group_message(&msg, group_id.as_slice().to_vec())
+                .ingest_group_message_from_sweep(
+                    &msg,
+                    group_id.as_slice().to_vec(),
+                    ingest::DeferredPeelSweep::LIVE,
+                )
                 .await
             {
                 Ok(
-                    IngestOutcome::Buffered { .. }
-                    | IngestOutcome::TransportDeferred { .. }
-                    | IngestOutcome::LocalState {
-                        state: LocalIngestState::Quarantined,
-                    }
-                    | IngestOutcome::Ignored {
-                        category: InputRejectionCategory::UnknownGroup,
-                    },
+                    Deferred(_)
+                    | Outcome(
+                        IngestOutcome::Buffered { .. }
+                        | IngestOutcome::LocalState {
+                            state: LocalIngestState::Quarantined,
+                        }
+                        | IngestOutcome::Ignored {
+                            category: InputRejectionCategory::UnknownGroup,
+                        },
+                    ),
                 ) => {
                     // Leave the row in its retry state so a later pass
                     // re-attempts it.
                     //
                     // `Buffered`: not the caller's to retire — see AGENTS.md,
                     // "a `Buffered` outcome never lets the caller retire the
-                    // wrapper". `TransportDeferred`: still un-peelable, or a
-                    // terminal-after-peel path inside `ingest_group_message`
-                    // already settled the row
+                    // wrapper". `Deferred`: still un-peelable, or a
+                    // terminal-after-peel path inside ingest already settled the row
                     // (`mark_raw_transport_message_failed_if_awaiting_retry`,
                     // `PeelDeferred`/`Retryable` alike). `Quarantined`: the group
                     // is frozen; the row replays once repair clears it.
@@ -3627,9 +3634,9 @@ impl<S: StorageProvider> Engine<S> {
                     let current = self.stored_message_state(&record.id)?;
                     self.release_cap_slot_if_row_left_peel_deferred(&record, current);
                 }
-                Ok(IngestOutcome::LocalState {
+                Ok(Outcome(IngestOutcome::LocalState {
                     state: LocalIngestState::Removed,
-                }) => {
+                })) => {
                     // Refused on our own removal before any peel — either on the
                     // durable record or by the realizing arm that writes that
                     // marker. Both retain the input, and neither re-stamps a row
@@ -3651,7 +3658,7 @@ impl<S: StorageProvider> Engine<S> {
                     // when the removal retired the deferred backlog.
                     break;
                 }
-                Ok(IngestOutcome::ResourceRefused { .. }) => {
+                Ok(Outcome(IngestOutcome::ResourceRefused { .. })) => {
                     // Refused for lack of room, not on the message's merits: the
                     // group's deferred-peel cap had no slot for this row right
                     // now. Leave it exactly as ingest found it — still awaiting
@@ -3673,7 +3680,7 @@ impl<S: StorageProvider> Engine<S> {
                     // replay runs again on every publish cycle, so the retry cost
                     // stays bounded by the rows still retained.
                 }
-                Ok(_) => {
+                Ok(Outcome(_)) => {
                     // Terminal reclassification of the raw wrapper: the content-
                     // derived row now carries the real verdict — applied
                     // (`Processed`), a same-epoch fork the incumbent won
