@@ -31,7 +31,7 @@ use nostr_relay_builder::prelude::{
 };
 use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
+    Client as NostrSdkClient, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
 };
 use sha2::{Digest, Sha256};
@@ -192,16 +192,16 @@ async fn active_group_send_timings() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "send latency and connection reuse diagnostic"]
 async fn send_connection_reuse() {
-    // Thirty messages plus thirty pushes exceed the mock's 60-event budget
-    // once group setup is included on the same persistent connection.
-    let _relay = LocalRelay::new(RelayBuilder::default().rate_limit(
+    // Warm-up plus thirty messages and pushes exceed the mock's 60-event
+    // budget once group setup uses the same persistent connection.
+    let relay = LocalRelay::new(RelayBuilder::default().rate_limit(
         nostr_relay_builder::builder::RateLimit {
             notes_per_minute: 1_000,
             ..Default::default()
         },
     ));
-    _relay.run().await.unwrap();
-    let relay_url = _relay.url().await.to_string();
+    relay.run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
     let relay_addr = relay_url
         .strip_prefix("ws://")
         .unwrap()
@@ -302,9 +302,9 @@ async fn send_connection_reuse() {
     }
     sleep(Duration::from_secs(2)).await;
     let mut received = runtimes[1].subscribe();
-    let before = connections.load(Ordering::SeqCst);
+    let mut before = connections.load(Ordering::SeqCst);
     let mut samples = Vec::new();
-    for index in 0..30 {
+    for index in 0..=30 {
         let text = format!("connection probe {index}");
         let started = Instant::now();
         let sent = runtimes[0]
@@ -315,7 +315,7 @@ async fn send_connection_reuse() {
             sent.published > 0,
             "send must obtain a relay acknowledgement"
         );
-        let acknowledged = started.elapsed().as_secs_f64() * 1000.0;
+        let caller_ms = started.elapsed().as_secs_f64() * 1000.0;
         wait_for_event(&mut received, |event| {
             matches!(event,
                 MarmotAppEvent::MessageReceived(message)
@@ -324,9 +324,15 @@ async fn send_connection_reuse() {
             )
         })
         .await;
-        samples.push(acknowledged);
+        if index == 0 {
+            // The anonymous WRITE pool is intentionally separate from receive
+            // subscriptions. Warm its socket before measuring retained reuse.
+            before = connections.load(Ordering::SeqCst);
+            continue;
+        }
+        samples.push(caller_ms);
         eprintln!(
-            "send_sample={index} ack_ms={acknowledged:.3} received_ms={:.3}",
+            "send_sample={index} caller_ms={caller_ms:.3} received_ms={:.3}",
             started.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -334,42 +340,40 @@ async fn send_connection_reuse() {
     let opened = std::env::var_os("SEND_RELAYS")
         .is_none()
         .then(|| connections.load(Ordering::SeqCst) - before);
+    let p95_index = (samples.len() * 95).div_ceil(100) - 1;
     eprintln!(
-        "send_summary setup_ms={setup_ms} samples={} mean_ms={:.3} p95_ms={:.3} p99_ms={:.3} new_connections={opened:?}",
+        "send_summary setup_ms={setup_ms} samples={} caller_mean_ms={:.3} caller_p95_ms={:.3} caller_max_ms={:.3} new_connections={opened:?}",
         samples.len(),
         samples.iter().sum::<f64>() / samples.len() as f64,
-        samples[28],
-        samples[29]
+        samples[p95_index],
+        samples.last().unwrap()
     );
     if std::env::var_os("SEND_PUSH").is_some() {
         let client = NostrSdkClient::builder().build();
         client.add_relay(&urls[0]).await.unwrap();
         client.connect().await;
         let events = client
-            .fetch_events_from(
-                [&urls[0]],
-                Filter::new()
+            .fetch_events(nostr_sdk::prelude::ReqTarget::single(
+                &urls[0],
+                [Filter::new()
                     .kind(Kind::GiftWrap)
-                    .pubkey(push_server.public_key()),
-                Duration::from_secs(5),
-            )
+                    .pubkey(push_server.public_key())],
+            ))
+            .timeout(Duration::from_secs(5))
             .await
             .unwrap();
         assert_eq!(
             events.len(),
-            30,
-            "one notification per acknowledged message"
+            31,
+            "one notification per acknowledged message, including warm-up"
         );
         for event in events {
-            let gift = nostr::nips::nip59::extract_rumor(&push_server, &event)
-                .await
-                .unwrap();
+            let gift = nostr::nips::nip59::extract_rumor(&push_server, &event).unwrap();
             assert_eq!(gift.rumor.kind, Kind::Custom(446));
-            assert!(
-                !BASE64_STANDARD
-                    .decode(&gift.rumor.content)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                BASE64_STANDARD.decode(&gift.rumor.content).unwrap().len(),
+                marmot_app::PUSH_ENCRYPTED_TOKEN_LEN,
+                "each trigger carries the peer's single encrypted token"
             );
         }
         client.shutdown().await;
@@ -381,92 +385,151 @@ async fn send_connection_reuse() {
 }
 
 #[tokio::test]
-async fn signed_publish_reuses_pool() {
+async fn publish_socket_isolation() {
     use cgka_traits::{
         MemberId, TransportAccountActivation, TransportAdapter, TransportPublishRequest,
         TransportPublishTarget,
     };
     use marmot_app::MarmotRelayPlane;
     use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
-    use nostr_relay_builder::{LocalRelay, RelayBuilder};
 
-    for auth in [
-        None,
-        Some(RelayBuilderNip42 {
-            mode: RelayBuilderNip42Mode::Write,
-        }),
-    ] {
-        let auth_required = auth.is_some();
-        let builder = match auth {
-            Some(auth) => RelayBuilder::default().nip42(auth),
-            None => RelayBuilder::default(),
-        };
-        let relay = LocalRelay::new(builder);
-        relay.run().await.unwrap();
-        let endpoint = TransportEndpoint(relay.url().await.to_string());
-        let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
-        let signer =
-            NostrSdkRelayClient::new(NostrSdkClient::builder().signer(Keys::generate()).build());
-        // An unusable fallback proves public writes use the connected pool.
-        if !auth_required {
-            signer.client().shutdown().await;
-        }
-        let account = MemberId::new(vec![0xA1; 32]);
-        let adapter = plane.account_adapter(account.clone(), Arc::new(signer.clone()));
-        adapter
-            .activate_account(TransportAccountActivation {
-                account_id: account.clone(),
-                inbox_endpoints: vec![endpoint.clone()],
-                group_subscriptions: Vec::new(),
-                since: None,
+    #[derive(Clone, Debug, Default)]
+    struct ConnectionAudit {
+        reads: Arc<Mutex<Vec<SocketAddr>>>,
+        writes: Arc<Mutex<Vec<SocketAddr>>>,
+    }
+
+    impl QueryPolicy for ConnectionAudit {
+        fn admit_query<'a>(
+            &'a self,
+            _: &'a nostr_relay_builder::prelude::Filter,
+            addr: &'a SocketAddr,
+        ) -> BoxedFuture<'a, PolicyResult> {
+            Box::pin(async move {
+                self.reads.lock().await.push(*addr);
+                PolicyResult::Accept
             })
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(5), async {
-            while plane.relay_health().await.connected != 1 {
-                sleep(Duration::from_millis(10)).await;
-            }
+        }
+    }
+
+    impl WritePolicy for ConnectionAudit {
+        fn admit_event<'a>(
+            &'a self,
+            event: &'a nostr_relay_builder::prelude::Event,
+            addr: &'a SocketAddr,
+        ) -> BoxedFuture<'a, PolicyResult> {
+            Box::pin(async move {
+                if event.kind == OldKind::MlsGroupMessage {
+                    self.writes.lock().await.push(*addr);
+                }
+                PolicyResult::Accept
+            })
+        }
+    }
+
+    let audit = ConnectionAudit::default();
+    let relay = LocalRelay::new(
+        RelayBuilder::default()
+            .nip42(RelayBuilderNip42 {
+                mode: RelayBuilderNip42Mode::Read,
+            })
+            .query_policy(audit.clone())
+            .write_policy(audit.clone()),
+    );
+    relay.run().await.unwrap();
+    let endpoint = TransportEndpoint(relay.url().await.to_string());
+    let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
+    let first = Keys::generate();
+    let account = MemberId::new(first.public_key().to_bytes().to_vec());
+    plane
+        .set_transport_signer(&account, Arc::new(first))
+        .await
+        .unwrap();
+    // Neither account publisher can rescue an accidental public send through
+    // the signer-bound path. The receive socket must authenticate for REQs.
+    let fallback = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    fallback.client().shutdown().await;
+    let adapter = plane.account_adapter(account.clone(), Arc::new(fallback.clone()));
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: Vec::new(),
+            since: None,
         })
         .await
         .unwrap();
-        let event = EventBuilder::new(Kind::MlsGroupMessage, "encrypted reuse")
-            .tags([Tag::custom(
-                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-                [hex::encode([0xD4; 32])],
-            )])
-            .sign_with_keys(&Keys::generate())
+    timeout(Duration::from_secs(5), async {
+        while audit.reads.lock().await.is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receive socket must issue its authenticated subscription");
+
+    let request = |account_id, content: &str| {
+        let event = EventBuilder::new(Kind::MlsGroupMessage, content)
+            .tags([Tag::custom("h", [hex::encode([0xD4; 32])])])
+            .finalize(&Keys::generate())
             .unwrap();
-        let message = NostrTransportEvent::from_nostr_event(&event)
-            .unwrap()
-            .to_transport_message()
-            .unwrap();
-        let request = TransportPublishRequest {
-            account_id: account,
-            message,
+        TransportPublishRequest {
+            account_id,
+            message: NostrTransportEvent::from_nostr_event(&event)
+                .unwrap()
+                .to_transport_message()
+                .unwrap(),
             target: TransportPublishTarget::Group {
                 group_id: GroupId::new(vec![0xC3; 32]),
                 transport_group_id: vec![0xD4; 32],
-                endpoints: vec![endpoint],
+                endpoints: vec![endpoint.clone()],
             },
             required_acks: 1,
-        };
-        for _ in 0..2 {
-            let report = timeout(Duration::from_secs(10), adapter.publish(request.clone()))
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(report.met_required_acks());
-            assert_eq!(report.message_id, request.message.id);
         }
-        assert_eq!(plane.relay_health().await.connection_attempts, 1);
-        assert_eq!(plane.relay_health().await.connected, 1);
-        plane.shutdown().await;
-        // A shut-down receive pool must leave the account publisher usable.
-        if auth_required {
-            assert!(adapter.publish(request).await.unwrap().met_required_acks());
-        }
-        signer.client().shutdown().await;
-    }
+    };
+    let publish = async |adapter: &marmot_app::MarmotRelayPlaneAccountAdapter, account, content| {
+        let request = request(account, content);
+        let report = timeout(Duration::from_secs(5), adapter.publish(request.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.met_required_acks());
+        assert_eq!(report.message_id, request.message.id);
+    };
+    publish(&adapter, account.clone(), "first").await;
+    publish(&adapter.clone(), account.clone(), "clone").await;
+    let second = Keys::generate();
+    let second_id = MemberId::new(second.public_key().to_bytes().to_vec());
+    let second_adapter = plane.account_adapter(second_id.clone(), Arc::new(fallback));
+    plane
+        .set_transport_signer(&second_id, Arc::new(second))
+        .await
+        .unwrap();
+    publish(&second_adapter, second_id.clone(), "second account").await;
+    second_adapter.deactivate_account(&second_id).await.unwrap();
+    publish(&adapter, account.clone(), "first after switch").await;
+    plane.shutdown().await;
+    publish(&adapter, account, "receive pool shut down").await;
+
+    let reads = audit.reads.lock().await;
+    let writes = audit.writes.lock().await;
+    assert_eq!(writes.len(), 5);
+    assert!(
+        writes.iter().all(|peer| !reads.contains(peer)),
+        "group writes must never use an authenticated receive socket"
+    );
+    assert_eq!(
+        writes[0], writes[1],
+        "adapter clones reuse the anonymous socket"
+    );
+    assert_ne!(writes[0], writes[2], "accounts own independent publishers");
+    assert_eq!(
+        writes[0], writes[3],
+        "account switches do not replace its publisher"
+    );
+    assert_eq!(
+        writes[0], writes[4],
+        "receive shutdown does not replace its publisher"
+    );
 }
 
 async fn mock_relay() -> (MockRelay, String) {

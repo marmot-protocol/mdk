@@ -10,10 +10,11 @@ use async_trait::async_trait;
 use cgka_traits::transport::Timestamp;
 use cgka_traits::{
     MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportEndpoint, TransportGroupSubscription, TransportGroupSync,
-    TransportPublishReport, TransportPublishRequest,
+    TransportDelivery, TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
+    TransportEndpointRejectionCategory, TransportGroupSubscription, TransportGroupSync,
+    TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
 };
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, ClientNotification, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
@@ -23,7 +24,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrAcquisitionCancellation, NostrAcquisitionError,
     NostrAcquisitionRequest, NostrAcquisitionResult, NostrPublishOutcome, NostrReconciliationItem,
@@ -74,6 +75,7 @@ const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
 const RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const RELAY_NOTIFICATION_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME: Duration = Duration::from_secs(5);
+const ACCOUNT_PUBLISH_WAIT: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct MarmotRelayPlane {
@@ -92,7 +94,6 @@ struct RelayPlaneTransport {
     adapter: NostrTransportAdapter,
     sdk_relay_client: Option<NostrSdkRelayClient>,
     directory_client: Option<NostrSdkClient>,
-    publication_signer: tokio::sync::RwLock<()>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     account_deliveries: RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
     account_delivery_metrics: Arc<AccountDeliveryMetrics>,
@@ -141,6 +142,7 @@ pub struct MarmotRelayPlaneAccountAdapter {
     account_id: MemberId,
     relay_plane: MarmotRelayPlane,
     publish_client: Arc<dyn NostrRelayClient>,
+    anonymous_publish_client: Option<NostrSdkRelayClient>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<AccountDeliveryEvent>>>,
     delivery_overflow: Arc<AccountDeliveryOverflowState>,
     incremental_activation: Arc<Mutex<Option<IncrementalActivation>>>,
@@ -750,7 +752,6 @@ impl MarmotRelayPlane {
             adapter,
             sdk_relay_client,
             directory_client,
-            publication_signer: tokio::sync::RwLock::new(()),
             directory_events: broadcast::channel(DIRECTORY_EVENT_BUFFER).0,
             account_deliveries: RwLock::new(HashMap::new()),
             account_delivery_metrics: Arc::new(AccountDeliveryMetrics::default()),
@@ -817,10 +818,19 @@ impl MarmotRelayPlane {
                 recovery_marker,
             },
         );
+        // Never share a socket with the authenticated receive pool or Welcome
+        // publisher. Adapter clones retain this account's anonymous WRITE pool.
+        let anonymous_publish_client = self
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .map(|_| NostrSdkRelayClient::from_builder(NostrSdkClient::builder()));
         MarmotRelayPlaneAccountAdapter {
             account_id,
             relay_plane: self.clone(),
             publish_client,
+            anonymous_publish_client,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             delivery_overflow,
             incremental_activation: Arc::new(Mutex::new(None)),
@@ -839,122 +849,6 @@ impl MarmotRelayPlane {
                 .await
                 .is_ok(),
             None => false,
-        }
-    }
-
-    pub(super) async fn publish_signed_event(
-        &self,
-        account: &MemberId,
-        fallback: &dyn NostrRelayClient,
-        endpoints: &[TransportEndpoint],
-        event: &NostrTransportEvent,
-        required_acks: usize,
-    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
-        // Signed envelopes need no account signer. Reuse the subscription
-        // pool's sockets instead of opening a second connection for each send.
-        // ponytail: reuse is single-account. Persistent per-account publish
-        // sockets would extend reuse without coupling concurrent accounts.
-        let mut shared = self
-            .inner
-            .transport
-            .sdk_relay_client
-            .as_ref()
-            .filter(|client| {
-                event.sig.is_some()
-                    && !client.client().pool().is_shutdown()
-                    && account_deliveries_read(&self.inner.transport.account_deliveries).len() == 1
-            });
-        // Registration can continue: subsequent multi-account sends use their
-        // own publishers. Hold the signer stable for this admitted publication.
-        let signer_lease = if shared.is_some() {
-            Some(self.inner.transport.publication_signer.read().await)
-        } else {
-            None
-        };
-        if let Some(client) = shared {
-            let owns_pool = {
-                let accounts = account_deliveries_read(&self.inner.transport.account_deliveries);
-                accounts.len() == 1 && accounts.contains_key(account)
-            };
-            let signer_matches = match client.client().signer().await {
-                Ok(signer) => signer
-                    .get_public_key()
-                    .await
-                    .is_ok_and(|key| key.as_bytes().as_slice() == account.as_slice()),
-                Err(_) => true, // Signerless public sockets use the auth fallback.
-            };
-            if !owns_pool || !signer_matches {
-                shared = None;
-            }
-        }
-        // Keep fresh connection attempts on the existing path, including its
-        // distinction between a failed dial and an ambiguous in-flight send.
-        if let Some(client) = shared {
-            for endpoint in endpoints {
-                if client
-                    .client()
-                    .relay(endpoint.as_str())
-                    .await
-                    .is_ok_and(|relay| relay.is_connected())
-                {
-                    continue;
-                }
-                shared = None;
-                break;
-            }
-        }
-        let publisher: &dyn NostrRelayClient = match shared {
-            Some(client) => client,
-            None => fallback,
-        };
-        let signer_lease = signer_lease.filter(|_| shared.is_some());
-        let outcome = publisher
-            .publish_event(endpoints, event, required_acks)
-            .await;
-        drop(signer_lease);
-        let auth_rejected = |failure: &cgka_traits::TransportEndpointFailure| {
-            failure.rejection_category
-                == Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired)
-        };
-        // A public read socket can still require account authentication to
-        // write. Preserve the signer-bound path for that explicit rejection.
-        match outcome {
-            Err(error)
-                if shared.is_some()
-                    && error.publish_endpoint_failures().iter().any(auth_rejected) =>
-            {
-                fallback
-                    .publish_event(endpoints, event, required_acks)
-                    .await
-            }
-            Ok(mut outcome) if shared.is_some() => {
-                // Quorum success can still include explicit auth rejections.
-                // Retry only those endpoints, preserving every prior receipt.
-                for failure in std::mem::take(&mut outcome.failed) {
-                    if !auth_rejected(&failure) {
-                        outcome.failed.push(failure);
-                        continue;
-                    }
-                    match fallback
-                        .publish_event(std::slice::from_ref(&failure.endpoint), event, 1)
-                        .await
-                    {
-                        Ok(retry)
-                            if retry
-                                .accepted
-                                .iter()
-                                .any(|receipt| receipt.endpoint == failure.endpoint) =>
-                        {
-                            outcome.accepted.extend(retry.accepted)
-                        }
-                        // A failed retry must not erase the original rejection
-                        // or turn an acknowledged publication into an error.
-                        _ => outcome.failed.push(failure),
-                    }
-                }
-                Ok(outcome)
-            }
-            result => result,
         }
     }
 
@@ -2440,6 +2334,141 @@ fn recover_relay_notification_forwarder_scoped(
 }
 
 impl MarmotRelayPlaneAccountAdapter {
+    pub(super) async fn publish_signed_event(
+        &self,
+        fallback: &dyn NostrRelayClient,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        let Some(publisher) = self
+            .anonymous_publish_client
+            .as_ref()
+            .filter(|_| event.sig.is_some())
+        else {
+            // Unsigned events and custom transports retain their supplied publisher.
+            return fallback
+                .publish_event_for_account(&self.account_id, endpoints, event, required_acks)
+                .await;
+        };
+        let deadline = tokio::time::Instant::now() + ACCOUNT_PUBLISH_WAIT;
+        let required_acks = required_acks.max(1);
+        let unknown = |endpoint: &TransportEndpoint| TransportEndpointFailure {
+            endpoint: endpoint.clone(),
+            reason: "publish acknowledgement unknown".to_owned(),
+            kind: TransportEndpointFailureKind::PossiblyExposed,
+            rejection_category: None,
+        };
+        let mut outcome = NostrPublishOutcome::default();
+        let mut pending = HashSet::new();
+        let mut publishes = FuturesUnordered::new();
+        let mut retrying = HashSet::new();
+        let mut retries = FuturesUnordered::new();
+        for endpoint in endpoints {
+            if !pending.insert(endpoint) {
+                continue;
+            }
+            // The SDK aggregate error cannot carry partial acknowledgements.
+            // Race endpoint results instead so public and authenticated receipts
+            // can satisfy the same quorum without discarding either.
+            publishes.push(async move {
+                let result = publisher
+                    .publish_event(std::slice::from_ref(endpoint), event, 1)
+                    .await;
+                (endpoint, result)
+            });
+        }
+        while !publishes.is_empty() || !retries.is_empty() {
+            let (is_retry, next) = tokio::select! {
+                next = timeout_at(deadline, publishes.next()), if !publishes.is_empty() => (false, next),
+                next = timeout_at(deadline, retries.next()), if !retries.is_empty() => (true, next),
+            };
+            match next {
+                Ok(Some((endpoint, result))) => {
+                    if is_retry {
+                        retrying.remove(endpoint);
+                    } else {
+                        pending.remove(endpoint);
+                    }
+                    match result {
+                        Ok(receipt) => {
+                            outcome.message_id = receipt.message_id.or(outcome.message_id);
+                            outcome.accepted.extend(receipt.accepted);
+                            outcome.failed.extend(receipt.failed);
+                        }
+                        Err(error) => {
+                            outcome.message_id =
+                                error.publish_message_id().cloned().or(outcome.message_id);
+                            let auth_required = !is_retry
+                                && error.publish_endpoint_failures().iter().any(|failure| {
+                                    failure.endpoint == *endpoint
+                                        && failure.rejection_category
+                                            == Some(
+                                                TransportEndpointRejectionCategory::AuthRequired,
+                                            )
+                                });
+                            if auth_required {
+                                retrying.insert(endpoint);
+                                retries.push(async move {
+                                    (
+                                        endpoint,
+                                        fallback
+                                            .publish_event_for_account(
+                                                &self.account_id,
+                                                std::slice::from_ref(endpoint),
+                                                event,
+                                                1,
+                                            )
+                                            .await,
+                                    )
+                                });
+                            } else if error.publish_endpoint_failures().is_empty() {
+                                if !is_retry {
+                                    return Err(error);
+                                }
+                                outcome.failed.push(unknown(endpoint));
+                            } else {
+                                outcome
+                                    .failed
+                                    .extend_from_slice(error.publish_endpoint_failures());
+                            }
+                        }
+                    }
+                    if outcome.accepted.len() >= required_acks {
+                        // Like the SDK, quorum cancels unresolved anonymous
+                        // attempts. Already-observed auth rejections still get
+                        // their concurrent retry within the original budget.
+                        publishes.clear();
+                        pending.clear();
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    // This includes in-flight authenticated retries. Keeping
+                    // their earlier AuthRequired would falsely prove no send.
+                    outcome.failed.extend(pending.drain().map(unknown));
+                    outcome.failed.extend(retrying.drain().map(unknown));
+                    break;
+                }
+            }
+        }
+        if outcome.accepted.len() >= required_acks {
+            return Ok(outcome);
+        }
+        let mut failure = TransportPublishFailure::with_endpoint_failures(
+            format!(
+                "insufficient publish acknowledgements: accepted {} of required {}",
+                outcome.accepted.len(),
+                required_acks
+            ),
+            outcome.failed,
+        );
+        failure.message_id = outcome
+            .message_id
+            .or_else(|| hex::decode(&event.id).ok().map(cgka_traits::MessageId::new));
+        Err(TransportAdapterError::PublishEndpoints(failure))
+    }
+
     /// Explicit catch-up must reissue even settled, matching subscriptions.
     /// Cancellation leaves reuse disabled until an activation succeeds.
     pub(crate) async fn require_fresh_activation(&self) {
@@ -2850,24 +2879,27 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         request.validate_envelope_matches_target()?;
         let event = NostrTransportEvent::from_transport_message(&request.message)
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
-        // Welcome fanout runs independently of account commands. Keep it off
-        // the receive socket so a blocked inbox write cannot stall group sends.
+        // Welcome fanout keeps its account publisher; a blocked inbox write
+        // cannot stall the independent anonymous group publisher.
         let outcome = if matches!(
             request.target,
             cgka_traits::TransportPublishTarget::Group { .. }
         ) {
-            self.relay_plane
-                .publish_signed_event(
+            self.publish_signed_event(
+                self.publish_client.as_ref(),
+                request.target.endpoints(),
+                &event,
+                request.required_acks,
+            )
+            .await?
+        } else {
+            self.publish_client
+                .publish_event_for_account(
                     &self.account_id,
-                    self.publish_client.as_ref(),
                     request.target.endpoints(),
                     &event,
                     request.required_acks,
                 )
-                .await?
-        } else {
-            self.publish_client
-                .publish_event(request.target.endpoints(), &event, request.required_acks)
                 .await?
         };
         let local_fanout_endpoints = if !outcome.accepted.is_empty() {

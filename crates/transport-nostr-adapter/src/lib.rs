@@ -1460,7 +1460,10 @@ impl TransportAdapter for NostrTransportAdapter {
                 .expect("the AccountNotActive guard above proved the account is active");
             // Sends repeat this sync. Keep the committed routes and telemetry
             // intact when nothing changed; failed relay teardown still retries.
-            if routes.groups == sync.group_subscriptions && state.pending_unsubscribes.is_empty() {
+            if routes.groups == sync.group_subscriptions
+                && state.pending_unsubscribes.is_empty()
+                && state.pending_scoped_unsubscribes.is_empty()
+            {
                 return Ok(());
             }
             // A sync amends the live activation's route set; it does not open a

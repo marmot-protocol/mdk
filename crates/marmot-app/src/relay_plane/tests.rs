@@ -3273,135 +3273,248 @@ impl nostr_relay_builder::prelude::WritePolicy for PublicAckGate {
     }
 }
 
-/// Quorum success must retry observed auth rejections without losing receipts.
+#[derive(Clone, Copy)]
+enum PublishCompletion {
+    Return,
+    Hold,
+}
+
+struct ObservedPublishClient {
+    inner: NostrSdkRelayClient,
+    account_id: MemberId,
+    attempts: Mutex<Vec<TransportEndpoint>>,
+    completed: AtomicUsize,
+    completion: PublishCompletion,
+}
+
+impl ObservedPublishClient {
+    async fn new(completion: PublishCompletion) -> Self {
+        let keys = nostr::Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let inner = NostrSdkRelayClient::multi_account();
+        inner
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        Self {
+            inner,
+            account_id,
+            attempts: Mutex::new(Vec::new()),
+            completed: AtomicUsize::new(0),
+            completion,
+        }
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for ObservedPublishClient {
+    async fn subscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.subscribe(subscription).await
+    }
+
+    async fn unsubscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.unsubscribe(subscription).await
+    }
+
+    async fn unsubscribe_account(&self, account: &MemberId) -> Result<(), TransportAdapterError> {
+        self.inner.unsubscribe_account(account).await
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.inner
+            .publish_event(endpoints, event, required_acks)
+            .await
+    }
+
+    async fn publish_event_for_account(
+        &self,
+        account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.attempts.lock().await.extend_from_slice(endpoints);
+        let result = self
+            .inner
+            .publish_event_for_account(account_id, endpoints, event, required_acks)
+            .await;
+        if result.is_ok() {
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.completion, PublishCompletion::Hold) {
+                // The real relay accepted, but the caller never observes its
+                // ACK. Cancellation must not preserve the initial rejection.
+                std::future::pending::<()>().await;
+            }
+        }
+        result
+    }
+}
+
 #[tokio::test]
-async fn retry_auth_after_quorum() {
+async fn publish_auth_receipts() {
     use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
-    use nostr_sdk::prelude::{EventBuilder, Keys, Kind, RelayMessage, RelayPoolNotification};
-    use tokio::sync::Semaphore;
-    use tokio::time::{sleep, timeout};
 
-    let gate = PublicAckGate(Arc::new(Semaphore::new(0)));
-    let public = LocalRelay::new(RelayBuilder::default().write_policy(gate.clone()));
+    let public = LocalRelay::new(RelayBuilder::default());
     let auth = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
         mode: RelayBuilderNip42Mode::Write,
     }));
     public.run().await.unwrap();
     auth.run().await.unwrap();
-    let auth_url = auth.url().await;
     let endpoints = vec![
         TransportEndpoint(public.url().await.to_string()),
-        TransportEndpoint(auth_url.to_string()),
+        TransportEndpoint(auth.url().await.to_string()),
     ];
     let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
-    let fallback =
-        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(Keys::generate()).build());
-    let account = MemberId::new(vec![0xA1; 32]);
-    let adapter = plane.account_adapter(account.clone(), Arc::new(fallback.clone()));
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: endpoints.clone(),
-            group_subscriptions: Vec::new(),
-            since: None,
-        })
-        .await
+    let fallback = Arc::new(ObservedPublishClient::new(PublishCompletion::Return).await);
+    let adapter = plane.account_adapter(fallback.account_id.clone(), fallback.clone());
+    let signed = nostr::EventBuilder::new(Kind::TextNote, "mixed quorum")
+        .sign_with_keys(&nostr::Keys::generate())
         .unwrap();
-    timeout(Duration::from_secs(5), async {
-        while plane.relay_health().await.connected != 2 {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
+    let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+    let outcome = timeout(
+        Duration::from_secs(10),
+        adapter.publish_signed_event(fallback.as_ref(), &endpoints, &event, 2),
+    )
     .await
+    .unwrap()
     .unwrap();
-
-    for accepted_count in [2, 1] {
-        if accepted_count == 1 {
-            fallback.client().shutdown().await;
-        }
-        let mut notifications = plane
-            .inner
-            .transport
-            .sdk_relay_client
-            .as_ref()
-            .unwrap()
-            .client()
-            .notifications();
-        let auth_url = auth_url.clone();
-        let release = gate.0.clone();
-        let rejection_gate = tokio::spawn(async move {
-            timeout(Duration::from_secs(5), async {
-                // Match SDK_RELAY_PUBLISH_ATTEMPTS: do not release the public
-                // ACK until all shared-client auth rejections were observed.
-                let mut rejected = 0;
-                while rejected < 3 {
-                    if let RelayPoolNotification::Message {
-                        relay_url,
-                        message:
-                            RelayMessage::Ok {
-                                status: false,
-                                message,
-                                ..
-                            },
-                        ..
-                    } = notifications.recv().await.unwrap()
-                        && relay_url == auth_url
-                        && message.starts_with("auth-required:")
-                    {
-                        rejected += 1;
-                    }
-                }
-                release.add_permits(1);
-            })
-            .await
-            .expect("three auth rejections before public acknowledgement");
-        });
-        let signed = EventBuilder::new(Kind::TextNote, "auth quorum regression")
-            .sign_with_keys(&Keys::generate())
-            .unwrap();
-        let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
-        let outcome = timeout(
-            Duration::from_secs(10),
-            plane.publish_signed_event(&account, &fallback, &endpoints, &event, 1),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        rejection_gate.await.unwrap();
-        assert_eq!(
-            outcome.message_id,
-            Some(MessageId::new(signed.id.to_bytes().to_vec()))
-        );
-        assert_eq!(outcome.accepted.len(), accepted_count);
-        assert!(
-            outcome
-                .accepted
-                .iter()
-                .any(|receipt| receipt.endpoint == endpoints[0])
-        );
-        if accepted_count == 2 {
-            assert!(
-                outcome
-                    .accepted
-                    .iter()
-                    .any(|receipt| receipt.endpoint == endpoints[1])
-            );
-            assert!(outcome.failed.is_empty());
-        } else {
-            assert_eq!(outcome.failed.len(), 1);
-            assert_eq!(outcome.failed[0].endpoint, endpoints[1]);
-            assert_eq!(
-                outcome.failed[0].rejection_category,
-                Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired)
-            );
-        }
-    }
+    assert_eq!(
+        outcome.message_id,
+        Some(MessageId::new(signed.id.to_bytes().to_vec()))
+    );
+    assert_eq!(
+        outcome
+            .accepted
+            .iter()
+            .map(|receipt| receipt.endpoint.clone())
+            .collect::<HashSet<_>>(),
+        endpoints.iter().cloned().collect()
+    );
+    assert!(outcome.failed.is_empty());
+    assert_eq!(*fallback.attempts.lock().await, vec![endpoints[1].clone()]);
+    fallback.inner.shutdown_accounts().await;
+    fallback.inner.client().shutdown().await;
     plane.shutdown().await;
 }
 
 #[tokio::test]
-async fn shared_publish_pins_signer() {
+async fn publish_auth_deadline() {
+    use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
+    use nostr_relay_builder::{LocalRelay, RelayBuilder};
+
+    let gate = PublicAckGate(Arc::new(tokio::sync::Semaphore::new(0)));
+    let public = LocalRelay::new(RelayBuilder::default().write_policy(gate.clone()));
+    let first = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+        mode: RelayBuilderNip42Mode::Write,
+    }));
+    let second = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+        mode: RelayBuilderNip42Mode::Write,
+    }));
+    public.run().await.unwrap();
+    first.run().await.unwrap();
+    second.run().await.unwrap();
+    let public_url = public.url().await;
+    let endpoints = vec![
+        TransportEndpoint(public_url.to_string()),
+        TransportEndpoint(first.url().await.to_string()),
+        TransportEndpoint(second.url().await.to_string()),
+    ];
+    let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
+    let fallback = Arc::new(ObservedPublishClient::new(PublishCompletion::Hold).await);
+    let adapter = plane.account_adapter(fallback.account_id.clone(), fallback.clone());
+    let mut notifications = adapter
+        .anonymous_publish_client
+        .as_ref()
+        .unwrap()
+        .client()
+        .notifications();
+    let signed = nostr::EventBuilder::new(Kind::TextNote, "one total deadline")
+        .sign_with_keys(&nostr::Keys::generate())
+        .unwrap();
+    let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+    let publisher = fallback.clone();
+    let targets = endpoints.clone();
+    let started = tokio::time::Instant::now();
+    let publication = tokio::spawn(async move {
+        adapter
+            .publish_signed_event(publisher.as_ref(), &targets, &event, 1)
+            .await
+    });
+    timeout(Duration::from_secs(10), async {
+        while fallback.completed.load(Ordering::SeqCst) != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both authenticated publications must run concurrently");
+    gate.0.add_permits(1);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let RelayPoolNotification::Message {
+                relay_url,
+                message: RelayMessage::Ok { status: true, .. },
+                ..
+            } = notifications.recv().await.unwrap()
+                && relay_url == public_url
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the public relay must acknowledge before the deadline");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !publication.is_finished(),
+        "observed auth rejections must still be retried after quorum"
+    );
+    tokio::time::pause();
+    tokio::time::advance(
+        ACCOUNT_PUBLISH_WAIT.saturating_sub(started.elapsed()) + Duration::from_millis(10),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    assert!(
+        publication.is_finished(),
+        "auth must not start a fresh publication budget"
+    );
+    let outcome = publication.await.unwrap().unwrap();
+    tokio::time::resume();
+    assert_eq!(
+        outcome.message_id,
+        Some(MessageId::new(signed.id.to_bytes().to_vec()))
+    );
+    assert_eq!(outcome.accepted.len(), 1);
+    assert_eq!(outcome.accepted[0].endpoint, endpoints[0]);
+    let failures = &outcome.failed;
+    assert_eq!(failures.len(), 2);
+    for endpoint in endpoints.into_iter().skip(1) {
+        let failure = failures
+            .iter()
+            .find(|failure| failure.endpoint == endpoint)
+            .unwrap();
+        assert_eq!(failure.kind, TransportEndpointFailureKind::PossiblyExposed);
+        assert_eq!(failure.rejection_category, None);
+    }
+    fallback.inner.shutdown_accounts().await;
+    fallback.inner.client().shutdown().await;
+    plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn publish_allows_independent_account_registration() {
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
     use nostr_sdk::prelude::{EventBuilder, Keys};
     use tokio::sync::Semaphore;
@@ -3412,12 +3525,15 @@ async fn shared_publish_pins_signer() {
     relay.run().await.unwrap();
     let endpoints = vec![TransportEndpoint(relay.url().await.to_string())];
     let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
-    let first = Keys::generate();
+    let first = Arc::new(Keys::generate());
     let account = MemberId::new(first.public_key().to_bytes().to_vec());
     let fallback = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
     fallback.client().shutdown().await;
     let adapter = plane.account_adapter(account.clone(), Arc::new(fallback.clone()));
-    plane.set_transport_signer(Arc::new(first.clone())).await;
+    plane
+        .set_transport_signer(&account, first.clone())
+        .await
+        .unwrap();
     adapter
         .activate_account(TransportAccountActivation {
             account_id: account.clone(),
@@ -3434,39 +3550,24 @@ async fn shared_publish_pins_signer() {
     })
     .await
     .unwrap();
-    let signed = EventBuilder::new(Kind::TextNote, "signer lease")
+    let signed = EventBuilder::new(Kind::TextNote, "independent publisher")
         .sign_with_keys(&Keys::generate())
         .unwrap();
     let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
-    let publication = plane.publish_signed_event(&account, &fallback, &endpoints, &event, 1);
+    let publication = adapter.publish_signed_event(&fallback, &endpoints, &event, 1);
     tokio::pin!(publication);
     assert!(futures::poll!(&mut publication).is_pending());
-    assert!(
-        plane
-            .inner
-            .transport
-            .publication_signer
-            .try_write()
-            .is_err()
-    );
 
-    let second = Keys::generate();
+    let second = Arc::new(Keys::generate());
     let second_id = MemberId::new(second.public_key().to_bytes().to_vec());
     let second_adapter = plane.account_adapter(second_id.clone(), Arc::new(fallback.clone()));
-    let replacement = plane.set_transport_signer(Arc::new(second.clone()));
-    tokio::pin!(replacement);
-    assert!(futures::poll!(&mut replacement).is_pending());
-    let sdk = plane.inner.transport.sdk_relay_client.as_ref().unwrap();
-    assert_eq!(
-        sdk.client()
-            .signer()
-            .await
-            .unwrap()
-            .get_public_key()
-            .await
-            .unwrap(),
-        first.public_key()
-    );
+    timeout(
+        Duration::from_secs(1),
+        plane.set_transport_signer(&second_id, second.clone()),
+    )
+    .await
+    .expect("an in-flight public write must not block another account's signer")
+    .unwrap();
 
     gate.0.add_permits(1);
     let outcome = timeout(Duration::from_secs(5), publication)
@@ -3474,28 +3575,43 @@ async fn shared_publish_pins_signer() {
         .unwrap()
         .unwrap();
     assert_eq!(outcome.accepted.len(), 1);
-    timeout(Duration::from_secs(5), replacement).await.unwrap();
-    assert_eq!(
-        sdk.client()
-            .signer()
+    let sdk = plane.inner.transport.sdk_relay_client.as_ref().unwrap();
+    sdk.register_account(account.clone(), first.clone())
+        .await
+        .expect("the first account must retain its immutable signer");
+    sdk.register_account(second_id.clone(), second.clone())
+        .await
+        .expect("the second account must retain its own immutable signer");
+    assert!(sdk.register_account(account.clone(), second).await.is_err());
+    assert!(
+        sdk.register_account(second_id.clone(), first)
             .await
+            .is_err()
+    );
+    assert!(
+        plane
+            .inner
+            .transport
+            .directory_client
+            .as_ref()
             .unwrap()
-            .get_public_key()
+            .relays()
             .await
-            .unwrap(),
-        second.public_key()
+            .is_empty(),
+        "account publication must not connect the anonymous directory client"
     );
 
-    // Returning to one account must not reuse a pool with the other signer.
+    // Returning to one account must retain its anonymous publisher after
+    // another account registered its independent receive context.
     second_adapter.deactivate_account(&second_id).await.unwrap();
-    assert!(
-        timeout(
-            Duration::from_secs(5),
-            plane.publish_signed_event(&account, &fallback, &endpoints, &event, 1),
-        )
-        .await
-        .unwrap()
-        .is_err()
-    );
+    gate.0.add_permits(1);
+    let outcome = timeout(
+        Duration::from_secs(5),
+        adapter.publish_signed_event(&fallback, &endpoints, &event, 1),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.accepted.len(), 1);
     plane.shutdown().await;
 }
