@@ -66,12 +66,19 @@ fn inbound_wire_metadata(
     }
 }
 
+mod acquisition;
 mod key_package;
 mod relay_list;
 #[cfg(feature = "sdk")]
 mod sdk_client;
 mod telemetry;
 
+pub use acquisition::{
+    NostrAcquisitionCancellation, NostrAcquisitionCorrelation, NostrAcquisitionEnd,
+    NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
+    NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats,
+    NostrNotificationLoss, NostrNotificationLossScope,
+};
 pub use key_package::{
     CLIENT_TAG, KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication, NostrKeyPackagePublisher,
 };
@@ -447,6 +454,29 @@ impl AccountSubscriptionEose {
 /// Boundary between this adapter and the actual Nostr relay implementation.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
+    /// Optional bounded, request-scoped history operation. Implementations must
+    /// validate the complete owned request before issuing any network work and
+    /// return one terminal outcome for every requested endpoint. Cancellation
+    /// closes only this request's subscriptions, never live interests.
+    async fn acquire_history(
+        &self,
+        _request: NostrAcquisitionRequest,
+        _cancellation: NostrAcquisitionCancellation,
+    ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
+        Err(NostrAcquisitionError::Unsupported)
+    }
+
+    /// Independent, cumulative control signal for notification-channel loss.
+    /// A watch receiver coalesces updates, so skipped counts must be cumulative
+    /// within the reported receiver scope. The current SDK backend explicitly
+    /// lacks this capability until its production migration.
+    fn notification_loss(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        Err(NostrAcquisitionError::Unsupported)
+    }
+
     async fn subscribe(&self, subscription: NostrSubscription)
     -> Result<(), TransportAdapterError>;
 
@@ -567,6 +597,28 @@ impl NostrTransportAdapter {
             subscription_lock: Arc::new(Mutex::new(())),
             monotonic_start: std::time::Instant::now(),
         }
+    }
+
+    /// Request owned, bounded transport evidence without borrowing adapter
+    /// routing state across the network wait. Admission and completion remain
+    /// with the account worker and recovery owner.
+    pub async fn acquire_history(
+        &self,
+        request: NostrAcquisitionRequest,
+        cancellation: NostrAcquisitionCancellation,
+    ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
+        request.validate()?;
+        self.relay_client
+            .acquire_history(request, cancellation)
+            .await
+    }
+
+    /// Observe receiver-scoped loss independently of the event-delivery queue.
+    pub fn notification_loss(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        self.relay_client.notification_loss()
     }
 
     pub async fn metrics(&self) -> NostrAdapterMetrics {

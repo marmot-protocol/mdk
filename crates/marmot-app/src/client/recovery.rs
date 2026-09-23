@@ -1476,6 +1476,68 @@ impl AppClient {
 mod tests {
     use super::*;
 
+    #[test]
+    fn owned_transport_evidence_can_be_staged_without_completing_recovery() {
+        use transport_nostr_adapter::{
+            NostrAcquisitionCorrelation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
+            NostrAcquisitionResult, NostrAcquisitionStats, SubscriptionAttempt,
+        };
+
+        let (storage, mut owner, now) = fixture();
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+            .unwrap()
+            .unwrap();
+        let event = transport_nostr_peeler::NostrTransportEvent {
+            id: "03".repeat(32),
+            pubkey: "04".repeat(32),
+            created_at: 1,
+            kind: 445,
+            tags: Vec::new(),
+            content: "owned transport bytes".into(),
+            sig: None,
+        };
+        let evidence = NostrAcquisitionResult {
+            correlation: NostrAcquisitionCorrelation {
+                account_id: cgka_traits::MemberId::new(vec![7; 32]),
+                attempt_serial: grant.reservation.attempt_serial,
+                obligation_id: grant.fence.obligations[0].0,
+                scope_id: 9,
+                scope_revision: grant.fence.obligations[0].1,
+                subscription_attempt: SubscriptionAttempt::INITIAL,
+            },
+            endpoints: vec![NostrAcquisitionEndpoint {
+                endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+                session_generation: Some(12),
+                events: vec![event.clone()],
+                end: NostrAcquisitionEnd::ByteLimitReached,
+                stats: NostrAcquisitionStats::default(),
+            }],
+        };
+
+        // The future executor can own this value across its network wait and
+        // hand events to the worker. The existing grant/fence remains the
+        // owner's authority; this incomplete endpoint cannot clear demand.
+        assert_eq!(
+            evidence.correlation.attempt_serial,
+            grant.reservation.attempt_serial
+        );
+        assert_eq!(evidence.endpoints[0].session_generation, Some(12));
+        assert_eq!(
+            evidence.endpoints[0].end,
+            NostrAcquisitionEnd::ByteLimitReached
+        );
+        assert!(!grant.fence.obligations.is_empty());
+        let mut endpoints = evidence.endpoints;
+        let worker_input = endpoints
+            .iter_mut()
+            .flat_map(|endpoint| std::mem::take(&mut endpoint.events))
+            .collect::<Vec<_>>();
+        assert_eq!(worker_input, vec![event]);
+        assert_eq!(endpoints[0].end, NostrAcquisitionEnd::ByteLimitReached);
+        assert!(!storage.pending_recovery_demands().unwrap().is_empty());
+    }
+
     fn fixture() -> (SqliteAccountStorage, AccountRecoveryOwner, Instant) {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         storage.ensure_account_projection("alice").unwrap();

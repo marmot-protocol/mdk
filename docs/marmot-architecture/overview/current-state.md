@@ -19,6 +19,12 @@ status: overview
 
 # Current State — Implementations & Spec
 
+The Nostr relay-client boundary now declares optional owned bounded acquisition
+and receiver-scoped notification-loss evidence. The production SDK client
+returns explicit unsupported results until #1358 adopts the qualified backend;
+the recovery owner and account worker still use their existing execution path.
+See [the interface contract](nostr-bounded-acquisition-interface.md).
+
 C6a resolves accepted kind-1009 edits in the durable timeline once, sharing effective text with reply and chat-list
 previews. Compact metadata is part of native conversation rows; accepted edit history is a separate paged query.
 Migration 76 repairs existing projections. Raw edit events remain available, but edits are no longer transcript rows.
