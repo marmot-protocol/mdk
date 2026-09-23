@@ -836,9 +836,10 @@ async fn minimal_relay_repair_restart_preserves_preview_and_retries_exact_signed
         .retry_onboarding_step(&id, OnboardingStep::Relays)
         .await
         .unwrap();
-    let attempts = network.attempts.lock().unwrap();
-    assert!(attempts.len() >= 2 && attempts.iter().all(|event| event == &published));
-    drop(attempts);
+    {
+        let attempts = network.attempts.lock().unwrap();
+        assert!(attempts.len() >= 2 && attempts.iter().all(|event| event == &published));
+    }
     third.shutdown_and_close().await.unwrap();
 }
 
