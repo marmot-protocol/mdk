@@ -183,3 +183,10 @@ and superseded checks, and the remaining blocking acquisition limitations.
   including the new lifetime regression and the snapshot-drop assertion. The bounds
   inventory distinguishes fixed active inventory limits from input-relative
   unresolved historical goals; no old route or unresolved event is evicted for a cap.
+- Qualified local evidence reconciliation: a new red regression showed the WIP
+  sampler still rejected unrelated global inventory revisions, contrary to #1987's
+  scope-specific retention fences. It now validates installed scope proof; actual
+  overlapping removal still rejects evidence. Tests perform real route/window
+  inventory retirement rather than manually incrementing a global counter. All
+  6 storage stall tests pass, including loss/route/overlap rejection, unrelated
+  eviction, distinct observations, reopen, clock correction and rollback.

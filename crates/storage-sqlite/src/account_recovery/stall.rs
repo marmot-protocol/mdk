@@ -72,10 +72,12 @@ impl SqliteAccountStorage {
             for (scope, scope_revision, format, bytes, ready) in scopes {
                 let Some(bytes) = bytes.filter(|_| ready == 1) else { return Ok(None); };
                 let payload = plan::decode_scope(format, &bytes)?;
+                // Retention invalidates the affected scope token/proof. An
+                // unrelated account inventory change cannot erase a valid
+                // local blocked-engine observation under this installed scope.
                 if payload.obligation_revision != i64_to_u64(revision)?
                     || payload.loss_revision != current.loss_revision
                     || payload.route_revision != current.route_revision
-                    || payload.inventory_revision != current.inventory_revision
                     || !plan::payload_is_qualified(&payload, 0, false)
                 { return Ok(None); }
                 coverage.push((scope, scope_revision));
@@ -328,6 +330,39 @@ mod tests {
     }
 
     #[test]
+    fn qualified_stall_survives_unrelated_inventory_retirement() {
+        for (route, at) in [([4_u8; 32], 50_i64), ([3_u8; 32], 101_i64)] {
+            let store = fixture();
+            qualify(&store);
+            assert!(observe(&store, 1).is_some());
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO transport_reconciliation_items VALUES(1,?1,zeroblob(32),?2)",
+                    params![route.as_slice(), at],
+                )
+                .unwrap();
+            store
+                .connection
+                .with_transaction(|| {
+                    let conn = store.lock()?;
+                    crate::account_recovery::delete_inventory_tx(
+                        &conn,
+                        "event_id=zeroblob(32)",
+                        &[],
+                    )?;
+                    Ok::<_, StorageError>(())
+                })
+                .unwrap();
+            let sample = observe(&store, 3_600_001)
+                .expect("unrelated eviction must not suppress valid blocked-engine evidence");
+            assert_eq!(sample.evidence.fruitless_completions, 2);
+            assert_eq!(store.recovery_retry_state().unwrap().attempt_serial, 1);
+        }
+    }
+
+    #[test]
     fn qualified_stall_rejects_new_loss_route_and_inventory_changes() {
         for invalidation in 0..3 {
             let store = fixture();
@@ -341,7 +376,19 @@ mod tests {
                     store.observe_recovery_route_snapshot([7; 32]).unwrap();
                 }
                 _ => {
-                    store.lock().unwrap().execute("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1", []).unwrap();
+                    store.lock().unwrap().execute("INSERT INTO transport_reconciliation_items VALUES(1,?1,zeroblob(32),50)", [[3_u8; 32].as_slice()]).unwrap();
+                    store
+                        .connection
+                        .with_transaction(|| {
+                            let conn = store.lock()?;
+                            crate::account_recovery::delete_inventory_tx(
+                                &conn,
+                                "event_id=zeroblob(32)",
+                                &[],
+                            )?;
+                            Ok::<_, StorageError>(())
+                        })
+                        .unwrap();
                 }
             }
             assert!(observe(&store, 3_600_001).is_none());
