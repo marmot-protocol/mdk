@@ -75,12 +75,48 @@ pub(crate) struct DeferredPeelSweep<'a> {
 /// failures are not cached and can be retried normally.
 #[derive(Default)]
 pub(super) struct PastPeelContextCache {
-    contexts: Mutex<HashMap<String, Option<Arc<PastPeelContext>>>>,
+    contexts: Mutex<PastPeelContexts>,
 }
+
+/// Contexts by anchor snapshot name; `None` marks an anchor found inactive.
+type PastPeelContexts = HashMap<String, Option<Arc<PastPeelContext>>>;
 
 struct PastPeelContext {
     context: cgka_traits::group_context::GroupContextSnapshot,
     message_retention_seconds: Option<u64>,
+}
+
+impl PastPeelContextCache {
+    /// `None` on a miss; `Some(None)` for an anchor already found inactive.
+    fn get(
+        &self,
+        snapshot_name: &str,
+    ) -> Result<Option<Option<Arc<PastPeelContext>>>, EngineError> {
+        Ok(self.contexts()?.get(snapshot_name).cloned())
+    }
+
+    fn insert(
+        &self,
+        snapshot_name: &str,
+        context: Option<Arc<PastPeelContext>>,
+    ) -> Result<(), EngineError> {
+        self.contexts()?.insert(snapshot_name.to_owned(), context);
+        Ok(())
+    }
+
+    fn contexts(&self) -> Result<std::sync::MutexGuard<'_, PastPeelContexts>, EngineError> {
+        self.contexts
+            .lock()
+            .map_err(|_| EngineError::Backend("past peel cache poisoned".into()))
+    }
+}
+
+/// What re-attempting a failed peel found, and how many retained-anchor
+/// contexts it had to derive by rewinding live state because no cache held
+/// them.
+struct RecoveryPeel {
+    recovery: Option<PastPeelRecovery>,
+    derived_contexts: u64,
 }
 
 impl<'a> DeferredPeelSweep<'a> {
@@ -651,7 +687,11 @@ impl<S: StorageProvider> Engine<S> {
                     )
                     .await
                 {
-                    Ok(recovered) => recovered,
+                    Ok(peel) => {
+                        self.engine_metrics
+                            .note_past_peel_context_derivations(peel.derived_contexts);
+                        peel.recovery
+                    }
                     // Defense-in-depth for the public TransportPeeler
                     // contract: a malformed or invalid-signature verdict
                     // raised only by the snapshot fallback is terminal on
@@ -782,7 +822,11 @@ impl<S: StorageProvider> Engine<S> {
                     )
                     .await
                 {
-                    Ok(recovered) => recovered,
+                    Ok(peel) => {
+                        self.engine_metrics
+                            .note_past_peel_context_derivations(peel.derived_contexts);
+                        peel.recovery
+                    }
                     // Defense-in-depth for the public TransportPeeler
                     // contract: a malformed or invalid-signature verdict
                     // raised only by the snapshot fallback is terminal on
@@ -2835,18 +2879,21 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         current_epoch: EpochId,
         sweep: DeferredPeelSweep<'_>,
-    ) -> Result<Option<PastPeelRecovery>, EngineError> {
+    ) -> Result<RecoveryPeel, EngineError> {
         for (index, branch) in sweep.branch_contexts().iter().enumerate() {
             match self.peeler.peel_group_message(msg, &branch.context).await {
                 Ok(peeled) => {
-                    return Ok(Some(PastPeelRecovery {
-                        peeled,
-                        source_epoch: EpochId(branch.tip_epoch),
-                        source: PeelRecoverySource::CandidateBranch {
-                            branch_id: branch.branch_id.clone(),
-                        },
-                        attempt_count: index as u64 + 1,
-                    }));
+                    return Ok(RecoveryPeel {
+                        recovery: Some(PastPeelRecovery {
+                            peeled,
+                            source_epoch: EpochId(branch.tip_epoch),
+                            source: PeelRecoverySource::CandidateBranch {
+                                branch_id: branch.branch_id.clone(),
+                            },
+                            attempt_count: index as u64 + 1,
+                        }),
+                        derived_contexts: 0,
+                    });
                 }
                 Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => continue,
                 Err(err) => return Err(EngineError::Peeler(err)),
@@ -2867,53 +2914,64 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         current_epoch: EpochId,
         cache: Option<&PastPeelContextCache>,
-    ) -> Result<Option<PastPeelRecovery>, EngineError> {
+    ) -> Result<RecoveryPeel, EngineError> {
         let snapshots = self.available_past_peel_snapshots(group_id)?;
         let mut attempt_count = 0_u64;
+        let mut derived_contexts = 0_u64;
         for (source_epoch, snapshot_name) in snapshots {
             if source_epoch >= current_epoch {
                 continue;
             }
             attempt_count = attempt_count.saturating_add(1);
-            let context = self.past_peel_context(group_id, &snapshot_name, cache)?;
+            let cached = match cache {
+                Some(cache) => cache.get(&snapshot_name)?,
+                None => None,
+            };
+            let context = match cached {
+                Some(context) => context,
+                None => {
+                    derived_contexts = derived_contexts.saturating_add(1);
+                    let context = self.derive_past_peel_context(group_id, &snapshot_name)?;
+                    if let Some(cache) = cache {
+                        cache.insert(&snapshot_name, context.clone())?;
+                    }
+                    context
+                }
+            };
             let Some(context) = context else {
                 continue;
             };
             let peeled = self.peeler.peel_group_message(msg, &context.context).await;
             match peeled {
                 Ok(peeled) => {
-                    return Ok(Some(PastPeelRecovery {
-                        peeled,
-                        source_epoch,
-                        source: PeelRecoverySource::RetainedAnchor {
-                            snapshot_name,
-                            message_retention_seconds: context.message_retention_seconds,
-                        },
-                        attempt_count,
-                    }));
+                    return Ok(RecoveryPeel {
+                        recovery: Some(PastPeelRecovery {
+                            peeled,
+                            source_epoch,
+                            source: PeelRecoverySource::RetainedAnchor {
+                                snapshot_name,
+                                message_retention_seconds: context.message_retention_seconds,
+                            },
+                            attempt_count,
+                        }),
+                        derived_contexts,
+                    });
                 }
                 Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => continue,
                 Err(err) => return Err(EngineError::Peeler(err)),
             }
         }
-        Ok(None)
+        Ok(RecoveryPeel {
+            recovery: None,
+            derived_contexts,
+        })
     }
 
-    fn past_peel_context(
+    fn derive_past_peel_context(
         &self,
         group_id: &GroupId,
         snapshot_name: &str,
-        cache: Option<&PastPeelContextCache>,
     ) -> Result<Option<Arc<PastPeelContext>>, EngineError> {
-        if let Some(cache) = cache {
-            let contexts = cache
-                .contexts
-                .lock()
-                .map_err(|_| EngineError::Backend("past peel cache poisoned".into()))?;
-            if let Some(context) = contexts.get(snapshot_name) {
-                return Ok(context.clone());
-            }
-        }
         // Restore live state before calling an async peeler. Contexts own only
         // the exporter material and authenticated retention policy they need.
         let mut hasher = Sha256::new();
@@ -2928,20 +2986,12 @@ impl<S: StorageProvider> Engine<S> {
         )?;
         let context = self.context_from_group_snapshot(group_id, snapshot_name);
         guard.commit()?;
-        let context = context?.map(|(context, message_retention_seconds)| {
+        Ok(context?.map(|(context, message_retention_seconds)| {
             Arc::new(PastPeelContext {
                 context,
                 message_retention_seconds,
             })
-        });
-        if let Some(cache) = cache {
-            cache
-                .contexts
-                .lock()
-                .map_err(|_| EngineError::Backend("past peel cache poisoned".into()))?
-                .insert(snapshot_name.to_owned(), context.clone());
-        }
-        Ok(context)
+        }))
     }
 
     fn has_retained_anchor_snapshot(

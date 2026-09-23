@@ -314,6 +314,9 @@ pub(crate) fn merge_engine_metrics(
     target.deferred_peel_candidate_cache_invalidations = target
         .deferred_peel_candidate_cache_invalidations
         .saturating_add(source.deferred_peel_candidate_cache_invalidations);
+    target.past_peel_context_derivations = target
+        .past_peel_context_derivations
+        .saturating_add(source.past_peel_context_derivations);
     merge_histogram(
         &mut target.deferred_peel_candidate_enumeration_ms,
         &source.deferred_peel_candidate_enumeration_ms,
@@ -466,6 +469,7 @@ mod tests {
             deferred_peel_candidate_cache_hits: 54,
             deferred_peel_candidate_cache_misses: 55,
             deferred_peel_candidate_cache_invalidations: 56,
+            past_peel_context_derivations: 70,
             deferred_peel_candidate_enumeration_ms: histogram(57, 58, 59),
             deferred_peel_row_capacity_refusals: 60,
             deferred_peel_group_byte_capacity_refusals: 61,
