@@ -8,7 +8,7 @@ publish = false
 [workspace]
 
 [dependencies]
-nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "e08022dc4fa588e8effbe8eb4b4238e7871cbd14", features = ["local-relay"] }
+nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "53a3fa447068bdd010606cd368d4ccad456eb761", features = ["local-relay"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 futures-util = "0.3"
 tokio-tungstenite = "0.26"

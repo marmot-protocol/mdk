@@ -7,7 +7,7 @@ fork SDK. It is an opt-in Cargo workspace. MDK's production dependency graph,
 recovery owner, scheduler, peeler, schema, and bindings are not changed here.
 Only loopback WebSocket relays and synthetic signed events are used.
 The qualified SDK integration revision is
-`e08022dc4fa588e8effbe8eb4b4238e7871cbd14`.
+`53a3fa447068bdd010606cd368d4ccad456eb761`.
 
 The test-only `CandidateRelay` implements the existing `NostrRelayClient`
 subscription and publication seam, and the test activates accounts through
@@ -136,5 +136,10 @@ asserts live delivery on Alice's restored subscription, live delivery on Bob's
 unrelated subscription, a new Alice socket, no new Bob query socket, unchanged
 Bob authenticator count, and denied cross-account reads after reconnect.
 The SDK's teardown-barrier tests force the old task to retain ownership and
-check queued reconnection and the one-shot state error. Twelve consecutive
-local runs of the active MDK regression passed at the final SDK pin.
+check queued reconnection and the one-shot state error. The final SDK review
+fix reserves connection ownership before dialing, so a discarded handshake
+cannot report `Connected`. It also clears an old termination signal before a
+replacement starts. The legacy fetch and stream await paths preserve partial
+results on timeout and disconnect; their reporting variants retain typed
+terminal outcomes. The active MDK regression passed twelve consecutive local
+runs at this final SDK pin.
