@@ -266,6 +266,20 @@ impl Marmot {
             .await?
             .into())
     }
+    /// Preview an exact, minimal relay-list repair without signing or publishing.
+    /// A manual-review preview has no approvable action.
+    pub async fn propose_onboarding_relay_repair(
+        &self,
+        account_ref: String,
+        step: OnboardingStepFfi,
+    ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .accounts()
+            .propose_onboarding_relay_repair(&account_ref, step.into())
+            .await?
+            .into())
+    }
     pub async fn cancel_onboarding_repair(
         &self,
         account_ref: String,

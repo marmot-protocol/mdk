@@ -537,7 +537,13 @@ Imported identities can use the durable preflight API instead of `login`:
 3. Localize the typed status, findings, and actions. A healthy account advances
    automatically until the single-device acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
    explicit `continue_onboarding_without`. Empty follow lists are valid.
-4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
+4. `propose_onboarding_relay_repair` previews the smallest safe change to a
+   general or inbox relay declaration, preserving the original ordered tags,
+   duplicate/custom entries, direction markers, and content. Show its typed
+   before/after diff and repair mode. `ManualReview` cannot be approved; prefill
+   a manual editor from the original tags or offer a separately labeled reset.
+   No proposal signs or publishes until explicit approval. The older
+   `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
    a proposal. Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned

@@ -37,6 +37,15 @@ nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
 The catalog includes C-only compatibility shims; prefer the v4 audit configuration
 setter and the composable runtime options constructor for new integrations.
 
+For a general or inbox onboarding relay failure, call
+`marmot_propose_onboarding_relay_repair` and inspect the optional
+`proposal->relay_repair` in the returned snapshot. Its ordered before/after
+tags and occurrence changes preserve duplicate entries, direction markers,
+unrelated fields, and content. `ManualReview` has no approval action; do not
+publish it or treat it as a full reset. Free the snapshot with
+`marmot_onboarding_snapshot_free` after presenting the exact diff. Approval
+remains a separate revision- and recovery-epoch-bound call.
+
 ## What you get
 
 - `libmarmot_c.so` / `libmarmot_c.a` (cdylib + staticlib).

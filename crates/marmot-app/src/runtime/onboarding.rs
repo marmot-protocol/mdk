@@ -9,6 +9,7 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 mod cancellation;
 mod recovery;
+mod relay_repair;
 mod single_device;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +187,80 @@ pub struct OnboardingStepState {
     pub actions: Vec<OnboardingAction>,
     pub checked_at: Option<u64>,
 }
+/// How a relay entry's original NIP-65 marker or inbox tag is interpreted.
+/// `Other` covers unrelated tags and malformed/future relay markers; callers
+/// must keep `fields` rather than reconstructing an event from this enum.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingRelayTagRole {
+    Other,
+    Unmarked,
+    Read,
+    Write,
+    Inbox,
+}
+
+/// A single tag in its exact event order, including duplicate and non-relay tags.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingRelayTag {
+    pub fields: Vec<String>,
+    pub endpoint: Option<String>,
+    pub role: OnboardingRelayTagRole,
+}
+
+/// Whether a consent-gated minimal proposal changes an exact tag occurrence.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingRelayTagDisposition {
+    Retained,
+    Removed,
+    Added,
+}
+
+/// The missing route capability supplied by an added tag.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingRelayCapability {
+    None,
+    Read,
+    Write,
+    ReadAndWrite,
+    Inbox,
+}
+
+/// One exact before/after tag occurrence and its effect on route capability.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingRelayTagChange {
+    pub disposition: OnboardingRelayTagDisposition,
+    pub before_index: Option<u64>,
+    pub after_index: Option<u64>,
+    pub fields: Vec<String>,
+    pub endpoint: Option<String>,
+    pub role: OnboardingRelayTagRole,
+    pub restores: OnboardingRelayCapability,
+}
+
+/// A lossless, non-publishing preview. `ManualReview` is intentionally not
+/// approvable; hosts may prefill an editor from `before_tags` but cannot sign
+/// an empty or guessed replacement through this preview.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingRelayRepairMode {
+    ManualReview,
+    RemovalOnly,
+    Additive,
+    RemovalAndAdditive,
+}
+
+/// Exact signed-declaration source and proposed replacement for user review.
+/// Both tag arrays include unrelated fields in order; content is never edited.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingRelayRepair {
+    pub mode: OnboardingRelayRepairMode,
+    pub original_event_id: Option<String>,
+    pub original_content: String,
+    pub proposed_content: String,
+    pub before_tags: Vec<OnboardingRelayTag>,
+    pub after_tags: Vec<OnboardingRelayTag>,
+    pub changes: Vec<OnboardingRelayTagChange>,
+}
+
 /// The relay declarations that approval will publish. Unknown non-relay tags
 /// and the original event content are retained internally.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,6 +272,8 @@ pub struct OnboardingRepairProposal {
     pub write_relays: Vec<String>,
     pub profile: Option<UserProfileMetadata>,
     pub follows: Option<Vec<String>>,
+    #[serde(default)]
+    pub relay_repair: Option<OnboardingRelayRepair>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingSnapshot {
@@ -1854,6 +1931,7 @@ impl AccountManager {
             write_relays,
             profile: None,
             follows: None,
+            relay_repair: None,
         });
         c.snapshot.steps[step.index()].actions = vec![
             OnboardingAction::ApproveRepair,
@@ -1918,6 +1996,7 @@ impl AccountManager {
             write_relays: Vec::new(),
             profile,
             follows,
+            relay_repair: None,
         });
         c.snapshot.steps[step.index()].actions = vec![
             OnboardingAction::ApproveRepair,
@@ -1987,6 +2066,21 @@ impl AccountManager {
         if c.approved || c.snapshot.revision != revision || proposal.revision != revision {
             return Err(onboarding_error());
         }
+        if let Some(repair) = &proposal.relay_repair {
+            let (expected, read_relays, write_relays) = self.minimal_relay_repair(
+                proposal.step,
+                c.records[proposal.step.index()].as_ref(),
+                &c.options.default_relays,
+            );
+            if expected.mode == OnboardingRelayRepairMode::ManualReview
+                || *repair != expected
+                || proposal.read_relays != read_relays
+                || proposal.write_relays != write_relays
+                || repair.original_event_id != proposal.previous_event_id
+            {
+                return Err(onboarding_error());
+            }
+        }
         let sources = self
             .await_while_onboarding_live(
                 &account_id,
@@ -2039,6 +2133,13 @@ impl AccountManager {
         c: &mut OnboardingCheckpoint,
     ) -> Result<bool, AppError> {
         let proposal = c.snapshot.proposal.clone().ok_or_else(onboarding_error)?;
+        if proposal
+            .relay_repair
+            .as_ref()
+            .is_some_and(|repair| repair.mode == OnboardingRelayRepairMode::ManualReview)
+        {
+            return Err(onboarding_error());
+        }
         let account = self.resolve(&c.snapshot.account_id_hex)?;
         let signer = match self.app.account_signer_for_summary(&account) {
             Ok(signer) => signer.as_nostr_signer(),
@@ -2259,6 +2360,17 @@ fn relay_repair_event(
     proposal: &OnboardingRepairProposal,
 ) -> (Vec<Vec<String>>, String, u64) {
     let previous = c.records[proposal.step.index()].as_ref();
+    if let Some(repair) = &proposal.relay_repair {
+        return (
+            repair
+                .after_tags
+                .iter()
+                .map(|tag| tag.fields.clone())
+                .collect(),
+            repair.proposed_content.clone(),
+            unix_now_seconds().max(previous.map_or(0, |event| event.created_at.saturating_add(1))),
+        );
+    }
     if let Some(profile) = &proposal.profile {
         let mut content = previous
             .and_then(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok())
