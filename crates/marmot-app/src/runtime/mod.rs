@@ -71,6 +71,7 @@ pub use agent_publisher::{
     AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
 };
 mod account_attention;
+mod audit_otlp_delivery;
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -457,7 +458,7 @@ impl RuntimeSharedServices {
             app.config.usage_diagnostics_silent
                 || app.config.cursor_persistence == crate::CursorPersistence::Frozen,
         );
-        let lifecycle = RuntimeLifecycle::new();
+        let lifecycle = RuntimeLifecycle::with_audit_export(app.audit_export_lifecycle.clone());
         let audit_log_tracker_config = app.audit_log_tracker_config.clone();
         let audit_log_tracker_uploader = AuditLogTrackerUploader::new(
             app.clone(),
@@ -707,6 +708,7 @@ struct RuntimeLifecycleInner {
     stop_tx: watch::Sender<bool>,
     active_account_opens: AtomicUsize,
     account_opens_drained: Notify,
+    audit_export: crate::audit_export_lifecycle::AuditExportLifecycle,
 }
 
 pub(crate) struct RuntimeAccountOpenPermit {
@@ -716,6 +718,12 @@ pub(crate) struct RuntimeAccountOpenPermit {
 
 impl RuntimeLifecycle {
     fn new() -> Self {
+        Self::with_audit_export(Default::default())
+    }
+
+    fn with_audit_export(
+        audit_export: crate::audit_export_lifecycle::AuditExportLifecycle,
+    ) -> Self {
         let (stop_tx, _) = watch::channel(false);
         Self {
             inner: Arc::new(RuntimeLifecycleInner {
@@ -724,17 +732,20 @@ impl RuntimeLifecycle {
                 stop_tx,
                 active_account_opens: AtomicUsize::new(0),
                 account_opens_drained: Notify::new(),
+                audit_export,
             }),
         }
     }
 
     pub(crate) fn begin_shutdown(&self) -> bool {
-        let was_stopping = self.inner.stopping.swap(true, Ordering::AcqRel);
-        self.inner.running.store(false, Ordering::Release);
-        if !was_stopping {
-            self.inner.stop_tx.send_replace(true);
-        }
-        !was_stopping
+        self.inner.audit_export.invalidate_all_with(|| {
+            let was_stopping = self.inner.stopping.swap(true, Ordering::AcqRel);
+            self.inner.running.store(false, Ordering::Release);
+            if !was_stopping {
+                self.inner.stop_tx.send_replace(true);
+            }
+            !was_stopping
+        })
     }
 
     pub(crate) fn mark_running(&self) {
@@ -5949,6 +5960,10 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
+        let _audit_export_mutation = self
+            .app
+            .audit_export_lifecycle
+            .mutate_account(&account.account_id_hex);
         self.ensure_worker_reaped(&account.account_id_hex).await?;
         let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
         async {
@@ -6625,6 +6640,10 @@ impl AccountManager {
         path: &str,
     ) -> Result<AuditLogDeleteOutcome, AppError> {
         let (path, owner_account_id_hex) = self.app.resolve_audit_log_path(path)?;
+        let _audit_export_mutation = match owner_account_id_hex.as_deref() {
+            Some(account) => self.app.audit_export_lifecycle.mutate_account(account),
+            None => self.app.audit_export_lifecycle.mutate_all(),
+        };
         if let Some(account_id_hex) = owner_account_id_hex {
             let commands = {
                 let workers = self.workers.lock().await;

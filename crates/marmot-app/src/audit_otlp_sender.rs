@@ -72,6 +72,10 @@ impl fmt::Debug for AuditOtlpSender {
 }
 
 impl AuditOtlpSender {
+    pub(crate) fn destination(&self) -> &str {
+        &self.destination
+    }
+
     /// Create an inactive sender for a dedicated `https://.../v1/logs` gateway.
     /// `destination` is the stable profile identity also passed to
     /// `LocalAuditDelivery::open`; it must remain stable across token rotation.

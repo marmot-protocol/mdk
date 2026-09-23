@@ -534,9 +534,22 @@ impl MarmotApp {
         &self,
         settings: AuditLogSettings,
     ) -> Result<AuditLogSettings, AppError> {
+        // A disable, clear, or later re-enable must invalidate an old HTTP
+        // result even when the persisted switch ends up enabled again.
+        let _mutation = self.audit_export_lifecycle.mutate_all();
         self.shared_storage()?
             .set_audit_log_settings(&audit_log_settings_to_storage(settings.clone()))?;
         Ok(settings)
+    }
+
+    pub(crate) fn audit_delivery_active_path(&self, label: &str) -> Result<PathBuf, AppError> {
+        let account_dir = self.account_dir(label);
+        let device_id = audit_device_id_hex(&account_dir)?;
+        let engine_id = audit_engine_id_hex(&self.member_id(label)?, &device_id);
+        Ok(marmot_forensics::default_jsonl_path(
+            account_dir,
+            &engine_id,
+        ))
     }
 
     pub(crate) fn audit_log_tracker_config(&self) -> config::AuditLogTrackerConfig {
@@ -932,6 +945,9 @@ impl MarmotApp {
     /// `AppClient::rotate_audit_log_if_active`) so the held handle is never
     /// orphaned. A missing file is treated as success.
     pub(crate) fn remove_audit_log_file(&self, path: &Path) -> Result<(), AppError> {
+        // This lower-level entry point is also used outside the runtime's
+        // async deletion path. Keep its removal fenced as well.
+        let _mutation = self.audit_export_lifecycle.mutate_all();
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),

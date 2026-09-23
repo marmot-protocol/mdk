@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-09-21
+updated: 2026-09-23
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -26,6 +26,7 @@ The retained deterministic hashes, raw group/message/transport identifiers, time
 | File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v4`; the line-level JSON Schema is [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json). |
 | Local file location | `<account_dir>/audit-<engine_id>-v4.jsonl` for app-opened account sessions, sealed into `-seg<NNNNNN>` siblings at 1 MiB. Exclusive-root startup deletes recognized v1/v2/v3 files and segments. |
 | Upload/listing | App and bindings list remaining local `audit-*.jsonl` files for inspection/deletion. Both explicit and tracker uploads accept only valid v4 snapshots; any legacy files left after cleanup and the separate key-reveal log are never sent. |
+| Audit OTLP delivery | An internal, explicit one-account attempt now composes the local prepared cursor and dedicated OTLP sender under runtime consent and lifecycle admission. No scheduler, production destination, or native binding activates it. |
 | Static bundle analyzer | Not present in the current repo path. The current artifact model is raw append-only JSONL audit logs. |
 
 ## Source map
@@ -59,8 +60,8 @@ The setting is persisted in shared SQLite:
 
 Important lifecycle behavior:
 
-- The setting applies when `MarmotApp::open_account()` opens an account session.
-- Enabling the setting does not retroactively attach a recorder to an already-open `AccountDeviceSession`.
+- The setting applies when `MarmotApp::open_account()` opens an account session. The runtime setter also hot-swaps
+  recorders on running account workers; the lower-level app setter alone does not change an already-open session.
 - If reading the setting fails, the app logs a warning and continues without audit logging.
 - If preparing the audit identity or opening the JSONL file fails, the app logs a warning and continues without audit
   logging.
@@ -1031,6 +1032,12 @@ metadata keys for indexing.
 ## Upload and tracker path
 
 The app can list and upload audit logs, but upload is separate from local recording.
+
+### Inactive audit OTLP runtime seam
+
+`MarmotAppRuntime::send_audit_otlp_once` is internal and requires a caller-supplied dedicated sender and one account. It prepares at most one bounded range of original v4 JSONL bodies under the existing exclusive root lease. Local admission covers preparation and, after a response, any durable finish; the HTTP request holds no local file, database, or lifecycle guard. One process-local reservation rejects overlapping attempts for the account. The root lease itself remains held until terminal storage close.
+
+The attempt checks recording consent, account identity, source state, runtime state, and the sender's stable destination profile before sending and again before finish. Disable/re-enable, file deletion, account removal, destination change, and terminal close invalidate a pending result. A late response can still represent remote receipt, but cannot advance the old local cursor. Complete `200 {}` finishes locally; `409` durably blocks the range; retryable and unknown outcomes retain it. A blocked receiver verdict has no local finish action. Cancellation retains the prepared range for identical replay, so duplicates remain possible. This seam does not start automatic OTLP delivery, configure a production endpoint, set retention, or claim downstream Loki durability. The existing Goggles manual and tracker uploads keep their own checkpoint and defaults.
 
 ### Listing
 

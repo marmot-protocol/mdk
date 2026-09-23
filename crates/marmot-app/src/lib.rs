@@ -105,6 +105,7 @@ mod profile_pseudonyms;
 #[cfg(feature = "media-benchmarks")]
 #[doc(hidden)]
 pub use media::MediaDownloadBenchmarkTransport;
+mod audit_export_lifecycle;
 mod messages;
 mod nostr_secret;
 mod notifications;
@@ -498,6 +499,7 @@ pub struct MarmotApp {
     /// [`Self::close_storage`] holds the write side across its whole teardown.
     /// See [`Self::begin_storage_open`].
     storage_lifecycle: Arc<RwLock<()>>,
+    audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle,
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
@@ -1436,6 +1438,7 @@ impl MarmotApp {
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
+            audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
             relay_urls,
             relay_plane,
             config,
@@ -1520,6 +1523,7 @@ impl MarmotApp {
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
+            audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
             relay_urls,
             account_home,
             relay_plane,
@@ -5356,6 +5360,10 @@ impl MarmotApp {
     /// error is returned once all of them have been closed.
     pub fn close_storage(&self) -> Result<(), AppError> {
         let started_at = Instant::now();
+        // Cancel export completions at the start of direct app close too.
+        // A local admission already running may finish first; HTTP never holds
+        // that admission and cannot delay the storage writer below.
+        self.audit_export_lifecycle.invalidate_all();
         // Exclusive for the whole teardown. The `storage_closed` flag alone
         // would not make this atomic: two concurrent closes could interleave so
         // that one released the root lease and returned while the other was
@@ -5370,6 +5378,7 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
+        self.audit_export_lifecycle.invalidate_all();
         self.presentation_signals.catalog_changed();
         let mut first_error = None;
         let mut closed = 0usize;
@@ -5479,6 +5488,27 @@ impl MarmotApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_storage_open(database)?;
         Ok(guard)
+    }
+
+    /// Local audit cursor work is admitted under the root owner's storage
+    /// lifecycle. The closure must finish before any HTTP await.
+    pub(crate) fn with_audit_export_admission<T>(
+        &self,
+        attempt: &audit_export_lifecycle::AuditExportAttempt,
+        work: impl FnOnce() -> Result<T, AppError>,
+    ) -> Result<Option<T>, AppError> {
+        let _storage = self.begin_storage_open("audit export")?;
+        if self
+            .root_runtime_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
+            return Err(AppError::AuditLogUpload(
+                "audit export requires exclusive root ownership".into(),
+            ));
+        }
+        self.audit_export_lifecycle.admit(attempt, work).transpose()
     }
 
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
