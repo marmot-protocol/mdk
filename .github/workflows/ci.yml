@@ -121,6 +121,12 @@ jobs:
       - name: Public app campaign contract
         run: python3 -m unittest discover -s scripts/tests -p 'test_app_stack_campaign.py'
 
+      - name: Install uv for audit receiver contract
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+
+      - name: Audit OTLP receiver contract
+        run: uv run --with 'jsonschema==4.25.1' python -m unittest discover -s scripts/audit-otlp-receiver -p 'test_receiver.py' -v
+
       - name: CI policy and path-classifier gates
         run: |
           ./scripts/check_convergence_constant_ledger.sh
@@ -1057,6 +1063,15 @@ jobs:
           bash -n scripts/hermes_marmot_deterministic_e2e.sh
           python3 -m py_compile scripts/hermes_marmot_configure_gateway.py integrations/hermes/tests/marmot/e2e_gateway_auth.py
           integrations/hermes/tests/marmot/test_dev_scripts.sh
+
+      - name: Pinned Hermes presence host contracts
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/hermes-installer-auth/env.sh"
+          HERMES_PRESENCE_CONTRACT=1 PYTHONPATH="$HERMES_AGENT_REPO" \
+            "$HERMES_AGENT_REPO/.venv/bin/python" -m unittest discover \
+            -s integrations/hermes/tests/marmot -p test_presence_host_contract.py -v
 
       - name: Real Hermes authorization and deterministic Marmot E2E
         run: |
