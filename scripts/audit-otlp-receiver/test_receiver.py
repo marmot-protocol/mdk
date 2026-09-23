@@ -65,10 +65,10 @@ class ReceiverTests(unittest.TestCase):
                 rows = [
                     row for stream in payload["streams"] for row in stream["values"]
                 ]
-                if owner.mode == "partial":
+                if owner.mode in {"partial", "partial_throttle"}:
                     owner.rows.extend(rows[:-1])
-                    raw = b'{"partialSuccess":{"rejectedLogRecords":"1"}}'
-                    self.send_response(200)
+                    raw = b"synthetic downstream rejection"
+                    self.send_response(400 if owner.mode == "partial" else 429)
                 elif owner.mode == "fail_after_prefix":
                     owner.rows.extend(rows[:1])
                     raw = b""
@@ -80,6 +80,10 @@ class ReceiverTests(unittest.TestCase):
                 elif owner.mode == "drop_after_write":
                     owner.rows.extend(rows)
                     self.connection.shutdown(socket.SHUT_RDWR)
+                    self.close_connection = True
+                    return
+                elif owner.mode == "malformed_http":
+                    self.wfile.write(b"invalid status line\r\n\r\n")
                     self.close_connection = True
                     return
                 else:
@@ -165,9 +169,7 @@ class ReceiverTests(unittest.TestCase):
         body = body.replace('"recorder":"test"', '"recorder":"' + "x" * padding + '"')
         self.assertEqual(len(body.encode("utf-8")), MAX_BODY_BYTES)
         self.assertEqual(self.post(encode_batch([body])), (200, {}))
-        self.assertEqual(
-            self.readback()[-1][1].encode("utf-8") + b"\n", body.encode() + b"\n"
-        )
+        self.assertEqual(self.readback()[-1][1], body)
 
     def test_invalid_records_and_mixed_batch_make_no_downstream_call(self):
         bad = [
@@ -181,6 +183,7 @@ class ReceiverTests(unittest.TestCase):
                 '"recorder":"test"', '"recorder":"test","recorder":"again"'
             ),
             synthetic(1).replace('"recorder":"test"', '"recorder":"test","unknown":1'),
+            synthetic(1).replace("synthetic-engine", r"\ud800"),
         ]
         for body in bad:
             with self.subTest(body=body):
@@ -227,15 +230,21 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(
             self.post(encode_batch([synthetic(1)]), token="wrong"), (401, {})
         )
+        self.assertEqual(
+            self.post(encode_batch([synthetic(1)]), token="\u00ff"), (401, {})
+        )
         self.assertEqual(self.calls, 0)
 
     def test_partial_acceptance_never_reports_full_success(self):
         self.mode = "partial"
         bodies = [synthetic(i) for i in range(3)]
-        self.assertEqual(
-            self.post(encode_batch(bodies)),
-            (200, {"partialSuccess": {"rejectedLogRecords": "1"}}),
-        )
+        self.assertEqual(self.post(encode_batch(bodies)), (409, {}))
+        self.assertEqual([row[1] for row in self.readback()], bodies[:-1])
+
+    def test_downstream_429_with_accepted_prefix_blocks_the_batch(self):
+        self.mode = "partial_throttle"
+        bodies = [synthetic(i) for i in range(3)]
+        self.assertEqual(self.post(encode_batch(bodies)), (409, {}))
         self.assertEqual([row[1] for row in self.readback()], bodies[:-1])
 
     def test_uncertain_downstream_acceptance_is_retryable_and_can_duplicate(self):
@@ -259,6 +268,11 @@ class ReceiverTests(unittest.TestCase):
 
     def test_unrecognized_downstream_2xx_cannot_become_full_success(self):
         self.mode = "invalid_success"
+        self.assertEqual(self.post(encode_batch([synthetic(1)])), (503, {}))
+        self.assertEqual(self.calls, 1)
+
+    def test_malformed_downstream_http_is_uncertain(self):
+        self.mode = "malformed_http"
         self.assertEqual(self.post(encode_batch([synthetic(1)])), (503, {}))
         self.assertEqual(self.calls, 1)
 

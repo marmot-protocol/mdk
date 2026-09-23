@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import time
@@ -47,7 +48,7 @@ def encoded(value):
 
 
 def encode_batch(bodies):
-    """ROUND-SEVEN's restricted OTLP/HTTP JSON producer shape."""
+    """The restricted OTLP/HTTP JSON producer shape."""
     return encoded(
         {
             "resourceLogs": [
@@ -111,6 +112,8 @@ def validate_batch(raw):
             event = strict_json(body)
             if type(event) is not dict or not VALIDATOR.is_valid(event):
                 raise ValueError
+            # Escaped JSON can decode to lone surrogates, which Loki cannot encode.
+            encoded(event)
             bodies.append((body, event))
         return bodies
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
@@ -176,7 +179,7 @@ def make_sink(url):
         raise ValueError("isolated_sink_must_be_loopback_loki_push")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-    def write(payload, record_count):
+    def write(payload):
         request = urllib.request.Request(
             url, data=payload, headers={"Content-Type": "application/json"}
         )
@@ -184,32 +187,20 @@ def make_sink(url):
             with opener.open(request, timeout=3) as response:
                 raw = response.read(65537)
                 if response.status == 204 and not raw:
-                    return "full", 0
-                if response.status == 200 and len(raw) <= 65536:
-                    result = strict_json(raw)
-                    if type(result) is dict and set(result) == {"partialSuccess"}:
-                        partial = result["partialSuccess"]
-                        if type(partial) is dict and set(partial) == {
-                            "rejectedLogRecords"
-                        }:
-                            rejected = partial["rejectedLogRecords"]
-                            if type(rejected) is int or (
-                                type(rejected) is str
-                                and rejected.isascii()
-                                and rejected.isdecimal()
-                            ):
-                                count = int(rejected)
-                                if 0 < count <= record_count:
-                                    return "partial", count
-        except (OSError, urllib.error.HTTPError, ValueError, RecursionError):
+                    return "full"
+        except urllib.error.HTTPError as error:
+            # Loki can accept a subset before returning a 4xx, including 429.
+            if 400 <= error.code < 500:
+                return "blocked"
+        except (OSError, http.client.HTTPException, ValueError, RecursionError):
             pass
-        return "uncertain", 0
+        return "uncertain"
 
     return write
 
 
 def make_server(token, sink, *, clock_ns=time.time_ns):
-    if not token or "\n" in token or "\r" in token:
+    if not token or not token.isascii() or "\n" in token or "\r" in token:
         raise ValueError("invalid_test_token")
 
     class Handler(BaseHTTPRequestHandler):
@@ -236,7 +227,8 @@ def make_server(token, sink, *, clock_ns=time.time_ns):
                 self.reply(404, {})
                 return
             if not hmac.compare_digest(
-                self.headers.get("Authorization", ""), "Bearer " + token
+                self.headers.get("Authorization", "").encode("latin-1"),
+                ("Bearer " + token).encode("ascii"),
             ):
                 self.reply(401, {})
                 return
@@ -268,15 +260,13 @@ def make_server(token, sink, *, clock_ns=time.time_ns):
             # This is the only side-effect boundary. All records are validated first.
             receipt_ns = clock_ns()
             try:
-                outcome, rejected = sink(loki_payload(bodies, receipt_ns), len(bodies))
-            except (OSError, RuntimeError):
-                outcome, rejected = "uncertain", 0
+                outcome = sink(loki_payload(bodies, receipt_ns))
+            except (OSError, RuntimeError, UnicodeError, http.client.HTTPException):
+                outcome = "uncertain"
             if outcome == "full":
                 self.reply(200, {})
-            elif outcome == "partial" and 0 < rejected <= len(bodies):
-                self.reply(
-                    200, {"partialSuccess": {"rejectedLogRecords": str(rejected)}}
-                )
+            elif outcome == "blocked":
+                self.reply(409, {})
             else:
                 self.reply(503, {})
 

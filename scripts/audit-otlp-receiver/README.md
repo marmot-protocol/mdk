@@ -1,11 +1,8 @@
 # Isolated audit OTLP receiver contract
 
-This executable contract follows the Goggles feasibility harness's ROUND-SEVEN
-small-batch producer and validating receiver (`delivery.py`, `test_delivery.py`,
-local snapshot `0a74fc3`). It uses synthetic v4 records and disposable loopback
-HTTP services. It is not a production server, a Goggles change, or an MDK sender.
-The existing Goggles upload/tracker path is unchanged and still present in MDK;
-no claim about its current production traffic or pause state is needed here.
+This loopback-only contract uses synthetic v4 records and disposable HTTP
+services to specify the receiver for a future MDK sender. It does not activate
+one. The existing Goggles upload and tracker path is unchanged.
 
 ## Request and validation
 
@@ -54,27 +51,30 @@ receiver response after that write can cause an exact-body duplicate on retry.
 | Receiver result | Future MDK action |
 | --- | --- |
 | HTTP 200 `{}` | Advance the prepared range cursor after its local durable acknowledgement commit. |
-| HTTP 200 `partialSuccess.rejectedLogRecords > 0` | Retain and block the whole range for explicit reconciliation; the count does not identify accepted records. |
-| HTTP 503, timeout, connection loss, or other transient 5xx/429 | Retain and retry the exact range with bounded backoff; accepted prefixes may duplicate. |
-| HTTP 400/413, 401/403, other terminal 4xx, malformed success, or any other 2xx | Retain and block until input, credential, or configuration is corrected. |
+| HTTP 409 (downstream 4xx, including 400 or 429) | Retain and block the whole range for explicit reconciliation; Loki may have accepted a subset. |
+| HTTP 503, timeout, connection loss, or other transient 5xx | Retain and retry the exact range with bounded backoff; accepted prefixes may duplicate. |
+| Receiver HTTP 400/413, 401/403, other terminal 4xx, malformed success, or any other 2xx | Retain and block until input, credential, or configuration is corrected. |
 
-In this harness, an explicit positive downstream partial count is propagated as
-OTLP partial success. An error, unexpected downstream 2xx, malformed response,
-or exception becomes 503. The receiver **never** returns full success after a
-known or uncertain partial acceptance. A downstream failure may have committed
-a prefix; without a receiver receipt ledger or an atomic downstream transaction,
-this stack cannot provide exactly-once delivery or prove that a retry writes no
-duplicates. Loki 204 itself is an API acceptance response, not a persistence
-proof. The future sender must inspect the full response body and must not
-advance on status class alone.
+Loki's push API has no OTLP `partialSuccess` body. Its
+[distributor](https://github.com/grafana/loki/blob/main/pkg/distributor/distributor.go)
+can write valid entries and then return 400 for rejected entries, or 429 when
+some streams are accepted.
+The receiver maps any downstream 4xx to 409 without copying Loki's error body;
+this blocks even a 429 that may have written nothing. An unexpected downstream
+2xx, 5xx, malformed response, or exception becomes 503. A 5xx or connection
+failure may also follow accepted writes. The receiver **never** reports full
+success after a known or uncertain partial acceptance. Without a receipt ledger
+or an atomic downstream transaction, this stack cannot provide exactly-once
+delivery or identify the accepted subset. Loki 204 is API acceptance, not a
+persistence proof. The future sender must inspect the full response, not just
+the 2xx status class.
 
 ## Run the synthetic contract
 
 From the MDK repository root:
 
 ```sh
-uv run --with 'jsonschema==4.25.1' python -m unittest discover \
-  -s scripts/audit-otlp-receiver -p 'test_receiver.py' -v
+just audit-otlp-receiver-contract
 ```
 
 This starts an ephemeral receiver and an ephemeral fake Loki HTTP service for
