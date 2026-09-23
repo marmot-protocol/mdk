@@ -373,3 +373,9 @@ and superseded checks, and the remaining blocking acquisition limitations.
   This run is not combined acceptance evidence. The migration corrections below
   must retain every legacy value and assert that new qualified evidence starts
   empty, including interrupted upgrade and reopen.
+- Migration assurance correction: the full-row upgrade expectations retain every
+  legacy value and explicitly require NULL/zero qualified-evidence fields and
+  empty observation allocators. The populated test now also interrupts migration
+  0094, verifies schema and all prior rows rolled back, then upgrades and reopens.
+  All four recovery migration regressions pass. No production migration or
+  completion guarantee was changed to make these tests pass.

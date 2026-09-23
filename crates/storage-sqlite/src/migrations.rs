@@ -1131,6 +1131,47 @@ mod tests {
                 "{table} changed after rollback"
             );
         }
+        // Also interrupt the integration's qualified-stagnation migration.
+        // Schema and historical evidence must roll back together before reopen.
+        run(&mut conn, &MIGRATIONS[..93]).unwrap();
+        let before_stall: Vec<_> = preserved
+            .iter()
+            .map(|table| recovery_completion_rows(&conn, table))
+            .collect();
+        let state_before_stall = recovery_completion_rows(&conn, "account_recovery_state");
+        fn interrupted_stall(tx: &Transaction<'_>) -> StorageResult<()> {
+            migration_0094_qualified_stall_observations::apply(tx)?;
+            Err(StorageError::Backend(
+                "injected qualified observation migration interruption".into(),
+            ))
+        }
+        assert!(
+            apply_migration(
+                &mut conn,
+                &Migration {
+                    version: 94,
+                    name: "0094_qualified_stall_observations",
+                    apply: interrupted_stall,
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(applied_name(&conn, 94).unwrap(), None);
+        assert!(
+            conn.prepare("SELECT qualified_certificate FROM app_epoch_stall_evidence")
+                .is_err()
+        );
+        assert_eq!(
+            recovery_completion_rows(&conn, "account_recovery_state"),
+            state_before_stall
+        );
+        for (table, expected) in preserved.iter().zip(&before_stall) {
+            assert_eq!(
+                &recovery_completion_rows(&conn, table),
+                expected,
+                "{table} changed after qualified observation migration rollback"
+            );
+        }
         run_all(&mut conn).unwrap();
         assert!(
             run(&mut conn, &MIGRATIONS[..92]).is_err(),
@@ -1147,6 +1188,14 @@ mod tests {
                     row.push(rusqlite::types::Value::Integer(0));
                 }
             }
+            if *table == "app_epoch_stall_evidence" {
+                // Preserve every legacy counter and warning, but never promote
+                // old EOSE observations into qualified stagnation evidence.
+                for row in &mut upgraded {
+                    use rusqlite::types::Value::{Integer, Null};
+                    row.extend([Null, Integer(0), Integer(0), Null]);
+                }
+            }
             assert_eq!(
                 &recovery_completion_rows(&conn, table),
                 &upgraded,
@@ -1158,7 +1207,12 @@ mod tests {
             &state[0][..retry_before[0].len()],
             retry_before[0].as_slice()
         );
-        assert_eq!(state[0].last(), Some(&rusqlite::types::Value::Null));
+        use rusqlite::types::Value::{Integer, Null};
+        assert_eq!(
+            &state[0][retry_before[0].len()..],
+            &[Null, Integer(0), Integer(0)],
+            "route identity and qualified observation allocators must start empty"
+        );
         assert!(conn.execute("INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms) VALUES ('explicit:second',3,1001,1001)",[]).is_err());
         assert_eq!(
             &recovery_completion_rows(&conn, "account_recovery_obligations"),
@@ -1238,6 +1292,14 @@ mod tests {
                 // Existing journals have no proof that invalidation ran.
                 for row in &mut upgraded {
                     row.push(rusqlite::types::Value::Integer(0));
+                }
+            }
+            if *table == "app_epoch_stall_evidence" {
+                // Preserve every legacy counter and warning, but never promote
+                // old EOSE observations into qualified stagnation evidence.
+                for row in &mut upgraded {
+                    use rusqlite::types::Value::{Integer, Null};
+                    row.extend([Null, Integer(0), Integer(0), Null]);
                 }
             }
             assert_eq!(
