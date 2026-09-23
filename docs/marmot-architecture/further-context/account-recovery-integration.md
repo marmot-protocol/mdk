@@ -21,18 +21,65 @@ token 12 is outstanding. No production retirement guarantee was relaxed.
 
 ## Required completion matrix
 
-| Acceptance boundary | Current remaining implementation / proof | Exit evidence |
+All behavior rows below are implemented and have focused passing evidence in the
+checkpoint ledger. Combined readiness remains pending until the frozen-revision
+checks and draft review are recorded; these focused results are not that claim.
+
+| Acceptance boundary | Implemented behavior and files | Acceptance evidence |
 | --- | --- | --- |
-| All history triggers share one owner | Verify startup, receive, maintenance, convergence and explicit paths together; remove remaining internal legacy retirement calls | One interleaved worker fixture with exact activation counts; source replacement inventory |
-| Durable pacing and local work | Verify duplicate joins, cap, productive admission reset, clock/reopen and eligible local convergence under cooldown | Controlled-clock owner tests and composed worker counters |
-| Qualified independent completion | Adapt truthful endpoint outcomes; complete runtime admission-to-checkpoint path; preserve unknown/incomplete outcomes | All-endpoint versus known-copy/maintenance matrix; stale route/loss/scope rejection; qualified synthetic backend fixture distinguished from production capability |
-| Live loss handoff | Reconcile queue-only off-worker writer, continuing count growth, worker notification-lag recording and external acknowledgment barrier | Writer/ack races, failed persistence compensation, zero-count incident, reopened pending loss |
-| Cancellation and API behavior | Detach dropped futures; preserve admitted prefix, durable independent demand, urgency cleanup and other-account service | Before activation/after admission/drop/reopen tests; public worker/API and cursor suites |
-| Maintenance timing | Fix baseline restoration failure without resetting grace or quiet deadlines | Default and override-policy restore tests plus stale EOSE rejection |
-| Evidence policy and escalation | Replace dead replay-completion detector tests/helpers; preserve authenticated evidence, distinct local observations, blocked/unknown status | Reorg/refusal/clock/anti-spoofing and mixed evidence matrix through actual owner |
-| Bounded state/investigation | Bound retained evidence and completed known-event rows with live grant lifetime protection; retain unresolved older debt after budget exhaustion | Repeated generation/route/caller/reopen fixtures; no timer-only rearm |
-| Same-schema conservative mode | One obligation per grant with the same executor/ledger/pacing/receipts/completion | Populated normal→conservative→normal handoff, partial admission, pending acknowledgment and reopen |
-| Combined readiness | Tests and docs on the complete dependency stack | Affected-crate suites (including policy overrides), fast-ci, policy decision/binding gates, test-replacement audit and draft PR review |
+| One history authority | `client/recovery.rs` reserves every attempt; `client/{mod,sync}.rs` and `runtime/account_worker.rs` delegate all mapped triggers | `recovery_owner_coalesces_overflow_and_epoch_demand_across_seams`; `explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic` |
+| Durable pacing and local work | Owner plus storage `account_recovery.rs` / `account_recovery/demand.rs` retain exact reservations, capped retry, productive reset and wall-clock correction | `automatic_attempts_share_one_durable_exponential_schedule`; `only_new_durable_admission_resets_pacing_with_a_minimum_activation_delay`; `reopened_owner_observes_reservation_and_uses_monotonic_time_thereafter`; `due_convergence_interleaves_with_a_backlog_of_worker_commands` |
+| Independent qualified completion | Frozen grants and admission receipts in `client/recovery.rs`, `client/sync.rs` and storage `account_recovery/plan.rs` reject stale revisions and require the declared predicate | `conservative_handoff_retains_partial_proof_and_completes_independently`; `history_completion_requires_every_designated_endpoint_and_durable_admission`; `scoped_progress_rejects_unrelated_windows_and_invalidated_attempts`; finite synthetic proof is test-only |
+| Live loss handoff and cursor | Queue evidence-only writer in `relay_plane/mod.rs`; worker imports and acknowledges through `client/recovery.rs`; cursor fences in `client/sync.rs` | `qualified_loss_completion_rolls_back_all_causes_after_plane_ack_failure`; `conservative_loss_causes_acknowledge_together_after_separate_grants`; `reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment`; `process_local_overflow_fence_freezes_cursor_while_marker_write_retries` |
+| Cancellation and supported API | Caller guard and grant lease preserve durable debt; repair returns typed truthful incomplete reasons; quiet catch-up preserved | `full_history_repair_serves_snapshot_reads_and_stops_at_checkpoint`; `joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_during_catch_up`; `cancelling_one_caller_preserves_independent_demand_and_quiescence`; full-history and cursor suites |
+| Maintenance timing | Existing domain boundary remains separate from all-endpoint history; displaced sessions keep grace/quiet timing | `post_join_boundary_completes_only_its_predicate_and_keeps_grace_fixed`; `conservative_activation_keeps_displaced_unqualified_maintenance_selectable`; stale-session tests |
+| Evidence and escalation | `client/epoch_stall.rs` has no replay authority; `client/recovery.rs` and storage `account_recovery/stall.rs` sample distinct qualified local observations; migration 0094 persists sample identity | `qualified_local_observations_escalate_without_replay_and_survive_reorg`; `qualified_stall_rejects_new_loss_route_and_inventory_changes`; `qualified_stall_transaction_failure_and_clock_rebase_never_forge_samples`; detector anti-spoofing suite |
+| Bounded state and investigation | Constant-memory loss snapshot; grant-owned admissions; completed known-event metadata reclaimed; unknown broad-history investigation quiesces with debt retained | `completed_known_event_metadata_waits_for_grant_release_then_is_reclaimed`; `unknown_history_is_bounded_while_epoch_input_remains_retryable`; storage loss snapshot/import tests; approved unresolved-watermark disk exception in runtime-state-bounds.md |
+| Populated migration and conservative mode | #1983/#1987 preserve old debt and atomic completion; one-obligation mode uses the same ledger/executor, including cross-grant loss acknowledgment | Populated/interrupted migration tests; `readiness_wait_and_mode_handoff_preserve_pending_state_and_retry_cost`; `conservative_grants_do_not_coalesce_or_buy_an_extra_retry`; conservative partial-proof/reopen/ack regressions |
+| Combined readiness | **Pending:** freeze signed code, run affected-crate suites, required gates, and draft review | Exact revisions, commands, outcomes and any superseded failures must be recorded below before claiming readiness |
+
+## Source ownership and replacement inventory
+
+- `AccountRecoveryOwner::select_authorized_attempt` and
+  `AppClient::authorize_account_recovery` are the single authorization/retry path.
+  Startup, receive, catch-up, full repair, overflow, epoch evidence, post-convergence
+  and maintenance join durable demand there. `execute_recovery_grant` adapts the
+  existing acquisition implementation to its frozen grant; it cannot chain an
+  independent overflow or epoch attempt.
+- `run_pending_epoch_backfill` and `run_pending_epoch_backfill_reporting_arm`
+  survive as delegated adapters and lifecycle reporting, without a separate retry
+  ledger. `epoch_stall.rs` retains authenticated evidence and warning projection;
+  its replay backoff/completion counter and global replay-disarm authority are gone.
+  Qualified local observations replace the old EOSE-counted escalation trigger.
+- Live subscription installation/reconnect stays in the relay plane and
+  `prepare_runtime_transport`. It does not imply history authorization or coverage.
+  Backend retry and registration retry retain their existing separate responsibilities.
+  `advance_post_join_maintenance_subscriptions` supplies only the maintenance domain
+  boundary; its any-endpoint evidence cannot complete all-endpoint history.
+- The approved off-worker writer calls only the queue-loss evidence API. Notification
+  loss, demand import, reservation, completion and acknowledgment remain serialized
+  with the account owner. Receipt release still uses the existing receipt journal
+  and authoritative epoch-gap adapter, preserving redelivery eligibility.
+- Internal calls to `clear_epoch_backfill_intents` and
+  `clear_account_delivery_recovery` are absent from marmot-app. The supported
+  lower-level storage compatibility methods remain ledger adapters. Terminal group
+  cleanup atomically retires that group's demand and warning evidence, preserving
+  independent account loss and retry state.
+- Directory discovery/cache coverage, superseded-invite recovery, onboarding,
+  publication and engine convergence remain their own domain owners as mapped in
+  the approved design. This integration does not absorb them into history demand.
+- Known-event completion and admission are implemented and exercised at the owner
+  boundary, but the current SDK's aggregate reconciliation result does not expose
+  identified missing event IDs. There is no production KnownEvent request producer
+  to invent here. Efficient selective acquisition is #1947; the supported backend
+  reports unknown/incomplete historical coverage honestly. EOSE is never upgraded
+  into qualified coverage. Production escalation requires actual qualified evidence;
+  the test backend's finite certificate is not a production capability claim.
+
+The 78-row `account-recovery-integration-tests.csv` maps removed/substantially
+rewritten regressions to current tests and separates deliberate completion-policy
+changes from preserved delivery, cancellation, retry, cursor and stale-evidence
+assertions. The original checkpoint inventory is immutable historical evidence.
 
 ## Sequencing and landing
 
@@ -267,3 +314,9 @@ and superseded checks, and the remaining blocking acquisition limitations.
   exact-head attribution and is only a failure inventory. The failures were
   investigated in the focused checkpoints above. It is not combined acceptance
   evidence; the following nextest run must use a frozen signed code revision.
+
+- Repository check cleanup: the first `fast-ci` run on `ae3fc968` rejected
+  production-unused grant mode metadata and a test-only marker probe. The metadata
+  was removed and the probe restricted to tests. The next run found one remaining
+  test reference to the removed field; `aebad88a` corrects it to inspect owner mode.
+  Neither failed run is acceptance evidence; full checks are rerunning.
