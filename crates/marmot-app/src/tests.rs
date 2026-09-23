@@ -3287,97 +3287,120 @@ fn a_backfill_whose_every_delivery_was_refused_does_not_disarm_the_detector() {
     });
 }
 
-/// A group armed *through the detector* must be able to arm again after a
-/// replay that retained none of its history.
-///
-/// This is the shape the merged disarm tests could not observe. They armed with
-/// `apply_backfill_decision` directly, which never enters `EpochStallDetector`,
-/// so the armed group was untracked and only a bystander could show the disarm
-/// rule at work. Production arms through `observe_resource_refusal`, and that
-/// path latches `fired_at_epoch` in `GroupStall::arm` — the same value
-/// `mark_replayed` would have written. Withholding `mark_replayed` therefore did
-/// nothing for the group that caused the replay: its next same-epoch refusal
-/// still returned `Skip`, and because the refused commit is neither marked seen
-/// nor allowed past the `since` floor, the armed backfill is the *only*
-/// automatic path back to it. Nothing else clears the latch — `observe_epoch`
-/// clears it only on a different epoch, and the epoch cannot move without the
-/// commit the replay failed to retain. That is a permanent, silent end to
-/// automatic repair for that group.
+/// A full admission cap preserves demand and eventually permits one owner-paced probe.
 #[test]
-fn a_group_armed_through_the_detector_rearms_after_a_fruitless_replay() {
-    run_composed_app_runtime_test("backfill-fruitless-rearm", || async {
+fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
+    run_composed_app_runtime_test("capacity-owner-probe", || async {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let filled_through = crate::unix_now_seconds() - 1_000;
         let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
             &dir,
             &relay,
-            backfill_drain_test_config(),
+            backfill_drain_test_config().with_dev_epoch_backfill_retry_backoff_ms(60_000),
             filled_through,
         )
         .await;
-        let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
-
-        // Arm the way production does: a refused delivery at the receive seam,
-        // which reaches `observe_resource_refusal` through `detect_epoch_stall`.
         client
             .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
             .await
-            .expect("a refused ingest still completes its pass");
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "a resource refusal at the receive seam must arm one recovery intent",
+            .unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let demand = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.group_id.as_deref() == Some(route.group_id.as_slice()))
+            .unwrap();
+        let ticket = demand.ticket;
+        assert_eq!(
+            demand.eligibility,
+            storage_sqlite::RecoveryEligibility::WaitingCapacity
         );
-
-        // The relays serve the history; the cap is still full, so the replay
-        // fetches it and retains none of it.
+        // A genuine caller can spend one override while capacity is still full.
         inject_epoch_gap_probe(
             &app,
             epoch_gap_probe(
                 &route.nostr_group_id_hex,
                 filled_through + 500,
-                "refused-during-the-replay",
+                "refused-during-replay",
             ),
         )
         .await;
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        assert!(
-            matches!(
-                client
-                    .run_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                    )
-                    .await
-                    .expect("the armed replay must run"),
-                crate::EpochBackfillRunOutcome::Completed(_)
+        assert!(matches!(
+            client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
+                )
+                .await
+                .unwrap(),
+            crate::EpochBackfillRunOutcome::Incomplete(_)
+        ));
+        let retry = storage.recovery_retry_state().unwrap();
+        let subscriptions = relay.unfloored_account_subscription_count();
+        assert!(matches!(
+            client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                )
+                .await
+                .unwrap(),
+            crate::EpochBackfillRunOutcome::Deferred
+        ));
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(relay.unfloored_account_subscription_count(), subscriptions);
+        client.recovery_owner.test_advance_to_retry(&storage);
+        client
+            .recovery_owner
+            .test_advance_clock(Duration::from_secs(60));
+        inject_epoch_gap_probe(
+            &app,
+            epoch_gap_probe(
+                &route.nostr_group_id_hex,
+                filled_through + 600,
+                "refused-again",
             ),
-            "a served end-of-stored-events drain is a completed replay, fruitless or not",
-        );
-
+        )
+        .await;
+        assert!(matches!(
+            client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                )
+                .await
+                .unwrap(),
+            crate::EpochBackfillRunOutcome::Incomplete(_)
+        ));
         assert_eq!(
-            client.epoch_stall.observe_resource_refusal(
-                route.group_id.clone(),
-                cgka_traits::EpochId(stalled_epoch),
-                epoch_stall_test_now_ms(),
-            ),
-            BackfillDecision::Arm,
-            "a replay that retained none of this group's refused history must leave it \
-             able to arm again at the same epoch — nothing else can clear the latch",
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            retry.attempt_serial + 1
+        );
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            subscriptions + 1
+        );
+        let pending = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.ticket.id == ticket.id)
+            .unwrap();
+        assert_eq!(
+            pending.eligibility,
+            storage_sqlite::RecoveryEligibility::WaitingCapacity
+        );
+        assert!(
+            !storage
+                .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
+                .unwrap()
         );
     });
 }
 
-/// The re-arm above must not become a spin.
-///
-/// A re-armable group facing a cap that is still full would otherwise run
-/// arm → drain → fruitless → re-arm at full speed: a fresh intent starts at
-/// `execution_attempts == 0`, and before this rule a *completed* run cleared
-/// `epoch_backfill_retry_not_before` unconditionally, so nothing paced the next
-/// attempt. A fruitless success now pays the same cooldown an unconfirmed drain
-/// does, which bounds the loop to one account-wide replay per backoff window
-/// while leaving caller-directed repair exempt.
+/// Duplicate capacity pressure neither bypasses nor indefinitely extends account pacing.
 #[test]
-fn consecutive_fruitless_replays_are_paced_by_the_retry_cooldown() {
+fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
     run_composed_app_runtime_test("backfill-fruitless-pacing", || async {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -3413,25 +3436,18 @@ fn consecutive_fruitless_replays_are_paced_by_the_retry_cooldown() {
             matches!(
                 client
                     .run_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                        marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
                     )
                     .await
                     .expect("the armed replay must run"),
-                crate::EpochBackfillRunOutcome::Completed(_)
+                crate::EpochBackfillRunOutcome::Incomplete(_)
             ),
-            "the first replay completes and is fruitless",
+            "refused admission cannot complete coverage",
         );
-        assert!(
-            client
-                .app
-                .account_storage(&client.state.label)
-                .unwrap()
-                .recovery_retry_state()
-                .unwrap()
-                .attempt_serial
-                > 0,
-            "a completed-but-fruitless replay must earn a retry cooldown, not clear it",
-        );
+        let storage = app.account_storage("alice").unwrap();
+        let retry = storage.recovery_retry_state().unwrap();
+        let subscriptions = relay.unfloored_account_subscription_count();
+        assert_eq!(retry.attempt_serial, 1);
 
         // The re-armed group arms a second intent, which the cooldown must hold.
         client
@@ -3455,12 +3471,49 @@ fn consecutive_fruitless_replays_are_paced_by_the_retry_cooldown() {
             "the second fruitless cycle must wait out the cooldown instead of \
              draining the account again immediately",
         );
-        // A person asking for a repair is not a loop.
-        assert!(
-            !client.epoch_backfill_retry_is_paced(
-                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
-            ),
-            "caller-directed catch-up stays exempt from the fruitless cooldown",
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(relay.unfloored_account_subscription_count(), subscriptions);
+        for index in 0..10 {
+            client
+                .ingest_received_delivery(route.probe(
+                    filled_through + 901 + index,
+                    &format!("duplicate-pressure-{index}"),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        client.recovery_owner.test_advance_to_retry(&storage);
+        client
+            .recovery_owner
+            .test_advance_clock(Duration::from_secs(60));
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            retry.attempt_serial + 1
+        );
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            subscriptions + 1
+        );
+        // A separate caller operation may override the new cooldown once. Its
+        // executor cannot spend another reservation on a follow-up replay.
+        client
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            retry.attempt_serial + 2
+        );
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            subscriptions + 2
         );
     });
 }
@@ -3505,7 +3558,9 @@ fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
 
         relay.fail_next_subscribe();
         client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .expect_err("the injected activation failure must surface");
         assert!(
@@ -3598,14 +3653,9 @@ fn a_failed_event_drain_retains_the_backfill_prefix_for_the_next_seam() {
     });
 }
 
-/// A fruitless replay re-arms only the groups whose refusals it counted.
-///
-/// The clear is scoped to this drain's attribution rather than swept
-/// account-wide: a group that never had history refused in this replay learned
-/// nothing from it, and clearing its latch would re-arm groups the replay says
-/// nothing about.
+/// Refusal blocks only its group; independent missing-input debt stays retryable.
 #[test]
-fn a_fruitless_replay_rearms_only_the_groups_whose_refusals_it_counted() {
+fn capacity_pressure_is_scoped_to_the_refused_group() {
     run_composed_app_runtime_test("backfill-fruitless-rearm-scope", || async {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -3619,16 +3669,13 @@ fn a_fruitless_replay_rearms_only_the_groups_whose_refusals_it_counted() {
         .await;
         let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
 
-        // An untouched group that armed at the same epoch but has no refusal in
-        // the replay below.
-        let untouched = cgka_traits::GroupId::new(vec![9_u8; 32]);
-        assert_eq!(
-            client.epoch_stall.observe_resource_refusal(
-                untouched.clone(),
-                cgka_traits::EpochId(stalled_epoch),
-                epoch_stall_test_now_ms()
-            ),
+        let untouched = client.create_group("independent debt", &[]).await.unwrap();
+        let untouched_epoch = client.group_mls_state(&untouched).unwrap().epoch;
+        client.apply_backfill_decision(
+            &untouched,
+            untouched_epoch,
             BackfillDecision::Arm,
+            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
         );
 
         client
@@ -3646,27 +3693,31 @@ fn a_fruitless_replay_rearms_only_the_groups_whose_refusals_it_counted() {
         .await;
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .expect("the armed replay must run");
 
+        let storage = app.account_storage("alice").unwrap();
+        let demands = storage.pending_recovery_demands().unwrap();
+        let refused = demands
+            .iter()
+            .find(|d| d.group_id.as_deref() == Some(route.group_id.as_slice()))
+            .unwrap();
+        let independent = demands
+            .iter()
+            .find(|d| d.group_id.as_deref() == Some(untouched.as_slice()))
+            .unwrap();
+        assert_eq!(refused.stalled_epoch, Some(stalled_epoch));
         assert_eq!(
-            client.epoch_stall.observe_resource_refusal(
-                route.group_id.clone(),
-                cgka_traits::EpochId(stalled_epoch),
-                epoch_stall_test_now_ms(),
-            ),
-            BackfillDecision::Arm,
-            "the group whose refusal the replay counted re-arms",
+            refused.eligibility,
+            storage_sqlite::RecoveryEligibility::WaitingCapacity
         );
         assert_eq!(
-            client.epoch_stall.observe_resource_refusal(
-                untouched,
-                cgka_traits::EpochId(stalled_epoch),
-                epoch_stall_test_now_ms()
-            ),
-            BackfillDecision::Skip,
-            "a group the replay refused nothing for keeps its latch",
+            independent.eligibility,
+            storage_sqlite::RecoveryEligibility::Retry,
+            "another group's refusal must not block this group's future acquisition"
         );
     });
 }
@@ -3778,21 +3829,15 @@ async fn verify_qualified_local_escalation(reopen: bool, qualified: bool) {
     );
 }
 
-/// A restart must not shorten the pacing interval the previous process owed.
-///
-/// The unit tests pin the rule on the detector's own clock; this pins it end to
-/// end, through the durable row, with an interval a test can actually be inside
-/// of. That combination is the whole hazard: the counter is persisted so
-/// restarts cannot erase it, which is exactly what would let a restart *become*
-/// the re-arm clock if the mark beside it were not wall-clock too. Three
-/// force-kills would then be worth three hours of waiting.
+/// Reopen preserves the same pending identities and deadline without earning a replay.
 #[test]
-fn a_restart_inside_the_pacing_interval_does_not_buy_a_rearm() {
+fn recovery_reopen_preserves_pending_debt_and_the_retry_deadline() {
     run_composed_app_runtime_test("frozen-epoch-restart-inside-interval", || async {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         // A real interval, long enough that this test is always inside it.
         let config = backfill_drain_test_config()
+            .with_dev_epoch_backfill_retry_backoff_ms(60_000)
             .with_dev_epoch_stall_wedge_rearm_interval_ms(10 * 60 * 1_000);
         let (app, mut client, route) = undecryptable_probe_route(&dir, &relay, config).await;
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
@@ -3815,9 +3860,13 @@ fn a_restart_inside_the_pacing_interval_does_not_buy_a_rearm() {
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
             .expect("the armed replay must run");
+        let storage = app.account_storage("alice").unwrap();
+        let retry = storage.recovery_retry_state().unwrap();
+        let pending = storage.recovery_revision_fence().unwrap().obligations;
         drop(client);
 
         let mut reopened = client_on_app_relay_plane(&app, "alice").await;
+        let subscriptions = relay.unfloored_account_subscription_count();
         for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
             reopened
                 .ingest_received_delivery(route.probe(
@@ -3828,9 +3877,24 @@ fn a_restart_inside_the_pacing_interval_does_not_buy_a_rearm() {
                 .expect("a retained undecryptable object completes its ingest pass");
         }
         assert!(
-            !reopened.has_pending_epoch_backfill(),
-            "the restored arm mark is wall-clock, so restarting owes the same wait",
+            reopened.has_pending_epoch_backfill(),
+            "EOSE did not retire the pending obligation",
         );
+        assert!(matches!(
+            reopened
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                )
+                .await
+                .unwrap(),
+            crate::EpochBackfillRunOutcome::Deferred
+        ));
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(
+            storage.recovery_revision_fence().unwrap().obligations,
+            pending
+        );
+        assert_eq!(relay.unfloored_account_subscription_count(), subscriptions);
         assert!(
             reopened.pending_epoch_stall_escalations.is_empty(),
             "and nothing was reported off an interval nobody waited out",

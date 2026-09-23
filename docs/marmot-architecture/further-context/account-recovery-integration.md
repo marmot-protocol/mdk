@@ -200,3 +200,12 @@ and superseded checks, and the remaining blocking acquisition limitations.
   warning-projection test; the convergence ledger gate passes. The old EOSE
   expectations first produced four failures. These results do not cover the
   remaining capacity, worker scheduling, and overflow integration inventory.
+- Capacity and reopen: the replacement regressions reproduced an integration
+  defect where one refused group put every coalesced obligation into capacity
+  wait. Eligibility now uses the actual refused-group set for group predicates;
+  account-wide coverage remains conservative. Three capacity tests pass with
+  exact activation/reservation counts, duplicate-deadline preservation and a
+  later paced probe. Reopen and activation-failure tests also pass. Two initial
+  timing fixtures accidentally requested zero backoff; their final versions use
+  an explicit long interval and advance only the owner clock. The replacement
+  CSV records the durable-owner guarantees replacing detector rearm assertions.

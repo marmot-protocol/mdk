@@ -3955,7 +3955,12 @@ impl AppClient {
                             | DrainVerdict::NovelProgressQuantumYield
                             | DrainVerdict::NoProgressQuantumYield
                     ),
-                    counts.refused > 0,
+                    obligation
+                        .group_id
+                        .as_ref()
+                        .map_or(counts.refused > 0, |group| {
+                            counts.refused_groups.contains(group)
+                        }),
                 );
                 let checkpoints = obligation
                     .scopes
