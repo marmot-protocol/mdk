@@ -186,6 +186,8 @@ pub(crate) struct AttemptGrant {
     pub(crate) fence: RecoveryRevisionFence,
     pub(crate) seam: marmot_forensics::EpochBackfillExecutionSeam,
     plan: Vec<GrantedObligation>,
+    pub(super) comparison_revision: Option<u64>,
+    pub(super) comparison_plan: Option<storage_sqlite::RecoveryComparisonPlan>,
     pub(super) inventory: Vec<FrozenRecoveryInventory>,
     loss: Vec<GrantedLoss>,
     _live: Arc<()>,
@@ -198,6 +200,7 @@ struct RecoveryAdmissionSnapshot {
     scopes: Vec<RecoveryScopePlan>,
     attempt: u64,
     fence: RecoveryRevisionFence,
+    comparison_revision: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -232,7 +235,7 @@ impl AttemptGrant {
     /// Executors only receive grants whose entire selected plan was durably
     /// frozen. A reservation alone is never sufficient authority for I/O.
     pub(crate) fn plan(&self) -> Option<&[GrantedObligation]> {
-        (!self.plan.is_empty()).then_some(self.plan.as_slice())
+        self.admission.as_ref().map(|_| self.plan.as_slice())
     }
 }
 
@@ -356,6 +359,13 @@ impl AccountRecoveryOwner {
         storage.release_due_recovery_capacity_probes(now_ms, duration_ms(self.policy.base)?)?;
         let immediate = explicit.as_ref().is_some_and(|permit| !permit.spent);
         let mut fence = storage.recovery_eligible_revision_fence(immediate)?;
+        let comparison = storage.recovery_comparison()?;
+        let mut comparison_revision = (comparison.pending()
+            && (immediate
+                || comparison
+                    .blocked_route_revision
+                    .is_none_or(|r| r != fence.route_revision)))
+        .then_some(comparison.revision);
         // An installed maintenance subscription is awaiting evidence, not
         // another acquisition. Observations are bound to its original scope
         // token and live session; reconnect cannot manufacture a new proof.
@@ -369,7 +379,9 @@ impl AccountRecoveryOwner {
         });
         let reserved = storage.with_transaction(|storage| {
             let prior = storage.recovery_retry_state()?;
-            if fence.obligations.is_empty() || (!immediate && now_ms < prior.not_before_ms) {
+            if (fence.obligations.is_empty() && comparison_revision.is_none())
+                || (!immediate && now_ms < prior.not_before_ms)
+            {
                 return Ok::<_, StorageError>(None);
             }
             if self.mode == RecoveryExecutorMode::Normal {
@@ -414,14 +426,25 @@ impl AccountRecoveryOwner {
                     })
                     .collect::<StorageResult<Vec<_>>>()?;
                 ordered.sort();
+                if comparison_revision.is_some() {
+                    let choose_comparison = ordered.first().is_none_or(|(not_caller, last, ..)| {
+                        *not_caller && comparison.attempt_serial <= *last
+                    });
+                    if choose_comparison {
+                        ordered.clear();
+                    } else {
+                        comparison_revision = None;
+                    }
+                }
                 fence.obligations = ordered
                     .into_iter()
                     .take(1)
                     .map(|(_, _, id, revision)| (id, revision))
                     .collect();
             }
-            let reservation = storage.reserve_recovery_attempt(
+            let reservation = storage.reserve_recovery_work(
                 &fence,
+                comparison_revision,
                 now_ms,
                 self.policy.delay_ms(prior.ordinal)?,
                 immediate,
@@ -439,6 +462,8 @@ impl AccountRecoveryOwner {
             fence,
             seam: marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             plan: Vec::new(),
+            comparison_revision,
+            comparison_plan: None,
             inventory: Vec::new(),
             loss: Vec::new(),
             _live: live,
@@ -461,48 +486,86 @@ impl AccountRecoveryOwner {
                 "invalid recovery grant plan".into(),
             ));
         }
-        let demands = storage.pending_recovery_demands()?;
-        for ((id, scopes), (selected, _)) in goals.into_iter().zip(&grant.fence.obligations) {
-            if id != *selected {
-                return Err(StorageError::Serialization(
-                    "invalid recovery grant selection".into(),
-                ));
-            }
-            let Some(tokens) = storage.install_recovery_scope_plan(
-                &grant.fence,
-                grant.reservation.attempt_serial,
-                id,
-                &scopes,
-            )?
-            else {
-                return Ok(None);
-            };
-            let demand = demands
-                .iter()
-                .find(|demand| demand.ticket.id == id)
-                .ok_or_else(|| {
-                    StorageError::Serialization("selected recovery demand disappeared".into())
-                })?;
-            grant.plan.push(GrantedObligation {
-                id,
-                cause: demand.cause,
-                group_id: demand.group_id.clone().map(cgka_traits::GroupId::new),
-                scopes: scopes
-                    .into_iter()
-                    .zip(tokens)
-                    .map(|(goal, token)| GrantedScope { goal, token })
-                    .collect(),
+        let result =
+            storage.with_transaction(|storage| -> Result<Vec<GrantedObligation>, FreezeError> {
+                let mut frozen = Vec::new();
+                let demands = storage.pending_recovery_demands()?;
+                for ((id, scopes), (selected, _)) in goals.into_iter().zip(&grant.fence.obligations)
+                {
+                    if id != *selected {
+                        return Err(StorageError::Serialization(
+                            "invalid recovery grant selection".into(),
+                        )
+                        .into());
+                    }
+                    let Some(tokens) = storage.install_recovery_scope_plan(
+                        &grant.fence,
+                        grant.reservation.attempt_serial,
+                        id,
+                        &scopes,
+                    )?
+                    else {
+                        return Err(FreezeError::Stale);
+                    };
+                    let demand = demands
+                        .iter()
+                        .find(|demand| demand.ticket.id == id)
+                        .ok_or_else(|| {
+                            StorageError::Serialization(
+                                "selected recovery demand disappeared".into(),
+                            )
+                        })?;
+                    frozen.push(GrantedObligation {
+                        id,
+                        cause: demand.cause,
+                        group_id: demand.group_id.clone().map(cgka_traits::GroupId::new),
+                        scopes: scopes
+                            .into_iter()
+                            .zip(tokens)
+                            .map(|(goal, token)| GrantedScope { goal, token })
+                            .collect(),
+                    });
+                }
+                match (grant.comparison_revision, &grant.comparison_plan) {
+                    (Some(revision), Some(plan)) if plan.fence == grant.fence => {
+                        if !storage.install_recovery_comparison_plan(
+                            revision,
+                            grant.reservation.attempt_serial,
+                            plan,
+                        )? {
+                            return Err(FreezeError::Stale);
+                        }
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(
+                            StorageError::Serialization("missing comparison plan".into()).into(),
+                        );
+                    }
+                }
+                Ok(frozen)
             });
-        }
+        grant.plan = match result {
+            Ok(plan) => plan,
+            Err(FreezeError::Stale) => return Ok(None),
+            Err(FreezeError::Storage(error)) => return Err(error),
+        };
         let admission = Arc::new(RecoveryAdmissionSnapshot {
             scopes: grant
                 .plan
                 .iter()
                 .flat_map(|obligation| &obligation.scopes)
                 .map(|scope| scope.goal.clone())
+                .chain(
+                    grant
+                        .comparison_plan
+                        .iter()
+                        .flat_map(|plan| plan.routes.iter().cloned()),
+                )
                 .collect(),
             attempt: grant.reservation.attempt_serial,
             fence: grant.fence.clone(),
+            comparison_revision: grant.comparison_revision,
         });
         self.active_admission = Arc::downgrade(&admission);
         grant.admission = Some(admission);
@@ -540,6 +603,15 @@ impl AccountRecoveryOwner {
         }) {
             return Ok(false);
         }
+        if let Some(revision) = admission.comparison_revision {
+            return storage.checkpoint_recovery_comparison_progress(
+                revision,
+                admission.attempt,
+                &admission.fence,
+                self.logical_now_ms(now)?,
+                duration_ms(self.policy.base)?,
+            );
+        }
         storage.checkpoint_recovery_progress(
             &admission.fence,
             admission.attempt,
@@ -571,6 +643,17 @@ impl AccountRecoveryOwner {
         }
         self.mode = mode;
         true
+    }
+}
+
+enum FreezeError {
+    Stale,
+    Storage(StorageError),
+}
+
+impl From<StorageError> for FreezeError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
     }
 }
 
@@ -3336,5 +3419,221 @@ mod tests {
             "a later admission cannot change an in-flight comparison snapshot"
         );
         assert!(frozen.until <= now + 1);
+    }
+
+    fn comparison_goal() -> RecoveryScopePlan {
+        RecoveryScopePlan {
+            scope_id: 0,
+            route_kind: 0,
+            route_role: 0,
+            group_id: None,
+            transport_group_id: None,
+            since_seconds: Some(10),
+            until_seconds: 100,
+            known_event_id: None,
+            inventory_floor: Some(10),
+            required_endpoints: vec!["wss://relay.example".into()],
+            admitted_endpoints: vec!["wss://relay.example".into()],
+        }
+    }
+
+    fn freeze_comparison(
+        owner: &mut AccountRecoveryOwner,
+        storage: &SqliteAccountStorage,
+        mut grant: AttemptGrant,
+    ) -> AttemptGrant {
+        grant.comparison_plan =
+            grant
+                .comparison_revision
+                .map(|_| storage_sqlite::RecoveryComparisonPlan {
+                    fence: grant.fence.clone(),
+                    live_since_seconds: Some(90),
+                    routes: vec![comparison_goal()],
+                    retry_routes: vec![],
+                });
+        let goals = grant
+            .fence
+            .obligations
+            .iter()
+            .map(|(id, _)| (*id, vec![comparison_goal()]))
+            .collect();
+        owner
+            .freeze_plan(storage, grant, goals, None)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn comparison_only_grant_preserves_cooldown_cancellation_and_scoped_admission() {
+        for mode in [
+            RecoveryExecutorMode::Normal,
+            RecoveryExecutorMode::Conservative,
+        ] {
+            let storage = SqliteAccountStorage::in_memory().unwrap();
+            let now = Instant::now();
+            let mut owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+            owner.select_executor_mode(mode);
+            storage
+                .join_recovery_comparison(&[1; 16], 1_000_000, &[comparison_goal()])
+                .unwrap();
+            let first = owner
+                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                .unwrap()
+                .unwrap();
+            assert!(first.fence.obligations.is_empty());
+            let first = freeze_comparison(&mut owner, &storage, first);
+            assert_eq!(
+                first.comparison_plan.as_ref().unwrap().live_since_seconds,
+                Some(90)
+            );
+            assert!(first.plan().unwrap().is_empty());
+            drop(first); // Cancelled after freeze; the pending slot and cost survive.
+            let before = storage.recovery_retry_state().unwrap();
+            storage
+                .join_recovery_comparison(&[2; 16], 1_001_000, &[comparison_goal()])
+                .unwrap();
+            let mut owner = AccountRecoveryOwner::open(&storage, 1_001_000, now, policy()).unwrap();
+            owner.select_executor_mode(mode);
+            assert!(
+                owner
+                    .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(storage.recovery_retry_state().unwrap(), before);
+            let due = now + Duration::from_secs(14);
+            let next = owner
+                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, due, None)
+                .unwrap()
+                .unwrap();
+            let next = freeze_comparison(&mut owner, &storage, next);
+            let route = storage_sqlite::TransportReconciliationRoute::Inbox;
+            assert!(
+                !owner
+                    .observe_scoped_admission(&storage, &route, 9, due)
+                    .unwrap()
+            );
+            assert!(
+                !owner
+                    .observe_scoped_admission(&storage, &route, 101, due)
+                    .unwrap()
+            );
+            assert!(
+                owner
+                    .observe_scoped_admission(&storage, &route, 50, due)
+                    .unwrap()
+            );
+            assert_eq!(storage.recovery_retry_state().unwrap().ordinal, 1);
+            assert!(
+                !owner
+                    .observe_scoped_admission(&storage, &route, 50, due)
+                    .unwrap()
+            );
+            drop(next);
+            assert!(
+                !owner
+                    .observe_scoped_admission(&storage, &route, 50, due)
+                    .unwrap()
+            );
+            assert!(storage.recovery_comparison().unwrap().pending());
+            assert_eq!(
+                storage.pending_recovery_demands().unwrap()[0].eligibility,
+                storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_and_coverage_share_one_cost_and_conservative_fairness() {
+        for mode in [
+            RecoveryExecutorMode::Normal,
+            RecoveryExecutorMode::Conservative,
+        ] {
+            let (storage, mut owner, now) = fixture();
+            owner.select_executor_mode(mode);
+            storage
+                .join_recovery_comparison(&[1; 16], 1_000_000, &[comparison_goal()])
+                .unwrap();
+            let first = owner
+                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                .unwrap()
+                .unwrap();
+            assert!(first.comparison_revision.is_some());
+            assert_eq!(
+                first.fence.obligations.len(),
+                usize::from(mode == RecoveryExecutorMode::Normal)
+            );
+            let first = freeze_comparison(&mut owner, &storage, first);
+            drop(first);
+            assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
+            assert!(
+                owner
+                    .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                    .unwrap()
+                    .is_none()
+            );
+            let next = owner
+                .select_authorized_attempt(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    now + Duration::from_secs(15),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(next.fence.obligations.len(), 1);
+            if mode == RecoveryExecutorMode::Conservative {
+                assert!(next.comparison_revision.is_none());
+            }
+            assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 2);
+            drop(next);
+            assert!(
+                storage
+                    .account_delivery_recovery("alice")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_rejected_freeze_rolls_back_coverage_and_preserves_permit() {
+        let (storage, mut owner, now) = fixture();
+        storage
+            .join_recovery_comparison(&[1; 16], 1_000_000, &[comparison_goal()])
+            .unwrap();
+        let mut permit = ExplicitRecoveryPermit::default();
+        let mut grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, Some(&mut permit))
+            .unwrap()
+            .unwrap();
+        let id = grant.fence.obligations[0].0;
+        let before = storage.recovery_scope_snapshots(id).unwrap().len();
+        grant.comparison_plan = Some(storage_sqlite::RecoveryComparisonPlan {
+            fence: grant.fence.clone(),
+            live_since_seconds: Some(90),
+            routes: vec![comparison_goal()],
+            retry_routes: vec![],
+        });
+        // A newer startup/caller joins after selection, invalidating the old slot revision.
+        storage
+            .join_recovery_comparison(&[2; 16], 1_001_000, &[comparison_goal()])
+            .unwrap();
+        let goals = grant
+            .fence
+            .obligations
+            .iter()
+            .map(|(id, _)| (*id, vec![comparison_goal()]))
+            .collect();
+        assert!(
+            owner
+                .freeze_plan(&storage, grant, goals, Some(&mut permit))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!permit.spent);
+        assert_eq!(storage.recovery_scope_snapshots(id).unwrap().len(), before);
+        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
+        assert!(storage.recovery_comparison().unwrap().pending());
     }
 }

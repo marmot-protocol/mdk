@@ -36,7 +36,8 @@ pub struct RecoveryEndpointCheckpoint {
 
 /// SQL columns are authoritative for route identity and historical bounds.
 /// Only endpoint policy, attempt fences and outcomes live in the versioned blob.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryScopePlan {
     pub scope_id: u64,
     pub route_kind: u8,
@@ -94,7 +95,7 @@ pub enum RecoveryEligibility {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ScopePayloadV1 {
-    required_endpoints: Vec<String>,
+    pub(super) required_endpoints: Vec<String>,
     admitted_endpoints: Vec<String>,
     checkpoints: Vec<RecoveryEndpointCheckpoint>,
     retained_known_event: bool,
@@ -377,6 +378,19 @@ impl SqliteAccountStorage {
         obligation_id: [u8; 16],
         plans: &[RecoveryScopePlan],
     ) -> StorageResult<Option<Vec<RecoveryScopeToken>>> {
+        self.install_recovery_scope_plan_inner(expected, attempt_serial, obligation_id, plans, true)
+    }
+
+    // Only comparison-debt preparation may store a goal without reserving I/O.
+    // Its zero attempt can never certify completion or authorize an executor.
+    pub(super) fn install_recovery_scope_plan_inner(
+        &self,
+        expected: &RecoveryRevisionFence,
+        attempt_serial: u64,
+        obligation_id: [u8; 16],
+        plans: &[RecoveryScopePlan],
+        reserved: bool,
+    ) -> StorageResult<Option<Vec<RecoveryScopeToken>>> {
         let Some((_, revision)) = expected
             .obligations
             .iter()
@@ -384,7 +398,8 @@ impl SqliteAccountStorage {
         else {
             return Err(invalid_scope());
         };
-        if attempt_serial == 0
+        if (reserved && attempt_serial == 0)
+            || (!reserved && attempt_serial != 0)
             || plans.is_empty()
             || plans
                 .windows(2)
@@ -408,7 +423,7 @@ impl SqliteAccountStorage {
         }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if retry_state(&conn)?.attempt_serial != attempt_serial
+            if (reserved && retry_state(&conn)?.attempt_serial != attempt_serial)
                 || !selected_fence_matches(&revision_fence(&conn)?, expected)
                 || !no_unimported_loss(&conn)?
             {

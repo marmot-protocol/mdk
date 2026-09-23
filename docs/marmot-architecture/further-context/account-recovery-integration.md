@@ -433,3 +433,26 @@ postdate the frozen-wake fix and do not predate any subsequent executable edits.
 The earlier 2865/2868 combined result predates that fix and remains historical
 failure evidence. Local review fixes and the amendment are unpushed while the two
 delivery regressions remain red; #1992's published code is still `81c2bb53`.
+
+## Amendment implementation — checkpoint 1
+
+The approved amendment now includes the two-cutoff distinction, per-route mixed
+settlement, and repeated-start guarantees. Migration 0095 adds one comparison
+slot. Storage joins coverage debt atomically, shares the existing retry reservation,
+freezes operational plans only inside recorded debt, preserves failed-route subsets,
+and settles independently of coverage and loss acknowledgment. The owner supports
+comparison-only and coalesced grants, scoped admission, atomic freeze rollback and
+same-schema conservative selection. Runtime startup is not connected yet.
+
+The first join regression failed with the intentionally absent persistence; it
+passed after the implementation. The complete focused storage/owner/migration
+selection then passed **93/93**, default features, no retries. It includes eight
+new storage and three new owner regressions, migration-0095 interruption/rollback,
+encrypted reopen, mixed failures, successor requests, spent-cost preservation,
+unsupported evidence checks, and stale inventory/loss rejection. Logs:
+`/tmp/mdk-1946-ci-owner/comparison-checkpoint-one-final.log`.
+
+This is the first of the two agreed implementation checkpoints, not a completion
+claim. The unchanged `since_floor` runtime journeys remain unresolved until the
+second checkpoint. Full affected-crate suites and final repository checks remain
+required after that integration.

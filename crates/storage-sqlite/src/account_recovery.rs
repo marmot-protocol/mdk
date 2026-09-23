@@ -1,5 +1,7 @@
 //! Account-private recovery demand. The worker owns demand and completion;
 //! the narrow loss writer may only append monotonically increasing evidence.
+mod comparison;
+pub use comparison::{RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan};
 mod demand;
 pub use demand::{
     RecoveryCause, RecoveryDemand, RecoveryDemandTicket, RecoveryPredicate, RecoveryRequest,
@@ -31,7 +33,8 @@ pub struct RecoveryRetryState {
 
 /// Immutable revision snapshot. Positive completion also requires qualified
 /// scope/admission evidence from the account owner; this is only the CAS fence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryRevisionFence {
     pub loss_revision: u64,
     pub route_revision: u64,
@@ -518,6 +521,18 @@ impl SqliteAccountStorage {
         delay_ms: u64,
         explicit_override: bool,
     ) -> StorageResult<Option<RecoveryRetryState>> {
+        self.reserve_recovery_work(expected, None, now_ms, delay_ms, explicit_override)
+    }
+
+    /// One account reservation for coverage, bounded comparison, or both.
+    pub fn reserve_recovery_work(
+        &self,
+        expected: &RecoveryRevisionFence,
+        comparison_revision: Option<u64>,
+        now_ms: u64,
+        delay_ms: u64,
+        explicit_override: bool,
+    ) -> StorageResult<Option<RecoveryRetryState>> {
         let now = sqlite_integer(now_ms)?;
         let delay = sqlite_integer(delay_ms)?;
         let due = now.checked_add(delay).ok_or_else(|| {
@@ -532,7 +547,8 @@ impl SqliteAccountStorage {
             ).storage()?;
             // One account-device identity per database: all loss causes must
             // be imported by that account owner before any scoped reservation.
-            if unimported || !selected_fence_matches(&revision_fence(&conn)?, expected)
+            if unimported || !comparison::work_fence_matches(&revision_fence(&conn)?, expected, comparison_revision.is_some())
+                || !comparison::selection_matches(&conn, comparison_revision, explicit_override)?
                 || (!explicit_override && now_ms < state.not_before_ms)
             {
                 return Ok(None);

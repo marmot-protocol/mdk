@@ -192,6 +192,8 @@ mod migration_0092_account_recovery_owner;
 mod migration_0093_recovery_route_snapshot;
 #[path = "migrations/0094_qualified_stall_observations.rs"]
 mod migration_0094_qualified_stall_observations;
+#[path = "migrations/0095_recovery_comparison.rs"]
+mod migration_0095_recovery_comparison;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -677,6 +679,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 94,
         name: "0094_qualified_stall_observations",
         apply: migration_0094_qualified_stall_observations::apply,
+    },
+    Migration {
+        version: 95,
+        name: "0095_recovery_comparison",
+        apply: migration_0095_recovery_comparison::apply,
     },
 ];
 
@@ -1172,6 +1179,34 @@ mod tests {
                 "{table} changed after qualified observation migration rollback"
             );
         }
+        run(&mut conn, &MIGRATIONS[..94]).unwrap();
+        let before_comparison = recovery_completion_rows(&conn, "account_recovery_state");
+        fn interrupted_comparison(tx: &Transaction<'_>) -> StorageResult<()> {
+            migration_0095_recovery_comparison::apply(tx)?;
+            Err(StorageError::Backend(
+                "injected comparison migration interruption".into(),
+            ))
+        }
+        assert!(
+            apply_migration(
+                &mut conn,
+                &Migration {
+                    version: 95,
+                    name: "0095_recovery_comparison",
+                    apply: interrupted_comparison,
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(applied_name(&conn, 95).unwrap(), None);
+        assert!(
+            conn.prepare("SELECT revision FROM account_recovery_comparison")
+                .is_err()
+        );
+        assert_eq!(
+            recovery_completion_rows(&conn, "account_recovery_state"),
+            before_comparison
+        );
         run_all(&mut conn).unwrap();
         assert!(
             run(&mut conn, &MIGRATIONS[..92]).is_err(),

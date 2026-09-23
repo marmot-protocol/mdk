@@ -1,10 +1,32 @@
 # #1946 amendment: bounded comparison with independent history debt
 
 Prepared 2026-09-23 against owner checkpoint
-`36442cd2e62883d0290c5fc6145e7af04ec7ea08`. The user chose to preserve automatic
-below-floor recovery and requested this concrete amendment. This document specifies
-the proposed implementation; no migration or runtime change described here has
-been implemented. The rest of `account-recovery-ownership.md` remains unchanged.
+`36442cd2e62883d0290c5fc6145e7af04ec7ea08`. The user approved this amendment, including the cutoff, mixed-result and repeated-
+start clarifications below. Implementation is in progress within #1992; the
+acceptance ledger records which parts are verified. The rest of `account-recovery-ownership.md` remains unchanged.
+
+## Approved clarifications
+
+The live subscription timestamp cutoff and the retained-inventory comparison
+floor are different. The restart regressions recover late events older than the
+live cutoff **but within** the inventory retention/compaction window. This does
+not promise recovery of arbitrary history older than that comparison floor.
+
+Settlement is per selected route. A serviced route cannot consume a transiently
+failed route's retry opportunity. Persist the failed subset (at most the selected
+route budget) in the same comparison slot; retry that subset under the shared
+account deadline before considering the opportunity serviced. Where only aggregate
+endpoint results are available, conservatively retry the whole affected route;
+retained IDs prevent needless payload reacquisition. Successful routes need not
+be compared again merely because a sibling failed. Unattempted routes are distinct
+from failed routes: their coverage debt remains, without inventing an unbounded
+continuation sweep. Backend-wide unsupported requires affirmative capability
+evidence and is never inferred from one failed endpoint or missing exhaustive proof.
+
+Repeated startup is an automatic request, never an override: it preserves the
+retry ordinal/deadline and ordinary live cutoff. Reconnects, ticks, maintenance and
+polling do not create requests. Frozen wake remains excluded. Tests must cover
+multiple restarts, exact persisted pacing, and retained-payload no-redownload.
 
 ## Contract change and evidence
 
@@ -39,9 +61,9 @@ validation, consistent with the existing ledger.
 
 | Column group | Proposed representation and purpose |
 | --- | --- |
-| Request | `revision`, `settled_revision`, `requested_at_ms`, `requested_until_seconds`; pending means revision exceeds settled revision. A pending join extends the upper bound monotonically and invalidates an older request token only when its intent changes. No row per boot, caller or attempt. |
-| Eligibility | `eligibility` = ready / waiting-capability; nullable `blocked_route_revision` and `blocked_capability_key` bind a known backend-wide unsupported result. Reopen alone cannot clear this block. |
-| Frozen attempt | Nullable `attempt_serial`, `frozen_revision`, `plan_format`, `plan_payload`; either all absent or all present. The version-1 payload holds the live activation floor and at most four selected route descriptors, admitted endpoints, comparison windows and the loss/route/inventory fence. It contains no receipt list or event payload. |
+| Request | `revision`, `settled_revision`, `request_key`, `requested_at_ms`, `requested_until_seconds`; pending means revision exceeds settled revision. A pending join extends the upper bound monotonically and invalidates an older request token only when its intent changes. No row per boot, caller or attempt. |
+| Eligibility | Ready / waiting-capability is derived from nullable `blocked_route_revision` and `blocked_capability_key` bind a known backend-wide unsupported result. Reopen alone cannot clear this block. |
+| Frozen attempt | `attempt_serial` and `frozen_revision` are zero until first freeze; `plan_format` defaults to 1 and `plan_payload` is nullable until then. The version-1 payload holds the live activation floor and at most four selected route descriptors, admitted endpoints, comparison windows and the loss/route/inventory fence. Persist the retryable route subset here after mixed outcomes. It contains no receipt list or event payload. |
 | Last observation | Nullable `last_outcome` = serviced-unknown / partial / unsupported / transient-failure. It is diagnostic operational state, never a coverage certificate. No per-attempt outcome history. |
 
 The row has **no deadline, ordinal, lease owner or independent attempt counter**.
@@ -91,9 +113,11 @@ framework or public app API:
    counters do not qualify. Keep the existing minimum activation delay. Do not
    make a comparison token acceptable to any coverage-completion API.
 5. **Settle comparison:** after its bounded execution and admission checkpoint,
-   CAS the frozen request revision/attempt and current safety fences. A normally
-   returned unknown/partial result, including exhaustion of the comparison time
-   quantum, services only this operational opportunity. Its unresolved coverage
+   CAS the frozen request revision/attempt and current safety fences. A serviced unknown/partial route is removed from the retry subset. A transient
+   failure remains pending; a mixed result never settles that failed work. Routes
+   not started before the comparison quantum expires remain coverage debt, while
+   a started operation interrupted by the quantum remains retryable. Once no
+   selected route is retryable, settle only this operational opportunity. Its unresolved coverage
    was already persisted in step 1. Stale settlement cannot consume a successor
    request or acknowledge live loss. A storage failure or dropped future leaves
    pending intent and spent cost; no asynchronous cleanup is needed to retain it.
@@ -141,8 +165,9 @@ until a relevant route/capability change or one explicit override; unknown must
 not be mislabeled unsupported merely to suppress traffic.
 
 Transient failure/unavailability keeps the request pending under capped pacing.
-A completed bounded unknown/partial pass settles the opportunity and does not
-repeat on timer ticks. Unattempted routes, omitted endpoints and history outside
+A completed bounded unknown/partial pass with no transiently failed route settles
+the opportunity and does not repeat on timer ticks. Mixed outcomes preserve only
+the retryable selected subset; unrelated successful routes are not reissued. Unattempted routes, omitted endpoints and history outside
 the inventory window remain represented by coverage debt. This amendment promises
 the existing bounded comparison opportunity, not exhaustive recovery for arbitrary
 older history or all routes in one boot. Cancellation retains the request for a
@@ -163,7 +188,7 @@ Proposed regression names below are acceptance targets, not existing test claims
 | Singleton, coverage-debt join, shared reserve/freeze/settle: `storage-sqlite/src/account_recovery/{comparison,plan}.rs`, `account_recovery.rs`, `migrations.rs`, new migration 0095 | `comparison_join_preserves_parked_debt_and_retry_cost`; `comparison_settlement_cannot_erase_successor_or_loss`; populated 0094→0095 upgrade, injected interruption/rollback, encrypted reopen; unknown format rejection. |
 | Typed owner work, admission and fair selection: `marmot-app/src/client/recovery.rs` | `comparison_only_grant_uses_shared_cooldown_and_bounded_plan`; `comparison_admission_rejects_stale_fences_and_duplicates`; normal/conservative handoff and fairness; rejected freeze preserves permit/observations; no loss acknowledgment from servicing comparison. |
 | Startup/catch-up join, bounded execution and existing due tick: `client/sync.rs`, `runtime/account_worker.rs` | `reopened_comparison_waits_for_shared_deadline_without_broad_replay`; `comparison_unknown_settles_opportunity_but_not_history`; `comparison_unsupported_stays_parked_on_reopen`; cancellation before/after admission and injected settlement failure retain debt and cost. |
-| Original below-floor delivery: `marmot-app/tests/since_floor.rs` | Preserve `cold_restart_reconciles_backlog_below_since_floor`: automatic above/below-floor delivery, persisted cursor, third-boot comparison and no repeated payload download. Preserve `stalled_epoch_backfill_still_arms_after_route_reconciliation`: same guarantees plus independent authenticated epoch-gap demand. |
+| Original below-live-cutoff delivery: `marmot-app/tests/since_floor.rs` | Preserve `cold_restart_reconciles_backlog_below_since_floor`: automatic above/below-live-cutoff delivery, persisted cursor, third-boot comparison and no repeated payload download. Preserve `stalled_epoch_backfill_still_arms_after_route_reconciliation`: same guarantees plus independent authenticated epoch-gap demand. |
 | Compatibility and replacement audit: cursor/full-history/owner suites and `account-recovery-integration-tests.csv` | Keep the unchanged three-boot frozen-wake test, ordinary quiet catch-up, prompt invite acceptance, maintenance timing and all stale-evidence tests. Add explicit mapping for any changed timing fixtures. No replacement with caller-requested catch-up and no weakened event-count assertions. |
 
 The two restart journeys need a controlled test clock/policy instead of assuming
