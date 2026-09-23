@@ -150,8 +150,11 @@ impl AsyncSignEvent for SdkSigner {
 
     fn sign_event_async(
         &self,
-        unsigned: UnsignedEvent,
+        mut unsigned: UnsignedEvent,
     ) -> SignerFuture<'_, Result<Event, Self::Error>> {
+        // SDK builders leave the id unset until finalization. External signers
+        // require the exact event id before they will sign or verify an AUTH.
+        unsigned.ensure_id();
         self.0.sign_event(unsigned)
     }
 }

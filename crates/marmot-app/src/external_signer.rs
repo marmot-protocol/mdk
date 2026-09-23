@@ -179,7 +179,10 @@ impl AccountIdentityProofSigner for RegisteredExternalSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::prelude::FinalizeUnsignedEvent;
+    use nostr::nips::nip59::GiftWrapSealBuilder;
+    use nostr::prelude::{EventBuilder, FinalizeEventAsync, FinalizeUnsignedEvent, Kind, RelayUrl};
+    use nostr_sdk::authenticator::{Authenticator, SignerAuthenticator};
+    use transport_nostr_peeler::SdkSigner;
 
     #[derive(Clone, Debug)]
     struct TestExternalSigner {
@@ -263,11 +266,42 @@ mod tests {
             registered_keys.public_key()
         );
 
-        let unsigned = EventBuilder::new(Kind::TextNote, "hello")
+        let mut unsigned = EventBuilder::new(Kind::TextNote, "hello")
             .finalize_unsigned(registered_keys.public_key());
+        unsigned.ensure_id();
         assert!(
             signer.sign_event(unsigned).await.is_err(),
             "registered external signer must reject events signed by a stale callback key"
         );
+    }
+
+    #[tokio::test]
+    async fn registered_external_signer_seals_welcomes_and_authenticates() {
+        let keys = nostr::prelude::Keys::generate();
+        let receiver = nostr::prelude::Keys::generate();
+        let registered = RegisteredExternalSigner::new(
+            keys.public_key(),
+            Arc::new(TestExternalSigner { keys: keys.clone() }),
+        );
+        let signer = Arc::new(registered) as Arc<dyn MarmotNostrSigner>;
+        let sdk_signer = SdkSigner(signer);
+        let rumor = EventBuilder::new(Kind::TextNote, "welcome fixture")
+            .finalize_unsigned(keys.public_key());
+        let seal = GiftWrapSealBuilder::new(rumor, receiver.public_key())
+            .finalize_async(&sdk_signer)
+            .await
+            .expect("registered external signer seals a Welcome rumor");
+        seal.verify()
+            .expect("sealed event has the requested id and signature");
+        assert_eq!(seal.pubkey, keys.public_key());
+
+        let relay = RelayUrl::parse("wss://relay.example").unwrap();
+        let auth = SignerAuthenticator::new(sdk_signer)
+            .make_auth_event(&relay, "challenge")
+            .await
+            .expect("registered external signer signs NIP-42 AUTH");
+        auth.verify()
+            .expect("AUTH has the requested id and signature");
+        assert_eq!(auth.pubkey, keys.public_key());
     }
 }
