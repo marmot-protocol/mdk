@@ -1351,6 +1351,17 @@ impl AppClient {
         let mut summary = if let Some(grant) = grant {
             self.execute_recovery_grant(grant, None, telemetry).await?
         } else {
+            if telemetry.is_some() && !explicit {
+                // A reopened worker may inherit a history cooldown or parked
+                // debt before it owns any live subscriptions. Restore its
+                // ordinary floored live interest without reserving history or
+                // changing the durable retry deadline.
+                self.prepare_transport_for_sync(telemetry)
+                    .await
+                    .map_err(|(stage, error)| {
+                        ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage)
+                    })?;
+            }
             // Network cooldown never withholds already queued input or engine
             // events. Receiving existing subscriptions is not a new acquisition.
             self.sync_sdk_relay(&mut DrainCounts::default()).await?.0
@@ -3834,7 +3845,12 @@ impl AppClient {
                     .insert(group, (subscription, route));
             }
         }
-        {
+        // Ordinary incremental catch-up and maintenance installation previously
+        // needed only their subscription/drain boundary. Inventory comparison
+        // can block on an unsupported relay for its full budget; introducing
+        // that wait here would hold live post-join delivery behind history work.
+        // Omitting comparison grants no qualified completion evidence.
+        if !quiet_prerequisites {
             match timeout(
                 TRANSPORT_RECONCILIATION_QUANTUM,
                 self.reconcile_transport_history(&grant.inventory),

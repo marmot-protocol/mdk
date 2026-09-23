@@ -5330,6 +5330,22 @@ async fn start_post_join_history_after_visibility(
     if summary.joined_groups.is_empty() {
         return;
     }
+    // Visibility is already published. Install ordinary live interest now,
+    // independently of the history owner's cooldown. Waiting for the retry
+    // timer leaves a newly joined account unrouted while another local account
+    // can already receive the SDK's single deduplicated copy of a group event.
+    // Failures retain the existing bounded registration-retry intent.
+    if let Err(error) = client
+        .retry_pending_runtime_group_subscription_refresh()
+        .await
+    {
+        publish_app_runtime_account_error(
+            events,
+            account_id_hex,
+            account_label,
+            account_error_message("post-join live subscription refresh failed", &error),
+        );
+    }
     if let Err(error) = client.advance_post_join_maintenance_subscriptions().await {
         publish_app_runtime_account_error(
             events,

@@ -52,7 +52,7 @@ checks and draft review are recorded; these focused results are not that claim.
   its replay backoff/completion counter and global replay-disarm authority are gone.
   Qualified local observations replace the old EOSE-counted escalation trigger.
 - Live subscription installation/reconnect stays in the relay plane and
-  `prepare_runtime_transport`. It does not imply history authorization or coverage.
+  `prepare_transport`. It does not imply history authorization or coverage.
   Backend retry and registration retry retain their existing separate responsibilities.
   `advance_post_join_maintenance_subscriptions` supplies only the maintenance domain
   boundary; its any-endpoint evidence cannot complete all-endpoint history.
@@ -332,3 +332,23 @@ and superseded checks, and the remaining blocking acquisition limitations.
   large-error closure, and simplifying a test boolean comparison. Runtime error
   priority and test assertions are unchanged. Full `fast-ci` and the combined
   suites will run on the following frozen signed checkpoint.
+
+- Frozen combined run on `81c2bb5313b38735d64fcb75d720aae73904963b`:
+  `fast-ci` passed, then nextest started 2866 tests across 22 binaries with four
+  workers, no retries and relay-runtime serialized. The known-red run was stopped
+  to fix eight real relay-runtime failures: 1493 passed, 8 assertion failures,
+  4 interrupted tests, 1361 not run, 21 skipped. This is partial failure evidence,
+  not combined readiness. The following simulator command was also interrupted.
+- Live registration regressions: reopen could inherit cooldown without installing
+  any live subscription; startup now restores floored live interest without a
+  history reservation. Incremental/maintenance-only grants no longer introduce
+  the inventory comparison wait into ordinary catch-up. A separate post-join
+  regression left ordinary live registration waiting on its retry timer: the
+  SDK's single deduplicated group copy could reach only an already-routed account
+  during that interval. The worker now tries the existing live registration path
+  immediately after publishing join visibility, with its original bounded retry
+  on failure. All eight unchanged failing relay-runtime journeys pass. No SDK
+  change, new dispatcher, deadline increase or assertion relaxation was used.
+  Temporary diagnostic probes were removed. All 24 owner/API compatibility tests
+  pass, including unchanged prompt-invite, reconnect, overflow and ordinary
+  registration failure/retry regressions. The complete stack must be rerun.
