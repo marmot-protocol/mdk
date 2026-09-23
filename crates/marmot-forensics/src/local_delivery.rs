@@ -1,0 +1,996 @@
+//! Small, opt-in local audit delivery boundary. No network or runtime activation.
+//! The caller owns the account root lease and supplies a receiver with an explicit
+//! complete-acceptance result. One attempt contains original, complete JSONL lines.
+
+use crate::audit::{AUDIT_LOG_SCHEMA_VERSION, AuditEvent};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+const MAX_BATCH_BYTES: usize = 64 * 1024;
+const MAX_LINE_BYTES: usize = 64 * 1024;
+const MAX_RECORDS: usize = 8;
+const FINGERPRINT_BYTES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryBatch {
+    pub destination: String,
+    pub generation: u64,
+    pub segment: String,
+    pub start: u64,
+    pub end: u64,
+    pub bodies: Vec<Vec<u8>>,
+}
+
+pub enum ReceiverResult {
+    Complete,
+    Retryable,
+    Permanent,
+    Partial,
+}
+
+pub trait AuditReceiver {
+    fn send(&mut self, batch: &DeliveryBatch) -> ReceiverResult;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryStep {
+    Idle,
+    WaitingForWriter,
+    Accepted,
+    Retryable,
+    Blocked,
+    Gap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GapReason {
+    TornTail,
+    InvalidRecord,
+    OversizedLine,
+    ChangedPreparedRange,
+    MissingSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryGap {
+    pub generation: u64,
+    pub segment: String,
+    pub start: u64,
+    pub end: Option<u64>,
+    pub reason: GapReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Prepared {
+    start: u64,
+    end: u64,
+    digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Journal {
+    generation: u64,
+    segment: String,
+    device: u64,
+    inode: u64,
+    fingerprint: String,
+    fingerprint_len: u8,
+    observed_len: u64,
+    acknowledged: u64,
+    prepared: Option<Prepared>,
+    blocked: Option<String>,
+    missing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct State {
+    version: u8,
+    destination: String,
+    next_generation: u64,
+    journals: Vec<Journal>,
+    gaps: Vec<DeliveryGap>,
+}
+
+/// A single-account, single-destination delivery cursor over one recorder path.
+/// Calls must be serialized under the account root lease. The source is never
+/// deleted by this type; retention and explicit gap repair belong to the host.
+pub struct LocalAuditDelivery {
+    active: PathBuf,
+    state_path: PathBuf,
+    state: State,
+    fenced: bool,
+}
+
+impl LocalAuditDelivery {
+    pub fn open(
+        active: impl AsRef<Path>,
+        state_dir: impl AsRef<Path>,
+        destination: &str,
+    ) -> io::Result<Self> {
+        if destination.is_empty() || destination.len() > 256 {
+            return Err(invalid("invalid destination identity"));
+        }
+        let active = active.as_ref().to_path_buf();
+        let name = active
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid("invalid recorder path"))?;
+        if !name.starts_with("audit-") || !name.ends_with(".jsonl") {
+            return Err(invalid("unexpected recorder file name"));
+        }
+        fs_private::prepare_directory_path(
+            state_dir.as_ref(),
+            0o700,
+            fs_private::ExistingDirectoryMode::Enforce,
+        )?;
+        let state_path = state_dir.as_ref().join("local-delivery.json");
+        if state_path.with_extension("json.tmp").exists() {
+            return Err(invalid("uncertain local state publication"));
+        }
+        let state = if state_path.exists() {
+            let bytes = read_private_file(&state_path)?;
+            let state: State =
+                serde_json::from_slice(&bytes).map_err(|_| invalid("corrupt delivery cursor"))?;
+            if state.version != 1 || state.destination != destination || state.next_generation == 0
+            {
+                return Err(invalid("incompatible delivery cursor"));
+            }
+            validate_state(&state, name)?;
+            state
+        } else {
+            State {
+                version: 1,
+                destination: destination.into(),
+                next_generation: 1,
+                journals: Vec::new(),
+                gaps: Vec::new(),
+            }
+        };
+        let mut delivery = Self {
+            active,
+            state_path,
+            state,
+            fenced: false,
+        };
+        delivery.discover()?;
+        Ok(delivery)
+    }
+
+    pub fn gaps(&self) -> &[DeliveryGap] {
+        &self.state.gaps
+    }
+
+    pub fn blocked(&self) -> Vec<(u64, &str)> {
+        self.state
+            .journals
+            .iter()
+            .filter_map(|j| j.blocked.as_deref().map(|reason| (j.generation, reason)))
+            .collect()
+    }
+
+    pub fn run_once(&mut self, receiver: &mut impl AuditReceiver) -> io::Result<DeliveryStep> {
+        if self.fenced {
+            return Err(invalid("uncertain local state publication"));
+        }
+        let old_gap_count = self.state.gaps.len();
+        self.discover()?;
+        if self.state.gaps.len() > old_gap_count {
+            return Ok(DeliveryStep::Gap);
+        }
+        for index in 0..self.state.journals.len() {
+            if self.state.journals[index].missing || self.state.journals[index].blocked.is_some() {
+                continue;
+            }
+            let (mut file, len) = self.open_journal(index)?;
+            if let Some(prepared) = self.state.journals[index].prepared.clone() {
+                if len < prepared.end {
+                    self.state.journals[index].observed_len =
+                        self.state.journals[index].observed_len.max(prepared.end);
+                    file.sync_all()?;
+                    self.record_gap(
+                        index,
+                        prepared.start,
+                        Some(prepared.end),
+                        GapReason::ChangedPreparedRange,
+                    )?;
+                    self.state.journals[index].blocked =
+                        Some("source truncated after prepared attempt".into());
+                    self.publish()?;
+                    return Ok(DeliveryStep::Gap);
+                }
+                let bytes = read_range(&mut file, prepared.start, prepared.end)?;
+                if digest(&bytes) != prepared.digest {
+                    file.sync_all()?;
+                    self.record_gap(
+                        index,
+                        prepared.start,
+                        Some(prepared.end),
+                        GapReason::ChangedPreparedRange,
+                    )?;
+                    return Ok(DeliveryStep::Gap);
+                }
+                let bodies = checked_bodies(&bytes)?;
+                return self.send(index, prepared, bodies, receiver);
+            }
+            let start = self.state.journals[index].acknowledged;
+            if start >= len {
+                continue;
+            }
+            file.seek(SeekFrom::Start(start))?;
+            let mut position = start;
+            let mut bodies = Vec::new();
+            let mut bytes = Vec::new();
+            while position < len && bodies.len() < MAX_RECORDS {
+                let line_start = position;
+                let (line, end, complete, oversized) = read_line(&mut file, position, len)?;
+                position = end;
+                if !complete {
+                    if !bodies.is_empty() {
+                        break;
+                    }
+                    if self.is_active(index) {
+                        return Ok(DeliveryStep::WaitingForWriter);
+                    }
+                    file.sync_all()?;
+                    self.record_gap(index, line_start, Some(end), GapReason::TornTail)?;
+                    return Ok(DeliveryStep::Gap);
+                }
+                if oversized || line.len() > MAX_BATCH_BYTES {
+                    if !bodies.is_empty() {
+                        break;
+                    }
+                    file.sync_all()?;
+                    self.record_gap(index, line_start, Some(end), GapReason::OversizedLine)?;
+                    return Ok(DeliveryStep::Gap);
+                }
+                if !valid_event(&line) {
+                    if !bodies.is_empty() {
+                        break;
+                    }
+                    file.sync_all()?;
+                    self.record_gap(index, line_start, Some(end), GapReason::InvalidRecord)?;
+                    return Ok(DeliveryStep::Gap);
+                }
+                if bytes.len() + line.len() > MAX_BATCH_BYTES {
+                    break;
+                }
+                bytes.extend_from_slice(&line);
+                bodies.push(line);
+            }
+            if bodies.is_empty() {
+                continue;
+            }
+            let end = start + bytes.len() as u64;
+            // The recorder flushes but does not fsync. A local prepared claim
+            // must establish that boundary before publication and send.
+            file.sync_all()?;
+            let prepared = Prepared {
+                start,
+                end,
+                digest: digest(&bytes),
+            };
+            self.state.journals[index].prepared = Some(prepared.clone());
+            self.publish()?;
+            return self.send(index, prepared, bodies, receiver);
+        }
+        if self.state.journals.iter().any(|j| j.blocked.is_some()) {
+            Ok(DeliveryStep::Blocked)
+        } else {
+            Ok(DeliveryStep::Idle)
+        }
+    }
+
+    fn send(
+        &mut self,
+        index: usize,
+        prepared: Prepared,
+        bodies: Vec<Vec<u8>>,
+        receiver: &mut impl AuditReceiver,
+    ) -> io::Result<DeliveryStep> {
+        let journal = &self.state.journals[index];
+        let batch = DeliveryBatch {
+            destination: self.state.destination.clone(),
+            generation: journal.generation,
+            segment: journal.segment.clone(),
+            start: prepared.start,
+            end: prepared.end,
+            bodies,
+        };
+        match receiver.send(&batch) {
+            ReceiverResult::Complete => {
+                self.state.journals[index].acknowledged = prepared.end;
+                self.state.journals[index].prepared = None;
+                self.publish()?;
+                Ok(DeliveryStep::Accepted)
+            }
+            ReceiverResult::Retryable => Ok(DeliveryStep::Retryable),
+            ReceiverResult::Permanent => {
+                self.state.journals[index].blocked = Some("permanent receiver rejection".into());
+                self.publish()?;
+                Ok(DeliveryStep::Blocked)
+            }
+            ReceiverResult::Partial => {
+                self.state.journals[index].blocked = Some("partial receiver acceptance".into());
+                self.publish()?;
+                Ok(DeliveryStep::Blocked)
+            }
+        }
+    }
+
+    fn record_gap(
+        &mut self,
+        index: usize,
+        start: u64,
+        end: Option<u64>,
+        reason: GapReason,
+    ) -> io::Result<()> {
+        let j = &self.state.journals[index];
+        self.state.gaps.push(DeliveryGap {
+            generation: j.generation,
+            segment: j.segment.clone(),
+            start,
+            end,
+            reason,
+        });
+        if let Some(end) = end {
+            self.state.journals[index].acknowledged = end;
+        }
+        self.state.journals[index].prepared = None;
+        self.publish()
+    }
+
+    fn is_active(&self, index: usize) -> bool {
+        self.active.file_name().and_then(|n| n.to_str())
+            == Some(self.state.journals[index].segment.as_str())
+    }
+
+    fn open_journal(&self, index: usize) -> io::Result<(File, u64)> {
+        let j = &self.state.journals[index];
+        let path = self
+            .active
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(&j.segment);
+        let mut file = open_source(&path)?;
+        let meta = file.metadata()?;
+        let (device, inode) = file_identity(&meta);
+        let len = meta.len();
+        let fingerprint = fingerprint(&mut file, j.fingerprint_len as usize)?;
+        if device != j.device
+            || inode != j.inode
+            || len < j.acknowledged
+            || (!j.fingerprint.is_empty() && fingerprint != j.fingerprint)
+        {
+            return Err(invalid("source identity changed; journal paused"));
+        }
+        Ok((file, len))
+    }
+
+    fn discover(&mut self) -> io::Result<()> {
+        let paths = source_paths(&self.active)?;
+        let mut seen = vec![false; self.state.journals.len()];
+        let mut changed = false;
+        for path in paths {
+            let mut file = open_source(&path)?;
+            let meta = file.metadata()?;
+            let (device, inode) = file_identity(&meta);
+            let len = meta.len();
+            let fp_len = (len as usize).min(FINGERPRINT_BYTES) as u8;
+            let fp = fingerprint(&mut file, fp_len as usize)?;
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| invalid("invalid source name"))?
+                .to_owned();
+            if let Some((index, journal)) = self
+                .state
+                .journals
+                .iter_mut()
+                .enumerate()
+                .find(|(_, j)| j.device == device && j.inode == inode && !j.missing)
+            {
+                let was_blocked = journal.blocked.is_some();
+                let existing_fp = fingerprint(
+                    &mut file,
+                    (journal.fingerprint_len as u64).min(len) as usize,
+                )?;
+                if !journal.fingerprint.is_empty() && journal.fingerprint != existing_fp {
+                    changed = true;
+                    if let Some(prepared) = journal.prepared.take() {
+                        file.sync_all()?;
+                        self.state.gaps.push(DeliveryGap {
+                            generation: journal.generation,
+                            segment: journal.segment.clone(),
+                            start: prepared.start,
+                            end: Some(prepared.end),
+                            reason: GapReason::ChangedPreparedRange,
+                        });
+                        journal.acknowledged = prepared.end;
+                        if len < prepared.end {
+                            journal.blocked =
+                                Some("source truncated after prepared attempt".into());
+                        }
+                        journal.fingerprint = fp;
+                        journal.fingerprint_len = fp_len;
+                        journal.segment = name;
+                        journal.observed_len = len.max(journal.acknowledged);
+                    } else {
+                        journal.blocked = Some("source fingerprint changed".into());
+                    }
+                } else {
+                    changed |= journal.fingerprint != fp
+                        || journal.segment != name
+                        || journal.observed_len != len.max(journal.acknowledged);
+                    journal.fingerprint = fp;
+                    journal.fingerprint_len = fp_len;
+                    journal.segment = name;
+                    if len < journal.acknowledged {
+                        journal.blocked = Some("source truncated below cursor".into());
+                    }
+                    journal.observed_len = len.max(journal.acknowledged);
+                }
+                seen[index] = true;
+                changed |= !was_blocked && journal.blocked.is_some();
+            } else {
+                let generation = self.state.next_generation;
+                self.state.next_generation = generation
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("generation exhausted"))?;
+                self.state.journals.push(Journal {
+                    generation,
+                    segment: name,
+                    device,
+                    inode,
+                    fingerprint: fp,
+                    fingerprint_len: fp_len,
+                    observed_len: len,
+                    acknowledged: 0,
+                    prepared: None,
+                    blocked: None,
+                    missing: false,
+                });
+                seen.push(true);
+                changed = true;
+            }
+        }
+        for (index, present) in seen.into_iter().enumerate() {
+            if !present && !self.state.journals[index].missing {
+                let j = &self.state.journals[index];
+                if j.prepared.is_some() {
+                    if self.state.journals[index].blocked.is_none() {
+                        self.state.journals[index].blocked = Some("prepared source missing".into());
+                    }
+                } else if j.acknowledged < j.observed_len {
+                    self.state.gaps.push(DeliveryGap {
+                        generation: j.generation,
+                        segment: j.segment.clone(),
+                        start: j.acknowledged,
+                        end: None,
+                        reason: GapReason::MissingSource,
+                    });
+                }
+                self.state.journals[index].missing = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.publish()?;
+        }
+        Ok(())
+    }
+
+    fn publish(&mut self) -> io::Result<()> {
+        if self.fenced {
+            return Err(invalid("uncertain local state publication"));
+        }
+        let result = self.publish_inner();
+        if result.is_err() {
+            self.fenced = true;
+        }
+        result
+    }
+
+    fn publish_inner(&self) -> io::Result<()> {
+        let temp = self.state_path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(&self.state).map_err(io::Error::other)?;
+        let mut file = fs_private::create_new_private(&temp)?;
+        if let Err(error) = (|| {
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })() {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+        drop(file);
+        fs::rename(&temp, &self.state_path)?;
+        File::open(self.state_path.parent().unwrap_or(Path::new(".")))?.sync_all()
+    }
+}
+
+fn validate_state(state: &State, active_name: &str) -> io::Result<()> {
+    let mut generations = std::collections::HashSet::new();
+    let mut identities = std::collections::HashSet::new();
+    let stem = active_name
+        .strip_suffix(".jsonl")
+        .ok_or_else(|| invalid("invalid recorder name"))?;
+    for j in &state.journals {
+        let expected_prefix = format!("{stem}-seg");
+        let segment_index = j
+            .segment
+            .strip_prefix(&expected_prefix)
+            .and_then(|s| s.strip_suffix(".jsonl"));
+        let valid_name = j.segment == active_name
+            || segment_index.is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()));
+        if !generations.insert(j.generation)
+            || (!j.missing && !identities.insert((j.device, j.inode)))
+            || j.generation >= state.next_generation
+            || !valid_name
+            || j.fingerprint_len as usize > FINGERPRINT_BYTES
+            || (j.fingerprint_len == 0) != j.fingerprint.is_empty()
+            || (!j.fingerprint.is_empty() && !valid_digest(&j.fingerprint))
+            || j.acknowledged > j.observed_len
+            || j.prepared.as_ref().is_some_and(|p| {
+                p.start != j.acknowledged
+                    || p.end <= p.start
+                    || p.end > j.observed_len
+                    || p.end - p.start > MAX_BATCH_BYTES as u64
+                    || !valid_digest(&p.digest)
+            })
+        {
+            return Err(invalid("corrupt delivery cursor"));
+        }
+    }
+    for gap in &state.gaps {
+        if !generations.contains(&gap.generation) || gap.end.is_some_and(|end| end <= gap.start) {
+            return Err(invalid("corrupt delivery gaps"));
+        }
+    }
+    Ok(())
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn source_paths(active: &Path) -> io::Result<Vec<PathBuf>> {
+    let parent = active.parent().unwrap_or(Path::new("."));
+    let name = active
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| invalid("invalid source path"))?;
+    let stem = name
+        .strip_suffix(".jsonl")
+        .ok_or_else(|| invalid("invalid source path"))?;
+    let prefix = format!("{stem}-seg");
+    let mut segments = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let Some(filename) = filename.to_str() else {
+            continue;
+        };
+        if filename.starts_with(&prefix) && filename.ends_with(".jsonl") {
+            let middle = &filename[prefix.len()..filename.len() - 6];
+            if middle.len() == 6 && middle.bytes().all(|b| b.is_ascii_digit()) {
+                segments.push(entry.path());
+            }
+        }
+    }
+    segments.sort();
+    if active.exists() {
+        segments.push(active.to_owned());
+    }
+    Ok(segments)
+}
+
+fn open_source(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid("source is not a regular file"));
+    }
+    Ok(file)
+}
+
+fn read_private_file(path: &Path) -> io::Result<Vec<u8>> {
+    let file = open_source(path)?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+#[cfg(not(unix))]
+fn file_identity(_meta: &fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+fn fingerprint(file: &mut File, len: usize) -> io::Result<String> {
+    if len == 0 {
+        return Ok(String::new());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = vec![0; len];
+    file.read_exact(&mut bytes)?;
+    Ok(digest(&bytes))
+}
+
+fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn read_range(file: &mut File, start: u64, end: u64) -> io::Result<Vec<u8>> {
+    if end <= start || end - start > MAX_BATCH_BYTES as u64 {
+        return Err(invalid("invalid prepared range"));
+    }
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = vec![0; (end - start) as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_line(file: &mut File, start: u64, limit: u64) -> io::Result<(Vec<u8>, u64, bool, bool)> {
+    let mut bytes = Vec::new();
+    let mut position = start;
+    let mut oversized = false;
+    let mut buffer = [0u8; 4096];
+    while position < limit {
+        let remaining = ((limit - position) as usize).min(buffer.len());
+        let count = file.read(&mut buffer[..remaining])?;
+        if count == 0 {
+            break;
+        }
+        if let Some(index) = buffer[..count].iter().position(|b| *b == b'\n') {
+            let used = index + 1;
+            if !oversized && bytes.len() + used <= MAX_LINE_BYTES {
+                bytes.extend_from_slice(&buffer[..used]);
+            } else {
+                oversized = true;
+            }
+            position += used as u64;
+            file.seek(SeekFrom::Start(position))?;
+            return Ok((bytes, position, true, oversized));
+        }
+        if !oversized && bytes.len() + count <= MAX_LINE_BYTES {
+            bytes.extend_from_slice(&buffer[..count]);
+        } else {
+            oversized = true;
+        }
+        position += count as u64;
+    }
+    Ok((bytes, position, false, oversized))
+}
+
+fn valid_event(line: &[u8]) -> bool {
+    std::str::from_utf8(line)
+        .ok()
+        .and_then(|text| serde_json::from_str::<AuditEvent>(text).ok())
+        .is_some_and(|event| event.schema_version == AUDIT_LOG_SCHEMA_VERSION)
+}
+
+fn checked_bodies(bytes: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    let mut bodies = Vec::new();
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        if !line.ends_with(b"\n") || !valid_event(line) {
+            return Err(invalid("prepared range contains invalid record"));
+        }
+        bodies.push(line.to_vec());
+    }
+    if bodies.is_empty() || bodies.len() > MAX_RECORDS {
+        return Err(invalid("invalid prepared record count"));
+    }
+    Ok(bodies)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::{
+        AuditEventKind, AuditRecord, ForensicRecorder, JsonlRecorder, default_jsonl_path,
+    };
+    use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct FakeReceiver {
+        next: Option<ReceiverResult>,
+        batches: Vec<DeliveryBatch>,
+    }
+
+    impl AuditReceiver for FakeReceiver {
+        fn send(&mut self, batch: &DeliveryBatch) -> ReceiverResult {
+            self.batches.push(batch.clone());
+            self.next.take().unwrap_or(ReceiverResult::Complete)
+        }
+    }
+
+    fn record(recorder: &JsonlRecorder, label: &str) {
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SendEntry {
+                intent_kind: label.into(),
+            },
+        ));
+    }
+
+    fn setup() -> (TempDir, PathBuf, PathBuf, JsonlRecorder) {
+        let dir = TempDir::new().unwrap();
+        let active = default_jsonl_path(dir.path(), "engine-abc");
+        let state_dir = dir.path().join("delivery");
+        let recorder = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+        (dir, active, state_dir, recorder)
+    }
+
+    fn drain(worker: &mut LocalAuditDelivery, sink: &mut FakeReceiver) {
+        for _ in 0..2000 {
+            match worker.run_once(sink).unwrap() {
+                DeliveryStep::Idle => return,
+                DeliveryStep::Accepted | DeliveryStep::Gap => {}
+                other => panic!("unexpected delivery step: {other:?}"),
+            }
+        }
+        panic!("delivery did not drain");
+    }
+
+    #[test]
+    fn real_recorder_append_retry_restart_and_ack_preserve_original_lines() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "one");
+        let original = fs::read(&active).unwrap();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver {
+            next: Some(ReceiverResult::Retryable),
+            ..Default::default()
+        };
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Retryable);
+        let first = sink.batches[0].clone();
+        assert_eq!(first.bodies.concat(), original);
+        drop(worker);
+
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_eq!(sink.batches[1].bodies, first.bodies);
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Idle);
+        record(&recorder, "two");
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_eq!(sink.batches[2].start, first.end);
+        assert_eq!(
+            sink.batches[2].bodies.concat(),
+            fs::read(&active).unwrap()[first.end as usize..]
+        );
+        assert!(LocalAuditDelivery::open(&active, &state_dir, "receiver-B").is_err());
+    }
+
+    #[test]
+    fn same_inode_changed_prepared_range_is_a_visible_gap_then_later_rows_continue() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "one");
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver {
+            next: Some(ReceiverResult::Retryable),
+            ..Default::default()
+        };
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Retryable);
+        let prepared_end = sink.batches[0].end;
+        // Rewrite a byte beyond the 64-byte head fingerprint, preserving inode
+        // and length. The range digest must catch the change before any send.
+        let mut file = OpenOptions::new().write(true).open(&active).unwrap();
+        file.seek(SeekFrom::Start(100)).unwrap();
+        file.write_all(b"X").unwrap();
+        file.sync_all().unwrap();
+        drop(worker);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
+        assert_eq!(sink.batches.len(), 1);
+        assert_eq!(worker.gaps()[0].reason, GapReason::ChangedPreparedRange);
+        assert_eq!(worker.gaps()[0].end, Some(prepared_end));
+        record(&recorder, "later");
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_eq!(sink.batches[1].start, prepared_end);
+    }
+
+    #[test]
+    fn changed_head_of_prepared_range_persists_gap_before_restart() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "one");
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver {
+            next: Some(ReceiverResult::Retryable),
+            ..Default::default()
+        };
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Retryable);
+        let mut file = OpenOptions::new().write(true).open(&active).unwrap();
+        file.seek(SeekFrom::Start(1)).unwrap();
+        file.write_all(b"X").unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
+        assert_eq!(sink.batches.len(), 1);
+        drop(worker);
+        let worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        assert_eq!(worker.gaps()[0].reason, GapReason::ChangedPreparedRange);
+    }
+
+    #[test]
+    fn torn_active_tail_waits_and_bad_line_skips_only_its_extent() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let prior_end = fs::metadata(&active).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&active).unwrap();
+        file.write_all(b"{broken").unwrap();
+        assert_eq!(
+            worker.run_once(&mut sink).unwrap(),
+            DeliveryStep::WaitingForWriter
+        );
+        assert!(worker.gaps().is_empty());
+        file.write_all(b"}\n").unwrap();
+        file.sync_all().unwrap();
+        record(&recorder, "after_bad_line");
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
+        assert_eq!(worker.gaps()[0].start, prior_end);
+        assert_eq!(worker.gaps()[0].end, Some(prior_end + 9));
+        assert_eq!(worker.gaps()[0].reason, GapReason::InvalidRecord);
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_eq!(sink.batches.last().unwrap().start, prior_end + 9);
+    }
+
+    #[test]
+    fn real_size_rotation_keeps_old_inode_and_drains_both_files() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        for index in 0..7000 {
+            record(&recorder, &format!("row-{index:05}"));
+            if fs::read_dir(active.parent().unwrap())
+                .unwrap()
+                .any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("-seg")
+                })
+            {
+                break;
+            }
+        }
+        let segment = source_paths(&active)
+            .unwrap()
+            .into_iter()
+            .find(|p| p != &active)
+            .expect("real recorder rotated");
+        drain(&mut worker, &mut sink);
+        let sent: Vec<u8> = sink
+            .batches
+            .iter()
+            .flat_map(|b| b.bodies.concat())
+            .collect();
+        let mut expected = fs::read(&segment).unwrap();
+        expected.extend_from_slice(&fs::read(&active).unwrap());
+        assert_eq!(sent, expected);
+        assert!(worker.gaps().is_empty());
+        assert_eq!(worker.state.journals.len(), 2);
+        assert_eq!(
+            worker.state.journals[0].segment,
+            segment.file_name().unwrap().to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn partial_rejection_blocks_one_journal_and_corrupt_state_fails_closed() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "one");
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver {
+            next: Some(ReceiverResult::Partial),
+            ..Default::default()
+        };
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Blocked);
+        assert_eq!(worker.blocked(), vec![(1, "partial receiver acceptance")]);
+        assert_eq!(worker.state.journals[0].acknowledged, 0);
+        drop(worker);
+        let worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        assert_eq!(worker.blocked(), vec![(1, "partial receiver acceptance")]);
+        drop(worker);
+        fs::write(state_dir.join("local-delivery.json"), b"broken").unwrap();
+        assert!(LocalAuditDelivery::open(&active, &state_dir, "receiver-A").is_err());
+    }
+
+    #[test]
+    fn blocked_journal_does_not_stop_a_new_recorder_generation() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "first");
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver {
+            next: Some(ReceiverResult::Permanent),
+            ..Default::default()
+        };
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Blocked);
+        recorder.rotate().unwrap();
+        record(&recorder, "second");
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_eq!(sink.batches.len(), 2);
+        assert_ne!(sink.batches[0].generation, sink.batches[1].generation);
+        assert_eq!(worker.blocked()[0].1, "permanent receiver rejection");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cursor_and_staging_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, active, state_dir, _recorder) = setup();
+        let _worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        assert_eq!(
+            fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(state_dir.join("local-delivery.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn oversized_line_is_skipped_and_later_record_is_delivered() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let start = fs::metadata(&active).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&active).unwrap();
+        file.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]).unwrap();
+        file.write_all(b"\n").unwrap();
+        record(&recorder, "after_large_line");
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
+        assert_eq!(worker.gaps()[0].reason, GapReason::OversizedLine);
+        assert_eq!(worker.gaps()[0].start, start);
+        assert_eq!(
+            worker.gaps()[0].end,
+            Some(start + MAX_LINE_BYTES as u64 + 2)
+        );
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+    }
+
+    #[test]
+    fn destructive_clear_reports_unknown_missing_source_gap() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "unaccepted");
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        recorder.rotate().unwrap();
+        let mut sink = FakeReceiver::default();
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
+        assert_eq!(worker.gaps()[0].reason, GapReason::MissingSource);
+        assert_eq!(worker.gaps()[0].end, None);
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+    }
+
+    #[test]
+    fn stale_state_staging_file_fences_open() {
+        let (_dir, active, state_dir, _recorder) = setup();
+        let worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drop(worker);
+        fs::write(state_dir.join("local-delivery.json.tmp"), b"uncertain").unwrap();
+        assert!(LocalAuditDelivery::open(&active, &state_dir, "receiver-A").is_err());
+    }
+}
