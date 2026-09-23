@@ -60,6 +60,55 @@ fn jsonl_recorder_appends_events_with_monotonic_seq() {
 }
 
 #[test]
+fn recorder_restart_appends_new_session_after_existing_complete_bytes() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let first = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    first.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "before_restart".into(),
+        },
+    ));
+    let before = fs::read(&path).unwrap();
+    let first_session = recorded_events(&path)[0].recorder_session_id.clone();
+    drop(first);
+
+    let second = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    let after = fs::read(&path).unwrap();
+    assert!(after.starts_with(&before));
+    let events = recorded_events(&path);
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[2].seq, 0);
+    assert_ne!(events[2].recorder_session_id, first_session);
+    drop(second);
+}
+
+#[test]
+fn failed_record_write_is_best_effort_and_next_row_survives() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    let before = fs::read(&path).unwrap();
+    recorder.fail_next_write();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "failed".into(),
+        },
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(recorder.health_snapshot().write_failures, 1);
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "survives".into(),
+        },
+    ));
+    assert_eq!(recorded_events(&path).len(), 2);
+}
+
+#[test]
 #[cfg(unix)]
 fn audit_file_is_owner_only_on_open_and_rotation() {
     use std::os::unix::fs::PermissionsExt;
