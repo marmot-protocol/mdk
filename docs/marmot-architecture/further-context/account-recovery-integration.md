@@ -190,3 +190,13 @@ and superseded checks, and the remaining blocking acquisition limitations.
   inventory retirement rather than manually incrementing a global counter. All
   6 storage stall tests pass, including loss/route/overlap rejection, unrelated
   eviction, distinct observations, reopen, clock correction and rollback.
+- Qualified observation regressions: removed the obsolete EOSE escalation counter.
+  Real local convergence evaluations now test qualified finite coverage, four
+  distinct paced observations, one warning, reorg/reopen continuity, and unchanged
+  replay cost; ordinary EOSE produces no qualified samples. The replacement CSV
+  maps every retired counter regression to its preserved guarantee. Detector
+  projection tests retain epoch/expiry/clock-reset and forged-traffic boundaries.
+  The final focused runs pass: 40 detector tests, 3 qualified-local tests, and the
+  warning-projection test; the convergence ledger gate passes. The old EOSE
+  expectations first produced four failures. These results do not cover the
+  remaining capacity, worker scheduling, and overflow integration inventory.

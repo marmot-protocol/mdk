@@ -5953,9 +5953,18 @@ mod tests {
                 .observe_resource_refusal(group_id.clone(), epoch, 1),
             BackfillDecision::Arm
         );
-        for _ in 0..3 {
-            let _ = client.epoch_stall.observe_fruitless_completion([&group_id]);
-        }
+        // This test exercises notification delivery from a durable warning,
+        // not qualification. Actual evidence counting is covered by the
+        // qualified local-evaluation and storage certificate tests.
+        client.epoch_stall.restore_wedge_evidence([(
+            group_id.clone(),
+            crate::client::epoch_stall::EpochStallEvidence {
+                stalled_epoch: epoch.0,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: 1,
+            },
+        )]);
         client.persist_epoch_stall_evidence([&group_id]);
         client
             .finish_scheduled_convergence_effects(
