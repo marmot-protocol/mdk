@@ -106,3 +106,16 @@ and superseded checks, and the remaining blocking acquisition limitations.
   conservative selection and loss-handoff regressions both failed before their fixes.
   An added maintenance fixture initially omitted its required group row; that
   fixture error was corrected by creating an actual runtime group.
+- Terminal retirement: the owner now retires group-scoped demands and their
+  detector/warning rows in one transaction, preserving account-wide loss/history
+  and retry state. The app's two legacy clear wrappers and the last internal
+  legacy-clear caller are removed; supported storage compatibility methods remain.
+  An injected delete failure verifies rollback, then successful retry and idempotent
+  retirement. All 5 storage stall tests and 26 app terminal tests (policy overrides)
+  pass. The first verification attempt needed the StorageProvider trait import;
+  that compilation failure preceded these passing runs.
+- Broader diagnostic run on `60141d5b` (before conservative/terminal edits): default
+  app library suite finished with 1461 pass, 18 fail, 4 ignored. This is failure
+  inventory, not final acceptance evidence. It includes old EOSE-completion test
+  expectations, cursor/overflow cases and worker lifecycle failures that still
+  require diagnosis; they are not all classified as assertion updates.

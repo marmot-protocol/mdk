@@ -3382,7 +3382,7 @@ impl AppClient {
         match self
             .app
             .account_storage(&self.state.label)
-            .and_then(|storage| Ok(storage.clear_recovery_failure(group_id)?))
+            .and_then(|storage| Ok(storage.retire_terminal_group_recovery(group_id)?))
         {
             Ok(changed) => {
                 self.epoch_stall.clear_recovered_group(group_id);
@@ -3450,20 +3450,11 @@ impl AppClient {
                 .map(cgka_traits::GroupId::new)
         }));
         terminal.retain(|group| super::group_is_terminal(&self.runtime, group));
-        let mut retired = Vec::new();
         for group in terminal {
             if self.retire_terminal_group_recovery(&group) {
                 self.pending_recovery_arm_writes.remove(&group);
                 self.pending_recovery_capacity_writes.remove(&group);
-                retired.push(hex::encode(group.as_slice()));
             }
-        }
-        if let Err(error) = self
-            .app
-            .clear_epoch_backfill_intents_for_groups(&self.state.label, &retired)
-        {
-            tracing::warn!(target: "marmot_app::epoch_stall", method="drop_terminal_epoch_backfill_intents",
-                error_kind=error.privacy_safe_kind(), "terminal demand retirement remains pending");
         }
     }
 

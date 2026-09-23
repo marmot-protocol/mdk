@@ -2,6 +2,7 @@
 //! relay EOSE never create a certificate. The account worker supplies the epoch
 //! actually observed after evaluating eligible local convergence work.
 use super::*;
+use cgka_traits::storage::StorageProvider;
 use rusqlite::OptionalExtension;
 
 pub struct QualifiedRecoveryStallSample {
@@ -11,6 +12,21 @@ pub struct QualifiedRecoveryStallSample {
 }
 
 impl SqliteAccountStorage {
+    /// Retire group-scoped recovery only after the account owner observes a
+    /// terminal group. Account-wide history/loss debt and retry cost survive.
+    pub fn retire_terminal_group_recovery(
+        &self,
+        group: &cgka_traits::GroupId,
+    ) -> StorageResult<bool> {
+        self.with_transaction(|storage| {
+            storage.lock()?.execute_cached(
+                "DELETE FROM account_recovery_obligations WHERE group_id=?1 AND cause IN (1,2,4)",
+                [group.as_slice()],
+            ).storage()?;
+            storage.clear_recovery_failure(group)
+        })
+    }
+
     /// Allocate only after a real local convergence evaluation, not when polling
     /// its result. A repeated certificate must reuse the returned revision.
     pub fn next_recovery_engine_observation(&self) -> StorageResult<u64> {
@@ -121,6 +137,56 @@ mod tests {
     use super::*;
     use crate::storage::test_support::{gid, sample_group};
     use cgka_traits::storage::GroupStorage;
+
+    #[test]
+    fn terminal_retirement_failure_preserves_all_group_debt_and_independent_loss() {
+        let store = fixture();
+        let group = gid(1);
+        store
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &[8; 32],
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .request_recovery(
+                RecoveryRequest::MaintenanceBoundary {
+                    group_id: group.as_slice(),
+                    job_id: &[9],
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .mark_account_delivery_recovery("alice", 55, 1)
+            .unwrap();
+        let before = store.recovery_revision_fence().unwrap();
+        let retry = store.recovery_retry_state().unwrap();
+        store.lock().unwrap().execute_batch("CREATE TRIGGER fail_terminal_retire BEFORE DELETE ON app_epoch_stall_evidence BEGIN SELECT RAISE(ABORT, 'injected terminal retire failure'); END;").unwrap();
+        assert!(store.retire_terminal_group_recovery(&group).is_err());
+        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        assert_eq!(store.epoch_stall_evidence().unwrap().len(), 1);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_terminal_retire")
+            .unwrap();
+        store.retire_terminal_group_recovery(&group).unwrap();
+        assert!(store.epoch_stall_evidence().unwrap().is_empty());
+        assert!(
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .all(|d| d.group_id.is_none())
+        );
+        assert!(store.account_delivery_recovery("alice").unwrap().is_some());
+        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert!(!store.retire_terminal_group_recovery(&group).unwrap());
+    }
 
     fn fixture() -> SqliteAccountStorage {
         let store = SqliteAccountStorage::in_memory().unwrap();

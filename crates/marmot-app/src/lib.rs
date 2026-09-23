@@ -3359,28 +3359,6 @@ impl MarmotApp {
         Ok(())
     }
 
-    pub(crate) fn clear_epoch_backfill_intents(
-        &self,
-        label: &str,
-        intents: &[storage_sqlite::StoredEpochBackfillIntent],
-    ) -> Result<(), AppError> {
-        self.ensure_account_state(label)?;
-        self.account_storage(label)?
-            .clear_epoch_backfill_intents(intents)?;
-        Ok(())
-    }
-
-    pub(crate) fn clear_epoch_backfill_intents_for_groups(
-        &self,
-        label: &str,
-        group_ids_hex: &[String],
-    ) -> Result<(), AppError> {
-        self.ensure_account_state(label)?;
-        self.account_storage(label)?
-            .clear_epoch_backfill_intents_for_groups(group_ids_hex)?;
-        Ok(())
-    }
-
     pub(crate) fn record_epoch_stall_evidence(
         &self,
         label: &str,
