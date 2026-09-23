@@ -185,7 +185,7 @@ pub(crate) struct AttemptGrant {
 #[derive(Clone)]
 struct GrantedLoss {
     id: [u8; 16],
-    watermarks: Vec<storage_sqlite::RecoveryLossWatermark>,
+    watermarks: storage_sqlite::RecoveryLossSnapshot,
 }
 
 /// Private input snapshot; identities are deliberately not Debug-printable.
@@ -839,7 +839,7 @@ impl AppClient {
         };
         let reclaimed = storage.with_transaction(|_| {
             for (fence, loss) in &self.recovery_owner.pending_loss_acknowledgments {
-                if !storage.acknowledge_recovery_loss(fence, loss.id, &loss.watermarks)? {
+                if !storage.acknowledge_recovery_loss_snapshot(fence, loss.id, &loss.watermarks)? {
                     // Roll back any preceding cause's deletion as well.
                     return Err(StorageError::NotFound);
                 }
@@ -1110,7 +1110,7 @@ impl AppClient {
             if let Some(cause) = cause {
                 grant.loss.push(GrantedLoss {
                     id: obligation.id,
-                    watermarks: storage.recovery_loss_watermarks(&self.state.label, cause)?,
+                    watermarks: storage.recovery_loss_snapshot(&self.state.label, cause)?,
                 });
             }
         }

@@ -188,6 +188,8 @@ local-access bounds, not convergence or recovery policy.
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
+| Loss acknowledgment snapshots | At most two 40-byte token/count commitments per active grant, plus at most two pending cross-grant commitments; no per-generation vector in the owner | Streamed from durable evidence; discarded on acknowledgment, error, cancellation recovery or reopen. The compatibility vector inspection API remains available to explicit lower-level callers. |
+| Evidence import temporary state | One row plus a keyset cursor, independent of unresolved generation count; transaction duration remains input-relative | Each row is imported atomically with demand, then the scan advances without retaining it. |
 | `account_delivery_loss_evidence` generation watermarks | One row per unresolved loss generation; **no fixed disk-row cap**. This is the explicitly approved #1946 retention exception, not a bounded-size claim. Duplicate observations reuse a watermark; increased counts rearm that generation. | Only qualified completion followed by exact live acknowledgment may reclaim captured evidence. Legacy retirement preserves watermarks and cannot erase another generation. Unresolved debt survives automatic investigation exhaustion and reopen. |
 
 The current transport backend cannot prove exhaustive history, so repeated loss

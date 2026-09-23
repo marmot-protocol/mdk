@@ -161,3 +161,15 @@ and superseded checks, and the remaining blocking acquisition limitations.
   checkpoint if persistence fails. All 11 repair tests and 16 owner tests pass with
   policy overrides. An initial fixture compilation used a nonexistent state
   accessor; that was corrected before the cursor regression reproduced its failure.
+- Bounded loss capture: the owner no longer copies all unresolved generation
+  watermarks into every grant. A 40-byte SHA-256 snapshot commits to the ordered
+  full token/count set, streamed with constant Rust memory. The acknowledgment
+  transaction still validates the same scope/revision/no-unimported-loss rules;
+  supported vector APIs share that implementation. Import uses a one-row keyset
+  scan without a temporary generation vector. This storage addition serves the
+  concrete approved disk-retention exception, not a future acquisition API.
+  A 1,024-generation fixture verifies preservation, earliest-token growth and
+  duplicate import; both acknowledgment forms exercise incomplete proof, commit
+  failure and newer loss. All 58 storage recovery, 16 owner and 11 repair tests
+  pass (app tests with policy overrides). The initial implementation needed an
+  explicit connection guard binding before compilation; final runs include it.

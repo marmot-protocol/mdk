@@ -7,7 +7,7 @@ pub use demand::{
 mod loss;
 mod plan;
 mod stall;
-pub use loss::{RecoveryLossCause, RecoveryLossWatermark};
+pub use loss::{RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
 pub use plan::{
     RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
     RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
@@ -650,14 +650,20 @@ impl SqliteAccountStorage {
         }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let rows = conn.prepare_cached(
-                "SELECT cause, marker_token, pending_since, dropped_count
-                 FROM account_delivery_loss_evidence
-                 WHERE account_label = ?1 AND (imported_count IS NULL OR dropped_count > imported_count)
-                 ORDER BY cause, marker_token",
-            ).storage()?.query_map([label], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)))
-                .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
-            for (cause, token, observed_at, dropped) in rows {
+            // Import one row at a time in this transaction. The unresolved
+            // evidence set is deliberately not disk-capped; do not mirror it
+            // into an unbounded temporary Vec on reopen.
+            let mut cursor = (-1_i64, -1_i64);
+            loop {
+                let row = conn.query_row_cached(
+                    "SELECT cause,marker_token,pending_since,dropped_count FROM account_delivery_loss_evidence
+                     WHERE account_label=?1 AND (cause,marker_token)>(?2,?3)
+                     AND (imported_count IS NULL OR dropped_count>imported_count)
+                     ORDER BY cause,marker_token LIMIT 1", params![label,cursor.0,cursor.1],
+                    |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))
+                ).optional().storage()?;
+                let Some((cause, token, observed_at, dropped)) = row else { break; };
+                cursor = (cause, token);
                 join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
                 conn.execute_cached(
                     "UPDATE account_delivery_loss_evidence SET imported_count = ?3

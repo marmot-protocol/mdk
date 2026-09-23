@@ -53,7 +53,12 @@ rows make migration fail atomically; no demand is silently discarded.
 `account_recovery/loss.rs` keeps qualified loss completion separate from external plane
 acknowledgment. Capture exact token/count watermarks before execution. After qualified
 completion, acknowledge the matching live generation and finish its writers before
-calling `acknowledge_recovery_loss`. SQL cannot establish that external prerequisite.
+calling `acknowledge_recovery_loss`. The runtime uses `recovery_loss_snapshot` and
+`acknowledge_recovery_loss_snapshot`: a constant-size SHA-256 commitment to the complete
+ordered token/count set, streamed under the same connection lock. This avoids copying
+unbounded unresolved evidence into active grants without capping or deleting it. Both
+acknowledgment forms share the same transaction and revision/qualification checks.
+SQL cannot establish the external acknowledgment prerequisite.
 New evidence or a persistence failure prevents reclamation; the owner must compensate
 the live acknowledgment and call `restore_unacknowledged_recovery_loss` before new work.
 Call that restore method when constructing an owner as well. Zero-count loss is evidence.
