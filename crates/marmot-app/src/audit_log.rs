@@ -393,7 +393,7 @@ fn system_time_ms(time: SystemTime) -> Option<u64> {
         .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
 }
 
-fn audit_upload_host_is_retired(host: &str) -> bool {
+pub(crate) fn audit_upload_host_is_retired(host: &str) -> bool {
     let host = host.trim_end_matches('.');
     retired_relay_hosts()
         .iter()

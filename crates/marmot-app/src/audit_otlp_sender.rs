@@ -12,15 +12,14 @@ use marmot_forensics::local_delivery::{DeliveryBatch, ReceiverResult};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::{collector_host_safety, config, retired_relay_hosts};
+use crate::{audit_log::audit_upload_host_is_retired, collector_host_safety, config};
 
 const MAX_RECORDS: usize = 96;
 const MAX_BODY_BYTES: usize = 65_535;
 const MAX_WIRE_BYTES: usize = 1024 * 1024;
-const MAX_RESPONSE_BYTES: usize = 1024;
 
-/// A receiver outcome for one prepared range. Only `Complete` may advance its
-/// cursor. `Unknown` means no response can be applied to the local journal.
+/// A sender outcome for one prepared range. Only `Complete` may advance its
+/// cursor. `Blocked` needs caller intervention; `Unknown` needs another attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOtlpSendResult {
     Complete,
@@ -31,15 +30,16 @@ pub enum AuditOtlpSendResult {
 }
 
 impl AuditOtlpSendResult {
-    /// Convert only an observed receiver verdict into a local finish action.
-    /// A lost or unreadable response leaves the prepared range untouched.
+    /// Return a local finish action only where the journal has a safe one.
+    /// `Blocked` has no finish action: the current local journal has no way to
+    /// undo a permanent block after credentials, routing, or input are fixed.
+    /// The caller must pause and surface it while retaining the prepared range.
     pub fn for_finish(self) -> Option<ReceiverResult> {
         match self {
             Self::Complete => Some(ReceiverResult::Complete),
             Self::Partial => Some(ReceiverResult::Partial),
             Self::Retryable => Some(ReceiverResult::Retryable),
-            Self::Blocked => Some(ReceiverResult::Permanent),
-            Self::Unknown => None,
+            Self::Blocked | Self::Unknown => None,
         }
     }
 }
@@ -59,6 +59,7 @@ impl std::error::Error for AuditOtlpSenderConfigError {}
 /// Dedicated audit endpoint and credential, held in memory only. Debug is
 /// intentionally opaque so callers cannot accidentally log either value.
 pub struct AuditOtlpSender {
+    destination: String,
     endpoint: Zeroizing<String>,
     token: Zeroizing<String>,
     timeout: Duration,
@@ -72,24 +73,39 @@ impl fmt::Debug for AuditOtlpSender {
 
 impl AuditOtlpSender {
     /// Create an inactive sender for a dedicated `https://.../v1/logs` gateway.
+    /// `destination` is the stable profile identity also passed to
+    /// `LocalAuditDelivery::open`; it must remain stable across token rotation.
     /// Loopback endpoints require the explicit dev/test constructor below.
     pub fn new(
+        destination: impl Into<String>,
         endpoint: impl Into<String>,
         bearer_token: impl Into<String>,
     ) -> Result<Self, AuditOtlpSenderConfigError> {
-        Self::build(endpoint.into(), bearer_token.into(), false)
+        Self::build(
+            destination.into(),
+            endpoint.into(),
+            bearer_token.into(),
+            false,
+        )
     }
 
     /// Permit an exact `localhost` or loopback-IP endpoint for local tests and
     /// development. The shared dial gate still checks every resolved address.
     pub fn for_loopback_dev(
+        destination: impl Into<String>,
         endpoint: impl Into<String>,
         bearer_token: impl Into<String>,
     ) -> Result<Self, AuditOtlpSenderConfigError> {
-        Self::build(endpoint.into(), bearer_token.into(), true)
+        Self::build(
+            destination.into(),
+            endpoint.into(),
+            bearer_token.into(),
+            true,
+        )
     }
 
     fn build(
+        destination: String,
         endpoint: String,
         bearer_token: String,
         allow_loopback: bool,
@@ -97,11 +113,11 @@ impl AuditOtlpSender {
         let url =
             config::parse_relay_telemetry_endpoint(&endpoint).ok_or(AuditOtlpSenderConfigError)?;
         let host = url.host_str().ok_or(AuditOtlpSenderConfigError)?;
-        if url.path() != "/v1/logs"
+        if destination.is_empty()
+            || destination.len() > 256
+            || url.path() != "/v1/logs"
             || url.query().is_some()
-            || retired_relay_hosts()
-                .iter()
-                .any(|retired| host.trim_end_matches('.').eq_ignore_ascii_case(retired))
+            || audit_upload_host_is_retired(host)
             || (config::endpoint_host_is_loopback(&endpoint) && !allow_loopback)
             || bearer_token.is_empty()
             || !bearer_token.is_ascii()
@@ -111,15 +127,20 @@ impl AuditOtlpSender {
             return Err(AuditOtlpSenderConfigError);
         }
         Ok(Self {
+            destination,
             endpoint: Zeroizing::new(endpoint),
             token: Zeroizing::new(bearer_token),
             timeout: collector_host_safety::REQUEST_TIMEOUT,
         })
     }
 
-    /// Send one owned, already prepared range. No local lease or file handle is
-    /// held here. A network error after request acceptance is always `Unknown`.
+    /// Send one owned, already prepared range. The destination identity must
+    /// match the identity passed to `LocalAuditDelivery::open`; a mismatch is
+    /// blocked before dialing. No local lease or file handle is held here.
     pub async fn send(&self, batch: DeliveryBatch) -> AuditOtlpSendResult {
+        if batch.token.destination() != self.destination.as_str() {
+            return AuditOtlpSendResult::Blocked;
+        }
         let Some(body) = encode_batch(batch) else {
             return AuditOtlpSendResult::Blocked;
         };
@@ -141,7 +162,7 @@ impl AuditOtlpSender {
         let Ok(client) = pin.build_client() else {
             return AuditOtlpSendResult::Unknown;
         };
-        let Ok(mut response) = client
+        let Ok(response) = client
             .post(pin.url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .bearer_auth(self.token.as_str())
@@ -151,7 +172,12 @@ impl AuditOtlpSender {
         else {
             return AuditOtlpSendResult::Unknown;
         };
-        let status = response.status().as_u16();
+        match response.status().as_u16() {
+            409 => return AuditOtlpSendResult::Partial,
+            429 | 500..=599 => return AuditOtlpSendResult::Retryable,
+            200 => {}
+            _ => return AuditOtlpSendResult::Blocked,
+        }
         let valid_success_headers = response.content_length() == Some(2)
             && response.headers().get(reqwest::header::CONTENT_TYPE)
                 == Some(&reqwest::header::HeaderValue::from_static(
@@ -163,31 +189,13 @@ impl AuditOtlpSender {
             && !response
                 .headers()
                 .contains_key(reqwest::header::TRANSFER_ENCODING);
-        let mut response_body = Vec::new();
-        loop {
-            match response.chunk().await {
-                Ok(Some(chunk)) if response_body.len() + chunk.len() <= MAX_RESPONSE_BYTES => {
-                    response_body.extend_from_slice(&chunk);
-                }
-                // A bounded read is enough to reject a malformed success.
-                // An explicit retryable or partial status retains its meaning
-                // even when its diagnostic body is larger than our budget.
-                Ok(Some(_)) => {
-                    return match status {
-                        409 => AuditOtlpSendResult::Partial,
-                        429 | 500..=599 => AuditOtlpSendResult::Retryable,
-                        _ => AuditOtlpSendResult::Blocked,
-                    };
-                }
-                Ok(None) => break,
-                Err(_) => return AuditOtlpSendResult::Unknown,
-            }
+        if !valid_success_headers {
+            return AuditOtlpSendResult::Blocked;
         }
-        match status {
-            200 if valid_success_headers && response_body == b"{}" => AuditOtlpSendResult::Complete,
-            409 => AuditOtlpSendResult::Partial,
-            429 | 500..=599 => AuditOtlpSendResult::Retryable,
-            _ => AuditOtlpSendResult::Blocked,
+        match response.bytes().await {
+            Ok(body) if body.as_ref() == b"{}" => AuditOtlpSendResult::Complete,
+            Ok(_) => AuditOtlpSendResult::Blocked,
+            Err(_) => AuditOtlpSendResult::Unknown,
         }
     }
 }

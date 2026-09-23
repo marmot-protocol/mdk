@@ -65,8 +65,9 @@ App runtime bridge for the first real Marmot app surfaces.
   `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and
   HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
 - Keep the inactive audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
-  preserves each original v4 JSON body inside the restricted OTLP JSON envelope, and maps only verified receiver
-  responses to local finish actions. It has no runtime worker, endpoint default, or native binding.
+  checks the prepared destination, preserves each original v4 JSON body inside the restricted OTLP JSON envelope,
+  and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
+  outcomes retain the prepared range. It has no runtime worker, endpoint default, or native binding.
 - Record into distinct v4 files and upload only strictly validated v4 snapshots. Never migrate or send v1-v3
   or key-reveal files. Reject removed/unknown fields and duplicate keys before HTTP; cache ineligible file verdicts
   by size and mtime without retry cooldowns. On exclusive-root startup, `audit_log/legacy_cleanup.rs` deletes

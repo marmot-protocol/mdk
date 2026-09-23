@@ -9,6 +9,8 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+const TEST_DESTINATION: &str = "audit-gateway";
+
 fn prepared() -> (
     TempDir,
     std::path::PathBuf,
@@ -25,7 +27,7 @@ fn prepared() -> (
             intent_kind: "quote \" and \\ slash".into(),
         },
     ));
-    let mut owner = LocalAuditDelivery::open(&active, &state, "audit-gateway").unwrap();
+    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
     let batch = match owner.prepare_once().unwrap() {
         Preparation::Batch(batch) => batch,
         other => panic!("expected batch: {other:?}"),
@@ -102,7 +104,9 @@ async fn exact_original_bodies_and_full_success_advance_after_reacquiring_owners
         .map(|line| String::from_utf8(line.strip_suffix(b"\n").unwrap().to_vec()).unwrap())
         .collect();
     let (endpoint, service) = service(reply(200, "{}")).await;
-    let sender = AuditOtlpSender::for_loopback_dev(endpoint, "dedicated-test-token").unwrap();
+    let sender =
+        AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "dedicated-test-token")
+            .unwrap();
     assert!(!format!("{sender:?}").contains("dedicated-test-token"));
     assert_eq!(sender.send(batch).await, AuditOtlpSendResult::Complete);
     let request = service.await.unwrap();
@@ -142,7 +146,7 @@ async fn exact_original_bodies_and_full_success_advance_after_reacquiring_owners
             &serde_json::json!({"body":{"stringValue":original_body}})
         );
     }
-    let mut owner = LocalAuditDelivery::open(&active, &state, "audit-gateway").unwrap();
+    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
     assert_eq!(
         owner
             .finish(&token, AuditOtlpSendResult::Complete.for_finish().unwrap())
@@ -164,7 +168,11 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
         (429, "{}", AuditOtlpSendResult::Retryable),
         (400, "{}", AuditOtlpSendResult::Blocked),
         (401, "{}", AuditOtlpSendResult::Blocked),
+        (403, "{}", AuditOtlpSendResult::Blocked),
+        (404, "{}", AuditOtlpSendResult::Blocked),
+        (408, "{}", AuditOtlpSendResult::Blocked),
         (413, "{}", AuditOtlpSendResult::Blocked),
+        (302, "{}", AuditOtlpSendResult::Blocked),
         (204, "", AuditOtlpSendResult::Blocked),
         (202, "{}", AuditOtlpSendResult::Blocked),
         (200, "", AuditOtlpSendResult::Blocked),
@@ -173,7 +181,8 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
         (200, "{} ", AuditOtlpSendResult::Blocked),
     ] {
         let (endpoint, task) = service(reply(status, body)).await;
-        let sender = AuditOtlpSender::for_loopback_dev(endpoint, "token").unwrap();
+        let sender =
+            AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
         assert_eq!(
             sender.send(batch.clone()).await,
             expected,
@@ -181,18 +190,99 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
         );
         task.await.unwrap();
     }
-    let (endpoint, task) = service(reply(503, &"x".repeat(MAX_RESPONSE_BYTES + 1))).await;
-    let sender = AuditOtlpSender::for_loopback_dev(endpoint, "token").unwrap();
+    let (endpoint, task) = service(reply(503, &"x".repeat(2048))).await;
+    let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
     assert_eq!(
         sender.send(batch.clone()).await,
         AuditOtlpSendResult::Retryable
     );
     task.await.unwrap();
     assert_eq!(AuditOtlpSendResult::Unknown.for_finish(), None);
+    assert_eq!(AuditOtlpSendResult::Blocked.for_finish(), None);
+}
+
+#[tokio::test]
+async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled() {
+    let (_dir, active, state, batch) = prepared();
+    let token = batch.token.clone();
+    let (endpoint, task) =
+        service(b"HTTP/1.1 409 Conflict\r\nContent-Length: 9\r\n\r\n{}".to_vec()).await;
+    let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
     assert_eq!(
-        AuditOtlpSendResult::Blocked.for_finish(),
-        Some(ReceiverResult::Permanent)
+        sender.send(batch.clone()).await,
+        AuditOtlpSendResult::Partial
     );
+    task.await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 9\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+    let mut sender =
+        AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
+    sender.timeout = Duration::from_millis(50);
+    assert_eq!(sender.send(batch).await, AuditOtlpSendResult::Partial);
+    task.await.unwrap();
+
+    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
+    assert_eq!(
+        owner
+            .finish(&token, AuditOtlpSendResult::Partial.for_finish().unwrap())
+            .unwrap(),
+        DeliveryStep::Blocked
+    );
+}
+
+#[tokio::test]
+async fn mismatched_destination_never_dials_or_advances_the_source_cursor() {
+    let (_dir, active, state, batch) = prepared();
+    let token = batch.token.clone();
+    let bodies = batch.bodies.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
+    let sender = AuditOtlpSender::for_loopback_dev("other-gateway", endpoint, "token").unwrap();
+    let outcome = sender.send(batch).await;
+    assert_eq!(outcome, AuditOtlpSendResult::Blocked);
+    assert_eq!(outcome.for_finish(), None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+
+    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
+    let replay = match owner.prepare_once().unwrap() {
+        Preparation::Batch(batch) => batch,
+        other => panic!("expected replay: {other:?}"),
+    };
+    assert_eq!(replay.token, token);
+    assert_eq!(replay.bodies, bodies);
+}
+
+#[tokio::test]
+async fn authentication_rejection_leaves_the_prepared_range_replayable() {
+    let (_dir, active, state, batch) = prepared();
+    let token = batch.token.clone();
+    let (endpoint, task) = service(reply(401, "{}")).await;
+    let sender =
+        AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "old-token").unwrap();
+    let outcome = sender.send(batch).await;
+    assert_eq!(outcome, AuditOtlpSendResult::Blocked);
+    assert_eq!(outcome.for_finish(), None);
+    task.await.unwrap();
+    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
+    let replay = match owner.prepare_once().unwrap() {
+        Preparation::Batch(batch) => batch,
+        other => panic!("expected replay: {other:?}"),
+    };
+    assert_eq!(replay.token, token);
 }
 
 #[tokio::test]
@@ -202,11 +292,11 @@ async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
     let token = batch.token.clone();
 
     let (endpoint, task) = service(Vec::new()).await;
-    let sender = AuditOtlpSender::for_loopback_dev(endpoint, "token").unwrap();
+    let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
     assert_eq!(sender.send(batch).await, AuditOtlpSendResult::Unknown);
     let first_request = task.await.unwrap();
 
-    let mut owner = LocalAuditDelivery::open(&active, &state, "audit-gateway").unwrap();
+    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
     let replay = match owner.prepare_once().unwrap() {
         Preparation::Batch(batch) => batch,
         other => panic!("expected replay: {other:?}"),
@@ -215,7 +305,7 @@ async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
     assert_eq!(replay.bodies, original);
     drop(owner);
     let (endpoint, task) = service(reply(200, "{}")).await;
-    let sender = AuditOtlpSender::for_loopback_dev(endpoint, "token").unwrap();
+    let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
     assert_eq!(sender.send(replay).await, AuditOtlpSendResult::Complete);
     let retried = task.await.unwrap();
     assert_eq!(retried.body, first_request.body);
@@ -225,10 +315,12 @@ async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
         String::from_utf8(original[0][..original[0].len() - 1].to_vec()).unwrap()
     );
 
-    let (endpoint, task) =
-        service(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n{}".to_vec()).await;
-    let sender = AuditOtlpSender::for_loopback_dev(endpoint, "token").unwrap();
-    let mut owner = LocalAuditDelivery::open(&active, &state, "audit-gateway").unwrap();
+    let (endpoint, task) = service(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{".to_vec(),
+    )
+    .await;
+    let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
+    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
     let replay = match owner.prepare_once().unwrap() {
         Preparation::Batch(batch) => batch,
         other => panic!("expected replay: {other:?}"),
@@ -249,11 +341,12 @@ async fn timeout_after_acceptance_is_unknown() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         request
     });
-    let mut sender = AuditOtlpSender::for_loopback_dev(endpoint, "token").unwrap();
+    let mut sender =
+        AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
     sender.timeout = Duration::from_millis(50);
     assert_eq!(sender.send(batch).await, AuditOtlpSendResult::Unknown);
     task.await.unwrap();
-    let mut owner = LocalAuditDelivery::open(&active, &state, "audit-gateway").unwrap();
+    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
     assert!(matches!(
         owner.prepare_once().unwrap(),
         Preparation::Batch(_)
@@ -268,13 +361,39 @@ fn endpoint_and_batch_limits_are_checked_before_network() {
         "https://example.org/v1/metrics",
         "https://example.org/v1/logs?tenant=x",
         "https://user:pass@example.org/v1/logs",
+        "https://localhost/v1/logs",
     ] {
-        assert!(AuditOtlpSender::new(endpoint, "token").is_err());
+        assert!(AuditOtlpSender::new(TEST_DESTINATION, endpoint, "token").is_err());
     }
-    assert!(AuditOtlpSender::new("https://example.org/v1/logs", "\r\ntoken").is_err());
-    let (_dir, _active, _state, mut batch) = prepared();
-    batch.bodies[0].extend_from_slice(b"extra");
-    assert!(encode_batch(batch).is_none());
+    let retired = crate::retired_relay_hosts();
+    let retired_host = &retired[0];
+    for host in [
+        retired_host.clone(),
+        format!("{}.", retired_host.to_ascii_uppercase()),
+    ] {
+        assert!(
+            AuditOtlpSender::new(TEST_DESTINATION, format!("https://{host}/v1/logs"), "token")
+                .is_err()
+        );
+    }
+    assert!(AuditOtlpSender::new(TEST_DESTINATION, "https://example.org/v1/logs", "").is_err());
+    assert!(
+        AuditOtlpSender::new(TEST_DESTINATION, "https://example.org/v1/logs", "\r\ntoken").is_err()
+    );
+    let (_dir, _active, _state, batch) = prepared();
+    let mut invalid = batch.clone();
+    invalid.bodies[0].extend_from_slice(b"extra");
+    assert!(encode_batch(invalid).is_none());
+    let mut empty = batch.clone();
+    empty.bodies.clear();
+    assert!(encode_batch(empty).is_none());
+    let mut too_many = batch.clone();
+    too_many.bodies = vec![batch.bodies[0].clone(); MAX_RECORDS + 1];
+    assert!(encode_batch(too_many).is_none());
+    let mut too_large = batch;
+    too_large.bodies[0] = vec![b'a'; MAX_BODY_BYTES + 1];
+    too_large.bodies[0].push(b'\n');
+    assert!(encode_batch(too_large).is_none());
 }
 
 /// Run explicitly where the pinned Python receiver dependency is available.
