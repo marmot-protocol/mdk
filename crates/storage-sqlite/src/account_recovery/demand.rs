@@ -208,6 +208,16 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// The serialized owner calls this only with no live attempt or caller
+    /// referring to known-event completion. Pending debt is never reclaimed;
+    /// epoch certificates and maintenance jobs have their own longer lifetimes.
+    pub fn reclaim_completed_recovery_events(&self) -> StorageResult<usize> {
+        self.lock()?.execute_cached(
+            "DELETE FROM account_recovery_obligations WHERE cause=4 AND predicate=1 AND state=1 AND urgency=0",
+            [],
+        ).storage()
+    }
+
     /// A cancelled last foreground waiter loses urgency, not durable work.
     /// System demand and other callers have independent identities/predicates.
     pub fn detach_recovery_waiter(&self, ticket: RecoveryDemandTicket) -> StorageResult<()> {

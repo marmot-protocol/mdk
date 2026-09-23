@@ -180,6 +180,15 @@ pub(crate) struct AttemptGrant {
     pub(super) inventory: Vec<FrozenRecoveryInventory>,
     loss: Vec<GrantedLoss>,
     _live: Arc<()>,
+    admission: Option<Arc<RecoveryAdmissionSnapshot>>,
+}
+
+/// Admission scope survives exactly as long as its grant. The owner holds only
+/// a weak reference, so cancellation/quiescence cannot retain a finished plan.
+struct RecoveryAdmissionSnapshot {
+    scopes: Vec<RecoveryScopePlan>,
+    attempt: u64,
+    fence: RecoveryRevisionFence,
 }
 
 #[derive(Clone)]
@@ -232,9 +241,7 @@ pub(crate) struct AccountRecoveryOwner {
     wall_anchor_ms: u64,
     monotonic_anchor: Instant,
     active: Weak<()>,
-    active_scopes: Vec<RecoveryScopePlan>,
-    active_attempt: u64,
-    active_fence: Option<RecoveryRevisionFence>,
+    active_admission: Weak<RecoveryAdmissionSnapshot>,
     policy: RecoveryRetryPolicy,
     mode: RecoveryExecutorMode,
     // At most the two loss causes. These are captured CAS inputs, never an
@@ -269,15 +276,14 @@ impl AccountRecoveryOwner {
         policy.delay_ms(0)?;
         storage.restore_unacknowledged_recovery_loss()?;
         storage.restore_recovery_waiters()?;
+        storage.reclaim_completed_recovery_events()?;
         storage.restore_recovery_retry(wall_now_ms, duration_ms(policy.cap)?)?;
         Ok(Self {
             maintenance_observations: std::collections::HashMap::new(),
             wall_anchor_ms: wall_now_ms,
             monotonic_anchor: monotonic_now,
             active: Weak::new(),
-            active_scopes: Vec::new(),
-            active_attempt: 0,
-            active_fence: None,
+            active_admission: Weak::new(),
             policy,
             mode: RecoveryExecutorMode::Normal,
             pending_loss_acknowledgments: Vec::new(),
@@ -328,7 +334,11 @@ impl AccountRecoveryOwner {
         now: Instant,
         explicit: Option<&mut ExplicitRecoveryPermit>,
     ) -> StorageResult<Option<AttemptGrant>> {
-        if self.active.upgrade().is_some() || readiness == RecoveryReadiness::Waiting {
+        if self.active.upgrade().is_some() {
+            return Ok(None);
+        }
+        storage.reclaim_completed_recovery_events()?;
+        if readiness == RecoveryReadiness::Waiting {
             return Ok(None);
         }
         let now_ms = self.logical_now_ms(now)?;
@@ -414,9 +424,7 @@ impl AccountRecoveryOwner {
         }
         let live = Arc::new(());
         self.active = Arc::downgrade(&live);
-        self.active_scopes.clear();
-        self.active_attempt = reservation.attempt_serial;
-        self.active_fence = Some(fence.clone());
+        self.active_admission = Weak::new();
         Ok(Some(AttemptGrant {
             reservation,
             fence,
@@ -426,6 +434,7 @@ impl AccountRecoveryOwner {
             inventory: Vec::new(),
             loss: Vec::new(),
             _live: live,
+            admission: None,
         }))
     }
 
@@ -476,12 +485,18 @@ impl AccountRecoveryOwner {
                     .collect(),
             });
         }
-        self.active_scopes = grant
-            .plan
-            .iter()
-            .flat_map(|obligation| &obligation.scopes)
-            .map(|scope| scope.goal.clone())
-            .collect();
+        let admission = Arc::new(RecoveryAdmissionSnapshot {
+            scopes: grant
+                .plan
+                .iter()
+                .flat_map(|obligation| &obligation.scopes)
+                .map(|scope| scope.goal.clone())
+                .collect(),
+            attempt: grant.reservation.attempt_serial,
+            fence: grant.fence.clone(),
+        });
+        self.active_admission = Arc::downgrade(&admission);
+        grant.admission = Some(admission);
         Ok(Some(grant))
     }
 
@@ -495,29 +510,24 @@ impl AccountRecoveryOwner {
         created_at: u64,
         now: Instant,
     ) -> StorageResult<bool> {
-        if self.active.upgrade().is_none()
-            || !self.active_scopes.iter().any(|scope| {
-                created_at <= scope.until_seconds
-                    && scope.since_seconds.is_none_or(|since| created_at >= since)
-                    && match route {
-                        storage_sqlite::TransportReconciliationRoute::Inbox => {
-                            scope.route_kind == 0
-                        }
-                        storage_sqlite::TransportReconciliationRoute::Group(id) => {
-                            scope.route_kind == 1 && scope.transport_group_id.as_ref() == Some(id)
-                        }
-                    }
-            })
-        {
-            return Ok(false);
-        }
-        let attempt = self.active_attempt;
-        let Some(fence) = self.active_fence.as_ref() else {
+        let Some(admission) = self.active_admission.upgrade() else {
             return Ok(false);
         };
+        if !admission.scopes.iter().any(|scope| {
+            created_at <= scope.until_seconds
+                && scope.since_seconds.is_none_or(|since| created_at >= since)
+                && match route {
+                    storage_sqlite::TransportReconciliationRoute::Inbox => scope.route_kind == 0,
+                    storage_sqlite::TransportReconciliationRoute::Group(id) => {
+                        scope.route_kind == 1 && scope.transport_group_id.as_ref() == Some(id)
+                    }
+                }
+        }) {
+            return Ok(false);
+        }
         storage.checkpoint_recovery_progress(
-            fence,
-            attempt,
+            &admission.fence,
+            admission.attempt,
             self.logical_now_ms(now)?,
             duration_ms(self.policy.base)?,
         )
@@ -817,9 +827,14 @@ impl AppClient {
             self.recovery_owner
                 .pending_loss_acknowledgments
                 .retain(|(_, prior)| prior.id != loss.id);
-            self.recovery_owner
-                .pending_loss_acknowledgments
-                .push((grant.fence.clone(), loss.clone()));
+            self.recovery_owner.pending_loss_acknowledgments.push((
+                {
+                    let mut fence = grant.fence.clone();
+                    fence.obligations.retain(|(id, _)| *id == loss.id);
+                    fence
+                },
+                loss.clone(),
+            ));
         }
         // Do not clear a shared plane guard while another loss obligation was
         // omitted from this grant (for example one waiting for a capability).
@@ -1792,9 +1807,141 @@ mod tests {
         let restored = storage.recovery_scope_snapshots(id).unwrap();
         assert_eq!(restored[0].plan.until_seconds, 10);
         assert!(restored[0].token == plan[0].scopes[0].token);
+        let admission = owner.active_admission.clone();
+        assert!(admission.upgrade().is_some());
         drop(grant);
+        assert!(
+            admission.upgrade().is_none(),
+            "the last grant owns the frozen admission snapshot"
+        );
         assert_eq!(storage.pending_recovery_demands().unwrap().len(), 1);
     }
+    #[tokio::test]
+    async fn completed_known_event_metadata_waits_for_grant_release_then_is_reclaimed() {
+        use storage_sqlite::{RecoveryEligibility, RecoveryRequest, RecoveryScopeCheckpoint};
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+        let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+        let group = client.create_group("retirement", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let complete = storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &[1; 32],
+                },
+                1,
+            )
+            .unwrap();
+        let pending = storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &[2; 32],
+                },
+                1,
+            )
+            .unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        let obligation = grant
+            .plan()
+            .unwrap()
+            .iter()
+            .find(|o| o.id == complete.id)
+            .unwrap();
+        // Supply the admission fact for this metadata-lifetime test. Runtime
+        // retained-copy validation is exercised separately by ingress tests.
+        let checkpoints = obligation
+            .scopes
+            .iter()
+            .map(|scope| RecoveryScopeCheckpoint {
+                token: scope.token.clone(),
+                retained_known_event: true,
+                endpoints: vec![],
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            storage
+                .checkpoint_recovery_obligation(
+                    &grant.fence,
+                    grant.reservation.attempt_serial,
+                    complete.id,
+                    &checkpoints,
+                    RecoveryEligibility::Retry
+                )
+                .unwrap()
+        );
+        let retry = storage.recovery_retry_state().unwrap();
+        assert!(
+            client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Receive
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .recovery_obligation_is_satisfied(complete.id, complete.revision)
+                .unwrap(),
+            "a live grant can still need its completion verdict"
+        );
+        let stale_fence = grant.fence.clone();
+        drop(grant);
+        assert!(
+            client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Receive
+                )
+                .unwrap()
+                .is_none(),
+            "reclamation cannot bypass cooldown"
+        );
+        assert!(
+            storage
+                .recovery_scope_snapshots(complete.id)
+                .unwrap()
+                .is_empty(),
+            "completed known-event scopes must not accumulate after their last grant drops"
+        );
+        assert!(
+            !storage
+                .recovery_obligation_is_satisfied(complete.id, complete.revision)
+                .unwrap()
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|d| d.ticket.id == pending.id)
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert!(
+            !storage
+                .checkpoint_recovery_obligation(
+                    &stale_fence,
+                    retry.attempt_serial,
+                    complete.id,
+                    &checkpoints,
+                    RecoveryEligibility::Retry
+                )
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn post_join_boundary_completes_only_its_predicate_and_keeps_grace_fixed() {
         verify_post_join_boundary_and_grace(RecoveryExecutorMode::Normal).await;

@@ -173,3 +173,13 @@ and superseded checks, and the remaining blocking acquisition limitations.
   failure and newer loss. All 58 storage recovery, 16 owner and 11 repair tests
   pass (app tests with policy overrides). The initial implementation needed an
   explicit connection guard binding before compilation; final runs include it.
+- Completed metadata lifetime: a red runtime test reproduced completed known-event
+  scope accumulation. The owner now reclaims those rows only after the live grant
+  releases, or at owner reconstruction, preserving pending events, stale-result
+  rejection and retry state. Admission snapshots are grant-owned with only a weak
+  owner reference; cancellation/quiescence releases them immediately. Pending
+  cross-grant loss acknowledgment retains only its own obligation revision rather
+  than the whole selected demand set. All 17 owner tests pass with policy overrides,
+  including the new lifetime regression and the snapshot-drop assertion. The bounds
+  inventory distinguishes fixed active inventory limits from input-relative
+  unresolved historical goals; no old route or unresolved event is evicted for a cap.
