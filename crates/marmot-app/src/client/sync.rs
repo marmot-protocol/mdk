@@ -942,6 +942,10 @@ impl AppClient {
         )))
     }
 
+    fn delivery_loss_blocks_cursor(&self) -> bool {
+        self.delivery_overflow_recovery_pending || self.adapter.delivery_loss_blocks_cursor()
+    }
+
     fn observe_delivery_overflow(
         &mut self,
         overflow: crate::relay_plane::AccountDeliveryOverflow,
@@ -1738,7 +1742,11 @@ impl AppClient {
     ) -> Result<crate::relay_plane::AccountDeliveryReceive, AppError> {
         loop {
             let Some(received) = self.adapter.receive_account_delivery().await? else {
-                if let Some(loss) = self.adapter.pending_delivery_overflow() {
+                if let Some(loss) = self
+                    .adapter
+                    .unpersisted_notification_loss()
+                    .or_else(|| self.adapter.pending_delivery_overflow())
+                {
                     self.observe_delivery_overflow(loss)?;
                 }
                 return Err(AppError::TransportClosed);
@@ -1772,7 +1780,7 @@ impl AppClient {
         let event_id = hex::encode(delivery.message.id.as_slice());
         let ingested =
             Self::ingest_delivery(self.transport_receipts()?, delivery, &mut summary).await?;
-        if self.adapter.pending_delivery_overflow().is_some() {
+        if self.delivery_loss_blocks_cursor() {
             // `record_drop` publishes this process-local fence at the exact
             // omission, before marker I/O or the reserved control record can
             // complete. Keep this per-delivery checkpoint on its pre-ingest
@@ -2276,7 +2284,10 @@ impl AppClient {
         };
 
         if verdict != DrainVerdict::Overflow
-            && let Some(overflow) = self.adapter.pending_delivery_overflow()
+            && let Some(overflow) = self
+                .adapter
+                .unpersisted_notification_loss()
+                .or_else(|| self.adapter.pending_delivery_overflow())
         {
             // The queue signal intentionally trails marker persistence, so a
             // quiescence timeout can win while that signal is still pending.
@@ -2408,7 +2419,7 @@ impl AppClient {
             false
         };
         let checkpointed_before = self.checkpointed_transport_timestamp;
-        if self.adapter.pending_delivery_overflow().is_none() {
+        if !self.delivery_loss_blocks_cursor() {
             self.checkpointed_transport_timestamp = self.state.last_transport_timestamp;
         }
         let checkpoint = if cfg!(feature = "test-policy-overrides")
@@ -3604,6 +3615,8 @@ impl AppClient {
             .delivery_overflow_recovery_marker_token
             .filter(|_| self.delivery_overflow_recovery_pending)
             .map(|token| self.adapter.start_delivery_overflow_recovery(token));
+        let mut overflow_guard =
+            overflow.map(|_| super::recovery::RecoveryLossAttemptGuard::new(self.adapter.clone()));
         let audit_groups = plan
             .iter()
             .filter(|obligation| obligation.cause == storage_sqlite::RecoveryCause::EpochGap)
@@ -3700,6 +3713,9 @@ impl AppClient {
             if !finished {
                 self.adapter.fail_delivery_overflow_recovery();
             }
+        }
+        if let Some(guard) = overflow_guard.as_mut() {
+            guard.disarm();
         }
         if repair.is_some()
             && let Some(verdict) =

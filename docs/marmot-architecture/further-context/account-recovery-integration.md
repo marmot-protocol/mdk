@@ -82,3 +82,10 @@ and superseded checks, and the remaining blocking acquisition limitations.
   control/count races. The notification replacement regression now exercises the
   actual worker receive boundary rather than assigning notification writes to the
   queue callback. Live-attempt cancellation and cursor handoff are the next section.
+- Live-attempt lifetime: two red regressions reproduced a stranded transient plane
+  flag after future drop and durable cursor advancement during an unacknowledged
+  attempt. A scoped attempt guard now releases the transient flag on every exit;
+  cursor fencing consults pending loss independently of dispatch visibility. Typed
+  notification lag remains worker-visible during an active attempt. Both regressions,
+  qualified-completion rollback after failed plane acknowledgment, and notification
+  replacement pass. These focused results do not establish combined readiness.

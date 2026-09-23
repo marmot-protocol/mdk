@@ -351,6 +351,8 @@ async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_r
     storage
         .mark_account_delivery_recovery("alice", 42, 3)
         .unwrap();
+    client.delivery_overflow_recovery_pending = true;
+    client.delivery_overflow_recovery_marker_token = Some(42);
     let before = relay.subscription_count();
     {
         let repair = client.repair_full_history();
@@ -366,6 +368,10 @@ async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_r
             } => {}
         }
     }
+    assert!(
+        client.adapter.pending_delivery_overflow().is_some(),
+        "dropping an active repair must release its transient plane recovery flag"
+    );
     let demands = storage.pending_recovery_demands().unwrap();
     let explicit = demands
         .iter()
@@ -396,4 +402,38 @@ async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_r
     assert!(!demands.iter().any(|d| d.caller_waiting));
     assert_eq!(storage.recovery_retry_state().unwrap(), retry);
     drop(reopened);
+}
+
+#[tokio::test]
+async fn loss_handoff_active_attempt_does_not_advance_the_durable_cursor() {
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .mark_account_delivery_recovery("alice", 42, 3)
+        .unwrap();
+    client.delivery_overflow_recovery_pending = true;
+    client.delivery_overflow_recovery_marker_token = Some(42);
+    let _attempt = client.adapter.start_delivery_overflow_recovery(42);
+    let old = client.checkpointed_transport_timestamp;
+    client.state.last_transport_timestamp = Some(unix_now_seconds());
+    assert!(
+        client
+            .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 0)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        client.checkpointed_transport_timestamp, old,
+        "an in-flight attempt is not acknowledged recovery"
+    );
+    drop(client);
+    let reopened = client_on_app_relay_plane(&app, "alice").await;
+    assert_eq!(reopened.checkpointed_transport_timestamp, old);
+    assert!(
+        storage
+            .account_delivery_recovery("alice")
+            .unwrap()
+            .is_some()
+    );
 }

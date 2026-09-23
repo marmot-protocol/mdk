@@ -2134,6 +2134,25 @@ impl MarmotRelayPlaneAccountAdapter {
         self.delivery_overflow.notification_persisted(observed);
     }
 
+    /// A running attempt has not acknowledged loss and cannot advance a cursor.
+    pub(crate) fn delivery_loss_blocks_cursor(&self) -> bool {
+        self.delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending
+    }
+
+    pub(crate) fn unpersisted_notification_loss(&self) -> Option<AccountDeliveryOverflow> {
+        let state = self
+            .delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        (state.pending && state.notification_losses > state.notification_imported)
+            .then(|| AccountDeliveryOverflowState::snapshot(&state))
+    }
+
     pub(crate) fn pending_delivery_overflow(&self) -> Option<AccountDeliveryOverflow> {
         self.delivery_overflow.pending_snapshot()
     }

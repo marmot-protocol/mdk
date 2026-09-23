@@ -65,6 +65,32 @@ impl Drop for RecoveryCallerGuard {
     }
 }
 
+/// Cancellation of a granted executor must release its transient plane lease.
+/// The account worker's sole active grant prevents overlap with another attempt.
+/// Durable loss and its cursor guard remain armed.
+pub(super) struct RecoveryLossAttemptGuard {
+    adapter: crate::relay_plane::MarmotRelayPlaneAccountAdapter,
+    armed: bool,
+}
+impl RecoveryLossAttemptGuard {
+    pub(super) fn new(adapter: crate::relay_plane::MarmotRelayPlaneAccountAdapter) -> Self {
+        Self {
+            adapter,
+            armed: true,
+        }
+    }
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for RecoveryLossAttemptGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.adapter.fail_delivery_overflow_recovery();
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RecoveryRetryPolicy {
     pub(crate) base: Duration,
