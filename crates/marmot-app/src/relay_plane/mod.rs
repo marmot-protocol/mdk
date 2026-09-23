@@ -1744,6 +1744,19 @@ trait RelayNotificationSource: Send + Sync {
     fn is_shutdown(&self) -> bool;
     fn record_loss(&self, _skipped: u64) {}
     fn receiver_replaced(&self) {}
+    #[cfg(test)]
+    fn worker_failure_hook(&self) -> Option<Arc<NotificationWorkerFailureHook>> {
+        None
+    }
+    #[cfg(test)]
+    fn notification_queued(&self) {}
+}
+
+#[cfg(test)]
+struct NotificationWorkerFailureHook {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    fail_once: AtomicBool,
 }
 
 struct SdkRelayNotificationSource {
@@ -2010,13 +2023,11 @@ async fn run_relay_notification_consumer(
 /// Keep reading the SDK receiver while account delivery or telemetry awaits.
 /// The bounded queue is an event lane; a full queue becomes a typed gap before
 /// the reader can block, and the watch control lane advances independently.
-fn abandoned_notification_lane<T>(
-    sender: &mpsc::Sender<T>,
-    in_flight: &AtomicBool,
+fn abandoned_notification_lane(
+    pending: &AtomicU64,
     source: &dyn RelayNotificationSource,
 ) -> RelayNotificationConsumerExit {
-    let abandoned = (sender.max_capacity() - sender.capacity()) as u64
-        + u64::from(in_flight.load(Ordering::SeqCst));
+    let abandoned = pending.load(Ordering::SeqCst);
     if abandoned > 0 {
         source.record_loss(abandoned);
         RelayNotificationConsumerExit::Lagged(abandoned)
@@ -2033,16 +2044,28 @@ async fn run_relay_notification_consumer_scoped(
 ) -> RelayNotificationConsumerOutcome {
     const EVENT_QUEUE_CAPACITY: usize = 256;
     let (sender, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-    let in_flight = Arc::new(AtomicBool::new(false));
-    let worker_in_flight = in_flight.clone();
+    // Channel capacity returns to its maximum when a panicked worker drops
+    // the receiver, even though queued work was discarded. Count admitted
+    // items independently until each worker operation actually finishes.
+    let pending = Arc::new(AtomicU64::new(0));
+    let worker_pending = pending.clone();
+    #[cfg(test)]
+    let worker_failure_hook = source.worker_failure_hook();
     let mut worker = tokio::spawn(async move {
         while let Some(notification) = event_rx.recv().await {
-            worker_in_flight.store(true, Ordering::SeqCst);
+            #[cfg(test)]
+            if let Some(hook) = &worker_failure_hook
+                && hook.fail_once.swap(false, Ordering::SeqCst)
+            {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+                panic!("injected relay notification worker failure");
+            }
             if handle_relay_notification(notification, &adapter, account_id.as_ref()).await {
-                worker_in_flight.store(false, Ordering::SeqCst);
+                worker_pending.fetch_sub(1, Ordering::SeqCst);
                 return true;
             }
-            worker_in_flight.store(false, Ordering::SeqCst);
+            worker_pending.fetch_sub(1, Ordering::SeqCst);
         }
         false
     });
@@ -2051,7 +2074,7 @@ async fn run_relay_notification_consumer_scoped(
         tokio::select! {
             worker_result = &mut worker => {
                 drop(abort_on_drop);
-                let exit = abandoned_notification_lane(&sender, &in_flight, source.as_ref());
+                let exit = abandoned_notification_lane(&pending, source.as_ref());
                 return RelayNotificationConsumerOutcome {
                     receiver,
                     exit: if exit == RelayNotificationConsumerExit::Closed && matches!(worker_result, Ok(true)) {
@@ -2064,8 +2087,7 @@ async fn run_relay_notification_consumer_scoped(
             update = receiver.next() => match update {
                 Some(NotificationUpdate::Notification(notification)) => {
                     if matches!(notification, ClientNotification::Shutdown) {
-                        let abandoned = (sender.max_capacity() - sender.capacity()) as u64
-                            + u64::from(in_flight.load(Ordering::SeqCst));
+                        let abandoned = pending.load(Ordering::SeqCst);
                         if abandoned > 0 {
                             source.record_loss(abandoned);
                         }
@@ -2078,11 +2100,12 @@ async fn run_relay_notification_consumer_scoped(
                             },
                         };
                     }
+                    pending.fetch_add(1, Ordering::SeqCst);
                     if let Err(error) = sender.try_send(notification) {
+                        pending.fetch_sub(1, Ordering::SeqCst);
                         let skipped = match error {
                             mpsc::error::TrySendError::Full(_) => {
-                                1 + sender.max_capacity().saturating_sub(sender.capacity()) as u64
-                                    + u64::from(in_flight.load(Ordering::SeqCst))
+                                1 + pending.load(Ordering::SeqCst)
                             }
                             mpsc::error::TrySendError::Closed(_) => 1,
                         };
@@ -2092,11 +2115,12 @@ async fn run_relay_notification_consumer_scoped(
                             exit: RelayNotificationConsumerExit::Lagged(skipped),
                         };
                     }
+                    #[cfg(test)]
+                    source.notification_queued();
                 }
                 Some(NotificationUpdate::Lagged { skipped }) => {
                     let abandoned = skipped
-                        .saturating_add((sender.max_capacity() - sender.capacity()) as u64)
-                        .saturating_add(u64::from(in_flight.load(Ordering::SeqCst)));
+                        .saturating_add(pending.load(Ordering::SeqCst));
                     source.record_loss(abandoned);
                     return RelayNotificationConsumerOutcome {
                         receiver,
@@ -2104,8 +2128,7 @@ async fn run_relay_notification_consumer_scoped(
                     };
                 }
                 None => {
-                    let abandoned = (sender.max_capacity() - sender.capacity()) as u64
-                        + u64::from(in_flight.load(Ordering::SeqCst));
+                    let abandoned = pending.load(Ordering::SeqCst);
                     if abandoned > 0 {
                         source.record_loss(abandoned);
                     }

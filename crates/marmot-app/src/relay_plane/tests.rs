@@ -388,7 +388,7 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
 }
 
 #[tokio::test]
-async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
+async fn abandoned_notification_lane_counts_queued_loss_for_only_its_account() {
     let sdk = NostrSdkRelayClient::multi_account();
     let alice_keys = nostr::prelude::Keys::generate();
     let bob_keys = nostr::prelude::Keys::generate();
@@ -407,13 +407,10 @@ async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
         client: alice_client.client().clone(),
         loss: Some(alice_client),
     };
-    let (sender, _receiver) = mpsc::channel(4);
-    sender.try_send(RelayPoolNotification::Shutdown).unwrap();
-    sender.try_send(RelayPoolNotification::Shutdown).unwrap();
-    let in_flight = AtomicBool::new(true);
+    let pending = AtomicU64::new(3);
     let failed_worker = tokio::spawn(async { panic!("forced event worker failure") });
     assert!(failed_worker.await.unwrap_err().is_panic());
-    let exit = abandoned_notification_lane(&sender, &in_flight, &source);
+    let exit = abandoned_notification_lane(&pending, &source);
     assert_eq!(exit, RelayNotificationConsumerExit::Lagged(3));
     assert_eq!(alice_loss.borrow().as_ref().unwrap().cumulative_skipped, 3);
     assert!(bob_loss.borrow().is_none());
@@ -431,6 +428,161 @@ async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
         1
     );
     assert!(bob_adapter.pending_delivery_overflow().is_none());
+}
+
+struct QueuedWorkerFailureSource {
+    sender: broadcast::Sender<RelayPoolNotification>,
+    subscriptions: AtomicUsize,
+    notifications_queued: AtomicUsize,
+    loss: NostrSdkRelayClient,
+    hook: Arc<NotificationWorkerFailureHook>,
+}
+
+impl QueuedWorkerFailureSource {
+    fn new(loss: NostrSdkRelayClient) -> Self {
+        Self {
+            sender: broadcast::channel(8).0,
+            subscriptions: AtomicUsize::new(0),
+            notifications_queued: AtomicUsize::new(0),
+            loss,
+            hook: Arc::new(NotificationWorkerFailureHook {
+                entered: Notify::new(),
+                release: Notify::new(),
+                fail_once: AtomicBool::new(true),
+            }),
+        }
+    }
+
+    fn send_notice(&self) {
+        self.sender
+            .send(RelayPoolNotification::Message {
+                relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
+                message: Box::new(RelayMessage::Notice("queued test notification".into())),
+            })
+            .expect("supervisor has an active receiver");
+    }
+}
+
+impl RelayNotificationSource for QueuedWorkerFailureSource {
+    fn notifications(&self) -> RelayNotificationStream {
+        self.subscriptions.fetch_add(1, Ordering::SeqCst);
+        test_notification_stream(self.sender.subscribe())
+    }
+
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+
+    fn record_loss(&self, skipped: u64) {
+        self.loss.record_notification_gap(skipped);
+    }
+
+    fn receiver_replaced(&self) {
+        self.loss.notification_receiver_replaced();
+    }
+
+    fn worker_failure_hook(&self) -> Option<Arc<NotificationWorkerFailureHook>> {
+        Some(self.hook.clone())
+    }
+
+    fn notification_queued(&self) {
+        self.notifications_queued.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
+    let sdk = NostrSdkRelayClient::multi_account();
+    let alice_keys = nostr::prelude::Keys::generate();
+    let bob_keys = nostr::prelude::Keys::generate();
+    let alice = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+    let bob = MemberId::new(bob_keys.public_key().to_bytes().to_vec());
+    let alice_client = sdk
+        .register_account(alice.clone(), Arc::new(alice_keys))
+        .await
+        .unwrap();
+    sdk.register_account(bob.clone(), Arc::new(bob_keys))
+        .await
+        .unwrap();
+    let mut alice_loss = sdk.notification_loss_for_account(&alice).await.unwrap();
+    let bob_loss = sdk.notification_loss_for_account(&bob).await.unwrap();
+
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+    let bob_adapter = plane.account_adapter(bob, relay);
+    let source = Arc::new(QueuedWorkerFailureSource::new(alice_client));
+    let supervisor = spawn_relay_notification_supervisor_scoped(
+        source.clone(),
+        plane.inner.transport.clone(),
+        Some(alice),
+    );
+
+    timeout(Duration::from_secs(2), async {
+        while source.subscriptions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the supervised consumer subscribes");
+    source.send_notice();
+    timeout(Duration::from_secs(2), source.hook.entered.notified())
+        .await
+        .expect("the real event worker takes its first notification");
+    source.send_notice();
+    source.send_notice();
+    timeout(Duration::from_secs(2), async {
+        while source.notifications_queued.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two more notifications enter the consumer's queue");
+    source.hook.release.notify_one();
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            alice_loss.changed().await.unwrap();
+            if alice_loss
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|gap| gap.cumulative_skipped >= 3)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("worker panic latches the in-flight and queued loss");
+    assert_eq!(alice_loss.borrow().as_ref().unwrap().cumulative_skipped, 3);
+    assert!(bob_loss.borrow().is_none());
+    timeout(Duration::from_secs(2), async {
+        while alice_adapter
+            .pending_delivery_overflow()
+            .is_none_or(|overflow| overflow.notification_losses == 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor signals account recovery from the real loss exit");
+    assert!(bob_adapter.pending_delivery_overflow().is_none());
+    assert_eq!(
+        plane
+            .inner
+            .transport
+            .notification_forwarder_health
+            .snapshot()
+            .lagged_notifications,
+        3
+    );
+
+    source.sender.send(RelayPoolNotification::Shutdown).unwrap();
+    timeout(Duration::from_secs(2), supervisor)
+        .await
+        .expect("supervisor stops after the replacement observes shutdown")
+        .unwrap();
+    sdk.shutdown_accounts().await;
 }
 
 #[tokio::test]
