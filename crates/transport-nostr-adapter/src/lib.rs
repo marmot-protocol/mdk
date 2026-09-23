@@ -74,10 +74,10 @@ mod sdk_client;
 mod telemetry;
 
 pub use acquisition::{
-    NostrAcquisitionCancellation, NostrAcquisitionCorrelation, NostrAcquisitionEnd,
-    NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
-    NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats,
-    NostrNotificationLoss, NostrNotificationLossScope,
+    NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
+    NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
+    NostrAcquisitionScope, NostrAcquisitionStats, NostrNotificationLoss,
+    NostrNotificationLossScope,
 };
 pub use key_package::{
     CLIENT_TAG, KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication, NostrKeyPackagePublisher,

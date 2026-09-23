@@ -3,36 +3,25 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use cgka_traits::{MemberId, TransportEndpoint};
-use tokio::sync::watch;
 use transport_nostr_peeler::NostrTransportEvent;
 
-use crate::SubscriptionAttempt;
-
-/// Caller-supplied correlation, copied unchanged into the result. The durable
-/// owner supplies its existing attempt and frozen scope identifiers; this value
-/// grants no authority to complete or clear an obligation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NostrAcquisitionCorrelation {
-    pub account_id: MemberId,
-    pub attempt_serial: u64,
-    /// Existing `RecoveryScopeToken` identity and revision, copied as data.
-    pub obligation_id: [u8; 16],
-    pub scope_id: u64,
-    pub scope_revision: u64,
-    /// Account activation fence. This is not a physical socket generation.
-    pub subscription_attempt: SubscriptionAttempt,
-}
+/// Request-local cancellation uses Tokio's shared cancellation primitive.
+/// The backend must still clean up only this request's subscriptions when the
+/// token fires or the acquisition future is dropped.
+pub type NostrAcquisitionCancellation = tokio_util::sync::CancellationToken;
 
 /// The exact Nostr query the recovery owner has justified. Explicit IDs can
 /// reacquire known inventory; a history window is bounded investigation and
 /// does not by itself establish complete coverage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NostrAcquisitionScope {
+    /// Reacquire known Nostr event IDs. This cannot discover unknown history.
     KnownEventIds(Vec<[u8; 32]>),
-    AccountInboxWindow {
-        since: u64,
-        until: u64,
-    },
+    /// Kind-1059 gift wraps addressed to `request.account_id` via the `p` tag.
+    /// Both time bounds are inclusive; never issue an unfiltered time REQ.
+    AccountInboxWindow { since: u64, until: u64 },
+    /// Kind-445 group events with the exact `h` tag below. Both time bounds
+    /// are inclusive; never issue an unfiltered time REQ.
     GroupWindow {
         transport_group_id: [u8; 32],
         since: u64,
@@ -49,6 +38,9 @@ pub enum NostrAcquisitionScope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NostrAcquisitionLimits {
     pub max_endpoints: usize,
+    /// Maximum IDs placed in a `KnownEventIds` request filter, independently
+    /// of the received-item budget.
+    pub max_requested_event_ids: usize,
     pub max_received_items_per_endpoint: usize,
     pub max_serialized_event_bytes_per_endpoint: usize,
     pub max_duration: Duration,
@@ -56,15 +48,18 @@ pub struct NostrAcquisitionLimits {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrAcquisitionRequest {
-    pub correlation: NostrAcquisitionCorrelation,
+    /// Selects the account's authentication context and inbox recipient.
+    /// The caller keeps its durable attempt, scope token, and revision fence.
+    pub account_id: MemberId,
     pub scope: NostrAcquisitionScope,
     pub endpoints: Vec<TransportEndpoint>,
     pub limits: NostrAcquisitionLimits,
 }
 
 impl NostrAcquisitionRequest {
-    /// Backends call this before opening a REQ. An empty/invalid scope or a
-    /// zero/unbounded budget must never fall back to ordinary subscriptions.
+    /// The adapter validates before dispatch. Backend implementations also
+    /// validate when called directly, before opening a REQ. This checks empty
+    /// and zero budgets; deployment-wide upper ceilings belong to the caller.
     pub fn validate(&self) -> Result<(), NostrAcquisitionError> {
         let limits = self.limits;
         if self.endpoints.is_empty()
@@ -86,7 +81,10 @@ impl NostrAcquisitionRequest {
         }
         match &self.scope {
             NostrAcquisitionScope::KnownEventIds(ids)
-                if ids.is_empty() || ids.iter().collect::<HashSet<_>>().len() != ids.len() =>
+                if ids.is_empty()
+                    || limits.max_requested_event_ids == 0
+                    || ids.len() > limits.max_requested_event_ids
+                    || ids.iter().collect::<HashSet<_>>().len() != ids.len() =>
             {
                 Err(NostrAcquisitionError::InvalidRequest)
             }
@@ -109,13 +107,15 @@ pub enum NostrAcquisitionError {
     InvalidRequest,
 }
 
-/// Typed request termination. Only `RequestPolicySatisfied` completed the
-/// selected request policy. Even that says nothing about durable admission,
-/// complete history, decryption, or engine readiness.
+/// Typed request termination. The fixed request policy is per-endpoint EOSE;
+/// only `RequestPolicySatisfied` reports it. Even EOSE says nothing about
+/// durable admission, complete history, decryption, or engine readiness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NostrAcquisitionEnd {
     RequestPolicySatisfied,
-    ExitCountReached,
+    /// An SDK exit-count policy fired despite this interface's EOSE policy.
+    /// Incomplete and never coverage evidence.
+    UnexpectedExitLimit,
     ItemLimitReached,
     ByteLimitReached,
     Cancelled,
@@ -126,7 +126,7 @@ pub enum NostrAcquisitionEnd {
     AuthenticationFailed,
     Rejected,
     RelayClosed,
-    BackendFailed,
+    SetupFailed,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -136,7 +136,8 @@ pub struct NostrAcquisitionStats {
     pub duplicates: usize,
     pub retained_high_water_items: usize,
     pub retained_high_water_event_bytes: usize,
-    /// Receiver-local skipped notifications, not unique missing events.
+    /// This request's `ReceiveLoss(u64)` skipped notifications, not unique
+    /// missing events. Distinct from the lifetime-cumulative loss watch below.
     pub receiver_skipped_notifications: u64,
 }
 
@@ -153,7 +154,6 @@ pub struct NostrAcquisitionEndpoint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrAcquisitionResult {
-    pub correlation: NostrAcquisitionCorrelation,
     /// Exactly one entry per requested endpoint, including failed endpoints.
     pub endpoints: Vec<NostrAcquisitionEndpoint>,
 }
@@ -171,48 +171,10 @@ pub enum NostrNotificationLossScope {
 /// stays fixed and the count never resets, even when a replacement receiver
 /// advances `receiver_generation`. Thus coalesced watch updates cannot erase
 /// a gap from a prior receiver. The generation is transport evidence, distinct
-/// from the durable attempt serial and account activation attempt.
+/// from the caller-held durable attempt and account activation attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrNotificationLoss {
     pub scope: NostrNotificationLossScope,
     pub receiver_generation: u64,
     pub cumulative_skipped: u64,
-}
-
-/// Cloneable request-local cancellation. Dropping or cancelling a caller
-/// future must be paired with backend request cleanup; neither operation may
-/// unsubscribe unrelated live interests.
-#[derive(Clone, Debug)]
-pub struct NostrAcquisitionCancellation {
-    tx: watch::Sender<bool>,
-}
-
-impl Default for NostrAcquisitionCancellation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NostrAcquisitionCancellation {
-    pub fn new() -> Self {
-        let (tx, _) = watch::channel(false);
-        Self { tx }
-    }
-
-    pub fn cancel(&self) {
-        self.tx.send_replace(true);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        *self.tx.borrow()
-    }
-
-    pub async fn cancelled(&self) {
-        let mut rx = self.tx.subscribe();
-        while !*rx.borrow_and_update() {
-            if rx.changed().await.is_err() {
-                return;
-            }
-        }
-    }
 }
