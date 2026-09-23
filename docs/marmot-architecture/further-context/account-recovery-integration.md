@@ -136,3 +136,17 @@ and superseded checks, and the remaining blocking acquisition limitations.
   perform no storage mutation. The unchanged compensation regression passes,
   as do all 16 owner tests with policy overrides. This preserves the primary
   storage error and the attempted compensating route restoration.
+- Repair API classification: a reproduced worker failure hid incomplete coverage
+  under `blocking_task`. A typed reason now preserves cancellation, deadline,
+  silence and unproven coverage independently from outstanding loss; worker error
+  channels remain unchanged. The prearmed worker regression, independent
+  classification matrix, shortened-policy no-EOSE loss test and controlled overall
+  deadline/prefix test pass. The first silence assertion incorrectly expected the
+  overall deadline even under shortened silence policy; it now explicitly checks
+  the policy-specific stop, with the actual deadline covered separately. These
+  checks predate the remaining qualified runtime completion work.
+- Approved retention exception (2026-09-23): unresolved per-generation durable
+  loss watermarks have no fixed disk-row cap. No outstanding loss may be erased
+  for a cap; qualified completion and exact live acknowledgment remain mandatory.
+  Design and bounds documents record this limitation. Active snapshot/completed
+  metadata reclamation and bounded investigation proofs remain acceptance work.

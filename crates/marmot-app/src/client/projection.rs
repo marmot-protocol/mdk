@@ -1237,6 +1237,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::NotificationsDisabled => "read_marker_failed:notifications_disabled",
         AppError::SqlcipherKeyDerivation(_) => "read_marker_failed:sqlcipher_key_derivation",
         AppError::BlockingTask(_) => "read_marker_failed:blocking_task",
+        AppError::FullHistoryRepairIncomplete { .. } => {
+            "read_marker_failed:history_repair_incomplete"
+        }
         AppError::RuntimeBusy => "read_marker_failed:runtime_busy",
         AppError::AccountSessionBusy => "read_marker_failed:account_session_busy",
         AppError::AccountWorkerBusy => "read_marker_failed:account_worker_busy",

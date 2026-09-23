@@ -7289,13 +7289,12 @@ mod tests {
         )
         .await;
 
+        let failure = response.await.unwrap().unwrap_err();
         assert!(
-            response
-                .await
-                .unwrap()
-                .unwrap_err()
+            failure
                 .to_string()
-                .contains("full_history_coverage_unproven")
+                .contains("full_history_coverage_unproven"),
+            "{failure}"
         );
         assert!(
             client.has_pending_epoch_backfill(),
@@ -7391,11 +7390,23 @@ mod tests {
             SyncFailureStage::RelayReceive
         );
         assert!(
-            failure
-                .source
-                .to_string()
-                .contains("account_delivery_queue_overflow"),
+            failure.source.privacy_safe_kind() == "account_delivery_queue_overflow",
             "the public failure must identify the unresolved durable gap",
+        );
+        assert!(
+            matches!(
+                failure.source,
+                AppError::FullHistoryRepairIncomplete {
+                    reason,
+                    delivery_loss_pending: true,
+                } if reason == if cfg!(feature = "test-policy-overrides") {
+                    crate::FullHistoryRepairIncompleteReason::NoRelayEose
+                } else {
+                    crate::FullHistoryRepairIncompleteReason::Deadline
+                }
+            ),
+            "the stop reason and independent loss fact must both survive: {:?}",
+            failure.source
         );
         assert!(
             client.delivery_overflow_recovery_pending,

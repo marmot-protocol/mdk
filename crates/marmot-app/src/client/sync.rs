@@ -445,6 +445,7 @@ impl DrainVerdict {
 fn incomplete_full_history_repair(
     summary: SyncSummary,
     verdict: DrainVerdict,
+    delivery_loss_pending: bool,
 ) -> ClassifiedSyncFailure {
     debug_assert_ne!(verdict, DrainVerdict::Complete);
     let error_kind = verdict
@@ -458,7 +459,28 @@ fn incomplete_full_history_repair(
     );
     ClassifiedSyncFailure::at_stage(
         summary,
-        AppError::BlockingTask(format!("full-history repair incomplete: {error_kind}")),
+        AppError::FullHistoryRepairIncomplete {
+            reason: match verdict {
+                DrainVerdict::CoverageUnproven => {
+                    crate::FullHistoryRepairIncompleteReason::CoverageUnproven
+                }
+                DrainVerdict::RepairCancelled => {
+                    crate::FullHistoryRepairIncompleteReason::Cancelled
+                }
+                DrainVerdict::RepairDeadline => crate::FullHistoryRepairIncompleteReason::Deadline,
+                DrainVerdict::Overflow => crate::FullHistoryRepairIncompleteReason::DeliveryLoss,
+                DrainVerdict::EoseTimeout => crate::FullHistoryRepairIncompleteReason::EoseTimeout,
+                DrainVerdict::NoRelayEose => crate::FullHistoryRepairIncompleteReason::NoRelayEose,
+                DrainVerdict::NovelProgressQuantumYield => {
+                    crate::FullHistoryRepairIncompleteReason::NovelProgressYield
+                }
+                DrainVerdict::NoProgressQuantumYield => {
+                    crate::FullHistoryRepairIncompleteReason::NoProgressYield
+                }
+                DrainVerdict::Complete => crate::FullHistoryRepairIncompleteReason::Unconfirmed,
+            },
+            delivery_loss_pending,
+        },
         SyncFailureStage::RelayReceive,
     )
 }
@@ -3719,8 +3741,13 @@ impl AppClient {
             && let Some(verdict) =
                 drain_verdict.filter(|verdict| *verdict != DrainVerdict::Complete)
         {
-            return result
-                .and_then(|summary| Err(incomplete_full_history_repair(summary, verdict)));
+            return result.and_then(|summary| {
+                Err(incomplete_full_history_repair(
+                    summary,
+                    verdict,
+                    self.delivery_loss_blocks_cursor(),
+                ))
+            });
         }
         result
     }
@@ -4006,6 +4033,7 @@ impl AppClient {
             return Err(incomplete_full_history_repair(
                 SyncSummary::default(),
                 verdict,
+                self.delivery_loss_blocks_cursor(),
             ));
         }
         let refresh = self.refresh_group_routes().map_err(|error| {
@@ -4099,6 +4127,7 @@ impl AppClient {
             Ok(summary) => Err(incomplete_full_history_repair(
                 summary,
                 control.stopped().unwrap_or(DrainVerdict::CoverageUnproven),
+                self.delivery_loss_blocks_cursor(),
             )),
             Err(failure) => Err(failure),
         }
@@ -4125,7 +4154,11 @@ impl AppClient {
         if verdict == DrainVerdict::Complete {
             Ok(summary)
         } else {
-            Err(incomplete_full_history_repair(summary, verdict))
+            Err(incomplete_full_history_repair(
+                summary,
+                verdict,
+                self.delivery_loss_blocks_cursor(),
+            ))
         }
     }
 
@@ -6984,7 +7017,7 @@ mod tests {
                 joined_groups: vec![cgka_traits::GroupId::new(vec![0x42])],
                 ..SyncSummary::default()
             };
-            let error = incomplete_full_history_repair(partial.clone(), verdict);
+            let error = incomplete_full_history_repair(partial.clone(), verdict, false);
             assert_eq!(error.partial_summary, partial);
             assert!(
                 error

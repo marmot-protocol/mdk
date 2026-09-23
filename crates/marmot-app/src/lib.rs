@@ -206,7 +206,7 @@ pub use drafts::{
     MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent,
 };
-pub use error::{AccountCatchUpFailure, AppError};
+pub use error::{AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason};
 pub use groups::{
     AppAgentTextStreamComponent, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandFailureReason,
     AppDisbandRequest, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,

@@ -183,3 +183,13 @@ When adding a map, task set, counter, or temp artifact to a long-lived process:
 
 No new long-lived runtime collection or database schema is introduced. These are
 local-access bounds, not convergence or recovery policy.
+
+### Account recovery durable loss evidence (`storage-sqlite/src/account_recovery/`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `account_delivery_loss_evidence` generation watermarks | One row per unresolved loss generation; **no fixed disk-row cap**. This is the explicitly approved #1946 retention exception, not a bounded-size claim. Duplicate observations reuse a watermark; increased counts rearm that generation. | Only qualified completion followed by exact live acknowledgment may reclaim captured evidence. Legacy retirement preserves watermarks and cannot erase another generation. Unresolved debt survives automatic investigation exhaustion and reopen. |
+
+The current transport backend cannot prove exhaustive history, so repeated loss
+can accumulate durable evidence indefinitely. An eventual disk cap needs a
+separate reviewed evidence/retirement contract; silently dropping debt is forbidden.

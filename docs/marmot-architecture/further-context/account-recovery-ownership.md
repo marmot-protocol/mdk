@@ -515,3 +515,14 @@ live-session guard, converting unclean close into unknown-scope debt. It would n
 additional lifecycle design and recovery after process death, including the existing
 close-before-graceful-cleanup shutdown order. Merely queueing the write behind a
 blocking worker would weaken loss durability and was not proposed as safe.
+
+### Approved exception: unresolved durable loss retention
+
+On 2026-09-23 the task owner approved retaining unresolved per-generation loss
+watermarks without a fixed disk-row cap. Qualified completion and the exact live
+acknowledgment remain the only reclamation path; the current backend cannot
+certify exhaustive history. Repeated unresolved generations can therefore grow
+this table even after automatic investigation stops. Do not evict, merge away or
+legacy-retire another generation to enforce a cap. This exception does not permit
+unbounded active snapshots, completed metadata or automatic replay. Their
+lifetimes and bounds are tracked in `../runtime-state-bounds.md`.
