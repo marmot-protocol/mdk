@@ -1317,18 +1317,20 @@ impl AppClient {
                     SyncFailureStage::StatePersist,
                 )
             })?;
-        storage
-            .request_recovery(
-                storage_sqlite::RecoveryRequest::IncrementalHistory,
-                unix_now_seconds().saturating_mul(1000),
-            )
-            .map_err(|error| {
-                ClassifiedSyncFailure::at_stage(
-                    SyncSummary::default(),
-                    error.into(),
-                    SyncFailureStage::StatePersist,
+        if self.app.cursor_persistence() == CursorPersistence::Advance {
+            storage
+                .request_recovery(
+                    storage_sqlite::RecoveryRequest::IncrementalHistory,
+                    unix_now_seconds().saturating_mul(1000),
                 )
-            })?;
+                .map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error.into(),
+                        SyncFailureStage::StatePersist,
+                    )
+                })?;
+        }
         let mut caller = ExplicitRecoveryPermit::default();
         let grant = self
             .authorize_account_recovery(
@@ -1351,7 +1353,12 @@ impl AppClient {
         let mut summary = if let Some(grant) = grant {
             self.execute_recovery_grant(grant, None, telemetry).await?
         } else {
-            if telemetry.is_some() && !explicit {
+            if self.app.cursor_persistence() == CursorPersistence::Frozen
+                || (telemetry.is_some() && !explicit)
+            {
+                if self.app.cursor_persistence() == CursorPersistence::Frozen {
+                    self.adapter.require_fresh_activation().await;
+                }
                 // A reopened worker may inherit a history cooldown or parked
                 // debt before it owns any live subscriptions. Restore its
                 // ordinary floored live interest without reserving history or
@@ -1361,6 +1368,15 @@ impl AppClient {
                     .map_err(|(stage, error)| {
                         ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage)
                     })?;
+                let since = self.subscription_rebuild_since().map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::TransportActivation,
+                    )
+                })?;
+                self.record_subscription_rebuild(since.map(|timestamp| timestamp.0))
+                    .await;
             }
             // Network cooldown never withholds already queued input or engine
             // events. Receiving existing subscriptions is not a new acquisition.
@@ -4138,7 +4154,7 @@ impl AppClient {
                 )
             })?;
         let mut waiter = super::recovery::RecoveryCallerGuard::new(storage.clone(), ticket);
-        let mut caller = ExplicitRecoveryPermit::default();
+        let mut caller = ExplicitRecoveryPermit::full_history();
         let grant = self
             .authorize_account_recovery(
                 Some(&mut caller),

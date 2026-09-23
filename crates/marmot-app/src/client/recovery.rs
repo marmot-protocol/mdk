@@ -50,6 +50,16 @@ pub(crate) enum RecoveryReadiness {
 #[derive(Default)]
 pub(crate) struct ExplicitRecoveryPermit {
     spent: bool,
+    full_history_requested: bool,
+}
+
+impl ExplicitRecoveryPermit {
+    pub(super) fn full_history() -> Self {
+        Self {
+            full_history_requested: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Owned by the serialized caller future. Synchronous drop cleanup runs at its
@@ -941,6 +951,16 @@ impl AppClient {
         mut explicit: Option<&mut ExplicitRecoveryPermit>,
         seam: marmot_forensics::EpochBackfillExecutionSeam,
     ) -> Result<Option<AttemptGrant>, AppError> {
+        // Wake collection retains the loaded live floor and leaves recovery
+        // debt/pacing to an Advance runtime. Only the separate full-history
+        // repair API explicitly opts into broad recovery in this posture.
+        if self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+            && !explicit
+                .as_ref()
+                .is_some_and(|permit| permit.full_history_requested)
+        {
+            return Ok(None);
+        }
         let storage = self.app.account_storage(&self.state.label)?;
         storage.synchronize_account_delivery_loss(&self.state.label)?;
         // Failed detector persistence is retried before any selection. These
@@ -2417,6 +2437,62 @@ mod tests {
             pending
                 .iter()
                 .any(|d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_wake_preserves_recovery_debt_and_cost_until_explicit_full_repair() {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(directory.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay_and_config(
+            directory.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::default()
+                .with_cursor_persistence(crate::CursorPersistence::Frozen),
+        )
+        .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .mark_account_delivery_recovery("alice", 42, 1)
+            .unwrap();
+        storage.synchronize_account_delivery_loss("alice").unwrap();
+        let debt = storage.recovery_revision_fence().unwrap();
+        let retry = storage.recovery_retry_state().unwrap();
+        let mut caller = ExplicitRecoveryPermit::default();
+        assert!(
+            client
+                .authorize_account_recovery(
+                    Some(&mut caller),
+                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(!caller.spent);
+        client.sync().await.unwrap();
+        assert_eq!(storage.recovery_revision_fence().unwrap(), debt);
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        // The distinct supported repair API still authorizes one attempt, but
+        // this backend cannot certify it or release unresolved loss.
+        assert!(client.repair_full_history().await.is_err());
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            retry.attempt_serial + 1
+        );
+        assert!(
+            storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
         );
     }
 

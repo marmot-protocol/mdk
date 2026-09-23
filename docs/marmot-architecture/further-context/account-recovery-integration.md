@@ -21,9 +21,13 @@ token 12 is outstanding. No production retirement guarantee was relaxed.
 
 ## Required completion matrix
 
-All behavior rows below are implemented and have focused passing evidence in the
-checkpoint ledger. Combined readiness remains pending until the frozen-revision
-checks and draft review are recorded; these focused results are not that claim.
+The combined run found an unresolved compatibility boundary: automatic recovery
+of late history below the cursor after cold restart. The owner currently parks
+that unprovable history as designed, which prevents the old bounded comparison
+from running on unchanged reopen. This is unfinished integration, not merely
+validation remaining. The other focused results below do not establish readiness.
+The proposed adjustment is in `account-recovery-incremental-comparison-proposal.md`;
+it is not an approved replacement for the agreed architecture.
 
 | Acceptance boundary | Implemented behavior and files | Acceptance evidence |
 | --- | --- | --- |
@@ -36,7 +40,8 @@ checks and draft review are recorded; these focused results are not that claim.
 | Evidence and escalation | `client/epoch_stall.rs` has no replay authority; `client/recovery.rs` and storage `account_recovery/stall.rs` sample distinct qualified local observations; migration 0094 persists sample identity | `qualified_local_observations_escalate_without_replay_and_survive_reorg`; `qualified_stall_rejects_new_loss_route_and_inventory_changes`; `qualified_stall_transaction_failure_and_clock_rebase_never_forge_samples`; detector anti-spoofing suite |
 | Bounded state and investigation | Constant-memory loss snapshot; grant-owned admissions; completed known-event metadata reclaimed; unknown broad-history investigation quiesces with debt retained | `completed_known_event_metadata_waits_for_grant_release_then_is_reclaimed`; `unknown_history_is_bounded_while_epoch_input_remains_retryable`; storage loss snapshot/import tests; approved unresolved-watermark disk exception in runtime-state-bounds.md |
 | Populated migration and conservative mode | #1983/#1987 preserve old debt and atomic completion; one-obligation mode uses the same ledger/executor, including cross-grant loss acknowledgment | Populated/interrupted migration tests; `readiness_wait_and_mode_handoff_preserve_pending_state_and_retry_cost`; `conservative_grants_do_not_coalesce_or_buy_an_extra_retry`; conservative partial-proof/reopen/ack regressions |
-| Combined readiness | **Pending:** freeze signed code, run affected-crate suites, required gates, and draft review | Exact revisions, commands, outcomes and any superseded failures must be recorded below before claiming readiness |
+| Automatic below-floor recovery | **Failing / design amendment pending:** parked incremental history suppresses the previous cold-restart comparison; `client/recovery.rs`, `client/sync.rs`, storage recovery records and the existing worker due tick are the concrete affected boundaries | `cold_restart_reconciles_backlog_below_since_floor`; `stalled_epoch_backfill_still_arms_after_route_reconciliation`; no assertion weakening or cooldown bypass accepted |
+| Combined readiness | **Blocked by the preceding behavior:** 2865/2868 passed on `3fcb8236`; the separate frozen-wake failure is fixed in the following focused checkpoint | Review findings fixed; full affected suite and final gates must pass after the remaining behavior is resolved |
 
 ## Source ownership and replacement inventory
 
@@ -379,3 +384,24 @@ and superseded checks, and the remaining blocking acquisition limitations.
   0094, verifies schema and all prior rows rolled back, then upgrades and reopens.
   All four recovery migration regressions pass. No production migration or
   completion guarantee was changed to make these tests pass.
+
+- Full combined run at `3fcb823652b3bfe4f294423dc452994c16443c18`:
+  2868 tests across 22 binaries, 2865 passed, 3 failed, 21 skipped, no retries.
+  Features included app/engine policy overrides, engine crash hooks and adapter
+  SDK. Both storage migration regressions pass in that combined run. Failures:
+  `frozen_wake_collection_ingests_without_moving_the_durable_cursor` and both
+  `since_floor` tests named in the matrix. Later gates were not run by that
+  fail-closed script. This is an exact-head failure inventory, not readiness.
+- Frozen-wake compatibility: owner authorization now defers ordinary history in
+  Frozen mode without spending its permit or retry cost; live interest retains
+  its loaded floor and records the existing rebuild audit. The distinct explicit
+  full-history repair API still goes through the owner. All 21 owner tests and
+  the unchanged three-boot cursor test pass (22 total). Durable debt survives;
+  no assertion or deadline was relaxed.
+- Below-floor investigation: restoring the legacy bounded comparison inside an
+  authorized incremental grant is necessary but insufficient. Both cold-restart
+  tests still fail because unchanged reopen cannot authorize parked history under
+  the approved quiescence rule. The diagnostic source was preserved separately;
+  it was not published as a fix. The contract question was escalated, with a
+  concrete bounded-comparison amendment. No automatic rearm exception, competing
+  authority, false coverage result or replacement assertion has been implemented.
