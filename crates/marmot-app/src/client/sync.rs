@@ -4003,6 +4003,7 @@ impl AppClient {
                     SyncFailureStage::StatePersist,
                 )
             })?;
+        let mut waiter = super::recovery::RecoveryCallerGuard::new(storage.clone(), ticket);
         let mut caller = ExplicitRecoveryPermit::default();
         let grant = self
             .authorize_account_recovery(
@@ -4034,7 +4035,7 @@ impl AppClient {
                     SyncFailureStage::StatePersist,
                 )
             })?;
-        storage.detach_recovery_waiter(ticket).map_err(|error| {
+        waiter.detach().map_err(|error| {
             ClassifiedSyncFailure::at_stage(
                 match &result {
                     Ok(summary) => summary.clone(),

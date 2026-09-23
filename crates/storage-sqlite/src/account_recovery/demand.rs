@@ -56,6 +56,8 @@ pub struct RecoveryDemand {
     pub marker_token: Option<u64>,
     pub known_event_id: Option<[u8; 32]>,
     pub requested_at_ms: u64,
+    /// A live explicit caller owns transient foreground urgency.
+    pub caller_waiting: bool,
 }
 
 fn invalid_demand() -> StorageError {
@@ -256,7 +258,7 @@ impl SqliteAccountStorage {
         let rows = conn
             .prepare_cached(
                 "SELECT id,revision,cause,predicate,eligibility,group_id,stalled_epoch,marker_token,
-             (SELECT known_event_id FROM account_recovery_scopes WHERE obligation_id=account_recovery_obligations.id AND known_event_id IS NOT NULL LIMIT 1), updated_at_ms
+             (SELECT known_event_id FROM account_recovery_scopes WHERE obligation_id=account_recovery_obligations.id AND known_event_id IS NOT NULL LIMIT 1), updated_at_ms, urgency
              FROM account_recovery_obligations WHERE state=0 ORDER BY id",
             )
             .storage()?
@@ -272,6 +274,7 @@ impl SqliteAccountStorage {
                     row.get::<_, Option<i64>>(7)?,
                     row.get::<_, Option<Vec<u8>>>(8)?,
                     row.get::<_, i64>(9)?,
+                    row.get::<_, bool>(10)?,
                 ))
             })
             .storage()?
@@ -290,6 +293,7 @@ impl SqliteAccountStorage {
                     token,
                     known,
                     requested_at,
+                    caller_waiting,
                 )| {
                     Ok(RecoveryDemand {
                         ticket: RecoveryDemandTicket {
@@ -322,6 +326,7 @@ impl SqliteAccountStorage {
                         },
                         group_id,
                         requested_at_ms: i64_to_u64(requested_at)?,
+                        caller_waiting,
                         known_event_id: known
                             .map(|bytes| bytes.try_into().map_err(|_| invalid_demand()))
                             .transpose()?,

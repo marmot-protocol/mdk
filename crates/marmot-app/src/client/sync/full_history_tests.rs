@@ -342,3 +342,58 @@ async fn one_fast_endpoint_cannot_complete_full_history_repair() {
     assert!(!coverage.complete());
     assert_eq!(relay.subscription_count(), before + 1);
 }
+
+#[tokio::test]
+async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_retry() {
+    let (_dir, app, relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .mark_account_delivery_recovery("alice", 42, 3)
+        .unwrap();
+    let before = relay.subscription_count();
+    {
+        let repair = client.repair_full_history();
+        tokio::pin!(repair);
+        tokio::select! {
+            result = &mut repair => panic!("unproven repair returned before cancellation: {result:?}"),
+            _ = async {
+                timeout(Duration::from_secs(5), async {
+                    while relay.subscription_count() == before {
+                        tokio::task::yield_now().await;
+                    }
+                }).await.expect("repair must activate before it is dropped");
+            } => {}
+        }
+    }
+    let demands = storage.pending_recovery_demands().unwrap();
+    let explicit = demands
+        .iter()
+        .find(|d| d.cause == storage_sqlite::RecoveryCause::ExplicitHistory)
+        .unwrap();
+    assert!(
+        !explicit.caller_waiting,
+        "dropping the caller must remove foreground urgency"
+    );
+    assert!(
+        demands
+            .iter()
+            .any(|d| d.cause == storage_sqlite::RecoveryCause::QueueLoss)
+    );
+    let pending_ids = demands.iter().map(|d| d.ticket.id).collect::<Vec<_>>();
+    let retry = storage.recovery_retry_state().unwrap();
+    assert_eq!(retry.attempt_serial, 1);
+    assert!(retry.not_before_ms > retry.recorded_at_ms);
+    assert_eq!(relay.subscription_count(), before + 1);
+    drop(client);
+    let reopened = client_on_app_relay_plane(&app, "alice").await;
+    let demands = storage.pending_recovery_demands().unwrap();
+    assert_eq!(
+        demands.iter().map(|d| d.ticket.id).collect::<Vec<_>>(),
+        pending_ids,
+        "reopen preserves every pending identity, including startup history demand"
+    );
+    assert!(!demands.iter().any(|d| d.caller_waiting));
+    assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+    drop(reopened);
+}

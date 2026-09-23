@@ -28,6 +28,43 @@ pub(crate) struct ExplicitRecoveryPermit {
     spent: bool,
 }
 
+/// Owned by the serialized caller future. Synchronous drop cleanup runs at its
+/// cancellation boundary; it never dispatches work or deletes unfinished debt.
+/// Reopen repeats cleanup if storage closed before this guard could persist it.
+pub(super) struct RecoveryCallerGuard {
+    storage: SqliteAccountStorage,
+    ticket: Option<storage_sqlite::RecoveryDemandTicket>,
+}
+
+impl RecoveryCallerGuard {
+    pub(super) fn new(
+        storage: SqliteAccountStorage,
+        ticket: storage_sqlite::RecoveryDemandTicket,
+    ) -> Self {
+        Self {
+            storage,
+            ticket: Some(ticket),
+        }
+    }
+
+    pub(super) fn detach(&mut self) -> StorageResult<()> {
+        if let Some(ticket) = self.ticket {
+            self.storage.detach_recovery_waiter(ticket)?;
+            self.ticket = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RecoveryCallerGuard {
+    fn drop(&mut self) {
+        if self.detach().is_err() {
+            tracing::warn!(target: "marmot_app::recovery", method = "detach_recovery_caller",
+                "caller cleanup remains pending until account reopen");
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RecoveryRetryPolicy {
     pub(crate) base: Duration,
@@ -116,6 +153,16 @@ pub(crate) struct AccountRecoveryOwner {
     active_fence: Option<RecoveryRevisionFence>,
     policy: RecoveryRetryPolicy,
     mode: RecoveryExecutorMode,
+}
+
+/// Use the same precision as persisted retry deadlines. Truncating to seconds
+/// can make an ordinary reopen look like a backward wall-clock correction.
+pub(crate) fn wall_now_ms() -> StorageResult<u64> {
+    duration_ms(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
 }
 
 fn duration_ms(value: Duration) -> StorageResult<u64> {

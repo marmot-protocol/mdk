@@ -1728,7 +1728,7 @@ impl MarmotApp {
         };
         let mut recovery_owner = client::recovery::AccountRecoveryOwner::open(
             &self.account_storage(&open.state.label)?,
-            unix_now_seconds().saturating_mul(1000),
+            client::recovery::wall_now_ms()?,
             Instant::now(),
             recovery_policy,
         )?;
