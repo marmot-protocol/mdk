@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use cgka_traits::TransportEndpoint;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::*;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestEnd {
@@ -171,7 +171,7 @@ async fn bounded_batches_project_partial_per_relay_results_and_known_inventory_t
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn large_event_byte_limit_and_cancelled_partial_leave_live_interest_operating() {
+async fn large_event_byte_limit_and_cancellation_leave_live_interest_operating() {
     let relay = LocalRelay::new();
     relay.run().await.unwrap();
     let keys = Keys::generate();
@@ -211,7 +211,6 @@ async fn large_event_byte_limit_and_cancelled_partial_leave_live_interest_operat
         )
         .await
         .unwrap();
-    sleep(Duration::from_millis(30)).await;
     let started = Instant::now();
     handle.cancel();
     let report = timeout(Duration::from_secs(1), handle.finish())
@@ -221,7 +220,10 @@ async fn large_event_byte_limit_and_cancelled_partial_leave_live_interest_operat
     let cancel_latency = started.elapsed();
     let outcome = BatchEvidence::from_sdk(&url, report.relays.into_values().next().unwrap());
     assert_eq!(outcome.end, RequestEnd::Cancelled);
-    assert_eq!(outcome.events.len(), 1);
+    // Cancellation can win before the first EVENT is retained. The report
+    // must describe the partial work that actually happened, including none.
+    assert!(outcome.events.len() <= 1);
+    assert!(outcome.events.iter().all(|event| event.id == large.id));
     let live_event = EventBuilder::new(Kind::Metadata, "live after history cancel")
         .finalize(&keys)
         .unwrap();

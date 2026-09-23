@@ -337,10 +337,12 @@ async fn auth_isolation(replace_relay_generation: bool) {
     let mut denied = false;
     tokio::time::timeout(DEADLINE, async {
         while !(challenged && denied) {
-            if let Some(NotificationUpdate::Notification(ClientNotification::Message {
-                message,
-                ..
-            })) = anonymous_messages.next().await
+            if let NotificationUpdate::Notification(ClientNotification::Message {
+                message, ..
+            }) = anonymous_messages
+                .next()
+                .await
+                .expect("anonymous notification stream closed before challenge")
             {
                 match *message {
                     RelayMessage::Auth { .. } => challenged = true,
@@ -539,10 +541,11 @@ async fn ingress_loss() {
     relay.add_event(later.clone()).await.unwrap();
     tokio::time::timeout(DEADLINE, async {
         loop {
-            if let Some(NotificationUpdate::Notification(ClientNotification::Message {
-                message,
-                ..
-            })) = stalled.next().await
+            if let NotificationUpdate::Notification(ClientNotification::Message { message, .. }) =
+                stalled
+                    .next()
+                    .await
+                    .expect("stalled notification stream closed before later event")
                 && let RelayMessage::Event { event, .. } = *message
                 && event.id == later.id
             {

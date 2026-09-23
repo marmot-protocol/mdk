@@ -75,8 +75,9 @@ signed event timestamps and subscription IDs; tests print the current run.
 
 A 16 KiB content event exceeded a 4 KiB request byte budget; the result
 retained zero events and reported the over-budget event. A separate cancelled
-request returned one partial event, with a sample cancellation latency below
-one millisecond. Its unrelated metadata subscription delivered after cancel.
+request reports the events actually retained before cancellation, which can
+be zero when cancellation wins the race. Its unrelated metadata subscription
+delivered after cancel.
 The SDK saturation tests additionally print retained high-water state and
 control/cancel/drop latency under sustained large-event and duplicate bursts.
 
@@ -94,6 +95,8 @@ the EVENT but gave no OK, so the result maps to `PossiblyExposed`. Mapping is
 based on typed SDK status/error kind, not relay error text. A silent server
 cannot prove that the event was stored or forwarded. Both local publication
 relays saw zero read queries from the publisher.
+An unavailable loopback endpoint returned `RetryableUnavailable` before an
+EVENT send attempt.
 
 ## Production migration gate under #1358
 

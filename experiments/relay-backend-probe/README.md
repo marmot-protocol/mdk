@@ -18,12 +18,12 @@ cargo fmt --manifest-path experiments/relay-backend-probe/Cargo.toml --check
 
 Tests cover typed notification gaps with continued reception; bounded
 acquisition and per-relay MDK-owned evidence; known-inventory reacquisition;
-byte and item limits; cancellation with a partial result and live subscription;
-Alice/Bob authenticated sessions and explicit anonymous reads; adapter
+byte and item limits; cancellation with a truthful partial report and live
+subscription; Alice/Bob authenticated sessions and explicit anonymous reads; adapter
 activation, reactivation, and account removal; and accepted, rejected, and
 acknowledgement-unknown publication with zero read queries on publish-only
-connections. An ignored diagnostic retains the immediate-reconnect race
-reproducer from the earlier 0.45.4 probe.
+connections. The immediate-reconnect diagnostic is now an active regression
+for same-relay reactivation and restored live delivery.
 
 See [QUALIFICATION.md](QUALIFICATION.md) for limits, outcome mapping, measured
 traffic, and the exact production migration gate.

@@ -248,15 +248,35 @@ impl NostrRelayClient for CandidateRelay {
             let url = loopback_url(endpoint).ok_or_else(|| {
                 TransportAdapterError::Publish("non-loopback probe endpoint".to_owned())
             })?;
-            self.publisher
+            if self
+                .publisher
                 .add_relay(&url)
                 .capabilities(RelayCapabilities::WRITE)
                 .await
-                .map_err(|_| TransportAdapterError::Publish("add relay failed".to_owned()))?;
-            self.publisher
+                .is_err()
+            {
+                outcome.failed.push(TransportEndpointFailure {
+                    endpoint: endpoint.clone(),
+                    reason: "add relay failed".to_owned(),
+                    kind: TransportEndpointFailureKind::RetryableUnavailable,
+                    rejection_category: None,
+                });
+                continue;
+            }
+            if self
+                .publisher
                 .try_connect_relay(&url, DEADLINE)
                 .await
-                .map_err(|_| TransportAdapterError::Publish("connect failed".to_owned()))?;
+                .is_err()
+            {
+                outcome.failed.push(TransportEndpointFailure {
+                    endpoint: endpoint.clone(),
+                    reason: "connect failed".to_owned(),
+                    kind: TransportEndpointFailureKind::RetryableUnavailable,
+                    rejection_category: None,
+                });
+                continue;
+            }
             let relay = self.publisher.relay(&url).await.unwrap().unwrap();
             match relay
                 .send_event(&event)
@@ -542,6 +562,28 @@ async fn one_shot_publication_maps_accept_reject_and_unknown_without_read_filter
         query_count.load(Ordering::SeqCst),
         0,
         "publish-only connections issued a read filter"
+    );
+
+    let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_url = RelayUrl::parse(&format!(
+        "ws://{}",
+        unavailable_listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    let unavailable = candidate
+        .publish_event(
+            &[TransportEndpoint(unavailable_url.to_string())],
+            &transport_event(&event),
+            1,
+        )
+        .await
+        .unwrap();
+    drop(unavailable_listener);
+    assert!(unavailable.accepted.is_empty());
+    assert_eq!(unavailable.failed.len(), 1);
+    assert_eq!(
+        unavailable.failed[0].kind,
+        TransportEndpointFailureKind::RetryableUnavailable
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
