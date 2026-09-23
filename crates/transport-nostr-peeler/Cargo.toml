@@ -23,5 +23,8 @@ web-time.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
