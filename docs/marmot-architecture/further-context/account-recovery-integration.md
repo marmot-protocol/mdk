@@ -221,3 +221,10 @@ and superseded checks, and the remaining blocking acquisition limitations.
   incorrectly counted incremental grants as epoch audit rows; final assertions
   use durable admission and the actual epoch audit contract. A test-only worker
   clock command changes no storage and grants no execution authority.
+- Overflow composed handoff: both replacement regressions pass with policy
+  overrides. Reopen installs ordinary live interest; one owner activation recovers
+  the omitted below-floor event but EOSE alone keeps the gap. A second explicit
+  operation with independent synthetic endpoint proof passes the actual live/SQL
+  acknowledgment and retires it. During writer retry the process-local fence
+  freezes the cursor; the writer persists evidence only, the serialized owner
+  imports demand, and reopen preserves the pending loss and old cursor.

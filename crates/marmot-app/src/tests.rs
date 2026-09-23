@@ -12237,7 +12237,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
 }
 
 #[test]
-fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
+fn reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment() {
     run_composed_app_runtime_test("delivery-overflow-reopen", || async {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -12282,10 +12282,10 @@ fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
         assert!(
             subscriptions.iter().all(|subscription| match subscription {
                 NostrSubscription::AccountInbox { since, .. }
-                | NostrSubscription::Group { since, .. } => since.is_none(),
+                | NostrSubscription::Group { since, .. } => since.is_some(),
                 NostrSubscription::GroupMaintenance { .. } => true,
             }),
-            "account reopen must issue no cursor floor while overflow recovery is pending"
+            "opening live interest cannot independently authorize an unfloored replay"
         );
 
         let group_id = client
@@ -12304,11 +12304,15 @@ fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
         let omitted_id = omitted.id.clone();
         inject_epoch_gap_probe(&reopened, omitted).await;
 
-        let _eose = scripted_eose_pump(reopened.relay_plane.clone(), relay, every_subscription);
+        let _eose = scripted_eose_pump(
+            reopened.relay_plane.clone(),
+            relay.clone(),
+            every_subscription,
+        );
         client
             .sync()
             .await
-            .expect("an EOSE-confirmed unfloored replay resolves the durable gap");
+            .expect("ordinary catch-up admits the replay prefix without certifying coverage");
         assert!(
             reopened
                 .load_state("alice")
@@ -12317,6 +12321,25 @@ fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
                 .contains(&omitted_id),
             "the unfloored recovery must ingest the older event omitted below the ordinary cursor floor"
         );
+        assert!(
+            client.delivery_overflow_recovery_pending,
+            "EOSE without an exhaustive admission certificate cannot acknowledge loss"
+        );
+        assert_eq!(relay.unfloored_account_subscription_count(), 1);
+        let storage = reopened.account_storage("alice").unwrap();
+        assert!(
+            storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
+        // The independent synthetic backend certifies the finite endpoint set
+        // only on this second, genuinely caller-requested operation. All actual
+        // delivery/admission, token fencing and live acknowledgment stay real.
+        client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
+        client.repair_full_history().await.unwrap();
+        assert_eq!(relay.unfloored_account_subscription_count(), 2);
         assert!(!client.delivery_overflow_recovery_pending);
         assert!(
             reopened
@@ -12325,12 +12348,12 @@ fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
                 .account_delivery_recovery("alice")
                 .unwrap()
                 .is_none(),
-            "the durable marker clears only after the recovery replay reaches EOSE"
+            "only qualified coverage plus exact live acknowledgment retires the marker"
         );
         let health = reopened.relay_plane.relay_health().await;
-        assert_eq!(health.account_delivery_recovery_attempts, 1);
+        assert_eq!(health.account_delivery_recovery_attempts, 2);
         assert_eq!(health.account_delivery_recovery_successes, 1);
-        assert_eq!(health.account_delivery_recovery_failures, 0);
+        assert_eq!(health.account_delivery_recovery_failures, 1);
     });
 }
 
@@ -12491,9 +12514,10 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
                 if app
                     .account_storage("alice")
                     .unwrap()
-                    .account_delivery_recovery("alice")
+                    .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
                     .unwrap()
-                    .is_some()
+                    .is_empty()
+                    == false
                 {
                     break;
                 }
@@ -12502,6 +12526,34 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         })
         .await
         .expect("the single marker worker must persist after the retry clears");
+        let storage = app.account_storage("alice").unwrap();
+        assert!(
+            storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none(),
+            "the loss writer persists evidence only; it cannot create owner demand"
+        );
+        // The serialized owner boundary imports the evidence. No acquisition is
+        // needed to prove cursor safety across this handoff and reopen.
+        let grant = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Receive)
+            .unwrap();
+        drop(grant);
+        assert!(
+            storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            app.load_state("alice").unwrap().last_transport_timestamp,
+            Some(cursor_before)
+        );
+        drop(client);
+        let reopened = client_on_app_relay_plane(&app, "alice").await;
+        assert!(reopened.delivery_overflow_recovery_pending);
+        assert_eq!(reopened.state.last_transport_timestamp, Some(cursor_before));
     });
 }
 
