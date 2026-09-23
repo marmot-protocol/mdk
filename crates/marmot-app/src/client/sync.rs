@@ -2727,7 +2727,7 @@ impl AppClient {
                 if progress.is_err() {
                     // Retained input remains valid; a failed retry reset merely
                     // preserves conservative pacing and never authorizes early I/O.
-                    tracing::warn!(target:"marmot_app::recovery",method="observe_scoped_admission",
+                    tracing::warn!(target: "marmot_app::recovery", method = "observe_scoped_admission",
                         "could not checkpoint recovery admission progress");
                 }
             }
@@ -3029,7 +3029,7 @@ impl AppClient {
             if let Err(error) = pressure {
                 self.pending_recovery_capacity_writes
                     .insert(group_id.clone(), stalled_epoch);
-                tracing::warn!(target:"marmot_app::recovery",method="record_recovery_capacity_pressure",
+                tracing::warn!(target: "marmot_app::recovery", method = "record_recovery_capacity_pressure",
                     error_kind=error.privacy_safe_kind(), "admission pressure remains pending persistence");
             }
         }
@@ -3475,7 +3475,7 @@ impl AppClient {
         {
             Ok(intents) => intents,
             Err(error) => {
-                tracing::warn!(target: "marmot_app::epoch_stall", method="drop_terminal_epoch_backfill_intents",
+                tracing::warn!(target: "marmot_app::epoch_stall", method = "drop_terminal_epoch_backfill_intents",
                     error_kind=error.privacy_safe_kind(), "could not inspect terminal recovery demand");
                 return;
             }
@@ -4332,7 +4332,7 @@ impl AppClient {
         // This seam follows an actual engine evaluation. Projection-only
         // replays of an effects batch must not allocate observation identities.
         if let Err(error) = self.observe_qualified_local_stagnation(group_id) {
-            tracing::warn!(target: "marmot_app::recovery", method="observe_qualified_local_stagnation",
+            tracing::warn!(target: "marmot_app::recovery", method = "observe_qualified_local_stagnation",
                 error_kind=error.privacy_safe_kind(), "qualified local observation remains uncounted");
         }
         self.drain_epoch_stall_escalations(&mut summary);

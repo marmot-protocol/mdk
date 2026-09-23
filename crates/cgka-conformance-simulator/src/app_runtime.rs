@@ -26,6 +26,7 @@ mod process_backend;
 mod process_io;
 pub(crate) mod process_relay;
 mod process_server;
+pub(crate) use process_backend::{HistoryRepairOutcome, history_repair_outcome};
 use process_backend::{ParticipantApp, ParticipantRuntime};
 use process_relay::{ProxyBackend, RelayBackend};
 pub use process_server::run as run_app_process_stdio;

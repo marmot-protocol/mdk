@@ -35,12 +35,14 @@ impl From<marmot_app::SendSummary> for SendReceipt {
 }
 /// An executed repair pass is distinct from a certificate of history coverage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) enum HistoryRepairOutcome {
+pub(crate) enum HistoryRepairOutcome {
     Complete,
     CoverageUnproven,
 }
 
-fn history_repair_outcome(result: Result<(), AppError>) -> Result<HistoryRepairOutcome, AppError> {
+pub(crate) fn history_repair_outcome(
+    result: Result<(), AppError>,
+) -> Result<HistoryRepairOutcome, AppError> {
     match result {
         Ok(()) => Ok(HistoryRepairOutcome::Complete),
         Err(error)

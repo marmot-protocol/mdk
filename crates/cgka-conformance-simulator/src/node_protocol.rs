@@ -244,6 +244,9 @@ pub struct NodeProgressV1 {
     pub relay_directory_inflight_fetches: usize,
     pub relay_directory_completed_fetches: usize,
     pub retry_timer_armed: bool,
+    /// Executed repairs whose exhaustive history coverage remains unproven.
+    #[serde(default)]
+    pub history_repairs_without_coverage: u64,
     pub projection_checkpoint_sha256: String,
     pub stable_checkpoint_observations: u32,
 }
@@ -252,7 +255,7 @@ impl NodeProgressV1 {
     /// The node serves one command at a time, so quiescence is the combination
     /// of no observed relay/retry work and two identical public checkpoints.
     /// This projection deliberately makes no claim about an unexposed runtime
-    /// outbox signal.
+    /// outbox signal or exhaustive transport-history coverage.
     pub fn observably_quiescent(&self) -> bool {
         self.relay_directory_inflight_fetches == 0
             && !self.retry_timer_armed
@@ -275,6 +278,7 @@ struct NodeRuntimeState {
     previous_checkpoint: Option<String>,
     stable_checkpoint_observations: u32,
     retry_timer_armed: bool,
+    history_repairs_without_coverage: u64,
     events: broadcast::Receiver<marmot_app::MarmotAppEvent>,
     runtime_events_observed: usize,
 }
@@ -404,6 +408,7 @@ impl NodeServer {
             previous_checkpoint: None,
             stable_checkpoint_observations: 0,
             retry_timer_armed: false,
+            history_repairs_without_coverage: 0,
             events,
             runtime_events_observed: 0,
         });
@@ -557,12 +562,22 @@ impl NodeServer {
                 full_history,
             } => {
                 let result = if full_history {
-                    state.runtime.repair_full_history(&state.account_id).await
+                    crate::app_runtime::history_repair_outcome(
+                        state.runtime.repair_full_history(&state.account_id).await,
+                    )
                 } else {
-                    state.runtime.catch_up_accounts().await
+                    state
+                        .runtime
+                        .catch_up_accounts()
+                        .await
+                        .map(|()| crate::app_runtime::HistoryRepairOutcome::Complete)
                 };
                 match result {
-                    Ok(()) => {
+                    Ok(outcome) => {
+                        if outcome == crate::app_runtime::HistoryRepairOutcome::CoverageUnproven {
+                            state.history_repairs_without_coverage =
+                                state.history_repairs_without_coverage.saturating_add(1);
+                        }
                         state.retry_timer_armed = false;
                         if state.active_group.is_some() {
                             accept_active_invite(state).await?;
@@ -829,6 +844,7 @@ async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1,
             relay_directory_inflight_fetches: telemetry.health.directory_inflight_fetches,
             relay_directory_completed_fetches: telemetry.health.directory_completed_fetches,
             retry_timer_armed: state.retry_timer_armed,
+            history_repairs_without_coverage: state.history_repairs_without_coverage,
             projection_checkpoint_sha256: checkpoint,
             stable_checkpoint_observations: state.stable_checkpoint_observations,
         },
@@ -1131,6 +1147,7 @@ mod tests {
             relay_directory_inflight_fetches: 0,
             relay_directory_completed_fetches: 1,
             retry_timer_armed: false,
+            history_repairs_without_coverage: 0,
             projection_checkpoint_sha256: "checkpoint".into(),
             stable_checkpoint_observations: 1,
         };

@@ -81,7 +81,7 @@ remain explicit; local verification does not claim remote CI or deployment succe
   into qualified coverage. Production escalation requires actual qualified evidence;
   the test backend's finite certificate is not a production capability claim.
 
-The 85-row `account-recovery-integration-tests.csv` maps removed/substantially
+The 87-row `account-recovery-integration-tests.csv` maps removed/substantially
 rewritten regressions to current tests and separates deliberate completion-policy
 changes from preserved delivery, cancellation, retry, cursor and stale-evidence
 assertions. The original checkpoint inventory is immutable historical evidence.
@@ -596,3 +596,27 @@ both repair passes remain coverage-unproven; original payload assertions remain.
 Logs: `simulator-ci-red.log`, `repair-reason-red.log`, `simulator-ci-focused.log`
 under `/tmp/mdk-1946-ci-owner/`. The mapping now has 85 rows. Full PR-CI simulator
 coverage and repository gates remain required before this follow-up is pushed.
+
+### Complete simulator selection exposed the second adapter
+
+The full PR-CI simulator selection on signed `b767c6d7678b5c53c26601f0e14f6369bee43c6f`
+completed with **506/509 passed, three failed, 42 skipped**, without retries.
+This includes both smoke shards, offline-history, the four process scenarios and
+all model-lane binaries. Two failures came from the separate standalone node's
+same repair-result boundary; the third was the production tracing audit rejecting
+four `method=` spellings that did not match its structured-field grammar.
+Log: `/tmp/mdk-1946-ci-owner/simulator-fix-t0fufaka/simulator-all-pr-ci.log`.
+
+The standalone node now shares the same classifier and exposes
+`progress.history_repairs_without_coverage`; its public-state oracle still makes
+no claim of exhaustive history. The strict cross-route regression adds an assertion
+that its passing report retains this unproven-coverage observation. All original
+positive and negative oracle assertions remain. Recovery tracing fields now use
+the established `method =` form, without changing logged values or behavior.
+The replacement mapping has 87 entries. No further production acquisition,
+completion or retry behavior is changed by these corrections.
+
+The node/tracing correction passed **9/9 focused tests**, no retries, including
+both failed process journeys and all four tracing audits. Log:
+`/tmp/mdk-1946-ci-owner/node-repair-focused.log`. Full final PR-CI simulator and
+repository gates are rerun on the signed successor before publication.

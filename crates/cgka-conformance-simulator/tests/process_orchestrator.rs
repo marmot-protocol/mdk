@@ -997,6 +997,13 @@ async fn four_party_cross_route_recovery_processes_match_unified_route() {
     validate_four_party_cross_route_process_report(&spec, &report)
         .unwrap_or_else(|error| panic!("four-process cross-route recovery failed: {error}"));
 
+    assert!(
+        report
+            .observations
+            .iter()
+            .any(|observation| observation.progress.history_repairs_without_coverage > 0),
+        "the passing public-state oracle must not erase unproven history coverage"
+    );
     assert_eq!(report.assertion_observations.len(), 1);
     for invalid in 0..4 {
         let mut missing_wait = report.clone();
