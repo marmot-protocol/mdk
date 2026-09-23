@@ -1,9 +1,10 @@
 # #1946 amendment: bounded comparison with independent history debt
 
 Prepared 2026-09-23 against owner checkpoint
-`36442cd2e62883d0290c5fc6145e7af04ec7ea08`. The user approved this amendment, including the cutoff, mixed-result and repeated-
-start clarifications below. Implementation is in progress within #1992; the
-acceptance ledger records which parts are verified. The rest of `account-recovery-ownership.md` remains unchanged.
+`36442cd2e62883d0290c5fc6145e7af04ec7ea08`. The user approved this amendment,
+including the cutoff, mixed-result and repeated-start clarifications below. Implementation is complete within #1992; the
+acceptance ledger records exact tested revisions and remaining backend limitations.
+The rest of `account-recovery-ownership.md` remains unchanged.
 
 ## Approved clarifications
 
@@ -39,9 +40,9 @@ cannot create another request. This is the narrow exception to the blanket
 unchanged-reopen quiescence rule; broad historical replay remains quiescent.
 
 The combined run at `3fcb823652b3bfe4f294423dc452994c16443c18` had 2,865 passes
-and three failures among 2,868 tests. The frozen-cursor failure was fixed in
-`36442cd2`; both unchanged `since_floor` journeys still fail. Restoring comparison
-inside the executor alone also failed: parked demand does not authorize it, and
+and three failures among 2,868 tests. At proposal time the frozen-cursor failure
+was fixed in `36442cd2`, while both unchanged `since_floor` journeys still failed.
+Restoring comparison inside the executor alone also failed: parked demand does not authorize it, and
 cold-start timing must now respect persisted cooldown. The exact mixture of these
 two effects in each failed boot has not been instrumented; neither should be
 presented as an observed database trace from that run.
@@ -186,18 +187,18 @@ scheduler. A tick may service a request, never create one.
 
 ## Implementation and acceptance inventory
 
-These are concrete remaining implementation tasks, not validation-only work.
-Proposed regression names below are acceptance targets, not existing test claims.
+These behaviors are implemented. The names below identify actual regressions;
+the adjacent integration ledger records the final combined verification results.
 
 | Behavior and affected files | Required acceptance |
 | --- | --- |
-| Singleton, coverage-debt join, shared reserve/freeze/settle: `storage-sqlite/src/account_recovery/{comparison,plan}.rs`, `account_recovery.rs`, `migrations.rs`, new migration 0095 | `comparison_join_preserves_parked_debt_and_retry_cost`; `comparison_settlement_cannot_erase_successor_or_loss`; populated 0094→0095 upgrade, injected interruption/rollback, encrypted reopen; unknown format rejection. |
-| Typed owner work, admission and fair selection: `marmot-app/src/client/recovery.rs` | `comparison_only_grant_uses_shared_cooldown_and_bounded_plan`; `comparison_admission_rejects_stale_fences_and_duplicates`; normal/conservative handoff and fairness; rejected freeze preserves permit/observations; no loss acknowledgment from servicing comparison. |
-| Startup/catch-up join, bounded execution and existing due tick: `client/sync.rs`, `runtime/account_worker.rs` | `reopened_comparison_waits_for_shared_deadline_without_broad_replay`; `comparison_unknown_settles_opportunity_but_not_history`; `comparison_unsupported_stays_parked_on_reopen`; cancellation before/after admission and injected settlement failure retain debt and cost. |
+| Singleton, coverage-debt join, shared reserve/freeze/settle: `storage-sqlite/src/account_recovery/{comparison,plan}.rs`, `account_recovery.rs`, `migrations.rs`, new migration 0095 | `comparison_join_persists_debt_before_reserving_and_coalesces_duplicates`; `settlement_preserves_successor_and_rejects_loss_or_inventory_changes`; `recovery_completion_migration_preserves_populated_state_and_rolls_back_interruption`; `comparison_cancellation_and_cost_survive_encrypted_reopen_and_repeated_starts`; unknown-format and unresolved-placeholder regressions. |
+| Typed owner work, admission and fair selection: `marmot-app/src/client/recovery.rs` | `comparison_only_grant_preserves_cooldown_cancellation_and_scoped_admission`; `comparison_and_coverage_share_one_cost_and_conservative_fairness`; `comparison_rejected_freeze_rolls_back_coverage_and_preserves_permit`. Servicing comparison cannot acknowledge loss. |
+| Startup/catch-up join, bounded execution and existing due tick: `client/sync.rs`, `runtime/account_worker.rs` | `comparison_runtime_retries_failed_route_without_reissuing_successful_sibling`; `comparison_quantum_keeps_interrupted_route_retryable_and_unattempted_coverage_pending`; `absent_comparison_backend_stays_parked_across_new_startup_requests`; `cancelled_comparison_executor_keeps_intent_cost_and_parked_coverage`; storage transaction-failure regressions. |
 | Original below-live-cutoff delivery: `marmot-app/tests/since_floor.rs` | Preserve `cold_restart_reconciles_backlog_below_since_floor`: automatic above/below-live-cutoff delivery, persisted cursor, third-boot comparison and no repeated payload download. Preserve `stalled_epoch_backfill_still_arms_after_route_reconciliation`: same guarantees plus independent authenticated epoch-gap demand. |
 | Compatibility and replacement audit: cursor/full-history/owner suites and `account-recovery-integration-tests.csv` | Keep the unchanged three-boot frozen-wake test, ordinary quiet catch-up, prompt invite acceptance, maintenance timing and all stale-evidence tests. Add explicit mapping for any changed timing fixtures. No replacement with caller-requested catch-up and no weakened event-count assertions. |
 
-The two restart journeys need a controlled test clock/policy instead of assuming
+The two restart journeys use a controlled test clock/policy instead of assuming
 an automatic attempt before the production 15-second deadline. Assert no
 reservation/activation before the deadline, then advance it and assert the same
 delivery/inventory outcomes. Default-policy unit tests continue pinning production
@@ -211,9 +212,9 @@ regressions; then runtime triggers/execution with both complete cold-restart
 journeys and cancellation. Do not start the second until the first section's
 checks pass. Neither is an independently deployable foundation layer.
 
-The next section is complete only when the first three storage/owner rows above
-have their applicable regressions passing on a signed checkpoint. The integration
-exit remains all #1946 matrix rows, the full four affected crates under the
+The signed checkpoints and their applicable storage/owner/runtime regressions
+are recorded in the integration ledger, including corrections discovered by the
+combined suite. The integration exit remains all #1946 matrix rows, the full four affected crates under the
 recorded feature set, default-policy compatibility tests, simulator policy tests,
 applicable doctests and `just fast-ci` passing on the final code. Focused green
 results alone do not make #1992 ready. Preserve the existing WIP and dependency

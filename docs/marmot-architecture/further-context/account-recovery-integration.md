@@ -1,6 +1,7 @@
 # Recovery owner integration — implementation ledger
 
-Resumed 2026-09-23. This is work in progress, not a completion claim.
+Completed for draft review 2026-09-23. Local verification is complete; remote CI
+and coordinated stack landing remain separate gates. No merge is authorized.
 The issue #1946 acceptance matrix and `account-recovery-ownership.md` remain
 normative. The original checkpoint/report and replacement-test CSV are preserved.
 
@@ -24,9 +25,9 @@ token 12 is outstanding. No production retirement guarantee was relaxed.
 The approved bounded-comparison amendment is implemented in two checkpoints.
 The original automatic restart journeys now pass with their delivery and retained-
 inventory assertions preserved. Mixed outcomes, cancellation, shared pacing and
-unsupported capability have focused storage/runtime coverage. Combined readiness
-still requires the final complete affected-crate run and repository gates below;
-focused green results do not establish it.
+unsupported capability have storage/runtime coverage. The complete affected-crate
+run and repository gates passed on the frozen code revision recorded below. Backend limitations and dependency landing requirements
+remain explicit; local verification does not claim remote CI or deployment success.
 
 | Acceptance boundary | Implemented behavior and files | Acceptance evidence |
 | --- | --- | --- |
@@ -39,8 +40,8 @@ focused green results do not establish it.
 | Evidence and escalation | `client/epoch_stall.rs` has no replay authority; `client/recovery.rs` and storage `account_recovery/stall.rs` sample distinct qualified local observations; migration 0094 persists sample identity | `qualified_local_observations_escalate_without_replay_and_survive_reorg`; `qualified_stall_rejects_new_loss_route_and_inventory_changes`; `qualified_stall_transaction_failure_and_clock_rebase_never_forge_samples`; detector anti-spoofing suite |
 | Bounded state and investigation | Constant-memory loss snapshot; grant-owned admissions; completed known-event metadata reclaimed; unknown broad-history investigation quiesces with debt retained | `completed_known_event_metadata_waits_for_grant_release_then_is_reclaimed`; `unknown_history_is_bounded_while_epoch_input_remains_retryable`; storage loss snapshot/import tests; approved unresolved-watermark disk exception in runtime-state-bounds.md |
 | Populated migration and conservative mode | #1983/#1987 preserve old debt and atomic completion; one-obligation mode uses the same ledger/executor, including cross-grant loss acknowledgment | Populated/interrupted migration tests; `readiness_wait_and_mode_handoff_preserve_pending_state_and_retry_cost`; `conservative_grants_do_not_coalesce_or_buy_an_extra_retry`; conservative partial-proof/reopen/ack regressions |
-| Automatic recovery below the live cutoff, within inventory window | **Implemented / focused tests pass:** migration 0095 and the shared owner slot authorize bounded comparison independently of parked coverage. Runtime joins startup/catch-up once; mixed failures remain pending and the existing tick services them | `cold_restart_reconciles_backlog_below_since_floor`; `stalled_epoch_backfill_still_arms_after_route_reconciliation`; no assertion weakening or cooldown bypass accepted |
-| Combined readiness | **Final suite pending:** historical `3fcb8236` failures are preserved below; the corresponding focused journeys now pass | Run all affected crates, default-policy compatibility, simulator, doctests and `just fast-ci` on the final code before pushing |
+| Automatic recovery below the live cutoff, within inventory window | **Implemented / complete suite passes:** migration 0095 and the shared owner slot authorize bounded comparison independently of parked coverage. Runtime joins startup/catch-up once; mixed failures remain pending and the existing tick services them | `cold_restart_reconciles_backlog_below_since_floor`; `stalled_epoch_backfill_still_arms_after_route_reconciliation`; no assertion weakening or cooldown bypass accepted |
+| Combined readiness | **Local gates passed:** the final frozen code passes affected-crate suites, default-policy compatibility, simulator policy, doctests and `just fast-ci`; historical failures remain below | Exact revision and results in the final verification section; GitHub CI is reported separately |
 
 ## Source ownership and replacement inventory
 
@@ -528,3 +529,40 @@ and every owner/comparison-storage test. Log:
 `/tmp/mdk-1946-ci-owner/comparison-compatibility-correction.log`.
 All 81 regression-map rows resolve to existing replacement test functions.
 This supersedes the four focused failures, not the required complete final stack.
+
+## Final local verification
+
+Signed executable checkpoint `e5fa32212c7fa4e0bc03c8c240834a09991557a7` is the frozen code used for all
+five gates below. No source edits occurred during this run. Subsequent publication
+documentation changes do not alter executable code; their repository gate is
+recorded separately in the PR. All unpushed commits have verified signatures.
+
+- **affected-nextest**: passed. Summary [ 910.683s] 2886 tests run: 2886 passed (1 slow), 21 skipped
+- **simulator-protocol-decision**: passed. Summary [   0.018s] 5 tests run: 5 passed, 0 skipped
+- **affected-doc-tests**: passed. Four affected crates; zero doctest cases present.
+- **default-owner-nextest**: passed. Summary [  15.694s] 33 tests run: 33 passed, 1460 skipped
+- **fast-ci**: passed. Formatting, static/documentation gates, workspace all-target
+  check and clippy (normal and diagnostic feature builds), and all five release-
+  assertion policy tests passed.
+
+The affected selection includes both original complete `since_floor` journeys,
+the unchanged Frozen wake journey, all owner/completion/cancellation/retirement
+regressions, populated/interrupted migrations, and same-schema conservative mode.
+The default-policy selection proves the production retry schedule separately from
+test overrides. Simulator policy and repository convergence/binding gates pass.
+The four-crate doctest command succeeds with zero doctests present; this is not
+reported as additional exercised cases.
+
+Exact commands, UTC timestamps, head and exit codes are in
+`/tmp/mdk-1946-ci-owner/verified-stack-651yhfzj/results.json`, with adjacent logs.
+The earlier four-failure run at `55e0b24f` remains diagnostic history; the final run
+supersedes it. The untouched original WIP remains available at the provenance
+revisions above. No SDK dependency/version change or #1947 acquisition/scheduling
+work is included. No outstanding implementation item in the approved #1946 matrix
+is relabeled as future validation; the declared backend and retention limitations
+remain part of the reviewed contract.
+
+Dependency CI was refreshed on 2026-09-23: #1983 at `13cb09a4` and #1987 at
+`4fded1e9` both have green Required CI. #1987's earlier readiness-timing shard
+passed after one rerun without a dependency change. This is separate from #1992's
+new-head CI, which must be checked after publication. The stack remains unmerged.
