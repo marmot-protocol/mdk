@@ -333,7 +333,13 @@ pub struct RuntimeSharedServices {
     #[cfg(test)]
     pub(crate) bounded_recovery_finished: Arc<Notify>,
     #[cfg(test)]
+    pub(crate) bounded_preparation_probes: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) bounded_result_ready: Arc<Notify>,
+    #[cfg(test)]
     pub(crate) bounded_prefix_admitted: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_pause_before_admission: Arc<AtomicBool>,
     #[cfg(test)]
     pub(crate) bounded_pause_after_first_admission: Arc<AtomicBool>,
     local_submission_wakeups: watch::Sender<()>,
@@ -432,7 +438,13 @@ impl Default for RuntimeSharedServices {
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]
+            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            bounded_result_ready: Arc::new(Notify::new()),
+            #[cfg(test)]
             bounded_prefix_admitted: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -486,7 +498,13 @@ impl RuntimeSharedServices {
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]
+            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            bounded_result_ready: Arc::new(Notify::new()),
+            #[cfg(test)]
             bounded_prefix_admitted: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),

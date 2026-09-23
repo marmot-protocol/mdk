@@ -1142,27 +1142,52 @@ async fn run_app_runtime_account_worker(
     let mut yield_to_convergence = false;
     let mut bounded_recovery: Option<bounded_recovery::Job> = None;
     let mut yield_to_bounded_admission = false;
+    let mut bounded_probe_at = TokioInstant::now();
+    let mut bounded_prepare_error_reported = false;
     'worker: loop {
         // Activation is deliberately test-only until #1358 supplies and
         // qualifies the real backend. This is the actual worker dispatch seam:
         // the grant is captured here, while only the owned request crosses the
         // network await. The active owner lease prevents legacy overlap.
-        if shared
+        let bounded_enabled = shared
             .bounded_group_recovery_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && bounded_recovery.is_none()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if bounded_enabled && bounded_recovery.is_none() && TokioInstant::now() >= bounded_probe_at
         {
-            match bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance) {
+            let now = TokioInstant::now();
+            bounded_probe_at = now + bounded_recovery::PROBE_INTERVAL;
+            let probe = (|| -> Result<Option<bounded_recovery::Plan>, AppError> {
+                let storage = client.app.account_storage(&client.state.label)?;
+                let remaining = client
+                    .recovery_owner
+                    .retry_remaining(&storage, Instant::now())?;
+                if !remaining.is_zero() {
+                    bounded_probe_at = now + remaining.min(bounded_recovery::PROBE_INTERVAL);
+                    return Ok(None);
+                }
+                #[cfg(test)]
+                shared
+                    .bounded_preparation_probes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance)
+            })();
+            match probe {
                 Ok(Some(plan)) => {
+                    bounded_prepare_error_reported = false;
                     bounded_recovery = Some(bounded_recovery::Job::start(&client, plan))
                 }
-                Ok(None) => {}
-                Err(error) => publish_app_runtime_account_error(
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    account_error_message("bounded recovery preparation failed", &error),
-                ),
+                Ok(None) => bounded_prepare_error_reported = false,
+                Err(error) => {
+                    if !bounded_prepare_error_reported {
+                        publish_app_runtime_account_error(
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            account_error_message("bounded recovery preparation failed", &error),
+                        );
+                        bounded_prepare_error_reported = true;
+                    }
+                }
             }
         }
         let ready_command = ready_command_index(&pending, &media_http);
@@ -1174,10 +1199,13 @@ async fn run_app_runtime_account_worker(
             _ = &mut shutdown => {
                 return;
             }
+            _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
             completed = async {
                 bounded_recovery.as_mut().expect("bounded task exists").wait().await
             }, if bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
                 bounded_recovery.as_mut().expect("bounded task exists").accept(completed);
+                #[cfg(test)]
+                shared.bounded_result_ready.notify_one();
                 yield_to_bounded_admission = true;
             }
             recovered = async {
@@ -1418,7 +1446,8 @@ async fn run_app_runtime_account_worker(
                 phase.finish(TelemetryOutcome::Success);
             }
             _ = async {}, if yield_to_bounded_admission
-                && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
+                && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)
+                && !bounded_admission_test_paused(&shared, bounded_recovery.as_ref()) => {
                 let job = bounded_recovery.as_mut().expect("bounded admission job exists");
                 for _ in 0..bounded_recovery::MAX_ADMISSION_PER_TURN {
                     #[cfg(test)]
@@ -1457,7 +1486,8 @@ async fn run_app_runtime_account_worker(
             }
             _ = async {
                 #[cfg(test)]
-                if shared.bounded_pause_after_first_admission.load(std::sync::atomic::Ordering::SeqCst) {
+                if shared.bounded_pause_before_admission.load(std::sync::atomic::Ordering::SeqCst)
+                    || shared.bounded_pause_after_first_admission.load(std::sync::atomic::Ordering::SeqCst) {
                     std::future::pending::<()>().await;
                 }
                 sleep(bounded_recovery::ADMISSION_YIELD_DELAY).await;
@@ -5768,6 +5798,29 @@ fn account_error_message(prefix: &str, err: &AppError) -> String {
     format!("{prefix}: {}", err.privacy_safe_kind())
 }
 
+fn bounded_admission_test_paused(
+    shared: &RuntimeSharedServices,
+    job: Option<&bounded_recovery::Job>,
+) -> bool {
+    #[cfg(test)]
+    {
+        job.is_some_and(|job| {
+            shared
+                .bounded_pause_before_admission
+                .load(std::sync::atomic::Ordering::SeqCst)
+                || (shared
+                    .bounded_pause_after_first_admission
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && job.has_admitted_prefix())
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (shared, job);
+        false
+    }
+}
+
 async fn release_startup_client_if_opened(
     open_client: Pin<&mut impl std::future::Future<Output = Result<AppClient, AppError>>>,
 ) {
@@ -5795,6 +5848,8 @@ fn publish_app_runtime_account_error(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     use marmot_account::AccountHome;
 
@@ -5922,6 +5977,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_known_group_acquisition_wait_keeps_worker_and_live_subscriptions_available() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
         use storage_sqlite::RecoveryRequest;
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -6136,6 +6192,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_three_relay_scope_leaves_legacy_attempt_eligible() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
         use storage_sqlite::RecoveryRequest;
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -6325,7 +6382,7 @@ mod tests {
         }
     }
 
-    async fn wake_bounded_fixture(fixture: &BoundedKnownFixture) {
+    async fn advance_bounded_fixture_clock(fixture: &BoundedKnownFixture) {
         let commands = fixture
             .runtime
             .accounts()
@@ -6342,6 +6399,16 @@ mod tests {
         timeout(Duration::from_secs(5), advanced)
             .await
             .unwrap()
+            .unwrap();
+    }
+
+    async fn wake_bounded_fixture(fixture: &BoundedKnownFixture) {
+        advance_bounded_fixture_clock(fixture).await;
+        let commands = fixture
+            .runtime
+            .accounts()
+            .worker_commands("bob")
+            .await
             .unwrap();
         let (respond, response) = oneshot::channel();
         commands
@@ -6384,6 +6451,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_saturation_preserves_demand_then_partial_result_admits_known_event() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
         use storage_sqlite::RecoveryScopeOutcome;
         use transport_nostr_adapter::NostrAcquisitionEnd;
         let fixture = bounded_known_fixture().await;
@@ -6443,6 +6511,42 @@ mod tests {
                 .iter()
                 .any(|demand| demand.ticket.id == fixture.demand_id)
         );
+        let probes = fixture
+            .runtime
+            .shared_services()
+            .bounded_preparation_probes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let retry = storage.recovery_retry_state().unwrap();
+        let commands = fixture
+            .runtime
+            .accounts()
+            .worker_commands("bob")
+            .await
+            .unwrap();
+        for _ in 0..24 {
+            let (respond, response) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                    group_id: fixture.group.clone(),
+                    respond,
+                })
+                .unwrap();
+            timeout(Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            fixture
+                .runtime
+                .shared_services()
+                .bounded_preparation_probes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            probes,
+            "live command bursts do not re-run bounded preparation during owner cooldown"
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
 
         fixture.runtime.shutdown().await;
 
@@ -6492,6 +6596,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_stale_loss_and_route_results_cannot_clear_known_demand() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
         use transport_nostr_adapter::NostrAcquisitionEnd;
         for new_loss in [true, false] {
             let fixture = bounded_known_fixture().await;
@@ -6561,7 +6666,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_shutdown_after_durable_prefix_survives_storage_reopen() {
+    async fn bounded_shutdown_after_durable_prefix_preserves_pending_demand_on_reopen() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
         use transport_nostr_adapter::NostrAcquisitionEnd;
         let fixture = bounded_known_fixture().await;
         fixture
@@ -6602,10 +6708,14 @@ mod tests {
                 .pending_recovery_demands()
                 .unwrap()
                 .iter()
-                .all(|demand| demand.ticket.id != fixture.demand_id),
-            "the durably admitted exact ID may complete before the result checkpoint"
+                .any(|demand| demand.ticket.id == fixture.demand_id),
+            "an uncheckpointed exact ID remains retryable after its durable prefix"
         );
         fixture.runtime.shutdown().await;
+        assert_eq!(
+            bounded_recovery::available_credits(),
+            bounded_recovery::MAX_CONCURRENT_JOBS
+        );
         drop(storage);
 
         let reopened = MarmotApp::with_relay(fixture._dir.path(), "wss://relay.example")
@@ -6626,13 +6736,96 @@ mod tests {
                 .pending_recovery_demands()
                 .unwrap()
                 .iter()
-                .all(|demand| demand.ticket.id != fixture.demand_id)
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_before_admission_reopens_unretained_demand() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        let fixture = bounded_known_fixture().await;
+        fixture
+            .runtime
+            .shared_services()
+            .bounded_pause_before_admission
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            vec![fixture.historical.clone()],
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        advance_bounded_fixture_clock(&fixture).await;
+        timeout(
+            Duration::from_secs(5),
+            fixture
+                .runtime
+                .shared_services()
+                .bounded_result_ready
+                .notified(),
+        )
+        .await
+        .expect("network result is owned but admission is paused");
+        let storage = fixture.app.account_storage("bob").unwrap();
+        let attempt = storage.recovery_retry_state().unwrap().attempt_serial;
+        assert!(
+            !storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+        fixture.runtime.shutdown().await;
+        assert_eq!(
+            bounded_recovery::available_credits(),
+            bounded_recovery::MAX_CONCURRENT_JOBS
+        );
+        drop(storage);
+
+        let reopened = MarmotApp::with_relay(fixture._dir.path(), "wss://relay.example")
+            .with_test_relay_client(fixture.relay.clone());
+        let reopened_storage = reopened.account_storage("bob").unwrap();
+        assert_eq!(
+            reopened_storage
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            attempt
+        );
+        assert!(
+            !reopened_storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            reopened_storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
         );
     }
 
     #[tokio::test]
     #[cfg(feature = "test-policy-overrides")]
     async fn retained_multi_epoch_backlog_advances_while_bounded_history_waits() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
         use cgka_traits::storage::ConvergencePassStorage;
         use transport_nostr_adapter::NostrAcquisitionEnd;
         let fixture = bounded_known_fixture_with_delay(Some(60_000)).await;

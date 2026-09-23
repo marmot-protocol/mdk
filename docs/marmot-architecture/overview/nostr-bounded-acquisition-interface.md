@@ -118,6 +118,10 @@ The relay request runs in a separate task through `acquire_history`; its result
 returns to the same worker for peeler/engine receipt and storage admission.
 Two process-wide credits are reserved before an attempt and held until pending
 admission and the guarded checkpoint finish. One account has at most one job.
+The worker probes at most once a second and checks the owner's durable retry
+deadline before preparing a plan; live deliveries during cooldown do not
+re-run the SQLite preparation writes. This slice considers the first known-event
+demand, leaving later known-event obligations to the existing owner executor.
 The fixture limits each request to two endpoints, one requested ID, 16 retained
 events and 128 KiB of serialized event JSON per endpoint, with a five-second
 request deadline. The worker admits one event per turn and yields between
@@ -131,10 +135,13 @@ state. Partial results do not clear unretained demand; saturated responses and
 stale fences leave it pending. Unsupported returns without a legacy replay
 fallback. Unsupported scope shapes, including a third required relay, are
 declined before spending retry authority and retain their full legacy scope.
-Controlled worker regressions cover a queued send, incoming and other-account
+Installed maintenance subscriptions and their owner observations remain in
+place on both a declined and a matched exact-ID selection. Controlled worker
+regressions cover a queued send, incoming and other-account
 projection, stable live subscriptions, duplicate relay copies, saturation,
-partial results, stale loss/route evidence, shutdown after a durable prefix,
-storage reopen, and two already-retained epoch inputs progressing while a
+partial results, stale loss/route evidence, shutdown before admission and after
+a durable prefix with the obligation still pending, storage reopen, and two
+already-retained epoch inputs progressing while a
 separate request waits.
 
 `RuntimeSharedServices::bounded_group_recovery_enabled` defaults to false and

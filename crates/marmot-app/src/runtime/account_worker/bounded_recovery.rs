@@ -1,6 +1,7 @@
 //! One owner-authorized, exact group-event acquisition through the account worker.
 //! Production activation waits for the conforming SDK backend. The controlled
 //! worker fixture enables this path explicitly; Unsupported never starts replay.
+//! Only the owner's first known-event demand is considered in this slice.
 
 use super::*;
 use crate::client::recovery::AttemptGrant;
@@ -22,8 +23,14 @@ pub(super) const MAX_BYTES_PER_ENDPOINT: usize = 128 * 1024;
 pub(super) const MAX_ADMISSION_PER_TURN: usize = 1;
 pub(super) const MAX_CONCURRENT_JOBS: usize = 2;
 pub(super) const ADMISSION_YIELD_DELAY: Duration = Duration::from_millis(1);
+pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_REQUEST_DURATION: Duration = Duration::from_secs(5);
 static ACQUISITION_CREDITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_JOBS);
+
+#[cfg(test)]
+pub(super) fn available_credits() -> usize {
+    ACQUISITION_CREDITS.available_permits()
+}
 
 pub(super) struct Plan {
     credit: Option<SemaphorePermit<'static>>,
@@ -305,6 +312,11 @@ impl Job {
     }
     pub(super) fn has_input(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_admitted_prefix(&self) -> bool {
+        self.admitted > 0
     }
 
     pub(super) async fn admit_one(

@@ -125,7 +125,7 @@ discover_constants \
     "(CONVERGENCE_[A-Z0-9_]+|MIN_CONVERGENCE_[A-Z0-9_]+|IDLE_CONVERGENCE_[A-Z0-9_]+)"
 discover_constants \
     "crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs" \
-    "(MAX_[A-Z0-9_]+|ADMISSION_YIELD_DELAY)"
+    "(MAX_[A-Z0-9_]+|ADMISSION_YIELD_DELAY|PROBE_INTERVAL)"
 discover_constants "crates/marmot-app/src/client/epoch_stall.rs" "EPOCH_STALL_[A-Z0-9_]+"
 discover_constants \
     "crates/marmot-app/src/lib.rs" \
