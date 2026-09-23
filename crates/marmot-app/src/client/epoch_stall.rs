@@ -1742,7 +1742,11 @@ mod tests {
                     EpochId(10),
                     T0 + round * HOUR_MS,
                 ),
-                if round == 0 { BackfillDecision::Arm } else { BackfillDecision::Reassess },
+                if round == 0 {
+                    BackfillDecision::Arm
+                } else {
+                    BackfillDecision::Reassess
+                },
                 "round {round}: a wedged group's paced re-arm is its only replay",
             );
             // The relays serve the account's stored history in full and it
@@ -1972,7 +1976,11 @@ mod tests {
                     EpochId(10),
                     T0 + hour * HOUR_MS,
                 ),
-                if hour == 0 { BackfillDecision::Arm } else { BackfillDecision::Reassess },
+                if hour == 0 {
+                    BackfillDecision::Arm
+                } else {
+                    BackfillDecision::Reassess
+                },
                 "hour {hour}: the timer cannot authorize network work or escalate",
             );
         }

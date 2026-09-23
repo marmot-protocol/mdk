@@ -3707,10 +3707,14 @@ impl MarmotApp {
         recovery_storage.restore_unacknowledged_recovery_loss()?;
         recovery_storage.synchronize_account_delivery_loss(label)?;
         let delivery_overflow_recovery = recovery_storage.account_delivery_recovery(label)?;
-        let notification_loss = recovery_storage.pending_recovery_demands()?.into_iter()
+        let notification_loss = recovery_storage
+            .pending_recovery_demands()?
+            .into_iter()
             .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
-        let delivery_overflow_recovery_pending = delivery_overflow_recovery.is_some() || notification_loss.is_some();
-        let delivery_overflow_recovery_marker_token = delivery_overflow_recovery.map(|recovery| recovery.marker_token)
+        let delivery_overflow_recovery_pending =
+            delivery_overflow_recovery.is_some() || notification_loss.is_some();
+        let delivery_overflow_recovery_marker_token = delivery_overflow_recovery
+            .map(|recovery| recovery.marker_token)
             .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);

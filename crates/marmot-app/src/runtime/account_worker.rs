@@ -7183,9 +7183,12 @@ mod tests {
         let mut orphan = client.runtime.group_record(&group_id).unwrap();
         orphan.id = test_group_id(0xde);
         cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
-        storage.arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
-            group_id_hex: hex::encode(orphan.id.as_slice()), stalled_epoch: 1,
-        }]).unwrap();
+        storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(orphan.id.as_slice()),
+                stalled_epoch: 1,
+            }])
+            .unwrap();
         let subscriptions_before = relay.subscription_count();
 
         let (events, _subscriber) = broadcast::channel(4);
@@ -7286,7 +7289,14 @@ mod tests {
         )
         .await;
 
-        assert!(response.await.unwrap().unwrap_err().to_string().contains("full_history_coverage_unproven"));
+        assert!(
+            response
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("full_history_coverage_unproven")
+        );
         assert!(
             client.has_pending_epoch_backfill(),
             "the coalesced attempt cannot discharge a separate unproven predicate",
@@ -7431,9 +7441,12 @@ mod tests {
         let mut orphan = client.runtime.group_record(&group_id).unwrap();
         orphan.id = test_group_id(0xde);
         cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
-        storage.arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
-            group_id_hex: hex::encode(orphan.id.as_slice()), stalled_epoch: 1,
-        }]).unwrap();
+        storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(orphan.id.as_slice()),
+                stalled_epoch: 1,
+            }])
+            .unwrap();
         let subscriptions_before = relay.subscription_count();
 
         client
@@ -7455,29 +7468,65 @@ mod tests {
     #[tokio::test]
     async fn full_history_repair_coalesces_new_demand_after_an_inflight_failure() {
         let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path()).create_account("alice").unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example", bounded_epoch_backfill_config())
-            .with_test_relay_client(relay.clone());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_a = client.create_group("demand a", &[]).await.unwrap();
         let group_b = client.create_group("demand b", &[]).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
-        client.apply_backfill_decision(&group_a, client.group_mls_state(&group_a).unwrap().epoch,
-            BackfillDecision::Arm, EpochStallBackfillTrigger::UndecryptableThreshold);
-        let grant = client.authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance).unwrap().unwrap();
-        client.apply_backfill_decision(&group_b, client.group_mls_state(&group_b).unwrap().epoch,
-            BackfillDecision::Arm, EpochStallBackfillTrigger::UndecryptableThreshold);
+        client.apply_backfill_decision(
+            &group_a,
+            client.group_mls_state(&group_a).unwrap().epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let grant = client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        client.apply_backfill_decision(
+            &group_b,
+            client.group_mls_state(&group_b).unwrap().epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
         relay.fail_next_subscribe();
-        assert!(client.execute_recovery_grant(grant, None, None).await.is_err());
+        assert!(
+            client
+                .execute_recovery_grant(grant, None, None)
+                .await
+                .is_err()
+        );
         let before = relay.unfloored_account_subscription_count();
         let attempts = storage.recovery_retry_state().unwrap().attempt_serial;
-        assert!(client.repair_full_history().await.unwrap_err().source.to_string().contains("full_history_coverage_unproven"));
+        assert!(
+            client
+                .repair_full_history()
+                .await
+                .unwrap_err()
+                .source
+                .to_string()
+                .contains("full_history_coverage_unproven")
+        );
         assert_eq!(relay.unfloored_account_subscription_count(), before + 1);
-        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, attempts + 1);
-        assert_eq!(storage.pending_epoch_backfill_intents().unwrap().len(), 2,
-            "both independent gap predicates remain incomplete after the shared EOSE");
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            attempts + 1
+        );
+        assert_eq!(
+            storage.pending_epoch_backfill_intents().unwrap().len(),
+            2,
+            "both independent gap predicates remain incomplete after the shared EOSE"
+        );
     }
 
     #[test]

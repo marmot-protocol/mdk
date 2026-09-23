@@ -152,8 +152,13 @@ impl AccountRecoveryOwner {
     /// repeatedly reopen the authorization gate within this process.
     #[cfg(test)]
     pub(crate) fn test_retry_remaining(&self, storage: &SqliteAccountStorage) -> Duration {
-        Duration::from_millis(storage.recovery_retry_state().unwrap().not_before_ms
-            .saturating_sub(self.logical_now_ms(Instant::now()).unwrap()))
+        Duration::from_millis(
+            storage
+                .recovery_retry_state()
+                .unwrap()
+                .not_before_ms
+                .saturating_sub(self.logical_now_ms(Instant::now()).unwrap()),
+        )
     }
 
     #[cfg(test)]
@@ -208,16 +213,24 @@ impl AccountRecoveryOwner {
             if fence.obligations.is_empty() || (!immediate && now_ms < prior.not_before_ms) {
                 return Ok::<_, StorageError>(None);
             }
-            let maintenance = self.maintenance_observations.values()
-                .map(|observation| observation.id).collect::<Vec<_>>();
+            let maintenance = self
+                .maintenance_observations
+                .values()
+                .map(|observation| observation.id)
+                .collect::<Vec<_>>();
             storage.rearm_recovery_maintenance_for_activation(&maintenance)?;
             fence = storage.recovery_eligible_revision_fence(immediate)?;
             let reservation = storage.reserve_recovery_attempt(
-                &fence, now_ms, self.policy.delay_ms(prior.ordinal)?, immediate,
+                &fence,
+                now_ms,
+                self.policy.delay_ms(prior.ordinal)?,
+                immediate,
             )?;
             Ok(reservation)
         })?;
-        let Some(reservation) = reserved else { return Ok(None); };
+        let Some(reservation) = reserved else {
+            return Ok(None);
+        };
         self.maintenance_observations.clear();
         if let Some(permit) = explicit {
             permit.spent = true;
@@ -269,8 +282,12 @@ impl AccountRecoveryOwner {
             else {
                 return Ok(None);
             };
-            let demand = demands.iter().find(|demand| demand.ticket.id == id)
-                .ok_or_else(|| StorageError::Serialization("selected recovery demand disappeared".into()))?;
+            let demand = demands
+                .iter()
+                .find(|demand| demand.ticket.id == id)
+                .ok_or_else(|| {
+                    StorageError::Serialization("selected recovery demand disappeared".into())
+                })?;
             grant.plan.push(GrantedObligation {
                 id,
                 cause: demand.cause,
@@ -318,7 +335,9 @@ impl AccountRecoveryOwner {
             return Ok(false);
         }
         let attempt = self.active_attempt;
-        let Some(fence) = self.active_fence.as_ref() else { return Ok(false); };
+        let Some(fence) = self.active_fence.as_ref() else {
+            return Ok(false);
+        };
         storage.checkpoint_recovery_progress(
             fence,
             attempt,
@@ -406,7 +425,10 @@ impl AppClient {
             }
             let subscription = self
                 .adapter
-                .install_group_maintenance_subscription(route.clone(), grant.reservation.attempt_serial)
+                .install_group_maintenance_subscription(
+                    route.clone(),
+                    grant.reservation.attempt_serial,
+                )
                 .await?;
             if let Err(error) = self
                 .runtime
@@ -535,27 +557,44 @@ impl AppClient {
         Ok(())
     }
 
-    pub(super) fn observe_qualified_local_stagnation(&mut self, group: &cgka_traits::GroupId) -> Result<(), AppError> {
-        let Some(stall) = self.epoch_stall.wedge_evidence(group) else { return Ok(()); };
+    pub(super) fn observe_qualified_local_stagnation(
+        &mut self,
+        group: &cgka_traits::GroupId,
+    ) -> Result<(), AppError> {
+        let Some(stall) = self.epoch_stall.wedge_evidence(group) else {
+            return Ok(());
+        };
         let record = self.runtime.group_record(group)?;
-        if record.is_terminal() || record.epoch.0 != stall.stalled_epoch { return Ok(()); }
+        if record.is_terminal() || record.epoch.0 != stall.stalled_epoch {
+            return Ok(());
+        }
         drop(self.transport_receipts()?);
         self.observe_recovery_route_policy()?;
         let storage = self.app.account_storage(&self.state.label)?;
         let observation = storage.next_recovery_engine_observation()?;
         let threshold = self.epoch_stall.fruitless_completion_threshold();
         let sample = storage.sample_qualified_recovery_stall(
-            group.as_slice(), record.epoch.0, observation,
+            group.as_slice(),
+            record.epoch.0,
+            observation,
             self.recovery_owner.logical_now_ms(Instant::now())?,
-            self.epoch_stall.qualified_observation_interval_ms(), threshold,
+            self.epoch_stall.qualified_observation_interval_ms(),
+            threshold,
         )?;
         if let Some(sample) = sample {
             let count = sample.evidence.fruitless_completions;
             self.restore_persisted_epoch_stall_evidence(vec![sample.evidence]);
-            if sample.warning_changed { self.mark_recovery_status_changed(group); }
+            if sample.warning_changed {
+                self.mark_recovery_status_changed(group);
+            }
             if sample.escalated {
-                self.report_epoch_stall_escalation(group, record.epoch.0, count, threshold,
-                    "observe_qualified_local_stagnation");
+                self.report_epoch_stall_escalation(
+                    group,
+                    record.epoch.0,
+                    count,
+                    threshold,
+                    "observe_qualified_local_stagnation",
+                );
             }
         }
         Ok(())
@@ -576,20 +615,31 @@ impl AppClient {
             return Ok(false);
         }
         for loss in &grant.loss {
-            let Some((_, revision)) = grant.fence.obligations.iter().find(|(id, _)| *id == loss.id) else {
+            let Some((_, revision)) = grant
+                .fence
+                .obligations
+                .iter()
+                .find(|(id, _)| *id == loss.id)
+            else {
                 storage.restore_unacknowledged_recovery_loss()?;
-            return Ok(false);
+                return Ok(false);
             };
-            if loss.watermarks.is_empty() || !storage.recovery_obligation_is_satisfied(loss.id, *revision)? {
+            if loss.watermarks.is_empty()
+                || !storage.recovery_obligation_is_satisfied(loss.id, *revision)?
+            {
                 storage.restore_unacknowledged_recovery_loss()?;
-            return Ok(false);
+                return Ok(false);
             }
         }
         // Do not clear a shared plane guard while another loss obligation was
         // omitted from this grant (for example one waiting for a capability).
-        if storage.pending_recovery_demands()?.iter().any(|demand| matches!(
-            demand.cause, storage_sqlite::RecoveryCause::QueueLoss | storage_sqlite::RecoveryCause::NotificationLoss
-        )) {
+        if storage.pending_recovery_demands()?.iter().any(|demand| {
+            matches!(
+                demand.cause,
+                storage_sqlite::RecoveryCause::QueueLoss
+                    | storage_sqlite::RecoveryCause::NotificationLoss
+            )
+        }) {
             storage.restore_unacknowledged_recovery_loss()?;
             return Ok(false);
         }
@@ -607,13 +657,19 @@ impl AppClient {
             Ok(())
         });
         if let Err(error) = reclaimed {
-            self.adapter.restore_delivery_overflow_guard(attempt.marker_token);
+            self.adapter
+                .restore_delivery_overflow_guard(attempt.marker_token);
             storage.restore_unacknowledged_recovery_loss()?;
-            return if matches!(error, StorageError::NotFound) { Ok(false) } else { Err(error.into()) };
+            return if matches!(error, StorageError::NotFound) {
+                Ok(false)
+            } else {
+                Err(error.into())
+            };
         }
         self.delivery_overflow_recovery_pending = false;
         self.delivery_overflow_recovery_marker_token = None;
-        self.adapter.record_delivery_overflow_recovery_success(elapsed);
+        self.adapter
+            .record_delivery_overflow_recovery_success(elapsed);
         Ok(true)
     }
 
@@ -628,23 +684,43 @@ impl AppClient {
         storage.synchronize_account_delivery_loss(&self.state.label)?;
         // Failed detector persistence is retried before any selection. These
         // observations carry demand only; SQL remains the retry authority.
-        let arms = self.pending_recovery_arm_writes.iter()
+        let arms = self
+            .pending_recovery_arm_writes
+            .iter()
             .map(|(group, epoch)| storage_sqlite::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(group.as_slice()), stalled_epoch: *epoch,
-            }).collect::<Vec<_>>();
-        self.app.arm_epoch_backfill_intents(&self.state.label, &arms)?;
+                group_id_hex: hex::encode(group.as_slice()),
+                stalled_epoch: *epoch,
+            })
+            .collect::<Vec<_>>();
+        self.app
+            .arm_epoch_backfill_intents(&self.state.label, &arms)?;
         self.pending_recovery_arm_writes.clear();
         for (group, epoch) in &self.pending_recovery_capacity_writes {
-            storage.record_recovery_capacity_pressure(group.as_slice(), *epoch,
-                self.recovery_owner.logical_now_ms(Instant::now())?)?;
+            storage.record_recovery_capacity_pressure(
+                group.as_slice(),
+                *epoch,
+                self.recovery_owner.logical_now_ms(Instant::now())?,
+            )?;
         }
         self.pending_recovery_capacity_writes.clear();
         drop(self.transport_receipts()?);
         self.observe_recovery_route_policy()?;
         let routing = self.routing.snapshot();
-        let admitted = !self.adapter.recovery_admitted_endpoints(&routing.local_inbox_endpoints).is_empty()
-            || routing.group_routes.iter().any(|route| !self.adapter.recovery_admitted_endpoints(&route.endpoints).is_empty());
-        let readiness = if admitted { RecoveryReadiness::Unknown } else { RecoveryReadiness::Waiting };
+        let admitted = !self
+            .adapter
+            .recovery_admitted_endpoints(&routing.local_inbox_endpoints)
+            .is_empty()
+            || routing.group_routes.iter().any(|route| {
+                !self
+                    .adapter
+                    .recovery_admitted_endpoints(&route.endpoints)
+                    .is_empty()
+            });
+        let readiness = if admitted {
+            RecoveryReadiness::Unknown
+        } else {
+            RecoveryReadiness::Waiting
+        };
         let Some(mut grant) = self.recovery_owner.select_authorized_attempt(
             &storage,
             readiness,
@@ -657,7 +733,8 @@ impl AppClient {
         grant.seam = seam;
         let demands = storage.pending_recovery_demands()?;
         let now = unix_now_seconds();
-        let incremental_since = self.relay_plane
+        let incremental_since = self
+            .relay_plane
             .subscription_rebuild_since(self.checkpointed_transport_timestamp)
             .map(|timestamp| timestamp.0);
         let mut goals = Vec::new();
@@ -677,8 +754,12 @@ impl AppClient {
             // Policy-only changes preserve time bounds. A new qualified demand
             // revision may extend the window, including a fresh loss at the same
             // engine epoch; updated_at changes for demand, not route observation.
-            let goal_until = stored.iter().map(|scope| scope.plan.until_seconds).max()
-                .map(|until| until.max(demand.requested_at_ms / 1000)).unwrap_or(now);
+            let goal_until = stored
+                .iter()
+                .map(|scope| scope.plan.until_seconds)
+                .max()
+                .map(|until| until.max(demand.requested_at_ms / 1000))
+                .unwrap_or(now);
             // Reuse the frozen historical goal. Route-policy expansion is handled
             // by an explicit revision change before installing a successor plan.
             let scopes = if !stored.is_empty()
@@ -826,8 +907,12 @@ impl AppClient {
         grant.inventory = inventory;
         for obligation in &grant.plan {
             let cause = match obligation.cause {
-                storage_sqlite::RecoveryCause::QueueLoss => Some(storage_sqlite::RecoveryLossCause::Queue),
-                storage_sqlite::RecoveryCause::NotificationLoss => Some(storage_sqlite::RecoveryLossCause::NotificationConsumer),
+                storage_sqlite::RecoveryCause::QueueLoss => {
+                    Some(storage_sqlite::RecoveryLossCause::Queue)
+                }
+                storage_sqlite::RecoveryCause::NotificationLoss => {
+                    Some(storage_sqlite::RecoveryLossCause::NotificationConsumer)
+                }
                 _ => None,
             };
             if let Some(cause) = cause {
@@ -1090,24 +1175,70 @@ mod tests {
     #[test]
     fn scoped_progress_rejects_unrelated_windows_and_invalidated_attempts() {
         let (storage, mut owner, now) = fixture();
-        drop(owner.select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None).unwrap().unwrap());
+        drop(
+            owner
+                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                .unwrap()
+                .unwrap(),
+        );
         let later = now + Duration::from_secs(15);
-        let grant = owner.select_authorized_attempt(&storage, RecoveryReadiness::Ready, later, None).unwrap().unwrap();
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, later, None)
+            .unwrap()
+            .unwrap();
         let id = grant.fence.obligations[0].0;
         let scope = RecoveryScopePlan {
-            scope_id: 0, route_kind: 0, route_role: 0, group_id: None, transport_group_id: None,
-            since_seconds: Some(5), until_seconds: 10, known_event_id: None, inventory_floor: None,
-            required_endpoints: vec!["relay".into()], admitted_endpoints: vec!["relay".into()],
+            scope_id: 0,
+            route_kind: 0,
+            route_role: 0,
+            group_id: None,
+            transport_group_id: None,
+            since_seconds: Some(5),
+            until_seconds: 10,
+            known_event_id: None,
+            inventory_floor: None,
+            required_endpoints: vec!["relay".into()],
+            admitted_endpoints: vec!["relay".into()],
         };
-        let grant = owner.freeze_plan(&storage, grant, vec![(id, vec![scope])]).unwrap().unwrap();
+        let grant = owner
+            .freeze_plan(&storage, grant, vec![(id, vec![scope])])
+            .unwrap()
+            .unwrap();
         let inbox = storage_sqlite::TransportReconciliationRoute::Inbox;
-        assert!(!owner.observe_scoped_admission(&storage, &inbox, 4, later).unwrap());
-        assert!(!owner.observe_scoped_admission(&storage, &inbox, 11, later).unwrap());
-        assert!(!owner.observe_scoped_admission(&storage, &storage_sqlite::TransportReconciliationRoute::Group([9;32]), 7, later).unwrap());
-        storage.record_account_delivery_loss("alice", 33, 1, 1).unwrap();
-        assert!(!owner.observe_scoped_admission(&storage, &inbox, 7, later).unwrap());
+        assert!(
+            !owner
+                .observe_scoped_admission(&storage, &inbox, 4, later)
+                .unwrap()
+        );
+        assert!(
+            !owner
+                .observe_scoped_admission(&storage, &inbox, 11, later)
+                .unwrap()
+        );
+        assert!(
+            !owner
+                .observe_scoped_admission(
+                    &storage,
+                    &storage_sqlite::TransportReconciliationRoute::Group([9; 32]),
+                    7,
+                    later
+                )
+                .unwrap()
+        );
+        storage
+            .record_account_delivery_loss("alice", 33, 1, 1)
+            .unwrap();
+        assert!(
+            !owner
+                .observe_scoped_admission(&storage, &inbox, 7, later)
+                .unwrap()
+        );
         drop(grant);
-        assert!(!owner.observe_scoped_admission(&storage, &inbox, 7, later).unwrap());
+        assert!(
+            !owner
+                .observe_scoped_admission(&storage, &inbox, 7, later)
+                .unwrap()
+        );
         assert_eq!(storage.recovery_retry_state().unwrap().ordinal, 2);
     }
 
@@ -1246,117 +1377,318 @@ mod tests {
         // grant restores maintenance too; the grace deadline cannot restart.
         let old_id = client.post_join_maintenance_subscriptions[&group].0.clone();
         let mut permit = ExplicitRecoveryPermit::default();
-        let grant = client.authorize_account_recovery(Some(&mut permit), marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp).unwrap().unwrap();
-        client.execute_recovery_grant(grant, None, None).await.unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                Some(&mut permit),
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .unwrap()
+            .unwrap();
+        client
+            .execute_recovery_grant(grant, None, None)
+            .await
+            .unwrap();
         let new_id = client.post_join_maintenance_subscriptions[&group].0.clone();
         assert_ne!(old_id, new_id);
-        client.advance_post_join_maintenance_subscriptions().await.unwrap();
-        assert_eq!(storage.maintenance_obligation(&job.id).unwrap().unwrap().grace_until, advanced.grace_until);
-        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, attempts + 1);
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .maintenance_obligation(&job.id)
+                .unwrap()
+                .unwrap()
+                .grace_until,
+            advanced.grace_until
+        );
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            attempts + 1
+        );
 
         // Losing the physical session through Grace creates one paced restore,
         // reusing the bounded domain identity and keeping its existing timer.
-        client.adapter.remove_group_maintenance_subscription(&new_id).await.unwrap();
+        client
+            .adapter
+            .remove_group_maintenance_subscription(&new_id)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        client.advance_post_join_maintenance_subscriptions().await.unwrap();
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
         assert_ne!(client.post_join_maintenance_subscriptions[&group].0, new_id);
-        assert_eq!(storage.maintenance_obligation(&job.id).unwrap().unwrap().grace_until, advanced.grace_until);
-
+        assert_eq!(
+            storage
+                .maintenance_obligation(&job.id)
+                .unwrap()
+                .unwrap()
+                .grace_until,
+            advanced.grace_until
+        );
     }
     #[tokio::test]
     async fn qualified_loss_completion_rolls_back_all_causes_after_plane_ack_failure() {
-        use crate::tests::{ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane};
-        use storage_sqlite::{RecoveryLossCause, RecoveryScopeCheckpoint, RecoveryEndpointCheckpoint, RecoveryScopeOutcome, RecoveryEligibility};
+        use crate::tests::{
+            ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
+        };
+        use storage_sqlite::{
+            RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryLossCause,
+            RecoveryScopeCheckpoint, RecoveryScopeOutcome,
+        };
         let dir = tempfile::tempdir().unwrap();
-        crate::AccountHome::open(dir.path()).create_account("alice").unwrap();
-        let app = crate::MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example", bounded_epoch_backfill_config())
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
-        storage.record_account_recovery_loss("alice", RecoveryLossCause::Queue, 55, 3, 1).unwrap();
-        storage.record_account_recovery_loss("alice", RecoveryLossCause::NotificationConsumer, 55, 1, 1).unwrap();
+        storage
+            .record_account_recovery_loss("alice", RecoveryLossCause::Queue, 55, 3, 1)
+            .unwrap();
+        storage
+            .record_account_recovery_loss(
+                "alice",
+                RecoveryLossCause::NotificationConsumer,
+                55,
+                1,
+                1,
+            )
+            .unwrap();
         client.delivery_overflow_recovery_pending = true;
         client.delivery_overflow_recovery_marker_token = Some(55);
         let mut permit = ExplicitRecoveryPermit::default();
-        let grant = client.authorize_account_recovery(Some(&mut permit), marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp).unwrap().unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                Some(&mut permit),
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(grant.loss.len(), 2);
         let attempt = client.adapter.start_delivery_overflow_recovery(55);
-        assert!(!client.finish_qualified_recovery_loss(&grant, attempt).unwrap(), "reservation and EOSE-free empty drain are not coverage");
+        assert!(
+            !client
+                .finish_qualified_recovery_loss(&grant, attempt)
+                .unwrap(),
+            "reservation and EOSE-free empty drain are not coverage"
+        );
         // A synthetic exhaustive, empty endpoint fixture supplies qualified
         // coverage. The production SDK adapter never fabricates this evidence.
         for obligation in grant.plan().unwrap() {
-            let checkpoints = obligation.scopes.iter().map(|scope| RecoveryScopeCheckpoint {
-                token: scope.token.clone(), retained_known_event: false,
-                endpoints: scope.goal.required_endpoints.iter().map(|endpoint| RecoveryEndpointCheckpoint {
-                    endpoint: endpoint.clone(), outcome: RecoveryScopeOutcome::Covered,
-                    exhaustive: true, admission_complete: true, first_boundary: false,
-                }).collect(),
-            }).collect::<Vec<_>>();
-            assert!(storage.checkpoint_recovery_obligation(&grant.fence, grant.reservation.attempt_serial,
-                obligation.id, &checkpoints, RecoveryEligibility::Retry).unwrap());
+            let checkpoints = obligation
+                .scopes
+                .iter()
+                .map(|scope| RecoveryScopeCheckpoint {
+                    token: scope.token.clone(),
+                    retained_known_event: false,
+                    endpoints: scope
+                        .goal
+                        .required_endpoints
+                        .iter()
+                        .map(|endpoint| RecoveryEndpointCheckpoint {
+                            endpoint: endpoint.clone(),
+                            outcome: RecoveryScopeOutcome::Covered,
+                            exhaustive: true,
+                            admission_complete: true,
+                            first_boundary: false,
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                storage
+                    .checkpoint_recovery_obligation(
+                        &grant.fence,
+                        grant.reservation.attempt_serial,
+                        obligation.id,
+                        &checkpoints,
+                        RecoveryEligibility::Retry
+                    )
+                    .unwrap()
+            );
         }
         let path = app.account_storage_path("alice");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let key = app.sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session).unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+            .unwrap();
         let connection = rusqlite::Connection::open(path).unwrap();
-        storage_sqlite::open_hardened_sqlcipher(&connection, &key, storage_sqlite::SqlCipherHardening::cipher_only()).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
         connection.execute_batch("CREATE TRIGGER fail_loss_reclaim BEFORE DELETE ON account_delivery_loss_evidence WHEN OLD.cause=1 BEGIN SELECT RAISE(FAIL, 'injected reclaim failure'); END;").unwrap();
-        assert!(client.finish_qualified_recovery_loss(&grant, attempt).is_err());
-        assert!(client.adapter.pending_delivery_overflow().is_some(), "plane guard restored after SQL failure");
+        assert!(
+            client
+                .finish_qualified_recovery_loss(&grant, attempt)
+                .is_err()
+        );
+        assert!(
+            client.adapter.pending_delivery_overflow().is_some(),
+            "plane guard restored after SQL failure"
+        );
         assert!(client.delivery_overflow_recovery_pending);
-        for cause in [RecoveryLossCause::Queue, RecoveryLossCause::NotificationConsumer] {
-            assert_eq!(storage.recovery_loss_watermarks("alice", cause).unwrap().len(), 1, "both cause deletions roll back together");
+        for cause in [
+            RecoveryLossCause::Queue,
+            RecoveryLossCause::NotificationConsumer,
+        ] {
+            assert_eq!(
+                storage
+                    .recovery_loss_watermarks("alice", cause)
+                    .unwrap()
+                    .len(),
+                1,
+                "both cause deletions roll back together"
+            );
         }
-        assert_eq!(storage.pending_recovery_demands().unwrap().iter().filter(|demand| matches!(demand.cause,
-            storage_sqlite::RecoveryCause::QueueLoss | storage_sqlite::RecoveryCause::NotificationLoss)).count(), 2);
-        connection.execute_batch("DROP TRIGGER fail_loss_reclaim").unwrap();
+        assert_eq!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .filter(|demand| matches!(
+                    demand.cause,
+                    storage_sqlite::RecoveryCause::QueueLoss
+                        | storage_sqlite::RecoveryCause::NotificationLoss
+                ))
+                .count(),
+            2
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_loss_reclaim")
+            .unwrap();
         drop(grant);
         let mut permit = ExplicitRecoveryPermit::default();
-        let grant = client.authorize_account_recovery(Some(&mut permit), marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp).unwrap().unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                Some(&mut permit),
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .unwrap()
+            .unwrap();
         let attempt = client.adapter.start_delivery_overflow_recovery(55);
         for obligation in grant.plan().unwrap() {
-            let checkpoints = obligation.scopes.iter().map(|scope| RecoveryScopeCheckpoint {
-                token: scope.token.clone(), retained_known_event: false,
-                endpoints: scope.goal.required_endpoints.iter().map(|endpoint| RecoveryEndpointCheckpoint {
-                    endpoint: endpoint.clone(), outcome: RecoveryScopeOutcome::Covered,
-                    exhaustive: true, admission_complete: true, first_boundary: false,
-                }).collect(),
-            }).collect::<Vec<_>>();
-            assert!(storage.checkpoint_recovery_obligation(&grant.fence, grant.reservation.attempt_serial,
-                obligation.id, &checkpoints, RecoveryEligibility::Retry).unwrap());
+            let checkpoints = obligation
+                .scopes
+                .iter()
+                .map(|scope| RecoveryScopeCheckpoint {
+                    token: scope.token.clone(),
+                    retained_known_event: false,
+                    endpoints: scope
+                        .goal
+                        .required_endpoints
+                        .iter()
+                        .map(|endpoint| RecoveryEndpointCheckpoint {
+                            endpoint: endpoint.clone(),
+                            outcome: RecoveryScopeOutcome::Covered,
+                            exhaustive: true,
+                            admission_complete: true,
+                            first_boundary: false,
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                storage
+                    .checkpoint_recovery_obligation(
+                        &grant.fence,
+                        grant.reservation.attempt_serial,
+                        obligation.id,
+                        &checkpoints,
+                        RecoveryEligibility::Retry
+                    )
+                    .unwrap()
+            );
         }
-        assert!(client.finish_qualified_recovery_loss(&grant, attempt).unwrap());
+        assert!(
+            client
+                .finish_qualified_recovery_loss(&grant, attempt)
+                .unwrap()
+        );
         assert!(!client.delivery_overflow_recovery_pending);
         assert!(client.adapter.pending_delivery_overflow().is_none());
-        for cause in [RecoveryLossCause::Queue, RecoveryLossCause::NotificationConsumer] {
-            assert!(storage.recovery_loss_watermarks("alice", cause).unwrap().is_empty());
+        for cause in [
+            RecoveryLossCause::Queue,
+            RecoveryLossCause::NotificationConsumer,
+        ] {
+            assert!(
+                storage
+                    .recovery_loss_watermarks("alice", cause)
+                    .unwrap()
+                    .is_empty()
+            );
         }
         assert_eq!(storage.restore_unacknowledged_recovery_loss().unwrap(), 0);
     }
 
     #[tokio::test]
     async fn recovery_inventory_is_frozen_before_io_and_excludes_future_items() {
-        use crate::tests::{ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane};
+        use crate::tests::{
+            ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
+        };
         let dir = tempfile::tempdir().unwrap();
-        crate::AccountHome::open(dir.path()).create_account("alice").unwrap();
-        let app = crate::MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example", bounded_epoch_backfill_config())
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
         let route = storage_sqlite::TransportReconciliationRoute::Inbox;
         let now = unix_now_seconds();
-        let item = |id, created_at| storage_sqlite::TransportReconciliationItem { event_id: [id; 32], created_at };
-        storage.record_transport_reconciliation_item(&route, &item(1, now)).unwrap();
-        storage.record_transport_reconciliation_item(&route, &item(2, now + 1000)).unwrap();
-        storage.request_recovery(storage_sqlite::RecoveryRequest::IncrementalHistory, now * 1000).unwrap();
+        let item = |id, created_at| storage_sqlite::TransportReconciliationItem {
+            event_id: [id; 32],
+            created_at,
+        };
+        storage
+            .record_transport_reconciliation_item(&route, &item(1, now))
+            .unwrap();
+        storage
+            .record_transport_reconciliation_item(&route, &item(2, now + 1000))
+            .unwrap();
+        storage
+            .request_recovery(
+                storage_sqlite::RecoveryRequest::IncrementalHistory,
+                now * 1000,
+            )
+            .unwrap();
         let mut permit = ExplicitRecoveryPermit::default();
-        let grant = client.authorize_account_recovery(Some(&mut permit), marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp).unwrap().unwrap();
-        let frozen = grant.inventory.iter().find(|snapshot| snapshot.route == route).unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                Some(&mut permit),
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .unwrap()
+            .unwrap();
+        let frozen = grant
+            .inventory
+            .iter()
+            .find(|snapshot| snapshot.route == route)
+            .unwrap();
         assert_eq!(frozen.items.len(), 1);
         assert_eq!(frozen.items[0].event_id, [1; 32]);
-        storage.record_transport_reconciliation_item(&route, &item(3, now)).unwrap();
-        assert_eq!(frozen.items.len(), 1, "a later admission cannot change an in-flight comparison snapshot");
+        storage
+            .record_transport_reconciliation_item(&route, &item(3, now))
+            .unwrap();
+        assert_eq!(
+            frozen.items.len(),
+            1,
+            "a later admission cannot change an in-flight comparison snapshot"
+        );
         assert!(frozen.until <= now + 1);
     }
-
 }

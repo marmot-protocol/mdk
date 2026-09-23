@@ -129,7 +129,6 @@ impl SqliteAccountStorage {
             let current = revision_fence(&conn)?;
             if current.loss_revision != expected.loss_revision
                 || current.route_revision != expected.route_revision
-                || current.inventory_revision != expected.inventory_revision
                 || !plan::no_unimported_loss(&conn)?
             {
                 return Ok(false);
@@ -152,6 +151,9 @@ impl SqliteAccountStorage {
             } else {
                 RecoveryLossCause::NotificationConsumer
             };
+            if !plan::scopes_qualify(&conn, expected, None, obligation_id, 0)? {
+                return Ok(false);
+            }
             if watermarks(&conn, &label, cause)? != captured {
                 return Ok(false);
             }

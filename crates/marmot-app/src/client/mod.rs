@@ -1070,13 +1070,27 @@ impl AppClient {
             return Ok(());
         }
         let storage = self.app.account_storage(&self.state.label)?;
-        let active_jobs = storage.list_maintenance_obligations()?.into_iter()
-            .filter(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin
-                && matches!(job.phase, cgka_traits::MaintenancePhase::CatchUp
-                    | cgka_traits::MaintenancePhase::EoseTimeout | cgka_traits::MaintenancePhase::Grace))
-            .map(|job| serde_json::to_vec(&(job.id.as_slice(), job.semantic_rearm_count))
-                .map(|key| (key, job.group_id.as_slice().to_vec()))
-                .map_err(|_| cgka_traits::storage::StorageError::Serialization("invalid maintenance recovery identity".into())))
+        let active_jobs = storage
+            .list_maintenance_obligations()?
+            .into_iter()
+            .filter(|job| {
+                job.trigger == cgka_traits::MaintenanceTrigger::PostJoin
+                    && matches!(
+                        job.phase,
+                        cgka_traits::MaintenancePhase::CatchUp
+                            | cgka_traits::MaintenancePhase::EoseTimeout
+                            | cgka_traits::MaintenancePhase::Grace
+                    )
+            })
+            .map(|job| {
+                serde_json::to_vec(&(job.id.as_slice(), job.semantic_rearm_count))
+                    .map(|key| (key, job.group_id.as_slice().to_vec()))
+                    .map_err(|_| {
+                        cgka_traits::storage::StorageError::Serialization(
+                            "invalid maintenance recovery identity".into(),
+                        )
+                    })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         storage.retain_recovery_maintenance_jobs(&active_jobs)?;
         let mut requested = false;
@@ -1122,10 +1136,16 @@ impl AppClient {
             waiting.insert(group_id.clone());
 
             if let Some((subscription, _)) = self.post_join_maintenance_subscriptions.get(&group_id)
-                && self.adapter.group_maintenance_any_eose(subscription).await.is_none()
+                && self
+                    .adapter
+                    .group_maintenance_any_eose(subscription)
+                    .await
+                    .is_none()
             {
                 self.post_join_maintenance_subscriptions.remove(&group_id);
-                self.recovery_owner.maintenance_observations.remove(&group_id);
+                self.recovery_owner
+                    .maintenance_observations
+                    .remove(&group_id);
             }
             if !self
                 .post_join_maintenance_subscriptions
@@ -1182,7 +1202,12 @@ impl AppClient {
                 .maintenance_observations
                 .remove(&group_id);
         }
-        if requested && let Some(grant) = self.authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Maintenance)? {
+        if requested
+            && let Some(grant) = self.authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )?
+        {
             match self.execute_recovery_grant(grant, None, None).await {
                 Ok(summary) => self.pending_applied_sync_summary.merge(summary),
                 Err(failure) => {
@@ -5971,11 +5996,13 @@ impl AppClient {
                 // The canonical group already populated routing. Its REQs and
                 // founding Welcome publication can progress independently.
                 let adapter = self.adapter.clone();
-                let sync = self.subscription_rebuild_since().map(|since| TransportGroupSync {
-                    account_id: adapter.account_id().clone(),
-                    group_subscriptions: self.routing.group_subscriptions(),
-                    since,
-                });
+                let sync = self
+                    .subscription_rebuild_since()
+                    .map(|since| TransportGroupSync {
+                        account_id: adapter.account_id().clone(),
+                        group_subscriptions: self.routing.group_subscriptions(),
+                        since,
+                    });
                 self.pending_runtime_group_subscription_refresh = true;
                 let register = async {
                     let sync = sync?;

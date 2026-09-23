@@ -666,10 +666,21 @@ impl SqliteAccountStorage {
                     params![label, marker_token],
                 )
                 .storage()?;
-            // Legacy retirement is not qualified completion. Keep the imported
-            // watermark so a late duplicate writer cannot recreate retired debt.
-            // Only the coordinated owner completion/plane-ack path may reclaim it.
-            Ok(cleared > 0)
+            if cleared == 0 {
+                return Ok(false);
+            }
+            // Retirement applies only to this token. Keep the imported watermark
+            // against delayed duplicates, but never retire joined generations.
+            conn.execute_cached(
+                "UPDATE account_delivery_loss_evidence
+                SET legacy_retired_count=imported_count
+                WHERE account_label=?1 AND cause=0 AND marker_token=?2",
+                params![label, marker_token],
+            )
+            .storage()?;
+            let remaining = crate::account_recovery::restore_legacy_loss_tx(&conn, label)?;
+            // The legacy caller clears its in-memory flag only on true.
+            Ok(!remaining)
         })
     }
 

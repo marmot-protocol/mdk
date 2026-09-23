@@ -133,7 +133,9 @@ async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identit
     overflow.consume_signal(generation);
     let first = overflow.start_recovery(1);
     assert!(overflow.start_marker_persistence());
-    overflow.persist_marker_before_drop(Arc::new(|_, _, _| Ok(()))).await;
+    overflow
+        .persist_marker_before_drop(Arc::new(|_, _, _| Ok(())))
+        .await;
     let elapsed_ms = overflow.finish_recovery(first).unwrap();
     overflow.record_recovery_success(elapsed_ms);
 
@@ -225,8 +227,10 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     .await
     .expect("the old generation marker worker must start");
 
-    assert!(overflow.finish_recovery(old_attempt).is_none(),
-        "a writer still in flight must prevent acknowledgment and generation reuse");
+    assert!(
+        overflow.finish_recovery(old_attempt).is_none(),
+        "a writer still in flight must prevent acknowledgment and generation reuse"
+    );
     // Exercise the defensive stale-worker fence independently of the public
     // handoff, which now forbids this transition while a writer is in flight.
     overflow.inner.lock().unwrap().pending = false;
@@ -2099,31 +2103,64 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
     storage.ensure_account_projection("alice").unwrap();
     let evidence = storage.clone();
     let marker: AccountDeliveryRecoveryMarker = Arc::new(move |cause, token, count| {
-        evidence.record_account_recovery_loss("alice", cause, token, count, 1)
+        evidence
+            .record_account_recovery_loss("alice", cause, token, count, 1)
             .map_err(|_| AccountDeliveryRecoveryMarkerError::Retryable)
     });
-    let adapter = plane.account_adapter_with_recovery_marker(account.clone(), relay.clone(), Some(marker.clone()));
-    recover_relay_notification_forwarder(&plane.inner.transport, RelayNotificationConsumerExit::Lagged(0));
+    let adapter = plane.account_adapter_with_recovery_marker(
+        account.clone(),
+        relay.clone(),
+        Some(marker.clone()),
+    );
+    recover_relay_notification_forwarder(
+        &plane.inner.transport,
+        RelayNotificationConsumerExit::Lagged(0),
+    );
     let loss = adapter.pending_delivery_overflow().unwrap();
     assert_eq!(loss.dropped, 0);
     assert_eq!(loss.notification_losses, 1);
-    assert!(timeout(Duration::from_secs(1), adapter.receive()).await.unwrap().unwrap().is_none());
+    assert!(
+        timeout(Duration::from_secs(1), adapter.receive())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
     let replacement = plane.account_adapter_with_recovery_marker(account, relay, Some(marker));
-    assert!(Arc::ptr_eq(&adapter.delivery_overflow, &replacement.delivery_overflow));
+    assert!(Arc::ptr_eq(
+        &adapter.delivery_overflow,
+        &replacement.delivery_overflow
+    ));
     timeout(Duration::from_secs(2), async {
         while !replacement.delivery_overflow.marker_barrier_complete() {
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     storage.synchronize_account_delivery_loss("alice").unwrap();
     let pending = storage.pending_recovery_demands().unwrap();
     assert_eq!(pending.len(), 1);
     assert!(pending[0].cause == storage_sqlite::RecoveryCause::NotificationLoss);
-    assert!(storage.account_delivery_recovery("alice").unwrap().is_none());
+    assert!(
+        storage
+            .account_delivery_recovery("alice")
+            .unwrap()
+            .is_none()
+    );
     let old = replacement.start_delivery_overflow_recovery(loss.marker_token);
-    recover_relay_notification_forwarder(&plane.inner.transport, RelayNotificationConsumerExit::Closed);
+    recover_relay_notification_forwarder(
+        &plane.inner.transport,
+        RelayNotificationConsumerExit::Closed,
+    );
     assert!(replacement.finish_delivery_overflow_recovery(old).is_none());
     replacement.fail_delivery_overflow_recovery();
-    assert_eq!(replacement.pending_delivery_overflow().unwrap().notification_losses, 2);
+    assert_eq!(
+        replacement
+            .pending_delivery_overflow()
+            .unwrap()
+            .notification_losses,
+        2
+    );
     plane.shutdown().await;
 }

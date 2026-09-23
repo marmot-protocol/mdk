@@ -128,7 +128,9 @@ impl SqliteAccountStorage {
                 "INSERT INTO account_recovery_obligations
                  (demand_key,cause,predicate,group_id,created_at_ms,updated_at_ms,caller_origin,urgency)
                  VALUES (?1,?2,?3,?4,?5,?5,?6,?6)
-                 ON CONFLICT(demand_key) DO NOTHING",
+                 ON CONFLICT(demand_key) DO UPDATE SET state=0,revision=revision+1,
+                     eligibility=0,updated_at_ms=excluded.updated_at_ms
+                 WHERE account_recovery_obligations.state=1 AND account_recovery_obligations.cause IN (4,5)",
                 params![key,cause,predicate,group,sqlite_integer(now_ms)?,caller],
             ).storage()?;
             let (id,revision): (Vec<u8>,i64) = conn.query_row_cached(
@@ -147,12 +149,17 @@ impl SqliteAccountStorage {
     /// physical session loss. This rearms only its limited boundary predicate;
     /// history debt, domain grace timers and account retry cost are untouched.
     /// The worker calls this only when no matching live session exists.
-    pub fn restore_recovery_maintenance_session(&self, ticket: RecoveryDemandTicket) -> StorageResult<()> {
-        self.lock()?.execute_cached(
-            "UPDATE account_recovery_obligations SET state=0,eligibility=1,revision=revision+1
+    pub fn restore_recovery_maintenance_session(
+        &self,
+        ticket: RecoveryDemandTicket,
+    ) -> StorageResult<()> {
+        self.lock()?
+            .execute_cached(
+                "UPDATE account_recovery_obligations SET state=0,eligibility=1,revision=revision+1
              WHERE id=?1 AND revision=?2 AND cause=2 AND predicate=2 AND state=1",
-            params![ticket.id.as_slice(), sqlite_integer(ticket.revision)?],
-        ).storage()?;
+                params![ticket.id.as_slice(), sqlite_integer(ticket.revision)?],
+            )
+            .storage()?;
         Ok(())
     }
 
@@ -166,7 +173,8 @@ impl SqliteAccountStorage {
                 "UPDATE account_recovery_obligations SET state=0,eligibility=1,revision=revision+1
                  WHERE id=?1 AND cause=2 AND predicate=2 AND state IN (0,1)",
                 [id.as_slice()],
-            ).storage()?;
+            )
+            .storage()?;
         }
         Ok(())
     }
@@ -174,8 +182,15 @@ impl SqliteAccountStorage {
     /// Remove prerequisites whose owning domain job no longer needs a session.
     /// The caller supplies the complete current domain set; independent history
     /// and loss obligations are never included in this reclamation.
-    pub fn retain_recovery_maintenance_jobs(&self, jobs: &[(Vec<u8>, Vec<u8>)]) -> StorageResult<()> {
-        let keys = jobs.iter().map(|(job, group)| format!("maintenance:{}:{}:2", hex::encode(group), hex::encode(job)))
+    pub fn retain_recovery_maintenance_jobs(
+        &self,
+        jobs: &[(Vec<u8>, Vec<u8>)],
+    ) -> StorageResult<()> {
+        let keys = jobs
+            .iter()
+            .map(|(job, group)| {
+                format!("maintenance:{}:{}:2", hex::encode(group), hex::encode(job))
+            })
             .collect::<std::collections::HashSet<_>>();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -209,15 +224,27 @@ impl SqliteAccountStorage {
     pub fn restore_recovery_waiters(&self) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            conn.execute_cached("DELETE FROM account_recovery_obligations WHERE caller_origin=1 AND state=1", []).storage()?;
-            conn.execute_cached("UPDATE account_recovery_obligations SET urgency=0 WHERE caller_origin=1", []).storage()?;
+            conn.execute_cached(
+                "DELETE FROM account_recovery_obligations WHERE caller_origin=1 AND state=1",
+                [],
+            )
+            .storage()?;
+            conn.execute_cached(
+                "UPDATE account_recovery_obligations SET urgency=0 WHERE caller_origin=1",
+                [],
+            )
+            .storage()?;
             Ok(())
         })
     }
 
     /// Read a completion verdict at the exact obligation revision; superseded
     /// or reclaimed rows cannot become evidence for an older attempt.
-    pub fn recovery_obligation_is_satisfied(&self, id: [u8;16], revision: u64) -> StorageResult<bool> {
+    pub fn recovery_obligation_is_satisfied(
+        &self,
+        id: [u8; 16],
+        revision: u64,
+    ) -> StorageResult<bool> {
         self.lock()?.query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations WHERE id=?1 AND revision=?2 AND state=1)",
             params![id.as_slice(),sqlite_integer(revision)?], |row| row.get(0),
@@ -252,7 +279,18 @@ impl SqliteAccountStorage {
             .storage()?;
         rows.into_iter()
             .map(
-                |(id, revision, cause, predicate, eligibility, group_id, epoch, token, known, requested_at)| {
+                |(
+                    id,
+                    revision,
+                    cause,
+                    predicate,
+                    eligibility,
+                    group_id,
+                    epoch,
+                    token,
+                    known,
+                    requested_at,
+                )| {
                     Ok(RecoveryDemand {
                         ticket: RecoveryDemandTicket {
                             id: id.try_into().map_err(|_| invalid_demand())?,
@@ -284,7 +322,9 @@ impl SqliteAccountStorage {
                         },
                         group_id,
                         requested_at_ms: i64_to_u64(requested_at)?,
-                        known_event_id: known.map(|bytes| bytes.try_into().map_err(|_| invalid_demand())).transpose()?,
+                        known_event_id: known
+                            .map(|bytes| bytes.try_into().map_err(|_| invalid_demand()))
+                            .transpose()?,
                         stalled_epoch: epoch.map(i64_to_u64).transpose()?,
                         marker_token: token.map(i64_to_u64).transpose()?,
                     })
@@ -349,54 +389,187 @@ mod tests {
     #[test]
     fn maintenance_session_restore_and_reclamation_preserve_other_debt_and_retry() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.lock().unwrap().execute("INSERT INTO cgka_groups(id,epoch,record) VALUES (?1,0,x'00')", [b"group".as_slice()]).unwrap();
-        let ticket = store.request_recovery(RecoveryRequest::MaintenanceBoundary { job_id: b"job", group_id: b"group" }, 1).unwrap();
-        let other = store.request_recovery(RecoveryRequest::IncrementalHistory, 1).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_groups(id,epoch,record) VALUES (?1,0,x'00')",
+                [b"group".as_slice()],
+            )
+            .unwrap();
+        let ticket = store
+            .request_recovery(
+                RecoveryRequest::MaintenanceBoundary {
+                    job_id: b"job",
+                    group_id: b"group",
+                },
+                1,
+            )
+            .unwrap();
+        let other = store
+            .request_recovery(RecoveryRequest::IncrementalHistory, 1)
+            .unwrap();
         let fence = store.recovery_revision_fence().unwrap();
-        store.reserve_recovery_attempt(&fence, 1, 15000, false).unwrap().unwrap();
+        store
+            .reserve_recovery_attempt(&fence, 1, 15000, false)
+            .unwrap()
+            .unwrap();
         let retry = store.recovery_retry_state().unwrap();
-        store.lock().unwrap().execute("UPDATE account_recovery_obligations SET state=1 WHERE id=?1", [ticket.id.as_slice()]).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE account_recovery_obligations SET state=1 WHERE id=?1",
+                [ticket.id.as_slice()],
+            )
+            .unwrap();
         store.restore_recovery_maintenance_session(ticket).unwrap();
         let restored = store.pending_recovery_demands().unwrap();
-        assert_eq!(restored.iter().find(|demand| demand.ticket.id == ticket.id).unwrap().ticket.revision, ticket.revision + 1);
+        assert_eq!(
+            restored
+                .iter()
+                .find(|demand| demand.ticket.id == ticket.id)
+                .unwrap()
+                .ticket
+                .revision,
+            ticket.revision + 1
+        );
         store.restore_recovery_maintenance_session(ticket).unwrap();
         assert_eq!(store.recovery_retry_state().unwrap(), retry);
-        store.retain_recovery_maintenance_jobs(&[(b"job".to_vec(), b"group".to_vec())]).unwrap();
+        store
+            .retain_recovery_maintenance_jobs(&[(b"job".to_vec(), b"group".to_vec())])
+            .unwrap();
         assert_eq!(store.pending_recovery_demands().unwrap().len(), 2);
         store.retain_recovery_maintenance_jobs(&[]).unwrap();
         let retained = store.pending_recovery_demands().unwrap();
         assert_eq!(retained.len(), 1);
         assert!(retained[0].ticket == other);
         assert_eq!(store.recovery_retry_state().unwrap(), retry);
-        let count: i64 = store.lock().unwrap().query_row("SELECT count(*) FROM account_recovery_scopes WHERE obligation_id=?1", [ticket.id.as_slice()], |row| row.get(0)).unwrap();
+        let count: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_recovery_scopes WHERE obligation_id=?1",
+                [ticket.id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0);
     }
 
     #[test]
     fn successive_explicit_callers_reuse_debt_without_free_retry_or_stale_detach() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        let first = store.request_recovery(RecoveryRequest::ExplicitHistory { operation_id: &[0;16] }, 1).unwrap();
+        let first = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[0; 16],
+                },
+                1,
+            )
+            .unwrap();
         let fence = store.recovery_revision_fence().unwrap();
-        store.reserve_recovery_attempt(&fence, 1, 15000, true).unwrap().unwrap();
+        store
+            .reserve_recovery_attempt(&fence, 1, 15000, true)
+            .unwrap()
+            .unwrap();
         let retry = store.recovery_retry_state().unwrap();
         for index in 1..100 {
-            let ticket = store.request_recovery(RecoveryRequest::ExplicitHistory { operation_id: &[index;16] }, u64::from(index)).unwrap();
+            let ticket = store
+                .request_recovery(
+                    RecoveryRequest::ExplicitHistory {
+                        operation_id: &[index; 16],
+                    },
+                    u64::from(index),
+                )
+                .unwrap();
             assert_eq!(ticket.id, first.id);
             assert_eq!(ticket.revision, first.revision + u64::from(index));
             store.detach_recovery_waiter(first).unwrap();
             assert_eq!(store.pending_recovery_demands().unwrap().len(), 1);
             assert_eq!(store.recovery_retry_state().unwrap(), retry);
         }
-        let urgency: i64 = store.lock().unwrap().query_row("SELECT urgency FROM account_recovery_obligations", [], |row| row.get(0)).unwrap();
+        let urgency: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT urgency FROM account_recovery_obligations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(urgency, 1);
     }
+}
 
+#[cfg(test)]
+mod waiter_tests {
+    use super::*;
+    #[test]
+    fn abandoned_waiter_keeps_debt_and_satisfied_waiter_is_reclaimed() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let ticket = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[7; 16],
+                },
+                1,
+            )
+            .unwrap();
+        let fence = store.recovery_revision_fence().unwrap();
+        let retry = store
+            .reserve_recovery_attempt(&fence, 1, 15_000, true)
+            .unwrap()
+            .unwrap();
+        store.restore_recovery_waiters().unwrap();
+        assert_eq!(
+            store.pending_recovery_demands().unwrap()[0].ticket.id,
+            ticket.id
+        );
+        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT urgency FROM account_recovery_obligations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE account_recovery_obligations SET state=1", [])
+            .unwrap();
+        store.detach_recovery_waiter(ticket).unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM account_recovery_obligations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+    }
 }
 
 impl SqliteAccountStorage {
     /// Admission pressure is demand, not permission for immediate replay into
     /// the same queue. Duplicate pressure joins one row and one waiting period.
-    pub fn record_recovery_capacity_pressure(&self, group: &[u8], epoch: u64, now_ms: u64) -> StorageResult<()> {
+    pub fn record_recovery_capacity_pressure(
+        &self,
+        group: &[u8],
+        epoch: u64,
+        now_ms: u64,
+    ) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let qualified: bool = conn.query_row_cached(
@@ -416,12 +589,21 @@ impl SqliteAccountStorage {
     /// The existing owner tick may authorize a bounded pressure probe after the
     /// minimum relief interval. The account retry reservation still applies;
     /// this does not reset pacing, increment attempts or start network work.
-    pub fn release_due_recovery_capacity_probes(&self, now_ms: u64, minimum_delay_ms: u64) -> StorageResult<()> {
-        let Some(before) = now_ms.checked_sub(minimum_delay_ms) else { return Ok(()); };
-        self.lock()?.execute_cached(
-            "UPDATE account_recovery_obligations SET eligibility=1
-             WHERE state=0 AND eligibility=2 AND updated_at_ms<=?1", [sqlite_integer(before)?],
-        ).storage()?;
+    pub fn release_due_recovery_capacity_probes(
+        &self,
+        now_ms: u64,
+        minimum_delay_ms: u64,
+    ) -> StorageResult<()> {
+        let Some(before) = now_ms.checked_sub(minimum_delay_ms) else {
+            return Ok(());
+        };
+        self.lock()?
+            .execute_cached(
+                "UPDATE account_recovery_obligations SET eligibility=1
+             WHERE state=0 AND eligibility=2 AND updated_at_ms<=?1",
+                [sqlite_integer(before)?],
+            )
+            .storage()?;
         Ok(())
     }
 }
@@ -429,29 +611,61 @@ impl SqliteAccountStorage {
 #[cfg(test)]
 mod capacity_tests {
     use super::*;
-    use cgka_traits::storage::GroupStorage;
     use crate::storage::test_support::{gid, sample_group};
+    use cgka_traits::storage::GroupStorage;
 
     #[test]
     fn admission_pressure_waits_before_a_probe_without_resetting_retry_cost() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 1, 2)).unwrap();
-        store.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 1_000).unwrap();
+        store
+            .record_recovery_capacity_pressure(gid(1).as_slice(), 1, 1_000)
+            .unwrap();
         let original = store.recovery_revision_fence().unwrap();
-        store.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 5_000).unwrap();
+        store
+            .record_recovery_capacity_pressure(gid(1).as_slice(), 1, 5_000)
+            .unwrap();
         assert_eq!(store.recovery_revision_fence().unwrap(), original);
-        store.release_due_recovery_capacity_probes(15_999, 15_000).unwrap();
-        assert!(store.recovery_eligible_revision_fence(false).unwrap().obligations.is_empty());
+        store
+            .release_due_recovery_capacity_probes(15_999, 15_000)
+            .unwrap();
+        assert!(
+            store
+                .recovery_eligible_revision_fence(false)
+                .unwrap()
+                .obligations
+                .is_empty()
+        );
         assert_eq!(store.recovery_retry_state().unwrap().attempt_serial, 0);
-        store.release_due_recovery_capacity_probes(16_000, 15_000).unwrap();
+        store
+            .release_due_recovery_capacity_probes(16_000, 15_000)
+            .unwrap();
         let fence = store.recovery_eligible_revision_fence(false).unwrap();
-        let first = store.reserve_recovery_attempt(&fence, 16_000, 15_000, false).unwrap().unwrap();
-        store.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 16_001).unwrap();
-        store.release_due_recovery_capacity_probes(31_000, 15_000).unwrap();
-        assert!(store.recovery_eligible_revision_fence(false).unwrap().obligations.is_empty());
+        let first = store
+            .reserve_recovery_attempt(&fence, 16_000, 15_000, false)
+            .unwrap()
+            .unwrap();
+        store
+            .record_recovery_capacity_pressure(gid(1).as_slice(), 1, 16_001)
+            .unwrap();
+        store
+            .release_due_recovery_capacity_probes(31_000, 15_000)
+            .unwrap();
+        assert!(
+            store
+                .recovery_eligible_revision_fence(false)
+                .unwrap()
+                .obligations
+                .is_empty()
+        );
         assert_eq!(store.recovery_retry_state().unwrap(), first);
-        store.release_due_recovery_capacity_probes(31_001, 15_000).unwrap();
-        let second = store.reserve_recovery_attempt(&fence, 31_001, 30_000, false).unwrap().unwrap();
+        store
+            .release_due_recovery_capacity_probes(31_001, 15_000)
+            .unwrap();
+        let second = store
+            .reserve_recovery_attempt(&fence, 31_001, 30_000, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(second.ordinal, 2);
         assert_eq!(store.pending_recovery_demands().unwrap().len(), 1);
     }
@@ -459,16 +673,55 @@ mod capacity_tests {
     #[test]
     fn abandoned_waiter_keeps_debt_and_satisfied_waiter_is_reclaimed() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        let ticket = store.request_recovery(RecoveryRequest::ExplicitHistory { operation_id: &[7;16] }, 1).unwrap();
+        let ticket = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[7; 16],
+                },
+                1,
+            )
+            .unwrap();
         let fence = store.recovery_revision_fence().unwrap();
-        let retry = store.reserve_recovery_attempt(&fence, 1, 15_000, true).unwrap().unwrap();
+        let retry = store
+            .reserve_recovery_attempt(&fence, 1, 15_000, true)
+            .unwrap()
+            .unwrap();
         store.restore_recovery_waiters().unwrap();
-        assert_eq!(store.pending_recovery_demands().unwrap()[0].ticket.id, ticket.id);
+        assert_eq!(
+            store.pending_recovery_demands().unwrap()[0].ticket.id,
+            ticket.id
+        );
         assert_eq!(store.recovery_retry_state().unwrap(), retry);
-        assert_eq!(store.lock().unwrap().query_row("SELECT urgency FROM account_recovery_obligations", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
-        store.lock().unwrap().execute("UPDATE account_recovery_obligations SET state=1", []).unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT urgency FROM account_recovery_obligations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE account_recovery_obligations SET state=1", [])
+            .unwrap();
         store.detach_recovery_waiter(ticket).unwrap();
-        assert_eq!(store.lock().unwrap().query_row("SELECT COUNT(*) FROM account_recovery_obligations", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM account_recovery_obligations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
         assert_eq!(store.recovery_retry_state().unwrap(), retry);
     }
 }

@@ -161,18 +161,15 @@ pub(crate) fn delete_group_tx(
     id: &GroupId,
 ) -> StorageResult<usize> {
     let mls_group_key = mls_group_key(id)?;
-    let removed_inventory = tx
-        .execute_cached(
-            "DELETE FROM transport_reconciliation_items
-             WHERE route_kind = 1 AND route_id IN (
+    crate::account_recovery::delete_inventory_tx(
+        tx,
+        "route_kind = 1 AND route_id IN (
                  SELECT transport_group_id
                  FROM cgka_transport_group_routes
                  WHERE group_id = ?1
              )",
-            params![id.as_slice()],
-        )
-        .storage()?;
-    crate::account_recovery::invalidate_inventory_tx(tx, removed_inventory)?;
+        params![id.as_slice()],
+    )?;
     tx.execute_cached(
         "DELETE FROM transport_reconciliation_route_state
              WHERE route_kind = 1 AND route_id IN (

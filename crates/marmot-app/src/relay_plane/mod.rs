@@ -143,8 +143,16 @@ struct AccountDeliveryRoute {
     recovery_marker: Option<AccountDeliveryRecoveryMarker>,
 }
 
-pub(crate) type AccountDeliveryRecoveryMarker =
-    Arc<dyn Fn(storage_sqlite::RecoveryLossCause, u64, u64) -> Result<(), AccountDeliveryRecoveryMarkerError> + Send + Sync + 'static>;
+pub(crate) type AccountDeliveryRecoveryMarker = Arc<
+    dyn Fn(
+            storage_sqlite::RecoveryLossCause,
+            u64,
+            u64,
+        ) -> Result<(), AccountDeliveryRecoveryMarkerError>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountDeliveryRecoveryMarkerError {
@@ -354,20 +362,32 @@ impl AccountDeliveryOverflowState {
             let marker = marker.clone();
             match tokio::task::spawn_blocking(move || {
                 if dropped > 0 {
-                    marker(storage_sqlite::RecoveryLossCause::Queue, marker_token, dropped)?;
+                    marker(
+                        storage_sqlite::RecoveryLossCause::Queue,
+                        marker_token,
+                        dropped,
+                    )?;
                 }
                 if notification_losses > 0 {
-                    marker(storage_sqlite::RecoveryLossCause::NotificationConsumer, marker_token, notification_losses)?;
+                    marker(
+                        storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                        marker_token,
+                        notification_losses,
+                    )?;
                 }
                 Ok(())
-            }).await {
+            })
+            .await
+            {
                 Ok(Ok(())) => {
                     let mut state = self
                         .inner
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if state.generation == generation {
-                        if state.dropped != dropped || state.notification_losses != notification_losses {
+                        if state.dropped != dropped
+                            || state.notification_losses != notification_losses
+                        {
                             continue;
                         }
                         state.marker_in_progress = false;
@@ -459,7 +479,10 @@ impl AccountDeliveryOverflowState {
     }
 
     fn restore_recovery_guard(&self, durable_marker_token: u64) {
-        let mut state = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !state.pending {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
@@ -739,11 +762,15 @@ impl MarmotRelayPlane {
         // slow consumer or blocking the shared router.
         let (delivery_tx, delivery_rx) = mpsc::channel(ACCOUNT_DELIVERY_BUFFER + 1);
         let mut routes = account_deliveries_write(&self.inner.transport.account_deliveries);
-        let delivery_overflow = routes.get(&account_id).map(|route| route.overflow.clone())
-            .unwrap_or_else(|| Arc::new(AccountDeliveryOverflowState {
-                inner: std::sync::Mutex::new(AccountDeliveryOverflowInner::default()),
-                metrics: self.inner.transport.account_delivery_metrics.clone(),
-            }));
+        let delivery_overflow = routes
+            .get(&account_id)
+            .map(|route| route.overflow.clone())
+            .unwrap_or_else(|| {
+                Arc::new(AccountDeliveryOverflowState {
+                    inner: std::sync::Mutex::new(AccountDeliveryOverflowInner::default()),
+                    metrics: self.inner.transport.account_delivery_metrics.clone(),
+                })
+            });
         routes.insert(
             account_id.clone(),
             AccountDeliveryRoute {
@@ -1804,10 +1831,18 @@ fn recover_relay_notification_forwarder(
                 && route.overflow.start_marker_persistence()
             {
                 let overflow = route.overflow.clone();
-                tokio::spawn(async move { overflow.persist_marker_before_drop(marker).await; });
+                tokio::spawn(async move {
+                    overflow.persist_marker_before_drop(marker).await;
+                });
             }
-            let generation = generation.unwrap_or_else(|| route.overflow.inner.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()).generation);
+            let generation = generation.unwrap_or_else(|| {
+                route
+                    .overflow
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .generation
+            });
             {
                 // Receiver closure is the reconnect signal; no queued control
                 // record survives into the replacement receiver.
@@ -2025,7 +2060,11 @@ impl MarmotRelayPlaneAccountAdapter {
             .inner
             .transport
             .adapter
-            .install_group_maintenance_recovery_subscription(&self.account_id, &group, recovery_attempt)
+            .install_group_maintenance_recovery_subscription(
+                &self.account_id,
+                &group,
+                recovery_attempt,
+            )
             .await
     }
 
@@ -2132,7 +2171,8 @@ impl MarmotRelayPlaneAccountAdapter {
     }
 
     pub(crate) fn restore_delivery_overflow_guard(&self, durable_marker_token: u64) {
-        self.delivery_overflow.restore_recovery_guard(durable_marker_token);
+        self.delivery_overflow
+            .restore_recovery_guard(durable_marker_token);
     }
 
     pub(crate) fn record_delivery_overflow_recovery_success(&self, elapsed_ms: u64) {
@@ -2147,11 +2187,13 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
         subscription_id: &str,
     ) -> Result<(), TransportAdapterError> {
-        self.relay_plane.inner.transport.adapter
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
             .remove_group_maintenance_recovery_subscription(&self.account_id, subscription_id)
             .await
     }
-
 }
 
 #[async_trait]

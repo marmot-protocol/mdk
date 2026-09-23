@@ -7,17 +7,17 @@ pub use demand::{
 mod loss;
 mod plan;
 mod stall;
-pub use stall::QualifiedRecoveryStallSample;
 pub use loss::{RecoveryLossCause, RecoveryLossWatermark};
 pub use plan::{
     RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
     RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
 };
+pub use stall::QualifiedRecoveryStallSample;
 
 use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64};
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Durable account-wide pacing, independent of any process's monotonic clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,13 +107,130 @@ fn revision_fence(conn: &Connection) -> StorageResult<RecoveryRevisionFence> {
     })
 }
 
-/// Invalidate coverage atomically with removal of retained inventory. Positive
-/// admissions and idempotent deletes leave this fence unchanged.
-pub(crate) fn invalidate_inventory_tx(conn: &Connection, removed: usize) -> StorageResult<()> {
-    if removed != 0 {
+/// Delete inventory and invalidate only frozen scopes whose route/window (and,
+/// for a known-event predicate, exact event) overlap the removed input. The
+/// account revision still fences reservations and plan installation. Callers
+/// must already own the surrounding transaction. Predicates are internal SQL.
+pub(crate) fn delete_inventory_tx(
+    conn: &Connection,
+    predicate: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+) -> StorageResult<usize> {
+    // This indexed no-op probe never reads the recovery tables. Ordinary live
+    // admission stays independent of the number of retained recovery scopes.
+    if conn
+        .query_row_cached(
+            &format!("SELECT 1 FROM transport_reconciliation_items WHERE {predicate}"),
+            parameters,
+            |_| Ok(()),
+        )
+        .optional()
+        .storage()?
+        .is_none()
+    {
+        return Ok(0);
+    }
+    let removed = conn
+        .prepare_cached(&format!(
+            "DELETE FROM transport_reconciliation_items WHERE {predicate}
+        RETURNING route_kind,route_id,event_id,created_at"
+        ))
+        .storage()?
+        .query_map(parameters, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    let count = removed.len();
+    let mut routes = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (kind, route, event, at) in removed {
+        routes.entry((kind, route)).or_default().push((at, event));
+    }
+    for items in routes.values_mut() {
+        items.sort_unstable();
+    }
+    conn.execute_cached("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1",[]).storage()?;
+    let rows=conn.prepare_cached("SELECT s.obligation_id,s.scope_id,s.scope_format,s.scope_payload,
+        s.route_kind,COALESCE(s.transport_group_id,x''),COALESCE(s.since_seconds,0),s.until_seconds,s.known_event_id,o.predicate
+        FROM account_recovery_scopes s JOIN account_recovery_obligations o ON o.id=s.obligation_id
+        WHERE s.snapshot_state=1 AND o.predicate!=2").storage()?
+        .query_map([],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,Vec<u8>>(3)?,
+            r.get::<_,i64>(4)?,r.get::<_,Vec<u8>>(5)?,r.get::<_,i64>(6)?,r.get::<_,i64>(7)?,r.get::<_,Option<Vec<u8>>>(8)?,r.get::<_,i64>(9)?)))
+        .storage()?.collect::<Result<Vec<_>,_>>().storage()?;
+    let mut affected = std::collections::BTreeSet::new();
+    for (id, scope, format, payload, kind, route, since, until, known, predicate) in rows {
+        let Some(items) = routes.get(&(kind, route)) else {
+            continue;
+        };
+        let lower = items.partition_point(|(at, _)| *at < since);
+        let upper = items.partition_point(|(at, _)| *at <= until);
+        if lower == upper
+            || (predicate == 1
+                && !items[lower..upper]
+                    .iter()
+                    .any(|(_, event)| known.as_ref() == Some(event)))
+        {
+            continue;
+        }
         conn.execute_cached(
-            "UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1", [],
+            "UPDATE account_recovery_scopes SET scope_revision=scope_revision+1,scope_payload=?3
+            WHERE obligation_id=?1 AND scope_id=?2",
+            params![
+                id,
+                scope,
+                plan::invalidate_retained_scope(format, &payload)?
+            ],
+        )
+        .storage()?;
+        affected.insert(id);
+    }
+    for id in affected {
+        reopen_invalidated_obligation_tx(conn, &id)?;
+    }
+    Ok(count)
+}
+
+fn reopen_invalidated_obligation_tx(conn: &Connection, id: &[u8]) -> StorageResult<()> {
+    let (state, predicate) = conn
+        .query_row_cached(
+            "SELECT state,predicate FROM account_recovery_obligations WHERE id=?1",
+            [id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .storage()?;
+    if state == 1 && !plan::retained_predicate_qualifies(conn, id, predicate)? {
+        conn.execute_cached("UPDATE account_recovery_obligations SET state=0,eligibility=1,revision=revision+1 WHERE id=?1",[id]).storage()?;
+    }
+    Ok(())
+}
+
+/// Released receipt journals may outlive their inventory rows and contain no
+/// trustworthy route/time bound. Keep conservative invalidation for that case.
+/// Maintenance's observed session boundary is independent of retained inventory.
+pub(crate) fn invalidate_inventory_tx(conn: &Connection) -> StorageResult<()> {
+    let rows = conn.prepare_cached(
+        "SELECT s.obligation_id,s.scope_id,s.scope_format,s.scope_payload FROM account_recovery_scopes s
+         JOIN account_recovery_obligations o ON o.id=s.obligation_id WHERE s.snapshot_state=1 AND o.predicate!=2",
+    ).storage()?.query_map([], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?,
+        row.get::<_,i64>(2)?,row.get::<_,Vec<u8>>(3)?))).storage()?
+        .collect::<Result<Vec<_>,_>>().storage()?;
+    conn.execute_cached("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1",[]).storage()?;
+    let mut affected = std::collections::BTreeSet::new();
+    for (id, scope, format, payload) in rows {
+        conn.execute_cached(
+            "UPDATE account_recovery_scopes SET scope_revision=scope_revision+1,scope_payload=?3 WHERE obligation_id=?1 AND scope_id=?2",
+            params![id,scope,plan::invalidate_retained_scope(format,&payload)?],
         ).storage()?;
+        affected.insert(id);
+    }
+    for id in affected {
+        reopen_invalidated_obligation_tx(conn, &id)?;
     }
     Ok(())
 }
@@ -174,8 +291,9 @@ fn join_epoch_tx(
     Ok(())
 }
 
-/// Only a serialized worker observation chooses the current plane token.
-/// Random token values and callback write timestamps do not order generations.
+/// A serialized worker observation chooses the current live plane token.
+/// Imports also replace the compatibility pointer to fence an older clear;
+/// random tokens do not order generations and each retains its own watermark.
 pub(crate) fn arm_overflow_tx(
     conn: &Connection,
     label: &str,
@@ -184,10 +302,10 @@ pub(crate) fn arm_overflow_tx(
     now: i64,
 ) -> StorageResult<()> {
     // Import may have joined this generation before its queued control record
-    // reaches the worker. Adopting that already-covered identity is metadata,
-    // not another loss observation or permission to reset quiescence.
+    // reaches the worker. Changing the represented identity must fence old
+    // grants even though it grants no permission to reset quiescence.
     let adopted = conn.execute_cached(
-        "UPDATE account_recovery_obligations SET marker_token = ?2,
+        "UPDATE account_recovery_obligations SET marker_token = ?2, revision = revision + 1, state = 0,
              dropped_count = (SELECT imported_count FROM account_delivery_loss_evidence
                  WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2),
              pending_since = (SELECT pending_since FROM account_delivery_loss_evidence
@@ -199,6 +317,12 @@ pub(crate) fn arm_overflow_tx(
     ).storage()?;
     if adopted == 0 {
         join_loss_tx(conn, label, 0, token, dropped, now, true)?;
+    } else {
+        conn.execute_cached(
+            "UPDATE account_recovery_state SET loss_revision=loss_revision+1 WHERE singleton=1",
+            [],
+        )
+        .storage()?;
     }
     // Preserve what the worker already observed, even when this token's marker
     // callback has not committed yet. A delayed duplicate cannot rearm debt.
@@ -263,15 +387,58 @@ fn join_loss_tx(
     Ok(())
 }
 
+/// Token-only legacy retirement cannot certify other generations joined into
+/// the same account demand. Reconstitute those generations in this transaction;
+/// their imported watermark remains distinct from low-level retirement.
+pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageResult<bool> {
+    let rows = conn
+        .prepare_cached(
+            "SELECT marker_token,pending_since,dropped_count FROM account_delivery_loss_evidence
+         WHERE account_label=?1 AND cause=0
+           AND (legacy_retired_count IS NULL OR dropped_count>legacy_retired_count)
+         ORDER BY marker_token",
+        )
+        .storage()?
+        .query_map([label], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    for (token, since, dropped) in &rows {
+        join_loss_tx(conn, label, 0, *token, *dropped, *since, true)?;
+        conn.execute_cached(
+            "UPDATE account_delivery_loss_evidence SET imported_count=dropped_count
+            WHERE account_label=?1 AND cause=0 AND marker_token=?2",
+            params![label, token],
+        )
+        .storage()?;
+    }
+    Ok(!rows.is_empty())
+}
+
 /// Selection may cover a subset. Additional unrelated obligations do not
 /// invalidate it; account-wide loss/route/inventory fences remain conservative.
 fn selected_fence_matches(
     current: &RecoveryRevisionFence,
     selected: &RecoveryRevisionFence,
 ) -> bool {
+    current.inventory_revision == selected.inventory_revision
+        && selected_completion_fence_matches(current, selected)
+}
+
+// Installed scopes carry their own inventory invalidation tokens. Global
+// inventory churn still fences installing a plan, but not unrelated completion.
+fn selected_completion_fence_matches(
+    current: &RecoveryRevisionFence,
+    selected: &RecoveryRevisionFence,
+) -> bool {
     current.loss_revision == selected.loss_revision
         && current.route_revision == selected.route_revision
-        && current.inventory_revision == selected.inventory_revision
         && !selected.obligations.is_empty()
         && selected
             .obligations
@@ -370,6 +537,7 @@ impl SqliteAccountStorage {
             {
                 return Ok(None);
             }
+            let mut eligible = true;
             for (id, _) in &expected.obligations {
                 let unknown_format: bool = conn.query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM account_recovery_scopes
@@ -379,13 +547,13 @@ impl SqliteAccountStorage {
                 if unknown_format {
                     return Err(StorageError::Serialization("unsupported recovery scope format".into()));
                 }
-                let eligible: bool = conn.query_row_cached(
+                eligible &= conn.query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
                      WHERE id = ?1 AND state = 0 AND (eligibility IN (0, 1) OR ?2))",
                     params![id.as_slice(), explicit_override], |row| row.get::<_, bool>(0),
                 ).storage()?;
-                if !eligible { return Ok(None); }
             }
+            if !eligible { return Ok(None); }
             conn.execute_cached(
                 "UPDATE account_recovery_state SET next_attempt = next_attempt + 1,
                  retry_ordinal = retry_ordinal + 1, retry_recorded_at_ms = ?1,
@@ -413,7 +581,9 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let prior = retry_state(&conn)?;
-            if attempt_serial == 0 || prior.attempt_serial != attempt_serial || prior.ordinal <= 1
+            if attempt_serial == 0
+                || prior.attempt_serial != attempt_serial
+                || prior.ordinal <= 1
                 || !selected_fence_matches(&revision_fence(&conn)?, expected)
                 || !plan::no_unimported_loss(&conn)?
             {
@@ -488,7 +658,7 @@ impl SqliteAccountStorage {
             ).storage()?.query_map([label], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)))
                 .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
             for (cause, token, observed_at, dropped) in rows {
-                join_loss_tx(&conn, label, cause, token, dropped, observed_at, false)?;
+                join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
                 conn.execute_cached(
                     "UPDATE account_delivery_loss_evidence SET imported_count = ?3
                      WHERE account_label = ?1 AND cause = ?4 AND marker_token = ?2",
@@ -527,6 +697,178 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store.ensure_account_projection("alice").unwrap();
         store
+    }
+
+    #[test]
+    fn review_legacy_clear_preserves_each_generation_across_reopen() {
+        for (old, newer) in [(10, 90), (90, 10)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("loss.sqlite");
+            let key = SqlCipherKey::new("generation retirement test").unwrap();
+            {
+                let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+                store.ensure_account_projection("alice").unwrap();
+                store
+                    .mark_account_delivery_recovery("alice", old, 2)
+                    .unwrap();
+                store
+                    .record_account_delivery_loss("alice", newer, 15, 10)
+                    .unwrap();
+                store.synchronize_account_delivery_loss("alice").unwrap();
+                assert!(!store.clear_account_delivery_recovery("alice", old).unwrap());
+            }
+            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            store.synchronize_account_delivery_loss("alice").unwrap();
+            let pending = store.account_delivery_recovery("alice").unwrap().unwrap();
+            assert_eq!((pending.marker_token, pending.dropped_count), (newer, 15));
+            // A low-level retirement covers only its token, never all joined loss.
+            assert!(
+                !store
+                    .clear_account_delivery_recovery("alice", newer)
+                    .unwrap()
+            );
+            assert_eq!(
+                store
+                    .account_delivery_recovery("alice")
+                    .unwrap()
+                    .unwrap()
+                    .marker_token,
+                old
+            );
+            assert!(store.clear_account_delivery_recovery("alice", old).unwrap());
+            assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+            store
+                .record_account_delivery_loss("alice", newer, 15, 11)
+                .unwrap();
+            store.synchronize_account_delivery_loss("alice").unwrap();
+            assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+            store
+                .record_account_delivery_loss("alice", newer, 16, 12)
+                .unwrap();
+            store.synchronize_account_delivery_loss("alice").unwrap();
+            assert_eq!(
+                store
+                    .account_delivery_recovery("alice")
+                    .unwrap()
+                    .unwrap()
+                    .dropped_count,
+                16
+            );
+        }
+    }
+
+    #[test]
+    fn review_legacy_clear_rollback_preserves_retirement_and_pending_loss() {
+        let store = fixture();
+        store
+            .mark_account_delivery_recovery("alice", 10, 2)
+            .unwrap();
+        store
+            .record_account_delivery_loss("alice", 90, 15, 10)
+            .unwrap();
+        store.synchronize_account_delivery_loss("alice").unwrap();
+        let before = store.recovery_revision_fence().unwrap();
+        store.lock().unwrap().execute_batch("CREATE TRIGGER reject_rejoin BEFORE INSERT ON account_recovery_obligations BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        assert!(store.clear_account_delivery_recovery("alice", 90).is_err());
+        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        assert_eq!(
+            store
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .unwrap()
+                .marker_token,
+            90
+        );
+        assert!(store.lock().unwrap().query_row("SELECT legacy_retired_count IS NULL FROM account_delivery_loss_evidence WHERE marker_token=90",[],|r|r.get::<_,bool>(0)).unwrap());
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_rejoin")
+            .unwrap();
+        assert!(!store.clear_account_delivery_recovery("alice", 90).unwrap());
+        assert!(store.clear_account_delivery_recovery("alice", 10).unwrap());
+    }
+
+    #[test]
+    fn review_adoption_fences_prior_generation_without_resetting_quiescence() {
+        let store = fixture();
+        store
+            .mark_account_delivery_recovery("alice", 20, 4)
+            .unwrap();
+        store
+            .mark_account_delivery_recovery("alice", 10, 6)
+            .unwrap();
+        store
+            .mark_account_delivery_recovery("alice", 20, 4)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE account_recovery_obligations SET eligibility=3")
+            .unwrap();
+        let before = store.recovery_revision_fence().unwrap();
+        let retry = store.recovery_retry_state().unwrap();
+        store
+            .mark_account_delivery_recovery("alice", 10, 6)
+            .unwrap();
+        let after = store.recovery_revision_fence().unwrap();
+        assert!(after.loss_revision > before.loss_revision);
+        assert!(after.obligations[0].1 > before.obligations[0].1);
+        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT eligibility FROM account_recovery_obligations",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        assert!(
+            store
+                .reserve_recovery_attempt(&before, 1000, 15000, true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn review_mixed_selection_cannot_reserve_for_quiescent_demand() {
+        let store = fixture();
+        store.mark_account_delivery_recovery("alice", 1, 4).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE account_recovery_obligations SET eligibility=3;
+            INSERT INTO cgka_groups(id,epoch,record) VALUES(x'01',7,x'00')",
+            )
+            .unwrap();
+        store
+            .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: "01".into(),
+                stalled_epoch: 7,
+            }])
+            .unwrap();
+        let fence = store.recovery_revision_fence().unwrap();
+        let retry = store.recovery_retry_state().unwrap();
+        assert_eq!(fence.obligations.len(), 2);
+        assert!(
+            store
+                .reserve_recovery_attempt(&fence, 1000, 15000, false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert!(
+            store
+                .reserve_recovery_attempt(&fence, 1000, 15000, true)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -638,8 +980,9 @@ mod tests {
             10
         );
         assert_eq!(store.recovery_revision_fence().unwrap(), current);
-        // A previously unobserved token has no trustworthy generation ordering.
-        // Join its uncertainty conservatively, without replacing the current token.
+        // A newly imported token must replace the compatibility pointer so an
+        // older token-only clear fails. Its numerical value is not an ordering;
+        // all generations retain separate evidence and retirement watermarks.
         store
             .record_account_delivery_loss("alice", 80, 3, 30)
             .unwrap();
@@ -650,7 +993,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .marker_token,
-            10
+            80
         );
         assert!(store.recovery_revision_fence().unwrap().loss_revision > current.loss_revision);
     }
@@ -776,7 +1119,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute_batch(
-                "INSERT INTO cgka_released_transport_receipts VALUES (x'02', x'01', 7);
+                "INSERT INTO cgka_released_transport_receipts(id,group_id,epoch) VALUES (x'02', x'01', 7);
              CREATE TRIGGER fail_release_ack BEFORE DELETE ON cgka_released_transport_receipts
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )

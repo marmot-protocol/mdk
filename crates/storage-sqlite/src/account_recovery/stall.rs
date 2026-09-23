@@ -119,8 +119,8 @@ impl SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cgka_traits::storage::GroupStorage;
     use crate::storage::test_support::{gid, sample_group};
+    use cgka_traits::storage::GroupStorage;
 
     fn fixture() -> SqliteAccountStorage {
         let store = SqliteAccountStorage::in_memory().unwrap();
@@ -131,57 +131,134 @@ mod tests {
     fn seed(store: &SqliteAccountStorage) {
         store.ensure_account_projection("alice").unwrap();
         store.put_group(&sample_group(gid(1), 1, 2)).unwrap();
-        store.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-            group_id_hex: hex::encode(gid(1).as_slice()), stalled_epoch: 1,
-        }]).unwrap();
-        store.record_epoch_stall_evidence(&[crate::StoredEpochStallEvidence {
-            group_id_hex: hex::encode(gid(1).as_slice()), stalled_epoch: 1,
-            fruitless_completions: 2, fruitless_reported: false, last_arm_at_ms: 1,
-        }]).unwrap();
+        store
+            .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(gid(1).as_slice()),
+                stalled_epoch: 1,
+            }])
+            .unwrap();
+        store
+            .record_epoch_stall_evidence(&[crate::StoredEpochStallEvidence {
+                group_id_hex: hex::encode(gid(1).as_slice()),
+                stalled_epoch: 1,
+                fruitless_completions: 2,
+                fruitless_reported: false,
+                last_arm_at_ms: 1,
+            }])
+            .unwrap();
     }
 
     fn qualify(store: &SqliteAccountStorage) {
         let fence = store.recovery_revision_fence().unwrap();
-        let attempt = store.reserve_recovery_attempt(&fence, 1, 15_000, true).unwrap().unwrap();
+        let attempt = store
+            .reserve_recovery_attempt(&fence, 1, 15_000, true)
+            .unwrap()
+            .unwrap();
         let id = fence.obligations[0].0;
         let goal = RecoveryScopePlan {
-            scope_id: 0, route_kind: 1, route_role: 0, group_id: Some(gid(1).as_slice().to_vec()),
-            transport_group_id: Some([3;32]), since_seconds: None, until_seconds: 100,
-            known_event_id: None, inventory_floor: Some(1),
-            required_endpoints: vec!["relay".into()], admitted_endpoints: vec!["relay".into()],
+            scope_id: 0,
+            route_kind: 1,
+            route_role: 0,
+            group_id: Some(gid(1).as_slice().to_vec()),
+            transport_group_id: Some([3; 32]),
+            since_seconds: None,
+            until_seconds: 100,
+            known_event_id: None,
+            inventory_floor: Some(1),
+            required_endpoints: vec!["relay".into()],
+            admitted_endpoints: vec!["relay".into()],
         };
-        let token = store.install_recovery_scope_plan(&fence, attempt.attempt_serial, id, &[goal]).unwrap().unwrap().remove(0);
-        assert!(store.checkpoint_recovery_obligation(&fence, attempt.attempt_serial, id, &[RecoveryScopeCheckpoint {
-            token, retained_known_event: false,
-            endpoints: vec![RecoveryEndpointCheckpoint { endpoint: "relay".into(), outcome: RecoveryScopeOutcome::Covered,
-                exhaustive: true, admission_complete: true, first_boundary: false }],
-        }], RecoveryEligibility::Retry).unwrap());
+        let token = store
+            .install_recovery_scope_plan(&fence, attempt.attempt_serial, id, &[goal])
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        assert!(
+            store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt.attempt_serial,
+                    id,
+                    &[RecoveryScopeCheckpoint {
+                        token,
+                        retained_known_event: false,
+                        endpoints: vec![RecoveryEndpointCheckpoint {
+                            endpoint: "relay".into(),
+                            outcome: RecoveryScopeOutcome::Covered,
+                            exhaustive: true,
+                            admission_complete: true,
+                            first_boundary: false
+                        }],
+                    }],
+                    RecoveryEligibility::Retry
+                )
+                .unwrap()
+        );
     }
 
     fn observe(store: &SqliteAccountStorage, time: u64) -> Option<QualifiedRecoveryStallSample> {
         let revision = store.next_recovery_engine_observation().unwrap();
-        store.sample_qualified_recovery_stall(gid(1).as_slice(), 1, revision, time, 3_600_000, 3).unwrap()
+        store
+            .sample_qualified_recovery_stall(gid(1).as_slice(), 1, revision, time, 3_600_000, 3)
+            .unwrap()
     }
 
     #[test]
     fn qualified_stall_needs_three_distinct_paced_evaluations_without_replay() {
         let store = fixture();
-        assert!(observe(&store, 1).is_none(), "legacy EOSE evidence and an evaluation do not prove coverage");
+        assert!(
+            observe(&store, 1).is_none(),
+            "legacy EOSE evidence and an evaluation do not prove coverage"
+        );
         qualify(&store);
         let first = observe(&store, 1).unwrap();
-        assert_eq!(first.evidence.fruitless_completions, 1, "legacy unqualified samples are not carried forward");
+        assert_eq!(
+            first.evidence.fruitless_completions, 1,
+            "legacy unqualified samples are not carried forward"
+        );
         assert!(!first.escalated);
         let too_early = store.next_recovery_engine_observation().unwrap();
-        assert!(store.sample_qualified_recovery_stall(gid(1).as_slice(), 1, too_early, 2, 3_600_000, 3).unwrap().is_none());
-        assert!(store.sample_qualified_recovery_stall(gid(1).as_slice(), 1, too_early, 3_600_001, 3_600_000, 3).unwrap().is_none(), "polling the same observation after the interval is not new evidence");
-        assert_eq!(observe(&store, 3_600_001).unwrap().evidence.fruitless_completions, 2);
+        assert!(
+            store
+                .sample_qualified_recovery_stall(gid(1).as_slice(), 1, too_early, 2, 3_600_000, 3)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .sample_qualified_recovery_stall(
+                    gid(1).as_slice(),
+                    1,
+                    too_early,
+                    3_600_001,
+                    3_600_000,
+                    3
+                )
+                .unwrap()
+                .is_none(),
+            "polling the same observation after the interval is not new evidence"
+        );
+        assert_eq!(
+            observe(&store, 3_600_001)
+                .unwrap()
+                .evidence
+                .fruitless_completions,
+            2
+        );
         let third = observe(&store, 7_200_001).unwrap();
         assert!(third.escalated && third.warning_changed);
         assert!(store.automatic_recovery_failed(&gid(1)).unwrap());
         assert!(!observe(&store, 10_800_001).unwrap().escalated);
-        assert_eq!(store.recovery_retry_state().unwrap().attempt_serial, 1, "local observations never purchase replay");
+        assert_eq!(
+            store.recovery_retry_state().unwrap().attempt_serial,
+            1,
+            "local observations never purchase replay"
+        );
         store.clear_recovery_failure(&gid(1)).unwrap();
-        assert!(observe(&store, 14_400_001).is_none(), "authenticated recovery retires detector certificates");
+        assert!(
+            observe(&store, 14_400_001).is_none(),
+            "authenticated recovery retires detector certificates"
+        );
     }
 
     #[test]
@@ -191,9 +268,15 @@ mod tests {
             qualify(&store);
             assert!(observe(&store, 1).is_some());
             match invalidation {
-                0 => store.record_account_delivery_loss("alice", 77, 1, 1).unwrap(),
-                1 => { store.observe_recovery_route_snapshot([7;32]).unwrap(); },
-                _ => { store.lock().unwrap().execute("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1", []).unwrap(); },
+                0 => store
+                    .record_account_delivery_loss("alice", 77, 1, 1)
+                    .unwrap(),
+                1 => {
+                    store.observe_recovery_route_snapshot([7; 32]).unwrap();
+                }
+                _ => {
+                    store.lock().unwrap().execute("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1", []).unwrap();
+                }
             }
             assert!(observe(&store, 3_600_001).is_none());
             assert!(!store.automatic_recovery_failed(&gid(1)).unwrap());
@@ -207,14 +290,63 @@ mod tests {
         assert!(observe(&store, 5_000_000).is_some());
         assert!(observe(&store, 1_000).is_none());
         assert!(observe(&store, 3_600_999).is_none());
-        assert_eq!(observe(&store, 3_601_000).unwrap().evidence.fruitless_completions, 2);
+        assert_eq!(
+            observe(&store, 3_601_000)
+                .unwrap()
+                .evidence
+                .fruitless_completions,
+            2
+        );
         store.lock().unwrap().execute_batch("CREATE TRIGGER fail_sample BEFORE INSERT ON app_group_recovery_failures BEGIN SELECT RAISE(FAIL, 'sample failure'); END;").unwrap();
         let revision = store.next_recovery_engine_observation().unwrap();
-        assert!(store.sample_qualified_recovery_stall(gid(1).as_slice(), 1, revision, 7_201_000, 3_600_000, 3).is_err());
-        assert_eq!(store.epoch_stall_evidence().unwrap()[0].fruitless_completions, 2);
-        store.lock().unwrap().execute_batch("DROP TRIGGER fail_sample").unwrap();
-        assert!(store.sample_qualified_recovery_stall(gid(1).as_slice(), 1, revision, 7_201_000, 3_600_000, 3).unwrap().unwrap().escalated);
-        assert!(store.sample_qualified_recovery_stall(gid(1).as_slice(), 1, revision, 10_801_000, 3_600_000, 3).unwrap().is_none());
+        assert!(
+            store
+                .sample_qualified_recovery_stall(
+                    gid(1).as_slice(),
+                    1,
+                    revision,
+                    7_201_000,
+                    3_600_000,
+                    3
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.epoch_stall_evidence().unwrap()[0].fruitless_completions,
+            2
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_sample")
+            .unwrap();
+        assert!(
+            store
+                .sample_qualified_recovery_stall(
+                    gid(1).as_slice(),
+                    1,
+                    revision,
+                    7_201_000,
+                    3_600_000,
+                    3
+                )
+                .unwrap()
+                .unwrap()
+                .escalated
+        );
+        assert!(
+            store
+                .sample_qualified_recovery_stall(
+                    gid(1).as_slice(),
+                    1,
+                    revision,
+                    10_801_000,
+                    3_600_000,
+                    3
+                )
+                .unwrap()
+                .is_none()
+        );
     }
     #[test]
     fn qualified_stall_certificate_and_interval_survive_reopen() {
@@ -226,15 +358,44 @@ mod tests {
             seed(&store);
             qualify(&store);
             let observation = store.next_recovery_engine_observation().unwrap();
-            assert!(store.sample_qualified_recovery_stall(gid(1).as_slice(), 1, observation, 1, 3_600_000, 3).unwrap().is_some());
+            assert!(
+                store
+                    .sample_qualified_recovery_stall(
+                        gid(1).as_slice(),
+                        1,
+                        observation,
+                        1,
+                        3_600_000,
+                        3
+                    )
+                    .unwrap()
+                    .is_some()
+            );
             store.close().unwrap();
             observation
         };
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert!(reopened.sample_qualified_recovery_stall(gid(1).as_slice(), 1, observation, 3_600_001, 3_600_000, 3).unwrap().is_none());
+        assert!(
+            reopened
+                .sample_qualified_recovery_stall(
+                    gid(1).as_slice(),
+                    1,
+                    observation,
+                    3_600_001,
+                    3_600_000,
+                    3
+                )
+                .unwrap()
+                .is_none()
+        );
         assert!(observe(&reopened, 3_600_000).is_none());
-        assert_eq!(observe(&reopened, 3_600_001).unwrap().evidence.fruitless_completions, 2);
+        assert_eq!(
+            observe(&reopened, 3_600_001)
+                .unwrap()
+                .evidence
+                .fruitless_completions,
+            2
+        );
         assert_eq!(reopened.recovery_retry_state().unwrap().attempt_serial, 1);
     }
-
 }
