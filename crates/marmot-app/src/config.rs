@@ -78,8 +78,20 @@ impl Default for AttachmentAcquisitionPolicy {
     }
 }
 
+/// Same-schema recovery rollback. Both modes share the durable owner, retry
+/// reservation and completion rules. Changing mode requires a new account client.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecoveryExecutorMode {
+    #[default]
+    Normal,
+    /// Select one obligation per broad acquisition grant. The executor,
+    /// comparison, account pacing and qualified completion rules are unchanged.
+    Conservative,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
+    pub recovery_executor_mode: RecoveryExecutorMode,
     /// Optional public client label for newly prepared KeyPackage events.
     /// None leaves publications untagged; signed retries retain their original tags.
     pub key_package_client_name: Option<String>,
@@ -264,6 +276,7 @@ pub struct MarmotServiceEndpoints {
 impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
+            recovery_executor_mode: RecoveryExecutorMode::Normal,
             key_package_client_name: None,
             attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
             attachment_acquisition_mode: AttachmentAcquisitionMode::default(),

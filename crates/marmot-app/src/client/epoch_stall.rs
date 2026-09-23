@@ -29,37 +29,22 @@
 //! [`EpochStallDetector::observe_epoch_passage`] must stay a *delayed* reset and
 //! not no reset at all.
 //!
-//! A group whose reported epoch never moves at all is the one shape that rule
-//! cannot report, because every arm after the first needs that epoch to change
-//! and the missing commit is the only thing that would change it. That group
-//! gets a second rule, on a second kind of evidence. Its same-epoch re-arms are
-//! paced on a wall clock
-//! ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) — each one buys another
-//! full-history replay, because a replay is the only thing that can learn
-//! anything new — and it escalates once
-//! [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`] of those replays have come
-//! back end-of-stored-events confirmed and empty
-//! ([`EpochStallDetector::observe_fruitless_completion`]). Counting the relays'
-//! verdicts rather than the arms is what keeps the minted-traffic property
-//! below: garbage can pace attempts, it cannot forge a relay's confirmation
-//! that it served everything it had.
+//! At a frozen epoch, elapsed time can request reassessment but cannot buy
+//! another replay or count evidence. The account owner authorizes acquisition.
+//! Storage counts distinct paced local evaluations only under qualified scope
+//! coverage and durable admission. EOSE alone cannot provide that proof. The
+//! detector restores the resulting current certificate projection; reorgs do
+//! not erase same-epoch evidence, and authenticated recovery retires it.
 //!
 //! Runs are bounded in wall-clock too. Nothing else ends a quiet group's run,
 //! so two arms more than [`EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS`] apart are
 //! two runs, not one — an unrelated stall weeks after a single arm starts fresh
 //! rather than landing as arm two of something long dead.
 //!
-//! The arm run is process-local, like the stall counts it extends. The
-//! frozen-epoch evidence is not: a group with nothing to re-arm on but the
-//! clock earns at most one confirmed fruitless replay per pacing interval, so a
-//! device restarted more often than that would never reach the threshold at
-//! all. (A group whose replay keeps *refusing* its history re-arms off those
-//! refusals instead, unpaced, and reaches the threshold faster.) That evidence
-//! and the
-//! wall-clock mark of the last arm are persisted per group and restored at
-//! account open ([`EpochStallDetector::restore_wedge_evidence`]). Wall-clock
-//! deliberately: the counter survives a restart, but the restart never becomes
-//! the re-arm clock.
+//! Arm-run detection remains process-local. Qualified frozen-epoch counts and
+//! observation marks are durable, so restart neither erases evidence nor earns
+//! credit. Resource refusal preserves debt and enters owner-paced capacity
+//! handling; it cannot count a qualified completion or clear a retry deadline.
 //! `sync_with_partial_progress` moves a one-shot escalation into either its
 //! success summary or its failure prefix before the managed runtime can rebuild
 //! the client. The compatibility `sync()` API instead leaves it stashed after
@@ -87,8 +72,7 @@ use std::collections::{HashMap, HashSet};
 
 use cgka_traits::ingest::{DeferralLineage, IngestOutcome};
 use cgka_traits::{EpochId, GroupId};
-use marmot_forensics::{EpochBackfillDeferredReason, EpochStallBackfillTrigger};
-use rand::RngCore;
+use marmot_forensics::EpochStallBackfillTrigger;
 
 /// Distinct undecryptable messages a group may accumulate at one stalled epoch
 /// before the runtime reads it as stuck and triggers an epoch-gap backfill.
@@ -135,7 +119,7 @@ pub(crate) const EPOCH_STALL_BACKFILL_THRESHOLD: usize = 8;
 /// raw transport id, so a flood costs a sender nothing), and a saturated cap
 /// answers `ResourceRefused` to the account-wide replay's own fetch for the
 /// group too. That refusal lands in the drain's refused set, so
-/// [`EpochStallDetector::rearm_refused_groups`] clears the very latch the arm
+/// `clear_suppression_for_test` (historical test fixture) clears the very latch the arm
 /// just set, and the next refusal takes the counted
 /// [`GroupStall::arm`] branch instead of the paced one. A flood therefore walks
 /// a group to this threshold in a run of retry backoffs rather than a run of
@@ -206,33 +190,15 @@ pub(crate) const EPOCH_STALL_WEDGE_REARM_INTERVAL_MS: u64 = 60 * 60 * 1_000;
 /// compile-time `const` assertion beside these constants.
 pub(crate) const EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 
-/// Replay completions that reached end-of-stored-events and recovered nothing,
-/// at one stalled epoch, before the runtime reports the group as beyond what
-/// full-history replay can repair.
-///
-/// This is the escalation rule for a group whose epoch never moves, and it
-/// counts *evidence*, not attempts. A completion counts only when the relays
-/// confirmed they had served the account's stored history
-/// (`EpochBackfillCompletionKind::EndOfStoredEvents`) and the replay still
-/// recovered nothing for the group (`AppClient::replay_recovered_something`).
-/// That second check is account-wide, not per group: one kept delivery, or one
-/// tracked group advancing anywhere in that replay, suppresses the count for
-/// every group the replay was armed for. So the evidence this threshold
-/// accumulates is conservative by construction — a busy account raises the bar
-/// for reporting any of its groups, which delays a report rather than
-/// inventing one.
-/// A drain that gave up unconfirmed proves only that the drain gave up, and the
-/// legacy `quiescence_fallback` completion is a deliberately weaker claim — so
-/// neither counts. That restriction is what preserves the property
-/// [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] relies on: minted undecryptable
-/// traffic can pace re-arms, but it cannot manufacture a relay's confirmation
-/// that the history it asked for was served in full and held nothing.
-///
-/// Three, matching [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] and for the same
-/// reason: two escalates a single unlucky follow-up, four costs another whole
-/// pacing interval. Safety is structural on both sides in the same way —
-/// escalation only *reports*, and the count is monotone while the group stays
-/// wedged, so being wrong high delays the report rather than losing it.
+/// Distinct paced local evaluations under still-qualified historical scope
+/// coverage and durable admission before reporting a blocked/unknown engine.
+/// The historical symbol and stored counter names remain stable, but EOSE,
+/// timer ticks, unreadable ciphertext and repeated observation IDs do not count.
+/// Storage validates the current group epoch, loss/route/scope fences and sample
+/// interval in the same transaction as its one-shot warning. Three preserves the
+/// existing reporting threshold; it changes neither branch choice nor recovery
+/// authority. A later interval may count another actual local evaluation without
+/// requiring another blanket history replay.
 pub(crate) const EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD: u32 = 3;
 
 /// The invariant the two wall-clock constants above are chosen under, checked
@@ -265,6 +231,8 @@ pub(crate) enum BackfillDecision {
     /// Nothing to do: the group has not (yet) crossed its stall threshold, or a
     /// backfill for this stalled epoch was already signalled.
     Skip,
+    /// Reevaluate eligible local convergence; this does not purchase history.
+    Reassess,
     /// Arm one account-wide full-history backfill.
     Arm,
     /// Arm, and report that repeated arming is not recovering this group:
@@ -276,33 +244,15 @@ pub(crate) enum BackfillDecision {
 impl BackfillDecision {
     /// Whether this decision arms a full-history backfill.
     pub(crate) fn arms_backfill(self) -> bool {
-        !matches!(self, Self::Skip)
+        matches!(self, Self::Arm | Self::ArmAndEscalate { .. })
     }
 }
 
 /// Which trigger a stall-arming ingest outcome records on its durable armed row.
 ///
-/// **The chosen semantics for a fork-side deferral: it counts, it arms, and it
-/// says so.** A deferral whose group's stored commit graph is contested is
-/// evidence of being stuck exactly as any other undecryptable is, and it is fed
-/// to the detector unchanged — suppressing it would cost more than the wasted
-/// replay it saves. The detector's frozen-device escalation is gated on having
-/// armed at the epoch the evidence was gathered at
-/// ([`GroupStall::observe_fruitless_completion`]), so a group whose deferrals
-/// did not arm can never report at all — and a forked group that never resolves
-/// is precisely the wedge that most needs reporting. What changes is the label,
-/// not the decision: the armed row names the fork, so an incident that keeps
-/// arming under [`EpochStallBackfillTrigger::ContestedForkDeferral`] reads as a
-/// fork to adjudicate rather than a device to re-sync. That costs the
-/// escalation none of its #1590 properties — the evidence behind a report is
-/// still the relays' own end-of-stored-events verdict, and the label is derived
-/// from retained authenticated commits, so it cannot be minted by publishing
-/// undecryptable envelopes.
-///
-/// Routing the group to convergence, which is what actually recovers it, needs
-/// nothing here: the engine schedules a group for convergence on the same seam
-/// that defers the object, and the app absorbs that through
-/// `effects.pending_convergence` on the very same delivery.
+/// A contested fork is an authenticated lineage classification, not a missing
+/// input diagnosis. The client schedules eligible local convergence and preserves
+/// independent history debt; the label itself grants no acquisition authority.
 pub(crate) fn backfill_trigger_for(outcome: &IngestOutcome) -> EpochStallBackfillTrigger {
     match outcome {
         IngestOutcome::TransportDeferred {
@@ -354,10 +304,8 @@ struct GroupStall {
     /// ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) and bounds a run in time
     /// ([`EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS`]).
     last_arm_at_ms: Option<u64>,
-    /// End-of-stored-events replay completions that recovered nothing while
-    /// this group sat at `epoch`. Per-epoch like `undecryptable`, because the
-    /// question it answers is "how many times have the relays confirmed they
-    /// have nothing that moves this device off *this* epoch".
+    /// Current durable qualified local-observation count at this epoch. Only
+    /// storage produces these samples; the detector restores the projection.
     fruitless_completions: u32,
 }
 
@@ -548,8 +496,8 @@ impl GroupStall {
     ///
     /// Second, and this is the half that has to hold by construction rather
     /// than by argument: the report a wedged group actually depends on is the
-    /// frozen-epoch one, escalated from the relays' own end-of-stored-events
-    /// verdict ([`Self::observe_fruitless_completion`]), and this method does
+    /// frozen-epoch one, escalated from storage-qualified scope coverage
+    /// and distinct local evaluations, and this method does
     /// not touch its evidence. So no reorg cadence, however dense, can silence
     /// a wedge report — it can only stop the arm *count* from being the thing
     /// that raises it.
@@ -593,10 +541,8 @@ impl GroupStall {
     /// reaches this path is attacker-mintable, so letting a paced re-arm count
     /// toward [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] would hand minted
     /// traffic an escalation for the price of waiting — exactly the property
-    /// that threshold's doc claims it does not have. What the re-arm is allowed
-    /// to do instead is run one more full-history replay, and the relays'
-    /// verdict on that replay is the evidence that escalates
-    /// ([`EpochStallDetector::observe_fruitless_completion`]).
+    /// that threshold's doc claims it does not have. This returns Reassess;
+    /// it cannot authorize network work or count a qualified local sample.
     ///
     /// It expires a stale run exactly as [`Self::arm`] does. Pacing keeps
     /// consecutive re-arms an interval apart, which is well inside
@@ -608,7 +554,7 @@ impl GroupStall {
     fn rearm_wedged(&mut self, now_ms: u64) -> BackfillDecision {
         self.expire_run_if_stale(now_ms);
         self.note_arm(now_ms);
-        BackfillDecision::Arm
+        BackfillDecision::Reassess
     }
 
     /// End the run when this arm lands more than
@@ -631,7 +577,7 @@ impl GroupStall {
     /// Whether this group may spend a paced re-arm now.
     ///
     /// `armed_at_epoch == Some(self.epoch)` is load-bearing:
-    /// [`EpochStallDetector::mark_replayed`] latches `fired_at_epoch` for every
+    /// `seed_suppression_for_test` (historical test fixture) latches `fired_at_epoch` for every
     /// tracked group without setting `armed_at_epoch`, so without this conjunct
     /// a group that never armed would re-arm out of another group's replay
     /// suppression.
@@ -653,22 +599,6 @@ impl GroupStall {
     fn note_arm(&mut self, now_ms: u64) {
         self.fired_at_epoch = Some(self.epoch);
         self.last_arm_at_ms = Some(now_ms);
-    }
-
-    /// Count one end-of-stored-events replay completion that recovered nothing
-    /// while this group sat at the epoch it armed at. Reports whether that
-    /// evidence has now earned an escalation this run has not already made.
-    fn observe_fruitless_completion(&mut self, threshold: u32) -> Option<u32> {
-        if self.armed_at_epoch != Some(self.epoch) {
-            return None;
-        }
-        self.fruitless_completions = self.fruitless_completions.saturating_add(1);
-        if self.fruitless_completions >= threshold && !self.escalated && !self.fruitless_reported {
-            self.escalated = true;
-            self.fruitless_reported = true;
-            return Some(self.fruitless_completions);
-        }
-        None
     }
 }
 
@@ -728,15 +658,6 @@ impl EpochStallDetector {
         self
     }
 
-    /// Escalate a wedged group after `threshold` fruitless end-of-stored-events
-    /// completions instead of the production
-    /// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
-    #[cfg(test)]
-    pub(crate) fn with_fruitless_completion_threshold(mut self, threshold: u32) -> Self {
-        self.fruitless_completion_threshold = threshold;
-        self
-    }
-
     /// The distinct-undecryptable count at which this detector arms a backfill.
     /// Reported on the `epoch_stall_backfill_armed` audit row so the row is
     /// honest even when the detector was built with a non-default threshold
@@ -752,6 +673,10 @@ impl EpochStallDetector {
         self.escalation_arm_threshold
     }
 
+    pub(crate) fn qualified_observation_interval_ms(&self) -> u64 {
+        self.wedge_rearm_interval_ms
+    }
+
     /// The confirmed-fruitless-completion count at which this detector reports a
     /// group wedged at one epoch. Logged as the deciding threshold when that
     /// rule is what escalated.
@@ -764,34 +689,17 @@ impl EpochStallDetector {
     /// for every currently-tracked group at its current epoch: N groups stuck at
     /// once cost one replay, not N. A group re-arms only when its epoch advances
     /// and it stalls again at the new epoch.
-    pub(crate) fn mark_replayed(&mut self) {
+    #[cfg(test)]
+    pub(crate) fn seed_suppression_for_test(&mut self) {
         for stall in self.groups.values_mut() {
             stall.fired_at_epoch = Some(stall.epoch);
         }
     }
 
-    /// Clear the replay-suppression latch for the groups a completed replay
-    /// fetched history for and could not retain.
-    ///
-    /// Withholding [`Self::mark_replayed`] on a fruitless replay re-arms
-    /// *bystanders* only. It cannot re-arm the group that caused the replay:
-    /// that group latched `fired_at_epoch` itself in [`GroupStall::arm`], which
-    /// writes the same value `mark_replayed` would have. Nothing else clears it
-    /// — [`GroupStall::observe_epoch`] clears only on a *different* epoch, and
-    /// the epoch cannot move without the very commit the replay failed to
-    /// retain. So without this, one fruitless replay permanently ends automatic
-    /// repair for that group: the refused object is neither marked seen nor
-    /// allowed past the relay `since` floor, and the armed backfill is the only
-    /// automatic path that re-serves it.
-    ///
-    /// Scoped to the refusals *this* drain counted rather than swept
-    /// account-wide: a group the replay refused nothing for learned nothing from
-    /// it, and clearing its latch would re-arm on evidence that does not exist.
-    ///
-    /// The run itself is untouched — `armed_at_epoch`, `arms` and `escalated`
-    /// all survive — so a group that keeps re-arming still escalates exactly
-    /// once per unrecovered run rather than restarting its count.
-    pub(crate) fn rearm_refused_groups(&mut self, groups: &HashSet<GroupId>) {
+    /// Historical projection fixture: clearing suppression represents a
+    /// newly observed refusal. Production retry eligibility belongs to SQL.
+    #[cfg(test)]
+    pub(crate) fn clear_suppression_for_test(&mut self, groups: &HashSet<GroupId>) {
         for group_id in groups {
             if let Some(stall) = self.groups.get_mut(group_id) {
                 stall.fired_at_epoch = None;
@@ -1010,39 +918,6 @@ impl EpochStallDetector {
         BackfillDecision::Skip
     }
 
-    /// Count one replay completion that reached end-of-stored-events and
-    /// recovered nothing, against each of the `groups` it was armed for.
-    ///
-    /// This is the escalation rule for a group whose epoch never moves, and the
-    /// admission test is deliberately narrow (see
-    /// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`]): the caller passes only
-    /// completions the relays confirmed served the account's stored history in
-    /// full, and only ones that recovered nothing. A group that has since left
-    /// the epoch it armed at is skipped — it is no longer wedged where the
-    /// evidence was gathered.
-    ///
-    /// Returns one entry per group whose evidence has now earned a report that
-    /// its run has not already made. Like every escalation, this only reports;
-    /// the replay it followed is unaffected.
-    pub(crate) fn observe_fruitless_completion<'groups>(
-        &mut self,
-        groups: impl IntoIterator<Item = &'groups GroupId>,
-    ) -> Vec<FruitlessEscalation> {
-        let threshold = self.fruitless_completion_threshold;
-        groups
-            .into_iter()
-            .filter_map(|group_id| {
-                let stall = self.groups.get_mut(group_id)?;
-                let completions = stall.observe_fruitless_completion(threshold)?;
-                Some(FruitlessEscalation {
-                    group_id: group_id.clone(),
-                    stalled_epoch: stall.epoch.0,
-                    completions,
-                })
-            })
-            .collect()
-    }
-
     /// Authenticated current-epoch peer traffic, a join, or a terminal marker
     /// for this device's copy ends the failed recovery run; a local epoch
     /// advance alone never calls this method.
@@ -1098,19 +973,6 @@ impl EpochStallDetector {
     }
 }
 
-/// A wedged group whose fruitless end-of-stored-events completions have reached
-/// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FruitlessEscalation {
-    pub(crate) group_id: GroupId,
-    pub(crate) stalled_epoch: u64,
-    /// Confirmed fruitless replay completions at `stalled_epoch`. Reported as
-    /// the escalation's `arms`: each completion is one armed full-history
-    /// replay the relays confirmed served the stored history and that recovered
-    /// nothing, which is the same claim the arm count makes and a stricter one.
-    pub(crate) completions: u32,
-}
-
 /// The part of a group's stall state that survives a restart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EpochStallEvidence {
@@ -1129,75 +991,109 @@ impl Default for EpochStallDetector {
     }
 }
 
-/// One armed group participating in a coalesced account-wide epoch-gap replay.
-#[derive(Clone, Debug)]
-pub(crate) struct PendingEpochBackfillGroup {
-    pub(crate) stalled_epoch: u64,
-}
-
-/// In-memory deferral seam identity for epoch-gap replay audit debouncing.
-///
-/// Never emitted on the forensic wire; bounded by the pending group's armed set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct EpochBackfillDeferredSnapshot {
-    pub(crate) reason: EpochBackfillDeferredReason,
-    pub(crate) retry_ordinal: u64,
-    /// Armed group identity paired with the latest observed local epoch, if any.
-    /// Sorted by opaque group-id bytes for stable comparison.
-    pub(crate) group_epochs: Vec<(GroupId, Option<u64>)>,
-}
-
-/// Pending epoch-gap recovery intent: one opaque attempt id correlates every
-/// lifecycle row for the current arm, and additional groups coalesce into the
-/// same account-wide replay without minting a second attempt.
-#[derive(Clone, Debug)]
-pub(crate) struct PendingEpochBackfill {
-    pub(crate) attempt_id: String,
-    pub(crate) groups: HashMap<GroupId, PendingEpochBackfillGroup>,
-    /// How many execution tries have started for this pending intent.
-    pub(crate) execution_attempts: u32,
-    /// How many drains ended because the EOSE gate timed out or could not be
-    /// observed. Worker-quantum yields do not unlock the weaker fallback.
-    pub(crate) eose_unconfirmed_attempts: u32,
-    /// Consecutive worker-quantum yields with no durable novel progress, used
-    /// only to pace retries without changing the drain-completion contract.
-    pub(crate) no_progress_attempts: u32,
-    /// Last deferred audit evidence keyed by the exact deferral seam snapshot.
-    pub(crate) last_deferred_audit: Option<EpochBackfillDeferredSnapshot>,
-}
-
-impl PendingEpochBackfill {
-    pub(crate) fn new() -> Self {
-        Self {
-            attempt_id: new_recovery_attempt_id(),
-            groups: HashMap::new(),
-            execution_attempts: 0,
-            eose_unconfirmed_attempts: 0,
-            no_progress_attempts: 0,
-            last_deferred_audit: None,
-        }
-    }
-}
-
-fn new_recovery_attempt_id() -> String {
-    let mut bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let encoded = hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &encoded[0..8],
-        &encoded[8..12],
-        &encoded[12..16],
-        &encoded[16..20],
-        &encoded[20..32]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restored_evidence(reported: bool) -> (EpochStallDetector, GroupId, EpochStallEvidence) {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let group = group(1);
+        let evidence = EpochStallEvidence {
+            stalled_epoch: 10,
+            fruitless_completions: if reported { 3 } else { 2 },
+            fruitless_reported: reported,
+            last_arm_at_ms: T0,
+        };
+        detector.restore_wedge_evidence([(group.clone(), evidence)]);
+        (detector, group, evidence)
+    }
+
+    #[test]
+    fn qualified_evidence_projection_survives_reorg_and_round_trips() {
+        for reported in [false, true] {
+            let (mut detector, group, evidence) = restored_evidence(reported);
+            for _ in 0..10 {
+                detector.observe_convergence_reorg(&group);
+            }
+            assert_eq!(detector.wedge_evidence(&group), Some(evidence));
+            let mut reopened = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+            reopened.restore_wedge_evidence([(
+                group.clone(),
+                detector.wedge_evidence(&group).unwrap(),
+            )]);
+            assert_eq!(reopened.wedge_evidence(&group), Some(evidence));
+            assert_eq!(
+                reopened.observe_undecryptable(
+                    group.clone(),
+                    "new".into(),
+                    EpochId(10),
+                    T0 + 60_000
+                ),
+                BackfillDecision::Skip
+            );
+            assert_eq!(reopened.wedge_evidence(&group), Some(evidence));
+        }
+    }
+
+    #[test]
+    fn qualified_evidence_projection_resets_on_epoch_change_or_expired_run() {
+        for transition in 0..3 {
+            let (mut detector, group, _) = restored_evidence(true);
+            match transition {
+                0 => detector.observe_group_epoch(&group, EpochId(11)),
+                1 => {
+                    let _ = detector.observe_undecryptable(
+                        group.clone(),
+                        "later".into(),
+                        EpochId(10),
+                        T0 + EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS + 1,
+                    );
+                }
+                _ => {
+                    let _ = detector.observe_undecryptable(
+                        group.clone(),
+                        "corrected-clock".into(),
+                        EpochId(10),
+                        T0 - EPOCH_STALL_CLOCK_SKEW_ALLOWANCE_MS - 1,
+                    );
+                }
+            }
+            assert_eq!(
+                detector
+                    .wedge_evidence(&group)
+                    .map(|e| e.fruitless_completions)
+                    .unwrap_or_default(),
+                0
+            );
+            assert!(
+                !detector
+                    .wedge_evidence(&group)
+                    .is_some_and(|e| e.fruitless_reported)
+            );
+        }
+    }
+
+    #[test]
+    fn elapsed_time_and_unreadable_traffic_cannot_mint_qualified_samples() {
+        let (mut detector, group, evidence) = restored_evidence(false);
+        for index in 1..12 {
+            assert_eq!(
+                detector.observe_undecryptable(
+                    group.clone(),
+                    format!("minted-{index}"),
+                    EpochId(10),
+                    T0 + index * HOUR_MS
+                ),
+                BackfillDecision::Reassess
+            );
+            let current = detector.wedge_evidence(&group).unwrap();
+            assert_eq!(
+                current.fruitless_completions,
+                evidence.fruitless_completions
+            );
+            assert!(!current.fruitless_reported);
+        }
+    }
 
     /// One fixed wall-clock instant, in ms.
     ///
@@ -1425,7 +1321,7 @@ mod tests {
 
         // Storm-collapse suppression covers tracked groups only, so a first arm
         // surviving it proves the passage created no entry to suppress.
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
         assert_eq!(
             detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(14), T0),
             BackfillDecision::Arm,
@@ -1538,7 +1434,7 @@ mod tests {
             detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
             BackfillDecision::Skip
         );
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
 
         // A passage the device already made, re-reported: no movement at all.
         detector.observe_epoch_passage(&g, EpochId(8), EpochId(10));
@@ -1588,7 +1484,7 @@ mod tests {
             BackfillDecision::Arm
         );
         let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e, T0);
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
 
         // B stalls at the next two epochs. Its run starts at the first of those
         // arms: the suppression it inherited was never a repair attempt of its
@@ -1602,26 +1498,6 @@ mod tests {
         assert_eq!(
             detector.observe_undecryptable(b, "b5".into(), EpochId(7), T0),
             BackfillDecision::ArmAndEscalate { arms: 2 }
-        );
-    }
-
-    #[test]
-    fn deferred_snapshot_distinguishes_observed_epoch_at_same_cardinality() {
-        let g = group(0x01);
-        let phantom = group(0xde);
-        let unchanged = EpochBackfillDeferredSnapshot {
-            reason: EpochBackfillDeferredReason::GroupEpochUnavailable,
-            retry_ordinal: 0,
-            group_epochs: vec![(g.clone(), Some(5)), (phantom.clone(), None)],
-        };
-        let epoch_advanced = EpochBackfillDeferredSnapshot {
-            reason: EpochBackfillDeferredReason::GroupEpochUnavailable,
-            retry_ordinal: 0,
-            group_epochs: vec![(g, Some(6)), (phantom, None)],
-        };
-        assert_ne!(
-            unchanged, epoch_advanced,
-            "observed local epoch transitions must change the deferral snapshot"
         );
     }
 
@@ -1700,40 +1576,6 @@ mod tests {
     }
 
     #[test]
-    fn mark_replayed_collapses_a_storm_of_simultaneously_stuck_groups() {
-        let mut detector = stall_detector(3);
-        let a = group(0x0A);
-        let b = group(0x0B);
-        let e = EpochId(19);
-
-        // Group A crosses the threshold and the caller runs ONE account-wide
-        // replay (which re-fetches every group's history, B included).
-        let _ = detector.observe_undecryptable(a.clone(), "a1".into(), e, T0);
-        let _ = detector.observe_undecryptable(a.clone(), "a2".into(), e, T0);
-        assert!(
-            detector
-                .observe_undecryptable(a.clone(), "a3".into(), e, T0)
-                .arms_backfill()
-        );
-
-        // Group B was accumulating undecryptables at the same epoch in the same
-        // drain but had not yet crossed the threshold.
-        let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e, T0);
-        let _ = detector.observe_undecryptable(b.clone(), "b2".into(), e, T0);
-
-        detector.mark_replayed();
-
-        // B crossing the threshold after the replay must NOT trigger a second
-        // one: the single replay already covered it.
-        assert!(
-            !detector
-                .observe_undecryptable(b.clone(), "b3".into(), e, T0)
-                .arms_backfill(),
-            "one account-wide replay should cover every stuck group at this epoch"
-        );
-    }
-
-    #[test]
     fn an_epoch_advance_resets_the_count() {
         let mut detector = stall_detector(3);
         let g = group(0x01);
@@ -1786,90 +1628,9 @@ mod tests {
         );
         assert_eq!(
             detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(10), T0 + HOUR_MS),
-            BackfillDecision::Arm,
+            BackfillDecision::Reassess,
             "and the wedged group still earns its paced re-arm once the interval elapses",
         );
-    }
-
-    /// The shape that decides the whole rescope: a group whose fork never
-    /// resolves still escalates, off the relays' own verdict.
-    ///
-    /// Reorgs are not rare punctuation on a forked group — they recur. A losing
-    /// commit is parked rather than consumed, so an unsettled fork keeps
-    /// producing fresh adjudications round after round: each pass can park a
-    /// *newly arrived* rival, and ordinary member traffic is enough to run a
-    /// pass per round indefinitely. (Re-parking the *same* commit is silent
-    /// since announce-once, so the repetition here is new parkings, not a
-    /// re-announcement of one.) If a reorg reset
-    /// the frozen-epoch evidence along with the arm run, the count below would
-    /// return to zero every round and this group — wedged at one epoch, relays
-    /// confirming round after round that they hold nothing that moves it —
-    /// could never report at all. Keeping the epoch-scoped evidence out of the
-    /// reset makes the report survive by construction rather than by cadence.
-    #[test]
-    fn a_chronically_forked_group_still_escalates_off_relay_confirmed_evidence() {
-        let mut detector = EpochStallDetector::new(1, 3)
-            .with_wedge_rearm_interval_ms(HOUR_MS)
-            .with_fruitless_completion_threshold(3);
-        let g = group(0x01);
-
-        let mut reports = Vec::new();
-        for round in 0..12u64 {
-            // Fresh undecryptable traffic arrives and the paced replay runs.
-            assert_eq!(
-                detector.observe_undecryptable(
-                    g.clone(),
-                    format!("fork-side-{round}"),
-                    EpochId(10),
-                    T0 + round * HOUR_MS,
-                ),
-                BackfillDecision::Arm,
-                "round {round}: a wedged group's paced re-arm is its only replay",
-            );
-            // The relays serve the account's stored history in full and it
-            // recovers nothing.
-            reports.extend(detector.observe_fruitless_completion([&g]));
-            // And the unresolved fork is re-adjudicated, parking another
-            // newly arrived rival.
-            detector.observe_convergence_reorg(&g);
-        }
-
-        assert_eq!(
-            reports.len(),
-            1,
-            "exactly one report: earned on the third relay-confirmed completion, then latched for this epoch",
-        );
-        assert_eq!(reports[0].completions, 3);
-        assert_eq!(reports[0].stalled_epoch, 10);
-    }
-
-    /// A burst of withdrawal signals must cost the frozen-epoch evidence
-    /// nothing. One pass can park several commits and announce one withdrawal
-    /// each, and successive passes keep parking newly arrived rivals, so this
-    /// seam sees runs of reorg observations as the ordinary case.
-    #[test]
-    fn repeated_reorg_signals_do_not_reset_the_frozen_epoch_evidence() {
-        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(3);
-        let g = group(0x01);
-
-        assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
-            BackfillDecision::Arm
-        );
-        assert!(detector.observe_fruitless_completion([&g]).is_empty());
-        assert!(detector.observe_fruitless_completion([&g]).is_empty());
-
-        for _ in 0..10 {
-            detector.observe_convergence_reorg(&g);
-        }
-
-        let reports = detector.observe_fruitless_completion([&g]);
-        assert_eq!(
-            reports.len(),
-            1,
-            "ten withdrawal signals must not spend the two completions already banked",
-        );
-        assert_eq!(reports[0].completions, 3);
     }
 
     /// Announce-once made this seam quieter, and the escalation path felt it.
@@ -2026,8 +1787,8 @@ mod tests {
         let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
         assert_eq!(
             detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0 + HOUR_MS),
-            BackfillDecision::Arm,
-            "a wedged group's only way back to a replay is the paced re-arm",
+            BackfillDecision::Reassess,
+            "the timer schedules local reassessment without new history demand",
         );
         // And the re-arm resets its own clock rather than opening a window.
         assert_eq!(
@@ -2053,71 +1814,14 @@ mod tests {
                     EpochId(10),
                     T0 + hour * HOUR_MS,
                 ),
-                BackfillDecision::Arm,
-                "hour {hour}: a paced re-arm is an arm of the replay, never of the run",
+                if hour == 0 {
+                    BackfillDecision::Arm
+                } else {
+                    BackfillDecision::Reassess
+                },
+                "hour {hour}: the timer cannot authorize network work or escalate",
             );
         }
-    }
-
-    /// What does escalate a wedged group: replays whose relays confirmed they
-    /// had served the account's stored history and that recovered nothing.
-    #[test]
-    fn fruitless_end_of_stored_events_completions_escalate_a_wedged_group_once() {
-        let mut detector = EpochStallDetector::new(1, 3)
-            .with_wedge_rearm_interval_ms(HOUR_MS)
-            .with_fruitless_completion_threshold(3);
-        let g = group(0x01);
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-
-        assert!(
-            detector.observe_fruitless_completion([&g]).is_empty(),
-            "one confirmed fruitless replay is not yet a report",
-        );
-        assert!(detector.observe_fruitless_completion([&g]).is_empty());
-        assert_eq!(
-            detector.observe_fruitless_completion([&g]),
-            vec![FruitlessEscalation {
-                group_id: g.clone(),
-                stalled_epoch: 10,
-                completions: 3,
-            }],
-        );
-        assert!(
-            detector.observe_fruitless_completion([&g]).is_empty(),
-            "a run reports once, however long it keeps gathering evidence",
-        );
-    }
-
-    /// Evidence is about one epoch. A group that has moved on since it armed is
-    /// no longer wedged where the evidence was gathered, so the completion says
-    /// nothing about it.
-    #[test]
-    fn a_completion_for_a_group_that_left_its_armed_epoch_is_not_evidence() {
-        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(1);
-        let g = group(0x01);
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-        detector.observe_epoch_passage(&g, EpochId(10), EpochId(12));
-
-        assert!(
-            detector.observe_fruitless_completion([&g]).is_empty(),
-            "a group that moved off its armed epoch cannot be reported wedged at it",
-        );
-    }
-
-    /// And the count is per-epoch: evidence gathered at one stalled epoch says
-    /// nothing about the next one.
-    #[test]
-    fn leaving_a_stalled_epoch_discards_its_fruitless_evidence() {
-        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(2);
-        let g = group(0x01);
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-        assert!(detector.observe_fruitless_completion([&g]).is_empty());
-
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0);
-        assert!(
-            detector.observe_fruitless_completion([&g]).is_empty(),
-            "the first epoch's evidence must not carry into the second",
-        );
     }
 
     /// The storm-collapse suppression a replay applies to groups that never
@@ -2128,7 +1832,7 @@ mod tests {
         let mut detector = EpochStallDetector::new(2, 3).with_wedge_rearm_interval_ms(HOUR_MS);
         let g = group(0x01);
         let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
 
         assert_eq!(
             detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0 + HOUR_MS * 5),
@@ -2137,7 +1841,7 @@ mod tests {
         );
     }
 
-    /// The same guard on the refusal path. `mark_replayed` latches
+    /// The same guard on the refusal path. `seed_suppression_for_test` latches
     /// `fired_at_epoch` for every tracked group without setting
     /// `armed_at_epoch`, and a refusal reaching that latch must read it as
     /// another group's suppression rather than as an arm of its own.
@@ -2146,7 +1850,7 @@ mod tests {
         let mut detector = EpochStallDetector::new(2, 3).with_wedge_rearm_interval_ms(HOUR_MS);
         let g = group(0x01);
         let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-        detector.mark_replayed();
+        detector.seed_suppression_for_test();
 
         assert_eq!(
             detector.observe_resource_refusal(g.clone(), EpochId(10), T0 + HOUR_MS * 5),
@@ -2182,7 +1886,7 @@ mod tests {
         );
         assert_eq!(
             detector.observe_resource_refusal(g.clone(), EpochId(10), T0 + HOUR_MS),
-            BackfillDecision::Arm,
+            BackfillDecision::Reassess,
             "a restored latch must not end this group's recovery for good",
         );
         assert_eq!(
@@ -2213,8 +1917,8 @@ mod tests {
         for hour in 1..=10 {
             assert_eq!(
                 detector.observe_resource_refusal(g.clone(), EpochId(10), T0 + hour * HOUR_MS),
-                BackfillDecision::Arm,
-                "hour {hour}: a paced re-arm is an arm of the replay, never of the run",
+                BackfillDecision::Reassess,
+                "hour {hour}: the timer cannot authorize network work or escalate",
             );
         }
     }
@@ -2232,7 +1936,7 @@ mod tests {
     /// deferred-peel cap breaks exactly that: the cap is one minted traffic can
     /// fill by itself (mdk#339), it answers `ResourceRefused` to the replay's
     /// own fetch for the group as well as to live traffic, and
-    /// [`EpochStallDetector::rearm_refused_groups`] then clears the latch the
+    /// `clear_suppression_for_test` (historical test fixture) then clears the latch the
     /// arm just set. The next refusal takes the counted branch rather than the
     /// paced one, so the loop refusal -> arm -> fruitless replay -> unlatch
     /// walks straight to [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] with no epoch
@@ -2254,7 +1958,7 @@ mod tests {
                 EpochId(10),
                 T0 + turn * 15_000,
             ));
-            detector.rearm_refused_groups(&refused);
+            detector.clear_suppression_for_test(&refused);
         }
 
         assert_eq!(
@@ -2321,111 +2025,6 @@ mod tests {
         );
     }
 
-    /// The restart rule, in both directions. Restored evidence is not lost, and
-    /// the restart itself buys nothing: the arm mark is wall-clock, so a device
-    /// force-killed a minute after arming still owes the rest of the interval.
-    #[test]
-    fn a_restart_carries_the_evidence_without_becoming_the_clock() {
-        let mut detector = EpochStallDetector::new(1, 3)
-            .with_wedge_rearm_interval_ms(HOUR_MS)
-            .with_fruitless_completion_threshold(3);
-        let g = group(0x01);
-        detector.restore_wedge_evidence([(
-            g.clone(),
-            EpochStallEvidence {
-                stalled_epoch: 10,
-                fruitless_completions: 2,
-                fruitless_reported: false,
-                last_arm_at_ms: T0,
-            },
-        )]);
-
-        assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0 + 60_000),
-            BackfillDecision::Skip,
-            "a restart must not shorten the interval the previous process owed",
-        );
-        assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0 + HOUR_MS),
-            BackfillDecision::Arm
-        );
-        assert_eq!(
-            detector.observe_fruitless_completion([&g]),
-            vec![FruitlessEscalation {
-                group_id: g.clone(),
-                stalled_epoch: 10,
-                completions: 3,
-            }],
-            "the two completions the previous process confirmed still count",
-        );
-    }
-
-    /// And a run already reported stays reported, so a restart cannot re-raise
-    /// a group whose evidence is already past the threshold.
-    #[test]
-    fn a_restart_does_not_re_report_an_already_escalated_run() {
-        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(3);
-        let g = group(0x01);
-        detector.restore_wedge_evidence([(
-            g.clone(),
-            EpochStallEvidence {
-                stalled_epoch: 10,
-                fruitless_completions: 3,
-                fruitless_reported: true,
-                last_arm_at_ms: T0,
-            },
-        )]);
-
-        assert!(
-            detector.observe_fruitless_completion([&g]).is_empty(),
-            "the run reported before the restart; restarting is not new evidence",
-        );
-    }
-
-    /// A dead run's evidence must not report a live one.
-    ///
-    /// `end_run` and `observe_epoch` are two different resets: the first fires
-    /// when an arm lands past the run continuation window, at whatever epoch the
-    /// group happens to sit on, and the second only when the epoch changes. The
-    /// fruitless counter is per-epoch, so only the second used to clear it —
-    /// which left a window where a stale-run arm cleared the report latch while
-    /// the evidence behind it survived, and the very next completion re-reported
-    /// off a run that had already ended. The cap-saturated shape reaches it for
-    /// real: `rearm_refused_groups` clears `fired_at_epoch` at the same epoch, so
-    /// the next undecryptable takes the unpaced arm branch.
-    #[test]
-    fn a_run_that_ended_on_the_clock_does_not_report_off_its_predecessor() {
-        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(3);
-        let g = group(0x01);
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-        let _ = detector.observe_fruitless_completion([&g]);
-        let _ = detector.observe_fruitless_completion([&g]);
-        assert_eq!(
-            detector.observe_fruitless_completion([&g]).len(),
-            1,
-            "the first run reports on its third confirmed fruitless replay",
-        );
-        // A fruitless replay re-arms the groups whose refusals it counted, and
-        // the device then goes quiet long enough for the run to age out.
-        detector.rearm_refused_groups(&std::iter::once(g.clone()).collect());
-        let later = T0 + EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS + 1;
-        assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), later),
-            BackfillDecision::Arm,
-            "an arm this far from the last one starts a fresh run",
-        );
-        assert!(
-            detector.observe_fruitless_completion([&g]).is_empty(),
-            "a fresh run re-earns its evidence exactly as it re-earns its arms",
-        );
-        assert!(detector.observe_fruitless_completion([&g]).is_empty());
-        assert_eq!(
-            detector.observe_fruitless_completion([&g]).len(),
-            1,
-            "and reports again only once it has earned three of its own",
-        );
-    }
-
     /// A restart must not suppress the arm-run rule.
     ///
     /// The report latch gates both escalation rules, but only the frozen-epoch
@@ -2471,39 +2070,6 @@ mod tests {
         );
     }
 
-    /// The durable latch is scoped to the epoch it was gathered at, which is
-    /// what makes a stale row harmless. Nothing persists the voiding
-    /// transitions — they happen on the delivery hot path — so a recovered
-    /// group leaves its last row behind; the first observation at any other
-    /// epoch has to discard it, latch included.
-    #[test]
-    fn a_restored_report_latch_does_not_survive_leaving_its_epoch() {
-        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(1);
-        let g = group(0x01);
-        detector.restore_wedge_evidence([(
-            g.clone(),
-            EpochStallEvidence {
-                stalled_epoch: 10,
-                fruitless_completions: 3,
-                fruitless_reported: true,
-                last_arm_at_ms: T0,
-            },
-        )]);
-
-        // The group moved on and later wedged somewhere else entirely.
-        detector.observe_epoch_passage(&g, EpochId(10), EpochId(11));
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(11), T0 + HOUR_MS);
-        assert_eq!(
-            detector.observe_fruitless_completion([&g]),
-            vec![FruitlessEscalation {
-                group_id: g.clone(),
-                stalled_epoch: 11,
-                completions: 1,
-            }],
-            "a report about the epoch it left cannot silence the epoch it is stuck at now",
-        );
-    }
-
     /// A clock that ran ahead must not wedge the gate for good.
     ///
     /// A mark taken under a dead RTC, a hand-set date, or a saturating
@@ -2527,68 +2093,8 @@ mod tests {
 
         assert_eq!(
             detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
-            BackfillDecision::Arm,
+            BackfillDecision::Reassess,
             "a mark the clock cannot have produced reads as elapsed, not as zero",
-        );
-    }
-
-    /// The run window has to read that same corrected clock. A mark in the
-    /// future is not zero elapsed there either: a run whose last arm cannot
-    /// have happened is over, and its evidence has to be re-earned rather than
-    /// counted toward the next report.
-    #[test]
-    fn a_mark_from_a_clock_that_ran_ahead_expires_the_run_it_marked() {
-        let mut detector = EpochStallDetector::new(1, 3)
-            .with_wedge_rearm_interval_ms(HOUR_MS)
-            .with_fruitless_completion_threshold(3);
-        let g = group(0x01);
-        detector.restore_wedge_evidence([(
-            g.clone(),
-            EpochStallEvidence {
-                stalled_epoch: 10,
-                fruitless_completions: 2,
-                fruitless_reported: false,
-                last_arm_at_ms: T0 + 365 * 24 * HOUR_MS,
-            },
-        )]);
-        // A fruitless replay that refused this group's history clears the
-        // latch, which is what lets the next refusal reach `arm` rather than
-        // the paced re-arm.
-        detector.rearm_refused_groups(&HashSet::from([g.clone()]));
-        assert_eq!(
-            detector.observe_resource_refusal(g.clone(), EpochId(10), T0),
-            BackfillDecision::Arm,
-        );
-
-        assert!(
-            detector.observe_fruitless_completion([&g]).is_empty(),
-            "evidence from a run that ended cannot complete the next run's report",
-        );
-    }
-
-    /// Nothing paces a wedged group but the clock, so its re-arms have to read
-    /// the run window too. A group that went quiet for a week and then received
-    /// one message is starting a new run, not continuing one whose last arm was
-    /// days ago.
-    #[test]
-    fn a_paced_rearm_past_the_run_continuation_window_starts_a_fresh_run() {
-        let mut detector = EpochStallDetector::new(1, 3)
-            .with_wedge_rearm_interval_ms(HOUR_MS)
-            .with_fruitless_completion_threshold(3);
-        let g = group(0x01);
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-        let _ = detector.observe_fruitless_completion([&g]);
-        let _ = detector.observe_fruitless_completion([&g]);
-
-        let a_week_later = T0 + 7 * 24 * HOUR_MS;
-        assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), a_week_later),
-            BackfillDecision::Arm,
-            "the interval has long elapsed, so the re-arm itself is due",
-        );
-        assert!(
-            detector.observe_fruitless_completion([&g]).is_empty(),
-            "week-old evidence belongs to a run the window already ended",
         );
     }
 
@@ -2609,29 +2115,6 @@ mod tests {
             ),
             BackfillDecision::Skip,
             "a reading a few minutes behind the mark is skew, not a year of waiting",
-        );
-    }
-
-    #[test]
-    fn wedge_evidence_round_trips_what_a_restart_has_to_carry() {
-        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(3);
-        let g = group(0x01);
-        assert_eq!(
-            detector.wedge_evidence(&g),
-            None,
-            "a group with no stall history has nothing durable to say",
-        );
-
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
-        let _ = detector.observe_fruitless_completion([&g]);
-        assert_eq!(
-            detector.wedge_evidence(&g),
-            Some(EpochStallEvidence {
-                stalled_epoch: 10,
-                fruitless_completions: 1,
-                fruitless_reported: false,
-                last_arm_at_ms: T0,
-            }),
         );
     }
 }

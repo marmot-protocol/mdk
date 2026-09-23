@@ -177,6 +177,10 @@ These are longer working documents. Go here when you need depth, not orientation
     structural URL gates, resolve/validate/pin, disabled redirects and proxies, timeout budgets, and privacy-safe
     errors.
 
+- **Doc:** [`further-context/audit-delivery-local-slice.md`](./further-context/audit-delivery-local-slice.md)
+  - **What it covers:** Measured JSONL recorder boundaries and the testable local cursor, prepared range, and gap
+    behavior before production delivery is activated.
+
 - **Doc:** [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.
 

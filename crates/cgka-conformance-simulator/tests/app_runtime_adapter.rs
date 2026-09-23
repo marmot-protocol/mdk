@@ -381,6 +381,7 @@ async fn retained_relay_control_restores_hidden_history_for_offline_repair() {
     subject.set_online("bob", true).await.unwrap();
     subject.repair_full_history(&["bob".into()]).await.unwrap();
     let hidden = subject.observations(&["bob".into()]).await.unwrap();
+    assert_eq!(hidden[0].local.history_repairs_without_coverage, 1);
     assert!(hidden[0].application.visible_plaintexts.is_empty());
 
     subject
@@ -388,6 +389,7 @@ async fn retained_relay_control_restores_hidden_history_for_offline_repair() {
         .unwrap();
     subject.repair_full_history(&["bob".into()]).await.unwrap();
     let restored = subject.observations(&["bob".into()]).await.unwrap();
+    assert_eq!(restored[0].local.history_repairs_without_coverage, 2);
     assert_eq!(
         restored[0].application.visible_plaintexts,
         ["restored relay history"]

@@ -89,6 +89,7 @@ async fn missing_eose_exhausts_overall_budget_and_retains_prefix() {
 async fn delayed_eose_completes_same_attempt_across_multiple_checkpoints() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
+    client.test_recovery_evidence = Some(super::super::recovery::empty_finite_history);
     let before = relay.subscription_count();
     let prefix = SyncSummary {
         joined_groups: vec![GroupId::new(vec![42])],
@@ -222,6 +223,7 @@ async fn delayed_overflow_repair_clears_only_its_own_durable_generation() {
     for advance_generation in [false, true] {
         let (_dir, app, relay) = fixture();
         let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.test_recovery_evidence = Some(super::super::recovery::empty_finite_history);
         let before = relay.subscription_count();
         let storage = app.account_storage("alice").unwrap();
         storage
@@ -341,4 +343,210 @@ async fn one_fast_endpoint_cannot_complete_full_history_repair() {
     assert!(coverage.any());
     assert!(!coverage.complete());
     assert_eq!(relay.subscription_count(), before + 1);
+}
+
+#[tokio::test]
+async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_retry() {
+    let (_dir, app, relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .mark_account_delivery_recovery("alice", 42, 3)
+        .unwrap();
+    client.delivery_overflow_recovery_pending = true;
+    client.delivery_overflow_recovery_marker_token = Some(42);
+    let before = relay.subscription_count();
+    {
+        let repair = client.repair_full_history();
+        tokio::pin!(repair);
+        tokio::select! {
+            result = &mut repair => panic!("unproven repair returned before cancellation: {result:?}"),
+            _ = async {
+                timeout(Duration::from_secs(5), async {
+                    while relay.subscription_count() == before {
+                        tokio::task::yield_now().await;
+                    }
+                }).await.expect("repair must activate before it is dropped");
+            } => {}
+        }
+    }
+    assert!(
+        client.adapter.pending_delivery_overflow().is_some(),
+        "dropping an active repair must release its transient plane recovery flag"
+    );
+    let demands = storage.pending_recovery_demands().unwrap();
+    let explicit = demands
+        .iter()
+        .find(|d| d.cause == storage_sqlite::RecoveryCause::ExplicitHistory)
+        .unwrap();
+    assert!(
+        !explicit.caller_waiting,
+        "dropping the caller must remove foreground urgency"
+    );
+    assert!(
+        demands
+            .iter()
+            .any(|d| d.cause == storage_sqlite::RecoveryCause::QueueLoss)
+    );
+    let pending_ids = demands.iter().map(|d| d.ticket.id).collect::<Vec<_>>();
+    let retry = storage.recovery_retry_state().unwrap();
+    assert_eq!(retry.attempt_serial, 1);
+    assert!(retry.not_before_ms > retry.recorded_at_ms);
+    assert_eq!(relay.subscription_count(), before + 1);
+    drop(client);
+    let reopened = client_on_app_relay_plane(&app, "alice").await;
+    let demands = storage.pending_recovery_demands().unwrap();
+    assert_eq!(
+        demands.iter().map(|d| d.ticket.id).collect::<Vec<_>>(),
+        pending_ids,
+        "reopen preserves every pending identity, including startup history demand"
+    );
+    assert!(!demands.iter().any(|d| d.caller_waiting));
+    assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+    drop(reopened);
+}
+
+#[tokio::test]
+async fn loss_handoff_active_attempt_does_not_advance_the_durable_cursor() {
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .mark_account_delivery_recovery("alice", 42, 3)
+        .unwrap();
+    client.delivery_overflow_recovery_pending = true;
+    client.delivery_overflow_recovery_marker_token = Some(42);
+    let _attempt = client.adapter.start_delivery_overflow_recovery(42);
+    let old = client.checkpointed_transport_timestamp;
+    client.state.last_transport_timestamp = Some(unix_now_seconds());
+    assert!(
+        client
+            .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 0)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        client.checkpointed_transport_timestamp, old,
+        "an in-flight attempt is not acknowledged recovery"
+    );
+    drop(client);
+    let reopened = client_on_app_relay_plane(&app, "alice").await;
+    assert_eq!(reopened.checkpointed_transport_timestamp, old);
+    assert!(
+        storage
+            .account_delivery_recovery("alice")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn qualified_loss_acknowledgment_persists_admitted_cursor_only_after_handoff() {
+    let (_dir, app, relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .mark_account_delivery_recovery("alice", 91, 1)
+        .unwrap();
+    client.delivery_overflow_recovery_pending = true;
+    client.delivery_overflow_recovery_marker_token = Some(91);
+    let before = relay.subscription_count();
+    client.test_recovery_evidence = Some(super::super::recovery::empty_finite_history);
+    // The already admitted prefix is volatile while loss remains pending.
+    client.state.last_transport_timestamp = Some(123);
+    let (result, ()) = tokio::join!(client.repair_full_history(), async {
+        while relay.subscription_count() == before {
+            tokio::task::yield_now().await;
+        }
+        assert_ne!(
+            app.load_state("alice").unwrap().last_transport_timestamp,
+            Some(123)
+        );
+        report(&app.relay_plane, &relay.accepted_subscriptions()[before..]).await;
+    });
+    result.unwrap();
+    assert!(!client.delivery_loss_blocks_cursor());
+    assert!(
+        storage
+            .account_delivery_recovery("alice")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        app.load_state("alice").unwrap().last_transport_timestamp,
+        Some(123)
+    );
+    assert_eq!(relay.subscription_count(), before + 1);
+}
+
+/// Explicit synthetic backend evidence is separate from the real adapter's
+/// EOSE signal. Empty finite endpoint inventories qualify; incomplete endpoint
+/// admission/exhaustiveness or an omitted required endpoint must not qualify.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn qualified_repair_requires_every_endpoint_and_complete_admission() {
+    use super::super::recovery::{TestRecoveryEvidence, empty_finite_history};
+    let cases: [(TestRecoveryEvidence, bool); 4] = [
+        (
+            |scope| {
+                let mut proof = empty_finite_history(scope);
+                proof.pop();
+                proof
+            },
+            false,
+        ),
+        (
+            |scope| {
+                let mut proof = empty_finite_history(scope);
+                proof[0].admission_complete = false;
+                proof
+            },
+            false,
+        ),
+        (
+            |scope| {
+                let mut proof = empty_finite_history(scope);
+                proof[0].exhaustive = false;
+                proof
+            },
+            false,
+        ),
+        (empty_finite_history, true),
+    ];
+    for (evidence, qualifies) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relays_and_config(
+            dir.path(),
+            vec!["wss://a.example".into(), "wss://b.example".into()],
+            MarmotAppConfig::default().with_dev_epoch_backfill_execution_quantum_ms(10),
+        )
+        .with_test_relay_client(relay.clone());
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.test_recovery_evidence = Some(evidence);
+        let before = relay.subscription_count();
+        let (result, ()) = tokio::join!(client.repair_full_history(), async {
+            while relay.subscription_count() == before {
+                tokio::task::yield_now().await;
+            }
+            report(&app.relay_plane, &relay.accepted_subscriptions()[before..]).await;
+        });
+        assert_eq!(result.is_ok(), qualifies, "{result:?}");
+        assert_eq!(relay.subscription_count(), before + 1);
+        let pending = app
+            .account_storage("alice")
+            .unwrap()
+            .pending_recovery_demands()
+            .unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .any(|d| d.cause == storage_sqlite::RecoveryCause::ExplicitHistory),
+            !qualifies
+        );
+    }
 }

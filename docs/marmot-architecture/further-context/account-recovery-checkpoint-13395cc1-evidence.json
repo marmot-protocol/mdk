@@ -1,0 +1,99 @@
+{
+  "code_revision": "13395cc10fd6941d2a2f72c0398bfc501b99fc25",
+  "target_dir": "/Volumes/Worktrees/codex/a430/mdk/target",
+  "app_features": "default (no test-policy-overrides)",
+  "test_threads": 2,
+  "checks": [
+    {
+      "check": "storage",
+      "log_path": "/tmp/mdk-1946-checkpoint-13395cc1-storage.log",
+      "sha256": "b6d32fbcd806cc2f5f4554fe65f9ff78c68ce122846d792f3113871beda2693d",
+      "bytes": 4493,
+      "results": [
+        "test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 817 filtered out; finished in 38.61s"
+      ],
+      "format_diff_files": [],
+      "exit_code": 0,
+      "command": "cargo test --target-dir /Volumes/Worktrees/codex/a430/mdk/target -p storage-sqlite account_recovery --lib -- --test-threads=2"
+    },
+    {
+      "check": "owner",
+      "log_path": "/tmp/mdk-1946-checkpoint-13395cc1-owner.log",
+      "sha256": "150557cab5b87f5ed8792b1c09e9ac1211f81c18123fae655202a248450d0062",
+      "bytes": 4859,
+      "results": [
+        "test client::recovery::tests::post_join_boundary_completes_only_its_predicate_and_keeps_grace_fixed ... FAILED",
+        "thread 'client::recovery::tests::post_join_boundary_completes_only_its_predicate_and_keeps_grace_fixed' (44750257) panicked at crates/marmot-app/src/client/recovery.rs:1262:62:",
+        "test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 1467 filtered out; finished in 8.24s"
+      ],
+      "format_diff_files": [],
+      "exit_code": 101,
+      "command": "cargo test --target-dir /Volumes/Worktrees/codex/a430/mdk/target -p marmot-app --lib client::recovery::tests:: -- --test-threads=2"
+    },
+    {
+      "check": "sync",
+      "log_path": "/tmp/mdk-1946-checkpoint-13395cc1-sync.log",
+      "sha256": "0dd730df5bf1fa172ed2fd8d55ad90e825947001e7b0bf663bd393cc3f50f0d0",
+      "bytes": 5875,
+      "results": [
+        "test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 1445 filtered out; finished in 68.60s"
+      ],
+      "format_diff_files": [],
+      "exit_code": 0,
+      "command": "cargo test --target-dir /Volumes/Worktrees/codex/a430/mdk/target -p marmot-app --lib client::sync::tests:: -- --test-threads=2"
+    },
+    {
+      "check": "worker-repair",
+      "log_path": "/tmp/mdk-1946-checkpoint-13395cc1-worker-repair.log",
+      "sha256": "c86f4999f1e75109ea0eccb6e85c50a29289bd71c619df0c41a3daa12706659e",
+      "bytes": 3944,
+      "results": [
+        "test runtime::account_worker::tests::full_history_repair_consumes_prearmed_backfill_without_replaying_twice ... FAILED",
+        "thread 'runtime::account_worker::tests::full_history_repair_consumes_prearmed_backfill_without_replaying_twice' (44757174) panicked at crates/marmot-app/src/runtime/account_worker.rs:7289:9:",
+        "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 1473 filtered out; finished in 5.73s"
+      ],
+      "format_diff_files": [],
+      "exit_code": 101,
+      "command": "cargo test --target-dir /Volumes/Worktrees/codex/a430/mdk/target -p marmot-app --lib runtime::account_worker::tests::full_history_repair -- --test-threads=2"
+    },
+    {
+      "check": "qualified-warning",
+      "log_path": "/tmp/mdk-1946-checkpoint-13395cc1-qualified-warning.log",
+      "sha256": "dfe803fa2ec2546349fbc27c9ea74b714472d590e4f4b12f3cea83d845b7ee1d",
+      "bytes": 2920,
+      "results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1476 filtered out; finished in 1.02s"
+      ],
+      "format_diff_files": [],
+      "exit_code": 0,
+      "command": "cargo test --target-dir /Volumes/Worktrees/codex/a430/mdk/target -p marmot-app --lib recovery_warning_requires_qualified_local_observations -- --test-threads=2"
+    },
+    {
+      "check": "fmt",
+      "log_path": "/tmp/mdk-1946-checkpoint-13395cc1-fmt.log",
+      "sha256": "0ab6c6a7069b890032e03efd20f36f6683b2d3a477021c7dff4edd00b52a5ab8",
+      "bytes": 223707,
+      "results": [],
+      "format_diff_files": [
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-account/src/runtime.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-app/src/client/epoch_stall.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-app/src/client/mod.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-app/src/client/recovery.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-app/src/client/sync.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-app/src/lib.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-app/src/relay_plane/mod.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-app/src/relay_plane/tests.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-app/src/runtime/account_worker.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/marmot-app/src/tests.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/storage-sqlite/src/account_recovery.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/storage-sqlite/src/account_recovery/demand.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/storage-sqlite/src/account_recovery/plan.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/storage-sqlite/src/account_recovery/stall.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/storage-sqlite/src/lib.rs",
+        "/Volumes/Worktrees/codex/1946-recovery-owner/mdk/crates/storage-sqlite/src/transport_reconciliation.rs"
+      ],
+      "exit_code": 1,
+      "command": "cargo fmt --all -- --check"
+    }
+  ]
+}

@@ -469,6 +469,16 @@ pub(crate) enum AccountWorkerCommand {
     },
     /// Count seeded groups the session has not fully hydrated yet, without
     /// promoting them on demand (mdk#1337 regression probe).
+    /// Controlled-clock fixture; changes no durable row and grants no I/O.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    AdvanceRecoveryClock {
+        elapsed: Duration,
+        respond: oneshot::Sender<()>,
+    },
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    RecoveryRetrySnapshot {
+        respond: oneshot::Sender<(storage_sqlite::RecoveryRetryState, Duration, bool)>,
+    },
     #[cfg(test)]
     UnhydratedGroupCount {
         respond: oneshot::Sender<usize>,
@@ -804,7 +814,7 @@ async fn run_app_runtime_account_worker(
                 barrier.wait().await;
             }
             let summary = client
-                .sync_with_stage_telemetry(&startup_stage_telemetry)
+                .sync_with_stage_telemetry(&startup_stage_telemetry, false)
                 .await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
@@ -938,19 +948,10 @@ async fn run_app_runtime_account_worker(
             )
             .await;
             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
-            let backfill_result = run_pending_epoch_backfill_reporting_arm(
-                &mut client,
-                &events,
-                &account_id_hex,
-                &account_label,
-                &shared,
-                EpochBackfillExecutionSeam::Startup,
-            )
-            .await;
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
             }
-            backfill_result
+            Ok(())
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
@@ -1802,7 +1803,7 @@ async fn run_app_runtime_account_worker(
                         crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
                     );
                     let catch_up = timeout(
-                        Duration::from_secs(15), client.sync_with_partial_progress(),
+                        Duration::from_secs(15), client.sync_automatically_with_partial_progress(),
                     ).await;
                     let outcome = match &catch_up {
                         Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
@@ -2000,7 +2001,7 @@ async fn handle_account_worker_catch_up(
     let sync_started_at = Instant::now();
     let stage_telemetry = context.shared.app_performance_telemetry();
     let sync_result = {
-        let mut sync = std::pin::pin!(client.sync_with_stage_telemetry(&stage_telemetry));
+        let mut sync = std::pin::pin!(client.sync_with_stage_telemetry(&stage_telemetry, true));
         loop {
             let command = if let Some(command) = pending.pop_front() {
                 Some(command)
@@ -2118,19 +2119,10 @@ async fn handle_account_worker_catch_up(
                 context.account_label,
             )
             .await;
-            let backfill_result = run_pending_epoch_backfill_reporting_arm(
-                client,
-                context.events,
-                context.account_id_hex,
-                context.account_label,
-                context.shared,
-                EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await;
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 context.shared.schedule_audit_log_tracker_update("catch_up");
             }
-            backfill_result
+            Ok(())
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
@@ -2610,6 +2602,15 @@ async fn handle_startup_hydration_command(
                     .retry_pending_push_registration_shares_best_effort()
                     .await;
             }
+        }
+        #[cfg(any(test, feature = "test-policy-overrides"))]
+        AccountWorkerCommand::RecoveryRetrySnapshot { respond } => {
+            let storage = client.app.account_storage(&client.state.label).unwrap();
+            let _ = respond.send((
+                storage.recovery_retry_state().unwrap(),
+                client.recovery_owner.test_retry_remaining(&storage),
+                storage.recovery_comparison().unwrap().pending(),
+            ));
         }
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => {
@@ -3245,6 +3246,22 @@ fn account_worker_command_future<'a>(
             );
             false
         }),
+        #[cfg(any(test, feature = "test-policy-overrides"))]
+        AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond } => Box::pin(async move {
+            client.recovery_owner.test_advance_clock(elapsed);
+            let _ = respond.send(());
+            true
+        }),
+        #[cfg(any(test, feature = "test-policy-overrides"))]
+        AccountWorkerCommand::RecoveryRetrySnapshot { respond } => Box::pin(async move {
+            let storage = client.app.account_storage(&client.state.label).unwrap();
+            let _ = respond.send((
+                storage.recovery_retry_state().unwrap(),
+                client.recovery_owner.test_retry_remaining(&storage),
+                storage.recovery_comparison().unwrap().pending(),
+            ));
+            true
+        }),
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => Box::pin(async move {
             let count = client.runtime.session().unhydrated_group_ids().len();
@@ -3262,19 +3279,10 @@ fn account_worker_command_future<'a>(
                         account_id_hex,
                         account_label,
                     );
-                    let backfill_result = run_pending_epoch_backfill_reporting_arm(
-                        client,
-                        events,
-                        account_id_hex,
-                        account_label,
-                        shared,
-                        EpochBackfillExecutionSeam::ExplicitCatchUp,
-                    )
-                    .await;
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("catch_up");
                     }
-                    backfill_result
+                    Ok(())
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
@@ -3367,10 +3375,7 @@ fn account_worker_command_future<'a>(
                         account_label,
                         message.clone(),
                     );
-                    Err(AccountCatchUpFailure::new(
-                        message,
-                        failure.classification(),
-                    ))
+                    Err(AccountCatchUpFailure::from_sync_failure(message, &failure))
                 }
             };
             shared.app_performance_telemetry().record_classified_result(
@@ -5345,6 +5350,22 @@ async fn start_post_join_history_after_visibility(
     if summary.joined_groups.is_empty() {
         return;
     }
+    // Visibility is already published. Install ordinary live interest now,
+    // independently of the history owner's cooldown. Waiting for the retry
+    // timer leaves a newly joined account unrouted while another local account
+    // can already receive the SDK's single deduplicated copy of a group event.
+    // Failures retain the existing bounded registration-retry intent.
+    if let Err(error) = client
+        .retry_pending_runtime_group_subscription_refresh()
+        .await
+    {
+        publish_app_runtime_account_error(
+            events,
+            account_id_hex,
+            account_label,
+            account_error_message("post-join live subscription refresh failed", &error),
+        );
+    }
     if let Err(error) = client.advance_post_join_maintenance_subscriptions().await {
         publish_app_runtime_account_error(
             events,
@@ -5427,7 +5448,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
             Err(_) => "failure",
         });
     }
-    let mut result = match backfill_result {
+    let result = match backfill_result {
         // An incomplete replay published the same real summary: it ingested
         // whatever it reached before the relays failed to confirm they had
         // served the account's stored history. Its intent stays pending, so the
@@ -5460,43 +5481,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
     if backfill_armed {
         shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
     }
-    // An epoch replay is itself a large relay burst and can discover the
-    // bounded account queue's overflow record. Resolve that distinct durable
-    // gap immediately instead of waiting for unrelated later traffic to wake
-    // another sync seam.
-    if result.is_ok() && client.delivery_overflow_recovery_pending {
-        result = match client.recover_delivery_overflow().await {
-            Ok(
-                DeliveryOverflowRecoveryOutcome::Completed(summary)
-                | DeliveryOverflowRecoveryOutcome::Incomplete(summary),
-            ) => {
-                publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
-                Ok(())
-            }
-            Err(failure) => {
-                publish_app_runtime_summary(
-                    events,
-                    account_id_hex,
-                    account_label,
-                    &failure.partial_summary,
-                );
-                let message = account_error_message(
-                    "account delivery overflow recovery failed",
-                    &failure.source,
-                );
-                publish_app_runtime_account_error(
-                    events,
-                    account_id_hex,
-                    account_label,
-                    message.clone(),
-                );
-                Err(AccountCatchUpFailure::new(
-                    message,
-                    failure.classification(),
-                ))
-            }
-        };
-    }
+
     result
 }
 
@@ -5864,9 +5849,10 @@ mod tests {
             "wss://relay.example",
             crate::MarmotAppConfig::default()
                 .with_dev_settlement_quiescence_ms(100)
-                .with_dev_scheduled_convergence_delay_ms(60_000),
+                .with_dev_scheduled_convergence_delay_ms(60_000)
+                .with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
-        .with_test_relay_client(relay);
+        .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
         runtime.reconcile_accounts().await.unwrap();
@@ -5926,6 +5912,13 @@ mod tests {
             .unwrap()
             .shutdown()
             .await;
+        // Lost history remains independent of the runnable local passes. The
+        // account already owes the cooldown reserved by catch-up.
+        let retry = storage.recovery_retry_state().unwrap();
+        let activations = relay.subscription_count();
+        storage
+            .record_account_delivery_loss("bob", 771, 1, crate::unix_now_seconds())
+            .unwrap();
         let first_pass = Arc::new(tokio::sync::Barrier::new(2));
         runtime
             .shared_services()
@@ -5984,6 +5977,23 @@ mod tests {
         })
         .await
         .expect("recovery must not starve the queued commands");
+        assert_eq!(
+            storage.recovery_retry_state().unwrap(),
+            retry,
+            "both actual scheduled convergence passes preserve history retry cost"
+        );
+        assert_eq!(
+            relay.subscription_count(),
+            activations,
+            "post-convergence and maintenance cannot bypass the owner cooldown"
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|d| d.cause == storage_sqlite::RecoveryCause::QueueLoss)
+        );
         runtime.drain_in_flight_work().await.unwrap();
         runtime.shutdown_and_close().await.unwrap();
     }
@@ -6016,9 +6026,18 @@ mod tests {
                 .observe_resource_refusal(group_id.clone(), epoch, 1),
             BackfillDecision::Arm
         );
-        for _ in 0..3 {
-            let _ = client.epoch_stall.observe_fruitless_completion([&group_id]);
-        }
+        // This test exercises notification delivery from a durable warning,
+        // not qualification. Actual evidence counting is covered by the
+        // qualified local-evaluation and storage certificate tests.
+        client.epoch_stall.restore_wedge_evidence([(
+            group_id.clone(),
+            crate::client::epoch_stall::EpochStallEvidence {
+                stalled_epoch: epoch.0,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: 1,
+            },
+        )]);
         client.persist_epoch_stall_evidence([&group_id]);
         client
             .finish_scheduled_convergence_effects(
@@ -6850,92 +6869,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_epoch_backfill_success_records_correlated_lifecycle_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(AuditLogSettings { enabled: true })
-            .unwrap();
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("successful epoch backfill audit", &[])
+    async fn pending_epoch_backfill_records_correlated_qualified_and_incomplete_attempts() {
+        for qualified in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay_and_config(
+                dir.path(),
+                "wss://relay.example".to_owned(),
+                bounded_epoch_backfill_config(),
+            )
+            .with_test_relay_client(relay.clone());
+            app.set_audit_log_settings(AuditLogSettings { enabled: true })
+                .unwrap();
+            let _eose =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let group_id = client
+                .create_group("successful epoch backfill audit", &[])
+                .await
+                .unwrap();
+            let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+            client.apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            );
+
+            if qualified {
+                client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
+            }
+            let (events, _subscriber) = broadcast::channel(4);
+            let shared = RuntimeSharedServices::default();
+            run_pending_epoch_backfill_reporting_arm(
+                &mut client,
+                &events,
+                "account-id",
+                "alice",
+                &shared,
+                EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
 
-        let (events, _subscriber) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        run_pending_epoch_backfill_reporting_arm(
-            &mut client,
-            &events,
-            "account-id",
-            "alice",
-            &shared,
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
-        )
-        .await
-        .unwrap();
-
-        let rows: Vec<serde_json::Value> = app
-            .audit_log_files()
-            .unwrap()
-            .into_iter()
-            .flat_map(|file| {
-                std::fs::read_to_string(file.path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let attempt_id = rows
-            .iter()
-            .find(|row| row["kind"]["type"] == "epoch_stall_backfill_armed")
-            .and_then(|row| row["context"]["operation_id"].as_str())
-            .expect("armed row must carry operation_id");
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
-                .count(),
-            1
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
-                .count(),
-            1
-        );
-        assert!(
-            rows.iter()
-                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
-                .count()
-                == 0
-        );
-        assert!(rows.iter().all(|row| {
-            !matches!(
-                row["kind"]["type"].as_str(),
-                Some(
-                    "epoch_stall_backfill_started"
-                        | "epoch_stall_backfill_completed"
-                        | "epoch_stall_backfill_failed"
-                )
-            ) || row["context"]["operation_id"].as_str() == Some(attempt_id)
-        }));
+            let rows: Vec<serde_json::Value> = app
+                .audit_log_files()
+                .unwrap()
+                .into_iter()
+                .flat_map(|file| {
+                    std::fs::read_to_string(file.path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let attempt_id = rows
+                .iter()
+                .find(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+                .and_then(|row| row["context"]["operation_id"].as_str())
+                .expect("owner attempt must carry operation_id");
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
+                    .count(),
+                usize::from(qualified)
+            );
+            assert!(
+                rows.iter()
+                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+                    .count()
+                    == usize::from(!qualified)
+            );
+            assert!(rows.iter().all(|row| {
+                !matches!(
+                    row["kind"]["type"].as_str(),
+                    Some(
+                        "epoch_stall_backfill_started"
+                            | "epoch_stall_backfill_completed"
+                            | "epoch_stall_backfill_failed"
+                    )
+                ) || row["context"]["operation_id"].as_str() == Some(attempt_id)
+            }));
+        }
     }
 
     #[tokio::test]
@@ -6948,7 +6973,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
         .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(AuditLogSettings { enabled: true })
@@ -7020,8 +7045,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!client.has_pending_epoch_backfill());
+        assert!(client.has_pending_epoch_backfill());
         let subscriptions_after_replay = relay.subscription_count();
+        let retry = app
+            .account_storage("alice")
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap();
+        assert_eq!(retry.attempt_serial, 2);
 
         run_pending_epoch_backfill_reporting_arm(
             &mut client,
@@ -7029,18 +7060,25 @@ mod tests {
             "account-id",
             "alice",
             &shared,
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
+            EpochBackfillExecutionSeam::Maintenance,
         )
         .await
         .unwrap();
         assert_eq!(relay.subscription_count(), subscriptions_after_replay);
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap(),
+            retry
+        );
     }
 
-    /// Phase-A characterization for #1946. Keep the same workload when the
-    /// recovery owner replaces this seam; then invert the bypass assertions.
+    /// The Phase-A workload: epoch and overflow join one owner reservation;
+    /// a later receive seam cannot bypass the durable account cooldown.
     #[cfg(feature = "test-policy-overrides")]
     #[tokio::test]
-    async fn recovery_ownership_baseline_overflow_bypasses_epoch_cooldown() {
+    async fn recovery_owner_coalesces_overflow_and_epoch_demand_across_seams() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -7075,16 +7113,20 @@ mod tests {
         let (events, _subscriber) = broadcast::channel(16);
         let shared = RuntimeSharedServices::default();
         let before = relay.unfloored_account_subscription_count();
+        client
+            .sync_with_stage_telemetry(&shared.app_performance_telemetry(), false)
+            .await
+            .unwrap();
         for (seam, expected_activations, reason) in [
             (
                 EpochBackfillExecutionSeam::Maintenance,
-                2,
-                "epoch replay chains straight into overflow",
+                1,
+                "startup joined compatible epoch, incremental and overflow demand in one activation",
             ),
             (
                 EpochBackfillExecutionSeam::Receive,
-                3,
-                "overflow runs again while the epoch replay is paced",
+                1,
+                "receive cannot bypass the account owner cooldown",
             ),
         ] {
             run_pending_epoch_backfill_reporting_arm(
@@ -7097,13 +7139,63 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(client.epoch_backfill_retry_is_paced(seam));
+            let retry = app
+                .account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap();
+            assert_eq!(retry.attempt_serial, 1);
+            assert_eq!(retry.not_before_ms - retry.recorded_at_ms, 300_000);
             assert_eq!(
                 relay.unfloored_account_subscription_count() - before,
                 expected_activations,
-                "baseline: {reason}",
+                "{reason}",
             );
         }
+        let retry = app
+            .account_storage("alice")
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap();
+        client
+            .advance_convergence_after_runtime_sync(&group)
+            .await
+            .unwrap();
+        run_pending_epoch_backfill_reporting_arm(
+            &mut client,
+            &events,
+            "account-id",
+            "alice",
+            &shared,
+            EpochBackfillExecutionSeam::Maintenance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap(),
+            retry
+        );
+        assert_eq!(relay.unfloored_account_subscription_count() - before, 1);
+        client
+            .sync_with_classified_partial_progress()
+            .await
+            .unwrap();
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            2
+        );
+        assert_eq!(
+            relay.unfloored_account_subscription_count() - before,
+            2,
+            "one genuine explicit caller spends one override without a nested overflow replay"
+        );
         assert!(client.has_pending_epoch_backfill());
         assert!(client.delivery_overflow_recovery_pending);
         assert_eq!(
@@ -7187,6 +7279,7 @@ mod tests {
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
 
+        let before = relay.unfloored_account_subscription_count();
         let (events, _subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
         let (command_tx, mut commands) = mpsc::channel(1);
@@ -7205,12 +7298,17 @@ mod tests {
 
         response.await.unwrap().unwrap();
         assert!(
-            !client.has_pending_epoch_backfill(),
-            "catch-up must consume the replay intent before sending success",
+            client.has_pending_epoch_backfill(),
+            "ordinary catch-up cannot certify complete historical coverage",
         );
-        assert!(
-            relay.subscription_count() >= 2,
-            "catch-up must perform its floored sync and the pending unfloored replay",
+        assert_eq!(relay.unfloored_account_subscription_count(), before + 1);
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            1
         );
         drop(command_tx);
     }
@@ -7236,15 +7334,16 @@ mod tests {
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        client
-            .pending_epoch_backfill
-            .as_mut()
-            .expect("backfill must be armed")
-            .groups
-            .insert(
-                test_group_id(0xde),
-                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
-            );
+        let storage = app.account_storage("alice").unwrap();
+        let mut orphan = client.runtime.group_record(&group_id).unwrap();
+        orphan.id = test_group_id(0xde);
+        cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
+        storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(orphan.id.as_slice()),
+                stalled_epoch: 1,
+            }])
+            .unwrap();
         let subscriptions_before = relay.subscription_count();
 
         let (events, _subscriber) = broadcast::channel(4);
@@ -7276,7 +7375,7 @@ mod tests {
             "the unavailable recovery intent must remain pending"
         );
         let outcome = client
-            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
+            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
             .await
             .expect("rechecking a deferred intent must not fail");
         assert!(
@@ -7288,73 +7387,96 @@ mod tests {
 
     #[tokio::test]
     async fn full_history_repair_consumes_prearmed_backfill_without_replaying_twice() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_test_relay_client(relay.clone());
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("full-history epoch backfill", &[])
-            .await
-            .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        let subscriptions_before_repair = relay.subscription_count();
+        for qualified in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay_and_config(
+                dir.path(),
+                "wss://relay.example".to_owned(),
+                bounded_epoch_backfill_config(),
+            )
+            .with_test_relay_client(relay.clone());
+            let _eose =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let group_id = client
+                .create_group("full-history epoch backfill", &[])
+                .await
+                .unwrap();
+            let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+            client.apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            );
+            if qualified {
+                client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
+            }
+            let subscriptions_before_repair = relay.subscription_count();
 
-        let (events, _subscriber) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        let (respond, response) = oneshot::channel();
-        let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
-        let (media_http_worker_lifetime, _) = watch::channel(());
-        let media_http = MediaHttpContext {
-            product: Default::default(),
-            tx: media_http_tx,
-            permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
-            prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
-            worker_lifetime: media_http_worker_lifetime,
-        };
-        let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
-        let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
-        handle_account_worker_command(
-            &mut client,
-            AccountWorkerCommand::RepairFullHistory { respond },
-            AccountWorkerCommandContext {
-                commands: &mut unused_commands,
-                pending: &mut unused_pending,
-                app: &app,
-                events: &events,
-                account_id_hex: "account-id",
-                account_label: "alice",
-                shared: &shared,
-                media_http: &media_http,
-                scheduled_convergence: &mut scheduled_convergence,
-            },
-        )
-        .await;
+            let (events, _subscriber) = broadcast::channel(4);
+            let shared = RuntimeSharedServices::default();
+            let (respond, response) = oneshot::channel();
+            let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
+            let (media_http_worker_lifetime, _) = watch::channel(());
+            let media_http = MediaHttpContext {
+                product: Default::default(),
+                tx: media_http_tx,
+                permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+                prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                worker_lifetime: media_http_worker_lifetime,
+            };
+            let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
+            let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
+            handle_account_worker_command(
+                &mut client,
+                AccountWorkerCommand::RepairFullHistory { respond },
+                AccountWorkerCommandContext {
+                    commands: &mut unused_commands,
+                    pending: &mut unused_pending,
+                    app: &app,
+                    events: &events,
+                    account_id_hex: "account-id",
+                    account_label: "alice",
+                    shared: &shared,
+                    media_http: &media_http,
+                    scheduled_convergence: &mut scheduled_convergence,
+                },
+            )
+            .await;
 
-        response.await.unwrap().unwrap();
-        assert!(
-            !client.has_pending_epoch_backfill(),
-            "every successful sync seam must consume an armed replay intent",
-        );
-        assert_eq!(
-            relay.subscription_count(),
-            subscriptions_before_repair + 2,
-            "the explicit unfloored repair already fulfills the pending replay",
-        );
+            let result = response.await.unwrap();
+            if qualified {
+                result.unwrap();
+                assert!(!client.has_pending_epoch_backfill());
+            } else {
+                let failure = result.unwrap_err();
+                assert!(
+                    failure
+                        .to_string()
+                        .contains("full_history_coverage_unproven"),
+                    "{failure}"
+                );
+                assert!(client.has_pending_epoch_backfill());
+            }
+            assert_eq!(
+                app.account_storage("alice")
+                    .unwrap()
+                    .recovery_retry_state()
+                    .unwrap()
+                    .attempt_serial,
+                1
+            );
+            assert_eq!(
+                relay.subscription_count(),
+                subscriptions_before_repair + 2,
+                "one activation serves the coalesced demands without a second replay",
+            );
+        }
     }
 
     #[tokio::test]
@@ -7394,17 +7516,17 @@ mod tests {
         client
             .repair_full_history()
             .await
-            .expect("both EOSE-confirmed recovery obligations must complete");
+            .expect_err("EOSE alone cannot complete either recovery predicate");
 
-        assert!(!client.has_pending_epoch_backfill());
-        assert!(!client.delivery_overflow_recovery_pending);
+        assert!(client.has_pending_epoch_backfill());
+        assert!(client.delivery_overflow_recovery_pending);
         assert!(
             app.account_storage("alice")
                 .unwrap()
                 .account_delivery_recovery("alice")
                 .unwrap()
-                .is_none(),
-            "success must clear the durable overflow marker",
+                .is_some(),
+            "unproven coverage must preserve the durable overflow marker",
         );
     }
 
@@ -7440,11 +7562,23 @@ mod tests {
             SyncFailureStage::RelayReceive
         );
         assert!(
-            failure
-                .source
-                .to_string()
-                .contains("account_delivery_queue_overflow"),
+            failure.source.privacy_safe_kind() == "account_delivery_queue_overflow",
             "the public failure must identify the unresolved durable gap",
+        );
+        assert!(
+            matches!(
+                failure.source,
+                AppError::FullHistoryRepairIncomplete {
+                    reason,
+                    delivery_loss_pending: true,
+                } if reason == if cfg!(feature = "test-policy-overrides") {
+                    crate::FullHistoryRepairIncompleteReason::NoRelayEose
+                } else {
+                    crate::FullHistoryRepairIncompleteReason::Deadline
+                }
+            ),
+            "the stop reason and independent loss fact must both survive: {:?}",
+            failure.source
         );
         assert!(
             client.delivery_overflow_recovery_pending,
@@ -7486,21 +7620,22 @@ mod tests {
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        client
-            .pending_epoch_backfill
-            .as_mut()
-            .expect("backfill must be armed")
-            .groups
-            .insert(
-                test_group_id(0xde),
-                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
-            );
+        let storage = app.account_storage("alice").unwrap();
+        let mut orphan = client.runtime.group_record(&group_id).unwrap();
+        orphan.id = test_group_id(0xde);
+        cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
+        storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(orphan.id.as_slice()),
+                stalled_epoch: 1,
+            }])
+            .unwrap();
         let subscriptions_before = relay.subscription_count();
 
         client
             .repair_full_history()
             .await
-            .expect("explicit repair must fall back to its ordinary unfloored replay");
+            .expect_err("one owner attempt retains unproven and unresolved history");
 
         assert_eq!(
             relay.subscription_count(),
@@ -7514,7 +7649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_history_repair_runs_queued_intent_after_primary_defers() {
+    async fn full_history_repair_coalesces_new_demand_after_an_inflight_failure() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -7522,79 +7657,58 @@ mod tests {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
-            "wss://relay.example".to_owned(),
+            "wss://relay.example",
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_a = client.create_group("queued repair a", &[]).await.unwrap();
-        let group_b = client.create_group("queued repair b", &[]).await.unwrap();
-
-        let stalled_epoch_a = client.group_mls_state(&group_a).unwrap().epoch;
+        let group_a = client.create_group("demand a", &[]).await.unwrap();
+        let group_b = client.create_group("demand b", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
         client.apply_backfill_decision(
             &group_a,
-            stalled_epoch_a,
+            client.group_mls_state(&group_a).unwrap().epoch,
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        let execution = client
-            .begin_epoch_backfill_execution(EpochBackfillExecutionSeam::Maintenance)
-            .expect("first intent must begin");
-        let operation_a = execution.pending.attempt_id.clone();
-
-        let stalled_epoch_b = client.group_mls_state(&group_b).unwrap().epoch;
+        let grant = client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
         client.apply_backfill_decision(
             &group_b,
-            stalled_epoch_b,
+            client.group_mls_state(&group_b).unwrap().epoch,
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        let operation_b = client
-            .pending_epoch_backfill
-            .as_ref()
-            .expect("second intent must arm in flight")
-            .attempt_id
-            .clone();
-        client.test_finish_epoch_backfill_execution(execution, false);
-        client
-            .pending_epoch_backfill
-            .as_mut()
-            .expect("newer intent must be primary")
-            .groups
-            .insert(
-                test_group_id(0xde),
-                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
-            );
-        let unfloored_before = relay.unfloored_account_subscription_count();
-
-        client
-            .repair_full_history()
-            .await
-            .expect("repair must run the queued observable intent");
-
+        relay.fail_next_subscribe();
+        assert!(
+            client
+                .execute_recovery_grant(grant, None, None)
+                .await
+                .is_err()
+        );
+        let before = relay.unfloored_account_subscription_count();
+        let attempts = storage.recovery_retry_state().unwrap().attempt_serial;
+        assert!(
+            client
+                .repair_full_history()
+                .await
+                .unwrap_err()
+                .source
+                .to_string()
+                .contains("full_history_coverage_unproven")
+        );
+        assert_eq!(relay.unfloored_account_subscription_count(), before + 1);
         assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            unfloored_before + 1,
-            "the queued intent must execute exactly one account-wide replay"
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            attempts + 1
         );
-        assert!(
-            client
-                .queued_epoch_backfills
-                .iter()
-                .any(|pending| pending.attempt_id == operation_b),
-            "the unavailable intent must remain queued"
-        );
-        assert!(
-            client
-                .pending_epoch_backfill
-                .as_ref()
-                .is_none_or(|pending| pending.attempt_id != operation_a)
-                && client
-                    .queued_epoch_backfills
-                    .iter()
-                    .all(|pending| pending.attempt_id != operation_a),
-            "the queued observable intent must be consumed"
+        assert_eq!(
+            storage.pending_epoch_backfill_intents().unwrap().len(),
+            2,
+            "both independent gap predicates remain incomplete after the shared EOSE"
         );
     }
 
@@ -8020,6 +8134,7 @@ mod tests {
             AccountHome::open(dir.path())
                 .create_account("alice")
                 .unwrap();
+            AccountHome::open(dir.path()).create_account("bob").unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
             let app = MarmotApp::with_relay_and_config(
                 dir.path(),
@@ -8028,6 +8143,11 @@ mod tests {
             )
             .with_test_relay_client(relay.clone());
             let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let mut bob = client_on_app_relay_plane(&app, "bob").await;
+            let bob_id = cgka_traits::MemberId::new(
+                hex::decode(app.account_home().account("bob").unwrap().account_id_hex).unwrap(),
+            );
+            let bob_before = relay.inbox_subscription_count(&bob_id);
             let before = relay.subscription_count();
             let (events, _subscriber) = broadcast::channel(4);
             let shared = RuntimeSharedServices::default();
@@ -8080,6 +8200,29 @@ mod tests {
                     response.try_recv(),
                     Err(oneshot::error::TryRecvError::Empty)
                 ));
+                // Another account uses its own worker catch-up path while
+                // Alice's history drain still waits for cancellation. No relay
+                // boundary is supplied to manufacture either completion.
+                let (bob_tx, mut bob_commands) = mpsc::channel(1);
+                let mut bob_pending = VecDeque::new();
+                let (bob_respond, bob_response) = oneshot::channel();
+                handle_account_worker_catch_up(
+                    &mut bob,
+                    bob_respond,
+                    &mut bob_commands,
+                    &mut bob_pending,
+                    AccountWorkerCatchUpContext {
+                        app: &app,
+                        events: &events,
+                        account_id_hex: "bob-id",
+                        account_label: "bob",
+                        shared: &shared,
+                    },
+                )
+                .await;
+                bob_response.await.unwrap().unwrap();
+                assert_eq!(relay.inbox_subscription_count(&bob_id), bob_before + 1);
+                drop(bob_tx);
                 if caller_cancels {
                     drop(response);
                 } else {
@@ -8096,7 +8239,15 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(relay.subscription_count(), before + 1);
+            assert_eq!(relay.subscription_count(), before + 2);
+            assert_eq!(
+                app.account_storage("bob")
+                    .unwrap()
+                    .recovery_retry_state()
+                    .unwrap()
+                    .attempt_serial,
+                1
+            );
         }
     }
 }

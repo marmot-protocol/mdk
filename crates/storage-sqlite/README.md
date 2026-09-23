@@ -27,6 +27,74 @@ The crate is split around storage concerns:
   `shared/legacy.sql` defines recognized compatibility columns, and `shared/fixtures/` plus the migration and assurance
   tests cover adoption and recovery. `shared/error.rs` owns the privacy-safe error mapper and result extension.
 
+## Account recovery groundwork
+
+`account_recovery.rs` owns the durable account recovery ledger and retry reservations.
+Migration 0092 replaces the overflow and epoch-demand tables while retaining their Rust
+storage methods as adapters. The overflow marker task writes loss evidence only; the
+account owner imports that evidence transactionally. A NULL imported count means that
+an observation has not been imported, including a valid zero-count loss marker.
+
+Attempt reservations fence selected demand and imported loss, survive reopen, and refuse
+unknown scope versions. They do not certify coverage. `account_recovery/plan.rs` stores
+versioned frozen scopes and accepts owner-validated endpoint/admission checkpoints.
+History requires all designated scopes/endpoints; exclusions, EOSE and SDK seen state
+are insufficient. Known-event retention and the limited first maintenance boundary use
+separate predicates. A stale scope token rejects a multi-scope checkpoint before any
+progress is written. Domain updates may share the same `with_transaction` boundary.
+
+Migration 0093 adds the current route-policy snapshot, a unique explicit-history row,
+and a receipt-journal flag recording whether inventory invalidation already ran.
+It preserves populated obligations, loss evidence, retry state, receipts, maintenance,
+inventory and cursors. Repeated serialized callers reuse the row without resetting retry;
+a stale detach cannot clear the current caller's urgency. Unexpected duplicate explicit
+rows make migration fail atomically; no demand is silently discarded.
+
+`account_recovery/loss.rs` keeps qualified loss completion separate from external plane
+acknowledgment. Capture exact token/count watermarks before execution. After qualified
+completion, acknowledge the matching live generation and finish its writers before
+calling `acknowledge_recovery_loss`. The runtime uses `recovery_loss_snapshot` and
+`acknowledge_recovery_loss_snapshot`: a constant-size SHA-256 commitment to the complete
+ordered token/count set, streamed under the same connection lock. This avoids copying
+unbounded unresolved evidence into active grants without capping or deleting it. Both
+acknowledgment forms share the same transaction and revision/qualification checks.
+SQL cannot establish the external acknowledgment prerequisite.
+New evidence or a persistence failure prevents reclamation; the owner must compensate
+the live acknowledgment and call `restore_unacknowledged_recovery_loss` before new work.
+Call that restore method when constructing an owner as well. Zero-count loss is evidence.
+Legacy clear methods remain caller-directed retirement adapters, not completion proofs;
+retained legacy watermarks do not recreate explicitly retired demand.
+
+Inventory expiration, compaction and message release or route/group deletion bump the
+account inventory revision in the same transaction; reservations and plan installation
+check that revision. Installed proof is invalidated only for overlapping route/window
+scopes (and the exact event for known-event predicates). Unrelated or out-of-window
+retention churn cannot invalidate bounded completion or loss acknowledgment, including
+when a productive admission triggers compaction. Removing the last qualified proof
+reopens satisfied demand in the same transaction without forgiving account retry cost;
+an alternative known-event copy or independent maintenance boundary remains valid.
+Receipt release records scoped invalidation before deleting inventory. Consumption
+uses conservative invalidation only if neither inventory bounds nor that durable flag
+exist (including journal rows migrated from older schemas). No-op admission never
+scans recovery scopes.
+Idempotent deletes do not invalidate proof. `retained_recovery_event` checks exact route, event and frozen
+window membership after the caller synchronizes release receipts; it does not certify
+successful decryption or engine readiness.
+
+**Merge gate:** this storage slice is stacked on #1983 and cannot ship independently.
+Runtime integration must replace competing dispatch/clear callers, provide qualified
+executor evidence and same-schema conservative handoff, and demonstrate bounded evidence
+reclamation under [the recovery design](../../docs/marmot-architecture/further-context/account-recovery-ownership.md).
+That integration, runtime cancellation-by-drop, policy/stagnation migration 0094 and
+SDK/acquisition changes are outside this slice. Old binaries refuse the upgraded schema;
+binary downgrade requires a pre-upgrade backup. Storage tests do not claim that the
+current production executor can supply exhaustive coverage. Completed known-event
+rows require owner-managed reclamation after no ticket/grant can reference them;
+this bounded-lifetime gate must be demonstrated before activation. An unbounded
+`since = None` includes older retained input, so its retirement must invalidate proof.
+The owner must use finite automatic goals and preserve uncovered older-history debt;
+it must not silently clip an explicit full-history request to the retention floor.
+
 ## Replay-state validation
 
 `group_replay_state_fingerprint` captures a consistent read of the same live canonical/OpenMLS state as a
@@ -171,3 +239,9 @@ for the full-row query versus 15.1 ms for metadata, avoiding 8 MiB of full paylo
 The query still enumerates all deferred metadata so an unattempted row beyond a previously
 attempted prefix remains visible. Candidate-graph cost and repeated zero-attempt wake pacing
 remain follow-up work in [#1715](https://github.com/marmot-protocol/mdk/issues/1715).
+
+Legacy token-only overflow retirement records a per-token retired watermark separately
+from import. Clearing one token restores any other joined generations and returns
+`false` while loss remains, preserving the runtime's pending flag across reopen.
+Late duplicate writers cannot resurrect a retired generation; increased counts can.
+The coordinated owner still owns qualified completion and bounded evidence reclamation.

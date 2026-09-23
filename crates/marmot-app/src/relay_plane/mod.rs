@@ -166,6 +166,8 @@ pub(crate) struct AccountDeliveryOverflow {
     pub(crate) generation: u64,
     pub(crate) marker_token: u64,
     pub(crate) dropped: u64,
+    pub(crate) notification_losses: u64,
+    pub(crate) notification_token: u64,
     pub(crate) queue_depth: usize,
     pub(crate) elapsed_ms: u64,
 }
@@ -187,8 +189,12 @@ struct AccountDeliveryOverflowInner {
     generation: u64,
     pending: bool,
     signal_queued: bool,
+    marker_signal_pending: bool,
     recovery_in_progress: bool,
     dropped: u64,
+    notification_losses: u64,
+    notification_token: u64,
+    notification_imported: u64,
     queue_depth: usize,
     started_at: Option<Instant>,
     recovery_started_at: Option<Instant>,
@@ -256,6 +262,14 @@ impl AccountDeliveryOverflowState {
     /// Record an omitted delivery and return the generation only when this
     /// caller must enqueue the generation's control record.
     fn record_drop(&self, queue_depth: usize) -> Option<u64> {
+        self.record_loss(queue_depth, false)
+    }
+
+    fn record_notification_loss(&self) -> Option<u64> {
+        self.record_loss(0, true)
+    }
+
+    fn record_loss(&self, queue_depth: usize, notification: bool) -> Option<u64> {
         let mut state = self
             .inner
             .lock()
@@ -264,15 +278,24 @@ impl AccountDeliveryOverflowState {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
             state.dropped = 0;
+            state.notification_losses = 0;
+            state.notification_token = 0;
+            state.notification_imported = 0;
             state.started_at = Some(Instant::now());
             state.marker_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
             state.marker_in_progress = false;
             state.marker_durable = false;
             state.marker_closed = false;
         }
-        state.dropped = state.dropped.saturating_add(1);
+        if notification {
+            state.notification_losses = state.notification_losses.saturating_add(1);
+            state.notification_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
+        } else {
+            state.dropped = state.dropped.saturating_add(1);
+            state.marker_durable = false;
+            RelayNotificationForwarderHealth::increment(&self.metrics.dropped, 1);
+        }
         state.queue_depth = state.queue_depth.max(queue_depth);
-        RelayNotificationForwarderHealth::increment(&self.metrics.dropped, 1);
         self.observe_queue_depth(queue_depth);
         if state.signal_queued {
             None
@@ -289,30 +312,57 @@ impl AccountDeliveryOverflowState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.generation == generation {
             state.signal_queued = false;
+            state.marker_signal_pending = false;
+        }
+    }
+
+    fn defer_marker_signal(&self, generation: u64) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if state.generation == generation {
+            state.marker_signal_pending = true;
+        }
+    }
+
+    fn take_durable_marker_signal(&self, generation: u64) -> bool {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if state.generation == generation
+            && state.marker_signal_pending
+            && (state.marker_durable || state.marker_closed)
+            && !state.marker_in_progress
+        {
+            state.marker_signal_pending = false;
+            true
+        } else {
+            false
         }
     }
 
     /// Claim the one account-local marker worker for the current generation.
-    /// Once the marker is durable (or storage has closed), later omissions need
-    /// only update the bounded counter and reuse the existing control record.
+    /// Each increased queue count must become durable. One writer aggregates
+    /// changes while active; notification incidents belong to the account worker.
     fn start_marker_persistence(&self) -> bool {
         let mut state = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.marker_durable || state.marker_closed || state.marker_in_progress {
+        if state.dropped == 0
+            || state.marker_durable
+            || state.marker_closed
+            || state.marker_in_progress
+        {
             return false;
         }
         state.marker_in_progress = true;
         true
     }
 
+    #[cfg(test)]
     fn marker_barrier_complete(&self) -> bool {
         let state = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.marker_durable || state.marker_closed
+        state.dropped == 0 || state.marker_durable || state.marker_closed
     }
 
     /// Persist the generation marker on one account-local blocking worker while
@@ -343,6 +393,9 @@ impl AccountDeliveryOverflowState {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if state.generation == generation {
+                        if state.dropped != dropped {
+                            continue;
+                        }
                         state.marker_in_progress = false;
                         state.marker_durable = true;
                     }
@@ -382,6 +435,18 @@ impl AccountDeliveryOverflowState {
             if state.generation != generation {
                 return;
             }
+        }
+    }
+
+    fn notification_persisted(&self, observed: AccountDeliveryOverflow) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation == observed.generation
+            && state.notification_token == observed.notification_token
+        {
+            state.notification_imported = observed.notification_losses;
         }
     }
 
@@ -431,6 +496,27 @@ impl AccountDeliveryOverflowState {
         Self::snapshot(&state)
     }
 
+    fn restore_recovery_guard(&self, durable_marker_token: u64) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.pending {
+            state.generation = state.generation.saturating_add(1);
+            state.pending = true;
+            state.dropped = 0;
+            state.notification_losses = 0;
+            state.notification_token = 0;
+            state.notification_imported = 0;
+            state.queue_depth = 0;
+            state.started_at = Some(Instant::now());
+            state.marker_token = durable_marker_token;
+            state.marker_durable = true;
+            state.marker_closed = false;
+            state.recovery_in_progress = false;
+        }
+    }
+
     fn finish_recovery(&self, attempt: AccountDeliveryOverflow) -> Option<u64> {
         let mut state = self
             .inner
@@ -438,7 +524,13 @@ impl AccountDeliveryOverflowState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let resolved = state.pending
             && state.generation == attempt.generation
+            && state.marker_token == attempt.marker_token
             && state.dropped == attempt.dropped
+            && state.notification_losses == attempt.notification_losses
+            && state.notification_imported == state.notification_losses
+            && (state.dropped == 0 || state.marker_durable)
+            && !state.marker_in_progress
+            && !state.marker_closed
             && !state.signal_queued;
         if resolved {
             state.pending = false;
@@ -490,6 +582,8 @@ impl AccountDeliveryOverflowState {
             generation: state.generation,
             marker_token: state.marker_token,
             dropped: state.dropped,
+            notification_losses: state.notification_losses,
+            notification_token: state.notification_token,
             queue_depth: state.queue_depth,
             elapsed_ms: state
                 .started_at
@@ -689,11 +783,17 @@ impl MarmotRelayPlane {
         // can always carry the explicit recovery signal without awaiting the
         // slow consumer or blocking the shared router.
         let (delivery_tx, delivery_rx) = mpsc::channel(ACCOUNT_DELIVERY_BUFFER + 1);
-        let delivery_overflow = Arc::new(AccountDeliveryOverflowState {
-            inner: std::sync::Mutex::new(AccountDeliveryOverflowInner::default()),
-            metrics: self.inner.transport.account_delivery_metrics.clone(),
-        });
-        account_deliveries_write(&self.inner.transport.account_deliveries).insert(
+        let mut routes = account_deliveries_write(&self.inner.transport.account_deliveries);
+        let delivery_overflow = routes
+            .get(&account_id)
+            .map(|route| route.overflow.clone())
+            .unwrap_or_else(|| {
+                Arc::new(AccountDeliveryOverflowState {
+                    inner: std::sync::Mutex::new(AccountDeliveryOverflowInner::default()),
+                    metrics: self.inner.transport.account_delivery_metrics.clone(),
+                })
+            });
+        routes.insert(
             account_id.clone(),
             AccountDeliveryRoute {
                 sender: delivery_tx,
@@ -1221,38 +1321,10 @@ impl MarmotRelayPlane {
                     route.overflow.observe_queue_depth(queue_depth);
                     if route.sender.capacity() <= 1 {
                         let signal_generation = route.overflow.record_drop(queue_depth);
-                        if let Some(generation) = signal_generation {
-                            if let Some(marker) = route.recovery_marker.clone() {
-                                if route.overflow.marker_barrier_complete() {
-                                    enqueue_account_delivery_overflow_signal(
-                                        &route.sender,
-                                        &route.overflow,
-                                        generation,
-                                    );
-                                } else if route.overflow.start_marker_persistence() {
-                                    // One account-local task owns this generation's
-                                    // persistence. The omitted payload is dropped
-                                    // here; later omissions update only the bounded
-                                    // counter while the shared router keeps serving
-                                    // every other account.
-                                    let sender = route.sender.clone();
-                                    let overflow_state = route.overflow.clone();
-                                    tokio::spawn(async move {
-                                        overflow_state.persist_marker_before_drop(marker).await;
-                                        enqueue_account_delivery_overflow_signal(
-                                            &sender,
-                                            &overflow_state,
-                                            generation,
-                                        );
-                                    });
-                                }
-                            } else {
-                                enqueue_account_delivery_overflow_signal(
-                                    &route.sender,
-                                    &route.overflow,
-                                    generation,
-                                );
-                            }
+                        if let Some(marker) = route.recovery_marker.clone() {
+                            persist_queue_loss(&route.sender, &route.overflow, marker, signal_generation);
+                        } else if let Some(generation) = signal_generation {
+                            enqueue_account_delivery_overflow_signal(&route.sender, &route.overflow, generation);
                         }
                         tracing::warn!(
                             target: "marmot_app::relay_plane",
@@ -1742,7 +1814,29 @@ fn recover_relay_notification_forwarder(
     exit: RelayNotificationConsumerExit,
 ) {
     let account_count = account_deliveries_read(&transport.account_deliveries).len();
-    account_deliveries_write(&transport.account_deliveries).clear();
+    // Latch account-local evidence before closing receivers. Keep each loss
+    // handle in the existing account registry so replacement adapters inherit
+    // the fence; the shared router never awaits account database I/O.
+    if !matches!(exit, RelayNotificationConsumerExit::Shutdown) {
+        let mut routes = account_deliveries_write(&transport.account_deliveries);
+        for route in routes.values_mut() {
+            if matches!(exit, RelayNotificationConsumerExit::Lagged(_)) {
+                route.overflow.record_notification_loss();
+            }
+            // The typed lag is latched across receiver replacement. Only the
+            // account worker may persist it, before returning the close signal.
+            let generation = route
+                .overflow
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation;
+            route.overflow.cancel_signal(generation);
+            let (closed_sender, closed_receiver) = mpsc::channel(1);
+            drop(closed_receiver);
+            route.sender = closed_sender;
+        }
+    }
     let _ = transport
         .directory_events
         .send(DirectoryRelayPlaneEvent::RecoveryRequired);
@@ -1929,6 +2023,7 @@ impl MarmotRelayPlaneAccountAdapter {
     pub(crate) async fn install_group_maintenance_subscription(
         &self,
         group: TransportGroupSubscription,
+        recovery_attempt: u64,
     ) -> Result<String, TransportAdapterError> {
         let sync = self
             .relay_plane
@@ -1949,7 +2044,11 @@ impl MarmotRelayPlaneAccountAdapter {
             .inner
             .transport
             .adapter
-            .install_group_maintenance_subscription(&self.account_id, &group)
+            .install_group_maintenance_recovery_subscription(
+                &self.account_id,
+                &group,
+                recovery_attempt,
+            )
             .await
     }
 
@@ -1959,6 +2058,53 @@ impl MarmotRelayPlaneAccountAdapter {
             .transport
             .adapter
             .subscription_any_eose(subscription_id)
+            .await
+    }
+
+    /// Operational capability identity only; SDK presence proves neither
+    /// endpoint availability nor exhaustive historical coverage.
+    pub(crate) fn recovery_comparison_capability_key(&self) -> &'static [u8] {
+        if self.relay_plane.inner.transport.sdk_relay_client.is_some() {
+            b"sdk-bounded-comparison-v1"
+        } else {
+            b"no-sdk-reconciliation-v1"
+        }
+    }
+
+    pub(crate) fn recovery_admitted_endpoints(
+        &self,
+        endpoints: &[TransportEndpoint],
+    ) -> Vec<String> {
+        if self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_endpoints(endpoints.to_vec(), "recovery scope")
+            .is_err()
+        {
+            return Vec::new();
+        }
+        // Preserve signed spelling in the frozen goal. Membership queries use
+        // the adapter's forward canonical identity lookup, never URL rewrites.
+        let mut result = endpoints
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect::<Vec<_>>();
+        result.sort();
+        result.dedup();
+        result
+    }
+
+    pub(crate) async fn group_maintenance_endpoint_eose(
+        &self,
+        subscription_id: &str,
+        endpoint: &TransportEndpoint,
+    ) -> Option<bool> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .subscription_endpoint_eose(subscription_id, endpoint)
             .await
     }
 
@@ -1995,6 +2141,29 @@ impl MarmotRelayPlaneAccountAdapter {
 
     /// Process-local overflow evidence becomes visible at the exact omission,
     /// before marker I/O or the queued control record can complete.
+    pub(crate) fn notification_loss_persisted(&self, observed: AccountDeliveryOverflow) {
+        self.delivery_overflow.notification_persisted(observed);
+    }
+
+    /// A running attempt has not acknowledged loss and cannot advance a cursor.
+    pub(crate) fn delivery_loss_blocks_cursor(&self) -> bool {
+        self.delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending
+    }
+
+    pub(crate) fn unpersisted_notification_loss(&self) -> Option<AccountDeliveryOverflow> {
+        let state = self
+            .delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        (state.pending && state.notification_losses > state.notification_imported)
+            .then(|| AccountDeliveryOverflowState::snapshot(&state))
+    }
+
     pub(crate) fn pending_delivery_overflow(&self) -> Option<AccountDeliveryOverflow> {
         self.delivery_overflow.pending_snapshot()
     }
@@ -2018,6 +2187,11 @@ impl MarmotRelayPlaneAccountAdapter {
         self.delivery_overflow.finish_recovery(attempt)
     }
 
+    pub(crate) fn restore_delivery_overflow_guard(&self, durable_marker_token: u64) {
+        self.delivery_overflow
+            .restore_recovery_guard(durable_marker_token);
+    }
+
     pub(crate) fn record_delivery_overflow_recovery_success(&self, elapsed_ms: u64) {
         self.delivery_overflow.record_recovery_success(elapsed_ms);
     }
@@ -2028,33 +2202,13 @@ impl MarmotRelayPlaneAccountAdapter {
 
     pub(crate) async fn remove_group_maintenance_subscription(
         &self,
-        group: &TransportGroupSubscription,
+        subscription_id: &str,
     ) -> Result<(), TransportAdapterError> {
-        let sync = self
-            .relay_plane
-            .inner
-            .relay_safety
-            .sanitize_group_sync(TransportGroupSync {
-                account_id: self.account_id.clone(),
-                group_subscriptions: vec![group.clone()],
-                since: None,
-            })
-            .map_err(TransportAdapterError::Subscription)?;
-        let group = sync.group_subscriptions.into_iter().next().ok_or_else(|| {
-            TransportAdapterError::Subscription(
-                "maintenance group subscription was empty".to_owned(),
-            )
-        })?;
         self.relay_plane
             .inner
             .transport
             .adapter
-            .remove_group_maintenance_subscription(NostrSubscription::GroupMaintenance {
-                account_id: self.account_id.clone(),
-                group_id: group.group_id,
-                transport_group_id: group.transport_group_id,
-                endpoints: group.endpoints,
-            })
+            .remove_group_maintenance_recovery_subscription(&self.account_id, subscription_id)
             .await
     }
 }
@@ -2194,6 +2348,37 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             )),
             None => Ok(None),
         }
+    }
+}
+
+/// Count persistence is independent of whether a control record is already
+/// queued. The one writer takes any deferred signal only after its latest
+/// watermark is durable, including signals requested while that writer ran.
+fn persist_queue_loss(
+    sender: &mpsc::Sender<AccountDeliveryEvent>,
+    overflow: &Arc<AccountDeliveryOverflowState>,
+    marker: AccountDeliveryRecoveryMarker,
+    signal: Option<u64>,
+) {
+    let generation = overflow
+        .inner
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .generation;
+    if let Some(generation) = signal {
+        overflow.defer_marker_signal(generation);
+    }
+    if overflow.start_marker_persistence() {
+        let sender = sender.clone();
+        let overflow = overflow.clone();
+        tokio::spawn(async move {
+            overflow.persist_marker_before_drop(marker).await;
+            if overflow.take_durable_marker_signal(generation) {
+                enqueue_account_delivery_overflow_signal(&sender, &overflow, generation);
+            }
+        });
+    } else if overflow.take_durable_marker_signal(generation) {
+        enqueue_account_delivery_overflow_signal(sender, overflow, generation);
     }
 }
 

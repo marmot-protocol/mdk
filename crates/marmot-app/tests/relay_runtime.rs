@@ -13114,6 +13114,12 @@ async fn onboarding_relay_repair_requires_approval_and_preserves_unrelated_tags(
         event
             .tags
             .iter()
+            .any(|tag| tag.as_slice() == ["r", "not a relay"])
+    );
+    assert!(
+        event
+            .tags
+            .iter()
             .any(|tag| tag.as_slice() == ["client", "preserve-me"])
     );
     client.shutdown().await;

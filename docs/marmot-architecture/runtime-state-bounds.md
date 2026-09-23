@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-18
+updated: 2026-09-23
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -183,3 +183,47 @@ When adding a map, task set, counter, or temp artifact to a long-lived process:
 
 No new long-lived runtime collection or database schema is introduced. These are
 local-access bounds, not convergence or recovery policy.
+
+### Account recovery durable loss evidence (`storage-sqlite/src/account_recovery/`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Loss acknowledgment snapshots | At most two 40-byte token/count commitments per active grant, plus at most two pending cross-grant commitments; no per-generation vector in the owner | Streamed from durable evidence; discarded on acknowledgment, error, cancellation recovery or reopen. The compatibility vector inspection API remains available to explicit lower-level callers. |
+| Evidence import temporary state | One row plus a keyset cursor, independent of unresolved generation count; transaction duration remains input-relative | Each row is imported atomically with demand, then the scan advances without retaining it. |
+| `account_delivery_loss_evidence` generation watermarks | One row per unresolved loss generation; **no fixed disk-row cap**. This is the explicitly approved #1946 retention exception, not a bounded-size claim. Duplicate observations reuse a watermark; increased counts rearm that generation. | Only qualified completion followed by exact live acknowledgment may reclaim captured evidence. Legacy retirement preserves watermarks and cannot erase another generation. Unresolved debt survives automatic investigation exhaustion and reopen. |
+
+The current transport backend cannot prove exhaustive history, so repeated loss
+can accumulate durable evidence indefinitely. An eventual disk cap needs a
+separate reviewed evidence/retirement contract; silently dropping debt is forbidden.
+
+### Recovery owner and completed metadata (`marmot-app/src/client/recovery.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Active grant and admission snapshot | One per account; scopes are input-relative to selected unresolved obligations and their frozen route/endpoint goals. The owner holds a weak admission reference. | Completion, error or future drop releases the snapshot and its inventory; quiescence does not retain an old plan. |
+| Frozen comparison inventory | At most four routes, each using the existing 16,384-item retained inventory bound | Owned by one grant; future drop releases all copied items. Older uncovered ranges remain durable debt, not omitted success. |
+| Pending cross-grant acknowledgment | At most the queue and notification causes; each holds one obligation revision and a fixed-size loss snapshot | Exact live/SQL acknowledgment clears it. Failed execution or reopen restores unreclaimed debt and discards the cache. |
+| Completed known-event rows and scopes | No historical completed-event log | Reclaimed before owner selection with no live grant, and on owner reconstruction. Pending exact-event debt is untouched. |
+| Explicit caller metadata | One serialized account-wide explicit-history row | Successful caller detach removes it; cancellation removes urgency only. Reopen performs the same cleanup. |
+| Maintenance boundary metadata and live observations | Input-relative to active post-join domain jobs | Removed with the job/session lifecycle; grace and quiet timers remain domain-owned. |
+| Epoch evidence and qualified certificates | One current record per tracked group/epoch, no per-evaluation log | Authenticated recovery or terminal retirement clears it; replacement updates the same row. |
+| Unresolved obligations/scopes | Input-relative to unresolved events and frozen historical route/endpoint goals; not a fixed account-wide byte cap | Independent qualified completion or explicit terminal domain retirement. Obsolete routes cannot be silently removed from an outstanding goal. Each scope retains one latest checkpoint rather than an attempt history. |
+
+Automatic unknown-history investigation stops at the existing drain quantum or
+completed inconclusive boundary and parks the obligation in `needs_deep_repair`.
+Timer ticks and duplicate joins do not rearm it. New loss/policy evidence or a
+serialized explicit caller can authorize another bounded investigation, subject
+to the shared owner. Missing epoch/event input uses the capped durable retry policy;
+local convergence eligibility remains independent of that network cooldown.
+
+### Recovery comparison slot (#1992 amendment)
+
+Migration 0095 adds exactly one coalescing operational comparison row per account,
+sharing the existing recovery retry state. Its frozen descriptor and failed-route
+subset contain at most the existing four-route pass budget; no per-startup or
+per-attempt history accumulates. Receipts remain in the existing 16,384-item,
+30-day per-route inventory, and the active grant owns the bounded in-memory copy.
+Transiently failed selected routes stay pending; serviced or unattempted routes
+never erase unresolved coverage. Retained inventory may be narrower than older
+coverage debt. This adds no disk-cap claim for the previously approved unresolved
+loss-generation watermark exception.
