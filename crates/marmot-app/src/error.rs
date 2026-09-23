@@ -11,6 +11,7 @@ use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification};
 pub struct AccountCatchUpFailure {
     message: String,
     classification: SyncFailureClassification,
+    repair_incomplete: Option<(FullHistoryRepairIncompleteReason, bool)>,
 }
 
 impl AccountCatchUpFailure {
@@ -18,6 +19,18 @@ impl AccountCatchUpFailure {
         Self {
             message,
             classification,
+            repair_incomplete: None,
+        }
+    }
+
+    pub(crate) fn from_sync_failure(
+        message: String,
+        failure: &crate::ClassifiedSyncFailure,
+    ) -> Self {
+        Self {
+            message,
+            classification: failure.classification(),
+            repair_incomplete: failure.source.full_history_repair_incomplete(),
         }
     }
 
@@ -357,6 +370,21 @@ impl From<TransportAdapterError> for AppError {
 }
 
 impl AppError {
+    /// Typed incomplete-repair evidence, including across the worker boundary.
+    /// The boolean indicates outstanding delivery loss; neither case is success.
+    pub fn full_history_repair_incomplete(
+        &self,
+    ) -> Option<(FullHistoryRepairIncompleteReason, bool)> {
+        match self {
+            Self::FullHistoryRepairIncomplete {
+                reason,
+                delivery_loss_pending,
+            } => Some((*reason, *delivery_loss_pending)),
+            Self::AccountCatchUp(failure) => failure.repair_incomplete,
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_account_not_active(&self) -> bool {
         matches!(
             self,
@@ -743,6 +771,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn worker_failure_preserves_typed_repair_outcome_without_parsing_messages() {
+        use super::FullHistoryRepairIncompleteReason as Reason;
+        for reason in [
+            Reason::CoverageUnproven,
+            Reason::Cancelled,
+            Reason::Deadline,
+            Reason::DeliveryLoss,
+            Reason::EoseTimeout,
+            Reason::NoRelayEose,
+            Reason::NovelProgressYield,
+            Reason::NoProgressYield,
+            Reason::Unconfirmed,
+        ] {
+            for loss in [false, true] {
+                let failure = crate::ClassifiedSyncFailure::at_stage(
+                    crate::SyncSummary::default(),
+                    AppError::FullHistoryRepairIncomplete {
+                        reason,
+                        delivery_loss_pending: loss,
+                    },
+                    crate::app_telemetry::SyncFailureStage::Unknown,
+                );
+                let wrapped = AppError::AccountCatchUp(AccountCatchUpFailure::from_sync_failure(
+                    "display only".into(),
+                    &failure,
+                ));
+                assert_eq!(
+                    wrapped.full_history_repair_incomplete(),
+                    Some((reason, loss))
+                );
+                assert_eq!(wrapped.privacy_safe_kind(), "account_catch_up");
+            }
+        }
+        let text_only = AppError::AccountCatchUp(AccountCatchUpFailure::new(
+            "full_history_coverage_unproven".into(),
+            crate::app_telemetry::SyncFailureClassification::UNKNOWN,
+        ));
+        assert_eq!(text_only.full_history_repair_incomplete(), None);
     }
 
     // Kind strings leave the runtime: `account_error_message` interpolates

@@ -3375,10 +3375,7 @@ fn account_worker_command_future<'a>(
                         account_label,
                         message.clone(),
                     );
-                    Err(AccountCatchUpFailure::new(
-                        message,
-                        failure.classification(),
-                    ))
+                    Err(AccountCatchUpFailure::from_sync_failure(message, &failure))
                 }
             };
             shared.app_performance_telemetry().record_classified_result(

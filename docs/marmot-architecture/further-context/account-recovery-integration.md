@@ -81,7 +81,7 @@ remain explicit; local verification does not claim remote CI or deployment succe
   into qualified coverage. Production escalation requires actual qualified evidence;
   the test backend's finite certificate is not a production capability claim.
 
-The 81-row `account-recovery-integration-tests.csv` maps removed/substantially
+The 85-row `account-recovery-integration-tests.csv` maps removed/substantially
 rewritten regressions to current tests and separates deliberate completion-policy
 changes from preserved delivery, cancellation, retry, cursor and stale-evidence
 assertions. The original checkpoint inventory is immutable historical evidence.
@@ -566,3 +566,33 @@ Dependency CI was refreshed on 2026-09-23: #1983 at `13cb09a4` and #1987 at
 `4fded1e9` both have green Required CI. #1987's earlier readiness-timing shard
 passed after one rerun without a dependency change. This is separate from #1992's
 new-head CI, which must be checked after publication. The stack remains unmerged.
+
+## Simulator CI follow-up
+
+CI run `35872775969` on publication head `58389f4c` exposed a validation gap:
+the previous local stack ran simulator policy checks, not the app/process journey
+lanes. The convergence recipe selected the retired
+`explicit_catch_up_arms_and_replays_without_later_traffic` name and failed closed
+with zero tests. It now selects the mapped owner-tick replacement, preserving the
+recipe's exact-match/no-empty-tests guarantee.
+
+Four simulator journeys reproduced locally (0/4 passed). Full-history repair's
+honest coverage-unproven result was flattened to generic `account_catch_up` by the
+worker/process boundary and aborted the scenario before its independent oracles.
+The worker now retains typed reason plus the independent loss flag inside its
+existing failure wrapper. A nonbreaking Rust error accessor exposes those facts;
+no display-string parsing or runtime success conversion occurs. The simulator's
+private RPC carries Complete versus CoverageUnproven explicitly. Only unproven
+coverage **without loss** allows the action to continue, recorded in
+`local.history_repairs_without_coverage`. Cancellation, deadline, EOSE failure,
+loss, storage and arbitrary catch-up errors remain failures. No runtime recovery,
+completion, scheduling or SDK policy changed.
+
+The new worker-boundary regression first failed with `None` instead of the typed
+reason. After the fix, all **six focused regressions passed**, including the four
+unchanged CI failures and negative classification tests for every incomplete
+reason with/without loss. The hidden/restored history journey additionally asserts
+both repair passes remain coverage-unproven; original payload assertions remain.
+Logs: `simulator-ci-red.log`, `repair-reason-red.log`, `simulator-ci-focused.log`
+under `/tmp/mdk-1946-ci-owner/`. The mapping now has 85 rows. Full PR-CI simulator
+coverage and repository gates remain required before this follow-up is pushed.

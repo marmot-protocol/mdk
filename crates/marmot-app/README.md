@@ -187,7 +187,9 @@ recovery can instead complete from a validated retained copy. Maintenance uses i
 The Rust `AppError::FullHistoryRepairIncomplete` preserves a bounded `FullHistoryRepairIncompleteReason` and an
 independent `delivery_loss_pending` flag. Worker/binding calls retain their existing error channel; their safe
 error code reports outstanding delivery loss when present, with cancellation taking precedence. No incomplete
-attempt is converted to a success. The API shape for repair calls is unchanged.
+attempt is converted to a success. Rust callers can inspect
+`AppError::full_history_repair_incomplete()` for the typed reason and independent loss flag,
+including through `AccountCatchUp`. It never parses display strings. The API shape for repair calls is unchanged.
 
 The explicit attempt has a 60-second overall cooperative budget, including setup and reconciliation. A started
 ingest/checkpoint finishes before deadline or caller/runtime cancellation is observed; this is not a hard bound

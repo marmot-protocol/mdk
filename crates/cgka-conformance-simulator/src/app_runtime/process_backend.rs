@@ -33,6 +33,29 @@ impl From<marmot_app::SendSummary> for SendReceipt {
         }
     }
 }
+/// An executed repair pass is distinct from a certificate of history coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum HistoryRepairOutcome {
+    Complete,
+    CoverageUnproven,
+}
+
+fn history_repair_outcome(result: Result<(), AppError>) -> Result<HistoryRepairOutcome, AppError> {
+    match result {
+        Ok(()) => Ok(HistoryRepairOutcome::Complete),
+        Err(error)
+            if error.full_history_repair_incomplete()
+                == Some((
+                    marmot_app::FullHistoryRepairIncompleteReason::CoverageUnproven,
+                    false,
+                )) =>
+        {
+            Ok(HistoryRepairOutcome::CoverageUnproven)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct EventSummary {
     pub count: usize,
@@ -93,9 +116,12 @@ impl ParticipantRuntime {
                 .map_err(WireError::app),
         }
     }
-    pub async fn repair_full_history(&self, account: &str) -> Result<(), AppError> {
+    pub async fn repair_full_history(
+        &self,
+        account: &str,
+    ) -> Result<HistoryRepairOutcome, AppError> {
         match self {
-            Self::Local(r) => r.repair_full_history(account).await,
+            Self::Local(r) => history_repair_outcome(r.repair_full_history(account).await),
             Self::Remote(p) => p
                 .call_async("repair_full_history", json!([account]))
                 .await
@@ -495,7 +521,9 @@ impl ParticipantServer {
             }
             "repair_full_history" => {
                 let (account,): (String,) = args(arguments)?;
-                value(r.repair_full_history(&account).await?)
+                value(history_repair_outcome(
+                    r.repair_full_history(&account).await,
+                )?)
             }
             "pause_maintenance" => {
                 let (account,): (String,) = args(arguments)?;
@@ -657,5 +685,63 @@ impl ParticipantServer {
             }
             _ => Err(WireError::environment("app_process_unknown_method")),
         }
+    }
+}
+
+#[cfg(test)]
+mod repair_outcome_tests {
+    use super::*;
+    use marmot_app::FullHistoryRepairIncompleteReason as Reason;
+
+    #[test]
+    fn only_unproven_coverage_without_loss_can_continue_to_independent_oracles() {
+        assert_eq!(
+            history_repair_outcome(Ok(())).unwrap(),
+            HistoryRepairOutcome::Complete
+        );
+        for reason in [
+            Reason::CoverageUnproven,
+            Reason::Cancelled,
+            Reason::Deadline,
+            Reason::DeliveryLoss,
+            Reason::EoseTimeout,
+            Reason::NoRelayEose,
+            Reason::NovelProgressYield,
+            Reason::NoProgressYield,
+            Reason::Unconfirmed,
+        ] {
+            for loss in [false, true] {
+                let result = history_repair_outcome(Err(AppError::FullHistoryRepairIncomplete {
+                    reason,
+                    delivery_loss_pending: loss,
+                }));
+                if reason == Reason::CoverageUnproven && !loss {
+                    let outcome = result.unwrap();
+                    assert_eq!(outcome, HistoryRepairOutcome::CoverageUnproven);
+                    let wire = serde_json::to_value(outcome).unwrap();
+                    assert_ne!(
+                        wire,
+                        serde_json::to_value(HistoryRepairOutcome::Complete).unwrap()
+                    );
+                    assert_eq!(
+                        serde_json::from_value::<HistoryRepairOutcome>(wire).unwrap(),
+                        outcome
+                    );
+                } else {
+                    assert!(result.is_err(), "{reason:?}, loss={loss}");
+                }
+            }
+        }
+        assert!(history_repair_outcome(Err(AppError::AccountWorkerResponseTimedOut)).is_err());
+        assert!(
+            history_repair_outcome(Err(AppError::AccountCatchUp(
+                marmot_app::AccountCatchUpFailure::new(
+                    "full_history_coverage_unproven".into(),
+                    marmot_app::SyncFailureClassification::UNKNOWN,
+                )
+            )))
+            .is_err(),
+            "text is not typed coverage evidence"
+        );
     }
 }

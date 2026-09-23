@@ -84,6 +84,10 @@ pub struct AppRuntimeApplicationProjectionV1 {
 pub struct AppRuntimeLocalDiagnosticsV1 {
     pub online: bool,
     pub catch_up_attempts: u64,
+    /// Repair passes that ran but could not certify exhaustive history.
+    /// Scenario delivery/convergence assertions remain independent.
+    #[serde(default)]
+    pub history_repairs_without_coverage: u64,
     pub reopen_count: u64,
     pub retryable_failures: u64,
     pub terminal_failures: u64,
@@ -164,6 +168,7 @@ struct Participant {
     account_id: String,
     online: bool,
     catch_up_attempts: u64,
+    history_repairs_without_coverage: u64,
     reopen_count: u64,
     retryable_failures: u64,
     terminal_failures: u64,
@@ -299,6 +304,7 @@ impl AppRuntimeHarness {
                     account_id,
                     online: true,
                     catch_up_attempts: 0,
+                    history_repairs_without_coverage: 0,
                     reopen_count: 0,
                     retryable_failures: 0,
                     terminal_failures: 0,
@@ -575,6 +581,9 @@ impl AppRuntimeHarness {
         self.refresh_cached_members(clients).await
     }
 
+    /// Execute repair and retain unproven coverage in local diagnostics. Success
+    /// here means the scenario may evaluate its independent public-state oracle;
+    /// it does not certify transport history. Other incomplete reasons fail.
     pub async fn repair_full_history(&mut self, clients: &[String]) -> Result<(), SubjectError> {
         for label in clients {
             let participant = self.participant_mut(label)?;
@@ -583,13 +592,21 @@ impl AppRuntimeHarness {
             }
             participant.catch_up_attempts = participant.catch_up_attempts.saturating_add(1);
             let account_id = participant.account_id.clone();
-            if let Err(error) = participant
+            match participant
                 .runtime()?
                 .repair_full_history(&account_id)
                 .await
             {
-                record_failure(participant, &error);
-                return Err(app_error(error));
+                Ok(process_backend::HistoryRepairOutcome::Complete) => {}
+                Ok(process_backend::HistoryRepairOutcome::CoverageUnproven) => {
+                    participant.history_repairs_without_coverage = participant
+                        .history_repairs_without_coverage
+                        .saturating_add(1);
+                }
+                Err(error) => {
+                    record_failure(participant, &error);
+                    return Err(app_error(error));
+                }
             }
         }
         self.refresh_cached_members(clients).await
@@ -1261,6 +1278,7 @@ impl AppRuntimeHarness {
             local: AppRuntimeLocalDiagnosticsV1 {
                 online: participant.online,
                 catch_up_attempts: participant.catch_up_attempts,
+                history_repairs_without_coverage: participant.history_repairs_without_coverage,
                 reopen_count: participant.reopen_count,
                 retryable_failures: participant.retryable_failures,
                 terminal_failures: participant.terminal_failures,
