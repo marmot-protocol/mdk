@@ -80,7 +80,7 @@ focused green results do not establish it.
   into qualified coverage. Production escalation requires actual qualified evidence;
   the test backend's finite certificate is not a production capability claim.
 
-The 80-row `account-recovery-integration-tests.csv` maps removed/substantially
+The 81-row `account-recovery-integration-tests.csv` maps removed/substantially
 rewritten regressions to current tests and separates deliberate completion-policy
 changes from preserved delivery, cancellation, retry, cursor and stale-evidence
 assertions. The original checkpoint inventory is immutable historical evidence.
@@ -500,3 +500,31 @@ bound while its operational plan remains bounded. All **9 comparison-storage
 regressions pass** after that correction; the complete stack run is restarted on
 the signed successor. Logs: `comparison-placeholder-red.log`,
 `comparison-placeholder-green.log`, and the interrupted `verified-stack-gmtu0_ms/`.
+
+### Combined-run compatibility corrections
+
+The complete affected-crate run on signed `55e0b24f0120f078cad55c5266d5843c7b77a847`
+finished with **2882 passed (one leaky), four failed, 21 skipped**; no retries.
+Logs: `/tmp/mdk-1946-ci-owner/verified-stack-sf5rybd5/`.
+Three unchanged assertions exposed a real regression: bounding every coalesced
+comparison suppressed the supported broader pass for fresh epoch/loss evidence
+and explicit catch-up. Frozen activation now distinguishes those independent
+reasons from previously investigated unchanged debt. Startup alone cannot widen
+acquisition, including repeated cold starts with unchanged epoch debt.
+
+The fourth failure was `reopen_and_toggle_restore_source_row_without_group_mutation`:
+a startup `sync_drain` row arrived after a quiet file interval but before the queued
+disable took effect. The test now waits for the existing completed-catch-up metric
+before taking its pre-disable sample. The exact full-body equality, source linkage,
+and re-enable assertions are unchanged. No audit implementation or timing guarantee
+was weakened. This timing-only replacement is recorded in the 81-row map.
+
+These corrections require focused recovery/restart/audit tests, then a fresh
+complete run; the failed run is not final acceptance evidence.
+
+The corrected focused selection passed **45/45**, no retries, including all four
+failures, both complete original restart journeys, unchanged frozen-cursor journey,
+and every owner/comparison-storage test. Log:
+`/tmp/mdk-1946-ci-owner/comparison-compatibility-correction.log`.
+All 81 regression-map rows resolve to existing replacement test functions.
+This supersedes the four focused failures, not the required complete final stack.

@@ -1181,6 +1181,7 @@ impl AppClient {
             .subscription_rebuild_since(self.checkpointed_transport_timestamp)
             .map(|timestamp| timestamp.0);
         let mut goals = Vec::new();
+        let mut independent_broad_acquisition = false;
         for (id, revision) in &grant.fence.obligations {
             let demand = demands
                 .iter()
@@ -1189,6 +1190,22 @@ impl AppClient {
                     StorageError::Serialization("selected recovery demand disappeared".into())
                 })?;
             let stored = storage.recovery_scope_snapshots(*id)?;
+            if !matches!(
+                demand.cause,
+                storage_sqlite::RecoveryCause::IncrementalHistory
+                    | storage_sqlite::RecoveryCause::Maintenance
+            ) {
+                // Startup comparison alone cannot reissue an old broad goal.
+                // Independently new loss/missing-input/route evidence, or a
+                // live explicit caller, still owns its supported wider pass.
+                independent_broad_acquisition |= explicit.is_some()
+                    || stored.is_empty()
+                    || stored.iter().any(|scope| {
+                        scope.obligation_revision != *revision
+                            || scope.route_revision != grant.fence.route_revision
+                            || scope.loss_revision != grant.fence.loss_revision
+                    });
+            }
             let since = if demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory {
                 incremental_since
             } else {
@@ -1420,7 +1437,22 @@ impl AppClient {
             routes.sort_by_key(|r| r.scope_id);
             grant.comparison_plan = Some(storage_sqlite::RecoveryComparisonPlan {
                 fence: grant.fence.clone(),
-                live_since_seconds: self.subscription_rebuild_since()?.map(|t| t.0),
+                live_since_seconds: if independent_broad_acquisition {
+                    goals
+                        .iter()
+                        .filter(|(id, _)| {
+                            demands.iter().any(|d| {
+                                d.ticket.id == *id
+                                    && d.cause != storage_sqlite::RecoveryCause::Maintenance
+                            })
+                        })
+                        .flat_map(|(_, scopes)| scopes)
+                        .map(|scope| scope.since_seconds)
+                        .collect::<Option<Vec<_>>>()
+                        .and_then(|bounds| bounds.into_iter().min())
+                } else {
+                    self.subscription_rebuild_since()?.map(|t| t.0)
+                },
                 routes,
                 retry_routes: Vec::new(),
             });

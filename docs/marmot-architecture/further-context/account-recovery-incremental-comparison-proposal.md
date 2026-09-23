@@ -131,12 +131,15 @@ with their first runtime consumer in #1992, not extracted into another storage P
 Normal mode may coalesce a comparison with eligible coverage in one reservation.
 A **comparison-only** grant uses the ordinary floored live subscription and the
 bounded set-comparison path; parked coverage cannot widen that activation to
-`since = None`. When coalesced with comparison, a broad recovery goal receives only the frozen
-bounded investigation and remains pending unless independently qualified. Its goal
-cannot widen that pass's live cutoff. A subsequent coverage-only grant may still
-require its own broader activation under the shared pacing. This preserves the
-restart regressions without clearing epoch-gap debt to suppress traffic. Maintenance retains its existing limited
-boundary, session restoration and grace timing.
+`since = None`. An unchanged previously investigated broad goal cannot widen
+automatic startup comparison. Independently new loss, missing-input or relevant route evidence can
+still require the broader activation, coalesced in the same reservation. A live
+explicit catch-up also retains its supported prearmed recovery pass; explicit
+full-history repair keeps its separately authorized range. Freeze that decision
+before I/O. This preserves both the cold-restart/no-redownload journeys and the
+existing new-loss/explicit-catch-up guarantees without clearing old epoch debt to
+suppress traffic. All unqualified history remains pending. Maintenance retains its
+existing limited boundary, session restoration and grace timing.
 
 Conservative mode selects one work item, treating the comparison slot as one item
 alongside individual coverage obligations. Use last-attempt ordering already used

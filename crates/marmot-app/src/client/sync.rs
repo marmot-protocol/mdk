@@ -3805,9 +3805,9 @@ impl AppClient {
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let obligations = grant.plan().expect("validated executor grant");
         // A bounded comparison freezes acquisition separately from historical
-        // goals. Coalesced broad debt receives only this partial investigation:
-        // it cannot widen the ordinary live cutoff, and remains pending. A
-        // coverage-only grant can still select the older historical range.
+        // goals. Unchanged broad debt cannot widen an automatic comparison.
+        // The frozen activation may be wider only for independently new broad
+        // demand or a live explicit caller; those retain their supported pass.
         let since = {
             let mut history = obligations
                 .iter()
