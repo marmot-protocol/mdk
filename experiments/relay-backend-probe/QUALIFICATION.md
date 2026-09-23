@@ -6,14 +6,16 @@ This probe uses the exact Git `rev` in `Cargo.toml` and `Cargo.lock` for the
 fork SDK. It is an opt-in Cargo workspace. MDK's production dependency graph,
 recovery owner, scheduler, peeler, schema, and bindings are not changed here.
 Only loopback WebSocket relays and synthetic signed events are used.
+The qualified SDK integration revision is
+`26a42e043474860fb0b0dbc1eb4ab34bc2c661fb`.
 
 The test-only `CandidateRelay` implements the existing `NostrRelayClient`
 subscription and publication seam, and the test activates accounts through
 `NostrTransportAdapter`. It uses one immutable authenticator per account, a
 separate anonymous client, and a separate write-only publisher client. An
-account's disconnect, generation replacement, reactivation, and removal do
-not replace Bob's client or subscriptions. The live inbox receives an event
-after Alice reconnects and after an Alice history request is cancelled.
+account's disconnect, same-object reactivation, generation replacement, and
+removal do not replace Bob's client or subscriptions. The live inbox receives
+an event after Alice reconnects and after an Alice history request is cancelled.
 The anonymous client reads public data, then observes an AUTH challenge and
 an `auth-required` CLOSED for a private inbox without an account authenticator.
 The publish-only connection causes zero `REQ` queries. The probe rejects
@@ -112,6 +114,24 @@ relays saw zero read queries from the publisher.
    `just fast-ci`; MarmotKit/UniFFI generation; Android/iOS binding and
    artifact validation. The probe does not qualify those production surfaces.
 
-The ignored immediate-reconnect diagnostic remains a concrete race check:
-`cargo test --locked --manifest-path experiments/relay-backend-probe/Cargo.toml --target-dir target sdk_immediate_reconnect_after_terminated_diagnostic -- --ignored --nocapture`.
-The passing path retires the old relay generation before reconnecting.
+## Reconnect contract and regression
+
+`Terminated` reports that termination was requested and automatic retry has
+stopped. It does not join the old connection task or prove its WebSocket has
+closed. The earlier ignored diagnostic treated `try_connect_relay` as a
+reactivation barrier. That one-shot API can return a state error while the old
+task owns the relay; it queues a replacement connection but does not report
+success for it. The supported immediate same-object operation is
+`connect_relay`, followed by observing a new connected status and restored
+subscription EOSE before relying on live traffic. An adapter can also retire
+the old relay object and add a new generation when replacing its own account
+route; the boundary probe continues to test that path.
+
+The active `sdk_immediate_reconnect_after_terminated_restores_live_delivery`
+regression exercises same-object reactivation without sleeps or retries. It
+asserts live delivery on Alice's restored subscription, live delivery on Bob's
+unrelated subscription, a new Alice socket, no new Bob query socket, unchanged
+Bob authenticator count, and denied cross-account reads after reconnect.
+The SDK's teardown-barrier tests force the old task to retain ownership and
+check queued reconnection and the one-shot state error. Twelve consecutive
+local runs of the active MDK regression passed at the final SDK pin.

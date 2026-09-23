@@ -155,20 +155,68 @@ async fn auth_isolation(replace_relay_generation: bool) {
         1,
         "must not switch identity on rejection"
     );
+    let bob_query_sockets_before_reconnect =
+        connections.0.lock().unwrap()[&bob.public_key().to_hex()].clone();
 
     // Reconnect Alice while Bob is actively requesting data.
     let a_relay = a.relay(&url).await.unwrap().unwrap();
     let mut lifecycle = a_relay.notifications();
-    a.disconnect_relay(&url).await.unwrap();
-    // disconnect_relay requests shutdown; its return is not a socket-close barrier.
-    loop {
-        if let RelayNotification::RelayStatus {
-            status: RelayStatus::Terminated,
-        } = lifecycle.next().await.unwrap()
-        {
-            break;
+    let mut a_live = a.notifications();
+    let mut b_live = b.notifications();
+    let a_subscription = SubscriptionId::new("alice-live-reconnect");
+    let b_subscription = SubscriptionId::new("bob-live-reconnect");
+    let mut b_live_event = None;
+    if !replace_relay_generation {
+        assert!(
+            a.subscribe(inbox(&alice))
+                .with_id(a_subscription.clone())
+                .await
+                .unwrap()
+                .failed
+                .is_empty()
+        );
+        assert!(
+            b.subscribe(inbox(&bob))
+                .with_id(b_subscription.clone())
+                .await
+                .unwrap()
+                .failed
+                .is_empty()
+        );
+        for (stream, id) in [
+            (&mut a_live, &a_subscription),
+            (&mut b_live, &b_subscription),
+        ] {
+            tokio::time::timeout(DEADLINE, async {
+                loop {
+                    if let ClientNotification::Message { message, .. } = stream.next().await.expect("live stream closed before EOSE")
+                        && matches!(*message, RelayMessage::EndOfStoredEvents(ref received) if received.as_ref() == id)
+                    {
+                        break;
+                    }
+                }
+            }).await.unwrap();
         }
     }
+    let a_auth_before_reconnect = a_auth.load(Ordering::SeqCst);
+    let b_auth_before_reconnect = b_auth.load(Ordering::SeqCst);
+    a.disconnect_relay(&url).await.unwrap();
+    // disconnect_relay requests shutdown; its return is not a socket-close barrier.
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let RelayNotification::RelayStatus {
+                status: RelayStatus::Terminated,
+            } = lifecycle
+                .next()
+                .await
+                .expect("relay lifecycle stream closed")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
     let ((), b_during) = tokio::join!(
         async {
             if replace_relay_generation {
@@ -177,20 +225,104 @@ async fn auth_isolation(replace_relay_generation: bool) {
                 a.remove_relay(&url).force().await.unwrap();
                 connect(&a, &url).await;
             } else {
-                a.try_connect_relay(&url, DEADLINE).await.unwrap();
+                // connect_relay queues reactivation while the old task owns the
+                // relay; try_connect_relay is a one-shot attempt and can report
+                // that ownership conflict after Terminated.
+                a.connect_relay(&url).await.unwrap();
+                tokio::time::timeout(DEADLINE, async {
+                    loop {
+                        if let RelayNotification::RelayStatus {
+                            status: RelayStatus::Connected,
+                        } = lifecycle
+                            .next()
+                            .await
+                            .expect("relay lifecycle stream closed")
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
             }
         },
         fetch(&b, inbox(&bob))
     );
     assert_eq!(b_during, b_first);
     assert_eq!(fetch(&a, inbox(&alice)).await, a_first);
-    assert_eq!(a_auth.load(Ordering::SeqCst), 2);
-    assert_eq!(b_auth.load(Ordering::SeqCst), 1);
+    assert!(a_auth.load(Ordering::SeqCst) > a_auth_before_reconnect);
+    assert_eq!(b_auth.load(Ordering::SeqCst), b_auth_before_reconnect);
+    if !replace_relay_generation {
+        // The restored Alice subscription reaches EOSE before testing live
+        // delivery. Bob's subscription stays on its original connection.
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                if let ClientNotification::Message { message, .. } = a_live.next().await.expect("Alice live stream closed before EOSE")
+                    && matches!(*message, RelayMessage::EndOfStoredEvents(ref received) if received.as_ref() == &a_subscription)
+                {
+                    break;
+                }
+            }
+        }).await.unwrap();
+        let a_event = EventBuilder::new(Kind::GiftWrap, "live after same-relay reconnect")
+            .tag(Tag::public_key(alice.public_key()))
+            .finalize(&sender)
+            .unwrap();
+        let b_event = EventBuilder::new(Kind::GiftWrap, "live during other-account reconnect")
+            .tag(Tag::public_key(bob.public_key()))
+            .finalize(&sender)
+            .unwrap();
+        b_live_event = Some(b_event.id);
+        relay.add_event(a_event.clone()).await.unwrap();
+        relay.add_event(b_event.clone()).await.unwrap();
+        for (stream, subscription, event_id) in [
+            (&mut a_live, &a_subscription, a_event.id),
+            (&mut b_live, &b_subscription, b_event.id),
+        ] {
+            tokio::time::timeout(DEADLINE, async {
+                loop {
+                    if let ClientNotification::Event {
+                        subscription_id,
+                        event,
+                        ..
+                    } = stream
+                        .next()
+                        .await
+                        .expect("live stream closed before event")
+                        && &subscription_id == subscription
+                        && event.id == event_id
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        {
+            let seen = connections.0.lock().unwrap();
+            assert_eq!(
+                seen[&alice.public_key().to_hex()].len(),
+                2,
+                "Alice reconnected with a new socket"
+            );
+            assert_eq!(
+                seen[&bob.public_key().to_hex()],
+                bob_query_sockets_before_reconnect,
+                "Bob kept his original query sockets during Alice's reconnect"
+            );
+        }
+        assert!(fetch(&a, inbox(&bob)).await.is_empty());
+        assert!(a_auth.load(Ordering::SeqCst) > a_auth_before_reconnect);
+        assert_eq!(b_auth.load(Ordering::SeqCst), b_auth_before_reconnect);
+    }
 
     // Removal invalidates only Alice's client. Bob retains his authenticated session.
     a.shutdown().await;
-    assert_eq!(fetch(&b, inbox(&bob)).await, b_first);
-    assert_eq!(b_auth.load(Ordering::SeqCst), 1);
+    let mut expected_b = b_first;
+    expected_b.extend(b_live_event);
+    assert_eq!(fetch(&b, inbox(&bob)).await, expected_b);
+    assert_eq!(b_auth.load(Ordering::SeqCst), b_auth_before_reconnect);
 
     // A separate anonymous client has no account signer to reveal on a challenge.
     let anonymous = Client::default();
@@ -224,10 +356,10 @@ async fn auth_isolation(replace_relay_generation: bool) {
     })
     .await
     .unwrap();
-    assert_eq!(a_auth.load(Ordering::SeqCst), 2);
-    assert_eq!(b_auth.load(Ordering::SeqCst), 1);
+    assert!(a_auth.load(Ordering::SeqCst) > a_auth_before_reconnect);
+    assert_eq!(b_auth.load(Ordering::SeqCst), b_auth_before_reconnect);
     println!(
-        "auth: two isolated account sockets; repeated requests reused each; Alice reauthenticated once; Bob survived Alice removal; cross-account private read denied; anonymous challenge and auth-required CLOSED observed without an account authenticator"
+        "auth: isolated account sockets; repeated requests reused each; Alice reauthenticated on a new socket; Bob survived Alice removal; cross-account private read denied; anonymous challenge and auth-required CLOSED observed without an account authenticator"
     );
     anonymous.shutdown().await;
     b.shutdown().await;
@@ -241,8 +373,7 @@ async fn authenticated_accounts_reuse_only_their_own_sessions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "diagnostic for intermittent SDK reconnect failure; Terminated is not a task-exit barrier"]
-async fn sdk_immediate_reconnect_after_terminated_diagnostic() {
+async fn sdk_immediate_reconnect_after_terminated_restores_live_delivery() {
     tokio::time::timeout(Duration::from_secs(60), auth_isolation(false))
         .await
         .unwrap();
