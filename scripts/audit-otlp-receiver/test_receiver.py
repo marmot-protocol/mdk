@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from receiver import (
     MAX_BODY_BYTES,
+    MAX_U64,
     MAX_WIRE_BYTES,
     encode_batch,
     encoded,
@@ -193,6 +194,44 @@ class ReceiverTests(unittest.TestCase):
                 self.assertEqual(self.post(encode_batch([synthetic(0), body]))[0], 400)
         self.assertEqual(self.calls, 0)
         self.assertEqual(self.readback(), [])
+
+    def test_typed_v4_integer_forms_and_bounds_before_downstream_write(self):
+        health = json.loads(synthetic(1))
+        health["kind"] = {
+            "type": "recorder_health",
+            "serialization_failures": 1,
+            "write_failures": 0,
+            "flush_failures": 0,
+        }
+        health_body = json.dumps(health, separators=(",", ":"))
+        bad = [
+            synthetic(1).replace('"seq":1', f'"seq":{number}')
+            for number in ("1.0", "1e0", str(MAX_U64 + 1), "-0")
+        ]
+        bad += [
+            synthetic(1).replace('"wall_time_ms":1', f'"wall_time_ms":{number}')
+            for number in ("1.0", str(MAX_U64 + 1))
+        ]
+        bad += [
+            health_body.replace(
+                '"serialization_failures":1', f'"serialization_failures":{number}'
+            )
+            for number in ("1.0", str(MAX_U64 + 1))
+        ]
+        for body in bad:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    self.post(encode_batch([synthetic(0), body])), (400, {})
+                )
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(self.readback(), [])
+
+        health_max = health_body.replace(
+            '"serialization_failures":1', f'"serialization_failures":{MAX_U64}'
+        )
+        valid = [synthetic(MAX_U64), health_max]
+        self.assertEqual(self.post(encode_batch(valid)), (200, {}))
+        self.assertEqual([row[1] for row in self.readback()], valid)
 
     def test_invalid_envelopes_and_limits_make_no_downstream_call(self):
         valid = encode_batch([synthetic(1)])

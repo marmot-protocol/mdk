@@ -19,6 +19,7 @@ from jsonschema import Draft202012Validator
 MAX_WIRE_BYTES = 1024 * 1024
 MAX_BODY_BYTES = 65535  # The source's body plus its LF fits a 64 KiB cursor line.
 MAX_RECORDS = 96
+MAX_U64 = (1 << 64) - 1
 SCHEMA_PATH = (
     Path(__file__).resolve().parents[2]
     / "crates/marmot-forensics/schema/audit-log-event.v4.schema.json"
@@ -40,7 +41,26 @@ def strict_json(raw):
     def reject_constant(_):
         raise ValueError("nonfinite_json")
 
-    return json.loads(raw, object_pairs_hook=unique, parse_constant=reject_constant)
+    def unsigned_u64(number):
+        # AuditEvent's numeric fields are u64 or u16. JSON Schema considers
+        # 1.0 an integer and has no u64 ceiling, unlike Rust typed decoding.
+        if number.startswith("-"):
+            raise ValueError("negative_integer")
+        value = int(number)
+        if value > MAX_U64:
+            raise ValueError("integer_exceeds_u64")
+        return value
+
+    def reject_float(_):
+        raise ValueError("noninteger_number")
+
+    return json.loads(
+        raw,
+        object_pairs_hook=unique,
+        parse_constant=reject_constant,
+        parse_int=unsigned_u64,
+        parse_float=reject_float,
+    )
 
 
 def encoded(value):

@@ -25,8 +25,12 @@ one LF within the local cursor's 64 KiB line ceiling. The body string excludes
 that LF and may not contain a raw CR or LF.
 
 The receiver parses JSON with duplicate-key and nonfinite-number rejection at
-every nesting level. It validates **every** body against MDK's bundled v4 JSON
-Schema before making the single downstream call. Malformed, unknown-version,
+every nesting level. Because the typed v4 event uses only `u64` and `u16`
+numbers, it also rejects fractional or exponent notation, negative integers,
+and integers above `u64::MAX`; the bundled schema enforces the `u16` ceiling.
+JSON Schema alone would admit `1.0` as an integer and has no `u64` maximum.
+The receiver validates **every** body against that schema before making the
+single downstream call. Malformed, unknown-version,
 unknown-kind, unknown-field, duplicate-key, oversized, and mixed valid/invalid
 batches return 400 (oversized HTTP requests return 413). They cause no durable
 queue, WAL, rejected-body log, or downstream write. This receiver has no server
