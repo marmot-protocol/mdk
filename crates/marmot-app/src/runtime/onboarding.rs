@@ -77,9 +77,11 @@ enum OnboardingPersist {
 }
 
 // v3 forbids older v2 cancellation/restart semantics. Recovered attempts use
-// v4 because a v3 reader cannot enforce epoch-scoped approvals.
+// v4 because a v3 reader cannot enforce epoch-scoped approvals. v5 protects
+// append semantics from v3/v4 readers, with or without a recovery epoch.
 const ONBOARDING_VERSION: u32 = 3;
 const RECOVERED_ONBOARDING_VERSION: u32 = 4;
+const APPEND_ONBOARDING_VERSION: u32 = 5;
 const ONBOARDING_V2: u32 = 2;
 const STEP_COUNT: usize = 6;
 const MAX_RELAYS: usize = 16;
@@ -480,7 +482,9 @@ fn decode_onboarding_checkpoint(
             checkpoint.version,
             checkpoint.snapshot.recovery_epoch.as_deref()
         ),
-        (ONBOARDING_VERSION, None) | (RECOVERED_ONBOARDING_VERSION, Some(_))
+        (ONBOARDING_VERSION, None)
+            | (RECOVERED_ONBOARDING_VERSION, Some(_))
+            | (APPEND_ONBOARDING_VERSION, _)
     ) || checkpoint
         .snapshot
         .recovery_epoch
@@ -920,6 +924,9 @@ impl AccountManager {
                     _ => vec![OnboardingAction::CancelOnboarding],
                 };
             }
+        }
+        if checkpoint.append_relays {
+            checkpoint.version = APPEND_ONBOARDING_VERSION;
         }
         checkpoint.snapshot.revision = checkpoint
             .snapshot

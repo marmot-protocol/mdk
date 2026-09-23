@@ -558,13 +558,16 @@ previous recovery journal is retained as opaque evidence there. A subsequent
 explicit recovery may replace older evidence. Keep any evidence needing longer
 retention outside this latest-only workflow before acknowledging recovery.
 
-Ordinary checkpoints remain version 3, with supported version 1/2 upgrades.
+Ordinary checkpoints start at version 3, with supported version 1/2 upgrades.
 Version 3 is a semantic barrier: old version 2 code rejects approved cancellation
 and cannot safely restart it. Recovery checkpoints use version 4 because a
 version 3 reader cannot validate epoch-scoped approvals. Completed recovery
 leaves a version 4 cancellation tombstone even before a new begin, so older
-readers fail closed. Downgrading during recovery is unsupported; finish recovery
-with an epoch-aware build. Do not relabel versions or delete checkpoints to
+readers fail closed. Preparing an additive relay proposal upgrades its checkpoint
+to version 5, with or without a recovery epoch. This prevents older readers from
+resuming an approved, unsigned proposal as a destructive replacement.
+Downgrading once either format is used is unsupported; use a build that supports
+the checkpoint version. Do not relabel versions or delete checkpoints to
 force a downgrade. Restore/upgrade to a supporting build, or explicitly recover
 unsupported evidence with this API.
 

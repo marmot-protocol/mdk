@@ -744,6 +744,81 @@ async fn defaults_preserve_relay_tags() {
 }
 
 #[tokio::test]
+async fn append_checkpoint_fences_old() {
+    for epoch in [None, Some("ab".repeat(32))] {
+        let (dir, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let tags = vec![vec![
+            "r".into(),
+            "ws://private.onion".into(),
+            "future-role".into(),
+        ]];
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.version = if epoch.is_some() {
+            RECOVERED_ONBOARDING_VERSION
+        } else {
+            ONBOARDING_VERSION
+        };
+        c.snapshot.recovery_epoch = epoch.clone();
+        c.records[OnboardingStep::Relays.index()] =
+            Some(signed(&keys, 10002, tags.clone(), "", unix_now_seconds()));
+        c.set(
+            OnboardingStep::Relays,
+            OnboardingStatus::NeedsInput,
+            Vec::new(),
+        );
+        manager
+            .app
+            .account_home()
+            .set_account_onboarding(&id, &serde_json::to_vec(&c).unwrap())
+            .unwrap();
+        manager
+            .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+            .await
+            .unwrap();
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        // The crash boundary after approval but before signing must also be fenced.
+        c.approved = true;
+        manager.save_onboarding(&mut c).unwrap();
+        let bytes = manager
+            .app
+            .account_home()
+            .account_onboarding(&id)
+            .unwrap()
+            .unwrap();
+        let saved: OnboardingCheckpoint = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved.version, APPEND_ONBOARDING_VERSION);
+        assert!(saved.approved && saved.signed_repair.is_none());
+        // Freeze the pre-append reader's version/epoch gate.
+        assert!(!matches!(
+            (saved.version, saved.snapshot.recovery_epoch.as_deref()),
+            (3, None) | (4, Some(_))
+        ));
+        assert_eq!(
+            decode_onboarding_checkpoint(&bytes, &id)
+                .unwrap()
+                .snapshot
+                .recovery_epoch,
+            epoch
+        );
+        runtime.shutdown_and_close().await.unwrap();
+        let reopened = super::tests::runtime(dir.path(), network.clone());
+        reopened.accounts().run_onboarding(&id).await.unwrap();
+        assert!(
+            network
+                .attempts
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .tags
+                .starts_with(&tags)
+        );
+        reopened.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn proposal_requires_route() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
