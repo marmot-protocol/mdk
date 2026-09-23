@@ -5176,7 +5176,7 @@ impl MarmotAppRuntime {
             key_package_result.is_ok(),
         );
         let key_package_bytes = key_package_result?;
-        if phase == AccountSetupPhase::LocalStateCreated {
+        if phase == AccountSetupPhase::LocalStateCreated && !schedule_background {
             self.accounts
                 .reset_startup_retry(&account.account_id_hex)
                 .await;
