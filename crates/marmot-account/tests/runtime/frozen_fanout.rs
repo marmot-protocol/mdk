@@ -1527,6 +1527,31 @@ async fn send_skips_slow_relay() {
     }
 }
 
+/// Poll a gated operation until its expected publish attempts have started.
+async fn wait_for_publish_count<F: std::future::Future>(
+    mut future: std::pin::Pin<&mut F>,
+    adapter: &RecordingAdapter,
+    expected: usize,
+) {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        std::future::poll_fn(|cx| {
+            assert!(
+                future.as_mut().poll(cx).is_pending(),
+                "must wait for quorum"
+            );
+            if adapter.publishes().len() == expected {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("publishes must reach the gated relay");
+}
+
+/// Quorum releases Welcomes once; cancelled relay retries retain their backoff across restart.
 #[tokio::test]
 async fn invite_quorum_survives_restart() {
     for required_acks in [0, 1, 2] {
@@ -1570,25 +1595,38 @@ async fn invite_quorum_survives_restart() {
         let adapter = RecordingAdapter::default();
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *adapter.inner.endpoint_gate.lock().unwrap() = Some((slow.clone(), gate.clone()));
+        let wall = Arc::new(TestWallClock::new(100_000));
         let mut runtime = AccountDeviceRuntime::new(
             alice,
             adapter.clone(),
             routing.clone(),
             RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
         );
-        let started = std::time::Instant::now();
-        let wait = Duration::from_millis(if required_acks == 2 { 100 } else { 500 });
-        let first = tokio::time::timeout(
-            wait,
-            runtime.send(SendIntent::Invite {
+        let first = {
+            let send = runtime.send(SendIntent::Invite {
                 group_id: group_id.clone(),
                 key_packages: vec![bob.fresh_key_package().await.unwrap()],
                 initial_admins: vec![],
-            }),
-        )
-        .await;
+            });
+            tokio::pin!(send);
+            if required_acks == 2 {
+                wait_for_publish_count(send.as_mut(), &adapter, 2).await;
+                None
+            } else {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(10), send)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            }
+        };
         let effects = if required_acks == 2 {
-            assert!(first.is_err(), "Welcome must wait for quorum");
             assert_eq!(adapter.publishes().len(), 2);
             let fanouts = runtime.session().outbound_fanouts().unwrap();
             assert_eq!(fanouts[0].outcome().accepted_targets, 1);
@@ -1602,12 +1640,7 @@ async fn invite_quorum_survives_restart() {
             );
             let retry = runtime.resume_outbound_fanouts();
             tokio::pin!(retry);
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), &mut retry)
-                    .await
-                    .is_err(),
-                "restart must still wait for the missing acknowledgement"
-            );
+            wait_for_publish_count(retry.as_mut(), &adapter, 3).await;
             assert_eq!(
                 adapter.publishes().len(),
                 3,
@@ -1616,14 +1649,8 @@ async fn invite_quorum_survives_restart() {
             gate.add_permits(1);
             retry.await.unwrap()
         } else {
-            first
-                .expect("invite must finish once its acknowledgement threshold is met")
-                .unwrap()
+            first.expect("invite must finish once its acknowledgement threshold is met")
         };
-        eprintln!(
-            "required_acks={required_acks} invite_elapsed_us={}",
-            started.elapsed().as_micros()
-        );
         assert!(effects.failures.is_empty());
         assert!(
             effects
@@ -1648,11 +1675,15 @@ async fn invite_quorum_survives_restart() {
         assert_eq!(fanouts.len(), 1);
         assert_eq!(fanouts[0].outcome().accepted_targets, 1);
         assert_eq!(fanouts[0].outcome().outstanding_targets, 1);
+        assert_eq!(
+            fanouts[0].target_status(0),
+            Some(FanoutTargetStatus::PossiblyExposed)
+        );
         assert!(fanouts[0].outcome().mls_confirmed);
         assert!(effects.pending_convergence.contains(&group_id));
         assert_eq!(
             runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
-            Some(0)
+            Some(30_000)
         );
         drop(runtime);
 
@@ -1663,7 +1694,20 @@ async fn invite_quorum_survives_restart() {
             resumed_adapter.clone(),
             routing,
             RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
         );
+        let deferred = resumed.resume_outbound_fanouts().await.unwrap();
+        assert!(deferred.reports.is_empty());
+        assert!(resumed_adapter.publishes().is_empty());
+        assert_eq!(
+            resumed.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
+            Some(30_000)
+        );
+        wall.set(100_030);
         {
             let retry = resumed.resume_outbound_fanouts();
             tokio::pin!(retry);

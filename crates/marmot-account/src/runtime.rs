@@ -3976,6 +3976,21 @@ where
                 }
                 self.session.put_outbound_fanout(&fanout)?;
             }
+            if !attempts.is_empty() {
+                // Cancelled publishes may have reached a relay. Back off their
+                // exact-event retries instead of immediately blocking the worker again.
+                for &index in &due {
+                    if fanout.target_status(index)
+                        == Some(cgka_traits::FanoutTargetStatus::Attempting)
+                    {
+                        fanout.record_target_failure(
+                            index,
+                            ambiguous_endpoint_failure(endpoints[index].clone()),
+                        )?;
+                    }
+                }
+                self.session.put_outbound_fanout(&fanout)?;
+            }
             drop(attempts);
             let report = frozen_fanout_report(&fanout);
             // Record this artifact before confirmation releases any frozen
