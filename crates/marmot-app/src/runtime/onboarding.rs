@@ -1534,7 +1534,11 @@ impl AccountManager {
         account_id: &str,
         kind: u64,
         endpoints: Vec<String>,
-    ) -> (Vec<NostrTransportEvent>, Vec<OnboardingFinding>, usize) {
+    ) -> (
+        Vec<NostrTransportEvent>,
+        Vec<OnboardingFinding>,
+        HashSet<String>,
+    ) {
         let signer = self
             .resolve(account_id)
             .ok()
@@ -1599,11 +1603,11 @@ impl AccountManager {
             });
         }
         let mut records = Vec::new();
-        let mut completed = 0;
+        let mut completed = HashSet::new();
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((_, Ok(events))) => {
-                    completed += 1;
+                Ok((endpoint, Ok(events))) => {
+                    completed.insert(relay_key(&endpoint));
                     // A full bounded page may omit another installation's slot.
                     if kind == 30443
                         && events
@@ -1709,7 +1713,7 @@ impl AccountManager {
             .inspect_onboarding_relays(&c.snapshot.account_id_hex, step.kind(), sources)
             .await;
         let Some(event) = records.into_iter().next() else {
-            return if completed == 0 || !failures.is_empty() {
+            return if completed.is_empty() || !failures.is_empty() {
                 (
                     OnboardingStatus::RetryableFailure,
                     if failures.is_empty() {
@@ -1793,7 +1797,7 @@ impl AccountManager {
                         )
                         .await;
                     findings.extend(failures);
-                    passed = completed > 0;
+                    passed = !completed.is_empty();
                     if !passed {
                         findings.push(finding(OnboardingIssue::NoUsableRoute));
                     }
@@ -1888,7 +1892,13 @@ impl AccountManager {
                 && (all.iter().collect::<HashSet<_>>().len() > MAX_RELAYS
                     || all
                         .iter()
-                        .any(|relay| nostr::RelayUrl::parse(relay).is_err())))
+                        .any(|relay| nostr::RelayUrl::parse(relay).is_err())
+                    || self
+                        .app
+                        .relay_plane
+                        .classify_relay_endpoints(all.clone())
+                        .iter()
+                        .any(|v| v.policy != RelayEndpointPolicy::Allowed)))
             || (step == OnboardingStep::Relays && write_relays.is_empty())
             || (step == OnboardingStep::InboxRelays && !write_relays.is_empty())
             || self
@@ -2069,8 +2079,15 @@ impl AccountManager {
             )
             .await?;
         self.require_live_onboarding_attempt(&c)?;
-        // Partial discovery can confirm a known record, but cannot prove absence.
-        if completed == 0 || (records.is_empty() && !failures.is_empty()) {
+        // Every configured source must finish: a timeout may hide a newer record.
+        // Unreachable user-declared hints cannot establish absence either.
+        if completed.is_empty()
+            || c.options
+                .discovery_relays
+                .iter()
+                .any(|endpoint| !completed.contains(&relay_key(endpoint)))
+            || (records.is_empty() && !failures.is_empty())
+        {
             c.set(proposal.step, OnboardingStatus::RetryableFailure, failures);
             c.snapshot.proposal = None;
         } else if records.first().map(|e| &e.id) != proposal.previous_event_id.as_ref() {
@@ -2305,21 +2322,6 @@ fn validate_onboarding_record(event: &NostrTransportEvent) -> Vec<OnboardingFind
                 tag.get(1)
                     .is_none_or(|key| key.len() != 64 || PublicKey::from_hex(key).is_err())
             }),
-        10002 => event
-            .tags
-            .iter()
-            .filter(|t| t.first().is_some_and(|v| v == "r"))
-            .any(|tag| {
-                tag.get(1).is_none_or(String::is_empty)
-                    || tag
-                        .get(2)
-                        .is_some_and(|role| !matches!(role.as_str(), "read" | "write"))
-            }),
-        10050 => event
-            .tags
-            .iter()
-            .filter(|t| t.first().is_some_and(|v| v == "relay"))
-            .any(|tag| tag.get(1).is_none_or(String::is_empty)),
         _ => false,
     };
     if malformed {

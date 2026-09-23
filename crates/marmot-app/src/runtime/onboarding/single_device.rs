@@ -84,7 +84,7 @@ impl AccountManager {
             });
         }
         // Missing any selected source remains inconclusive even if others reached EOSE.
-        let discovery_complete = completed > 0 && findings.is_empty();
+        let discovery_complete = !completed.is_empty() && findings.is_empty();
         let discovery = if !packages.is_empty() {
             findings.push(finding(OnboardingIssue::OtherInstallationPossible));
             OnboardingDeviceDiscovery::OtherInstallationPossible

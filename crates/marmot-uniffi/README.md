@@ -516,7 +516,11 @@ Imported identities can use the durable preflight API instead of `login`:
    declarations. Relay findings are advisory once a usable outbox/inbox route is
    confirmed. Proposals require a policy-allowed write route (or inbox route);
    reachability is checked after publication. Explicit relay selections replace
-   the list. A missing discovery result is not global proof of absence: hosts must
+   the list and require every selected endpoint to pass dial policy. Approval
+   requires every configured discovery source to complete; failures from additional
+   user-declared sources are tolerated only when the previous record is found.
+   This bounded check cannot rule out newer records on unreachable or unqueried sources.
+   A missing discovery result is not global proof of absence: hosts must
    not automatically approve publication for imported identities.
    Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned
