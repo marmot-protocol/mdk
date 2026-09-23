@@ -14,6 +14,8 @@ separate anonymous client, and a separate write-only publisher client. An
 account's disconnect, generation replacement, reactivation, and removal do
 not replace Bob's client or subscriptions. The live inbox receives an event
 after Alice reconnects and after an Alice history request is cancelled.
+The anonymous client reads public data, then observes an AUTH challenge and
+an `auth-required` CLOSED for a private inbox without an account authenticator.
 The publish-only connection causes zero `REQ` queries. The probe rejects
 non-loopback endpoints; it is not an MDK dialer or TLS/privacy implementation.
 

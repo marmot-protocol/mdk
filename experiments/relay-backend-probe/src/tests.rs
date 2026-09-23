@@ -199,11 +199,35 @@ async fn auth_isolation(replace_relay_generation: bool) {
         fetch(&anonymous, Filter::new().kind(Kind::TextNote)).await,
         BTreeSet::from([public.id])
     );
+    let mut anonymous_messages = anonymous.notifications_with_gaps();
     assert!(fetch(&anonymous, inbox(&alice)).await.is_empty());
+    let mut challenged = false;
+    let mut denied = false;
+    tokio::time::timeout(DEADLINE, async {
+        while !(challenged && denied) {
+            if let Some(NotificationUpdate::Notification(ClientNotification::Message {
+                message,
+                ..
+            })) = anonymous_messages.next().await
+            {
+                match *message {
+                    RelayMessage::Auth { .. } => challenged = true,
+                    RelayMessage::Closed { message, .. }
+                        if message.starts_with("auth-required:") =>
+                    {
+                        denied = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(a_auth.load(Ordering::SeqCst), 2);
     assert_eq!(b_auth.load(Ordering::SeqCst), 1);
     println!(
-        "auth: two isolated account sockets; repeated requests reused each; Alice reauthenticated once; Bob survived Alice removal; cross-account and anonymous private reads denied"
+        "auth: two isolated account sockets; repeated requests reused each; Alice reauthenticated once; Bob survived Alice removal; cross-account private read denied; anonymous challenge and auth-required CLOSED observed without an account authenticator"
     );
     anonymous.shutdown().await;
     b.shutdown().await;
