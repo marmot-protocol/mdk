@@ -7786,6 +7786,8 @@ const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[
     "wss://purplepag.es",
     VERTEX_DIRECTORY_RELAY,
     "wss://nos.lol",
+    "wss://relay.ditto.pub",
+    "wss://relay.primal.net",
 ];
 
 pub fn default_directory_discovery_relays() -> Vec<TransportEndpoint> {

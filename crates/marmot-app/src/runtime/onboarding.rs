@@ -232,6 +232,8 @@ struct OnboardingCheckpoint {
     approved: bool,
     signed_repair: Option<NostrTransportEvent>,
     #[serde(default)]
+    append_relays: bool,
+    #[serde(default)]
     single_device_acknowledged: bool,
     #[serde(default)]
     setup_cleanup_pending: bool,
@@ -322,6 +324,7 @@ impl OnboardingCheckpoint {
             records: vec![None; STEP_COUNT],
             approved: false,
             signed_repair: None,
+            append_relays: false,
             single_device_acknowledged: false,
             setup_cleanup_pending: false,
             attempt_start_revision: 0,
@@ -1725,7 +1728,9 @@ impl AccountManager {
             );
         }
         let mut findings = validate_onboarding_record(&event);
+        let mut passed = findings.is_empty();
         if step.relay() {
+            passed = false;
             let name = if step == OnboardingStep::Relays {
                 "r"
             } else {
@@ -1754,14 +1759,16 @@ impl AccountManager {
             }
             let state = crate::relay_list_state_from_event(&event);
             if let Some(state) = state {
-                let mut endpoints = state.relays.clone();
-                if step == OnboardingStep::Relays {
-                    for endpoint in state.read_relays {
-                        if !endpoints.contains(&endpoint) {
-                            endpoints.push(endpoint);
-                        }
-                    }
-                }
+                // NIP-65 requires a usable outbox; read-only routes cannot satisfy it.
+                let mut endpoints = state.relays;
+                let defaults = c
+                    .options
+                    .default_relays
+                    .iter()
+                    .map(|relay| relay_key(relay))
+                    .collect::<HashSet<_>>();
+                // Keep the dial cap from hiding appended defaults behind an old long list.
+                endpoints.sort_by_cached_key(|relay| !defaults.contains(&relay_key(relay)));
                 if endpoints.is_empty() {
                     findings.push(finding(OnboardingIssue::NoUsableRoute));
                 } else {
@@ -1779,10 +1786,8 @@ impl AccountManager {
                         )
                         .await;
                     findings.extend(failures);
-                    if completed == 0
-                        || (step == OnboardingStep::Relays
-                            && state.relays.iter().all(|relay| is_plaintext_onion(relay)))
-                    {
+                    passed = completed > 0;
+                    if !passed {
                         findings.push(finding(OnboardingIssue::NoUsableRoute));
                     }
                 }
@@ -1790,7 +1795,9 @@ impl AccountManager {
                 findings.push(finding(OnboardingIssue::Malformed));
             }
         }
-        let status = if findings.is_empty() {
+        // Other clients may use routes this runtime cannot. Their failures are
+        // advisory once a usable route exists, not grounds to rewrite the list.
+        let status = if passed {
             OnboardingStatus::Passed
         } else {
             OnboardingStatus::NeedsInput
@@ -1803,7 +1810,7 @@ impl AccountManager {
     }
     /// Prepare a relay replacement without signing or publishing it. Passing
     /// None appends the recommended defaults to the observed list, preserving
-    /// existing read/write roles. Invalid existing entries require an explicit edit.
+    /// existing tags and read/write roles, independently of local dial policy.
     /// For inbox lists use read_relays; write_relays must be empty.
     pub async fn propose_onboarding_relays(
         &self,
@@ -1824,16 +1831,13 @@ impl AccountManager {
         {
             return Err(onboarding_error());
         }
+        c.append_relays = selection.is_none();
         let (read_relays, write_relays) = if let Some(selection) = selection {
             selection
         } else {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
             if let Some(event) = &c.records[step.index()] {
-                // Never turn an unparseable declaration into a defaults-only replacement.
-                if !validate_onboarding_record(event).is_empty() {
-                    return Err(onboarding_error());
-                }
                 let state =
                     crate::relay_list_state_from_event(event).ok_or_else(onboarding_error)?;
                 if step == OnboardingStep::Relays {
@@ -1849,13 +1853,13 @@ impl AccountManager {
             for relays in [&mut reads, &mut writes] {
                 let mut seen = HashSet::new();
                 for relay in relays.iter_mut() {
-                    let url = nostr::RelayUrl::parse(&*relay).map_err(|_| onboarding_error())?;
+                    let url = relay_key(relay);
                     *relay = known.entry(url).or_insert_with(|| relay.clone()).clone();
                 }
                 relays.retain(|relay| seen.insert(relay.clone()));
             }
             for relay in &c.options.default_relays {
-                let url = nostr::RelayUrl::parse(relay).map_err(|_| onboarding_error())?;
+                let url = relay_key(relay);
                 if known.contains_key(&url) {
                     continue;
                 }
@@ -1873,17 +1877,23 @@ impl AccountManager {
             .cloned()
             .collect::<Vec<_>>();
         if all.is_empty()
-            || all.iter().collect::<HashSet<_>>().len() > MAX_RELAYS
+            || (!c.append_relays
+                && (all.iter().collect::<HashSet<_>>().len() > MAX_RELAYS
+                    || all
+                        .iter()
+                        .any(|relay| nostr::RelayUrl::parse(relay).is_err())))
             || (step == OnboardingStep::Relays && write_relays.is_empty())
             || (step == OnboardingStep::InboxRelays && !write_relays.is_empty())
             || self
                 .app
                 .relay_plane
-                .classify_relay_endpoints(all)
-                .iter()
-                .any(|v| {
-                    v.policy != RelayEndpointPolicy::Allowed && !is_plaintext_onion(&v.endpoint)
+                .classify_relay_endpoints(if step == OnboardingStep::Relays {
+                    write_relays.clone()
+                } else {
+                    read_relays.clone()
                 })
+                .iter()
+                .all(|v| v.policy != RelayEndpointPolicy::Allowed)
         {
             return Err(onboarding_error());
         }
@@ -2052,7 +2062,8 @@ impl AccountManager {
             )
             .await?;
         self.require_live_onboarding_attempt(&c)?;
-        if completed == 0 || !failures.is_empty() {
+        // Partial discovery can confirm a known record, but cannot prove absence.
+        if completed == 0 || (records.is_empty() && !failures.is_empty()) {
             c.set(proposal.step, OnboardingStatus::RetryableFailure, failures);
             c.snapshot.proposal = None;
         } else if records.first().map(|e| &e.id) != proposal.previous_event_id.as_ref() {
@@ -2235,8 +2246,13 @@ impl AccountManager {
 
 // A published declaration can retain Tor endpoints even without a Tor transport.
 fn is_plaintext_onion(endpoint: &str) -> bool {
-    nostr::RelayUrl::parse(endpoint)
-        .is_ok_and(|url| url.is_onion() && url.as_str().starts_with("ws://"))
+    url::Url::parse(endpoint).is_ok_and(|url| {
+        url.scheme() == "ws" && url.domain().is_some_and(|host| host.ends_with(".onion"))
+    })
+}
+
+fn relay_key(endpoint: &str) -> String {
+    url::Url::parse(endpoint).map_or_else(|_| endpoint.to_owned(), |url| url.to_string())
 }
 
 fn validate_onboarding_record(event: &NostrTransportEvent) -> Vec<OnboardingFinding> {
@@ -2371,11 +2387,24 @@ fn relay_repair_event(
     } else {
         "relay"
     };
+    let inherited = previous
+        .filter(|_| c.append_relays)
+        .and_then(crate::relay_list_state_from_event)
+        .into_iter()
+        .flat_map(|state| {
+            state
+                .relays
+                .into_iter()
+                .chain(state.read_relays)
+                .chain(state.write_relays)
+        })
+        .map(|relay| relay_key(&relay))
+        .collect::<HashSet<_>>();
     let mut tags = previous
         .map(|e| {
             e.tags
                 .iter()
-                .filter(|t| t.first().is_none_or(|v| v != tag_name))
+                .filter(|t| c.append_relays || t.first().is_none_or(|v| v != tag_name))
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -2387,6 +2416,9 @@ fn relay_repair_event(
         }
     }
     for relay in relays {
+        if inherited.contains(&relay_key(&relay)) {
+            continue;
+        }
         let mut tag = vec![tag_name.to_owned(), relay.clone()];
         if proposal.step == OnboardingStep::Relays {
             match (

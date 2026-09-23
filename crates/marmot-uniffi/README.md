@@ -511,11 +511,12 @@ Imported identities can use the durable preflight API instead of `login`:
 4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
    a proposal. Recommended relays append missing defaults to the observed list,
-   preserving existing NIP-65 roles and `ws://` onion entries. Onion entries stay
-   in the published list but are not dialed by the direct transport; an accessible
-   route is still required. Invalid existing entries require an explicit
-   edit; they are never silently removed. Explicit relay selections replace the
-   list. A missing discovery result is not global proof of absence: hosts must
+   preserving every original relay tag, including private-network, onion,
+   retired, and unparseable entries. Dial policy filters connections, not published
+   declarations. Relay findings are advisory once a usable outbox/inbox route is
+   confirmed. Proposals require a policy-allowed write route (or inbox route);
+   reachability is checked after publication. Explicit relay selections replace
+   the list. A missing discovery result is not global proof of absence: hosts must
    not automatically approve publication for imported identities.
    Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned
