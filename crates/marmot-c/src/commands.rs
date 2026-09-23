@@ -3193,6 +3193,7 @@ pub unsafe extern "C" fn marmot_verify_public_nostr_event_json(
 #[cfg(test)]
 mod nostr_verification_tests {
     use super::*;
+    use nostr::{EventBuilder, JsonUtil, Keys, Kind};
     use std::{ffi::CString, ptr};
 
     #[test]
@@ -3218,6 +3219,19 @@ mod nostr_verification_tests {
             MarmotStatus::Ok
         );
         assert_eq!(verified, 1);
+
+        let signed_event = EventBuilder::new(Kind::TextNote, "public C event")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let event_json = CString::new(signed_event.as_json()).unwrap();
+        let mut event_verified = 0u8;
+        assert_eq!(
+            unsafe {
+                marmot_verify_public_nostr_event_json(event_json.as_ptr(), &raw mut event_verified)
+            },
+            MarmotStatus::Ok
+        );
+        assert_eq!(event_verified, 1);
 
         let malformed = CString::new("{}").unwrap();
         let mut out = 1u8;
