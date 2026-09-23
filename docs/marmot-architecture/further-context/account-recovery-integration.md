@@ -26,8 +26,10 @@ of late history below the cursor after cold restart. The owner currently parks
 that unprovable history as designed, which prevents the old bounded comparison
 from running on unchanged reopen. This is unfinished integration, not merely
 validation remaining. The other focused results below do not establish readiness.
-The proposed adjustment is in `account-recovery-incremental-comparison-proposal.md`;
-it is not an approved replacement for the agreed architecture.
+The user chose to preserve automatic recovery and requested the concrete bounded-
+comparison amendment in `account-recovery-incremental-comparison-proposal.md`. Its
+schema/runtime changes are specified but not implemented; all other architecture
+constraints remain in force.
 
 | Acceptance boundary | Implemented behavior and files | Acceptance evidence |
 | --- | --- | --- |
@@ -40,7 +42,7 @@ it is not an approved replacement for the agreed architecture.
 | Evidence and escalation | `client/epoch_stall.rs` has no replay authority; `client/recovery.rs` and storage `account_recovery/stall.rs` sample distinct qualified local observations; migration 0094 persists sample identity | `qualified_local_observations_escalate_without_replay_and_survive_reorg`; `qualified_stall_rejects_new_loss_route_and_inventory_changes`; `qualified_stall_transaction_failure_and_clock_rebase_never_forge_samples`; detector anti-spoofing suite |
 | Bounded state and investigation | Constant-memory loss snapshot; grant-owned admissions; completed known-event metadata reclaimed; unknown broad-history investigation quiesces with debt retained | `completed_known_event_metadata_waits_for_grant_release_then_is_reclaimed`; `unknown_history_is_bounded_while_epoch_input_remains_retryable`; storage loss snapshot/import tests; approved unresolved-watermark disk exception in runtime-state-bounds.md |
 | Populated migration and conservative mode | #1983/#1987 preserve old debt and atomic completion; one-obligation mode uses the same ledger/executor, including cross-grant loss acknowledgment | Populated/interrupted migration tests; `readiness_wait_and_mode_handoff_preserve_pending_state_and_retry_cost`; `conservative_grants_do_not_coalesce_or_buy_an_extra_retry`; conservative partial-proof/reopen/ack regressions |
-| Automatic below-floor recovery | **Failing / design amendment pending:** parked incremental history suppresses the previous cold-restart comparison; `client/recovery.rs`, `client/sync.rs`, storage recovery records and the existing worker due tick are the concrete affected boundaries | `cold_restart_reconciles_backlog_below_since_floor`; `stalled_epoch_backfill_still_arms_after_route_reconciliation`; no assertion weakening or cooldown bypass accepted |
+| Automatic below-floor recovery | **Failing / amendment specified, implementation pending:** parked incremental history suppresses the previous cold-restart comparison; `client/recovery.rs`, `client/sync.rs`, storage recovery records and the existing worker due tick are the concrete affected boundaries | `cold_restart_reconciles_backlog_below_since_floor`; `stalled_epoch_backfill_still_arms_after_route_reconciliation`; no assertion weakening or cooldown bypass accepted |
 | Combined readiness | **Blocked by the preceding behavior:** 2865/2868 passed on `3fcb8236`; the separate frozen-wake failure is fixed in the following focused checkpoint | Review findings fixed; full affected suite and final gates must pass after the remaining behavior is resolved |
 
 ## Source ownership and replacement inventory
@@ -405,3 +407,29 @@ and superseded checks, and the remaining blocking acquisition limitations.
   it was not published as a fix. The contract question was escalated, with a
   concrete bounded-comparison amendment. No automatic rearm exception, competing
   authority, false coverage result or replacement assertion has been implemented.
+
+## Bounded-comparison amendment checkpoint — 2026-09-23
+
+The user selected automatic bounded comparison under the same owner/cooldown,
+with older coverage debt retained. The adjacent amendment now specifies migration
+0095, one durable coalescing comparison slot, typed reservation/freeze/admission/
+settlement contracts, cancellation and conservative-mode behavior, and the exact
+remaining implementation/test boundaries. No executable source or schema has
+changed in this documentation checkpoint. The two `since_floor` failures remain
+unresolved; the combined suite has not been rerun or claimed green.
+
+Independent checks on exact code head
+`36442cd2e62883d0290c5fc6145e7af04ec7ea08` completed successfully:
+
+- Simulator `protocol_decision_gate`: 5 tests passed.
+- Four affected crates' doctest commands passed (zero doctests present).
+- Default-policy owner, receipt and prompt-invite selection: 25 tests passed.
+- Complete `just fast-ci`: passed, including workspace all-target check/clippy,
+  diagnostics feature builds and repository static/documentation gates.
+
+Exact commands, exit codes and timestamps are preserved locally in
+`/tmp/mdk-1946-ci-owner/independent-gates-k5dyamlj/results.json`. These checks
+postdate the frozen-wake fix and do not predate any subsequent executable edits.
+The earlier 2865/2868 combined result predates that fix and remains historical
+failure evidence. Local review fixes and the amendment are unpushed while the two
+delivery regressions remain red; #1992's published code is still `81c2bb53`.
