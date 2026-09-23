@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-09-23
+updated: 2026-09-24
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
@@ -12,8 +12,9 @@ status: overview
 relay-client boundary. It takes an owned `NostrAcquisitionRequest` and a
 request-local `tokio_util::sync::CancellationToken`, and returns owned
 `NostrAcquisitionResult` evidence. No account worker, engine, or storage borrow
-needs to survive the network wait. Current `NostrSdkRelayClient` uses the
-default explicit `Unsupported` result; production traffic is unchanged.
+needs to survive the network wait. The production `NostrSdkRelayClient` now
+implements this operation with the qualified rust-nostr fork. Existing account
+recovery policy and durable admission remain owned outside the transport.
 
 The request's account ID selects the authentication context and inbox
 recipient. The calling executor retains its existing `AttemptGrant`,
@@ -91,9 +92,9 @@ rejected before I/O.
   implementation. The app's `MarmotRelayPlane::acquire_history` validates
   endpoints with the existing `RelaySafetyPolicy` before the backend may
   register a new relay; the recovery consumer must call this guarded method.
-  It must prove cleanup preserves
-  live subscriptions and qualify real SDK behavior separately; the fake tests
-  here check only request validation and the owned result/control shape.
+  Its production-backend regressions cover bounded partial results, dropped
+  request cleanup, live-subscription preservation, and independent account
+  loss watches. Platform artifact qualification remains a separate gate.
 - The #1947 recovery consumer captures an owned plan from the #1946 owner,
   retains its grant and scope token, dispatches network acquisition outside
   the serialized account worker,
@@ -103,5 +104,6 @@ rejected before I/O.
   network evidence without clearing durable progress. Worker migration and
   scheduling are outside this interface PR.
 
-This slice adds no connection allocator, production SDK acquisition, loss
-bridge, recovery executor, retry policy, schema migration, or public binding.
+This integration adds the production SDK acquisition and account-scoped loss
+bridge. It adds no recovery executor, durable retry policy, schema migration,
+or public binding.

@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-23
+updated: 2026-09-24
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -19,10 +19,11 @@ status: overview
 
 # Current State — Implementations & Spec
 
-The Nostr relay-client boundary now declares optional owned bounded acquisition
-and receiver-scoped notification-loss evidence. The production SDK client
-returns explicit unsupported results until #1358 adopts the qualified backend;
-the recovery owner and account worker still use their existing execution path.
+The Nostr relay-client boundary declares owned bounded acquisition and
+receiver-scoped notification-loss evidence. The production SDK client now uses
+the qualified rust-nostr fork for bounded history requests and account-scoped
+loss watches; the recovery owner and account worker still use their existing
+execution path.
 See [the interface contract](nostr-bounded-acquisition-interface.md).
 
 C6a resolves accepted kind-1009 edits in the durable timeline once, sharing effective text with reply and chat-list
