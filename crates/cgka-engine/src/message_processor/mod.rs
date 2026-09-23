@@ -274,8 +274,10 @@ pub(crate) struct DeferredPeelGroupState {
     /// Retained-anchor peel contexts, shared by every retry over this group's
     /// backlog: the deferred-peel sweep and the publish-cycle replay. Deriving
     /// one costs a durable rewind of live group state, which a long backlog
-    /// would otherwise pay per retained anchor per row. Exporter-bearing, and
-    /// held in engine memory on the same terms as `candidate_cache`.
+    /// would otherwise pay per retained anchor per row. Exporter-bearing, held
+    /// in engine memory on the same terms as `candidate_cache`, and dropped
+    /// with it: on every canonical change, and whenever a sweep turns its
+    /// candidate generation over.
     ///
     /// Entries are keyed by anchor NAME, and `create_group_state_snapshot` is
     /// INSERT OR REPLACE — so an anchor can be rewritten under an unchanged

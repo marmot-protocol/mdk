@@ -698,7 +698,9 @@ pub struct EngineMetricsSnapshot {
     /// Cached generations discarded because their work became stale or ended.
     pub deferred_peel_candidate_cache_invalidations: u64,
     /// Retained-anchor peel contexts derived by rewinding live group state.
-    /// A context served from cache is not a derivation.
+    /// A context served from cache is not a derivation. Recorded when the
+    /// recovery attempt returns; one that fails on a peeler error is not
+    /// recorded.
     pub past_peel_context_derivations: u64,
     /// Candidate enumeration elapsed time in local monotonic milliseconds.
     pub deferred_peel_candidate_enumeration_ms: HistogramSnapshot,
