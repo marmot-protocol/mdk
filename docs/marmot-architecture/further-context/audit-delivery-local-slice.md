@@ -7,9 +7,9 @@ status: local testable slice; no production activation
 
 # Audit delivery local slice
 
-This branch starts from `origin/master` and follows the simplified reassessment
-checkpoint. PR #1958 was consulted only for its test inventory. The cursor here
-has an internal version marker and is not a commitment to that PR's `v1` layout.
+This testable slice follows the simplified audit-delivery reassessment. Its
+cursor has an internal version marker and does not adopt PR #1958's on-disk
+layout.
 
 ## Recorder boundary evidence
 
@@ -38,8 +38,9 @@ acknowledged byte offset, and at most one prepared range per journal. The
 fingerprint catches accidental file replacement; it is not a full-file proof.
 The prepared range is at most eight complete lines and 64 KiB, with a SHA-256
 digest of exactly those original bytes. The 64 KiB limit comfortably covers
-the recorder's measured ordinary rows (about 597 bytes on average, 811 bytes
-maximum in the cited session) while bounding each read and retry. A line over
+the recorder's [documented ordinary rows](../../../crates/marmot-forensics/src/audit.rs)
+(about 597 bytes on average, 811 bytes maximum in one measured session) while
+bounding each read and retry. A line over
 64 KiB becomes a visible gap; this is a local policy, not a schema limit.
 
 Before publishing a prepared attempt, the reader syncs the source file because
@@ -50,6 +51,9 @@ compared with its range digest before the receiver sees it. Only the receiver's
 explicit complete result advances the cursor. Retryable outcomes keep the
 attempt; permanent or partial outcomes block that journal. A lost acceptance
 response can duplicate rows on retry.
+An interrupted staging write is discarded on restart because the rename is
+the commit point. A fingerprint mismatch blocks the journal as an uncertain
+identity, including when a prepared attempt exists.
 
 Gap records carry journal generation, segment, byte extent (or unknown end),
 and a fixed reason. Complete malformed or oversized lines are skipped to their
@@ -60,7 +64,8 @@ and blocked status are exposed to the caller. Other journals can continue.
 
 The fake receiver tests cover real recorder append, size rotation, restart,
 retry, acceptance, changed range, active torn tail, malformed and oversized
-lines, destructive clear, partial rejection, and corrupt cursor. The local
+lines, destructive clear, partial rejection, rotation during discovery, and
+corrupt or oversized cursor. The local
 reader has no HTTP, runtime scheduling, root-lease acquisition, retention,
 capacity cleanup, receiver validation, or investigation reader integration.
 Those require the later receiver and lifecycle steps before production use.

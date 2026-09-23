@@ -1,4 +1,5 @@
 pub mod audit;
+#[cfg(unix)]
 pub mod local_delivery;
 
 pub use audit::{
