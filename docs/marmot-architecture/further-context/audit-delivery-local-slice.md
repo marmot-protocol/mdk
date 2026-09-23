@@ -44,13 +44,21 @@ bounding each read and retry. A line over
 64 KiB becomes a visible gap; this is a local policy, not a schema limit.
 
 Before publishing a prepared attempt, the reader syncs the source file because
-the recorder only flushes. Cursor and gap updates use a private staged file,
-file sync, rename, and parent directory sync. If publication is uncertain, the
+the recorder only flushes. `prepare_once()` persists that bounded attempt and
+returns an owned batch of the original JSONL lines plus a token; it retains no
+source file handle or lock. The caller can release the account root lease before
+an external send, then reacquire it for `finish(token, result)`. Both operations
+reload the current cursor so a second owner cannot make a stale in-memory
+completion valid. Cursor and gap updates use a private staged file, file sync,
+rename, and parent directory sync. If publication is uncertain, the
 instance fences further work. On restart, a prepared range is re-read and
-compared with its range digest before the receiver sees it. Only the receiver's
-explicit complete result advances the cursor. Retryable outcomes keep the
-attempt; permanent or partial outcomes block that journal. A lost acceptance
-response can duplicate rows on retry.
+compared with its range digest before the receiver sees it. `finish` rejects a
+token whose destination, generation, or persisted range no longer matches. It
+does not reopen the source: an explicit complete acceptance of the owned batch
+can advance its cursor even if the source changed during the send. Retryable or
+missing results keep the exact attempt for replay; permanent or partial results
+block only that journal. A lost acceptance response can duplicate rows on retry,
+so the eventual receiver must handle duplicate original rows.
 An interrupted staging write is discarded on restart because the rename is
 the commit point. If the first-byte fingerprint changes for a matching
 device/inode, the reader retires the old generation, records an unknown-extent
@@ -78,6 +86,9 @@ retry, acceptance, changed range, active torn tail, malformed and oversized
 lines, destructive clear, partial rejection, rotation during discovery and
 between discovery and reopening, simulated inode reuse, and
 observed unprepared tail truncation, corrupt or oversized cursor. The local
-reader has no HTTP, runtime scheduling, root-lease acquisition, retention,
+reader also tests restart after prepare, lost acknowledgement, duplicate-safe
+retry, completion after source change, stale tokens, and absence of a retained
+source descriptor in the returned batch. It has no HTTP, runtime scheduling,
+root-lease acquisition, retention,
 capacity cleanup, receiver validation, or investigation reader integration.
 Those require the later receiver and lifecycle steps before production use.
