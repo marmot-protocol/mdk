@@ -3732,6 +3732,22 @@ impl AppClient {
             };
             if !finished {
                 self.adapter.fail_delivery_overflow_recovery();
+            } else if !self.delivery_loss_blocks_cursor() {
+                // Every drained prefix was persisted while the loss fence held
+                // the old cursor. Promote the admitted candidate only after the
+                // exact live acknowledgment and durable evidence reclamation.
+                let previous = self.checkpointed_transport_timestamp;
+                self.checkpointed_transport_timestamp = self.state.last_transport_timestamp;
+                if let Err(error) =
+                    self.save_state_with_pending_local_group_deletion_frontier_clears()
+                {
+                    self.checkpointed_transport_timestamp = previous;
+                    return Err(ClassifiedSyncFailure::at_stage(
+                        result.as_ref().ok().cloned().unwrap_or_default(),
+                        error,
+                        SyncFailureStage::StatePersist,
+                    ));
+                }
             }
         }
         if let Some(guard) = overflow_guard.as_mut() {
@@ -3963,23 +3979,43 @@ impl AppClient {
                             storage_sqlite::RecoveryScopeCheckpoint {
                                 token: scope.token.clone(),
                                 retained_known_event,
-                                endpoints: scope
-                                    .goal
-                                    .required_endpoints
-                                    .iter()
-                                    .map(|endpoint| storage_sqlite::RecoveryEndpointCheckpoint {
-                                        endpoint: endpoint.clone(),
-                                        outcome: if scope.goal.admitted_endpoints.contains(endpoint)
-                                        {
-                                            outcome
-                                        } else {
-                                            storage_sqlite::RecoveryScopeOutcome::Excluded
-                                        },
-                                        exhaustive: false,
-                                        admission_complete: false,
-                                        first_boundary: false,
-                                    })
-                                    .collect(),
+                                endpoints: {
+                                    let checkpoints = scope
+                                        .goal
+                                        .required_endpoints
+                                        .iter()
+                                        .map(|endpoint| {
+                                            storage_sqlite::RecoveryEndpointCheckpoint {
+                                                endpoint: endpoint.clone(),
+                                                outcome: if scope
+                                                    .goal
+                                                    .admitted_endpoints
+                                                    .contains(endpoint)
+                                                {
+                                                    outcome
+                                                } else {
+                                                    storage_sqlite::RecoveryScopeOutcome::Excluded
+                                                },
+                                                exhaustive: false,
+                                                admission_complete: false,
+                                                first_boundary: false,
+                                            }
+                                        })
+                                        .collect();
+                                    // Synthetic tests supply independent finite-inventory certificates;
+                                    // ordinary EOSE never manufactures them. Refusal/unfinished drains
+                                    // cannot be promoted by this fixture either.
+                                    #[cfg(test)]
+                                    let checkpoints = if verdict == DrainVerdict::Complete
+                                        && counts.refused == 0
+                                    {
+                                        self.test_recovery_evidence
+                                            .map_or(checkpoints, |evidence| evidence(&scope.goal))
+                                    } else {
+                                        checkpoints
+                                    };
+                                    checkpoints
+                                },
                             },
                         )
                     })

@@ -1743,6 +1743,8 @@ impl MarmotApp {
             )?;
         }
         let mut client = AppClient {
+            #[cfg(test)]
+            test_recovery_evidence: None,
             recovery_owner,
             conversation_captures: Vec::new(),
             runtime_telemetry: None,

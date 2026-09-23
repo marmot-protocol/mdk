@@ -150,3 +150,14 @@ and superseded checks, and the remaining blocking acquisition limitations.
   for a cap; qualified completion and exact live acknowledgment remain mandatory.
   Design and bounds documents record this limitation. Active snapshot/completed
   metadata reclamation and bounded investigation proofs remain acceptance work.
+- Qualified runtime completion: an explicit synthetic finite-endpoint certificate
+  fixture now drives the real executor, scope checkpoint, caller verdict and loss
+  acknowledgment. Ordinary SDK EOSE remains Unknown; the fixture is test-only and
+  makes no production-capability claim. Positive continuation tests now require
+  that independent proof. Missing endpoints, incomplete admission/exhaustiveness,
+  stale EOSE and newer loss refuse completion. A new regression reproduced success
+  returning before cursor promotion after acknowledgment; the executor now saves
+  that already-admitted candidate after the handoff and restores its old in-memory
+  checkpoint if persistence fails. All 11 repair tests and 16 owner tests pass with
+  policy overrides. An initial fixture compilation used a nonexistent state
+  accessor; that was corrected before the cursor regression reproduced its failure.

@@ -330,6 +330,10 @@ pub(crate) struct GroupRouteRefresh {
 }
 
 pub struct AppClient {
+    /// Synthetic endpoint certificates for executor/completion contract tests.
+    /// Never enabled by EOSE or by the production SDK adapter.
+    #[cfg(test)]
+    pub(crate) test_recovery_evidence: Option<recovery::TestRecoveryEvidence>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,

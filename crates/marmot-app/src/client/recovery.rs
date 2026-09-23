@@ -13,6 +13,30 @@ use storage_sqlite::{
     SqliteAccountStorage,
 };
 
+/// Tests inject the result of a finite synthetic endpoint inventory. This seam
+/// exercises admission/checkpoint/acknowledgment, not the production backend's
+/// ability to prove exhaustiveness. That backend continues to return Unknown.
+#[cfg(test)]
+pub(crate) type TestRecoveryEvidence =
+    fn(&RecoveryScopePlan) -> Vec<storage_sqlite::RecoveryEndpointCheckpoint>;
+
+#[cfg(test)]
+pub(crate) fn empty_finite_history(
+    scope: &RecoveryScopePlan,
+) -> Vec<storage_sqlite::RecoveryEndpointCheckpoint> {
+    scope
+        .admitted_endpoints
+        .iter()
+        .map(|endpoint| storage_sqlite::RecoveryEndpointCheckpoint {
+            endpoint: endpoint.clone(),
+            outcome: storage_sqlite::RecoveryScopeOutcome::Covered,
+            exhaustive: true,
+            admission_complete: true,
+            first_boundary: false,
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryReadiness {
     #[cfg(test)]
