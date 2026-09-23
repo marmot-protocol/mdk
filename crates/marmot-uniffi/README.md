@@ -93,6 +93,10 @@ All methods, including less common management/diagnostic operations, are listed 
 3. Use local reads for initial UI where their contracts allow it. Start the runtime for live
    account workers, relay synchronization and acquisition. Local data and send readiness are
    distinct: render a conversation's available history while honoring its composer capabilities.
+   If one account worker fails to start, another ready account remains usable. A failed account
+   is retried on a later trigger after bounded in-memory backoff; repeated commands during the
+   delay report unavailability without reopening it. The runtime's aggregate start/reconcile
+   result still reports the partial failure.
 4. Keep synchronous storage reads off the UI thread. Async Swift/Kotlin calls may suspend;
    C methods are blocking unless documented otherwise. Host signer/secret-store callbacks may
    run concurrently on worker threads and must be thread-safe.

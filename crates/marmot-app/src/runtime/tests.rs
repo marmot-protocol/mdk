@@ -2804,7 +2804,7 @@ async fn cancelled_startup_is_reaped() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn reconcile_failure_releases_spawned_worker_session_guards() {
+async fn reconcile_failure_waits_for_sibling_and_preserves_its_session() {
     let dir = tempfile::tempdir().expect("tempdir");
     marmot_account::AccountHome::open(dir.path())
         .create_account("alice")
@@ -2817,10 +2817,6 @@ async fn reconcile_failure_releases_spawned_worker_session_guards() {
     let alice_client = open_runtime_local_test_client(&app, &runtime, "alice").await;
     let (alice_reached, alice_proceed) = install_local_open_gate(&app, "alice");
     let (bob_reached, bob_proceed) = install_local_open_gate(&app, "bob");
-    let (rollback_waiter, rollback_started) = std::sync::mpsc::channel();
-    runtime
-        .accounts()
-        .register_reconcile_rollback_waiter(rollback_waiter);
 
     let reconcile_runtime = runtime.clone();
     let reconcile = tokio::spawn(async move { reconcile_runtime.reconcile_accounts().await });
@@ -2830,10 +2826,10 @@ async fn reconcile_failure_releases_spawned_worker_session_guards() {
     );
 
     alice_proceed.send(()).expect("release alice open result");
-    wait_for_test_signal(rollback_started, "failed-reconcile rollback").await;
+    tokio::task::yield_now().await;
     assert!(
         !reconcile.is_finished(),
-        "rollback must wait for Bob's in-flight open to release its session guard"
+        "reconcile must consume Bob's pending readiness result"
     );
     bob_proceed.send(()).expect("release bob open result");
 
@@ -2842,15 +2838,236 @@ async fn reconcile_failure_releases_spawned_worker_session_guards() {
         .expect("reconcile task")
         .expect_err("reconcile should fail while alice is busy");
     assert!(matches!(err, AppError::AccountSessionBusy));
-    drop(open_runtime_local_test_client(&app, &runtime, "bob").await);
+    assert_eq!(runtime.app_performance_snapshot().account_open.attempts, 2);
+    runtime
+        .accounts()
+        .worker_commands("bob")
+        .await
+        .expect("Bob remains ready");
     drop(alice_client);
     runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn concurrent_reconcile_cannot_lose_workers_to_failed_rollback() {
+async fn failed_account_startup_preserves_ready_sibling() {
     let dir = tempfile::tempdir().expect("tempdir");
-    marmot_account::AccountHome::open(dir.path())
+    let home = marmot_account::AccountHome::open(dir.path());
+    let alice = home.create_account("alice").expect("create alice");
+    let bob = home.create_account("bob").expect("create bob");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let alice_client = open_runtime_local_test_client(&app, &runtime, "alice").await;
+    let (alice_reached, alice_proceed) = install_local_open_gate(&app, "alice");
+    let (bob_reached, bob_proceed) = install_local_open_gate(&app, "bob");
+
+    let manager = runtime.accounts();
+    let starting = manager.clone();
+    let reconcile = tokio::spawn(async move { starting.reconcile().await });
+    let ((), ()) = tokio::join!(
+        wait_for_test_signal(alice_reached, "alice open"),
+        wait_for_test_signal(bob_reached, "bob open"),
+    );
+    bob_proceed.send(()).expect("release healthy bob");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if manager.workers.lock().await[&bob.account_id_hex].ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Bob becomes ready while Alice still waits");
+    let bob_commands = timeout(Duration::from_secs(1), manager.worker_commands("bob"))
+        .await
+        .expect("Bob must not wait for Alice's lifecycle transaction")
+        .expect("Bob serves commands");
+    alice_proceed.send(()).expect("release failing alice");
+    assert!(matches!(
+        reconcile.await.expect("reconcile task"),
+        Err(AppError::AccountSessionBusy)
+    ));
+
+    let workers = manager.workers.lock().await;
+    assert!(!workers.contains_key(&alice.account_id_hex));
+    assert!(workers[&bob.account_id_hex].ready);
+    drop(workers);
+    let bob_after = manager
+        .worker_commands("bob")
+        .await
+        .expect("bob remains usable");
+    assert!(bob_after.same_channel(&bob_commands));
+    drop(alice_client);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_worker_startup_is_suppressed_until_explicit_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let alice = app
+        .account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let manager = runtime.accounts();
+    let alice_client = open_runtime_local_test_client(&app, &runtime, "alice").await;
+    assert!(matches!(
+        manager.reconcile().await,
+        Err(AppError::AccountSessionBusy)
+    ));
+    manager
+        .startup_retries
+        .lock()
+        .unwrap()
+        .extend_deadline_for_test(&alice.account_id_hex, Duration::from_secs(60));
+    assert_eq!(runtime.app_performance_snapshot().account_open.attempts, 1);
+
+    for _ in 0..3 {
+        let error = manager
+            .worker_commands("alice")
+            .await
+            .expect_err("retry deferred");
+        assert!(matches!(error, AppError::BlockingTask(_)));
+        assert!(manager.reconcile().await.is_err());
+    }
+    assert!(manager.worker_commands_for_setup("alice").await.is_err());
+    assert!(manager.media_worker_commands("alice").await.is_err());
+    let snapshot = runtime.app_performance_snapshot();
+    assert_eq!(
+        snapshot.account_open.attempts, 1,
+        "cooldown must not spawn more workers"
+    );
+    let suppressed = snapshot
+        .runtime_operations
+        .iter()
+        .find(|operation| operation.operation == RuntimeOp::AccountStartupRetrySuppressed)
+        .expect("suppression operation");
+    assert_eq!(suppressed.not_ready, 8);
+
+    app.account_home()
+        .create_account("bob")
+        .expect("create healthy Bob");
+    assert!(
+        manager.reconcile().await.is_err(),
+        "Alice is still cooling down"
+    );
+    manager
+        .worker_commands("bob")
+        .await
+        .expect("Bob starts during Alice's cooldown");
+    assert_eq!(runtime.app_performance_snapshot().account_open.attempts, 2);
+
+    drop(alice_client);
+    manager
+        .restart_account(&alice.account_id_hex)
+        .await
+        .expect("explicit restart");
+    assert_eq!(runtime.app_performance_snapshot().account_open.attempts, 3);
+    manager
+        .worker_commands("alice")
+        .await
+        .expect("ready fast path");
+    assert_eq!(runtime.app_performance_snapshot().account_open.attempts, 3);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn signed_out_account_stays_gated_until_explicit_sign_in() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let alice = app
+        .account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let manager = runtime.accounts();
+    let alice_client = open_runtime_local_test_client(&app, &runtime, "alice").await;
+    assert!(matches!(
+        manager.reconcile().await,
+        Err(AppError::AccountSessionBusy)
+    ));
+    manager.deactivate_account("alice").await.expect("sign out");
+    manager
+        .restart_account(&alice.account_id_hex)
+        .await
+        .expect("signed-out restart is gated");
+    assert!(
+        !manager
+            .workers
+            .lock()
+            .await
+            .contains_key(&alice.account_id_hex)
+    );
+    assert_eq!(runtime.app_performance_snapshot().account_open.attempts, 1);
+
+    drop(alice_client);
+    let signed_in = manager
+        .sign_in_account("alice")
+        .await
+        .expect("explicit sign-in");
+    assert!(signed_in.running);
+    assert_eq!(runtime.app_performance_snapshot().account_open.attempts, 2);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stuck_worker_reap_does_not_block_a_healthy_account() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let alice = app
+        .account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let bob = app
+        .account_home()
+        .create_account("bob")
+        .expect("create bob");
+    let runtime = MarmotAppRuntime::new(app);
+    let manager = runtime.accounts();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (shutdown, _shutdown_rx) = oneshot::channel();
+    let (commands, _receiver) = mpsc::channel(1);
+    manager.workers.lock().await.insert(
+        alice.account_id_hex.clone(),
+        ManagedAccountWorker {
+            ready: false,
+            handle: tokio::task::spawn_blocking(move || {
+                let _ = release_rx.recv();
+            }),
+            commands,
+            media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
+            shutdown,
+        },
+    );
+
+    let outcome = timeout(Duration::from_secs(12), manager.reconcile()).await;
+    let bob_ready = manager
+        .workers
+        .lock()
+        .await
+        .get(&bob.account_id_hex)
+        .is_some_and(|w| w.ready);
+    release_tx.send(()).expect("release stuck worker");
+    let error = outcome
+        .expect("cleanup budget must release the global transaction")
+        .expect_err("Alice remains fenced while her worker exits");
+    assert!(matches!(error, AppError::BlockingTask(_)));
+    assert!(
+        bob_ready,
+        "Bob must start while Alice's cleanup is unfinished"
+    );
+    manager
+        .restart_account(&alice.account_id_hex)
+        .await
+        .expect("Alice starts after cleanup");
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_reconcile_keeps_ready_worker_and_suppresses_failed_account() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alice = marmot_account::AccountHome::open(dir.path())
         .create_account("alice")
         .expect("create alice");
     marmot_account::AccountHome::open(dir.path())
@@ -2879,12 +3096,9 @@ async fn concurrent_reconcile_cannot_lose_workers_to_failed_rollback() {
     tokio::task::yield_now().await;
     assert!(
         !reconcile_b.is_finished(),
-        "reconcile B must not return while reconcile A can still roll back its workers"
+        "reconcile B must wait for A to settle all attempted workers"
     );
 
-    // Alice's failed open result is already captured behind its gate. Releasing
-    // the one-shot owner now lets B open Alice after A finishes rolling back.
-    drop(alice_client);
     alice_proceed.send(()).expect("release alice open result");
     bob_proceed.send(()).expect("release bob open result");
 
@@ -2893,10 +3107,22 @@ async fn concurrent_reconcile_cannot_lose_workers_to_failed_rollback() {
         .expect("reconcile A task")
         .expect_err("reconcile A should preserve Alice's captured busy error");
     assert!(matches!(err_a, AppError::AccountSessionBusy));
-    reconcile_b
+    let err_b = reconcile_b
         .await
         .expect("reconcile B task")
-        .expect("reconcile B should install fresh workers after A rolls back");
+        .expect_err("Alice is cooling down");
+    assert!(matches!(err_b, AppError::BlockingTask(_)));
+    runtime
+        .accounts()
+        .worker_commands("bob")
+        .await
+        .expect("Bob remains ready");
+    drop(alice_client);
+    runtime
+        .accounts()
+        .restart_account(&alice.account_id_hex)
+        .await
+        .expect("explicit retry starts Alice");
 
     let managed = runtime
         .accounts()

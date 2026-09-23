@@ -1150,7 +1150,13 @@ impl AccountManager {
             }
             Err(error) => return Err(error.into()),
         };
-        self.reconcile_locked().await?;
+        self.startup_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear(&snapshot.account_id_hex);
+        self.reconcile_locked_report()
+            .await?
+            .for_account(&snapshot.account_id_hex)?;
         Ok(snapshot)
     }
     pub async fn begin_external_signer_onboarding<S: crate::ExternalAccountSigner + 'static>(
@@ -1208,7 +1214,13 @@ impl AccountManager {
             }
             Err(error) => return Err(error.into()),
         };
-        self.reconcile_locked().await?;
+        self.startup_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear(&snapshot.account_id_hex);
+        self.reconcile_locked_report()
+            .await?
+            .for_account(&snapshot.account_id_hex)?;
         drop(_workers);
         self.app.register_external_signer(&id, signer).await?;
         Ok(snapshot)
@@ -1390,7 +1402,8 @@ impl AccountManager {
             }
             self.save_onboarding(c)?;
             if c.snapshot.steps[index].status != OnboardingStatus::Passed {
-                self.reconcile().await?;
+                self.reconcile_for_account(&c.snapshot.account_id_hex)
+                    .await?;
                 return Ok(());
             }
         }
@@ -1421,6 +1434,7 @@ impl AccountManager {
             return Err(onboarding_error());
         }
         if c.approved {
+            self.reset_startup_retry(&account_id).await;
             self.run_onboarding_locked(&mut c).await?;
         } else {
             c.snapshot.proposal = None;
@@ -1433,7 +1447,8 @@ impl AccountManager {
                 c.reset_step(c.snapshot.steps[index].step);
             }
             self.save_onboarding(&mut c)?;
-            self.reconcile().await?;
+            self.reset_startup_retry(&account_id).await;
+            self.reconcile_for_account(&account_id).await?;
             self.run_onboarding_locked(&mut c).await?;
         }
         Ok(c.snapshot)
@@ -1469,7 +1484,8 @@ impl AccountManager {
             }
         }
         self.save_onboarding(&mut c)?;
-        self.reconcile().await?;
+        self.reset_startup_retry(&account_id).await;
+        self.reconcile_for_account(&account_id).await?;
         self.run_onboarding_locked(&mut c).await?;
         Ok(c.snapshot)
     }
@@ -1495,6 +1511,7 @@ impl AccountManager {
         }
         c.set(step, OnboardingStatus::Skipped, Vec::new());
         self.save_onboarding(&mut c)?;
+        self.reset_startup_retry(&account_id).await;
         self.run_onboarding_locked(&mut c).await?;
         Ok(c.snapshot)
     }

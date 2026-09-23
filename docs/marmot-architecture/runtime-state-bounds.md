@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-18
+updated: 2026-09-23
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -23,6 +23,17 @@ Tracking issue: marmot-protocol/mdk#381.
 - **Each structure documents its bound** (max size, TTL, or eviction policy) below and enforces it in code.
 
 ## Inventory
+
+### `marmot-app` account-worker startup (`src/runtime/worker_startup.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| In-memory startup failures | At most one entry per eligible account, with a saturating failure count, monotonic deadline, and closed failure classification; no history or error text | Successful readiness, explicit lifecycle reset, ineligibility, account removal/deactivation, or shutdown clears entries. Reconcile prunes absent and ineligible accounts. |
+| Pending worker reapers | At most one cleanup task per removed managed worker | The lifecycle transaction gives cleanup one shared five-second budget. An unfinished handle retains only its account's replacement fence; another account can start. Cancelled callers leave handles tracked for the next transaction or terminal shutdown. |
+
+The retry delay starts at one second, doubles after each actual failure, and caps at 60 seconds.
+Suppressed calls do not advance the count or deadline. Expiry permits an attempt on the next
+existing trigger; no timer retains an account or holds the transaction through a cooldown.
 
 ### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)
 

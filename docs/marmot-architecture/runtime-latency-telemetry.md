@@ -1,7 +1,7 @@
 ---
 title: "Conversation readiness and runtime latency telemetry"
 created: 2026-09-18
-updated: 2026-09-18
+updated: 2026-09-23
 status: implementation
 tags: [marmot, runtime, telemetry, performance]
 ---
@@ -73,6 +73,7 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `worker_acquire` | General worker lookup/reconciliation, across callers |
 | `lifecycle_lock_wait` | Wait for the account manager's lifecycle transaction lock |
 | `account_startup`, `worker_reopen` | Initial/reconnect runtime client open; existing account stage metrics provide additional subdivision |
+| `account_startup_retry_suppressed` | Zero-duration completed-only `not_ready` count for each eligible account whose trigger was deferred by the worker-start cooldown |
 | `worker_hydration` | Nonempty startup hydration pipeline, including command service between slices |
 | `worker_catch_up` | Worker catch-up including the preceding frozen read snapshot and coalescing |
 | `worker_snapshot` | Frozen group read snapshot immediately before catch-up |
@@ -97,7 +98,10 @@ Callbacks aggregate only and must never access storage or perform I/O. Connectio
 transaction durations reveal contention but do not identify a particular query or conversation.
 
 Existing `app_account_open_failures` now receives bounded failure-stage/error-class
-classification from account-worker readiness. Existing outbound queue, execution, local acceptance,
+classification from actual account-worker readiness attempts. The separate
+`app_runtime_account_startup_retry_suppressed_not_ready` counter records deferred trigger
+decisions, not unique accounts or elapsed cooldown time. It carries no account label or
+failure text. Existing outbound queue, execution, local acceptance,
 local projection, publication and caller-response metrics now also cover draft sends. Compare
 build cohorts separately: increased outbound sample coverage is not itself a performance regression.
 Publication success retains the existing required-ack semantics, not recipient delivery semantics.

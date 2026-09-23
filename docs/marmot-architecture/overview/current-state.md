@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-19
+updated: 2026-09-23
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -140,6 +140,11 @@ Generated identities remain unavailable to background attention and managed work
 until local readiness. Failed pre-readiness setup preserves its files and keys
 without preventing healthy accounts from starting; it does not automatically erase
 or repair an unreadable database. See [local artifact safety](local-artifact-safety.md#initializing-encrypted-account-databases).
+Managed worker startup now settles each account independently: an account that reached
+local readiness remains usable when another fails. Actual failures get an in-memory
+per-account retry delay capped at 60 seconds; ordinary worker acquisition and reconcile
+triggers during that delay do not reopen the failed account. Explicit restart and committed
+setup/onboarding changes can retry it. Aggregate reconciliation still reports partial failure.
 
 MDK now exposes opt-in durable onboarding for imported identities, with per-step
 validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.

@@ -62,6 +62,7 @@ operations! {
     WorkerAcquire => "worker_acquire",
     LifecycleLockWait => "lifecycle_lock_wait",
     AccountStartup => "account_startup",
+    AccountStartupRetrySuppressed => "account_startup_retry_suppressed",
     WorkerHydration => "worker_hydration",
     WorkerCatchUp => "worker_catch_up",
     WorkerSnapshot => "worker_snapshot",
