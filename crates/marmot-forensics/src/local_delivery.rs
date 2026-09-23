@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 
 const MAX_BATCH_BYTES: usize = 64 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
-const MAX_RECORDS: usize = 8;
-const FINGERPRINT_BYTES: usize = 64;
+const MAX_RECORDS: usize = 96;
+// The recorder session id follows the schema, sequence, and wall clock fields.
+// Include the full id even when two fresh heads share the same millisecond.
+const FINGERPRINT_BYTES: usize = 192;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,11 +196,19 @@ impl LocalAuditDelivery {
         if self.state.gaps.len() > old_gap_count {
             return Ok(DeliveryStep::Gap);
         }
+        let mut source_moved = false;
         for index in 0..self.state.journals.len() {
             if self.state.journals[index].missing || self.state.journals[index].blocked.is_some() {
                 continue;
             }
-            let (mut file, len) = self.open_journal(index)?;
+            let (mut file, len) = match self.open_journal(index) {
+                Ok(source) => source,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    source_moved = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             self.state.journals[index].observed_len =
                 self.state.journals[index].observed_len.max(len);
             if let Some(prepared) = self.state.journals[index].prepared.clone() {
@@ -209,7 +219,7 @@ impl LocalAuditDelivery {
                     self.record_gap(
                         index,
                         prepared.start,
-                        Some(prepared.end),
+                        prepared.end,
                         GapReason::ChangedPreparedRange,
                     )?;
                     self.state.journals[index].blocked =
@@ -223,7 +233,7 @@ impl LocalAuditDelivery {
                     self.record_gap(
                         index,
                         prepared.start,
-                        Some(prepared.end),
+                        prepared.end,
                         GapReason::ChangedPreparedRange,
                     )?;
                     return Ok(DeliveryStep::Gap);
@@ -251,7 +261,7 @@ impl LocalAuditDelivery {
                         return Ok(DeliveryStep::WaitingForWriter);
                     }
                     file.sync_all()?;
-                    self.record_gap(index, line_start, Some(end), GapReason::TornTail)?;
+                    self.record_gap(index, line_start, end, GapReason::TornTail)?;
                     return Ok(DeliveryStep::Gap);
                 }
                 if oversized {
@@ -259,7 +269,7 @@ impl LocalAuditDelivery {
                         break;
                     }
                     file.sync_all()?;
-                    self.record_gap(index, line_start, Some(end), GapReason::OversizedLine)?;
+                    self.record_gap(index, line_start, end, GapReason::OversizedLine)?;
                     return Ok(DeliveryStep::Gap);
                 }
                 if !valid_event(&line) {
@@ -267,7 +277,7 @@ impl LocalAuditDelivery {
                         break;
                     }
                     file.sync_all()?;
-                    self.record_gap(index, line_start, Some(end), GapReason::InvalidRecord)?;
+                    self.record_gap(index, line_start, end, GapReason::InvalidRecord)?;
                     return Ok(DeliveryStep::Gap);
                 }
                 if bytes.len() + line.len() > MAX_BATCH_BYTES {
@@ -292,7 +302,9 @@ impl LocalAuditDelivery {
             self.publish()?;
             return self.send(index, prepared, bodies, receiver);
         }
-        if self.state.journals.iter().any(|j| j.blocked.is_some()) {
+        if source_moved {
+            Ok(DeliveryStep::Retryable)
+        } else if self.state.journals.iter().any(|j| j.blocked.is_some()) {
             Ok(DeliveryStep::Blocked)
         } else {
             Ok(DeliveryStep::Idle)
@@ -340,20 +352,21 @@ impl LocalAuditDelivery {
         &mut self,
         index: usize,
         start: u64,
-        end: Option<u64>,
+        end: u64,
         reason: GapReason,
     ) -> io::Result<()> {
         let j = &self.state.journals[index];
-        self.state.gaps.push(DeliveryGap {
-            generation: j.generation,
-            segment: j.segment.clone(),
-            start,
-            end,
-            reason,
-        });
-        if let Some(end) = end {
-            self.state.journals[index].acknowledged = end;
-        }
+        append_gap(
+            &mut self.state.gaps,
+            DeliveryGap {
+                generation: j.generation,
+                segment: j.segment.clone(),
+                start,
+                end: Some(end),
+                reason,
+            },
+        );
+        self.state.journals[index].acknowledged = end;
         self.state.journals[index].prepared = None;
         self.publish()
     }
@@ -379,21 +392,36 @@ impl LocalAuditDelivery {
 
     fn open_journal(&self, index: usize) -> io::Result<(File, u64)> {
         let j = &self.state.journals[index];
+        let active_name =
+            self.active.file_name().and_then(|n| n.to_str()) == Some(j.segment.as_str());
         let path = self
             .active
             .parent()
             .unwrap_or(Path::new("."))
             .join(&j.segment);
-        let mut file = open_source(&path)?;
+        let mut file = match open_source(&path) {
+            Err(error) if active_name && error.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            result => result?,
+        };
         let meta = file.metadata()?;
         let (device, inode) = file_identity(&meta);
         let len = meta.len();
+        if device != j.device || inode != j.inode {
+            if active_name {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            return Err(invalid("source identity changed; journal paused"));
+        }
+        if active_name && len < j.fingerprint_len as u64 {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         let fingerprint = fingerprint(&mut file, j.fingerprint_len as usize)?;
-        if device != j.device
-            || inode != j.inode
-            || len < j.acknowledged
-            || (!j.fingerprint.is_empty() && fingerprint != j.fingerprint)
-        {
+        if len < j.acknowledged || (!j.fingerprint.is_empty() && fingerprint != j.fingerprint) {
+            if active_name {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
             return Err(invalid("source identity changed; journal paused"));
         }
         Ok((file, len))
@@ -443,22 +471,41 @@ impl LocalAuditDelivery {
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| invalid("invalid source name"))?
                 .to_owned();
-            if let Some((index, journal)) = self
+            if len == 0
+                && !self
+                    .state
+                    .journals
+                    .iter()
+                    .any(|j| j.device == device && j.inode == inode && !j.missing)
+            {
+                // Empty new files carry no stable prefix or deliverable line.
+                // Assign their generation after the first completed write.
+                continue;
+            }
+            if let Some(index) = self
                 .state
                 .journals
-                .iter_mut()
-                .enumerate()
-                .find(|(_, j)| j.device == device && j.inode == inode && !j.missing)
+                .iter()
+                .position(|j| j.device == device && j.inode == inode && !j.missing)
             {
+                let journal = &mut self.state.journals[index];
                 let was_blocked = journal.blocked.is_some();
                 let existing_fp = fingerprint(
                     &mut file,
                     (journal.fingerprint_len as u64).min(len) as usize,
                 )?;
                 if !journal.fingerprint.is_empty() && journal.fingerprint != existing_fp {
-                    // This is an identity failure. Keep any prepared range and
-                    // its digest intact for an explicit recovery decision.
-                    journal.blocked = Some("source fingerprint changed".into());
+                    // The recorder never rewrites its head. On filesystems
+                    // that reuse inode numbers, this is a replacement: retire
+                    // the old journal and register the current bytes afresh.
+                    let was_active = self.active.file_name().and_then(|n| n.to_str())
+                        == Some(journal.segment.as_str());
+                    retire_missing(&mut self.state, index, was_active);
+                    seen[index] = true;
+                    register_journal(&mut self.state, name, device, inode, fp, fp_len, len)?;
+                    seen.push(true);
+                    changed = true;
+                    continue;
                 } else {
                     changed |= journal.fingerprint != fp
                         || journal.segment != name
@@ -479,23 +526,7 @@ impl LocalAuditDelivery {
                 seen[index] = true;
                 changed |= !was_blocked && journal.blocked.is_some();
             } else {
-                let generation = self.state.next_generation;
-                self.state.next_generation = generation
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("generation exhausted"))?;
-                self.state.journals.push(Journal {
-                    generation,
-                    segment: name,
-                    device,
-                    inode,
-                    fingerprint: fp,
-                    fingerprint_len: fp_len,
-                    observed_len: len,
-                    acknowledged: 0,
-                    prepared: None,
-                    blocked: None,
-                    missing: false,
-                });
+                register_journal(&mut self.state, name, device, inode, fp, fp_len, len)?;
                 seen.push(true);
                 changed = true;
             }
@@ -504,18 +535,7 @@ impl LocalAuditDelivery {
             if !present && !self.state.journals[index].missing {
                 let was_active = self.active.file_name().and_then(|n| n.to_str())
                     == Some(self.state.journals[index].segment.as_str());
-                let j = &self.state.journals[index];
-                if j.prepared.is_some() || j.acknowledged < j.observed_len || was_active {
-                    self.state.gaps.push(DeliveryGap {
-                        generation: j.generation,
-                        segment: j.segment.clone(),
-                        start: j.prepared.as_ref().map_or(j.acknowledged, |p| p.start),
-                        end: None,
-                        reason: GapReason::MissingSource,
-                    });
-                }
-                self.state.journals[index].prepared = None;
-                self.state.journals[index].missing = true;
+                retire_missing(&mut self.state, index, was_active);
                 changed = true;
             }
         }
@@ -554,6 +574,69 @@ impl LocalAuditDelivery {
         fs::rename(&temp, &self.state_path)?;
         File::open(self.state_path.parent().unwrap_or(Path::new(".")))?.sync_all()
     }
+}
+
+fn append_gap(gaps: &mut Vec<DeliveryGap>, gap: DeliveryGap) {
+    if let Some(previous) = gaps.last_mut()
+        && previous.generation == gap.generation
+        && previous.segment == gap.segment
+        && previous.reason == gap.reason
+        && previous.end == Some(gap.start)
+    {
+        previous.end = gap.end;
+    } else {
+        gaps.push(gap);
+    }
+}
+
+fn retire_missing(state: &mut State, index: usize, was_active: bool) {
+    let journal = &mut state.journals[index];
+    if journal.prepared.is_some() || journal.acknowledged < journal.observed_len || was_active {
+        append_gap(
+            &mut state.gaps,
+            DeliveryGap {
+                generation: journal.generation,
+                segment: journal.segment.clone(),
+                start: journal
+                    .prepared
+                    .as_ref()
+                    .map_or(journal.acknowledged, |p| p.start),
+                end: None,
+                reason: GapReason::MissingSource,
+            },
+        );
+    }
+    journal.prepared = None;
+    journal.missing = true;
+}
+
+fn register_journal(
+    state: &mut State,
+    segment: String,
+    device: u64,
+    inode: u64,
+    fingerprint: String,
+    fingerprint_len: u8,
+    observed_len: u64,
+) -> io::Result<()> {
+    let generation = state.next_generation;
+    state.next_generation = generation
+        .checked_add(1)
+        .ok_or_else(|| invalid("generation exhausted"))?;
+    state.journals.push(Journal {
+        generation,
+        segment,
+        device,
+        inode,
+        fingerprint,
+        fingerprint_len,
+        observed_len,
+        acknowledged: 0,
+        prepared: None,
+        blocked: None,
+        missing: false,
+    });
+    Ok(())
 }
 
 fn validate_state(state: &State, active_name: &str) -> io::Result<()> {
@@ -831,10 +914,10 @@ mod tests {
         };
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Retryable);
         let prepared_end = sink.batches[0].end;
-        // Rewrite a byte beyond the 64-byte head fingerprint, preserving inode
+        // Rewrite a byte beyond the 192-byte head fingerprint, preserving inode
         // and length. The range digest must catch the change before any send.
         let mut file = OpenOptions::new().write(true).open(&active).unwrap();
-        file.seek(SeekFrom::Start(100)).unwrap();
+        file.seek(SeekFrom::Start(250)).unwrap();
         file.write_all(b"X").unwrap();
         file.sync_all().unwrap();
         drop(worker);
@@ -849,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_head_blocks_prepared_range_without_changing_its_cursor() {
+    fn changed_head_retires_prepared_generation_with_visible_missing_gap() {
         let (_dir, active, state_dir, recorder) = setup();
         record(&recorder, "one");
         let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
@@ -862,13 +945,47 @@ mod tests {
         file.seek(SeekFrom::Start(1)).unwrap();
         file.write_all(b"X").unwrap();
         file.sync_all().unwrap();
-        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Blocked);
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
         assert_eq!(sink.batches.len(), 1);
-        assert!(worker.gaps().is_empty());
-        assert!(worker.state.journals[0].prepared.is_some());
+        assert_eq!(worker.gaps()[0].reason, GapReason::MissingSource);
+        assert_eq!(worker.gaps()[0].start, 0);
+        assert_eq!(worker.gaps()[0].end, None);
+        assert!(worker.state.journals[0].missing);
+        assert!(worker.state.journals[0].prepared.is_none());
+        assert_eq!(worker.state.journals.len(), 2);
+        assert_ne!(
+            worker.state.journals[0].generation,
+            worker.state.journals[1].generation
+        );
         drop(worker);
         let worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
-        assert_eq!(worker.blocked()[0].1, "source fingerprint changed");
+        assert!(worker.blocked().is_empty());
+        assert_eq!(worker.gaps()[0].reason, GapReason::MissingSource);
+        assert!(worker.state.journals[0].missing);
+    }
+
+    #[test]
+    fn reused_inode_number_after_clear_retires_old_unaccepted_bytes() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "old_unaccepted");
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let old_generation = worker.state.journals[0].generation;
+        // Inode reuse is filesystem-dependent. Force the observed identity to
+        // match the replacement after a real recorder clear to model reuse.
+        recorder.rotate().unwrap();
+        record(&recorder, "new_generation");
+        let identity = file_identity(&fs::metadata(&active).unwrap());
+        worker.state.journals[0].device = identity.0;
+        worker.state.journals[0].inode = identity.1;
+        let mut sink = FakeReceiver::default();
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
+        assert_eq!(worker.gaps()[0].reason, GapReason::MissingSource);
+        assert_eq!(worker.gaps()[0].start, 0);
+        assert_eq!(worker.gaps()[0].end, None);
+        assert!(worker.state.journals[0].missing);
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_ne!(sink.batches[0].generation, old_generation);
+        assert_eq!(sink.batches[0].bodies.concat(), fs::read(&active).unwrap());
     }
 
     #[test]
@@ -897,6 +1014,39 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_invalid_lines_coalesce_into_one_gap() {
+        let (_dir, active, state_dir, _recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let start = fs::metadata(&active).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&active).unwrap();
+        file.write_all(b"bad-one\nbad-two\n").unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
+        assert_eq!(worker.gaps().len(), 1);
+        assert_eq!(worker.gaps()[0].start, start);
+        assert_eq!(worker.gaps()[0].end, Some(start + 16));
+        assert_eq!(worker.gaps()[0].reason, GapReason::InvalidRecord);
+    }
+
+    #[test]
+    fn ordinary_rows_use_more_than_eight_records_per_bounded_batch() {
+        let (_dir, active, state_dir, recorder) = setup();
+        for index in 0..120 {
+            record(&recorder, &format!("row-{index}"));
+        }
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        let first = &sink.batches[0];
+        assert!(first.bodies.len() > 8);
+        assert!(first.bodies.len() <= MAX_RECORDS);
+        assert!(first.bodies.concat().len() <= MAX_BATCH_BYTES);
+    }
+
+    #[test]
     fn real_size_rotation_keeps_old_inode_and_drains_both_files() {
         let (_dir, active, state_dir, recorder) = setup();
         let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
@@ -922,6 +1072,7 @@ mod tests {
             .into_iter()
             .find(|p| p != &active)
             .expect("real recorder rotated");
+        record(&recorder, "after_roll");
         drain(&mut worker, &mut sink);
         let sent: Vec<u8> = sink
             .batches
@@ -1091,6 +1242,33 @@ mod tests {
             worker.state.journals[0].prepared.as_ref().unwrap().end,
             prepared_end
         );
+    }
+
+    #[test]
+    fn rotation_between_discover_and_open_is_retryable_then_reconciled() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "before_roll");
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        let stem = active.file_stem().unwrap().to_str().unwrap();
+        let segment = active.with_file_name(format!("{stem}-seg000001.jsonl"));
+        assert_eq!(
+            worker
+                .run_once_with_after_discover(&mut sink, || {
+                    drop(recorder);
+                    fs::rename(&active, &segment).unwrap();
+                    let next = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+                    record(&next, "after_roll");
+                })
+                .unwrap(),
+            DeliveryStep::Retryable
+        );
+        assert!(sink.batches.is_empty());
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_eq!(sink.batches[0].bodies.concat(), fs::read(&segment).unwrap());
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_eq!(sink.batches[1].bodies.concat(), fs::read(&active).unwrap());
+        assert!(worker.gaps().is_empty());
     }
 
     #[test]

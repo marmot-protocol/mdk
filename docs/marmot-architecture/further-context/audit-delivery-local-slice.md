@@ -33,10 +33,10 @@ session, and replays source context. Tests cover these boundaries in
 
 `LocalAuditDelivery` reads the recorder's actual active and numbered segment
 files. It stores destination identity, monotonically assigned journal
-generation, current segment name, device/inode, a small first-byte fingerprint,
+generation, current segment name, device/inode, a 192-byte head fingerprint,
 acknowledged byte offset, and at most one prepared range per journal. The
 fingerprint catches accidental file replacement; it is not a full-file proof.
-The prepared range is at most eight complete lines and 64 KiB, with a SHA-256
+The prepared range is at most 96 complete lines and 64 KiB, with a SHA-256
 digest of exactly those original bytes. The 64 KiB limit comfortably covers
 the recorder's [documented ordinary rows](../../../crates/marmot-forensics/src/audit.rs)
 (about 597 bytes on average, 811 bytes maximum in one measured session) while
@@ -52,19 +52,27 @@ explicit complete result advances the cursor. Retryable outcomes keep the
 attempt; permanent or partial outcomes block that journal. A lost acceptance
 response can duplicate rows on retry.
 An interrupted staging write is discarded on restart because the rename is
-the commit point. A fingerprint mismatch blocks the journal as an uncertain
-identity, including when a prepared attempt exists.
+the commit point. If the first-byte fingerprint changes for a matching
+device/inode, the reader retires the old generation, records an unknown-extent
+missing-source gap for unaccepted bytes, and registers the current file as a
+new generation. This also covers filesystem inode reuse after a destructive
+clear. A prepared-range digest mismatch records a bounded gap before passing
+that range.
 
 Gap records carry journal generation, segment, byte extent (or unknown end),
 and a fixed reason. Complete malformed or oversized lines are skipped to their
 next newline; a torn active tail waits; a torn sealed tail can be skipped.
+Adjacent gaps with the same generation and reason are coalesced.
 Changing a prepared range records a gap before passing its bytes. Destructive
 clear of an unaccepted file records an unknown-extent missing-source gap. Gap
-and blocked status are exposed to the caller. Other journals can continue.
+and blocked status are exposed to the caller. A source that moves between
+discovery and reopening returns a retryable step for that journal; the next
+discovery reconciles its segment and active names. Other journals can continue.
 
 The fake receiver tests cover real recorder append, size rotation, restart,
 retry, acceptance, changed range, active torn tail, malformed and oversized
-lines, destructive clear, partial rejection, rotation during discovery, and
+lines, destructive clear, partial rejection, rotation during discovery and
+between discovery and reopening, simulated inode reuse, and
 corrupt or oversized cursor. The local
 reader has no HTTP, runtime scheduling, root-lease acquisition, retention,
 capacity cleanup, receiver validation, or investigation reader integration.
