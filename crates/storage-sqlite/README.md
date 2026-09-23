@@ -27,6 +27,20 @@ The crate is split around storage concerns:
   `shared/legacy.sql` defines recognized compatibility columns, and `shared/fixtures/` plus the migration and assurance
   tests cover adoption and recovery. `shared/error.rs` owns the privacy-safe error mapper and result extension.
 
+## Group recovery storage
+
+`GroupRecoveryStore` owns private SQLCipher candidate files and atomic promotion
+of one validated group. Protocol validation belongs to `cgka-session`; hosts should use
+its opaque prepared-recovery API. Keep the source quiesced and do not modify staged files.
+Promotion checks the original connection’s write fence, preserves unrelated groups and
+app projections, remaps account-global message order, retains unreplayed rows as invalidated
+history, and carries pending deliveries into the existing outbox. Transaction failure leaves
+the source unchanged. Promotion clears obsolete epoch-backfill intents and stall evidence
+for the repaired group. Policies, maintenance/publication records, and leave/disband intent
+remain host-owned; candidate divergence in these tables rejects promotion. App projections,
+acquisition state, and account-global duplicate evidence remain live. Files survive
+cancellation/failure for explicit host cleanup.
+
 ## Replay-state validation
 
 `group_replay_state_fingerprint` captures a consistent read of the same live canonical/OpenMLS state as a

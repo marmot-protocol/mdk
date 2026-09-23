@@ -599,6 +599,7 @@ fn storage_error_class(error: &StorageError) -> SyncErrorClass {
 
 fn storage_error_kind(error: &StorageError) -> &'static str {
     match error {
+        StorageError::RecoverySourceChanged => "storage_recovery_source_changed",
         StorageError::NotFound => "storage_not_found",
         StorageError::AlreadyExists => "storage_already_exists",
         StorageError::SnapshotMissing(_) => "storage_snapshot_missing",
