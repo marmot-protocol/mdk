@@ -150,10 +150,22 @@ impl SqliteAccountStorage {
                 ).storage()?;
                 if duplicate { return Ok(read(&conn)?.revision); }
             }
+            let unresolved_prior = {
+                let conn = storage.lock()?;
+                conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM account_recovery_obligations o
+                    JOIN account_recovery_scopes s ON s.obligation_id=o.id
+                    WHERE o.demand_key='incremental' AND o.state=0 AND s.snapshot_state=0)",
+                    [], |row| row.get::<_,bool>(0)).storage()?
+            };
             let ticket = storage.request_recovery(RecoveryRequest::IncrementalHistory, now_ms)?;
             let stored = storage.recovery_scope_snapshots(ticket.id)?;
             let mut merged: Vec<_> = stored.iter().map(|s| s.plan.clone()).collect();
             for goal in goals {
+                let mut goal = goal.clone();
+                // An existing unresolved placeholder carries no proven lower
+                // bound. Hydration cannot replace that older debt with the
+                // newer comparison floor; only acquisition stays bounded.
+                if unresolved_prior { goal.since_seconds = None; }
                 if let Some(old) = merged.iter_mut().find(|s| s.route_kind == goal.route_kind
                     && s.group_id == goal.group_id && s.transport_group_id == goal.transport_group_id) {
                     old.since_seconds = old.since_seconds.zip(goal.since_seconds).map(|(a,b)| a.min(b));
@@ -731,5 +743,43 @@ mod tests {
             .unwrap()
         );
         assert!(s.recovery_comparison().unwrap().pending());
+    }
+
+    #[test]
+    fn comparison_join_does_not_narrow_preexisting_unresolved_history() {
+        let s = storage();
+        let prior = s
+            .request_recovery(RecoveryRequest::IncrementalHistory, 1)
+            .unwrap();
+        assert!(s.recovery_scope_snapshots(prior.id).unwrap().is_empty());
+        s.join_recovery_comparison(&[1; 16], 100_000, &[scope()])
+            .unwrap();
+        let debt = s.recovery_scope_snapshots(prior.id).unwrap();
+        assert_eq!(
+            debt[0].plan.since_seconds, None,
+            "an unresolved earlier goal has no proven lower bound"
+        );
+        let (revision, attempt, _) = reserve(&s, 100_000, vec![scope()]);
+        assert!(
+            s.settle_recovery_comparison(
+                revision,
+                attempt,
+                &[(0, RecoveryComparisonOutcome::ServicedUnknown)],
+                None
+            )
+            .unwrap()
+        );
+        assert!(
+            s.pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|d| d.ticket.id == prior.id)
+        );
+        assert_eq!(
+            s.recovery_scope_snapshots(prior.id).unwrap()[0]
+                .plan
+                .since_seconds,
+            None
+        );
     }
 }

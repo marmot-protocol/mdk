@@ -486,3 +486,17 @@ and full-repair isolation guards; the 37/37 run includes them. Affected-crate
 clippy passed before those guards. All will be refreshed in the frozen complete
 stack run rather than treating earlier focused results as final acceptance.
 The two original restart tests add two rows to the replacement map (80 total).
+
+### Pre-publication debt-preservation correction
+
+Checkpoint 2 is signed `3e2723cb2d08fa97bb1dcd89db82d41113c728f2`. Its frozen
+full run was deliberately interrupted after 40 passes (four in-flight tests
+received SIGINT; 2841 were not run), not reported as an acceptance result.
+Source audit found that joining a comparison could resolve a pre-existing
+unbounded incremental placeholder using the newer comparison lower bound.
+`comparison_join_does_not_narrow_preexisting_unresolved_history` reproduced
+`Some(10)` instead of `None`. The join now retains the unresolved prior lower
+bound while its operational plan remains bounded. All **9 comparison-storage
+regressions pass** after that correction; the complete stack run is restarted on
+the signed successor. Logs: `comparison-placeholder-red.log`,
+`comparison-placeholder-green.log`, and the interrupted `verified-stack-gmtu0_ms/`.
