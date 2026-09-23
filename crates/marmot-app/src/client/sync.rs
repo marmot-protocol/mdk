@@ -3652,6 +3652,19 @@ impl AppClient {
                 &mut drain_verdict,
             )
             .await;
+        if result.is_err() {
+            self.abandon_loss_completion().map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|failure| failure.partial_summary.clone())
+                        .unwrap_or_default(),
+                    error,
+                    SyncFailureStage::StatePersist,
+                )
+            })?;
+        }
         for (id, group, before) in audit_groups {
             let after = self.local_epoch_for_group(&group);
             let revision = grant
@@ -3794,7 +3807,7 @@ impl AppClient {
         // Account activation tears down every old physical maintenance REQ.
         // The grant includes those prerequisites so they are restored under
         // its fresh fenced session without a second recovery activation.
-        self.post_join_maintenance_subscriptions.clear();
+        let displaced = std::mem::take(&mut self.post_join_maintenance_subscriptions);
         self.install_granted_post_join_subscriptions(grant)
             .await
             .map_err(|error| {
@@ -3804,7 +3817,34 @@ impl AppClient {
                     SyncFailureStage::GroupSubscriptionSync,
                 )
             })?;
-        if grant.mode == crate::RecoveryExecutorMode::Normal {
+        // Conservative grants select one predicate, but a broad activation must
+        // preserve every existing temporary session. Restoration supplies no
+        // completion evidence for an unselected obligation. A pending boundary
+        // remains eligible; a completed boundary keeps its domain grace clock.
+        for (group, (_, route)) in displaced {
+            if !self
+                .post_join_maintenance_subscriptions
+                .contains_key(&group)
+            {
+                let subscription = self
+                    .adapter
+                    .install_group_maintenance_subscription(
+                        route.clone(),
+                        grant.reservation.attempt_serial,
+                    )
+                    .await
+                    .map_err(|error| {
+                        ClassifiedSyncFailure::at_stage(
+                            SyncSummary::default(),
+                            error.into(),
+                            SyncFailureStage::GroupSubscriptionSync,
+                        )
+                    })?;
+                self.post_join_maintenance_subscriptions
+                    .insert(group, (subscription, route));
+            }
+        }
+        {
             match timeout(
                 TRANSPORT_RECONCILIATION_QUANTUM,
                 self.reconcile_transport_history(&grant.inventory),

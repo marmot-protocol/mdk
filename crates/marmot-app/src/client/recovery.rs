@@ -125,6 +125,7 @@ pub(crate) struct AttemptGrant {
     _live: Arc<()>,
 }
 
+#[derive(Clone)]
 struct GrantedLoss {
     id: [u8; 16],
     watermarks: Vec<storage_sqlite::RecoveryLossWatermark>,
@@ -179,6 +180,10 @@ pub(crate) struct AccountRecoveryOwner {
     active_fence: Option<RecoveryRevisionFence>,
     policy: RecoveryRetryPolicy,
     mode: RecoveryExecutorMode,
+    // At most the two loss causes. These are captured CAS inputs, never an
+    // authority for completion: storage rechecks every predicate at acknowledgment.
+    // Reopen discards them and restores all durable unacknowledged loss.
+    pending_loss_acknowledgments: Vec<(RecoveryRevisionFence, GrantedLoss)>,
 }
 
 /// Use the same precision as persisted retry deadlines. Truncating to seconds
@@ -218,6 +223,7 @@ impl AccountRecoveryOwner {
             active_fence: None,
             policy,
             mode: RecoveryExecutorMode::Normal,
+            pending_loss_acknowledgments: Vec::new(),
         })
     }
 
@@ -286,13 +292,54 @@ impl AccountRecoveryOwner {
             if fence.obligations.is_empty() || (!immediate && now_ms < prior.not_before_ms) {
                 return Ok::<_, StorageError>(None);
             }
-            let maintenance = self
-                .maintenance_observations
-                .values()
-                .map(|observation| observation.id)
-                .collect::<Vec<_>>();
-            storage.rearm_recovery_maintenance_for_activation(&maintenance)?;
-            fence = storage.recovery_eligible_revision_fence(immediate)?;
+            if self.mode == RecoveryExecutorMode::Normal {
+                let maintenance = self
+                    .maintenance_observations
+                    .values()
+                    .map(|observation| observation.id)
+                    .collect::<Vec<_>>();
+                storage.rearm_recovery_maintenance_for_activation(&maintenance)?;
+                fence = storage.recovery_eligible_revision_fence(immediate)?;
+            } else {
+                // One predicate owns this grant. Restore other physical sessions
+                // without re-completing their predicates or restarting grace.
+                // Oldest installed attempt first prevents a retrying predicate
+                // from starving the remaining durable obligations across reopen.
+                let demands = storage.pending_recovery_demands()?;
+                // Displaced unqualified boundaries need a new selected grant;
+                // their prior waiting state cannot strand them after we discard
+                // the old session observation. Completed grace stays completed.
+                let displaced = self
+                    .maintenance_observations
+                    .values()
+                    .filter(|observation| demands.iter().any(|d| d.ticket.id == observation.id))
+                    .map(|observation| observation.id)
+                    .collect::<Vec<_>>();
+                storage.rearm_recovery_maintenance_for_activation(&displaced)?;
+                let mut ordered = fence
+                    .obligations
+                    .iter()
+                    .map(|(id, revision)| {
+                        let caller = immediate
+                            && demands
+                                .iter()
+                                .any(|d| d.ticket.id == *id && d.caller_waiting);
+                        let last = storage
+                            .recovery_scope_snapshots(*id)?
+                            .iter()
+                            .map(|scope| scope.attempt_serial)
+                            .max()
+                            .unwrap_or(0);
+                        Ok((!caller, last, *id, *revision))
+                    })
+                    .collect::<StorageResult<Vec<_>>>()?;
+                ordered.sort();
+                fence.obligations = ordered
+                    .into_iter()
+                    .take(1)
+                    .map(|(_, _, id, revision)| (id, revision))
+                    .collect();
+            }
             let reservation = storage.reserve_recovery_attempt(
                 &fence,
                 now_ms,
@@ -673,6 +720,14 @@ impl AppClient {
         Ok(())
     }
 
+    pub(super) fn abandon_loss_completion(&mut self) -> Result<(), AppError> {
+        self.recovery_owner.pending_loss_acknowledgments.clear();
+        self.app
+            .account_storage(&self.state.label)?
+            .restore_unacknowledged_recovery_loss()?;
+        Ok(())
+    }
+
     /// The completion handoff is ordered: durable qualification, exact live
     /// plane acknowledgment, then guarded evidence reclamation. Failure after
     /// the plane acknowledgment restores the local guard and durable demand.
@@ -684,7 +739,6 @@ impl AppClient {
     ) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         if grant.loss.is_empty() {
-            storage.restore_unacknowledged_recovery_loss()?;
             return Ok(false);
         }
         for loss in &grant.loss {
@@ -694,15 +748,21 @@ impl AppClient {
                 .iter()
                 .find(|(id, _)| *id == loss.id)
             else {
-                storage.restore_unacknowledged_recovery_loss()?;
                 return Ok(false);
             };
             if loss.watermarks.is_empty()
                 || !storage.recovery_obligation_is_satisfied(loss.id, *revision)?
             {
-                storage.restore_unacknowledged_recovery_loss()?;
                 return Ok(false);
             }
+        }
+        for loss in &grant.loss {
+            self.recovery_owner
+                .pending_loss_acknowledgments
+                .retain(|(_, prior)| prior.id != loss.id);
+            self.recovery_owner
+                .pending_loss_acknowledgments
+                .push((grant.fence.clone(), loss.clone()));
         }
         // Do not clear a shared plane guard while another loss obligation was
         // omitted from this grant (for example one waiting for a capability).
@@ -713,16 +773,16 @@ impl AppClient {
                     | storage_sqlite::RecoveryCause::NotificationLoss
             )
         }) {
-            storage.restore_unacknowledged_recovery_loss()?;
             return Ok(false);
         }
         let Some(elapsed) = self.adapter.finish_delivery_overflow_recovery(attempt) else {
+            self.recovery_owner.pending_loss_acknowledgments.clear();
             storage.restore_unacknowledged_recovery_loss()?;
             return Ok(false);
         };
         let reclaimed = storage.with_transaction(|_| {
-            for loss in &grant.loss {
-                if !storage.acknowledge_recovery_loss(&grant.fence, loss.id, &loss.watermarks)? {
+            for (fence, loss) in &self.recovery_owner.pending_loss_acknowledgments {
+                if !storage.acknowledge_recovery_loss(fence, loss.id, &loss.watermarks)? {
                     // Roll back any preceding cause's deletion as well.
                     return Err(StorageError::NotFound);
                 }
@@ -732,6 +792,7 @@ impl AppClient {
         if let Err(error) = reclaimed {
             self.adapter
                 .restore_delivery_overflow_guard(attempt.marker_token);
+            self.recovery_owner.pending_loss_acknowledgments.clear();
             storage.restore_unacknowledged_recovery_loss()?;
             return if matches!(error, StorageError::NotFound) {
                 Ok(false)
@@ -739,6 +800,7 @@ impl AppClient {
                 Err(error.into())
             };
         }
+        self.recovery_owner.pending_loss_acknowledgments.clear();
         self.delivery_overflow_recovery_pending = false;
         self.delivery_overflow_recovery_marker_token = None;
         self.adapter
@@ -1151,6 +1213,331 @@ mod tests {
     }
 
     #[test]
+    fn conservative_grants_do_not_coalesce_or_buy_an_extra_retry() {
+        let (storage, mut owner, now) = fixture();
+        storage
+            .request_recovery(
+                storage_sqlite::RecoveryRequest::IncrementalHistory,
+                1_000_000,
+            )
+            .unwrap();
+        let before = storage.recovery_revision_fence().unwrap();
+        let normal = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(normal.fence.obligations.len(), 2);
+        assert!(!owner.select_executor_mode(RecoveryExecutorMode::Conservative));
+        drop(normal); // cancellation before activation preserves both obligations
+        let retry = storage.recovery_retry_state().unwrap();
+        drop(owner);
+        let mut owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+        assert!(owner.select_executor_mode(RecoveryExecutorMode::Conservative));
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert!(
+            owner
+                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                .unwrap()
+                .is_none()
+        );
+        let single = owner
+            .select_authorized_attempt(
+                &storage,
+                RecoveryReadiness::Ready,
+                now + Duration::from_secs(15),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.fence.obligations.len(), 1);
+        assert_eq!(single.mode, RecoveryExecutorMode::Conservative);
+        drop(single);
+        assert!(owner.select_executor_mode(RecoveryExecutorMode::Normal));
+        assert!(
+            owner
+                .select_authorized_attempt(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    now + Duration::from_secs(44),
+                    None
+                )
+                .unwrap()
+                .is_none()
+        );
+        let combined = owner
+            .select_authorized_attempt(
+                &storage,
+                RecoveryReadiness::Ready,
+                now + Duration::from_secs(45),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(combined.fence.obligations.len(), 2);
+        assert_eq!(storage.recovery_revision_fence().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn conservative_activation_keeps_displaced_unqualified_maintenance_selectable() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+        let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+        let group = client.create_group("maintenance", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let now = Instant::now();
+        let mut owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+        let ticket = storage
+            .request_recovery(
+                storage_sqlite::RecoveryRequest::MaintenanceBoundary {
+                    job_id: &[1],
+                    group_id: group.as_slice(),
+                },
+                1_000_000,
+            )
+            .unwrap();
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+            .unwrap()
+            .unwrap();
+        let goal = RecoveryScopePlan {
+            scope_id: 0,
+            route_kind: 1,
+            route_role: 0,
+            group_id: Some(group.as_slice().to_vec()),
+            transport_group_id: Some([9; 32]),
+            since_seconds: None,
+            until_seconds: 10,
+            known_event_id: None,
+            inventory_floor: None,
+            required_endpoints: vec!["relay".into()],
+            admitted_endpoints: vec!["relay".into()],
+        };
+        let goals = grant
+            .fence
+            .obligations
+            .iter()
+            .map(|(id, _)| (*id, vec![goal.clone()]))
+            .collect();
+        let grant = owner.freeze_plan(&storage, grant, goals).unwrap().unwrap();
+        let maintenance = grant
+            .plan()
+            .unwrap()
+            .iter()
+            .find(|o| o.id == ticket.id)
+            .unwrap();
+        assert!(
+            !storage
+                .checkpoint_recovery_obligation(
+                    &grant.fence,
+                    grant.reservation.attempt_serial,
+                    ticket.id,
+                    &[storage_sqlite::RecoveryScopeCheckpoint {
+                        token: maintenance.scopes[0].token.clone(),
+                        endpoints: vec![],
+                        retained_known_event: false
+                    }],
+                    storage_sqlite::RecoveryEligibility::WaitingCapability
+                )
+                .unwrap()
+        );
+        owner.maintenance_observations.insert(
+            group,
+            MaintenanceRecoveryObservation {
+                fence: grant.fence.clone(),
+                attempt_serial: grant.reservation.attempt_serial,
+                id: ticket.id,
+                scopes: maintenance.scopes.clone(),
+            },
+        );
+        drop(grant);
+        owner.select_executor_mode(RecoveryExecutorMode::Conservative);
+        let other = owner
+            .select_authorized_attempt(
+                &storage,
+                RecoveryReadiness::Ready,
+                now + Duration::from_secs(15),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.fence.obligations.len(), 1);
+        assert_ne!(other.fence.obligations[0].0, ticket.id);
+        let pending = storage.pending_recovery_demands().unwrap();
+        let maintenance = pending.iter().find(|d| d.ticket.id == ticket.id).unwrap();
+        assert_eq!(
+            maintenance.eligibility,
+            storage_sqlite::RecoveryEligibility::Retry
+        );
+        assert!(maintenance.ticket.revision > ticket.revision);
+        assert!(
+            storage
+                .recovery_eligible_revision_fence(false)
+                .unwrap()
+                .obligations
+                .iter()
+                .any(|(id, _)| *id == ticket.id)
+        );
+    }
+
+    #[test]
+    fn conservative_handoff_retains_partial_proof_and_completes_independently() {
+        use storage_sqlite::{
+            RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryRequest,
+            RecoveryScopeCheckpoint, RecoveryScopeOutcome,
+        };
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        storage.ensure_account_projection("alice").unwrap();
+        storage
+            .request_recovery(RecoveryRequest::IncrementalHistory, 1_000_000)
+            .unwrap();
+        storage
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[8; 16],
+                },
+                1_000_000,
+            )
+            .unwrap();
+        let now = Instant::now();
+        let mut owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+        let goal = RecoveryScopePlan {
+            scope_id: 0,
+            route_kind: 0,
+            route_role: 0,
+            group_id: None,
+            transport_group_id: None,
+            since_seconds: Some(1),
+            until_seconds: 10,
+            known_event_id: None,
+            inventory_floor: Some(1),
+            required_endpoints: vec!["a".into(), "b".into()],
+            admitted_endpoints: vec!["a".into(), "b".into()],
+        };
+        let proof = |endpoint: &str| RecoveryEndpointCheckpoint {
+            endpoint: endpoint.into(),
+            outcome: RecoveryScopeOutcome::Covered,
+            exhaustive: true,
+            admission_complete: true,
+            first_boundary: true,
+        };
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+            .unwrap()
+            .unwrap();
+        let goals = grant
+            .fence
+            .obligations
+            .iter()
+            .map(|(id, _)| (*id, vec![goal.clone()]))
+            .collect();
+        let grant = owner.freeze_plan(&storage, grant, goals).unwrap().unwrap();
+        assert_eq!(grant.plan().unwrap().len(), 2);
+        for obligation in grant.plan().unwrap() {
+            assert!(
+                !storage
+                    .checkpoint_recovery_obligation(
+                        &grant.fence,
+                        grant.reservation.attempt_serial,
+                        obligation.id,
+                        &[RecoveryScopeCheckpoint {
+                            token: obligation.scopes[0].token.clone(),
+                            endpoints: vec![proof("a")],
+                            retained_known_event: false
+                        }],
+                        RecoveryEligibility::Retry
+                    )
+                    .unwrap()
+            );
+        }
+        drop(grant);
+        let retry = storage.recovery_retry_state().unwrap();
+        drop(owner);
+        let mut owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+        owner.select_executor_mode(RecoveryExecutorMode::Conservative);
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        let first = owner
+            .select_authorized_attempt(
+                &storage,
+                RecoveryReadiness::Ready,
+                now + Duration::from_secs(15),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.fence.obligations.len(), 1);
+        let id = first.fence.obligations[0].0;
+        let first = owner
+            .freeze_plan(&storage, first, vec![(id, vec![goal.clone()])])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage.recovery_scope_snapshots(id).unwrap()[0]
+                .checkpoints
+                .len(),
+            1
+        );
+        assert!(
+            storage
+                .checkpoint_recovery_obligation(
+                    &first.fence,
+                    first.reservation.attempt_serial,
+                    id,
+                    &[RecoveryScopeCheckpoint {
+                        token: first.plan().unwrap()[0].scopes[0].token.clone(),
+                        endpoints: vec![proof("b")],
+                        retained_known_event: false
+                    }],
+                    RecoveryEligibility::Retry
+                )
+                .unwrap()
+        );
+        drop(first);
+        let pending = storage.pending_recovery_demands().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_ne!(pending[0].ticket.id, id);
+        assert_eq!(
+            storage
+                .recovery_scope_snapshots(pending[0].ticket.id)
+                .unwrap()[0]
+                .checkpoints
+                .len(),
+            1
+        );
+        assert!(
+            owner
+                .select_authorized_attempt(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    now + Duration::from_secs(44),
+                    None
+                )
+                .unwrap()
+                .is_none()
+        );
+        let second = owner
+            .select_authorized_attempt(
+                &storage,
+                RecoveryReadiness::Ready,
+                now + Duration::from_secs(45),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.fence.obligations,
+            vec![(pending[0].ticket.id, pending[0].ticket.revision)]
+        );
+        drop(second);
+        owner.select_executor_mode(RecoveryExecutorMode::Normal);
+        assert_eq!(storage.pending_recovery_demands().unwrap().len(), 1);
+        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 3);
+    }
+
+    #[test]
     fn reopened_owner_observes_reservation_and_uses_monotonic_time_thereafter() {
         let (storage, mut owner, now) = fixture();
         drop(
@@ -1353,6 +1740,11 @@ mod tests {
     }
     #[tokio::test]
     async fn post_join_boundary_completes_only_its_predicate_and_keeps_grace_fixed() {
+        verify_post_join_boundary_and_grace(RecoveryExecutorMode::Normal).await;
+        verify_post_join_boundary_and_grace(RecoveryExecutorMode::Conservative).await;
+    }
+
+    async fn verify_post_join_boundary_and_grace(mode: RecoveryExecutorMode) {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
             every_subscription, scripted_eose_pump,
@@ -1449,6 +1841,7 @@ mod tests {
         // Another due recovery activation replaces physical sessions. Its one
         // grant restores maintenance too; the grace deadline cannot restart.
         let old_id = client.post_join_maintenance_subscriptions[&group].0.clone();
+        assert!(client.recovery_owner.select_executor_mode(mode));
         let mut permit = ExplicitRecoveryPermit::default();
         let grant = client
             .authorize_account_recovery(
@@ -1457,6 +1850,9 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        if mode == RecoveryExecutorMode::Conservative {
+            assert_eq!(grant.fence.obligations.len(), 1);
+        }
         client
             .execute_recovery_grant(grant, None, None)
             .await
@@ -1522,6 +1918,222 @@ mod tests {
             advanced.grace_until
         );
     }
+    // Synthetic exhaustive backend evidence, independent of EOSE. Production
+    // legacy reconciliation cannot manufacture these endpoint certificates.
+    fn qualify_test_obligation(
+        storage: &SqliteAccountStorage,
+        grant: &AttemptGrant,
+        obligation: &GrantedObligation,
+    ) {
+        let checkpoints = obligation
+            .scopes
+            .iter()
+            .map(|scope| storage_sqlite::RecoveryScopeCheckpoint {
+                token: scope.token.clone(),
+                retained_known_event: false,
+                endpoints: scope
+                    .goal
+                    .required_endpoints
+                    .iter()
+                    .map(|endpoint| storage_sqlite::RecoveryEndpointCheckpoint {
+                        endpoint: endpoint.clone(),
+                        outcome: storage_sqlite::RecoveryScopeOutcome::Covered,
+                        exhaustive: true,
+                        admission_complete: true,
+                        first_boundary: false,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            storage
+                .checkpoint_recovery_obligation(
+                    &grant.fence,
+                    grant.reservation.attempt_serial,
+                    obligation.id,
+                    &checkpoints,
+                    storage_sqlite::RecoveryEligibility::Retry
+                )
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn conservative_loss_causes_acknowledge_together_after_separate_grants() {
+        verify_conservative_loss_handoff(false).await;
+        verify_conservative_loss_handoff(true).await;
+    }
+
+    async fn verify_conservative_loss_handoff(reopen: bool) {
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
+        use storage_sqlite::{RecoveryCause, RecoveryLossCause};
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .record_account_recovery_loss("alice", RecoveryLossCause::Queue, 55, 1, 1)
+            .unwrap();
+        storage
+            .record_account_recovery_loss(
+                "alice",
+                RecoveryLossCause::NotificationConsumer,
+                56,
+                0,
+                1,
+            )
+            .unwrap();
+        client.delivery_overflow_recovery_pending = true;
+        client.delivery_overflow_recovery_marker_token = Some(55);
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        for obligation in grant
+            .plan()
+            .unwrap()
+            .iter()
+            .filter(|o| o.cause == RecoveryCause::IncrementalHistory)
+        {
+            qualify_test_obligation(&storage, &grant, obligation);
+        }
+        drop(grant);
+        client
+            .recovery_owner
+            .select_executor_mode(RecoveryExecutorMode::Conservative);
+        let mut first_completed = None;
+        for index in 0..2 {
+            client.recovery_owner.test_advance_to_retry(&storage);
+            let grant = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(grant.plan().unwrap().len(), 1);
+            let selected = grant.fence.obligations[0];
+            if let Some(first) = first_completed {
+                assert_ne!(selected.0, first);
+            }
+            qualify_test_obligation(&storage, &grant, &grant.plan().unwrap()[0]);
+            let attempt = client.adapter.start_delivery_overflow_recovery(55);
+            assert_eq!(
+                client
+                    .finish_qualified_recovery_loss(&grant, attempt)
+                    .unwrap(),
+                index == 1
+            );
+            if index == 0 {
+                assert!(
+                    storage
+                        .recovery_obligation_is_satisfied(selected.0, selected.1)
+                        .unwrap(),
+                    "a separately qualified cause must survive while its sibling remains pending"
+                );
+                assert!(
+                    (client.delivery_overflow_recovery_pending
+                        || client.adapter.delivery_loss_blocks_cursor())
+                );
+                assert_eq!(
+                    storage
+                        .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    storage
+                        .recovery_loss_watermarks("alice", RecoveryLossCause::NotificationConsumer)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                first_completed = Some(selected.0);
+                client.adapter.fail_delivery_overflow_recovery();
+            }
+            drop(grant);
+            if index == 0 && reopen {
+                let retry = storage.recovery_retry_state().unwrap();
+                let now = Instant::now();
+                let wall = client.recovery_owner.logical_now_ms(now).unwrap();
+                client.recovery_owner =
+                    AccountRecoveryOwner::open(&storage, wall, now, policy()).unwrap();
+                assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+                assert_eq!(
+                    storage
+                        .pending_recovery_demands()
+                        .unwrap()
+                        .iter()
+                        .filter(|d| matches!(
+                            d.cause,
+                            RecoveryCause::QueueLoss | RecoveryCause::NotificationLoss
+                        ))
+                        .count(),
+                    2
+                );
+                assert!(
+                    client
+                        .recovery_owner
+                        .pending_loss_acknowledgments
+                        .is_empty()
+                );
+                assert!(
+                    client
+                        .authorize_account_recovery(
+                            None,
+                            marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                client.recovery_owner.test_advance_to_retry(&storage);
+                let grant = client
+                    .authorize_account_recovery(
+                        None,
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(grant.mode, RecoveryExecutorMode::Normal);
+                assert_eq!(grant.loss.len(), 2);
+                for obligation in grant.plan().unwrap() {
+                    qualify_test_obligation(&storage, &grant, obligation);
+                }
+                let attempt = client.adapter.start_delivery_overflow_recovery(55);
+                assert!(
+                    client
+                        .finish_qualified_recovery_loss(&grant, attempt)
+                        .unwrap()
+                );
+                break;
+            }
+        }
+        assert!(
+            !(client.delivery_overflow_recovery_pending
+                || client.adapter.delivery_loss_blocks_cursor())
+        );
+        assert!(
+            storage
+                .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .recovery_loss_watermarks("alice", RecoveryLossCause::NotificationConsumer)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn qualified_loss_completion_rolls_back_all_causes_after_plane_ack_failure() {
         use crate::tests::{

@@ -84,8 +84,8 @@ impl Default for AttachmentAcquisitionPolicy {
 pub enum RecoveryExecutorMode {
     #[default]
     Normal,
-    /// Keep broad legacy acquisition and disable the comparison leg. This does
-    /// not assert exhaustive coverage or resurrect independent retry loops.
+    /// Select one obligation per broad acquisition grant. The executor,
+    /// comparison, account pacing and qualified completion rules are unchanged.
     Conservative,
 }
 

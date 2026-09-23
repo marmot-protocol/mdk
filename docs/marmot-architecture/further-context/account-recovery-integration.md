@@ -89,3 +89,20 @@ and superseded checks, and the remaining blocking acquisition limitations.
   notification lag remains worker-visible during an active attempt. Both regressions,
   qualified-completion rollback after failed plane acknowledgment, and notification
   replacement pass. These focused results do not establish combined readiness.
+- Same-schema execution: conservative mode now selects one obligation, using the
+  same comparison/executor and account reservation as normal mode. Selection uses
+  the last installed attempt to avoid starving other obligations; only a live
+  explicit caller spends its existing override. Existing maintenance sessions are
+  restored without inventing completion or restarting grace, and displaced pending
+  boundaries remain selectable. The two loss causes can qualify in separate grants:
+  at most two captured acknowledgment inputs survive in memory, while SQLite checks
+  every predicate/revision again before the shared live acknowledgment. No storage
+  API was added. A failed executor or acknowledgment restores pending debt; owner
+  reopen also restores qualified but unacknowledged loss without forgiving retry.
+  Fourteen owner tests pass with default policy, including populated mode handoff,
+  independent partial-proof completion, cancellation before activation, two-grant
+  loss acknowledgment, and interruption/reopen. The mode/maintenance and final
+  two-grant/reopen regressions also pass with policy overrides. The initial
+  conservative selection and loss-handoff regressions both failed before their fixes.
+  An added maintenance fixture initially omitted its required group row; that
+  fixture error was corrected by creating an actual runtime group.
