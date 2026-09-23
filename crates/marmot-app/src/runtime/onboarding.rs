@@ -1151,7 +1151,7 @@ impl AccountManager {
             Err(error) => return Err(error.into()),
         };
         self.clear_startup_retry(&snapshot.account_id_hex);
-        self.reconcile_locked_report()
+        self.reconcile_locked_report_for(Some(&snapshot.account_id_hex))
             .await?
             .for_account(&snapshot.account_id_hex)?;
         Ok(snapshot)
@@ -1212,7 +1212,7 @@ impl AccountManager {
             Err(error) => return Err(error.into()),
         };
         self.clear_startup_retry(&snapshot.account_id_hex);
-        self.reconcile_locked_report()
+        self.reconcile_locked_report_for(Some(&snapshot.account_id_hex))
             .await?
             .for_account(&snapshot.account_id_hex)?;
         drop(_workers);
@@ -1441,8 +1441,7 @@ impl AccountManager {
                 c.reset_step(c.snapshot.steps[index].step);
             }
             self.save_onboarding(&mut c)?;
-            self.reset_startup_retry(&account_id).await;
-            self.reconcile_for_account(&account_id).await?;
+            self.retry_and_reconcile_for_account(&account_id).await?;
             self.run_onboarding_locked(&mut c).await?;
         }
         Ok(c.snapshot)
@@ -1478,8 +1477,7 @@ impl AccountManager {
             }
         }
         self.save_onboarding(&mut c)?;
-        self.reset_startup_retry(&account_id).await;
-        self.reconcile_for_account(&account_id).await?;
+        self.retry_and_reconcile_for_account(&account_id).await?;
         self.run_onboarding_locked(&mut c).await?;
         Ok(c.snapshot)
     }

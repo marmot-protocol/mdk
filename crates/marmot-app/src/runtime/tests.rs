@@ -2787,26 +2787,51 @@ async fn cancelled_startup_is_reaped() {
         worker.commands.clone()
     };
 
-    // A cancelled startup remains fenced without holding the global worker
-    // transaction while its old session is still open.
-    let premature = timeout(Duration::from_secs(1), manager.worker_commands("alice"))
-        .await
-        .expect("lookup returns promptly")
-        .expect_err("abandoned open must not admit a replacement");
-    assert!(matches!(premature, AppError::BlockingTask(_)));
+    let retrying = manager.clone();
+    let mut lookup = tokio::spawn(async move { retrying.worker_commands("alice").await });
+    // The requested account waits for its old session guard, while unrelated
+    // accounts still reconcile without waiting for that cleanup.
+    let premature = timeout(Duration::from_millis(50), &mut lookup).await;
     proceed.send(()).unwrap();
-    let commands = timeout(Duration::from_secs(10), async {
-        loop {
-            match manager.worker_commands("alice").await {
-                Ok(commands) => break commands,
-                Err(AppError::BlockingTask(_)) => tokio::task::yield_now().await,
-                Err(error) => panic!("unexpected replacement error: {error}"),
-            }
-        }
-    })
-    .await
-    .expect("replacement opens after the old session releases");
+    assert!(premature.is_err());
+    let commands = timeout(Duration::from_secs(10), lookup)
+        .await
+        .expect("replacement opens after the old session releases")
+        .expect("lookup task")
+        .expect("first requested lookup succeeds");
     assert!(!commands.same_channel(&old_commands));
+    assert!(manager.workers.lock().await[&account.account_id_hex].ready);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finished_worker_is_replaced_on_first_requested_lookup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let account = app.account_home().create_account("alice").expect("account");
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let handle = tokio::spawn(async {});
+    tokio::task::yield_now().await;
+    assert!(handle.is_finished());
+    let (shutdown, _shutdown_rx) = oneshot::channel();
+    let (old_commands, _old_receiver) = mpsc::channel(1);
+    manager.workers.lock().await.insert(
+        account.account_id_hex.clone(),
+        ManagedAccountWorker {
+            ready: true,
+            handle,
+            commands: old_commands.clone(),
+            media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
+            shutdown,
+        },
+    );
+
+    let replacement = timeout(Duration::from_secs(5), manager.worker_commands("alice"))
+        .await
+        .expect("lookup completes")
+        .expect("finished worker is replaced on first lookup");
+    assert!(!replacement.same_channel(&old_commands));
     assert!(manager.workers.lock().await[&account.account_id_hex].ready);
     runtime.shutdown().await;
 }
@@ -2986,6 +3011,47 @@ async fn failed_worker_startup_is_suppressed_until_explicit_restart() {
         .await
         .expect("ready fast path");
     assert_eq!(runtime.app_performance_snapshot().account_open.attempts, 3);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_retry_keeps_backoff_reset_and_reconcile_in_one_transaction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let alice = app
+        .account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let manager = runtime.accounts();
+    let alice_client = open_runtime_local_test_client(&app, &runtime, "alice").await;
+    manager
+        .startup_retries
+        .lock()
+        .unwrap()
+        .fail(alice.account_id_hex.clone(), tokio::time::Instant::now());
+
+    let transaction = manager.worker_transactions.lock().await;
+    let retrying = manager.clone();
+    let account_id = alice.account_id_hex.clone();
+    let retry =
+        tokio::spawn(async move { retrying.retry_and_reconcile_for_account(&account_id).await });
+    tokio::task::yield_now().await;
+    let reconciling = manager.clone();
+    let global = tokio::spawn(async move { reconciling.reconcile().await });
+    tokio::task::yield_now().await;
+    drop(transaction);
+
+    assert!(matches!(
+        retry.await.expect("explicit retry task"),
+        Err(AppError::AccountSessionBusy)
+    ));
+    assert!(matches!(
+        global.await.expect("global reconcile task"),
+        Err(AppError::BlockingTask(_))
+    ));
+    assert_eq!(runtime.app_performance_snapshot().account_open.attempts, 1);
+    drop(alice_client);
     runtime.shutdown().await;
 }
 

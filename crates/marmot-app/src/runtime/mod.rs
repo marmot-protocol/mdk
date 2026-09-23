@@ -5189,10 +5189,15 @@ impl MarmotAppRuntime {
         let readiness = self.account_setup_readiness(&account.label)?;
         if schedule_background {
             let handoff_started_at = Instant::now();
-            let handoff_result = self
-                .accounts
-                .reconcile_for_account(&account.account_id_hex)
-                .await;
+            let handoff_result = if phase == AccountSetupPhase::LocalStateCreated {
+                self.accounts
+                    .retry_and_reconcile_for_account(&account.account_id_hex)
+                    .await
+            } else {
+                self.accounts
+                    .reconcile_for_account(&account.account_id_hex)
+                    .await
+            };
             self.shared.app_performance_telemetry().record(
                 AppPerformanceOperation::AccountSetupLocalReadyHandoff,
                 handoff_started_at.elapsed(),
@@ -6120,7 +6125,7 @@ impl AccountManager {
             .account_home()
             .set_account_signed_out(account_ref, false)?;
         self.clear_startup_retry(&account.account_id_hex);
-        self.reconcile_locked_report()
+        self.reconcile_locked_report_for(Some(&account.account_id_hex))
             .await?
             .for_account(&account.account_id_hex)?;
         let running = self
@@ -6152,13 +6157,28 @@ impl AccountManager {
     }
 
     async fn reconcile_for_account(&self, account_id: &str) -> Result<(), AppError> {
+        self.reconcile_for_account_inner(account_id, false).await
+    }
+
+    async fn retry_and_reconcile_for_account(&self, account_id: &str) -> Result<(), AppError> {
+        self.reconcile_for_account_inner(account_id, true).await
+    }
+
+    async fn reconcile_for_account_inner(
+        &self,
+        account_id: &str,
+        reset_retry: bool,
+    ) -> Result<(), AppError> {
         let lock_wait = self
             .shared
             .app_performance_telemetry()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
-        self.reconcile_locked_report()
+        if reset_retry {
+            self.clear_startup_retry(account_id);
+        }
+        self.reconcile_locked_report_for(Some(account_id))
             .await?
             .for_account(account_id)
     }
@@ -6180,6 +6200,13 @@ impl AccountManager {
     }
 
     async fn reconcile_locked_report(&self) -> Result<WorkerReconcileReport, AppError> {
+        self.reconcile_locked_report_for(None).await
+    }
+
+    async fn reconcile_locked_report_for(
+        &self,
+        target_account_id: Option<&str>,
+    ) -> Result<WorkerReconcileReport, AppError> {
         self.app.presentation_signals.catalog_changed();
         let started_at = Instant::now();
         let result = async {
@@ -6254,6 +6281,16 @@ impl AccountManager {
             // Worker task teardown releases AppClient's account-session guard.
             // Reap stale tasks before opening replacements for the same labels.
             self.register_worker_reapers(stale_workers);
+            if let Some(account_id) = target_account_id {
+                let retry_allowed = self
+                    .startup_retries
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .allows(account_id, tokio::time::Instant::now());
+                if retry_allowed {
+                    self.ensure_worker_reaped(account_id).await?;
+                }
+            }
             let pending_reapers = self.finish_worker_reapers().await;
 
             let pending = accounts
@@ -6447,7 +6484,7 @@ impl AccountManager {
             self.ensure_worker_reaped(&account.account_id_hex).await?;
         }
         self.clear_startup_retry(&account.account_id_hex);
-        self.reconcile_locked_report()
+        self.reconcile_locked_report_for(Some(&account.account_id_hex))
             .await?
             .for_account(&account.account_id_hex)
     }
@@ -7027,8 +7064,8 @@ impl AccountManager {
                 .set_account_signed_out(&account.label, false)?;
             self.app.presentation_signals.catalog_changed();
         }
-        self.reset_startup_retry(&account.account_id_hex).await;
-        self.reconcile_for_account(&account.account_id_hex).await?;
+        self.retry_and_reconcile_for_account(&account.account_id_hex)
+            .await?;
         self.app
             .account_home()
             .complete_account_setup(&account.label)?;
@@ -7239,8 +7276,8 @@ impl AccountManager {
                 .set_account_signed_out(&account.label, false)?;
             self.app.presentation_signals.catalog_changed();
         }
-        self.reset_startup_retry(&account.account_id_hex).await;
-        self.reconcile_for_account(&account.account_id_hex).await?;
+        self.retry_and_reconcile_for_account(&account.account_id_hex)
+            .await?;
         self.app
             .account_home()
             .complete_account_setup(&account.label)?;
@@ -7269,7 +7306,7 @@ impl AccountManager {
         let account = self.resolve(account_ref)?;
         let _worker_transaction = self.worker_transactions.lock().await;
         self.clear_startup_retry(&account.account_id_hex);
-        self.reconcile_locked_report()
+        self.reconcile_locked_report_for(Some(&account.account_id_hex))
             .await?
             .for_account(&account.account_id_hex)
     }

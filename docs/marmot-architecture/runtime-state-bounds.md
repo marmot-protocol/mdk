@@ -29,7 +29,7 @@ Tracking issue: marmot-protocol/mdk#381.
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | In-memory startup failures | At most one entry per eligible account, with a saturating failure count and monotonic deadline; no history or error text | Successful readiness, explicit lifecycle reset, ineligibility, account removal/deactivation, or shutdown clears entries. Reconcile prunes absent and ineligible accounts. |
-| Pending worker reapers | At most one cleanup task per removed managed worker | Reconcile checks unrelated cleanup without waiting. Explicit lifecycle operations wait at most twice the worker shutdown grace period for their own account before changing durable state. An unfinished handle retains only its account's replacement fence. Cancelled callers leave handles tracked for the next transaction or terminal shutdown. |
+| Pending worker reapers | At most one cleanup task per removed managed worker | Global reconcile checks cleanup without waiting. Targeted worker acquisition and explicit lifecycle operations wait at most twice the worker shutdown grace period for their own account. An unfinished handle retains only its account's replacement fence. Cancelled callers leave handles tracked for the next transaction or terminal shutdown. |
 
 The retry delay starts at one second, doubles after each actual failure, and caps at 60 seconds.
 Suppressed calls do not advance the count or deadline. Expiry permits an attempt on the next
