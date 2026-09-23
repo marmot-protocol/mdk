@@ -9,7 +9,7 @@ normative. The original checkpoint/report and replacement-test CSV are preserved
 - Preserved code: `13395cc10fd6941d2a2f72c0398bfc501b99fc25`;
   report/branch: `d8652d185d9fae0626ca199c944bce7ae0a4a8fb`.
 - Design #1982: `0092219b974139a98bc059f3d7380668154ccbe1`.
-- Ledger #1983: `13cb09a4` (independent marker retirement regression fixed).
+- Ledger #1983: `13cb09a4b32f73602b046b05afb2b6d1fcae4498` (independent marker retirement regression fixed).
 - Completion #1987: `4fded1e91fdbb59286cfa00b2ac3018bee97d2b5`.
 - Subscription fencing #1985: `73d7ccf1bbe78dd11d705539aad463724de1556f`.
 - Reconciled owner baseline: `eb89ea7f7a3c072535803533e2f0af5897e24cb1`.
@@ -41,9 +41,9 @@ standalone storage layer is planned. Storage changes must serve a concrete runti
 integration requirement. No SDK change, connection allocation, or #1947 scheduling
 or nonblocking acquisition work belongs here.
 
-#1985 can land independently. #1983 and #1987 remain drafts and must not deploy
-before the owner integration is ready to land with them. Proposed coordinated order:
-#1982 design, #1985 fencing, #1983 ledger, #1987 completion, then owner integration,
+#1985 is already merged. #1983 is open and #1987 is a draft; neither storage
+change should deploy before the owner integration is ready to land with them.
+Proposed coordinated order: #1982 design, #1983 ledger, #1987 completion, then owner integration,
 with the storage/runtime commits treated as one release unit. Retarget the stacked
 PRs as their bases merge; do not squash away required dependency ancestry silently.
 Old binaries reject the upgraded schema; binary downgrade needs a pre-upgrade
@@ -252,3 +252,18 @@ and superseded checks, and the remaining blocking acquisition limitations.
   live reopen and host wake. The four lifecycle/readiness failures seen in the
   broader cargo-test run pass unchanged in isolation; the repository uses
   process-isolated nextest for its combined CI run, which remains required.
+
+- API catch-up compatibility: the unchanged joined-group visibility/prompt-accept
+  regression failed in isolation because a coalesced maintenance prerequisite
+  changed ordinary incremental catch-up into a full-history EOSE wait. Incremental
+  plus maintenance grants now retain quiet-drain behavior; installation and quiet
+  remain unqualified completion. The original regression and all 18 owner tests
+  pass with policy overrides. The cancellation fixture also passes with another
+  account performing a real catch-up while the first account waits, preserving
+  same-account snapshot reads and its original cancellation bounds. The replacement
+  inventory now contains 78 mappings, with every replacement symbol checked.
+- Superseded broad diagnostic: `app-feature-inventory.log` reports 1491 pass,
+  11 fail, 4 ignored. Source edits overlapped compilation, so it has no reliable
+  exact-head attribution and is only a failure inventory. The failures were
+  investigated in the focused checkpoints above. It is not combined acceptance
+  evidence; the following nextest run must use a frozen signed code revision.

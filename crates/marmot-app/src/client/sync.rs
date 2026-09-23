@@ -3743,8 +3743,17 @@ impl AppClient {
             .collect::<Option<Vec<_>>>()
             .and_then(|bounds| bounds.into_iter().min())
             .map(cgka_traits::transport::Timestamp);
-        let incremental_only = obligations.iter().all(|obligation| {
-            obligation.cause == storage_sqlite::RecoveryCause::IncrementalHistory
+        // Maintenance installs a temporary subscription and observes its first
+        // boundary later under the domain's existing deadline. Sharing that
+        // prerequisite must not turn ordinary incremental catch-up into a
+        // blocking full-history wait. Neither quiet completion nor installation
+        // certifies the still-pending maintenance/history predicate.
+        let quiet_prerequisites = obligations.iter().all(|obligation| {
+            matches!(
+                obligation.cause,
+                storage_sqlite::RecoveryCause::IncrementalHistory
+                    | storage_sqlite::RecoveryCause::Maintenance
+            )
         });
         self.pending_runtime_group_subscription_refresh = true;
         self.relay_plane
@@ -3849,7 +3858,7 @@ impl AppClient {
         }
         let (mut summary, verdict) = if let Some(control) = repair {
             self.drain_full_history_repair(counts, control).await?
-        } else if incremental_only {
+        } else if quiet_prerequisites {
             self.sync_sdk_relay(counts).await?
         } else {
             self.drain_sdk_relay(

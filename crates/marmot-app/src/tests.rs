@@ -868,7 +868,7 @@ impl ScriptedPushRelayClient {
         self.publish_release.notify_waiters();
     }
 
-    fn inbox_subscription_count(&self, expected_account_id: &MemberId) -> usize {
+    pub(crate) fn inbox_subscription_count(&self, expected_account_id: &MemberId) -> usize {
         self.subscriptions
             .lock()
             .unwrap()

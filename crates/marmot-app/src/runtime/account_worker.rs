@@ -8098,6 +8098,7 @@ mod tests {
             AccountHome::open(dir.path())
                 .create_account("alice")
                 .unwrap();
+            AccountHome::open(dir.path()).create_account("bob").unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
             let app = MarmotApp::with_relay_and_config(
                 dir.path(),
@@ -8106,6 +8107,11 @@ mod tests {
             )
             .with_test_relay_client(relay.clone());
             let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let mut bob = client_on_app_relay_plane(&app, "bob").await;
+            let bob_id = cgka_traits::MemberId::new(
+                hex::decode(app.account_home().account("bob").unwrap().account_id_hex).unwrap(),
+            );
+            let bob_before = relay.inbox_subscription_count(&bob_id);
             let before = relay.subscription_count();
             let (events, _subscriber) = broadcast::channel(4);
             let shared = RuntimeSharedServices::default();
@@ -8158,6 +8164,29 @@ mod tests {
                     response.try_recv(),
                     Err(oneshot::error::TryRecvError::Empty)
                 ));
+                // Another account uses its own worker catch-up path while
+                // Alice's history drain still waits for cancellation. No relay
+                // boundary is supplied to manufacture either completion.
+                let (bob_tx, mut bob_commands) = mpsc::channel(1);
+                let mut bob_pending = VecDeque::new();
+                let (bob_respond, bob_response) = oneshot::channel();
+                handle_account_worker_catch_up(
+                    &mut bob,
+                    bob_respond,
+                    &mut bob_commands,
+                    &mut bob_pending,
+                    AccountWorkerCatchUpContext {
+                        app: &app,
+                        events: &events,
+                        account_id_hex: "bob-id",
+                        account_label: "bob",
+                        shared: &shared,
+                    },
+                )
+                .await;
+                bob_response.await.unwrap().unwrap();
+                assert_eq!(relay.inbox_subscription_count(&bob_id), bob_before + 1);
+                drop(bob_tx);
                 if caller_cancels {
                     drop(response);
                 } else {
@@ -8174,7 +8203,15 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(relay.subscription_count(), before + 1);
+            assert_eq!(relay.subscription_count(), before + 2);
+            assert_eq!(
+                app.account_storage("bob")
+                    .unwrap()
+                    .recovery_retry_state()
+                    .unwrap()
+                    .attempt_serial,
+                1
+            );
         }
     }
 }
