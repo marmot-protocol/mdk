@@ -346,6 +346,21 @@ impl OnboardingCheckpoint {
     fn high_water(&self) -> u64 {
         self.snapshot.revision.max(self.attempt_start_revision)
     }
+    fn defaults_need_edit(&self) -> bool {
+        let Some(event) = &self.records[OnboardingStep::Relays.index()] else {
+            return false;
+        };
+        let inherited = raw_relay_keys(event);
+        let writes: HashSet<_> = crate::relay_list_state_from_event(event)
+            .into_iter()
+            .flat_map(|state| state.write_relays)
+            .map(|relay| relay_key(&relay))
+            .collect();
+        self.options.default_relays.iter().all(|relay| {
+            let key = relay_key(relay);
+            inherited.contains(&key) && !writes.contains(&key)
+        })
+    }
     fn attempt(&self) -> OnboardingAttempt {
         use sha2::{Digest, Sha256};
         OnboardingAttempt {
@@ -388,10 +403,11 @@ impl OnboardingCheckpoint {
                 }
                 // No replacement may be proposed from inconclusive discovery.
                 if step.relay() && status == OnboardingStatus::NeedsInput {
-                    actions.extend([
-                        OnboardingAction::UseRecommendedRelays,
-                        OnboardingAction::EditRelays,
-                    ]);
+                    // Appending cannot change an inherited role to create an outbox.
+                    if step != OnboardingStep::Relays || !self.defaults_need_edit() {
+                        actions.push(OnboardingAction::UseRecommendedRelays);
+                    }
+                    actions.push(OnboardingAction::EditRelays);
                 }
                 actions
             }
@@ -500,6 +516,11 @@ fn decode_onboarding_checkpoint(
         if step.step.index() != index {
             return Err(onboarding_error());
         }
+    }
+    if checkpoint.defaults_need_edit() {
+        checkpoint.snapshot.steps[OnboardingStep::Relays.index()]
+            .actions
+            .retain(|action| *action != OnboardingAction::UseRecommendedRelays);
     }
     Ok(checkpoint)
 }
@@ -1869,9 +1890,13 @@ impl AccountManager {
                 }
                 relays.retain(|relay| seen.insert(relay.clone()));
             }
+            let inherited = c.records[step.index()]
+                .as_ref()
+                .map(raw_relay_keys)
+                .unwrap_or_default();
             for relay in &c.options.default_relays {
                 let url = relay_key(relay);
-                if known.contains_key(&url) {
+                if inherited.contains(&url) || known.contains_key(&url) {
                     continue;
                 }
                 known.insert(url, relay.clone());
@@ -2279,6 +2304,17 @@ fn relay_key(endpoint: &str) -> String {
     url::Url::parse(endpoint).map_or_else(|_| endpoint.to_owned(), |url| url.to_string())
 }
 
+fn raw_relay_keys(event: &NostrTransportEvent) -> HashSet<String> {
+    let name = if event.kind == 10002 { "r" } else { "relay" };
+    event
+        .tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|value| value == name))
+        .filter_map(|tag| tag.get(1))
+        .map(|relay| relay_key(relay))
+        .collect()
+}
+
 fn validate_onboarding_record(event: &NostrTransportEvent) -> Vec<OnboardingFinding> {
     let malformed = match event.kind {
         0 => match serde_json::from_str::<serde_json::Value>(&event.content) {
@@ -2398,17 +2434,8 @@ fn relay_repair_event(
     };
     let inherited = previous
         .filter(|_| c.append_relays)
-        .and_then(crate::relay_list_state_from_event)
-        .into_iter()
-        .flat_map(|state| {
-            state
-                .relays
-                .into_iter()
-                .chain(state.read_relays)
-                .chain(state.write_relays)
-        })
-        .map(|relay| relay_key(&relay))
-        .collect::<HashSet<_>>();
+        .map(raw_relay_keys)
+        .unwrap_or_default();
     let mut tags = previous
         .map(|e| {
             e.tags

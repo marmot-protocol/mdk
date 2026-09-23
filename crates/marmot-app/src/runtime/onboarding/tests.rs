@@ -574,6 +574,11 @@ async fn defaults_append_relay_roles() {
                 vec!["r".into(), "wss://both.example/".into(), "write".into()],
                 vec!["r".into(), "wss://read.example/".into(), "read".into()],
                 vec!["r".into(), "wss://default.example/".into(), "read".into()],
+                vec![
+                    "r".into(),
+                    "wss://future.example/".into(),
+                    "future-role".into(),
+                ],
             ]
         } else {
             vec![
@@ -586,6 +591,12 @@ async fn defaults_append_relay_roles() {
         let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
         checkpoint.snapshot.proposal = None;
         checkpoint.records[step.index()] = Some(event.clone());
+        if step == OnboardingStep::Relays {
+            checkpoint
+                .options
+                .default_relays
+                .push("wss://future.example".into());
+        }
         checkpoint
             .options
             .default_relays
@@ -622,6 +633,7 @@ async fn defaults_append_relay_roles() {
                 [
                     "wss://inbox.example",
                     "wss://default.example",
+                    "wss://future.example",
                     "wss://new.example"
                 ]
             );
@@ -632,7 +644,7 @@ async fn defaults_append_relay_roles() {
         assert!(tags.starts_with(&event.tags));
         assert_eq!(
             tags.len(),
-            if step == OnboardingStep::Relays { 7 } else { 4 }
+            if step == OnboardingStep::Relays { 8 } else { 5 }
         );
         // Explicit editor selections still replace rather than append.
         let replaced = manager
@@ -826,6 +838,69 @@ async fn append_checkpoint_fences_old() {
                 .starts_with(&tags)
         );
         reopened.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn inherited_roles_offer_edit() {
+    for role in ["read", "future-role"] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        network.events.lock().unwrap().push(signed(
+            &keys,
+            10002,
+            vec![
+                vec!["r".into(), "wss://default.example/".into(), role.into()],
+                vec!["r".into(), "ws://private.onion".into(), "write".into()],
+            ],
+            "",
+            unix_now_seconds(),
+        ));
+        missing_relays(&runtime, &id).await;
+        let manager = runtime.accounts();
+        let snapshot = manager.onboarding_snapshot(&id).unwrap().unwrap();
+        let step = &snapshot.steps[OnboardingStep::Relays.index()];
+        assert!(
+            step.findings
+                .iter()
+                .any(|f| f.issue == OnboardingIssue::NoUsableRoute)
+        );
+        assert!(
+            !step
+                .actions
+                .contains(&OnboardingAction::UseRecommendedRelays)
+        );
+        assert!(step.actions.contains(&OnboardingAction::EditRelays));
+        assert!(
+            manager
+                .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+                .await
+                .is_err()
+        );
+        // Older checkpoints may still advertise the impossible append action.
+        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        checkpoint.snapshot.steps[OnboardingStep::Relays.index()]
+            .actions
+            .push(OnboardingAction::UseRecommendedRelays);
+        manager.save_onboarding(&mut checkpoint).unwrap();
+        let restored = manager.onboarding_snapshot(&id).unwrap().unwrap();
+        assert!(
+            !restored.steps[OnboardingStep::Relays.index()]
+                .actions
+                .contains(&OnboardingAction::UseRecommendedRelays)
+        );
+        manager
+            .propose_onboarding_relays(
+                &id,
+                OnboardingStep::Relays,
+                Some((
+                    vec!["wss://default.example".into()],
+                    vec!["wss://default.example".into()],
+                )),
+            )
+            .await
+            .unwrap();
+        assert!(network.attempts.lock().unwrap().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
     }
 }
 

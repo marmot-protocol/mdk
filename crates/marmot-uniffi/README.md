@@ -513,7 +513,10 @@ Imported identities can use the durable preflight API instead of `login`:
    a proposal. Recommended relays append missing defaults to the observed list,
    preserving every original relay tag, including private-network, onion,
    retired, and unparseable entries. Dial policy filters connections, not published
-   declarations. Relay findings are advisory once a usable outbox/inbox route is
+   declarations. Defaults are deduplicated against raw tags, including unknown roles.
+   If every default already has a read-only or unknown role, the general-relay step
+   offers explicit editing instead of recommending an append that cannot add a write route.
+   Relay findings are advisory once a usable outbox/inbox route is
    confirmed. Proposals require a policy-allowed write route (or inbox route);
    reachability is checked after publication. Explicit relay selections replace
    the list and require every selected endpoint to pass dial policy. Approval
