@@ -106,9 +106,7 @@ impl RelaySafetyPolicy {
     ) -> Result<TransportAccountActivation, String> {
         activation.inbox_endpoints =
             self.sanitize_endpoints(activation.inbox_endpoints, "account inbox")?;
-        for group in &mut activation.group_subscriptions {
-            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
-        }
+        self.filter_group_routes(&mut activation.group_subscriptions);
         Ok(activation)
     }
 
@@ -116,10 +114,19 @@ impl RelaySafetyPolicy {
         &self,
         mut sync: TransportGroupSync,
     ) -> Result<TransportGroupSync, String> {
-        for group in &mut sync.group_subscriptions {
-            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
-        }
+        self.filter_group_routes(&mut sync.group_subscriptions);
         Ok(sync)
+    }
+
+    fn filter_group_routes(&self, groups: &mut Vec<cgka_traits::TransportGroupSubscription>) {
+        // Signed group routes are peer input. An unusable route must not
+        // prevent the account's inbox or other groups from subscribing.
+        groups.retain_mut(|group| {
+            group.endpoints =
+                self.retain_safe_endpoints(std::mem::take(&mut group.endpoints), "group route");
+            group.endpoints.truncate(self.max_endpoints_per_route);
+            !group.endpoints.is_empty()
+        });
     }
 
     pub(crate) fn sanitize_publish_request(
@@ -128,6 +135,11 @@ impl RelaySafetyPolicy {
     ) -> Result<TransportPublishRequest, String> {
         match &mut request.target {
             TransportPublishTarget::Group { endpoints, .. } => {
+                *endpoints = self.retain_safe_endpoints(std::mem::take(endpoints), "group publish");
+                endpoints.truncate(self.max_endpoints_per_route);
+                if endpoints.is_empty() {
+                    return Err("group publish: no safe relay endpoints".to_owned());
+                }
                 *endpoints = self.sanitize_endpoints(endpoints.clone(), "group publish")?;
             }
             TransportPublishTarget::Inbox { endpoints, .. } => {

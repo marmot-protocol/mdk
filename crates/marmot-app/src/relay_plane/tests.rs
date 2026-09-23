@@ -810,6 +810,79 @@ fn notification_trigger_endpoints_use_the_relay_safety_policy() {
 }
 
 #[tokio::test]
+async fn unsafe_group_routes_isolated() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account_id.clone(), relay.clone());
+    let safe = TransportEndpoint("wss://relay.example".into());
+    let unsafe_endpoints = vec![
+        TransportEndpoint("wss://relay.onion".into()),
+        TransportEndpoint("ws://relay.onion".into()),
+        TransportEndpoint("wss://127.0.0.1".into()),
+        TransportEndpoint("not a url".into()),
+    ];
+    let groups: Vec<_> = (0..3)
+        .map(|id| TransportGroupSubscription {
+            group_id: GroupId::new(vec![id; 16]),
+            transport_group_id: vec![id; 32],
+            endpoints: match id {
+                0 => vec![safe.clone()],
+                1 => [unsafe_endpoints.clone(), vec![safe.clone()]].concat(),
+                _ => unsafe_endpoints.clone(),
+            },
+        })
+        .collect();
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![safe.clone()],
+            group_subscriptions: groups.clone(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: groups.clone(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    let subscriptions = relay.subscriptions.lock().unwrap().clone();
+    assert_eq!(subscriptions.len(), 3, "inbox and two usable groups");
+    for subscription in subscriptions {
+        assert_eq!(subscription.endpoints(), std::slice::from_ref(&safe));
+    }
+
+    for group in groups {
+        let all_unsafe = group.endpoints == unsafe_endpoints;
+        let request = TransportPublishRequest {
+            account_id: account_id.clone(),
+            message: group_event("filtered", &group.transport_group_id)
+                .to_transport_message()
+                .unwrap(),
+            target: TransportPublishTarget::Group {
+                group_id: group.group_id,
+                transport_group_id: group.transport_group_id,
+                endpoints: group.endpoints,
+            },
+            required_acks: 1,
+        };
+        let result = plane.inner.relay_safety.sanitize_publish_request(request);
+        if all_unsafe {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(
+                result.unwrap().target.endpoints(),
+                std::slice::from_ref(&safe)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn relay_plane_deduplicates_canonical_relay_endpoints() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
