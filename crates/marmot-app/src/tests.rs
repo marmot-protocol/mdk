@@ -1231,6 +1231,11 @@ fn expire_epoch_backfill_retry_cooldown(client: &mut crate::AppClient) {
     let storage = client.app.account_storage(&client.state.label).unwrap();
     assert!(storage.recovery_retry_state().unwrap().attempt_serial > 0);
     client.recovery_owner.test_advance_to_retry(&storage);
+    // The helper advances by whole milliseconds from a monotonic remainder.
+    // Cross the boundary even when that remainder was truncated below 1 ms.
+    client
+        .recovery_owner
+        .test_advance_clock(Duration::from_millis(1));
 }
 
 /// Open a client on the app's *own* relay plane.
@@ -12325,22 +12330,34 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
             if ordinal > 0 {
                 expire_epoch_backfill_retry_cooldown(&mut client);
             }
-            assert!(matches!(
-                client
-                    .run_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                    )
-                    .await
-                    .unwrap(),
-                crate::EpochBackfillRunOutcome::Incomplete(_)
-            ));
-            let remaining = client
-                .recovery_owner
-                .test_retry_remaining(&client.app.account_storage(&client.state.label).unwrap());
-            let expected = Duration::from_secs(15 * (1 << ordinal));
+            let outcome = client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                .unwrap();
             assert!(
-                remaining > expected - Duration::from_secs(1) && remaining <= expected,
-                "overflow attempt {ordinal} must earn {expected:?}, got {remaining:?}"
+                matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+                "overflow attempt {ordinal} returned {outcome:?}; retry state: {:?}",
+                client
+                    .app
+                    .account_storage(&client.state.label)
+                    .unwrap()
+                    .recovery_retry_state()
+                    .unwrap()
+            );
+            let storage = client.app.account_storage(&client.state.label).unwrap();
+            let retry = storage.recovery_retry_state().unwrap();
+            let expected = Duration::from_secs(15 * (1 << ordinal));
+            assert_eq!(
+                retry.delay_ms,
+                expected.as_millis() as u64,
+                "overflow attempt {ordinal} must reserve the full backoff"
+            );
+            let remaining = client.recovery_owner.test_retry_remaining(&storage);
+            assert!(
+                remaining > Duration::ZERO && remaining <= expected,
+                "overflow attempt {ordinal} must stay in backoff after reserving {expected:?}, got {remaining:?}"
             );
             let subscriptions = relay.accepted_subscriptions().len();
             assert!(matches!(
