@@ -1824,6 +1824,154 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
     relay_plane.shutdown().await;
 }
 
+#[tokio::test]
+async fn directory_endpoint_change_retries_a_batch_left_pending_by_partial_failure() {
+    use nostr::prelude::{EventBuilder, Keys};
+
+    let old_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let new_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let old_url = old_relay.url().await.to_string();
+    let new_url = new_relay.url().await.to_string();
+    let alice = Keys::generate();
+    let bob = Keys::generate();
+    let relay_plane = MarmotRelayPlane::full_history_with_loopback(true);
+    let mut events = relay_plane.subscribe_directory_events();
+    let plan = |endpoint: &str, bob_author: String| DirectorySyncPlan {
+        endpoints: vec![TransportEndpoint(endpoint.to_owned())],
+        watched_user_count: 2,
+        batches: vec![
+            DirectorySyncBatch {
+                subscription_id: "directory_users_alice".to_owned(),
+                authors: vec![alice.public_key().to_hex()],
+                kinds: vec![0],
+                since: None,
+            },
+            DirectorySyncBatch {
+                subscription_id: "directory_users_bob".to_owned(),
+                authors: vec![bob_author],
+                kinds: vec![0],
+                since: None,
+            },
+        ],
+    };
+
+    relay_plane
+        .sync_directory_user_subscriptions(plan(&old_url, bob.public_key().to_hex()), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_plane
+            .inner
+            .directory
+            .stats()
+            .await
+            .active_subscriptions,
+        2
+    );
+
+    assert_eq!(
+        relay_plane
+            .sync_directory_user_subscriptions(plan(&new_url, "invalid-pubkey".to_owned()), false)
+            .await
+            .unwrap_err(),
+        "invalid directory author"
+    );
+    let desired = [
+        "directory_users_alice".to_owned(),
+        "directory_users_bob".to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    let (to_add, _) = relay_plane
+        .inner
+        .directory
+        .subscription_diff(&desired)
+        .await;
+    assert_eq!(
+        to_add,
+        ["directory_users_bob".to_owned()].into_iter().collect()
+    );
+    assert_eq!(
+        relay_plane
+            .inner
+            .directory
+            .stats()
+            .await
+            .active_subscriptions,
+        1
+    );
+
+    relay_plane
+        .sync_directory_user_subscriptions(plan(&new_url, bob.public_key().to_hex()), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_plane
+            .inner
+            .directory
+            .stats()
+            .await
+            .active_subscriptions,
+        2
+    );
+
+    let writer = NostrSdkClient::builder().signer(bob.clone()).build();
+    let relay_url = RelayUrl::parse(&new_url).unwrap();
+    writer.add_relay(relay_url.clone()).await.unwrap();
+    writer
+        .try_connect_relay(relay_url.clone(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"bob"}"#)
+        .sign_with_keys(&bob)
+        .unwrap();
+    writer.send_event_to([relay_url], &profile).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let DirectoryRelayPlaneEvent::Record(record) = events.recv().await.unwrap()
+                && record.event.id == profile.id.to_hex()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Bob's retried subscription must deliver from the new relay");
+    writer.shutdown().await;
+    relay_plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn directory_subscribe_error_restores_filter_and_keeps_rebuild_pending() {
+    let id = "directory_users_retry";
+    let old_author = "11".repeat(32);
+    let new_author = "22".repeat(32);
+    let directory =
+        directory_plane_with_active_subscription(id, vec![old_author.clone()], vec![0]).await;
+    let endpoint = RelayUrl::parse("wss://relay.example").unwrap();
+    directory.set_subscription_endpoints(&[endpoint]).await;
+    directory
+        .mark_rebuild_pending(&[id.to_owned()].into_iter().collect())
+        .await;
+    let previous = directory
+        .record_subscription_filter(
+            id.to_owned(),
+            DirectorySubscriptionFilter::new(vec![new_author.clone()], vec![0]),
+        )
+        .await;
+    directory
+        .restore_failed_subscription_filter(id, previous)
+        .await;
+
+    let (to_add, _) = directory
+        .subscription_diff(&[id.to_owned()].into_iter().collect())
+        .await;
+    assert!(to_add.contains(id));
+    assert_eq!(directory.stats().await.active_subscriptions, 0);
+    assert!(directory.accepts_live_event(id, &old_author, 0).await);
+    assert!(!directory.accepts_live_event(id, &new_author, 0).await);
+}
+
 async fn directory_live_auth_challenge(deny_read: bool) {
     use futures::{SinkExt, StreamExt};
     use nostr::prelude::{EventBuilder, Keys};

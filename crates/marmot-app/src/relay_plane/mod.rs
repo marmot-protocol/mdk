@@ -1167,13 +1167,14 @@ impl MarmotRelayPlane {
         let (mut to_add, to_remove) = self.inner.directory.subscription_diff(&desired_ids).await;
         if force_rebuild || endpoints_changed {
             to_add = desired_ids;
+            self.inner.directory.mark_rebuild_pending(&to_add).await;
         }
         for subscription_id in &to_remove {
             directory_client
                 .unsubscribe(&SubscriptionId::new(subscription_id.clone()))
                 .await;
         }
-        if endpoints_changed {
+        if force_rebuild || endpoints_changed {
             for subscription_id in &to_add {
                 directory_client
                     .unsubscribe(&SubscriptionId::new(subscription_id.clone()))
@@ -1227,22 +1228,26 @@ impl MarmotRelayPlane {
                 .directory
                 .record_subscription_filter(batch.subscription_id.clone(), validation_filter)
                 .await;
-            if let Err(err) = directory_client
+            let subscription = directory_client
                 .subscribe_with_id_to(
                     relay_urls.clone(),
                     SubscriptionId::new(batch.subscription_id.clone()),
                     filter,
                     None,
                 )
-                .await
-            {
+                .await;
+            if !subscription.is_ok_and(|output| !output.success.is_empty()) {
                 self.inner
                     .directory
                     .restore_failed_subscription_filter(&batch.subscription_id, previous)
                     .await;
-                return Err(format!("directory subscription subscribe: {err}"));
+                return Err("directory subscription registered on no relays".to_owned());
             }
             subscriptions_created += usize::from(previous.is_none());
+            self.inner
+                .directory
+                .mark_subscription_installed(&batch.subscription_id)
+                .await;
         }
 
         self.inner

@@ -103,6 +103,7 @@ struct DirectoryRelayPlaneState {
     active_subscriptions: HashMap<String, DirectorySubscriptionFilter>,
     active_endpoints: HashSet<String>,
     auth_required: HashSet<(String, String)>,
+    pending_rebuild: HashSet<String>,
     completed_fetches: usize,
     coalesced_waiters: usize,
     failed_fetches: usize,
@@ -355,11 +356,12 @@ impl DirectoryRelayPlane {
                 .active_subscriptions
                 .keys()
                 .filter(|id| {
-                    state.active_endpoints.iter().any(|endpoint| {
-                        !state
-                            .auth_required
-                            .contains(&((*id).clone(), endpoint.clone()))
-                    })
+                    !state.pending_rebuild.contains(*id)
+                        && state.active_endpoints.iter().any(|endpoint| {
+                            !state
+                                .auth_required
+                                .contains(&((*id).clone(), endpoint.clone()))
+                        })
                 })
                 .count(),
             auth_required_routes: state.auth_required.len(),
@@ -385,6 +387,7 @@ impl DirectoryRelayPlane {
         let to_add = desired_ids
             .difference(&active_ids)
             .cloned()
+            .chain(desired_ids.intersection(&state.pending_rebuild).cloned())
             .collect::<HashSet<_>>();
         let to_remove = active_ids
             .difference(desired_ids)
@@ -411,6 +414,22 @@ impl DirectoryRelayPlane {
             .await
             .auth_required
             .retain(|(id, _)| id != subscription_id);
+    }
+
+    pub(crate) async fn mark_rebuild_pending(&self, ids: &HashSet<String>) {
+        self.state
+            .lock()
+            .await
+            .pending_rebuild
+            .extend(ids.iter().cloned());
+    }
+
+    pub(crate) async fn mark_subscription_installed(&self, subscription_id: &str) {
+        self.state
+            .lock()
+            .await
+            .pending_rebuild
+            .remove(subscription_id);
     }
 
     pub(crate) async fn mark_auth_required(&self, subscription_id: &str, endpoint: &str) -> bool {
@@ -480,6 +499,7 @@ impl DirectoryRelayPlane {
         state
             .auth_required
             .retain(|(id, _)| active_ids.contains(id));
+        state.pending_rebuild.retain(|id| active_ids.contains(id));
         Ok(DirectorySubscriptionSyncSummary {
             active_subscriptions: state.active_subscriptions.len(),
             subscriptions_created,
@@ -519,6 +539,7 @@ impl DirectoryRelayPlane {
         state
             .auth_required
             .retain(|(id, _)| active_ids.contains(id));
+        state.pending_rebuild.retain(|id| active_ids.contains(id));
         Ok(DirectorySubscriptionSyncSummary {
             active_subscriptions: state.active_subscriptions.len(),
             subscriptions_created: created,
@@ -560,6 +581,7 @@ impl DirectoryRelayPlane {
     ) -> bool {
         let state = self.state.lock().await;
         state.active_endpoints.contains(endpoint)
+            && !state.pending_rebuild.contains(subscription_id)
             && !state
                 .auth_required
                 .contains(&(subscription_id.to_owned(), endpoint.to_owned()))
