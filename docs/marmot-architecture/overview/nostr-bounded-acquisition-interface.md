@@ -203,6 +203,11 @@ cancellation on either side of a durable prefix, stale generation/route
 fences, restart persistence, or resumption after worker-credit saturation.
 Focused worker admission and completion fences, with their exact limits, are
 recorded in [recovery admission and interruption qualification](../further-context/recovery-admission-interruption-qualification.md).
+The [progress and fairness qualification](../further-context/recovery-p5-progress-fairness-2026-09-24.md)
+records controlled ready-work and distinct known-ID owner turns; this branch
+also runs those fixtures against the isolated SDK pin. Its broad recovery and
+device limits remain open.
+
 Two further real-SDK controls exercise competing recovery demands and a newer
 delivery loss. The conforming NIP-77 relay fixture expects an already-retained
 known ID and a fresh comparison to settle through automatic worker service

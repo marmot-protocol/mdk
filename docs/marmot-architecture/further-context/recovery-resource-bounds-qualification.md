@@ -41,6 +41,15 @@ one captured timestamp; its fixed-time storage witness keeps the coverage
 guard intact. Six no-retry CI-profile repetitions and #2023's exact-head CI
 passed. This resource slice does not establish general comparison fairness.
 
+The merged [progress and fairness qualification](recovery-p5-progress-fairness-2026-09-24.md)
+predated this branch's SDK pin. On the composed branch, its default-build
+two-ID owner-turn test and both feature-on progress tests pass with the
+request-local isolation revision `63384e485d55097cb3d9e57a2146f453a5742570`.
+They cover controlled retained-epoch and other-group progress and consecutive
+missing-ID turns. The test-only scheduler hold, broad worker-held recovery,
+arbitrary account/relay fairness, and device latency remain outside this
+qualification.
+
 ## Accounting boundaries
 
 The relay fixture counts UTF-8 WebSocket text payloads before SDK filtering.
