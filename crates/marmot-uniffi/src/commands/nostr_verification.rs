@@ -11,12 +11,12 @@ pub fn verify_public_nostr_event_json(event_json: String) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, JsonUtil, Keys, Kind};
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind};
 
     #[test]
     fn binding_accepts_valid_public_event_and_rejects_tampering() {
         let event = EventBuilder::new(Kind::TextNote, "public event")
-            .sign_with_keys(&Keys::generate())
+            .finalize(&Keys::generate())
             .unwrap();
         let json = event.as_json();
         assert!(verify_public_nostr_event_json(json.clone()));

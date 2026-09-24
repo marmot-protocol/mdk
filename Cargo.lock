@@ -3630,7 +3630,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "marmot-uniffi",
- "nostr",
+ "nostr 0.45.5",
  "nostr-relay-builder",
  "tempfile",
  "tokio",

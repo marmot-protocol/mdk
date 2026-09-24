@@ -3165,13 +3165,13 @@ pub unsafe extern "C" fn marmot_verify_public_nostr_event_json(
 #[cfg(test)]
 mod nostr_verification_tests {
     use super::*;
-    use nostr::{EventBuilder, JsonUtil, Keys, Kind};
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind};
     use std::{ffi::CString, ptr};
 
     #[test]
     fn public_event_verifier_clears_outputs_and_fails_closed() {
         let signed_event = EventBuilder::new(Kind::TextNote, "public C event")
-            .sign_with_keys(&Keys::generate())
+            .finalize(&Keys::generate())
             .unwrap();
         let event_json = CString::new(signed_event.as_json()).unwrap();
         let mut event_verified = 0u8;

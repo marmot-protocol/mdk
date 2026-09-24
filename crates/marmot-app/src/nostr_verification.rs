@@ -3,13 +3,13 @@
 //! This uses the same Rust Nostr/libsecp256k1 stack as MDK's transport path.
 //! It does not require an account, runtime, relay connection, or secret key.
 
-use nostr::{Event, JsonUtil};
+use nostr::prelude::Event;
 
 // The digest-only verifier is retained for the BIP-340 reference vectors, not
 // exported to hosts: public-event consumers must also verify the canonical ID.
 #[cfg(test)]
 fn verify_bip340_signature(public_key_hex: &str, message_hex: &str, signature_hex: &str) -> bool {
-    use nostr::secp256k1::{Message, SECP256K1, XOnlyPublicKey, schnorr::Signature};
+    use secp256k1::{Secp256k1, XOnlyPublicKey, schnorr::Signature};
 
     let (mut public_key, mut message, mut signature) = ([0u8; 32], [0u8; 32], [0u8; 64]);
     if hex::decode_to_slice(public_key_hex, &mut public_key).is_err()
@@ -24,8 +24,8 @@ fn verify_bip340_signature(public_key_hex: &str, message_hex: &str, signature_he
     ) else {
         return false;
     };
-    SECP256K1
-        .verify_schnorr(&signature, &Message::from_digest(message), &public_key)
+    Secp256k1::verification_only()
+        .verify_schnorr(&signature, &message, &public_key)
         .is_ok()
 }
 
@@ -40,7 +40,7 @@ pub fn verify_public_nostr_event_json(event_json: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Kind};
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind};
 
     #[test]
     fn bip340_reference_vectors_and_malformed_inputs_fail_closed() {
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn public_event_verification_checks_id_and_signature() {
         let event = EventBuilder::new(Kind::TextNote, "public event")
-            .sign_with_keys(&Keys::generate())
+            .finalize(&Keys::generate())
             .unwrap();
         let json = event.as_json();
         assert!(verify_public_nostr_event_json(&json));
