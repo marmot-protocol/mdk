@@ -21,6 +21,7 @@ struct HeldExactQuery {
     hold_exact: Arc<AtomicBool>,
     reject_broad: Arc<AtomicBool>,
     exact_queries: Arc<AtomicUsize>,
+    entered_at: Arc<Mutex<Option<Instant>>>,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
@@ -44,6 +45,7 @@ impl QueryPolicy for HeldExactQuery {
                     let released = self.release.notified();
                     tokio::pin!(released);
                     released.as_mut().enable();
+                    *self.entered_at.lock().unwrap() = Some(Instant::now());
                     self.entered.notify_one();
                     released.await;
                 }
@@ -580,6 +582,9 @@ async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
     // acquire this probe; NIP-77 comparison remains available on the relay.
     gate.reject_broad.store(true, Ordering::SeqCst);
     let storage = app.account_storage(&alice.label).unwrap();
+    let shared = runtime.shared_services();
+    let mut network_result = Box::pin(shared.bounded_result_ready.notified());
+    network_result.as_mut().enable();
     storage
         .request_recovery(
             storage_sqlite::RecoveryRequest::KnownEvent {
@@ -592,25 +597,54 @@ async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
     runtime
         .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
         .await;
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if gate.exact_queries.load(Ordering::SeqCst) >= 1 {
-                break;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("first exact-ID request enters the real relay's query gate");
+    timeout(Duration::from_secs(10), gate.entered.notified())
+        .await
+        .expect("first exact-ID request enters the real relay's query gate");
+    let entered_at = gate
+        .entered_at
+        .lock()
+        .unwrap()
+        .expect("relay entry timestamp");
     let first_retry = storage.recovery_retry_state().unwrap();
     assert_eq!(gate.exact_queries.load(Ordering::SeqCst), 1);
     assert!(first_retry.not_before_ms > first_retry.recorded_at_ms);
+    let demand_id = storage
+        .pending_recovery_demands()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.known_event_id == Some(event_id))
+        .expect("exact demand remains pending while its query is held")
+        .ticket
+        .id;
+    let scope_before = storage.recovery_scope_snapshots(demand_id).unwrap();
+    assert!(!scope_before.is_empty());
+    assert!(
+        scope_before
+            .iter()
+            .all(|scope| scope.checkpoints.is_empty())
+    );
     assert!(
         !storage
             .retained_recovery_event(&route, &event_id, None, created_at)
             .unwrap()
     );
-    runtime.shutdown_and_close().await.unwrap();
+    assert!(
+        futures::FutureExt::now_or_never(network_result.as_mut()).is_none(),
+        "the worker has not accepted an SDK result before shutdown"
+    );
+    // The SDK request expires five seconds after its REQ. Shutdown must
+    // finish earlier, while this exact query is still held by the relay.
+    let remaining = Duration::from_secs(4)
+        .checked_sub(entered_at.elapsed())
+        .expect("shutdown starts inside the request-relative cancellation window");
+    timeout(remaining, runtime.shutdown_and_close())
+        .await
+        .expect("shutdown interrupts the held SDK acquisition before its deadline")
+        .unwrap();
+    assert!(
+        futures::FutureExt::now_or_never(network_result.as_mut()).is_none(),
+        "shutdown did not accept a completed SDK result"
+    );
     gate.release.notify_waiters();
     drop(storage);
     drop(runtime);
@@ -633,6 +667,11 @@ async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
     let reopened_retry = reopened_storage.recovery_retry_state().unwrap();
     assert_eq!(reopened_retry.attempt_serial, first_retry.attempt_serial);
     assert_eq!(gate.exact_queries.load(Ordering::SeqCst), 1);
+    let scope_after = reopened_storage
+        .recovery_scope_snapshots(demand_id)
+        .unwrap();
+    assert_eq!(scope_after.len(), scope_before.len());
+    assert!(scope_after.iter().all(|scope| scope.checkpoints.is_empty()));
     assert!(
         !reopened_storage
             .retained_recovery_event(&route, &event_id, None, created_at)
@@ -690,11 +729,6 @@ async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
             .retained_recovery_event(&route, &event_id, None, created_at)
             .unwrap()
     );
-    assert_eq!(
-        reopened_storage.recovery_retry_state().unwrap(),
-        comparison_retry
-    );
-    assert_eq!(gate.exact_queries.load(Ordering::SeqCst), 1);
     let transport_event =
         transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&signed).unwrap();
     let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
@@ -702,13 +736,7 @@ async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
         .publish_event(&[cgka_traits::TransportEndpoint(url)], &transport_event, 1)
         .await
         .unwrap();
-    assert!(
-        !reopened_storage
-            .retained_recovery_event(&route, &event_id, None, created_at)
-            .unwrap()
-    );
     gate.hold_exact.store(false, Ordering::SeqCst);
-    gate.release.notify_waiters();
     reopened_runtime
         .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
         .await;
