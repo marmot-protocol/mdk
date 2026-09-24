@@ -1895,10 +1895,7 @@ fn spawn_relay_notification_supervisor_scoped(
     account_id: Option<MemberId>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        transport
-            .notification_forwarder_health
-            .running_count
-            .fetch_add(1, Ordering::SeqCst);
+        let _running = RunningSupervisorGuard::new(transport.notification_forwarder_health.clone());
         let mut receiver = None;
         let mut restart_backoff = RelayNotificationRestartBackoff::default();
         loop {
@@ -1973,11 +1970,28 @@ fn spawn_relay_notification_supervisor_scoped(
                 }
             }
         }
-        transport
-            .notification_forwarder_health
-            .running_count
-            .fetch_sub(1, Ordering::SeqCst);
     })
+}
+
+struct RunningSupervisorGuard(Arc<RelayNotificationForwarderHealth>);
+
+impl RunningSupervisorGuard {
+    fn new(health: Arc<RelayNotificationForwarderHealth>) -> Self {
+        health.running_count.fetch_add(1, Ordering::SeqCst);
+        Self(health)
+    }
+}
+
+impl Drop for RunningSupervisorGuard {
+    fn drop(&mut self) {
+        // Terminal shutdown may already have reset the aggregate to zero.
+        let _ = self
+            .0
+            .running_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                Some(count.saturating_sub(1))
+            });
+    }
 }
 
 struct AbortTaskOnDrop(tokio::task::AbortHandle);

@@ -726,6 +726,15 @@ struct TestNotificationSource {
 }
 
 impl TestNotificationSource {
+    fn steady() -> Self {
+        Self {
+            sender: broadcast::channel(1).0,
+            subscriptions: AtomicUsize::new(0),
+            preload_lag: false,
+            panic_first: AtomicBool::new(false),
+        }
+    }
+
     fn lag_once() -> Self {
         Self {
             sender: broadcast::channel(1).0,
@@ -772,6 +781,97 @@ impl RelayNotificationSource for TestNotificationSource {
     fn is_shutdown(&self) -> bool {
         false
     }
+}
+
+#[tokio::test]
+async fn aborted_scoped_supervisors_release_health_across_account_restarts() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let bob = MemberId::new(vec![0xB2; 32]);
+    let running_count = &plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .running_count;
+
+    for _ in 0..3 {
+        let _alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+        let _bob_adapter = plane.account_adapter(bob.clone(), relay.clone());
+        let source = Arc::new(TestNotificationSource::steady());
+        let mut forwarders = plane
+            .inner
+            .transport
+            .account_notification_forwarders
+            .lock()
+            .await;
+        assert!(
+            forwarders
+                .insert(
+                    alice.clone(),
+                    spawn_relay_notification_supervisor_scoped(
+                        source.clone(),
+                        plane.inner.transport.clone(),
+                        Some(alice.clone()),
+                    ),
+                )
+                .is_none()
+        );
+        assert!(
+            forwarders
+                .insert(
+                    bob.clone(),
+                    spawn_relay_notification_supervisor_scoped(
+                        source.clone(),
+                        plane.inner.transport.clone(),
+                        Some(bob.clone()),
+                    ),
+                )
+                .is_none()
+        );
+        drop(forwarders);
+        timeout(Duration::from_secs(2), async {
+            while running_count.load(Ordering::SeqCst) != 2
+                || source.subscriptions.load(Ordering::SeqCst) != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both scoped supervisors start");
+
+        plane.deactivate_account_context(&alice).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while running_count.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting Alice releases only her supervisor count");
+        assert!(plane.relay_health().await.notification_forwarder_running);
+        assert!(
+            plane
+                .inner
+                .transport
+                .account_notification_forwarders
+                .lock()
+                .await
+                .get(&bob)
+                .is_some_and(|handle| !handle.is_finished())
+        );
+
+        plane.deactivate_account_context(&bob).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while running_count.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting the last account releases the running count");
+        assert!(!plane.relay_health().await.notification_forwarder_running);
+    }
+
+    plane.shutdown().await;
 }
 
 #[tokio::test]
