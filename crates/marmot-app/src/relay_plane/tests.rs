@@ -858,6 +858,15 @@ async fn unsafe_group_routes_isolated() {
 
     for group in groups {
         let all_unsafe = group.endpoints == unsafe_endpoints;
+        let admitted = adapter.recovery_admitted_endpoints(&group.endpoints);
+        assert_eq!(
+            admitted,
+            if all_unsafe {
+                vec![]
+            } else {
+                vec![safe.0.clone()]
+            }
+        );
         let request = TransportPublishRequest {
             account_id: account_id.clone(),
             message: group_event("filtered", &group.transport_group_id)
@@ -880,6 +889,40 @@ async fn unsafe_group_routes_isolated() {
             );
         }
     }
+}
+
+#[test]
+fn recovery_route_cap_and_aliases() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let adapter = plane.account_adapter(MemberId::new(vec![1; 32]), relay);
+    let mut endpoints = vec![TransportEndpoint("wss://relay.onion".into())];
+    endpoints.extend((0..20).map(|i| TransportEndpoint(format!("wss://relay{i}.example/"))));
+    endpoints.push(TransportEndpoint(" wss://RELAY0.example/ ".into()));
+    let group = TransportGroupSubscription {
+        group_id: GroupId::new(vec![1; 16]),
+        transport_group_id: vec![2; 32],
+        endpoints: endpoints.clone(),
+    };
+    let sync = plane
+        .inner
+        .relay_safety
+        .sanitize_group_sync(TransportGroupSync {
+            account_id: adapter.account_id().clone(),
+            group_subscriptions: vec![group],
+            since: None,
+        })
+        .unwrap();
+    assert_eq!(sync.group_subscriptions[0].endpoints.len(), 16);
+    let admitted = adapter.recovery_admitted_endpoints(&endpoints);
+    let mut expected: Vec<_> = endpoints[1..17]
+        .iter()
+        .map(|endpoint| endpoint.0.clone())
+        .collect();
+    expected.push(" wss://RELAY0.example/ ".into());
+    expected.sort();
+    assert_eq!(admitted, expected);
+    assert_eq!(endpoints.len(), 22, "signed route remains unchanged");
 }
 
 #[tokio::test]
