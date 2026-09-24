@@ -614,6 +614,7 @@ jobs:
           BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
         run: |
           python3 crates/marmot-uniffi/build-provenance.py verify android \
+            --artifact-root packaged-source/crates/marmot-uniffi/output/android \
             packaged-source/crates/marmot-uniffi/output/android/provenance/*.json
 
       - name: Package Android bundle
@@ -661,6 +662,9 @@ jobs:
             fi
           done
 
+          python3 crates/marmot-uniffi/validate-android-artifact.py directory \
+            "$bundle_dir" --report "$bundle_dir/android-elf.json"
+
           cat > "$bundle_dir/manifest.json" <<EOF
           {
             "name": "marmotkit-android",
@@ -675,6 +679,7 @@ jobs:
             "android_ndk_home": "$MARMOTKIT_BUILD_ANDROID_NDK_HOME",
             "android_ndk_version": "$MARMOTKIT_BUILD_ANDROID_NDK_VERSION",
             "android_api": "$MARMOTKIT_BUILD_ANDROID_API",
+            "elf_validation": "android-elf.json",
             "contents": [
               "kotlin/dev/ipf/marmotkit/marmot_uniffi.kt",
               "jniLibs/arm64-v8a/libmarmot_uniffi.so",
@@ -722,6 +727,18 @@ jobs:
               exit 1
             fi
           done
+
+          elf_validation="$(jq -r '.elf_validation' <<< "$manifest")"
+          if [[ "$elf_validation" != "android-elf.json" ]]; then
+            echo "error: Android manifest elf_validation must name android-elf.json" >&2
+            exit 1
+          fi
+          if ! grep -Fqx "$bundle_root/android-elf.json" <<< "$archive_entries"; then
+            echo "error: Android archive is missing android-elf.json" >&2
+            exit 1
+          fi
+          python3 crates/marmot-uniffi/validate-android-artifact.py bundle \
+            "$asset" --root "$bundle_root" --report "$bundle_dir/android-elf.json"
 
           shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
           mkdir -p dist

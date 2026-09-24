@@ -97,7 +97,9 @@ jobs:
           python3 scripts/test_check_binding_docs.py
 
       - name: Binding build phase contracts
-        run: python3 crates/marmot-uniffi/test-build-phases.py
+        run: |
+          python3 crates/marmot-uniffi/test-build-phases.py
+          python3 crates/marmot-uniffi/test-android-artifact.py
 
       - name: Install example SHA-256 gate
         run: |

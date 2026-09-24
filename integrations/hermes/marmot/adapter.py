@@ -74,6 +74,31 @@ def _remember_live_adapter(adapter: "MarmotPlatformAdapter") -> "MarmotPlatformA
 def _live_adapter() -> Optional["MarmotPlatformAdapter"]:
     return _LIVE_ADAPTER_REF() if _LIVE_ADAPTER_REF is not None else None
 
+
+def _home_channel_platform_name(home_channel: Any) -> Optional[str]:
+    """Platform name of a core HomeChannel, tolerant of the Platform enum.
+
+    Hermes parses ``platforms.<name>.home_channel`` into
+    ``gateway.config.HomeChannel``, whose ``platform`` is a ``Platform`` enum
+    member: ``str()`` on it is ``"Platform.MARMOT"``, which the shared home
+    resolver rejects as ``wrong_platform``. Prefer ``.value`` so a home set by
+    Hermes's own ``/sethome`` resolves exactly like the YAML projection the
+    doctor reads.
+
+    Both call sites read ``self.config.home_channel``, which is always an
+    attribute-style value: the core ``HomeChannel`` object, or the
+    ``SimpleNamespace`` that ``_effective_platform_config`` builds for the
+    plugin-settings path. The YAML mapping form belongs to the doctor and is
+    handled once in ``diagnostics._home_channel_fields``, so it is deliberately
+    not tolerated here.
+    """
+
+    raw = getattr(home_channel, "platform", None)
+    if raw in (None, ""):
+        return None
+    return str(getattr(raw, "value", raw)).strip().lower() or None
+
+
 DEFAULT_SOCKET_HOME = "~/.marmot"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
 TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
@@ -1969,14 +1994,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         platform = None
         chat_id = None
         if home_channel is not None:
-            platform = str(getattr(home_channel, "platform", "") or "").strip().lower() or None
+            platform = _home_channel_platform_name(home_channel)
             chat_id = getattr(home_channel, "chat_id", None)
         route, error = marmot_diagnostics.resolve_home_route(
             extra,
             home_channel=chat_id if chat_id not in (None, "") else extra.get("home_channel"),
             home_platform=platform,
         )
-        del error
+        if route is None and error is not None:
+            # Reason code only, never the route. Discarding it here is what kept a
+            # wrong_platform home silent while the doctor reported a mismatch.
+            logger.debug("Marmot home channel unresolved (%s)", error)
         return route
 
     def _hermes_home(self) -> Path:
@@ -4559,8 +4587,8 @@ async def probe_readiness(
     group_id = adapter.group_id_hex
     home_channel = getattr(config, "home_channel", None)
     if not group_id and home_channel is not None:
-        home_platform = str(getattr(home_channel, "platform", "") or "").strip().lower()
-        home_chat_id = str(getattr(home_channel, "chat_id", "") or "").strip()
+        home_platform = _home_channel_platform_name(home_channel) or ""
+        home_chat_id = (getattr(home_channel, "chat_id", None) or "").strip()
         if home_platform in {"", "marmot"} and home_chat_id:
             if home_chat_id.lower().startswith("marmot:"):
                 home_chat_id = home_chat_id.split(":", 1)[1].strip()

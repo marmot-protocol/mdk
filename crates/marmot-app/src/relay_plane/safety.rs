@@ -106,9 +106,7 @@ impl RelaySafetyPolicy {
     ) -> Result<TransportAccountActivation, String> {
         activation.inbox_endpoints =
             self.sanitize_endpoints(activation.inbox_endpoints, "account inbox")?;
-        for group in &mut activation.group_subscriptions {
-            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
-        }
+        self.filter_group_routes(&mut activation.group_subscriptions);
         Ok(activation)
     }
 
@@ -116,10 +114,38 @@ impl RelaySafetyPolicy {
         &self,
         mut sync: TransportGroupSync,
     ) -> Result<TransportGroupSync, String> {
-        for group in &mut sync.group_subscriptions {
-            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
-        }
+        self.filter_group_routes(&mut sync.group_subscriptions);
         Ok(sync)
+    }
+
+    fn filter_group_routes(&self, groups: &mut Vec<cgka_traits::TransportGroupSubscription>) {
+        // Signed group routes are peer input. An unusable route must not
+        // prevent the account's inbox or other groups from subscribing.
+        let offered = groups.len();
+        groups.retain_mut(|group| {
+            group.endpoints =
+                self.usable_group_endpoints(std::mem::take(&mut group.endpoints), "group route");
+            !group.endpoints.is_empty()
+        });
+        let dropped_routes = offered - groups.len();
+        if dropped_routes != 0 {
+            tracing::warn!(
+                target: "marmot_app::relay_plane",
+                method = "filter_group_routes",
+                dropped_routes,
+                "omitted group routes with no usable relay endpoints"
+            );
+        }
+    }
+
+    fn usable_group_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Vec<TransportEndpoint> {
+        let mut kept = self.retain_safe_endpoints(endpoints, context);
+        kept.truncate(self.max_endpoints_per_route);
+        kept
     }
 
     pub(crate) fn sanitize_publish_request(
@@ -128,7 +154,11 @@ impl RelaySafetyPolicy {
     ) -> Result<TransportPublishRequest, String> {
         match &mut request.target {
             TransportPublishTarget::Group { endpoints, .. } => {
-                *endpoints = self.sanitize_endpoints(endpoints.clone(), "group publish")?;
+                *endpoints =
+                    self.usable_group_endpoints(std::mem::take(endpoints), "group publish");
+                if endpoints.is_empty() {
+                    return Err("group publish: no safe relay endpoints".to_owned());
+                }
             }
             TransportPublishTarget::Inbox { endpoints, .. } => {
                 *endpoints = self.sanitize_endpoints(endpoints.clone(), "inbox publish")?;
@@ -148,9 +178,8 @@ impl RelaySafetyPolicy {
     /// appending a single loopback URL. Every endpoint is checked against the
     /// same rule; only the response to a rejection differs.
     ///
-    /// The result still passes through [`Self::sanitize_endpoints`] at the
-    /// dial chokepoint, so this narrows what is offered rather than replacing
-    /// the check.
+    /// Group routes also apply the route limit through
+    /// [`Self::usable_group_endpoints`].
     pub(crate) fn retain_safe_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,
@@ -213,6 +242,35 @@ impl RelaySafetyPolicy {
             ));
         }
         Ok(sanitized)
+    }
+}
+
+impl super::MarmotRelayPlaneAccountAdapter {
+    pub(crate) fn recovery_admitted_endpoints(
+        &self,
+        endpoints: &[TransportEndpoint],
+    ) -> Vec<String> {
+        let admitted: std::collections::HashSet<_> = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .usable_group_endpoints(endpoints.to_vec(), "recovery scope")
+            .into_iter()
+            .map(|endpoint| endpoint.0)
+            .collect();
+        // Preserve signed spelling in the frozen goal. Membership queries use
+        // the adapter's forward canonical identity lookup, never URL rewrites.
+        let mut result = endpoints
+            .iter()
+            .filter(|endpoint| {
+                RelayUrl::parse(endpoint.as_str().trim())
+                    .is_ok_and(|url| admitted.contains(url.as_str()))
+            })
+            .map(|endpoint| endpoint.0.clone())
+            .collect::<Vec<_>>();
+        result.sort();
+        result.dedup();
+        result
     }
 }
 
