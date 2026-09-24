@@ -614,9 +614,101 @@ async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
     runtime
         .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
         .await;
-    timeout(Duration::from_secs(10), gate.entered.notified())
-        .await
-        .expect("first exact-ID request enters the real relay's query gate");
+    let first_gate = timeout(Duration::from_secs(10), gate.entered.notified()).await;
+    if first_gate.is_err() {
+        // Temporary CI diagnosis. Read independent state before the original
+        // assertion; do not ask the worker to make progress on this path.
+        let retry = storage.recovery_retry_state();
+        let comparison = storage.recovery_comparison().map(|comparison| {
+            (
+                comparison.revision,
+                comparison.settled_revision,
+                comparison.attempt_serial,
+                comparison.blocked_route_revision,
+                comparison.requested_until_seconds,
+                comparison.plan.map(|plan| {
+                    (
+                        plan.live_since_seconds,
+                        plan.routes
+                            .into_iter()
+                            .map(|route| {
+                                (
+                                    route.since_seconds,
+                                    route.until_seconds,
+                                    route.required_endpoints.len(),
+                                    route.admitted_endpoints.len(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }),
+            )
+        });
+        let pending = storage.pending_recovery_demands();
+        let frozen = pending.as_ref().ok().and_then(|demands| {
+            demands
+                .iter()
+                .find(|demand| demand.known_event_id == Some(event_id))
+                .map(|demand| {
+                    storage
+                        .recovery_scope_snapshots(demand.ticket.id)
+                        .map(|scopes| {
+                            scopes
+                                .into_iter()
+                                .map(|scope| {
+                                    (
+                                        scope.attempt_serial,
+                                        scope.plan.since_seconds,
+                                        scope.plan.until_seconds,
+                                        scope.plan.known_event_id == Some(event_id),
+                                        scope.plan.required_endpoints.len(),
+                                        scope.plan.admitted_endpoints.len(),
+                                        scope.checkpoints.len(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                })
+        });
+        let demands = pending.map(|demands| {
+            demands
+                .iter()
+                .map(|demand| {
+                    (
+                        demand.cause,
+                        demand.eligibility,
+                        demand.known_event_id == Some(event_id),
+                        demand.requested_at_ms,
+                        demand.caller_waiting,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let witness = shared
+            .bounded_result_witness
+            .lock()
+            .ok()
+            .and_then(|witness| {
+                witness.as_ref().map(|witness| {
+                    (
+                        witness.account_label == alice.label,
+                        witness.attempt_serial,
+                        witness.event_id == event_id,
+                        witness.matching_items,
+                    )
+                })
+            });
+        eprintln!(
+            "first exact-ID gate timeout diagnosis: exact_queries={}, entered_at={:?}, hold_exact={}, reject_broad={}, bounded_probes={}, available_credits={}, accepted_result_witness={witness:?}, retry={retry:?}, comparison={comparison:?}, demands={demands:?}, frozen_target_scopes={frozen:?}",
+            gate.exact_queries.load(Ordering::SeqCst),
+            gate.entered_at.lock().ok().and_then(|entered| *entered),
+            gate.hold_exact.load(Ordering::SeqCst),
+            gate.reject_broad.load(Ordering::SeqCst),
+            shared.bounded_preparation_probes.load(Ordering::SeqCst),
+            bounded_recovery::available_credits(),
+        );
+    }
+    first_gate.expect("first exact-ID request enters the real relay's query gate");
     let entered_at = gate
         .entered_at
         .lock()
