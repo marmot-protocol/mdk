@@ -746,6 +746,91 @@ mod tests {
     }
 
     #[test]
+    fn comparison_request_second_must_be_covered_by_joined_debt_window() {
+        let old = RecoveryScopePlan {
+            since_seconds: None,
+            ..scope()
+        };
+        let mut current = scope();
+        current.until_seconds = 101;
+
+        let stale = storage();
+        let revision = stale
+            .join_recovery_comparison(&[1; 16], 101_000, std::slice::from_ref(&old))
+            .unwrap();
+        assert_eq!(
+            stale.recovery_comparison().unwrap().requested_until_seconds,
+            101
+        );
+        let debt = stale.pending_recovery_demands().unwrap();
+        let debt_route = &stale.recovery_scope_snapshots(debt[0].ticket.id).unwrap()[0].plan;
+        assert_eq!(debt_route.since_seconds, None);
+        assert_eq!(debt_route.until_seconds, 100);
+        assert_eq!(debt_route.required_endpoints, old.required_endpoints);
+        let mut fence = stale.recovery_revision_fence().unwrap();
+        fence.obligations.clear();
+        let attempt = stale
+            .reserve_recovery_work(&fence, Some(revision), 101_000, 15_000, false)
+            .unwrap()
+            .unwrap()
+            .attempt_serial;
+        assert!(
+            stale
+                .install_recovery_comparison_plan(
+                    revision,
+                    attempt,
+                    &RecoveryComparisonPlan {
+                        fence: fence.clone(),
+                        live_since_seconds: None,
+                        routes: vec![current.clone()],
+                        retry_routes: Vec::new(),
+                    },
+                )
+                .is_err(),
+            "a newer request timestamp cannot extend operational coverage past debt"
+        );
+
+        let aligned = storage();
+        let aligned_debt = RecoveryScopePlan {
+            until_seconds: 101,
+            ..old
+        };
+        let revision = aligned
+            .join_recovery_comparison(&[1; 16], 101_000, std::slice::from_ref(&aligned_debt))
+            .unwrap();
+        let debt = aligned.pending_recovery_demands().unwrap();
+        let debt_route = &aligned.recovery_scope_snapshots(debt[0].ticket.id).unwrap()[0].plan;
+        assert_eq!(debt_route.since_seconds, None);
+        assert_eq!(debt_route.until_seconds, 101);
+        assert_eq!(
+            debt_route.required_endpoints,
+            aligned_debt.required_endpoints
+        );
+        let mut fence = aligned.recovery_revision_fence().unwrap();
+        fence.obligations.clear();
+        let attempt = aligned
+            .reserve_recovery_work(&fence, Some(revision), 101_000, 15_000, false)
+            .unwrap()
+            .unwrap()
+            .attempt_serial;
+        assert!(
+            aligned
+                .install_recovery_comparison_plan(
+                    revision,
+                    attempt,
+                    &RecoveryComparisonPlan {
+                        fence,
+                        live_since_seconds: None,
+                        routes: vec![current],
+                        retry_routes: Vec::new(),
+                    },
+                )
+                .unwrap(),
+            "matching the joined debt window makes the same route admissible"
+        );
+    }
+
+    #[test]
     fn comparison_join_does_not_narrow_preexisting_unresolved_history() {
         let s = storage();
         let prior = s
