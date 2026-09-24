@@ -39,31 +39,36 @@ are narrower than the broad maintenance path observed here.
 
 ## Controlled witness
 
-`worker_wait_attribution_tests::owner_granted_broad_maintenance_wait_holds_queued_worker_command`
+`worker_wait_attribution_tests::owner_granted_broad_recovery_wait_holds_queued_worker_command`
 uses a real local relay and the configured SDK. It finishes startup catch-up and
 publishes a real group ciphertext before arming the relay query gate. The gate
 selects only a broad, no-ID `#h` request for that group's routing handle.
 
 The test records a durable known-event ticket, advances the worker's recovery
-clock, and lets its maintenance tick select work. When the matching relay request
-enters the gate, the test verifies that the recovery attempt serial advanced and
-that the ticket's frozen scope carries both that serial and the selected event ID.
+clock, and advances its timers by 16 seconds. A due scheduled-convergence arm or
+the periodic maintenance arm can invoke the same backfill reporting helper with
+the `Maintenance` seam; the fixture does not distinguish those two timer callers.
+When the matching relay request enters the gate, the test verifies that the
+recovery attempt serial advanced and that the ticket's frozen scope carries
+both that serial and the selected event ID.
 It then enqueues `GroupRecoveryStatus` through the same account worker's command
 sender. The reply remains pending during a 150 ms held-request window and
-completes after the relay releases the request. This ties the relay wait to an
-owner-granted attempt and a queued command at the actual worker. The test passes
-with `cargo test -p marmot-app --lib --features test-policy-overrides
-owner_granted_broad_maintenance_wait_holds_queued_worker_command`.
+completes within two seconds after the relay releases the request, before the
+configured 30-second EOSE/quantum limit could end the attempt. This ties the
+relay wait to an owner-granted attempt and a queued command at the actual
+worker. The test passes with `cargo test -p marmot-app --lib --features test-policy-overrides
+owner_granted_broad_recovery_wait_holds_queued_worker_command`.
 
 The fixture has one account and one group. It publishes a current KeyPackage
 and checks the lifecycle fields that make key-package catch-up unnecessary.
 Startup and the published event's live echo settle before the new demand is
-recorded. It performs no explicit
-catch-up, incoming peer delivery or group convergence after arming the gate.
-The exact-ID bounded job remains disabled. The only scheduled history entry is
-the periodic maintenance tick, and the gate matches the group's `#h` route
-rather than an unrelated inbox or inspector request. It blocks only the first
-matching request; a second matching request cannot explain the pending command.
+recorded. It performs no explicit catch-up, incoming peer delivery or group
+convergence after arming the gate.
+The exact-ID bounded job remains disabled. The two timer callers of the shared
+helper are the possible history entry points in this fixture, and the gate
+matches the group's `#h` route rather than an unrelated inbox or inspector
+request. It blocks only the first matching request; a second matching request
+cannot explain the pending command.
 `try_send` confirms queue admission before the pending check. The shared fixture
 mutex serializes tests only; it is not held by the account worker or command
 receiver. The same status command completes before the demand and gate are
@@ -81,16 +86,14 @@ completion order.
 
 ## Correction boundary
 
-A safe correction needs a short owner turn to freeze plan, routes and receipt
-inventory, an owned off-worker network request with attempt/generation fencing,
-and bounded requeued admission through the existing MLS and SQLCipher path.
-Endpoint outcomes and durable admission must both qualify completion. Cancellation
-or an unavailable backend must leave the obligation eligible. Already-ready local
-engine work and queued commands should run while the network request waits.
+The [P5/P7 contract in #1976](https://github.com/marmot-protocol/mdk/issues/1976)
+requires off-worker acquisition and bounded admission while local work remains
+serviceable. This witness identifies the shared reporting helper as one legacy
+entry and the concrete split seam between `authorize_account_recovery` and the
+network awaits in `execute_recovery_grant_inner`.
 
-The concrete seam is between `authorize_account_recovery` and the network awaits
-in `execute_recovery_grant_inner`. The worker must still own receipt-journal
-synchronization, `freeze_recovery_inventory`, route and obligation revision
+The worker must still own receipt-journal synchronization,
+`freeze_recovery_inventory`, route and obligation revision
 capture, MLS ingestion, progress checkpointing, and generation-checked finish.
 The relay plane/adapter may own an immutable request and endpoint outcomes while
 the worker services other turns. Transport activation currently also installs
@@ -100,8 +103,6 @@ another task. `advance_post_join_maintenance_subscriptions` and
 `run_due_maintenance` retain maintenance policy, protocol timers and publication
 ownership, and may resume only after their qualified prerequisite is available.
 
-Moving only an EOSE timeout, adding another retry loop, or treating a reservation
-as completion would not fix this path. Activating the current test-only exact-ID
-job for the broad maintenance path would widen its eligibility and resource
-contract. The legacy broad executor still runs on the worker until a scoped
-replacement proves its route, endpoint, admission and lifecycle behavior.
+The current exact-ID job has narrower eligibility and resource guarantees than
+this broad path. The legacy broad executor still runs on the worker until a
+scoped replacement proves route, endpoint, admission and lifecycle behavior.

@@ -1,7 +1,11 @@
 //! Attribution witness for a legacy owner-granted network wait on the account worker.
+//! P5 should invert the pending assertion: the queued command must be served while
+//! a broad relay request is held. Keep this fixture when replacing that wait.
 
 use super::*;
-use nostr_relay_builder::prelude::{BoxedFuture, Filter as RelayFilter, PolicyResult, QueryPolicy};
+use nostr_relay_builder::prelude::{
+    BoxedFuture, Filter as RelayFilter, PolicyResult, QueryPolicy, SingleLetterTag,
+};
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{Client as NostrSdkClient, Filter, Kind, RelayCapabilities, ReqTarget};
 use std::net::SocketAddr;
@@ -42,10 +46,10 @@ impl QueryPolicy for HeldBroadRequest {
         Box::pin(async move {
             let route = self.group_route.lock().unwrap().clone();
             let for_group = route.as_ref().is_some_and(|route| {
-                serde_json::to_value(query)
-                    .ok()
-                    .and_then(|value| value["#h"].as_array().cloned())
-                    .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(route)))
+                query
+                    .generic_tags
+                    .get(&SingleLetterTag::from_char('h').expect("h is a valid tag"))
+                    .is_some_and(|values| values.contains(route))
             });
             if self.armed.load(Ordering::SeqCst)
                 && query.ids.is_none()
@@ -69,7 +73,7 @@ impl QueryPolicy for HeldBroadRequest {
 }
 
 #[tokio::test]
-async fn owner_granted_broad_maintenance_wait_holds_queued_worker_command() {
+async fn owner_granted_broad_recovery_wait_holds_queued_worker_command() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldBroadRequest::default();
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(gate.clone()));
@@ -84,7 +88,8 @@ async fn owner_granted_broad_maintenance_wait_holds_queued_worker_command() {
         url.clone(),
         crate::MarmotAppConfig::default()
             .with_allow_loopback_relay_endpoints(true)
-            .with_dev_epoch_backfill_eose_wait_ms(3_000),
+            .with_dev_epoch_backfill_eose_wait_ms(30_000)
+            .with_dev_epoch_backfill_execution_quantum_ms(30_000),
     );
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
@@ -200,13 +205,15 @@ async fn owner_granted_broad_maintenance_wait_holds_queued_worker_command() {
         .await
         .expect("clock command reaches the worker")
         .unwrap();
-    // The periodic maintenance arm is the legacy executor under test.
+    // Either due convergence or periodic maintenance can enter the same
+    // legacy backfill helper with the Maintenance seam.
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(16)).await;
     tokio::time::resume();
     timeout(Duration::from_secs(5), entered.as_mut())
         .await
         .expect("the owner-granted broad REQ reached the real relay");
+    let held_since = TokioInstant::now();
     let retry = storage.recovery_retry_state().unwrap();
     assert_eq!(retry.attempt_serial, prior_attempt + 1);
     let scopes = storage.recovery_scope_snapshots(ticket.id).unwrap();
@@ -229,10 +236,14 @@ async fn owner_granted_broad_maintenance_wait_holds_queued_worker_command() {
         "the queued command unexpectedly completed during the held broad network wait"
     );
     assert!(gate.inside_gate.load(Ordering::SeqCst));
+    assert!(
+        held_since.elapsed() < Duration::from_secs(1),
+        "the held-window observation must finish before the executor's own deadline"
+    );
     gate.release();
-    timeout(Duration::from_secs(10), status)
+    timeout(Duration::from_secs(2), status)
         .await
-        .expect("the queued command completes after the relay releases the request")
+        .expect("the queued command completes after release and before the executor timeout")
         .unwrap()
         .unwrap();
     drop(release_on_drop);
