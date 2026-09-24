@@ -469,16 +469,33 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
                 .await
                 .expect("the selected bounded KnownEvent attempt finishes before retry");
         }
-        let (retry_before_next, remaining, comparison_pending) =
-            runtime.recovery_retry_snapshot_for_test(&alice.label).await;
-        assert!(remaining > Duration::ZERO);
-        assert_eq!(
-            comparison_pending, !comparison_settled,
-            "the next opportunity observes the durable comparison state"
-        );
-        runtime
-            .advance_recovery_clock_for_test(&alice.label, remaining + Duration::from_millis(1))
-            .await;
+        let retry_before_next = storage.recovery_retry_state().unwrap();
+        // Startup can leave IncrementalHistory debt ahead of the comparison.
+        // Give each pending obligation, plus the comparison, one owner turn.
+        let opportunities = storage.pending_recovery_demands().unwrap().len() + 1;
+        for _ in 0..opportunities {
+            let (retry, remaining, comparison_pending) =
+                runtime.recovery_retry_snapshot_for_test(&alice.label).await;
+            let known_pending = storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|d| d.known_event_id == Some(event_id));
+            if !known_pending && !comparison_pending {
+                break;
+            }
+            runtime
+                .advance_recovery_clock_for_test(&alice.label, remaining + Duration::from_millis(1))
+                .await;
+            timeout(Duration::from_secs(20), async {
+                while storage.recovery_retry_state().unwrap().attempt_serial == retry.attempt_serial
+                {
+                    sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("automatic worker reserves the next pending obligation");
+        }
         timeout(Duration::from_secs(20), async {
             loop {
                 let known_cleared = storage
@@ -497,7 +514,7 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
         .await
         .unwrap_or_else(|err| {
             panic!(
-                "next automatic owner opportunity settles the other demand: {err:?}; comparison={:?}; retry={:?}; demands={:?}",
+                "bounded automatic owner opportunities settle both demands: {err:?}; comparison={:?}; retry={:?}; demands={:?}",
                 {
                     let comparison = storage.recovery_comparison().unwrap();
                     (comparison.revision, comparison.settled_revision, comparison.attempt_serial)
