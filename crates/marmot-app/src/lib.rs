@@ -3408,9 +3408,9 @@ impl MarmotApp {
         Ok(self.account_storage(label)?.epoch_stall_evidence()?)
     }
 
-    /// `group_id_hex` of every `account_groups` row still carrying the migration
-    /// default `self_membership = 'member'`. The one-time open/upgrade backfill
-    /// uses this to derive membership for legacy rows from current engine state.
+    /// `group_id_hex` of every `account_groups` row carrying
+    /// `self_membership = 'member'`. The one-time open/upgrade backfill reads
+    /// this complete candidate set only while its account marker is absent.
     pub(crate) fn account_group_ids_defaulting_to_member(
         &self,
         account_ref: &str,

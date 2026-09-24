@@ -1942,12 +1942,12 @@ impl AppClient {
         self.group_mls_state_unchecked(group_id)
     }
 
-    /// Builds one roster response from live group state while overlaying the
-    /// durable, event-owned self-membership projection.
+    /// Builds one roster response from live group state and overlays the
+    /// separately stored self-membership projection.
     ///
-    /// Roster completeness is validated by the host and is not used here to
-    /// infer a departure: only the one-time legacy backfill and authenticated
-    /// membership events may advance stored self-membership.
+    /// This read path does not classify departures from roster contents.
+    /// Legacy defaults are reconciled by the account-open backfill, while
+    /// authenticated membership events own steady-state changes.
     pub(crate) fn group_roster_session(
         &self,
         group_id: &GroupId,
@@ -1962,33 +1962,18 @@ impl AppClient {
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         let profiles = self.app.profiles_by_id()?;
         let members = self.members_with_profiles_unchecked(group_id, &profiles)?;
-        self.overlay_storage_self_membership(&mut group_record)?;
-        let mls_state = self.group_mls_state_unchecked(group_id)?;
-        Ok(crate::groups::AppGroupRosterSession {
-            group_record,
-            members,
-            mls_state,
-        })
-    }
-
-    /// Overlay the durable membership advanced by the migration and
-    /// authenticated membership events.
-    ///
-    /// Ordinary roster reads must stay side-effect free: a temporarily
-    /// incomplete roster is not authoritative evidence that the local account
-    /// was removed. Legacy rows are repaired by
-    /// [`Self::backfill_self_membership_once`] during account hydration.
-    fn overlay_storage_self_membership(
-        &self,
-        group_record: &mut AppGroupRecord,
-    ) -> Result<(), AppError> {
         if let Some(membership) = self
             .app
             .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
         {
             group_record.self_membership = membership;
         }
-        Ok(())
+        let mls_state = self.group_mls_state_unchecked(group_id)?;
+        Ok(crate::groups::AppGroupRosterSession {
+            group_record,
+            members,
+            mls_state,
+        })
     }
 
     fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
@@ -2988,17 +2973,18 @@ impl AppClient {
     /// group *before* upgrading keep an inflated `account_unread_total()`: the
     /// frozen unread row has no future removal event to flip the flag to
     /// `'removed'`. This backfill closes that gap by deriving membership from
-    /// current engine state once, right after the account is opened.
+    /// current engine state once, right after the account is opened. The pass
+    /// first reads every candidate roster and performs no membership writes if
+    /// any roster is unavailable, so a deferred-hydration retry cannot partly
+    /// classify healthy groups and then classify them again on a later pass.
     ///
-    /// For each row still carrying the default `'member'`, it asks the engine
-    /// for the group's roster (`runtime.members`, sourced from the Marmot
-    /// record's authoritative post-merge member set) and flips the row to
-    /// `Removed` only when the call succeeds and the local account id is
-    /// definitively absent. Engine errors / unknown groups are skipped so
-    /// uncertainty never suppresses (matching the projection's existing
-    /// invariant). The work is gated behind a once-only account-import marker,
-    /// so subsequent opens are a single marker read and the hot path stays
-    /// projection-only.
+    /// For each row carrying `'member'`, it asks the engine for the group's
+    /// roster (`runtime.members`, sourced from the hydrated Marmot record's
+    /// post-merge member set) and plans `Removed` only when the local account id
+    /// is absent. An engine error or malformed id aborts before any plan is
+    /// written, so uncertainty never suppresses. The work is gated behind a
+    /// once-only account-import marker, so subsequent opens are a single marker
+    /// read and the hot path stays projection-only.
     ///
     /// A backfilled departure is recorded as `Removed`, not `Left`: roster
     /// absence cannot tell us *why* the account is gone, and `Removed`
@@ -3018,36 +3004,30 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
-        let mut hydration_pending = false;
+        let mut reconciliation = Vec::new();
         for group_id_hex in self
             .app
             .account_group_ids_defaulting_to_member(&self.state.label)?
         {
             let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
-                continue;
+                return Ok(());
             };
             let group_id = GroupId::new(group_id_bytes);
             // Authoritative roster from engine state. On any engine error
-            // (unknown/quarantined group, partially-missing live state) leave
-            // the row at the preserving default — uncertainty never suppresses.
+            // (unknown/quarantined group, partially-missing live state), abort
+            // the whole pass before writing anything. The preserving defaults
+            // remain and the unset marker makes the next open retry.
             let members = match self.runtime.members(&group_id) {
                 Ok(members) => members,
-                Err(err) => {
-                    // A deferred-hydration open (mdk#1161) answers every
-                    // roster read with the retryable not-hydrated state.
-                    // Skipping is correct, but the once-only marker must not
-                    // burn on a pass that could not see any roster — the
-                    // worker re-runs this after its hydration pipeline.
-                    if matches!(
-                        AppError::from(err).as_engine_error(),
-                        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
-                    ) {
-                        hydration_pending = true;
-                    }
-                    continue;
-                }
+                Err(_) => return Ok(()),
             };
-            if local_account_removed_from_roster(&members, &local_account_id_hex) {
+            reconciliation.push((
+                group_id_hex,
+                local_account_removed_from_roster(&members, &local_account_id_hex),
+            ));
+        }
+        for (group_id_hex, removed) in reconciliation {
+            if removed {
                 self.app.set_group_self_membership(
                     &self.state.label,
                     &group_id_hex,
@@ -3055,12 +3035,10 @@ impl AppClient {
                 )?;
             }
         }
-        if !hydration_pending {
-            self.app.mark_account_import_complete(
-                &self.state.label,
-                crate::SELF_MEMBERSHIP_BACKFILL_MARKER,
-            )?;
-        }
+        self.app.mark_account_import_complete(
+            &self.state.label,
+            crate::SELF_MEMBERSHIP_BACKFILL_MARKER,
+        )?;
         Ok(())
     }
 
@@ -6590,7 +6568,6 @@ mod self_membership_backfill_tests {
     use cgka_traits::storage::GroupStorage;
     use std::sync::Arc;
 
-    /// Builds the minimal engine member needed by the backfill predicate tests.
     fn member(id_hex: &str) -> Member {
         Member {
             id: MemberId::new(hex::decode(id_hex).unwrap()),
@@ -6598,7 +6575,6 @@ mod self_membership_backfill_tests {
         }
     }
 
-    /// A case-insensitive local identity match must preserve active membership.
     #[test]
     fn local_account_in_roster_is_not_removed() {
         let roster = vec![member("aa"), member("bb")];
@@ -6608,7 +6584,6 @@ mod self_membership_backfill_tests {
         assert!(!local_account_removed_from_roster(&roster, "AA"));
     }
 
-    /// A complete roster without the local identity is authoritative migration evidence.
     #[test]
     fn local_account_absent_from_roster_is_removed() {
         // Roster has only peers; the local account ("aa") was removed/left.
@@ -6616,7 +6591,6 @@ mod self_membership_backfill_tests {
         assert!(local_account_removed_from_roster(&roster, "aa"));
     }
 
-    /// An empty but successfully read roster also proves legacy membership is stale.
     #[test]
     fn empty_roster_is_treated_as_removed() {
         assert!(local_account_removed_from_roster(&[], "aa"));
