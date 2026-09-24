@@ -208,8 +208,10 @@ delivery loss. The conforming NIP-77 relay fixture expects an already-retained
 known ID and a fresh comparison to settle through automatic worker service
 after the injected test clock moves past the current shared retry deadline.
 It allows either owner-selection order and establishes no real-time latency
-bound. An intermittent comparison settlement failure remains under owner
-diagnosis.
+bound. An intermittent failure was traced to this fixture joining an earlier
+frozen route with a newer request second; that test-only window mismatch was
+corrected in #2023. This controlled case does not establish general owner
+fairness.
 
 In a separate two-relay run, one exact-ID EOSE stays withheld after the other
 relay has sent the event. The event remains unadmitted while the SDK request is

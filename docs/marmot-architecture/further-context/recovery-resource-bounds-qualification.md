@@ -33,11 +33,13 @@ that same demand after capacity returns. The fresh partial-result fixture is
 separate evidence.
 
 The existing conforming-relay worker fixture joins a comparison and thereby
-creates an `IncrementalHistory` obligation. An isolated CI-profile run observed
-two retry reservations after the known event cleared without comparison
-settlement. The later reservation selected the comparison; the reason it did
-not settle in that run remains under separate owner diagnosis.
-this resource slice does not establish comparison progress or general fairness.
+creates an `IncrementalHistory` obligation. Its intermittent comparison timeout
+was traced to a test-only window mismatch: the fixture joined an earlier frozen
+route with a newer request second, leaving the recorded debt one second short
+of the next operational plan. The #2023 fixture correction derives both from
+one captured timestamp; its fixed-time storage witness keeps the coverage
+guard intact. Six no-retry CI-profile repetitions and #2023's exact-head CI
+passed. This resource slice does not establish general comparison fairness.
 
 ## Accounting boundaries
 
@@ -93,13 +95,12 @@ result. The baseline failed the new real SDK/worker/SQLCipher fence assertion
 while a second relay withheld EOSE and `bounded_result_ready` was pending.
 With the reviewed SDK isolation revision, that assertion and the
 stale-new-loss regression passed. All five real-SDK worker cases passed in a
-subsequent complete run. The first run had one comparison-case timeout while
-other builds were active; that case also passed alone on rerun. This is
-candidate evidence, not a guarantee that the comparison fixture is stable: a
-later isolated CI-profile run failed without retries after two owner
-reservations. The SDK fix merged separately; this MDK PR's CI and comparison
-owner diagnosis remain gates;
-activation stays off.
+subsequent complete run. A later CI-profile comparison failure was traced to
+the stale-window fixture join described above; the earlier timeout had the
+same symptom, but its exact cause was not instrumented. No production owner
+rejection was observed in the traced failure. The SDK isolation fix
+and fixture correction merged separately. This MDK PR's composed CI remains a
+gate; activation stays off.
 
 The fixture does not bound shared connection queues, WebSocket/parser
 allocation, one oversized in-flight event, all account concurrency, or the
