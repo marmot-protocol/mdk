@@ -1203,9 +1203,19 @@ async fn run_app_runtime_account_worker(
             completed = async {
                 bounded_recovery.as_mut().expect("bounded task exists").wait().await
             }, if bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
-                bounded_recovery.as_mut().expect("bounded task exists").accept(completed);
+                let job = bounded_recovery.as_mut().expect("bounded task exists");
+                job.accept(completed);
                 #[cfg(test)]
-                shared.bounded_result_ready.notify_one();
+                {
+                    let (attempt_serial, event_id, matching_items) = job.result_witness_for_test();
+                    *shared.bounded_result_witness.lock().unwrap() = Some(super::BoundedResultWitness {
+                        account_label: account_label.clone(),
+                        attempt_serial,
+                        event_id,
+                        matching_items,
+                    });
+                    shared.bounded_result_ready.notify_one();
+                }
                 yield_to_bounded_admission = true;
             }
             recovered = async {

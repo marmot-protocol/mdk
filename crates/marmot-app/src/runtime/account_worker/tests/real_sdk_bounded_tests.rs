@@ -17,6 +17,8 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[path = "real_sdk_bounded_tests/admission_interruption_tests.rs"]
 mod admission_interruption_tests;
+#[path = "interruption_redelivery_tests.rs"]
+mod interruption_redelivery_tests;
 
 #[derive(Clone, Debug, Default)]
 struct HeldExactQuery {

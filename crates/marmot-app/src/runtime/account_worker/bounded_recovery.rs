@@ -338,6 +338,21 @@ impl Job {
         self.admitted > 0
     }
 
+    #[cfg(test)]
+    pub(super) fn result_witness_for_test(&self) -> (u64, [u8; 32], usize) {
+        let requested = hex::encode(self.plan.event_id);
+        let matching_items = self
+            .pending
+            .iter()
+            .filter(|(_, event)| event.id.eq_ignore_ascii_case(&requested))
+            .count();
+        (
+            self.plan.grant.reservation.attempt_serial,
+            self.plan.event_id,
+            matching_items,
+        )
+    }
+
     pub(super) async fn admit_one(
         &mut self,
         client: &mut AppClient,
