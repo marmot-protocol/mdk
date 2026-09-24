@@ -5850,6 +5850,7 @@ mod tests {
     use std::sync::Arc;
 
     mod real_sdk_bounded_tests;
+    mod real_sdk_progress_fairness_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
