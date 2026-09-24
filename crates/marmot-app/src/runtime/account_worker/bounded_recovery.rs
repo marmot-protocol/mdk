@@ -11,6 +11,8 @@ use cgka_traits::{
     TransportDelivery, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
 };
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::SemaphorePermit;
 use transport_nostr_adapter::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionError,
@@ -27,10 +29,24 @@ pub(super) const ADMISSION_YIELD_DELAY: Duration = Duration::from_millis(1);
 pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_REQUEST_DURATION: Duration = Duration::from_secs(5);
 static ACQUISITION_CREDITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_JOBS);
+#[cfg(test)]
+static CREDIT_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 pub(super) fn available_credits() -> usize {
     ACQUISITION_CREDITS.available_permits()
+}
+
+#[cfg(test)]
+pub(super) fn credit_refusals_for_test() -> usize {
+    CREDIT_REFUSALS.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(super) fn hold_all_credits_for_test() -> SemaphorePermit<'static> {
+    ACQUISITION_CREDITS
+        .try_acquire_many(MAX_CONCURRENT_JOBS as u32)
+        .expect("fixture owns all bounded execution credits")
 }
 
 pub(super) struct Plan {
@@ -131,6 +147,8 @@ pub(super) fn prepare(
     // Reserve process capacity before spending the owner's durable attempt.
     // No waiter or completed result can exist without a credit.
     let Ok(credit) = ACQUISITION_CREDITS.try_acquire() else {
+        #[cfg(test)]
+        CREDIT_REFUSALS.fetch_add(1, Ordering::SeqCst);
         return Ok(None);
     };
     // The owner selects one predicate for this request without changing the
