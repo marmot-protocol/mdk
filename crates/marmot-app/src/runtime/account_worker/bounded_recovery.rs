@@ -1,6 +1,7 @@
 //! One owner-authorized, exact group-event acquisition through the account worker.
-//! Production activation waits for the conforming SDK backend. The controlled
-//! worker fixture enables this path explicitly; Unsupported never starts replay.
+//! Production activation waits for integrated SDK-session qualification. The
+//! controlled worker fixture enables this path explicitly; Unsupported never
+//! starts replay.
 //! Only the owner's first known-event demand is considered in this slice.
 
 use super::*;
@@ -206,13 +207,13 @@ pub(super) fn prepare(
 
 impl Job {
     pub(super) fn start(client: &AppClient, mut plan: Plan) -> Self {
-        let adapter = client.adapter.clone();
+        let relay_plane = client.relay_plane.clone();
         let request = plan.request.clone();
         let credit = plan.credit.take().expect("authorized plan owns capacity");
         let cancellation = NostrAcquisitionCancellation::new();
         let token = cancellation.clone();
         let handle = tokio::spawn(async move {
-            let result = adapter.acquire_history(request, token).await;
+            let result = relay_plane.acquire_history(request, token).await;
             (credit, result)
         });
         Self {

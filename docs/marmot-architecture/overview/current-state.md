@@ -23,7 +23,10 @@ The Nostr relay-client boundary declares owned bounded acquisition and
 receiver-scoped notification-loss evidence. The production SDK client now uses
 the qualified rust-nostr fork for bounded history requests and account-scoped
 loss watches; the recovery owner and account worker still use their existing
-execution path.
+production execution path. A controlled exact-ID group-recovery path now
+acquires history outside the account worker and admits it through that worker,
+but its private activation switch defaults off pending integrated SDK-session
+qualification.
 See [the interface contract](nostr-bounded-acquisition-interface.md).
 
 C6a resolves accepted kind-1009 edits in the durable timeline once, sharing effective text with reply and chat-list
