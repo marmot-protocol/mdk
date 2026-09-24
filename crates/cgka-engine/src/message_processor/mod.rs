@@ -949,7 +949,7 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        if !matches!(intent, SendIntent::Leave { .. }) && self.has_leave_send_gate(&group_id)? {
+        if !matches!(intent, SendIntent::Leave { .. }) && self.leave_in_progress(&group_id)? {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Leaving",

@@ -2725,6 +2725,161 @@ async fn maintenance_fails_an_obligation_left_on_a_removed_copy() {
     );
 }
 
+/// A pending leave gates every send but the leave itself, and the record stays
+/// live until someone commits the removal — so driving the obligation meanwhile
+/// is a `SelfUpdate` the leave gate is guaranteed to refuse: `Retry` +
+/// `maintenance_send_failed`, uncapped, every tick. Failing it instead would
+/// strand a device whose leave never lands, so the leg has to leave the
+/// obligation untouched until the departure resolves either way.
+#[tokio::test]
+async fn maintenance_waits_on_an_obligation_while_a_leave_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot leaving obligation key").unwrap();
+    let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice-leaving-obl");
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-leaving-obl");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "leaving obligation".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes[0].clone(),
+        other => panic!("expected FoundingGroupCreated publish work, got {other:?}"),
+    };
+    bob.ingest(welcome).await.unwrap();
+
+    let mut bob_runtime = AccountDeviceRuntime::new(
+        bob,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(5)),
+    )
+    .with_maintenance_timing(MaintenanceTiming::immediate());
+    let obligation_id = bob_runtime.schedule_manual_self_update(&group_id).unwrap();
+    bob_runtime
+        .mark_post_join_subscription_installed(&group_id)
+        .unwrap();
+
+    // Nobody commits bob's removal, so the leave stays pending.
+    bob_runtime
+        .session_mut()
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let before = bob_runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+
+    // Zero windows walk a live obligation one phase per sweep, so this is
+    // enough sweeps to reach the send several times over.
+    for _ in 0..6 {
+        bob_runtime.run_due_maintenance().await.unwrap();
+    }
+
+    let after = bob_runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.last_failure_code, None,
+        "a send the leave gate refuses must never be attempted"
+    );
+    assert_eq!(after.attempt_count, 0);
+    assert_eq!(
+        after, before,
+        "the obligation waits untouched until the leave resolves"
+    );
+}
+
+/// The disband twin of the pending-leave wait: a disband in progress gates
+/// every send but its own terminal Commit, yet the group stays live until that
+/// Commit converges — and an acknowledged failure returns it to live. The leg
+/// has to wait on the obligation rather than drive a refused `SelfUpdate` every
+/// tick or fail a rotation the group may still owe.
+#[tokio::test]
+async fn maintenance_waits_on_an_obligation_while_a_disband_is_in_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot disbanding obligation key").unwrap();
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice-disband-obl"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(5)),
+    )
+    .with_maintenance_timing(MaintenanceTiming::immediate());
+    let (group_id, _) = runtime
+        .create_group(CreateGroupRequest {
+            name: "disbanding obligation".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // The request alone: nothing advances convergence to prepare its Commit.
+    // It clears the group's existing maintenance rows, so the owed rotation is
+    // one scheduled while the disband is pending.
+    runtime
+        .session_mut()
+        .send(SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(runtime.session().disbanding_in_progress(&group_id).unwrap());
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    let before = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+
+    for _ in 0..6 {
+        runtime.run_due_maintenance().await.unwrap();
+    }
+
+    let after = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.last_failure_code, None,
+        "a send the disband gate refuses must never be attempted"
+    );
+    assert_eq!(after.attempt_count, 0);
+    assert_eq!(
+        after, before,
+        "the obligation waits untouched until the disband resolves"
+    );
+}
+
 #[tokio::test]
 async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanout() {
     let dir = tempfile::tempdir().unwrap();

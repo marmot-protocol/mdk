@@ -399,12 +399,24 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
         .expect("conforming startup comparison has a frozen route")
         .routes
         .clone();
+    // Rejoin with a window derived from the same timestamp as the request,
+    // as request_bounded_comparison does. Keep any older lower bound and the
+    // route's endpoint evidence from the first comparison.
+    let now_ms = crate::client::recovery::wall_now_ms().unwrap();
+    let requested_until = now_ms / 1000;
+    let requested_floor =
+        requested_until.saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+    let requested_routes = prior_routes
+        .into_iter()
+        .map(|mut route| {
+            route.since_seconds = route.since_seconds.map(|since| since.min(requested_floor));
+            route.until_seconds = route.until_seconds.max(requested_until);
+            route.inventory_floor = None;
+            route
+        })
+        .collect::<Vec<_>>();
     storage
-        .join_recovery_comparison(
-            &[0x77; 16],
-            crate::client::recovery::wall_now_ms().unwrap(),
-            &prior_routes,
-        )
+        .join_recovery_comparison(&[0x77; 16], now_ms, &requested_routes)
         .unwrap();
     assert!(storage.recovery_comparison().unwrap().pending());
     let shared = runtime.shared_services();

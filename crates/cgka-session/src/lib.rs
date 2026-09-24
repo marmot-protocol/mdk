@@ -1323,6 +1323,10 @@ impl AccountDeviceSession {
         self.engine.disbanding_in_progress(group_id)
     }
 
+    pub fn leave_in_progress(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        self.engine.leave_in_progress(group_id)
+    }
+
     pub fn disbanding_support_blockers(
         &self,
         group_id: &GroupId,
