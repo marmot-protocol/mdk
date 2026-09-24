@@ -5,9 +5,9 @@ use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
-    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT_ID,
+    APP_OWNED_APP_COMPONENT_ID_START, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
 };
 use cgka_traits::engine::{GroupStateChange, SendResult};
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -21,7 +21,11 @@ use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal
 use openmls::prelude::{KeyPackage as MlsKeyPackage, LeafNodeIndex, MlsMessageOut};
 use openmls_traits::OpenMlsProvider;
 use std::collections::BTreeSet;
-use tls_codec::Serialize as _;
+use tls_codec::{Serialize as _, Size as _, VLByteSlice};
+
+// Local authoring limits for opaque application state carried by later Welcomes.
+const APP_STATE_MAX_ENTRIES: usize = 32;
+const APP_STATE_MAX_ENCODED_LEN: usize = 8192;
 
 impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_send_update_group_data(
@@ -113,6 +117,46 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+
+        if updates
+            .iter()
+            .any(|update| update.component_id >= APP_OWNED_APP_COMPONENT_ID_START)
+        {
+            let dictionary = mls_group
+                .extensions()
+                .app_data_dictionary()
+                .map(|ext| ext.dictionary());
+            let mut count = 0;
+            let mut encoded_len = 0;
+            if let Some(dictionary) = dictionary {
+                for entry in dictionary
+                    .entries()
+                    .filter(|entry| entry.id() >= APP_OWNED_APP_COMPONENT_ID_START)
+                {
+                    count += 1;
+                    encoded_len += entry.tls_serialized_len();
+                }
+            }
+            // Count replacements once, including each id and TLS payload length.
+            for update in updates
+                .iter()
+                .filter(|update| update.component_id >= APP_OWNED_APP_COMPONENT_ID_START)
+            {
+                if let Some(previous) = dictionary.and_then(|dict| dict.get(&update.component_id)) {
+                    encoded_len -= update.component_id.tls_serialized_len()
+                        + VLByteSlice(previous).tls_serialized_len();
+                } else {
+                    count += 1;
+                }
+                encoded_len += update.component_id.tls_serialized_len()
+                    + VLByteSlice(&update.data).tls_serialized_len();
+            }
+            if count > APP_STATE_MAX_ENTRIES || encoded_len > APP_STATE_MAX_ENCODED_LEN {
+                return Err(EngineError::Other(format!(
+                    "application state exceeds {APP_STATE_MAX_ENTRIES} entries or {APP_STATE_MAX_ENCODED_LEN} encoded bytes"
+                )));
+            }
+        }
 
         // Diff the components being changed against the live (pre-commit) group
         // so confirm_published can emit attributed GroupStateChanged events (and
