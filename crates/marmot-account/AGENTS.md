@@ -53,7 +53,9 @@ relay auth, or transport-specific relay discovery.
   — nothing here un-marks a supersession on re-adoption. A supersession never revives a `Failed` obligation: that phase
   is a terminal verdict (`local_member_removed` is the live one), and re-arming it would send a `SelfUpdate` into a group
   the device has left, once per tick, uncounted by `MaintenanceRunSummary.failures`. `Complete` is deliberately not
-  guarded — a withdrawn commit un-completing the obligation it satisfied is the PCS re-arm this layer owes.
+  guarded — a withdrawn commit un-completing the obligation it satisfied is the PCS re-arm this layer owes. A pending
+  leave or disband is not a terminal verdict: `run_due_maintenance` leaves the group's obligation untouched while
+  either is in progress, since both can resolve with the device still a member.
 - The same two reconcilers also hand a withdrawn own commit's intent back to the engine
   (`reissue_superseded_own_commit` on the event path, `reissue_superseded_own_commits_from_state` in
   `run_due_maintenance`) and return the engine's `SupersededIntentReport`s in `AccountDeviceEffects::superseded_intents`.
