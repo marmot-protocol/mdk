@@ -15,6 +15,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+#[path = "real_sdk_bounded_tests/admission_interruption_tests.rs"]
+mod admission_interruption_tests;
+
 #[derive(Clone, Debug, Default)]
 struct HeldExactQuery {
     event_id_hex: Arc<Mutex<String>>,
