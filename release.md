@@ -637,7 +637,18 @@ The Android zip contains:
 - `kotlin/dev/ipf/marmotkit/MarmotAndroid.kt`
 - `kotlin/io/crates/keyring/Keyring.kt`
 - `jniLibs/<abi>/libmarmot_uniffi.so` for `arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`
+- `android-elf.json`
 - `manifest.json`
+
+`arm64-v8a` and `x86_64` are linked with 16 KB ELF load-segment alignment on the final library invocation, which
+leaves configured Cargo rustflags in place. `armeabi-v7a` and `x86` keep the NDK
+default page size. The ABI list is unchanged. `android-elf.json` records each library's SHA-256 and observed
+`PT_LOAD` alignments from the packaged bytes. `manifest.json` keeps the existing ordered `contents` array and adds
+`elf_validation` pointing at that report. App-bundle ZIP alignment does not change those ELF segments. The
+exact-head candidate workflow validates the same report before it publishes a non-release ZIP and keeps the report
+with that run's diagnostics. A reviewed release still publishes the immutable artifact through the existing formal
+or full-SHA snapshot flow; do not treat a green packaging check as a version selection or as Play Console
+readback.
 
 Each manifest records the release identifier, exact source commit, workflow builder commit, workspace version,
 `Cargo.lock` hash, and Rust toolchain versions. Apple manifests also record enabled features, targets, deployment

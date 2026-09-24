@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Package Android `arm64-v8a` and `x86_64` MarmotKit libraries with 16 KB ELF load-segment alignment, and reject a release or exact-head candidate whose packaged libraries do not meet that alignment. The page-size flags are appended on the final library link so configured Cargo rustflags stay in effect.
+
 ### Added
 
 - Add bounded encrypted NIP-88 poll creation and replacement-vote methods. Timeline rows expose deterministic poll

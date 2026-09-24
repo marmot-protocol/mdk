@@ -9,6 +9,7 @@ on:
       - .cargo/**
       - .github/workflows/bindings-profile.yml
       - .github/workflows/bindings-profile-measurement.yml
+      - .github/workflows/bindings.yaml
       - crates/marmot-uniffi/**
       - "!crates/marmot-uniffi/*.md"
       - "!crates/marmot-uniffi/**/*.md"
@@ -22,6 +23,7 @@ on:
       - .cargo/**
       - .github/workflows/bindings-profile.yml
       - .github/workflows/bindings-profile-measurement.yml
+      - .github/workflows/bindings.yaml
       - crates/marmot-uniffi/**
       - "!crates/marmot-uniffi/*.md"
       - "!crates/marmot-uniffi/**/*.md"
@@ -81,6 +83,7 @@ jobs:
           python3 crates/marmot-uniffi/test-release-profile.py
           python3 crates/marmot-uniffi/test-build-phases.py
           python3 crates/marmot-uniffi/test-apple-privacy.py
+          python3 crates/marmot-uniffi/test-android-artifact.py
 
   apple-build:
     name: Build Apple candidate input (${{ matrix.part }})
@@ -303,6 +306,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python3 crates/marmot-uniffi/build-provenance.py verify android \
+            --artifact-root crates/marmot-uniffi/output/android \
             crates/marmot-uniffi/output/android/provenance/*.json
       - name: Assemble and validate Android candidate package
         env:
@@ -326,6 +330,8 @@ jobs:
           stage="$RUNNER_TEMP/marmotkit-android-$SOURCE_SHA"
           mkdir -p "$stage" "$RUNNER_TEMP/marmotkit-profile-android"
           cp -R "$root/kotlin" "$root/jniLibs" "$root/provenance" "$stage/"
+          python3 crates/marmot-uniffi/validate-android-artifact.py directory \
+            "$stage" --report "$stage/android-elf.json"
           {
             echo "source_sha=$SOURCE_SHA"
             echo "builder_sha=$BUILDER_SHA"
@@ -333,6 +339,10 @@ jobs:
             for path in "${required[@]}"; do sha256sum "$root/$path"; done
           } > "$stage/manifest.txt"
           (cd "$RUNNER_TEMP" && zip -qr "marmotkit-profile-android/$SOURCE_SHA.zip" "marmotkit-android-$SOURCE_SHA")
+          python3 crates/marmot-uniffi/validate-android-artifact.py bundle \
+            "$RUNNER_TEMP/marmotkit-profile-android/$SOURCE_SHA.zip" \
+            --root "marmotkit-android-$SOURCE_SHA" \
+            --report "$stage/android-elf.json"
           sha256sum "$RUNNER_TEMP/marmotkit-profile-android/$SOURCE_SHA.zip" \
             > "$RUNNER_TEMP/marmotkit-profile-android/$SOURCE_SHA.zip.sha256"
       - name: Upload Android candidate package

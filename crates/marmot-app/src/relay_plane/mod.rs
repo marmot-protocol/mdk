@@ -2512,30 +2512,6 @@ impl MarmotRelayPlaneAccountAdapter {
         }
     }
 
-    pub(crate) fn recovery_admitted_endpoints(
-        &self,
-        endpoints: &[TransportEndpoint],
-    ) -> Vec<String> {
-        if self
-            .relay_plane
-            .inner
-            .relay_safety
-            .sanitize_endpoints(endpoints.to_vec(), "recovery scope")
-            .is_err()
-        {
-            return Vec::new();
-        }
-        // Preserve signed spelling in the frozen goal. Membership queries use
-        // the adapter's forward canonical identity lookup, never URL rewrites.
-        let mut result = endpoints
-            .iter()
-            .map(|endpoint| endpoint.0.clone())
-            .collect::<Vec<_>>();
-        result.sort();
-        result.dedup();
-        result
-    }
-
     pub(crate) async fn group_maintenance_endpoint_eose(
         &self,
         subscription_id: &str,

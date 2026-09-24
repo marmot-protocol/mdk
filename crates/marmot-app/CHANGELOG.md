@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Judge epoch-backfill overflow retry backoff by the durable delay. A loaded runner
+  can spend more than a second after that reservation is written, which previously
+  failed a test that still required nearly the full cooldown to be remaining.
+
 ### Changed
 
 - Restrict the account-local overflow marker writer to durable loss evidence. The account

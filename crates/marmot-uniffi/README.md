@@ -422,6 +422,19 @@ Build all Android ABIs:
 
 The script keeps the host library's UniFFI metadata intact while stripping
 debug and static symbol sections from each packaged Android JNI library.
+The two 64-bit Android links pass `-Wl,-z,max-page-size=16384` and
+`-Wl,-z,common-page-size=16384` as extra flags on the final library `cargo rustc`
+invocation. That appends the policy after Cargo's selected rustflags instead of
+replacing `build.rustflags` or target rustflags. The 32-bit ABIs stay on the NDK's default
+page size, and the supported ABI set is unchanged. Google Play's 16 KB check
+reads ELF `PT_LOAD` alignment; aligning the app bundle ZIP does not change
+those segments. Each published Android archive includes `android-elf.json`
+with the SHA-256, ELF class, machine, and observed load alignments of all
+four `libmarmot_uniffi.so` files. `manifest.json` keeps its existing ordered
+`contents` list and records `elf_validation: android-elf.json`. Exact-head
+candidate packages carry the same report next to their provenance manifest.
+A later release publishes the new artifact; this check does not by itself
+select a version or prove an app's Play Console result.
 
 Standard MarmotKit release builds use the workspace `[profile.release]` together with
 `marmotkit-release-profile.env`: `lto=thin`, `codegen-units=1`, `opt-level=3`,

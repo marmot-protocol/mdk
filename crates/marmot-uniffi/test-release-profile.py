@@ -478,12 +478,15 @@ class ReleaseProfileTests(unittest.TestCase):
             f"log = Path({str(log)!r})\n"
             "entry = {'argv': sys.argv[1:], 'strip': os.environ.get('CARGO_PROFILE_RELEASE_STRIP'),"
             " 'lto': os.environ.get('CARGO_PROFILE_RELEASE_LTO'),"
-            " 'codegen': os.environ.get('CARGO_PROFILE_RELEASE_CODEGEN_UNITS')}\n"
+            " 'codegen': os.environ.get('CARGO_PROFILE_RELEASE_CODEGEN_UNITS'),"
+            " 'rustflags': os.environ.get('RUSTFLAGS'),"
+            " 'encoded_rustflags': os.environ.get('CARGO_ENCODED_RUSTFLAGS'),"
+            " 'target_rustflags': {k: os.environ[k] for k in os.environ if k.startswith('CARGO_TARGET_') and k.endswith('_RUSTFLAGS')}}\n"
             "with log.open('a', encoding='utf-8') as handle:\n"
             "    handle.write(json.dumps(entry) + '\\n')\n"
             "args = sys.argv[1:]\n"
             "target_dir = Path(os.environ['CARGO_TARGET_DIR'])\n"
-            "if args and args[0] == 'build':\n"
+            "if args and args[0] in {'build', 'rustc'}:\n"
             "    triple = None\n"
             "    if '--target' in args:\n"
             "        triple = args[args.index('--target') + 1]\n"
@@ -492,7 +495,10 @@ class ReleaseProfileTests(unittest.TestCase):
             "    else:\n"
             "        out = target_dir / 'release' / 'libmarmot_uniffi.so'\n"
             "    out.parent.mkdir(parents=True, exist_ok=True)\n"
-            "    out.write_bytes(b'library')\n"
+            "    if triple:\n"
+            "        out.write_bytes(Path(os.environ['ANDROID_ELF_DIR'], triple).read_bytes())\n"
+            "    else:\n"
+            "        out.write_bytes(b'library')\n"
             "elif args and args[0] == 'run':\n"
             "    out_dir = Path(args[args.index('--out-dir') + 1])\n"
             "    generated = out_dir / 'dev/ipf/marmotkit/marmot_uniffi.kt'\n"
@@ -515,10 +521,22 @@ class ReleaseProfileTests(unittest.TestCase):
             ndk / "llvm-readelf",
             "#!/bin/sh\necho 'There are 4 section headers'\n",
         )
+        android_fixtures = load("android_artifact_fixtures", HERE / "test-android-artifact.py")
+        elf_dir = self.root / "android-elf"
+        elf_dir.mkdir()
+        for triple, abi in android_fixtures.TARGET_TO_ABI.items():
+            align = 0x4000 if abi in android_fixtures.SIXTY_FOUR else 0x1000
+            (elf_dir / triple).write_bytes(android_fixtures.elf_with_alignments(abi, [align, align]))
         env = os.environ.copy()
+        for key in list(env):
+            if key in {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"}:
+                env.pop(key)
+            elif key.startswith("CARGO_TARGET_") and key.endswith("_RUSTFLAGS"):
+                env.pop(key)
         env["HOME"] = str(self.root / "home-kotlin")
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
         env["ANDROID_NDK_HOME"] = str(self.root / "ndk")
+        env["ANDROID_ELF_DIR"] = str(elf_dir)
         env["CARGO_TARGET_DIR"] = str(target)
         env["MARMOTKIT_WORKSPACE_DIR"] = str(workspace)
         env["MARMOTKIT_CRATE_DIR"] = str(crate)
@@ -544,6 +562,22 @@ class ReleaseProfileTests(unittest.TestCase):
             self.assertEqual(row["lto"], "thin")
             self.assertEqual(row["codegen"], "1")
         self.assertEqual(len(generate), 1)
+        self.assertNotIn("max-page-size", json.dumps(host[0]["target_rustflags"]))
+        self.assertFalse(host[0]["rustflags"])
+        for row in android:
+            triple = row["argv"][row["argv"].index("--target") + 1]
+            if triple in {"aarch64-linux-android", "x86_64-linux-android"}:
+                self.assertEqual(row["argv"][0], "rustc")
+                split = row["argv"].index("--")
+                self.assertEqual(row["argv"][split + 1:], [
+                    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+                    "-C", "link-arg=-Wl,-z,common-page-size=16384",
+                ])
+                self.assertNotIn("max-page-size", json.dumps(row["target_rustflags"]))
+            else:
+                self.assertEqual(row["argv"][0], "build")
+                self.assertNotIn("max-page-size", json.dumps(row))
+                self.assertFalse(row["rustflags"])
         self.assertTrue((crate / "output/android/kotlin/dev/ipf/marmotkit/marmot_uniffi.kt").is_file())
 
     def test_kotlin_generation_is_required(self):
