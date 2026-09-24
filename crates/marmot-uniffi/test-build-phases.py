@@ -21,14 +21,28 @@ import unittest
 TOOLS = Path(__file__).resolve().parent
 TARGETS = ["aarch64-apple-ios", "aarch64-apple-ios-sim", "aarch64-apple-darwin"]
 ANDROID = ["aarch64-linux-android", "armv7-linux-androideabi", "i686-linux-android", "x86_64-linux-android"]
+PAGE_POLICY_RUSTC_ARGS = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "link-arg=-Wl,-z,common-page-size=16384",
+]
+
+
+def page_policy_args(args):
+    return args[args.index("--") + 1:]
 SHIM = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, runpy, sys
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
+def target_rustflags():
+    return {key: os.environ[key] for key in os.environ
+        if key.startswith("CARGO_TARGET_") and key.endswith("_RUSTFLAGS")}
 with open(os.environ["BUILD_TEST_LOG"], "a") as log:
     log.write(json.dumps({"tool": name, "args": args,
         "strip": os.environ.get("CARGO_PROFILE_RELEASE_STRIP"),
-        "macos_flags": os.environ.get("CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS")}) + "\n")
+        "macos_flags": os.environ.get("CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS"),
+        "rustflags": os.environ.get("RUSTFLAGS"),
+        "encoded_rustflags": os.environ.get("CARGO_ENCODED_RUSTFLAGS"),
+        "target_rustflags": target_rustflags()}) + "\n")
 def put(path, data="fixture"):
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,6 +69,13 @@ elif name == "cargo":
             put(path)
             if suffix == "a":
                 path.write_bytes(pathlib.Path(os.environ["BUILD_TEST_ARCHIVE"]).read_bytes())
+            elif suffix == "so" and "--target" in args:
+                triple = args[args.index("--target") + 1]
+                fixtures = runpy.run_path(os.environ["BUILD_TEST_ANDROID_FIXTURES"])
+                if triple in fixtures["TARGET_TO_ABI"]:
+                    raw = os.environ.get("BUILD_TEST_ANDROID_ALIGN")
+                    align = int(raw) if raw else None
+                    path.write_bytes(fixtures["library_for_target"](triple, align))
 elif name == "xcodebuild":
     pathlib.Path(args[args.index("-output") + 1]).mkdir(parents=True)
 elif name == "llvm-readelf":
@@ -92,7 +113,13 @@ class BuildPhases(unittest.TestCase):
             MARMOTKIT_WORKSPACE_DIR=str(self.root), MARMOTKIT_CRATE_DIR=str(self.crate),
             BUILD_TEST_LOG=str(self.log), BUILD_TEST_ARCHIVE=str(archive),
             BUILD_TEST_TARGETS=" ".join(TARGETS + ANDROID),
+            BUILD_TEST_ANDROID_FIXTURES=str(TOOLS / "test-android-artifact.py"),
             CARGO_TARGET_DIR="target", OTLP_EXPORT="1", PRODUCT_ANALYTICS_EXPORT="1")
+        for key in list(self.env):
+            if key in {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"}:
+                self.env.pop(key)
+            elif key.startswith("CARGO_TARGET_") and key.endswith("_RUSTFLAGS"):
+                self.env.pop(key)
         ndk = self.root / "ndk"
         for host in ["darwin-x86_64", "linux-x86_64"]:
             for prefix in ["aarch64-linux-android", "armv7a-linux-androideabi", "i686-linux-android", "x86_64-linux-android"]:
@@ -166,6 +193,7 @@ class BuildPhases(unittest.TestCase):
             BUILD_TEST_TARGETS="")
         self.assertEqual([c["tool"] for c in self.commands()], ["cargo", "cargo"])
         self.assertTrue(all(c["strip"] == "none" for c in self.commands()))
+        self.assertNotIn("max-page-size", self.log.read_text())
         for path in ["dev/ipf/marmotkit/marmot_uniffi.kt", "dev/ipf/marmotkit/MarmotAndroid.kt", "io/crates/keyring/Keyring.kt"]:
             self.assertTrue((self.crate / "output/android/kotlin" / path).exists())
 
@@ -176,10 +204,53 @@ class BuildPhases(unittest.TestCase):
             self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS=abi)
         cargo = [c for c in self.commands() if c["tool"] == "cargo"]
         self.assertEqual(len(cargo), 2)
-        self.assertTrue(all(c["args"][0] == "build" and "--target" in c["args"] and c["strip"] == "symbols" for c in cargo))
+        self.assertTrue(all(c["args"][0] == "rustc" and "--lib" in c["args"] and "--target" in c["args"] and c["strip"] == "symbols" for c in cargo))
         for abi in ["arm64-v8a", "x86_64"]:
             self.assertTrue((self.crate / "output/android/jniLibs" / abi / "libmarmot_uniffi.so").exists())
         self.assertTrue((self.crate / "output/android/kotlin/dev/ipf/marmotkit/marmot_uniffi.kt").exists())
+        for command in cargo:
+            self.assertEqual(page_policy_args(command["args"]), PAGE_POLICY_RUSTC_ARGS)
+            self.assertNotIn("max-page-size", json.dumps(command["target_rustflags"]))
+
+    def test_android_page_policy_follows_rustflags_precedence(self):
+        self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="armeabi-v7a")
+        thirty_two = [c for c in self.commands() if c["tool"] == "cargo"][-1]
+        self.assertEqual(thirty_two["args"][0], "build")
+        self.assertNotIn("max-page-size", json.dumps(thirty_two))
+        self.assertIsNone(thirty_two["rustflags"])
+        self.log.unlink()
+        self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="arm64-v8a x86",
+            RUSTFLAGS="-C debuginfo=0",
+            CARGO_BUILD_RUSTFLAGS="-C link-arg=-Wl,-z,origin")
+        for command in [c for c in self.commands() if c["tool"] == "cargo"]:
+            triple = command["args"][command["args"].index("--target") + 1]
+            self.assertEqual(command["rustflags"], "-C debuginfo=0")
+            if triple == "aarch64-linux-android":
+                self.assertEqual(command["args"][0], "rustc")
+                self.assertEqual(page_policy_args(command["args"]), PAGE_POLICY_RUSTC_ARGS)
+                self.assertNotIn("max-page-size", json.dumps(command["target_rustflags"]))
+                self.assertNotIn("origin", json.dumps(command["target_rustflags"]))
+            else:
+                self.assertEqual(command["args"][0], "build")
+                self.assertNotIn("--", command["args"])
+                self.assertNotIn("max-page-size", json.dumps(command))
+        self.log.unlink()
+        encoded = "-C\x1fdebuginfo=0"
+        target_key = "CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS"
+        self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="x86_64",
+            CARGO_ENCODED_RUSTFLAGS=encoded,
+            **{target_key: "-C target-cpu=native"})
+        command = [c for c in self.commands() if c["tool"] == "cargo"][-1]
+        self.assertEqual(command["encoded_rustflags"], encoded)
+        self.assertEqual(command["target_rustflags"][target_key], "-C target-cpu=native")
+        self.assertEqual(page_policy_args(command["args"]), PAGE_POLICY_RUSTC_ARGS)
+        self.assertEqual(command["rustflags"], None)
+
+    def test_native_android_rejects_misaligned_library_before_success(self):
+        result = self.run_phase("kotlin-bindings.sh", "native", success=False,
+            ANDROID_ABIS="arm64-v8a", BUILD_TEST_ANDROID_ALIGN="4096")
+        self.assertIn("below 16 KB", result.stderr)
+        self.assertNotIn("Done.", result.stdout)
 
     def test_default_commands_still_build_complete_bundles(self):
         for script in ["xcframework.sh", "xcframework-macos.sh", "kotlin-bindings.sh"]:
@@ -207,7 +278,13 @@ class BuildPhases(unittest.TestCase):
         self.env.update(SOURCE_SHA="a" * 40, BUILDER_SHA="b" * 40,
             GITHUB_ENV=str(self.root / "github-env"), GITHUB_RUN_ID="12345")
         paths = [self.root / "provenance" / (part + ".json") for part in parts]
+        fixtures = runpy.run_path(str(TOOLS / "test-android-artifact.py"))
         for part, path in zip(parts, paths):
+            if part in {"arm64-v8a", "armeabi-v7a", "x86", "x86_64"}:
+                align = 0x4000 if part in {"arm64-v8a", "x86_64"} else 0x1000
+                library = self.crate / "output/android/jniLibs" / part / "libmarmot_uniffi.so"
+                library.parent.mkdir(parents=True, exist_ok=True)
+                library.write_bytes(fixtures["elf_with_alignments"](part, [align, align]))
             self.provenance("record", part, path)
         return paths
 
@@ -218,25 +295,35 @@ class BuildPhases(unittest.TestCase):
             (TOOLS / "marmotkit-release-profile.env").read_bytes()
         ).hexdigest()
         self.assertEqual(recorded["release_profile_sha256"], expected_profile_hash)
-        self.provenance("verify", "android", *paths)
+        self.provenance("verify", "android", "--artifact-root", self.crate / "output/android", *paths)
+        native = json.loads(paths[1].read_text())
+        library = self.crate / "output/android/jniLibs/arm64-v8a/libmarmot_uniffi.so"
+        self.assertEqual(native["library_sha256"], hashlib.sha256(library.read_bytes()).hexdigest())
+        self.assertNotIn("library_sha256", json.loads(paths[0].read_text()))
         values = dict(line.split("=", 1) for line in Path(self.env["GITHUB_ENV"]).read_text().splitlines())
         self.assertEqual(values["MARMOTKIT_BUILD_ANDROID_NDK_HOME"], str(self.root / "ndk"))
         self.assertEqual(values["MARMOTKIT_BUILD_ANDROID_NDK_VERSION"], "27.2.12479018")
         self.assertEqual(values["MARMOTKIT_BUILD_RUSTC"], "rustc 1.97.1 fixture")
         self.assertEqual(values["MARMOTKIT_BUILD_CARGO"], "cargo 1.97.1 fixture")
         self.assertEqual(values["MARMOTKIT_BUILD_ANDROID_API"], "26")
+        Path(self.env["GITHUB_ENV"]).unlink()
+        library.write_bytes(library.read_bytes() + b"\x00")
+        self.provenance("verify", "android", "--artifact-root", self.crate / "output/android", *paths, success=False)
+        self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
 
     def test_provenance_rejects_missing_duplicate_and_disagreeing_inputs(self):
         paths = self.record_inputs(["kotlin", "arm64-v8a", "armeabi-v7a", "x86", "x86_64"])
-        self.provenance("verify", "android", *paths[:-1], success=False)
-        self.provenance("verify", "android", *paths[:-1], paths[1], success=False)
+        root = self.crate / "output/android"
+        self.provenance("verify", "android", "--artifact-root", root, *paths[:-1], success=False)
+        self.provenance("verify", "android", "--artifact-root", root, *paths[:-1], paths[1], success=False)
         original = json.loads(paths[-1].read_text())
         for key in ["source_sha", "builder_sha", "workflow_run_id",
                     "release_profile_sha256", "feature_set", "rustc", "cargo",
-                    "android_ndk_home", "android_ndk_version", "android_api", "part"]:
+                    "android_ndk_home", "android_ndk_version", "android_api", "part",
+                    "library_sha256"]:
             with self.subTest(key=key):
                 paths[-1].write_text(json.dumps(original | {key: "different"}))
-                self.provenance("verify", "android", *paths, success=False)
+                self.provenance("verify", "android", "--artifact-root", root, *paths, success=False)
         self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
 
     def test_apple_provenance_checks_generated_swift_and_native_inputs(self):

@@ -3630,6 +3630,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "marmot-uniffi",
+ "nostr 0.45.5",
  "nostr-relay-builder",
  "tempfile",
  "tokio",
@@ -7779,6 +7780,7 @@ version = "0.10.4"
 dependencies = [
  "async-trait",
  "clap",
+ "libc",
  "marmot-terminal-harness",
  "serde_json",
  "tempfile",

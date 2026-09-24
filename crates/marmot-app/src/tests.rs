@@ -12451,6 +12451,11 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                 expected.as_millis() as u64,
                 "overflow attempt {ordinal} must reserve the full backoff"
             );
+            assert_eq!(
+                retry.not_before_ms.saturating_sub(retry.recorded_at_ms),
+                expected.as_millis() as u64,
+                "overflow attempt {ordinal} deadline must match the earned delay"
+            );
             let remaining = client.recovery_owner.test_retry_remaining(&storage);
             assert!(
                 remaining > Duration::ZERO && remaining <= expected,

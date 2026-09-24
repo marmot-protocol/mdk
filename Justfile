@@ -626,6 +626,7 @@ binding-docs-gate:
 # Exercise release build phases without compiling Rust or requiring platform SDKs.
 binding-build-gate:
     python3 crates/marmot-uniffi/test-build-phases.py
+    python3 crates/marmot-uniffi/test-android-artifact.py
 
 # Refresh mechanical signatures/source links while preserving integration prose.
 # New exports are scaffolded and remain failing until an author completes their guidance.

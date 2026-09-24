@@ -109,6 +109,7 @@ pub use media::MediaDownloadBenchmarkTransport;
 mod audit_export_lifecycle;
 mod messages;
 mod nostr_secret;
+mod nostr_verification;
 mod notifications;
 mod projection;
 mod publisher_sequences;
@@ -238,6 +239,7 @@ pub use media::{
 };
 pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;
+pub use nostr_verification::verify_public_nostr_event_json;
 pub use notifications::{
     BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
     GroupPushTokenDebugEntry, GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR,
