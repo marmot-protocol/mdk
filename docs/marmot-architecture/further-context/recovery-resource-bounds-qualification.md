@@ -70,7 +70,7 @@ One local run of the six focused tests against the reviewed SDK pin reported:
 | --- | ---: | ---: | ---: | ---: |
 | Two empty relays | 300 | 148 | 0 | 0 / 0 |
 | One event, other endpoint lacks EOSE | 375 | 620 | 470 | 1 / 1 |
-| 24 duplicate copies per relay | 300 | 26,208 | 22,560 | 10 / 2 across both relays |
+| 24 duplicate copies per relay | 375 | 26,208 | 22,560 | 10 / 2 across both relays |
 | One oversized event per relay | 300 | 9,176 | 8,876 | 2 / 0 |
 
 The numeric request ceilings are small fixture limits that distinguish a

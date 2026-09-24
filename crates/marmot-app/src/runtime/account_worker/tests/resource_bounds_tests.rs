@@ -4,7 +4,7 @@ use super::*;
 use futures::{SinkExt, StreamExt};
 use nostr_sdk::prelude::{Client as SdkClient, EventBuilder, FinalizeEvent, Keys, Kind};
 use serde_json::{Value, json};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use transport_nostr_adapter::{
@@ -26,11 +26,26 @@ struct TextBoundary {
 struct CountedRelay {
     counts: Mutex<TextBoundary>,
     request_seen: tokio::sync::Notify,
+    sent_events_done: tokio::sync::Notify,
+    pause_after_sent: AtomicUsize,
+    resume_writer: tokio::sync::Notify,
 }
 
 impl CountedRelay {
     fn snapshot(&self) -> TextBoundary {
         *self.counts.lock().unwrap()
+    }
+
+    async fn wait_for_sent_events(&self, expected: usize) {
+        loop {
+            let notified = self.sent_events_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.snapshot().sent_events >= expected {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -98,10 +113,17 @@ async fn counted_exact_relay(
                             {
                                 return;
                             }
-                            let mut tally = counts.counts.lock().unwrap();
-                            tally.sent_text += text.len();
-                            tally.sent_event_json += event.to_string().len();
-                            tally.sent_events += 1;
+                            let sent_events = {
+                                let mut tally = counts.counts.lock().unwrap();
+                                tally.sent_text += text.len();
+                                tally.sent_event_json += event.to_string().len();
+                                tally.sent_events += 1;
+                                tally.sent_events
+                            };
+                            counts.sent_events_done.notify_waiters();
+                            if counts.pause_after_sent.load(Ordering::SeqCst) == sent_events {
+                                counts.resume_writer.notified().await;
+                            }
                         }
                     }
                     if send_eose {
@@ -137,6 +159,21 @@ async fn acquire_exact(
     bytes: usize,
     duration: Duration,
 ) -> transport_nostr_adapter::NostrAcquisitionResult {
+    acquire_exact_with_client(endpoints, id, items, bytes, duration)
+        .await
+        .1
+}
+
+async fn acquire_exact_with_client(
+    endpoints: &[String],
+    id: [u8; 32],
+    items: usize,
+    bytes: usize,
+    duration: Duration,
+) -> (
+    NostrSdkRelayClient,
+    transport_nostr_adapter::NostrAcquisitionResult,
+) {
     let sdk = NostrSdkRelayClient::new(SdkClient::builder().build());
     let request = NostrAcquisitionRequest {
         account_id: cgka_traits::MemberId::new(vec![7; 32]),
@@ -154,13 +191,14 @@ async fn acquire_exact(
             max_duration: duration,
         },
     };
-    timeout(
+    let result = timeout(
         duration + Duration::from_secs(2),
         sdk.acquire_history(request, NostrAcquisitionCancellation::new()),
     )
     .await
     .expect("bounded SDK call returns")
-    .expect("valid exact request")
+    .expect("valid exact request");
+    (sdk, result)
 }
 
 #[tokio::test]
@@ -238,7 +276,10 @@ async fn duplicate_notifications_spend_item_budget_before_retention_deduplicatio
     let event_bytes = event.to_string().len();
     let (left_url, left) = counted_exact_relay(Some(event.clone()), 24, false).await;
     let (right_url, right) = counted_exact_relay(Some(event), 24, false).await;
-    let result = acquire_exact(
+    // Force the SDK's fifth-item result to precede both writers' last frame.
+    left.pause_after_sent.store(8, Ordering::SeqCst);
+    right.pause_after_sent.store(8, Ordering::SeqCst);
+    let (sdk, result) = acquire_exact_with_client(
         &[left_url, right_url],
         id,
         4,
@@ -256,6 +297,24 @@ async fn duplicate_notifications_spend_item_budget_before_retention_deduplicatio
         assert_eq!(endpoint.stats.retained_high_water_event_bytes, event_bytes);
         assert_eq!(endpoint.stats.serialized_event_bytes, 5 * event_bytes);
     }
+    timeout(Duration::from_secs(2), async {
+        tokio::join!(left.wait_for_sent_events(8), right.wait_for_sent_events(8));
+    })
+    .await
+    .expect("both relay writers reach their forced hold after the SDK result");
+    assert_eq!(left.snapshot().sent_events, 8);
+    assert_eq!(right.snapshot().sent_events, 8);
+    left.resume_writer.notify_one();
+    right.resume_writer.notify_one();
+    timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            left.wait_for_sent_events(24),
+            right.wait_for_sent_events(24)
+        );
+    })
+    .await
+    .expect("both relay writers finish all 48 queued EVENT frames");
+    drop(sdk);
     let left = left.snapshot();
     let right = right.snapshot();
     assert_eq!(left.sent_events + right.sent_events, 48);
