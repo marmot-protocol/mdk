@@ -1956,18 +1956,41 @@ impl AppClient {
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         let profiles = self.app.profiles_by_id()?;
         let members = self.members_with_profiles_unchecked(group_id, &profiles)?;
+        self.overlay_roster_self_membership(&mut group_record, &members)?;
+        let mls_state = self.group_mls_state_unchecked(group_id)?;
+        Ok(crate::groups::AppGroupRosterSession {
+            group_record,
+            members,
+            mls_state,
+        })
+    }
+
+    /// Overlay durable membership and, only while the legacy import remains
+    /// pending, let a complete roster finish that migration on demand.
+    fn overlay_roster_self_membership(
+        &self,
+        group_record: &mut AppGroupRecord,
+        members: &[AppGroupMemberRecord],
+    ) -> Result<(), AppError> {
         if let Some(membership) = self
             .app
             .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
         {
             group_record.self_membership = membership;
-            // Reconcile the legacy Member default using the roster already read.
+            // Reconcile the legacy Member default using the roster already read, but only while
+            // the one-time import is still outstanding. Once that import completes, membership
+            // changes are event-owned; treating a later transiently-incomplete roster as an
+            // eviction would durably hide an otherwise-live conversation.
             let local_id = hex::encode(self.adapter.account_id().as_slice());
-            if membership == SelfMembership::Member
-                && !members
-                    .iter()
-                    .any(|member| member.member_id_hex == local_id)
-            {
+            let membership_import_complete = self
+                .app
+                .account_import_marker(&self.state.label, crate::SELF_MEMBERSHIP_BACKFILL_MARKER)?;
+            if should_reconcile_legacy_self_membership(
+                membership_import_complete,
+                membership,
+                &members,
+                &local_id,
+            ) {
                 self.app.set_group_self_membership(
                     &self.state.label,
                     &group_record.group_id_hex,
@@ -1976,12 +1999,7 @@ impl AppClient {
                 group_record.self_membership = SelfMembership::Removed;
             }
         }
-        let mls_state = self.group_mls_state_unchecked(group_id)?;
-        Ok(crate::groups::AppGroupRosterSession {
-            group_record,
-            members,
-            mls_state,
-        })
+        Ok(())
     }
 
     fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
@@ -6395,6 +6413,25 @@ fn local_account_removed_from_roster(
         .any(|member| hex::encode(member.id.as_slice()).eq_ignore_ascii_case(local_account_id_hex))
 }
 
+/// Whether an on-demand roster read may finish the one-time legacy membership
+/// import before the account-open pipeline reaches it. After the import marker
+/// is set, durable membership is advanced only by authenticated membership
+/// events; a later roster omission is not allowed to manufacture an eviction.
+fn should_reconcile_legacy_self_membership(
+    membership_import_complete: bool,
+    stored_membership: SelfMembership,
+    members: &[AppGroupMemberRecord],
+    local_account_id_hex: &str,
+) -> bool {
+    !membership_import_complete
+        && stored_membership == SelfMembership::Member
+        && !members.iter().any(|member| {
+            member
+                .member_id_hex
+                .eq_ignore_ascii_case(local_account_id_hex)
+        })
+}
+
 fn validate_stamped_poll_response(
     poll_event: &MarmotInnerEvent,
     response_created_at: u64,
@@ -6575,9 +6612,15 @@ mod post_canonical_create_tests {
 
 #[cfg(test)]
 mod self_membership_backfill_tests {
-    use super::local_account_removed_from_roster;
+    use super::{
+        AppGroupMemberRecord, SelfMembership, local_account_removed_from_roster,
+        should_reconcile_legacy_self_membership,
+    };
+    use crate::tests::ScriptedPushRelayClient;
+    use crate::{AccountHome, MarmotApp, SELF_MEMBERSHIP_BACKFILL_MARKER};
     use cgka_traits::MemberId;
     use cgka_traits::group::Member;
+    use std::sync::Arc;
 
     fn member(id_hex: &str) -> Member {
         Member {
@@ -6605,6 +6648,79 @@ mod self_membership_backfill_tests {
     #[test]
     fn empty_roster_is_treated_as_removed() {
         assert!(local_account_removed_from_roster(&[], "aa"));
+    }
+
+    #[test]
+    fn incomplete_roster_can_only_reconcile_the_pending_legacy_import() {
+        let peers_only = vec![AppGroupMemberRecord {
+            member_id_hex: "bb".to_owned(),
+            account: None,
+            local: false,
+        }];
+
+        assert!(should_reconcile_legacy_self_membership(
+            false,
+            SelfMembership::Member,
+            &peers_only,
+            "aa",
+        ));
+        assert!(!should_reconcile_legacy_self_membership(
+            true,
+            SelfMembership::Member,
+            &peers_only,
+            "aa",
+        ));
+    }
+
+    #[test]
+    fn terminal_membership_is_never_reclassified_by_the_legacy_import() {
+        for membership in [SelfMembership::Left, SelfMembership::Removed] {
+            assert!(!should_reconcile_legacy_self_membership(
+                false,
+                membership,
+                &[],
+                "aa",
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_import_keeps_a_later_incomplete_roster_from_persisting_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("large group", &[]).await.unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let peers_only = vec![AppGroupMemberRecord {
+            member_id_hex: "bb".repeat(32),
+            account: None,
+            local: false,
+        }];
+        let mut group_record = client
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .cloned()
+            .unwrap();
+
+        app.mark_account_import_complete("alice", SELF_MEMBERSHIP_BACKFILL_MARKER)
+            .unwrap();
+        client
+            .overlay_roster_self_membership(&mut group_record, &peers_only)
+            .unwrap();
+
+        assert_eq!(group_record.self_membership, SelfMembership::Member);
+        assert_eq!(
+            app.stored_group_self_membership("alice", &group_id_hex)
+                .unwrap(),
+            Some(SelfMembership::Member),
+            "post-start roster gaps must not turn an established conversation into a departure",
+        );
     }
 }
 
