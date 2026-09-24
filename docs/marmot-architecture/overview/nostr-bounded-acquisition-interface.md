@@ -156,3 +156,59 @@ unknown-history recovery; it
 remains worker-held and can still wait for EOSE. This exact-ID slice does not
 establish unknown-history discovery, bandwidth optimality or the original
 phone/NSE outcome.
+
+### P5 real-SDK qualification progress
+
+`bounded_real_sdk_two_relays_retain_one_encrypted_known_event` exercises the
+production multi-account `NostrSdkRelayClient`, endpoint-validated relay plane,
+account worker, MLS receive path, and SQLCipher storage. A real encrypted
+kind-445 event is published to two local WebSocket relays while its recipient
+is signed out. Their ordinary live subscriptions return EOSE without replaying
+history. The exact-ID request retrieves the event from each relay, and the
+worker retains the eligible event before clearing its known-event obligation.
+The regression asserts one exact-ID REQ per endpoint, one returned EVENT per
+endpoint, and per-endpoint byte ceilings in the fixture. The event JSON
+counters measure normalized JSON after parsing; they are included in the text
+counters, not additional bytes. The measurements are WebSocket
+text payloads at the local relay boundary, excluding TCP/TLS framing, SDK
+allocations, and process memory.
+
+One serial run measured these per-relay byte totals (left/right), including
+fixture setup and control traffic:
+
+| Case | Client to relay text | Relay to client text | Client EVENT JSON | Relay EVENT JSON |
+| --- | ---: | ---: | ---: | ---: |
+| Exact-ID retention | 2,863 / 2,920 | 1,464 / 1,464 | 944 / 944 | 944 / 944 |
+| Withheld EOSE and concurrent messages | 4,807 / 4,807 | 7,776 / 7,733 | 2,868 / 2,868 | 6,716 / 6,716 |
+
+These are fixture measurements, not a bandwidth target. The test enforces
+coarse ceilings because SDK control frames can vary between runs; the exact
+recovered event size and duplicate count are asserted separately.
+
+`bounded_real_sdk_missing_eose_keeps_send_and_read_available` withholds one
+relay's exact-ID EOSE. During the outstanding SDK request, the acquiring
+worker completes an outbound send and a committed snapshot read, and a live
+encrypted message from another account reaches its projection before the
+same acquisition ends. Both relays return the exact event; only the delayed
+relay's EOSE is withheld. Durable retention can admit either copy and satisfy
+the known-event obligation. This proves progress for that single case, not
+general coverage from partial endpoint evidence or recovery when only one
+endpoint returns the event.
+
+The activation gate remains closed. These tests do not yet qualify the real
+SDK path for SDK-seen but unretained input, both endpoints returning no data,
+saturation/oversized results, cancellation on either side of a durable
+prefix, stale generation/route fences, or restart persistence. Two further
+real-SDK controls exercise competing recovery demands and a newer delivery
+loss. On a conforming NIP-77 relay, an already-retained known ID and a fresh
+comparison both settle through automatic worker service after the injected
+test clock moves past the current shared retry deadline. The fixture allows
+either owner-selection order and establishes no real-time latency bound. In a
+separate two-relay run, one exact-ID EOSE stays withheld after the event has
+been durably retained from the other relay. A newer queue-loss revision then
+prevents that in-flight exact result from checkpointing its stale scope;
+the queue-loss demand remains pending. These controls do not qualify all
+competing account recovery demands or every stale loss outcome. Controlled
+backend tests cover several remaining policies, but they do not establish
+their behavior against production SDK sessions. No public activation or
+platform bandwidth/peak-memory claim follows from the P5 regressions.

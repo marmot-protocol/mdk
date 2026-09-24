@@ -227,12 +227,12 @@ impl MarmotApp {
                 "client token must contain 1 to 128 UTF-8 bytes".into(),
             ));
         }
-        if let Some(original) = &edit_of_client_token {
-            if original.is_empty() || original.len() > 128 || original == &token {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "invalid original client token for pending edit".into(),
-                ));
-            }
+        if let Some(original) = &edit_of_client_token
+            && (original.is_empty() || original.len() > 128 || original == &token)
+        {
+            return Err(AppError::InvalidAppMessagePayload(
+                "invalid original client token for pending edit".into(),
+            ));
         }
         let account = self.account_home().account(account_ref)?;
         let storage = self.draft_storage(&account.label)?;
