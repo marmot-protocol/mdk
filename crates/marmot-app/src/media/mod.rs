@@ -10,11 +10,11 @@ use cgka_traits::app_components::{
 };
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
-use nostr::NostrSigner;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use transport_nostr_peeler::MarmotNostrSigner;
 
 use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
 use crate::{AppError, ChatListAttachmentKind, SendSummary};
@@ -191,7 +191,7 @@ pub(crate) async fn upload_profile_image(
     image: &[u8],
     media_type: &str,
     server: Option<&str>,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
 ) -> Result<String, AppError> {
     upload_profile_image_with_policy(image, media_type, server, signer, false).await
 }
@@ -200,7 +200,7 @@ pub(crate) async fn upload_profile_image_with_policy(
     image: &[u8],
     media_type: &str,
     server: Option<&str>,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     allow_loopback_http: bool,
 ) -> Result<String, AppError> {
     if image.is_empty() {
@@ -683,7 +683,7 @@ pub(crate) async fn upload_encrypted_media(
     request: MediaUploadRequest,
     source_epoch: u64,
     media_secret: &[u8],
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     policy: MediaOperationPolicy<'_>,
     transport: &BlossomHttpTransport,
 ) -> Result<MediaUploadResult, AppError> {
@@ -754,7 +754,7 @@ async fn upload_encrypted_media_attachment(
     request: MediaUploadAttachmentRequest,
     source_epoch: u64,
     media_secret: &[u8],
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     upload_servers: &[String],
     policy: MediaOperationPolicy<'_>,
     transport: &BlossomHttpTransport,
@@ -846,7 +846,7 @@ async fn upload_blossom_blob_with_fallback(
     servers: &[String],
     encrypted: Bytes,
     encrypted_hash_hex: &str,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     transport: &BlossomHttpTransport,
 ) -> Result<String, AppError> {
     let mut failures = Vec::new();

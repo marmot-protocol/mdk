@@ -1,3 +1,23 @@
+type RelayPoolNotification = nostr_sdk::prelude::ClientNotification;
+use nostr_sdk::prelude::FinalizeEvent;
+fn test_notification_stream(
+    receiver: broadcast::Receiver<RelayPoolNotification>,
+) -> RelayNotificationStream {
+    Box::pin(futures::stream::unfold(
+        receiver,
+        |mut receiver| async move {
+            match receiver.recv().await {
+                Ok(notification) => {
+                    Some((NotificationUpdate::Notification(notification), receiver))
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    Some((NotificationUpdate::Lagged { skipped }, receiver))
+                }
+                Err(broadcast::error::RecvError::Closed) => None,
+            }
+        },
+    ))
+}
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -90,18 +110,61 @@ async fn set_transport_signer_arms_the_sdk_client_for_nip42_auth() {
         .sdk_relay_client
         .as_ref()
         .expect("sdk-backed plane has a relay client");
+    let keys = nostr::prelude::Keys::generate();
+    let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
     assert!(
-        sdk.client().signer().await.is_err(),
-        "a fresh plane must not have a signer"
+        sdk.notification_loss_for_account(&account_id)
+            .await
+            .is_err()
     );
-
     plane
-        .set_transport_signer(Arc::new(nostr::Keys::generate()))
-        .await;
+        .set_transport_signer(&account_id, Arc::new(keys))
+        .await
+        .unwrap();
+    assert!(sdk.notification_loss_for_account(&account_id).await.is_ok());
+    let directory_client = plane
+        .inner
+        .transport
+        .directory_client
+        .as_ref()
+        .expect("sdk-backed plane has an anonymous directory client");
+    assert!(directory_client.relays().await.is_empty());
+}
 
+#[tokio::test]
+async fn history_acquisition_rejects_unsafe_endpoint_before_sdk_registration() {
+    use transport_nostr_adapter::{NostrAcquisitionLimits, NostrAcquisitionScope};
+
+    let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+    let request = NostrAcquisitionRequest {
+        account_id: MemberId::new(vec![1; 32]),
+        scope: NostrAcquisitionScope::KnownEventIds(vec![[2; 32]]),
+        endpoints: vec![TransportEndpoint("ws://127.0.0.1:19474".into())],
+        limits: NostrAcquisitionLimits {
+            max_endpoints: 1,
+            max_requested_event_ids: 1,
+            max_received_items_per_endpoint: 1,
+            max_serialized_event_bytes_per_endpoint: 1024,
+            max_duration: Duration::from_secs(1),
+        },
+    };
+    assert!(matches!(
+        plane
+            .acquire_history(request, NostrAcquisitionCancellation::new())
+            .await,
+        Err(NostrAcquisitionError::InvalidRequest)
+    ));
     assert!(
-        sdk.client().signer().await.is_ok(),
-        "the transport client must hold a signer to answer NIP-42 AUTH"
+        plane
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .unwrap()
+            .client()
+            .relays()
+            .await
+            .is_empty()
     );
 }
 
@@ -301,10 +364,8 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
     let _ = notifications.send(RelayPoolNotification::Shutdown);
 
     let outcome = run_relay_notification_consumer(
-        receiver,
+        test_notification_stream(receiver),
         relay_plane.inner.transport.adapter.clone(),
-        relay_plane.inner.transport.directory_events.clone(),
-        relay_plane.inner.directory.clone(),
     )
     .await;
 
@@ -317,8 +378,6 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
     let resumed = run_relay_notification_consumer(
         outcome.receiver,
         relay_plane.inner.transport.adapter.clone(),
-        relay_plane.inner.transport.directory_events.clone(),
-        relay_plane.inner.directory.clone(),
     )
     .await;
     assert_eq!(
@@ -329,7 +388,205 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
 }
 
 #[tokio::test]
-async fn notification_recovery_closes_account_delivery_and_signals_directory_rebuild() {
+async fn abandoned_notification_lane_counts_queued_loss_for_only_its_account() {
+    let sdk = NostrSdkRelayClient::multi_account();
+    let alice_keys = nostr::prelude::Keys::generate();
+    let bob_keys = nostr::prelude::Keys::generate();
+    let alice = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+    let bob = MemberId::new(bob_keys.public_key().to_bytes().to_vec());
+    let alice_client = sdk
+        .register_account(alice.clone(), Arc::new(alice_keys))
+        .await
+        .unwrap();
+    sdk.register_account(bob.clone(), Arc::new(bob_keys))
+        .await
+        .unwrap();
+    let alice_loss = sdk.notification_loss_for_account(&alice).await.unwrap();
+    let bob_loss = sdk.notification_loss_for_account(&bob).await.unwrap();
+    let source = SdkRelayNotificationSource {
+        client: alice_client.client().clone(),
+        loss: Some(alice_client),
+    };
+    let pending = AtomicU64::new(3);
+    let failed_worker = tokio::spawn(async { panic!("forced event worker failure") });
+    assert!(failed_worker.await.unwrap_err().is_panic());
+    let exit = abandoned_notification_lane(&pending, &source);
+    assert_eq!(exit, RelayNotificationConsumerExit::Lagged(3));
+    assert_eq!(alice_loss.borrow().as_ref().unwrap().cumulative_skipped, 3);
+    assert!(bob_loss.borrow().is_none());
+
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+    let bob_adapter = plane.account_adapter(bob, relay);
+    recover_relay_notification_forwarder_scoped(&plane.inner.transport, exit, Some(&alice));
+    assert_eq!(
+        alice_adapter
+            .pending_delivery_overflow()
+            .unwrap()
+            .notification_losses,
+        1
+    );
+    assert!(bob_adapter.pending_delivery_overflow().is_none());
+}
+
+struct QueuedWorkerFailureSource {
+    sender: broadcast::Sender<RelayPoolNotification>,
+    subscriptions: AtomicUsize,
+    notifications_queued: AtomicUsize,
+    loss: NostrSdkRelayClient,
+    hook: Arc<NotificationWorkerFailureHook>,
+}
+
+impl QueuedWorkerFailureSource {
+    fn new(loss: NostrSdkRelayClient) -> Self {
+        Self {
+            sender: broadcast::channel(8).0,
+            subscriptions: AtomicUsize::new(0),
+            notifications_queued: AtomicUsize::new(0),
+            loss,
+            hook: Arc::new(NotificationWorkerFailureHook {
+                entered: Notify::new(),
+                release: Notify::new(),
+                fail_once: AtomicBool::new(true),
+            }),
+        }
+    }
+
+    fn send_notice(&self) {
+        self.sender
+            .send(RelayPoolNotification::Message {
+                relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
+                message: Box::new(RelayMessage::Notice("queued test notification".into())),
+            })
+            .expect("supervisor has an active receiver");
+    }
+}
+
+impl RelayNotificationSource for QueuedWorkerFailureSource {
+    fn notifications(&self) -> RelayNotificationStream {
+        self.subscriptions.fetch_add(1, Ordering::SeqCst);
+        test_notification_stream(self.sender.subscribe())
+    }
+
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+
+    fn record_loss(&self, skipped: u64) {
+        self.loss.record_notification_gap(skipped);
+    }
+
+    fn receiver_replaced(&self) {
+        self.loss.notification_receiver_replaced();
+    }
+
+    fn worker_failure_hook(&self) -> Option<Arc<NotificationWorkerFailureHook>> {
+        Some(self.hook.clone())
+    }
+
+    fn notification_queued(&self) {
+        self.notifications_queued.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
+    let sdk = NostrSdkRelayClient::multi_account();
+    let alice_keys = nostr::prelude::Keys::generate();
+    let bob_keys = nostr::prelude::Keys::generate();
+    let alice = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+    let bob = MemberId::new(bob_keys.public_key().to_bytes().to_vec());
+    let alice_client = sdk
+        .register_account(alice.clone(), Arc::new(alice_keys))
+        .await
+        .unwrap();
+    sdk.register_account(bob.clone(), Arc::new(bob_keys))
+        .await
+        .unwrap();
+    let mut alice_loss = sdk.notification_loss_for_account(&alice).await.unwrap();
+    let bob_loss = sdk.notification_loss_for_account(&bob).await.unwrap();
+
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+    let bob_adapter = plane.account_adapter(bob, relay);
+    let source = Arc::new(QueuedWorkerFailureSource::new(alice_client));
+    let supervisor = spawn_relay_notification_supervisor_scoped(
+        source.clone(),
+        plane.inner.transport.clone(),
+        Some(alice),
+    );
+
+    timeout(Duration::from_secs(2), async {
+        while source.subscriptions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the supervised consumer subscribes");
+    source.send_notice();
+    timeout(Duration::from_secs(2), source.hook.entered.notified())
+        .await
+        .expect("the real event worker takes its first notification");
+    source.send_notice();
+    source.send_notice();
+    timeout(Duration::from_secs(2), async {
+        while source.notifications_queued.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two more notifications enter the consumer's queue");
+    source.hook.release.notify_one();
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            alice_loss.changed().await.unwrap();
+            if alice_loss
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|gap| gap.cumulative_skipped >= 3)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("worker panic latches the in-flight and queued loss");
+    assert_eq!(alice_loss.borrow().as_ref().unwrap().cumulative_skipped, 3);
+    assert!(bob_loss.borrow().is_none());
+    timeout(Duration::from_secs(2), async {
+        while alice_adapter
+            .pending_delivery_overflow()
+            .is_none_or(|overflow| overflow.notification_losses == 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor signals account recovery from the real loss exit");
+    assert!(bob_adapter.pending_delivery_overflow().is_none());
+    assert_eq!(
+        plane
+            .inner
+            .transport
+            .notification_forwarder_health
+            .snapshot()
+            .lagged_notifications,
+        3
+    );
+
+    source.sender.send(RelayPoolNotification::Shutdown).unwrap();
+    timeout(Duration::from_secs(2), supervisor)
+        .await
+        .expect("supervisor stops after the replacement observes shutdown")
+        .unwrap();
+    sdk.shutdown_accounts().await;
+}
+
+#[tokio::test]
+async fn notification_recovery_closes_only_account_delivery() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account = MemberId::new(vec![0xA1; 32]);
@@ -349,10 +606,12 @@ async fn notification_recovery_closes_account_delivery_and_signals_directory_reb
             .is_none(),
         "closing the producer must drive the account worker into its existing reconnect path"
     );
-    assert!(matches!(
-        directory_events.recv().await,
-        Ok(DirectoryRelayPlaneEvent::RecoveryRequired)
-    ));
+    assert!(
+        timeout(Duration::from_millis(20), directory_events.recv())
+            .await
+            .is_err(),
+        "account receiver loss must not invalidate the independent directory receiver"
+    );
 
     let health = relay_plane
         .inner
@@ -467,6 +726,15 @@ struct TestNotificationSource {
 }
 
 impl TestNotificationSource {
+    fn steady() -> Self {
+        Self {
+            sender: broadcast::channel(1).0,
+            subscriptions: AtomicUsize::new(0),
+            preload_lag: false,
+            panic_first: AtomicBool::new(false),
+        }
+    }
+
     fn lag_once() -> Self {
         Self {
             sender: broadcast::channel(1).0,
@@ -493,7 +761,7 @@ impl TestNotificationSource {
 }
 
 impl RelayNotificationSource for TestNotificationSource {
-    fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification> {
+    fn notifications(&self) -> RelayNotificationStream {
         if self.panic_first.swap(false, Ordering::SeqCst) {
             panic!("injected notification consumer panic");
         }
@@ -502,12 +770,12 @@ impl RelayNotificationSource for TestNotificationSource {
             let relay_url = RelayUrl::parse("wss://relay.example").unwrap();
             let notice = || RelayPoolNotification::Message {
                 relay_url: relay_url.clone(),
-                message: RelayMessage::Notice("preloaded notification".into()),
+                message: Box::new(RelayMessage::Notice("preloaded notification".into())),
             };
             let _ = self.sender.send(notice());
             let _ = self.sender.send(notice());
         }
-        receiver
+        test_notification_stream(receiver)
     }
 
     fn is_shutdown(&self) -> bool {
@@ -516,16 +784,104 @@ impl RelayNotificationSource for TestNotificationSource {
 }
 
 #[tokio::test]
+async fn aborted_scoped_supervisors_release_health_across_account_restarts() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let bob = MemberId::new(vec![0xB2; 32]);
+    let running_count = &plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .running_count;
+
+    for _ in 0..3 {
+        let _alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+        let _bob_adapter = plane.account_adapter(bob.clone(), relay.clone());
+        let source = Arc::new(TestNotificationSource::steady());
+        let mut forwarders = plane
+            .inner
+            .transport
+            .account_notification_forwarders
+            .lock()
+            .await;
+        assert!(
+            forwarders
+                .insert(
+                    alice.clone(),
+                    spawn_relay_notification_supervisor_scoped(
+                        source.clone(),
+                        plane.inner.transport.clone(),
+                        Some(alice.clone()),
+                    ),
+                )
+                .is_none()
+        );
+        assert!(
+            forwarders
+                .insert(
+                    bob.clone(),
+                    spawn_relay_notification_supervisor_scoped(
+                        source.clone(),
+                        plane.inner.transport.clone(),
+                        Some(bob.clone()),
+                    ),
+                )
+                .is_none()
+        );
+        drop(forwarders);
+        timeout(Duration::from_secs(2), async {
+            while running_count.load(Ordering::SeqCst) != 2
+                || source.subscriptions.load(Ordering::SeqCst) != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both scoped supervisors start");
+
+        plane.deactivate_account_context(&alice).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while running_count.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting Alice releases only her supervisor count");
+        assert!(plane.relay_health().await.notification_forwarder_running);
+        assert!(
+            plane
+                .inner
+                .transport
+                .account_notification_forwarders
+                .lock()
+                .await
+                .get(&bob)
+                .is_some_and(|handle| !handle.is_finished())
+        );
+
+        plane.deactivate_account_context(&bob).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while running_count.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting the last account releases the running count");
+        assert!(!plane.relay_health().await.notification_forwarder_running);
+    }
+
+    plane.shutdown().await;
+}
+
+#[tokio::test]
 async fn notification_supervisor_restarts_after_consumer_panic() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account_adapter = relay_plane.account_adapter(MemberId::new(vec![0xA1; 32]), relay);
     let source = Arc::new(TestNotificationSource::panic_once());
-    let supervisor = spawn_relay_notification_supervisor(
-        source.clone(),
-        relay_plane.inner.transport.clone(),
-        relay_plane.inner.directory.clone(),
-    );
+    let supervisor =
+        spawn_relay_notification_supervisor(source.clone(), relay_plane.inner.transport.clone());
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -582,8 +938,13 @@ async fn notification_supervisor_restarts_after_consumer_panic() {
 async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
     let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
     let relay = Arc::new(RecordingRelayClient::default());
-    let existing_adapter =
-        relay_plane.account_adapter(MemberId::new(vec![0xA1; 32]), relay.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+    let existing_adapter = relay_plane.account_adapter(account_id.clone(), relay.clone());
+    relay_plane
+        .set_transport_signer(&account_id, Arc::new(keys))
+        .await
+        .unwrap();
 
     timeout(Duration::from_secs(1), async {
         while !relay_plane
@@ -605,18 +966,20 @@ async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
         .sdk_relay_client
         .as_ref()
         .unwrap()
-        .client()
-        .shutdown()
+        .shutdown_accounts()
         .await;
     timeout(Duration::from_secs(1), async {
         loop {
             let forwarder = relay_plane
                 .inner
                 .transport
-                .notification_forwarder
+                .account_notification_forwarders
                 .lock()
                 .await;
-            if forwarder.as_ref().is_some_and(JoinHandle::is_finished) {
+            if forwarder
+                .get(&account_id)
+                .is_some_and(JoinHandle::is_finished)
+            {
                 break;
             }
             drop(forwarder);
@@ -645,10 +1008,11 @@ async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
         relay_plane
             .inner
             .transport
-            .notification_forwarder
+            .account_notification_forwarders
             .lock()
             .await
-            .is_none(),
+            .get(&account_id)
+            .is_some_and(JoinHandle::is_finished),
         "a terminal SDK pool must not be respawned"
     );
     assert!(
@@ -663,6 +1027,15 @@ async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
 
 #[async_trait]
 impl NostrRelayClient for RecordingRelayClient {
+    async fn publish_event_for_account(
+        &self,
+        _account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.publish_event(endpoints, event, required_acks).await
+    }
     async fn subscribe(
         &self,
         subscription: NostrSubscription,
@@ -1873,15 +2246,27 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
     let sdk_subscriptions = relay_plane
         .inner
         .transport
-        .sdk_relay_client
+        .directory_client
         .as_ref()
         .unwrap()
-        .client()
         .subscriptions()
         .await;
     assert!(
         sdk_subscriptions.contains_key(&SubscriptionId::new(subscription_id.clone())),
         "the first SDK subscription must be live before the later batch fails"
+    );
+    assert!(
+        !relay_plane
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .unwrap()
+            .client()
+            .subscriptions()
+            .await
+            .contains_key(&SubscriptionId::new(subscription_id.clone())),
+        "directory read filters must never be installed on the account transport client"
     );
     assert!(
         relay_plane
@@ -1892,7 +2277,454 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
         "the validation filter must be committed for every live SDK subscription"
     );
 
+    relay_plane
+        .sync_directory_user_subscriptions(
+            DirectorySyncPlan {
+                endpoints: Vec::new(),
+                watched_user_count: 0,
+                batches: Vec::new(),
+            },
+            false,
+        )
+        .await
+        .expect("empty plan removes stale directory interests");
+    assert!(
+        !relay_plane
+            .inner
+            .transport
+            .directory_client
+            .as_ref()
+            .unwrap()
+            .subscriptions()
+            .await
+            .contains_key(&SubscriptionId::new(subscription_id.clone()))
+    );
+    assert!(
+        !relay_plane
+            .inner
+            .directory
+            .accepts_live_event(&subscription_id, &author, 0)
+            .await
+    );
+
     relay_plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn directory_endpoint_change_retries_a_batch_left_pending_by_partial_failure() {
+    use nostr::prelude::{EventBuilder, Keys};
+
+    let old_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let new_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let old_url = old_relay.url().await.to_string();
+    let new_url = new_relay.url().await.to_string();
+    let alice = Keys::generate();
+    let bob = Keys::generate();
+    let relay_plane = MarmotRelayPlane::full_history_with_loopback(true);
+    let mut events = relay_plane.subscribe_directory_events();
+    let plan = |endpoint: &str, bob_author: String| DirectorySyncPlan {
+        endpoints: vec![TransportEndpoint(endpoint.to_owned())],
+        watched_user_count: 2,
+        batches: vec![
+            DirectorySyncBatch {
+                subscription_id: "directory_users_alice".to_owned(),
+                authors: vec![alice.public_key().to_hex()],
+                kinds: vec![0],
+                since: None,
+            },
+            DirectorySyncBatch {
+                subscription_id: "directory_users_bob".to_owned(),
+                authors: vec![bob_author],
+                kinds: vec![0],
+                since: None,
+            },
+        ],
+    };
+
+    relay_plane
+        .sync_directory_user_subscriptions(plan(&old_url, bob.public_key().to_hex()), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_plane
+            .inner
+            .directory
+            .stats()
+            .await
+            .active_subscriptions,
+        2
+    );
+
+    assert_eq!(
+        relay_plane
+            .sync_directory_user_subscriptions(plan(&new_url, "invalid-pubkey".to_owned()), false)
+            .await
+            .unwrap_err(),
+        "invalid directory author"
+    );
+    let desired = [
+        "directory_users_alice".to_owned(),
+        "directory_users_bob".to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    let (to_add, _) = relay_plane
+        .inner
+        .directory
+        .subscription_diff(&desired)
+        .await;
+    assert_eq!(
+        to_add,
+        ["directory_users_bob".to_owned()].into_iter().collect()
+    );
+    assert_eq!(
+        relay_plane
+            .inner
+            .directory
+            .stats()
+            .await
+            .active_subscriptions,
+        1
+    );
+
+    relay_plane
+        .sync_directory_user_subscriptions(plan(&new_url, bob.public_key().to_hex()), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_plane
+            .inner
+            .directory
+            .stats()
+            .await
+            .active_subscriptions,
+        2
+    );
+
+    let writer = NostrSdkClient::default();
+    let relay_url = RelayUrl::parse(&new_url).unwrap();
+    writer.add_relay(relay_url.clone()).await.unwrap();
+    writer
+        .try_connect_relay(relay_url.clone(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"bob"}"#)
+        .finalize(&bob)
+        .unwrap();
+    writer.send_event(&profile).to([relay_url]).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let DirectoryRelayPlaneEvent::Record(record) = events.recv().await.unwrap()
+                && record.event.id == profile.id.to_hex()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Bob's retried subscription must deliver from the new relay");
+    writer.shutdown().await;
+    relay_plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn directory_subscribe_error_restores_filter_and_keeps_rebuild_pending() {
+    let id = "directory_users_retry";
+    let old_author = "11".repeat(32);
+    let new_author = "22".repeat(32);
+    let directory =
+        directory_plane_with_active_subscription(id, vec![old_author.clone()], vec![0]).await;
+    let endpoint = RelayUrl::parse("wss://relay.example").unwrap();
+    directory.set_subscription_endpoints(&[endpoint]).await;
+    directory
+        .mark_rebuild_pending(&[id.to_owned()].into_iter().collect())
+        .await;
+    let previous = directory
+        .record_subscription_filter(
+            id.to_owned(),
+            DirectorySubscriptionFilter::new(vec![new_author.clone()], vec![0]),
+        )
+        .await;
+    directory
+        .restore_failed_subscription_filter(id, previous)
+        .await;
+
+    let (to_add, _) = directory
+        .subscription_diff(&[id.to_owned()].into_iter().collect())
+        .await;
+    assert!(to_add.contains(id));
+    assert_eq!(directory.stats().await.active_subscriptions, 0);
+    assert!(directory.accepts_live_event(id, &old_author, 0).await);
+    assert!(!directory.accepts_live_event(id, &new_author, 0).await);
+}
+
+#[tokio::test]
+async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
+    use nostr::prelude::{EventBuilder, Keys};
+
+    let keys = Keys::generate();
+    let id = "directory_users_immediate";
+    let endpoint = RelayUrl::parse("wss://relay.example").unwrap();
+    let directory =
+        directory_plane_with_active_subscription(id, vec![keys.public_key().to_hex()], vec![0])
+            .await;
+    directory
+        .set_subscription_endpoints(std::slice::from_ref(&endpoint))
+        .await;
+    directory
+        .mark_rebuild_pending(&[id.to_owned()].into_iter().collect())
+        .await;
+    let previous = directory
+        .record_subscription_filter(
+            id.to_owned(),
+            DirectorySubscriptionFilter::new(vec![keys.public_key().to_hex()], vec![0]),
+        )
+        .await;
+    let source = Arc::new(TestNotificationSource {
+        sender: broadcast::channel(8).0,
+        subscriptions: AtomicUsize::new(0),
+        preload_lag: false,
+        panic_first: AtomicBool::new(false),
+    });
+    let (sender, mut events) = broadcast::channel(8);
+    let forwarder =
+        spawn_directory_notification_forwarder(source.clone(), sender, directory.clone());
+    timeout(Duration::from_secs(2), async {
+        while source.subscriptions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"immediate"}"#)
+        .finalize(&keys)
+        .unwrap();
+    source.send(RelayPoolNotification::Event {
+        relay_url: endpoint.clone(),
+        subscription_id: SubscriptionId::new(id),
+        event: Box::new(profile.clone()),
+    });
+    let record = timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let DirectoryRelayPlaneEvent::Record(record) = record else {
+        panic!("immediate matching event must be forwarded while subscribe is still pending");
+    };
+    assert_eq!(record.event.id, profile.id.to_hex());
+    assert_eq!(directory.stats().await.active_subscriptions, 0);
+
+    directory
+        .restore_failed_subscription_filter(id, previous)
+        .await;
+    let (to_add, _) = directory
+        .subscription_diff(&[id.to_owned()].into_iter().collect())
+        .await;
+    assert!(to_add.contains(id));
+    assert_eq!(directory.stats().await.active_subscriptions, 0);
+    assert!(directory.mark_auth_required(id, endpoint.as_str()).await);
+    source.send(RelayPoolNotification::Event {
+        relay_url: endpoint,
+        subscription_id: SubscriptionId::new(id),
+        event: Box::new(profile),
+    });
+    source.send(RelayPoolNotification::Shutdown);
+    timeout(Duration::from_secs(2), forwarder)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed)
+    ));
+}
+
+async fn directory_live_auth_challenge(deny_read: bool) {
+    use futures::{SinkExt, StreamExt};
+    use nostr::prelude::{EventBuilder, Keys};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    let keys = Keys::generate();
+    let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"jack"}"#)
+        .finalize(&keys)
+        .unwrap();
+    let expected_id = profile.id.to_hex();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let auth_responses = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let requests = requests.clone();
+        let auth_responses = auth_responses.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if request[0] == "AUTH" {
+                    auth_responses.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                if request[0] != "REQ" {
+                    continue;
+                }
+                requests.fetch_add(1, Ordering::SeqCst);
+                let subscription = request[1].as_str().unwrap();
+                socket
+                    .send(Message::Text(r#"["AUTH","optional-challenge"]"#.into()))
+                    .await
+                    .unwrap();
+                let reply = if deny_read {
+                    serde_json::json!([
+                        "CLOSED",
+                        subscription,
+                        "auth-required: read requires login"
+                    ])
+                } else {
+                    serde_json::json!(["EVENT", subscription, profile])
+                };
+                socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .unwrap();
+                if !deny_read {
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!(["EOSE", subscription]).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+    };
+
+    let relay_plane = MarmotRelayPlane::full_history_with_loopback(true);
+    let mut events = relay_plane.subscribe_directory_events();
+    relay_plane
+        .sync_directory_user_subscriptions(
+            DirectorySyncPlan {
+                endpoints: vec![endpoint],
+                watched_user_count: 1,
+                batches: vec![DirectorySyncBatch {
+                    subscription_id: "directory_users_auth".to_owned(),
+                    authors: vec![keys.public_key().to_hex()],
+                    kinds: vec![0],
+                    since: None,
+                }],
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+    if deny_read {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = relay_plane.inner.directory.stats().await;
+                if stats.auth_required_routes == 1 && stats.active_subscriptions == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("auth-required CLOSE must remove healthy directory coverage");
+        assert!(
+            timeout(Duration::from_millis(200), events.recv())
+                .await
+                .is_err(),
+            "auth-required must not trigger a rebuild loop"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    } else {
+        let record = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let DirectoryRelayPlaneEvent::Record(record) = record else {
+            panic!("optional AUTH must not trigger a recovery rebuild");
+        };
+        assert_eq!(record.event.id, expected_id);
+        let stats = relay_plane.inner.directory.stats().await;
+        assert_eq!(stats.auth_required_routes, 0);
+        assert_eq!(stats.active_subscriptions, 1);
+    }
+    assert_eq!(auth_responses.load(Ordering::SeqCst), 0);
+    relay_plane.shutdown().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn anonymous_live_directory_auth_required_is_visible_without_retry_loop() {
+    directory_live_auth_challenge(true).await;
+}
+
+#[tokio::test]
+async fn anonymous_live_directory_accepts_event_after_optional_auth() {
+    directory_live_auth_challenge(false).await;
+}
+
+#[tokio::test]
+async fn directory_notification_lag_requests_refresh() {
+    let source: Arc<dyn RelayNotificationSource> = Arc::new(TestNotificationSource::lag_once());
+    let (sender, mut receiver) = broadcast::channel(4);
+    let directory = DirectoryRelayPlane::new(Arc::new(RecordingDirectoryFetcher::default()));
+    let task = spawn_directory_notification_forwarder(source, sender, directory);
+    assert!(matches!(
+        timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        DirectoryRelayPlaneEvent::RecoveryRequired
+    ));
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn directory_auth_required_blocks_only_the_rejecting_endpoint() {
+    let author = "11".repeat(32);
+    let id = "directory_users_shared";
+    let directory =
+        directory_plane_with_active_subscription(id, vec![author.clone()], vec![0]).await;
+    let blocked = RelayUrl::parse("wss://blocked.example").unwrap();
+    let healthy = RelayUrl::parse("wss://healthy.example").unwrap();
+    assert!(
+        directory
+            .set_subscription_endpoints(&[blocked.clone(), healthy.clone()])
+            .await
+    );
+    assert!(
+        !directory
+            .set_subscription_endpoints(&[blocked.clone(), healthy.clone()])
+            .await
+    );
+    assert!(directory.mark_auth_required(id, blocked.as_str()).await);
+    assert!(
+        !directory
+            .accepts_live_event_from(id, blocked.as_str(), &author, 0)
+            .await
+    );
+    assert!(
+        directory
+            .accepts_live_event_from(id, healthy.as_str(), &author, 0)
+            .await
+    );
+    let stats = directory.stats().await;
+    assert_eq!(stats.auth_required_routes, 1);
+    assert_eq!(stats.active_subscriptions, 1);
+
+    assert!(directory.mark_auth_required(id, healthy.as_str()).await);
+    let stats = directory.stats().await;
+    assert_eq!(stats.auth_required_routes, 2);
+    assert_eq!(stats.active_subscriptions, 0);
 }
 
 #[tokio::test]
@@ -2010,18 +2842,15 @@ fn relay_pool_group_notification(
     id_prefix: &str,
     transport_group_id: &[u8],
 ) -> RelayPoolNotification {
-    use nostr_sdk::prelude::{Alphabet, EventBuilder, Keys, SingleLetterTag, Tag, TagKind};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
 
     let signed = EventBuilder::new(
         Kind::MlsGroupMessage,
         format!("encrypted recovery {id_prefix}"),
     )
-    .tags([Tag::custom(
-        TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-        [hex::encode(transport_group_id)],
-    )])
+    .tags([Tag::custom("h", [hex::encode(transport_group_id)])])
     .custom_created_at(NostrTimestamp::from_secs(1_700_000_001))
-    .sign_with_keys(&Keys::generate())
+    .finalize(&Keys::generate())
     .expect("sign test group event");
     RelayPoolNotification::Event {
         relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
@@ -2054,11 +2883,8 @@ async fn supervised_notification_lag_recovers_later_inbound_exactly_once() {
         .unwrap();
 
     let source = Arc::new(TestNotificationSource::lag_once());
-    let supervisor = spawn_relay_notification_supervisor(
-        source.clone(),
-        relay_plane.inner.transport.clone(),
-        relay_plane.inner.directory.clone(),
-    );
+    let supervisor =
+        spawn_relay_notification_supervisor(source.clone(), relay_plane.inner.transport.clone());
 
     timeout(Duration::from_secs(2), async {
         while relay_plane

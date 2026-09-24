@@ -22,13 +22,13 @@
 
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use marmot_account::AccountHome;
 use marmot_app::{MarmotApp, MarmotAppConfig};
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::{
-    Alphabet, Client as NostrSdkClient, EventBuilder, Keys, Kind, SingleLetterTag, Tag, TagKind,
+    Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
 };
 use tokio::time::{sleep, timeout};
@@ -88,12 +88,9 @@ async fn publish_garbage_group_message_at(
     assert!(envelope.len() >= NOSTR_GROUP_CONTENT_MIN_LEN);
     let ephemeral = Keys::generate();
     let signed = EventBuilder::new(Kind::MlsGroupMessage, BASE64_STANDARD.encode(envelope))
-        .tags([Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-            [nostr_group_id_hex.to_owned()],
-        )])
+        .tags([Tag::custom("h", [nostr_group_id_hex.to_owned()])])
         .custom_created_at(NostrTimestamp::from_secs(created_at))
-        .sign_with_keys(&ephemeral)
+        .finalize(&ephemeral)
         .expect("sign ephemeral kind-445 test event");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event");

@@ -271,6 +271,33 @@ pub(crate) struct DeferredPeelGroupState {
     /// logged, or copied into durable generation state, and process restart
     /// drops it naturally.
     candidate_cache: Option<DeferredPeelCandidateCacheEntry>,
+    /// Retained-anchor peel contexts, shared by every retry over this group's
+    /// backlog: the deferred-peel sweep and the publish-cycle replay. Deriving
+    /// one costs a durable rewind of live group state, which a long backlog
+    /// would otherwise pay per retained anchor per row. Exporter-bearing, held
+    /// in engine memory on the same terms as `candidate_cache`, and dropped
+    /// with it: on every canonical change, and whenever a sweep turns its
+    /// candidate generation over.
+    ///
+    /// Entries are keyed by anchor NAME, and `create_group_state_snapshot` is
+    /// INSERT OR REPLACE — so an anchor can be rewritten under an unchanged
+    /// name. Two facts make that safe, and both must hold for this cache to
+    /// stay correct:
+    ///
+    /// - Every rewrite of an anchor whose epoch is already in the past happens
+    ///   inside a canonical apply that selected a tip, and that same apply
+    ///   calls `invalidate_deferred_peel_candidate_cache`, dropping these
+    ///   contexts along with the candidate ones.
+    /// - The one anchor refresh not gated on a selected tip
+    ///   (`openmls_projection::apply_openmls_canonicalization_result`, the
+    ///   `apply_start_epoch == current_epoch` arm) only ever rewrites the
+    ///   CURRENT-epoch anchor, which is never a peel source:
+    ///   `try_peel_group_message_from_available_snapshots` skips every
+    ///   snapshot whose `source_epoch >= current_epoch`.
+    ///
+    /// Do not close the gap by folding anchor content into the fingerprint —
+    /// that reads every anchor blob on every fingerprint.
+    past_peel_contexts: Option<Arc<crate::message_processor::ingest::PastPeelContextCache>>,
     /// Per-row verdicts backing `stored_convergence_commit_edges`: the
     /// stored payload's hash, plus the commit's `(source_epoch, digest)` or
     /// `None` for a row that is not an MLS-wire commit. A row id CAN map to different payload bytes
@@ -333,31 +360,6 @@ struct DeferredPeelCandidateCacheEntry {
     /// ever gains proposal-dependent state, this cache key must gain the same
     /// dependency.
     peel: Arc<crate::openmls_projection::CandidateBranchPeel>,
-    /// Historical peel contexts, cached beside the candidate contexts because
-    /// they answer the same question for the same generation. Deriving one
-    /// costs a durable rewind of live group state, which a long backlog would
-    /// otherwise pay per retained anchor per bounded slice.
-    ///
-    /// Surviving a slice rests on a narrower invariant than the key above
-    /// states. `context_fingerprint` covers anchor NAMES, never anchor
-    /// content, and `create_group_state_snapshot` is INSERT OR REPLACE — so an
-    /// anchor can be rewritten under an unchanged name. Two facts make that
-    /// safe here, and both must hold for this cache to stay correct:
-    ///
-    /// - Every rewrite of an anchor whose epoch is already in the past happens
-    ///   inside a canonical apply that selected a tip, and that same apply
-    ///   calls `invalidate_deferred_peel_candidate_cache`, dropping this whole
-    ///   entry along with these contexts.
-    /// - The one anchor refresh not gated on a selected tip
-    ///   (`openmls_projection::apply_openmls_canonicalization_result`, the
-    ///   `apply_start_epoch == current_epoch` arm) only ever rewrites the
-    ///   CURRENT-epoch anchor, which is never a peel source:
-    ///   `try_peel_group_message_from_available_snapshots` skips every
-    ///   snapshot whose `source_epoch >= current_epoch`.
-    ///
-    /// Do not close the gap by folding anchor content into the fingerprint —
-    /// that reads every anchor blob on every fingerprint.
-    past_contexts: Arc<crate::message_processor::ingest::PastPeelContextCache>,
 }
 
 struct DeferredPeelCandidateEnumerationFailure {
@@ -2262,11 +2264,10 @@ impl<S: StorageProvider> Engine<S> {
                 cached.context_fingerprint == context.full
                     && cached.durable_generation_fingerprint == durable_generation_fingerprint
             })
-            .map(|cached| (Arc::clone(&cached.peel), Arc::clone(&cached.past_contexts)));
-        let (peel, past_contexts, candidate_cache_hit) = if let Some((peel, past_contexts)) = cached
-        {
+            .map(|cached| Arc::clone(&cached.peel));
+        let (peel, candidate_cache_hit) = if let Some(peel) = cached {
             self.engine_metrics.note_deferred_peel_candidate_cache_hit();
-            (peel, past_contexts, true)
+            (peel, true)
         } else {
             self.clear_completed_candidate_cache(group_id);
             self.engine_metrics
@@ -2348,8 +2349,6 @@ impl<S: StorageProvider> Engine<S> {
                 })?;
             let cached_generation_fingerprint = Some(context.full);
             let enumerated = Arc::new(enumerated);
-            let past_contexts =
-                Arc::new(crate::message_processor::ingest::PastPeelContextCache::default());
             self.deferred_peel
                 .entry(group_id.clone())
                 .or_default()
@@ -2357,9 +2356,8 @@ impl<S: StorageProvider> Engine<S> {
                 context_fingerprint: context.full,
                 durable_generation_fingerprint: cached_generation_fingerprint,
                 peel: Arc::clone(&enumerated),
-                past_contexts: Arc::clone(&past_contexts),
             });
-            (enumerated, past_contexts, false)
+            (enumerated, false)
         };
         tracing::debug!(
             target: "cgka_engine::message_processor",
@@ -2367,6 +2365,7 @@ impl<S: StorageProvider> Engine<S> {
             cache_hit = candidate_cache_hit,
             "deferred-peel candidate cache lookup"
         );
+        let past_contexts = self.past_peel_contexts(group_id);
         let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel)
             .with_past_contexts(&past_contexts);
         let preparation_ms = sweep_started.elapsed().as_millis() as u64;
@@ -2916,7 +2915,7 @@ impl<S: StorageProvider> Engine<S> {
     /// Anchors enter this by NAME, not by content — reading every anchor blob
     /// per fingerprint would cost more than the peels it saves. What makes a
     /// name sufficient is documented at
-    /// `DeferredPeelCandidateCacheEntry::past_contexts`, whose cached contexts
+    /// `DeferredPeelGroupState::past_peel_contexts`, whose cached contexts
     /// are the consumer that depends on it; change one and re-read the other.
     fn deferred_peel_context(
         &mut self,
@@ -3316,10 +3315,10 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     fn clear_completed_candidate_cache(&mut self, group_id: &GroupId) {
-        let invalidated = self
-            .deferred_peel
-            .get_mut(group_id)
-            .is_some_and(|state| state.candidate_cache.take().is_some());
+        let invalidated = self.deferred_peel.get_mut(group_id).is_some_and(|state| {
+            state.past_peel_contexts = None;
+            state.candidate_cache.take().is_some()
+        });
         if invalidated {
             self.engine_metrics
                 .note_deferred_peel_candidate_cache_invalidation();
@@ -3329,6 +3328,15 @@ impl<S: StorageProvider> Engine<S> {
                 "invalidated deferred-peel candidate cache"
             );
         }
+    }
+
+    /// The group's retained-anchor peel contexts, until the next invalidation.
+    fn past_peel_contexts(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Arc<crate::message_processor::ingest::PastPeelContextCache> {
+        let state = self.deferred_peel.entry(group_id.clone()).or_default();
+        Arc::clone(state.past_peel_contexts.get_or_insert_default())
     }
 
     /// Bookkeeping for a row leaving `PeelDeferred` (applied, reclassified,
@@ -3565,6 +3573,8 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
+        use ingest::GroupMessageIngestOutcome::{Deferred, Outcome};
+
         // Only states the loop below can act on; the storage backend skips
         // fetching and decoding terminal/record-only rows entirely, which
         // keeps a re-join from re-parsing the group's whole message history.
@@ -3590,28 +3600,36 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             };
             let was_peel_deferred = record.state == MessageState::PeelDeferred;
+            // Fetched per row: a row that applies invalidates the contexts,
+            // and the rows behind it must not be offered stale ones.
+            let past_contexts = self.past_peel_contexts(group_id);
             match self
-                .ingest_group_message(&msg, group_id.as_slice().to_vec())
+                .ingest_group_message_from_sweep(
+                    &msg,
+                    group_id.as_slice().to_vec(),
+                    ingest::DeferredPeelSweep::LIVE.with_past_contexts(&past_contexts),
+                )
                 .await
             {
                 Ok(
-                    IngestOutcome::Buffered { .. }
-                    | IngestOutcome::TransportDeferred { .. }
-                    | IngestOutcome::LocalState {
-                        state: LocalIngestState::Quarantined,
-                    }
-                    | IngestOutcome::Ignored {
-                        category: InputRejectionCategory::UnknownGroup,
-                    },
+                    Deferred(_)
+                    | Outcome(
+                        IngestOutcome::Buffered { .. }
+                        | IngestOutcome::LocalState {
+                            state: LocalIngestState::Quarantined,
+                        }
+                        | IngestOutcome::Ignored {
+                            category: InputRejectionCategory::UnknownGroup,
+                        },
+                    ),
                 ) => {
                     // Leave the row in its retry state so a later pass
                     // re-attempts it.
                     //
                     // `Buffered`: not the caller's to retire — see AGENTS.md,
                     // "a `Buffered` outcome never lets the caller retire the
-                    // wrapper". `TransportDeferred`: still un-peelable, or a
-                    // terminal-after-peel path inside `ingest_group_message`
-                    // already settled the row
+                    // wrapper". `Deferred`: still un-peelable, or a
+                    // terminal-after-peel path inside ingest already settled the row
                     // (`mark_raw_transport_message_failed_if_awaiting_retry`,
                     // `PeelDeferred`/`Retryable` alike). `Quarantined`: the group
                     // is frozen; the row replays once repair clears it.
@@ -3627,9 +3645,9 @@ impl<S: StorageProvider> Engine<S> {
                     let current = self.stored_message_state(&record.id)?;
                     self.release_cap_slot_if_row_left_peel_deferred(&record, current);
                 }
-                Ok(IngestOutcome::LocalState {
+                Ok(Outcome(IngestOutcome::LocalState {
                     state: LocalIngestState::Removed,
-                }) => {
+                })) => {
                     // Refused on our own removal before any peel — either on the
                     // durable record or by the realizing arm that writes that
                     // marker. Both retain the input, and neither re-stamps a row
@@ -3651,7 +3669,7 @@ impl<S: StorageProvider> Engine<S> {
                     // when the removal retired the deferred backlog.
                     break;
                 }
-                Ok(IngestOutcome::ResourceRefused { .. }) => {
+                Ok(Outcome(IngestOutcome::ResourceRefused { .. })) => {
                     // Refused for lack of room, not on the message's merits: the
                     // group's deferred-peel cap had no slot for this row right
                     // now. Leave it exactly as ingest found it — still awaiting
@@ -3673,7 +3691,7 @@ impl<S: StorageProvider> Engine<S> {
                     // replay runs again on every publish cycle, so the retry cost
                     // stays bounded by the rows still retained.
                 }
-                Ok(_) => {
+                Ok(Outcome(_)) => {
                     // Terminal reclassification of the raw wrapper: the content-
                     // derived row now carries the real verdict — applied
                     // (`Processed`), a same-epoch fork the incumbent won

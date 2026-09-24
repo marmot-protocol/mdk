@@ -614,7 +614,7 @@ fn generated_account_birth_marks_cutover_scan_complete_before_session_open() {
 async fn failed_import_relay_discovery_does_not_publish_default_lists() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let imported = home
         .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
         .unwrap();
@@ -2623,8 +2623,8 @@ fn account_setup_validation_rejects_import_nsec_for_login_operation() {
 #[test]
 fn account_setup_validation_reports_identity_key_mismatch_without_leaking_secrets() {
     use nostr::prelude::ToBech32;
-    let keys = nostr::Keys::generate();
-    let other = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
+    let other = nostr::prelude::Keys::generate();
     let request = AccountSetupRequest {
         identity: Some(keys.public_key().to_bech32().unwrap()),
         import_nsec: Some(Zeroizing::new(other.secret_key().to_bech32().unwrap())),
@@ -2656,8 +2656,8 @@ async fn account_setup_rejects_conflicting_identity_and_import_nsec_before_mutat
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let runtime = MarmotAppRuntime::new(app.clone());
-    let keys = nostr::Keys::generate();
-    let other = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
+    let other = nostr::prelude::Keys::generate();
     let request = AccountSetupRequest {
         identity: Some(keys.public_key().to_bech32().unwrap()),
         import_nsec: Some(Zeroizing::new(other.secret_key().to_bech32().unwrap())),
@@ -2677,7 +2677,7 @@ async fn account_setup_rejects_conflicting_identity_and_import_nsec_before_mutat
 #[test]
 fn account_setup_validation_accepts_matching_identity_and_import_nsec() {
     use nostr::prelude::ToBech32;
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let request = AccountSetupRequest {
         identity: Some(keys.public_key().to_bech32().unwrap()),
         import_nsec: Some(Zeroizing::new(keys.secret_key().to_bech32().unwrap())),
@@ -2692,7 +2692,7 @@ async fn account_setup_login_rejects_import_nsec_sidecar() {
     use nostr::prelude::ToBech32;
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let request = AccountSetupRequest {
         import_nsec: Some(Zeroizing::new(keys.secret_key().to_bech32().unwrap())),
         ..AccountSetupRequest::default()

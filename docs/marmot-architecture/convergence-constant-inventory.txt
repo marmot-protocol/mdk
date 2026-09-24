@@ -46,3 +46,11 @@ A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_WEDGE_REARM_INTERVAL
 A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS
 A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD
 A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_CLOCK_SKEW_ALLOWANCE_MS
+A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|MAX_ENDPOINTS
+A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|MAX_EVENTS_PER_ENDPOINT
+A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|MAX_BYTES_PER_ENDPOINT
+A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|MAX_ADMISSION_PER_TURN
+A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|MAX_CONCURRENT_JOBS
+A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|ADMISSION_YIELD_DELAY
+A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|PROBE_INTERVAL
+A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|MAX_REQUEST_DURATION

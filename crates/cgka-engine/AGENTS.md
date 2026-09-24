@@ -403,9 +403,11 @@ immediate drain behavior; application routing still depends on captured branch c
 500-ms budget across its reprocessing loop. Explicit-time engine entry points keep the row allowance without an
 elapsed wall deadline; queued outbound foreground preflight keeps its existing budget. Return pending at complete operation boundaries; do not cancel a
 snapshot guard or advance a partially tried generation. Foreground send budgets retain their separate semantics.
-Historical anchor peel contexts are materialized lazily once per candidate generation — they derive only from an
-immutable retained anchor, so they outlive a bounded slice and are dropped with the generation that owns them; they
-preserve snapshot provenance and historical retention policy. Restore live state before awaiting a peeler. The sweep stops
+Historical anchor peel contexts are materialized lazily and held per group in `DeferredPeelGroupState::past_peel_contexts`,
+shared by the sweep and the publish-cycle `replay_buffered_messages`; they outlive a bounded slice or a replay and are
+dropped with the candidate cache — on every canonical change, and whenever a sweep turns its candidate generation over
+(read that field's doc for why a name-keyed entry stays valid until then). The replay fetches them per row, so a row that invalidates cannot hand stale
+contexts to the rows behind it. They preserve snapshot provenance and historical retention policy. Restore live state before awaiting a peeler. The sweep stops
 when canonical/candidate context is invalidated; never persist this secret-bearing cache or extend epoch retention.
 Tests: `tests/deferred_peel_lifecycle.rs` covers host budget yield, explicit-time row determinism, restart and eventual
 completion. Readiness queries all deferred rows using the storage state filter; never hide unattempted rows by

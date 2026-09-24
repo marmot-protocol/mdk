@@ -111,7 +111,7 @@ async fn user_blocks_remote_adoption_survives_failed_edit_and_supersedes_uncerta
             Tag::parse(["word", "preserve"]).unwrap(),
         ])
         .custom_created_at(NostrTimestamp::from_secs(old.created_at + 1))
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .unwrap();
     fetcher
         .events
@@ -180,7 +180,7 @@ async fn user_blocks_unreadable_live_replacement_fences_later_empty_fetch() {
     let at = crate::unix_now_seconds();
     let unreadable = EventBuilder::new(Kind::MuteList, "unreadable")
         .custom_created_at(NostrTimestamp::from_secs(at))
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .unwrap();
     assert!(
         app.ingest_block_list_event(NostrTransportEvent::from_nostr_event(&unreadable).unwrap())
@@ -195,7 +195,7 @@ async fn user_blocks_unreadable_live_replacement_fences_later_empty_fetch() {
     assert!(relay.attempted_events.lock().unwrap().is_empty());
     let repaired = EventBuilder::new(Kind::MuteList, "")
         .custom_created_at(NostrTimestamp::from_secs(at + 1))
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .unwrap();
     fetcher
         .events

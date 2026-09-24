@@ -13,7 +13,8 @@ App runtime bridge for the first real Marmot app surfaces.
   `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
   (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (durable preflight, cancellation, and advisory installation detection), `audit_tracker.rs` (the forensic audit-log
-  tracker upload worker), `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers), and `avatar.rs`
+  tracker upload worker), `audit_otlp_delivery.rs` (the inactive explicit one-account OTLP attempt),
+  `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers), and `avatar.rs`
   (local identity-avatar demand and bounded maintenance), plus `avatar_access.rs` (bounded local native batches) and `attachment_history.rs`
   (bounded local attachment discovery and shared-parser presentation), `attachment_access.rs`
   (read-only source-slot availability and verified local byte ranges), and `account_worker/attachments.rs`
@@ -64,6 +65,13 @@ App runtime bridge for the first real Marmot app surfaces.
   the per-attempt pinned upload path, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the
   `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and
   HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
+- Keep the inactive audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
+  checks the prepared destination, preserves each original v4 JSON body inside the restricted OTLP JSON envelope,
+  and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
+  outcomes retain the prepared range. It has no runtime worker, endpoint default, or native binding.
+- Keep process-local audit export admission in `src/audit_export_lifecycle.rs`: one active attempt per account, short
+  local admission under `storage_lifecycle`, and cancellation on consent, deletion, account removal, destination change,
+  or close. Never hold local guards across HTTP or wait for HTTP before releasing the root lease on terminal close.
 - Record into distinct v4 files and upload only strictly validated v4 snapshots. Never migrate or send v1-v3
   or key-reveal files. Reject removed/unknown fields and duplicate keys before HTTP; cache ineligible file verdicts
   by size and mtime without retry cooldowns. On exclusive-root startup, `audit_log/legacy_cleanup.rs` deletes

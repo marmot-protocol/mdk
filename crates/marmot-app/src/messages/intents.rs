@@ -877,7 +877,7 @@ mod mention_tests {
     use crate::ids::{nprofile_for_account_id, npub_for_account_id};
 
     fn valid_pubkey_hex() -> String {
-        nostr::Keys::generate().public_key().to_hex()
+        nostr::prelude::Keys::generate().public_key().to_hex()
     }
 
     #[test]

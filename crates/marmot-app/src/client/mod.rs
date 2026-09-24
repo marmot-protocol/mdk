@@ -31,10 +31,10 @@ use marmot_account::{
     TransportRoutingPolicy,
 };
 use marmot_forensics::AuditEventContext;
-use nostr::NostrSigner;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use storage_sqlite::{PreparedGroupImageUploadRecord, PreparedGroupImageUploadState};
+use transport_nostr_peeler::MarmotNostrSigner;
 use zeroize::Zeroizing;
 
 use crate::app_telemetry::AppPerformanceOperation;
@@ -136,7 +136,7 @@ pub(crate) struct EncryptedMediaUploadHttp {
     request: MediaUploadRequest,
     source_epoch: u64,
     media_secret: SecretBytes,
-    nostr_signer: Arc<dyn NostrSigner>,
+    nostr_signer: Arc<dyn MarmotNostrSigner>,
     version: EncryptedMediaVersion,
     default_endpoints: Vec<AppBlobEndpoint>,
     allowed_locator_kinds: Vec<String>,
@@ -353,7 +353,7 @@ pub struct AppClient {
     pub(crate) adapter: MarmotRelayPlaneAccountAdapter,
     pub(crate) routing: AppTransportRouting,
     pub(crate) relay_plane: MarmotRelayPlane,
-    pub(crate) transport_signer: Arc<dyn nostr::NostrSigner>,
+    pub(crate) transport_signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     pub(crate) blossom_http_transport: BlossomHttpTransport,
     pub(crate) state: AccountState,
     /// O(1) membership index over `state.seen_events`, kept in lockstep by

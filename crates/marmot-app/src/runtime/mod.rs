@@ -15,7 +15,7 @@ use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::transport_adapter::TransportEndpointRejectionCategory;
-use cgka_traits::{GroupId, SecretBytes, TransportAdapterError, TransportEndpoint};
+use cgka_traits::{GroupId, MemberId, SecretBytes, TransportAdapterError, TransportEndpoint};
 use futures::stream::{FuturesUnordered, StreamExt};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
@@ -71,6 +71,7 @@ pub use agent_publisher::{
     AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
 };
 mod account_attention;
+mod audit_otlp_delivery;
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -282,7 +283,7 @@ struct AccountTeardownGuard<'a> {
 #[derive(Clone)]
 struct TrackedWorkerReaper {
     account_id: String,
-    handle: Arc<Mutex<JoinHandle<()>>>,
+    handle: Arc<Mutex<JoinHandle<Result<(), AppError>>>>,
 }
 
 impl<'a> AccountTeardownGuard<'a> {
@@ -326,6 +327,21 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
+    /// Off until the production SDK acquisition backend passes its two-relay
+    /// conformance gate. Controlled worker fixtures opt in explicitly.
+    pub(crate) bounded_group_recovery_enabled: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) bounded_recovery_finished: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_preparation_probes: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) bounded_result_ready: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_prefix_admitted: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_pause_before_admission: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) bounded_pause_after_first_admission: Arc<AtomicBool>,
     local_submission_wakeups: watch::Sender<()>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
@@ -418,6 +434,19 @@ impl MessageSubscriptionSeenIds {
 impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
+            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_recovery_finished: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            bounded_result_ready: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_prefix_admitted: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             local_submission_wakeups: watch::channel(()).0,
             attachment_updates: watch::channel(()).0,
@@ -465,6 +494,19 @@ impl RuntimeSharedServices {
             lifecycle.clone(),
         );
         Self {
+            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_recovery_finished: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            bounded_result_ready: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_prefix_admitted: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
             local_submission_wakeups: watch::channel(()).0,
@@ -5814,10 +5856,15 @@ impl AccountManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for (account_id, worker) in workers {
+                let relay_plane = self.shared.relay_plane().clone();
+                let retired_account = account_id.clone();
                 reapers.push(TrackedWorkerReaper {
                     account_id,
                     handle: Arc::new(Mutex::new(tokio::spawn(async move {
                         worker.shutdown().await;
+                        let member = MemberId::new(hex::decode(retired_account)?);
+                        relay_plane.deactivate_account_context(&member).await?;
+                        Ok(())
                     }))),
                 });
             }
@@ -5835,8 +5882,13 @@ impl AccountManager {
         for reaper in reapers {
             let mut handle = reaper.handle.lock().await;
             let completed = handle.is_finished();
-            if completed {
-                let _ = (&mut *handle).await;
+            if completed && let Ok(Err(error)) = (&mut *handle).await {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "finish_worker_reapers",
+                    error_kind = error.privacy_safe_kind(),
+                    "account transport retirement failed",
+                );
             }
             drop(handle);
             if completed {
@@ -5870,21 +5922,18 @@ impl AccountManager {
             .collect::<Vec<_>>();
         for reaper in reapers {
             let mut handle = reaper.handle.lock().await;
-            if handle.is_finished() {
-                let _ = (&mut *handle).await;
-            } else if tokio::time::timeout_at(deadline, &mut *handle)
+            let result = tokio::time::timeout_at(deadline, &mut *handle)
                 .await
-                .is_err()
-            {
-                return Err(AppError::BlockingTask(
-                    "account worker cleanup still in progress".into(),
-                ));
-            }
+                .map_err(|_| {
+                    AppError::BlockingTask("account worker cleanup still in progress".into())
+                })?;
             drop(handle);
             self.worker_reapers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .retain(|tracked| !Arc::ptr_eq(&tracked.handle, &reaper.handle));
+            result
+                .map_err(|_| AppError::BlockingTask("account worker cleanup failed".into()))??;
         }
         Ok(())
     }
@@ -5899,7 +5948,14 @@ impl AccountManager {
                 .cloned();
             let Some(reaper) = reaper else { break };
             let mut handle = reaper.handle.lock().await;
-            let _ = (&mut *handle).await;
+            if let Ok(Err(error)) = (&mut *handle).await {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "finish_worker_reapers_unbounded",
+                    error_kind = error.privacy_safe_kind(),
+                    "account transport retirement failed",
+                );
+            }
             drop(handle);
             self.worker_reapers
                 .lock()
@@ -5949,6 +6005,10 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
+        let audit_export = self.app.audit_export_lifecycle.clone();
+        let account_id = account.account_id_hex.clone();
+        let _audit_export_mutation =
+            blocking_app_task(move || Ok(audit_export.mutate_account(&account_id))).await?;
         self.ensure_worker_reaped(&account.account_id_hex).await?;
         let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
         async {
@@ -6625,6 +6685,15 @@ impl AccountManager {
         path: &str,
     ) -> Result<AuditLogDeleteOutcome, AppError> {
         let (path, owner_account_id_hex) = self.app.resolve_audit_log_path(path)?;
+        let audit_export = self.app.audit_export_lifecycle.clone();
+        let fence_owner = owner_account_id_hex.clone();
+        let _audit_export_mutation = blocking_app_task(move || {
+            Ok(match fence_owner.as_deref() {
+                Some(account) => audit_export.mutate_account(account),
+                None => audit_export.mutate_all(),
+            })
+        })
+        .await?;
         if let Some(account_id_hex) = owner_account_id_hex {
             let commands = {
                 let workers = self.workers.lock().await;
@@ -6637,15 +6706,20 @@ impl AccountManager {
                 // A send error means the worker channel is closed, so its
                 // session — and thus any file handle — is gone; fall through to
                 // a direct removal, which is then safe.
-                if commands
+                let queued = commands
                     .send(AccountWorkerCommand::DeleteAuditLog {
                         path: path.clone(),
                         respond,
                     })
                     .await
-                    .is_ok()
-                    && account_worker_response(response).await?
-                {
+                    .is_ok();
+                #[cfg(test)]
+                if queued {
+                    self.app
+                        .audit_export_lifecycle
+                        .notify_delete_queued_for_test();
+                }
+                if queued && account_worker_response(response).await? {
                     // The live recorder owned this file and rotated it: old
                     // file gone, fresh file already recording.
                     return Ok(AuditLogDeleteOutcome {

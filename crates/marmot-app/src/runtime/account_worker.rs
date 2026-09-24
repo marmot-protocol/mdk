@@ -2,6 +2,7 @@
 //! and the runtime-event publishing helpers the loop drives.
 
 mod attachments;
+mod bounded_recovery;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
@@ -1139,7 +1140,56 @@ async fn run_app_runtime_account_worker(
         });
 
     let mut yield_to_convergence = false;
+    let mut bounded_recovery: Option<bounded_recovery::Job> = None;
+    let mut yield_to_bounded_admission = false;
+    let mut bounded_probe_at = TokioInstant::now();
+    let mut bounded_prepare_error_reported = false;
     'worker: loop {
+        // Activation is deliberately test-only until #1358 supplies and
+        // qualifies the real backend. This is the actual worker dispatch seam:
+        // the grant is captured here, while only the owned request crosses the
+        // network await. The active owner lease prevents legacy overlap.
+        let bounded_enabled = shared
+            .bounded_group_recovery_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if bounded_enabled && bounded_recovery.is_none() && TokioInstant::now() >= bounded_probe_at
+        {
+            let now = TokioInstant::now();
+            bounded_probe_at = now + bounded_recovery::PROBE_INTERVAL;
+            let probe = (|| -> Result<Option<bounded_recovery::Plan>, AppError> {
+                let storage = client.app.account_storage(&client.state.label)?;
+                let remaining = client
+                    .recovery_owner
+                    .retry_remaining(&storage, Instant::now())?;
+                if !remaining.is_zero() {
+                    bounded_probe_at = now + remaining.min(bounded_recovery::PROBE_INTERVAL);
+                    return Ok(None);
+                }
+                #[cfg(test)]
+                shared
+                    .bounded_preparation_probes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance)
+            })();
+            match probe {
+                Ok(Some(plan)) => {
+                    bounded_prepare_error_reported = false;
+                    bounded_recovery = Some(bounded_recovery::Job::start(&client, plan))
+                }
+                Ok(None) => bounded_prepare_error_reported = false,
+                Err(error) => {
+                    if !bounded_prepare_error_reported {
+                        publish_app_runtime_account_error(
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            account_error_message("bounded recovery preparation failed", &error),
+                        );
+                        bounded_prepare_error_reported = true;
+                    }
+                }
+            }
+        }
         let ready_command = ready_command_index(&pending, &media_http);
         tokio::select! {
             biased;
@@ -1148,6 +1198,15 @@ async fn run_app_runtime_account_worker(
             }
             _ = &mut shutdown => {
                 return;
+            }
+            _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
+            completed = async {
+                bounded_recovery.as_mut().expect("bounded task exists").wait().await
+            }, if bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
+                bounded_recovery.as_mut().expect("bounded task exists").accept(completed);
+                #[cfg(test)]
+                shared.bounded_result_ready.notify_one();
+                yield_to_bounded_admission = true;
             }
             recovered = async {
                 let recovery = welcome_recovery
@@ -1202,8 +1261,10 @@ async fn run_app_runtime_account_worker(
                     Some(command) => Some(command),
                     None => commands.recv().await,
                 }
-            }, if !yield_to_convergence || !scheduled_convergence.has_ready() => {
+            }, if (!yield_to_convergence || !scheduled_convergence.has_ready())
+                && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
+                yield_to_bounded_admission = true;
                 match command {
                     Some(command) => {
                         let command = match command {
@@ -1273,8 +1334,10 @@ async fn run_app_runtime_account_worker(
                     None => return,
                 }
             }
-            _ = scheduled_convergence.timer.as_mut() => {
+            _ = scheduled_convergence.timer.as_mut(), if !yield_to_bounded_admission
+                || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
                 yield_to_convergence = false;
+                yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence);
                 // Recovery owns the live client, but member/roster reads can
@@ -1382,7 +1445,58 @@ async fn run_app_runtime_account_worker(
 
                 phase.finish(TelemetryOutcome::Success);
             }
+            _ = async {}, if yield_to_bounded_admission
+                && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)
+                && !bounded_admission_test_paused(&shared, bounded_recovery.as_ref()) => {
+                let job = bounded_recovery.as_mut().expect("bounded admission job exists");
+                for _ in 0..bounded_recovery::MAX_ADMISSION_PER_TURN {
+                    #[cfg(test)]
+                    let had_input = job.has_input();
+                    match job.admit_one(&mut client).await {
+                        Ok(summary) => {
+                            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                            publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
+                            schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                            #[cfg(test)]
+                            if had_input {
+                                shared.bounded_prefix_admitted.notify_one();
+                            }
+                        }
+                        Err(error) => {
+                            publish_app_runtime_account_error(&events, &account_id_hex, &account_label,
+                                account_error_message("bounded recovery admission failed", &error));
+                            // The durable demand and successfully admitted prefix survive.
+                            bounded_recovery = None;
+                            #[cfg(test)]
+                            shared.bounded_recovery_finished.notify_one();
+                            break;
+                        }
+                    }
+                }
+                if bounded_recovery.as_ref().is_some_and(|job| job.ready() && !job.has_input())
+                    && let Some(job) = bounded_recovery.take() {
+                        if let Err(error) = job.finish(&mut client) {
+                            publish_app_runtime_account_error(&events, &account_id_hex, &account_label,
+                                account_error_message("bounded recovery checkpoint failed", &error));
+                        }
+                        #[cfg(test)]
+                        shared.bounded_recovery_finished.notify_one();
+                }
+                yield_to_bounded_admission = false;
+            }
+            _ = async {
+                #[cfg(test)]
+                if shared.bounded_pause_before_admission.load(std::sync::atomic::Ordering::SeqCst)
+                    || shared.bounded_pause_after_first_admission.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                sleep(bounded_recovery::ADMISSION_YIELD_DELAY).await;
+            }, if !yield_to_bounded_admission
+                && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
+                yield_to_bounded_admission = true;
+            }
             received = client.receive_next_delivery() => {
+                yield_to_bounded_admission = true;
                 // Only the transport wait participates in `select!`. Once a
                 // delivery has been claimed, finish ingest + incidental
                 // publish + projection as one uncancelled worker operation;
@@ -5684,6 +5798,29 @@ fn account_error_message(prefix: &str, err: &AppError) -> String {
     format!("{prefix}: {}", err.privacy_safe_kind())
 }
 
+fn bounded_admission_test_paused(
+    shared: &RuntimeSharedServices,
+    job: Option<&bounded_recovery::Job>,
+) -> bool {
+    #[cfg(test)]
+    {
+        job.is_some_and(|job| {
+            shared
+                .bounded_pause_before_admission
+                .load(std::sync::atomic::Ordering::SeqCst)
+                || (shared
+                    .bounded_pause_after_first_admission
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && job.has_admitted_prefix())
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (shared, job);
+        false
+    }
+}
+
 async fn release_startup_client_if_opened(
     open_client: Pin<&mut impl std::future::Future<Output = Result<AppClient, AppError>>>,
 ) {
@@ -5711,6 +5848,8 @@ fn publish_app_runtime_account_error(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     use marmot_account::AccountHome;
 
@@ -5834,6 +5973,1012 @@ mod tests {
             pending.pop_front(),
             Some(AccountWorkerCommand::ConnectivityRestored { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn bounded_known_group_acquisition_wait_keeps_worker_and_live_subscriptions_available() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use storage_sqlite::RecoveryRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime
+            .shared_services()
+            .bounded_group_recovery_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.publish_key_package("bob").await.unwrap();
+        let group = runtime
+            .create_group_with_options(
+                "alice",
+                "bounded",
+                std::slice::from_ref(&bob.account_id_hex),
+                AppCreateGroupOptions {
+                    relays: Some(vec![
+                        "wss://relay.example".into(),
+                        "wss://relay-two.example".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        runtime
+            .accounts()
+            .workers
+            .lock()
+            .await
+            .remove(&bob.account_id_hex)
+            .unwrap()
+            .shutdown()
+            .await;
+        runtime
+            .send_message("alice", &group, b"known but unreceived".to_vec())
+            .await
+            .unwrap();
+        let historical = relay
+            .last_published_group_event()
+            .expect("real group ciphertext was published");
+        let event_id: [u8; 32] = hex::decode(&historical.id).unwrap().try_into().unwrap();
+        let storage = app.account_storage("bob").unwrap();
+        let group_route = match historical.to_transport_message().unwrap().envelope {
+            cgka_traits::transport::TransportEnvelope::GroupMessage { transport_group_id } => {
+                storage_sqlite::TransportReconciliationRoute::Group(
+                    transport_group_id.try_into().unwrap(),
+                )
+            }
+            _ => unreachable!("published event is group ciphertext"),
+        };
+        assert!(
+            !storage
+                .retained_recovery_event(&group_route, &event_id, None, historical.created_at)
+                .unwrap(),
+            "the controlled SDK has seen this ID, but MDK has not retained it"
+        );
+        runtime.reconcile_accounts().await.unwrap();
+        storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &event_id,
+                },
+                crate::client::recovery::wall_now_ms().unwrap(),
+            )
+            .unwrap();
+        *relay.acquisition_result.lock().unwrap() =
+            Some(transport_nostr_adapter::NostrAcquisitionResult {
+                endpoints:
+                    ["wss://relay.example", "wss://relay-two.example"]
+                        .into_iter()
+                        .map(
+                            |endpoint| {
+                                transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint: cgka_traits::TransportEndpoint(endpoint.into()),
+                    session_generation: Some(1),
+                    events: vec![historical.clone()],
+                    end: transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
+                    stats: Default::default(),
+                }
+                            },
+                        )
+                        .collect(),
+            });
+        relay
+            .acquisition_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let commands = runtime.accounts().worker_commands("bob").await.unwrap();
+        let (respond, advanced) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::AdvanceRecoveryClock {
+                elapsed: Duration::from_secs(600),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), advanced)
+            .await
+            .unwrap()
+            .unwrap();
+        let (respond, response) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), relay.acquisition_entered.notified())
+            .await
+            .expect("owner-authorized acquisition starts");
+        let subscriptions = relay.subscription_count();
+        timeout(
+            Duration::from_secs(5),
+            runtime.send_message("bob", &group, b"live while history waits".to_vec()),
+        )
+        .await
+        .expect("queued send must not wait for EOSE")
+        .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if app.messages("alice").unwrap().iter().any(|message| {
+                    message.group_id_hex == hex::encode(&group)
+                        && message.plaintext == "live while history waits"
+                }) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live projection continues while history waits");
+        runtime
+            .send_message("alice", &group, b"incoming while history waits".to_vec())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if app.messages("bob").unwrap().iter().any(|message| {
+                    message.group_id_hex == hex::encode(&group)
+                        && message.plaintext == "incoming while history waits"
+                }) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("acquiring account projects live input while history waits");
+        let bob_commands = runtime.accounts().worker_commands("alice").await.unwrap();
+        let (respond, response) = oneshot::channel();
+        bob_commands
+            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .unwrap();
+        timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            relay.subscription_count(),
+            subscriptions,
+            "bounded history does not rebuild live interests"
+        );
+        assert_eq!(
+            relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.known_event_id == Some(event_id))
+        );
+        relay.acquisition_release.notify_one();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .all(|demand| demand.known_event_id != Some(event_id))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("known event becomes durably disposed after duplicate copies");
+        assert!(
+            storage
+                .retained_recovery_event(&group_route, &event_id, None, historical.created_at)
+                .unwrap()
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_three_relay_scope_leaves_legacy_attempt_eligible() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use storage_sqlite::RecoveryRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.publish_key_package("bob").await.unwrap();
+        let group = runtime
+            .create_group_with_options(
+                "alice",
+                "three relays",
+                std::slice::from_ref(&bob.account_id_hex),
+                AppCreateGroupOptions {
+                    relays: Some(vec![
+                        "wss://relay.example".into(),
+                        "wss://relay-two.example".into(),
+                        "wss://relay-three.example".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        runtime
+            .accounts()
+            .workers
+            .lock()
+            .await
+            .remove(&bob.account_id_hex)
+            .unwrap()
+            .shutdown()
+            .await;
+        runtime
+            .send_message("alice", &group, b"known but unreceived".to_vec())
+            .await
+            .unwrap();
+        let historical = relay.last_published_group_event().unwrap();
+        let event_id: [u8; 32] = hex::decode(&historical.id).unwrap().try_into().unwrap();
+        let storage = app.account_storage("bob").unwrap();
+        storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &event_id,
+                },
+                crate::client::recovery::wall_now_ms().unwrap(),
+            )
+            .unwrap();
+        let mut client = app.client("bob").await.unwrap();
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let before = storage.recovery_retry_state().unwrap();
+        assert!(
+            bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance)
+                .unwrap()
+                .is_none()
+        );
+        let after = storage.recovery_retry_state().unwrap();
+        assert_eq!(after.attempt_serial, before.attempt_serial);
+        assert_eq!(after.not_before_ms, before.not_before_ms);
+        assert_eq!(
+            relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let grant = client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .expect("legacy executor remains eligible for the full route");
+        assert!(grant.plan().unwrap().iter().any(|obligation| {
+            obligation.scopes.iter().any(|scope| {
+                scope.goal.known_event_id == Some(event_id)
+                    && scope.goal.required_endpoints.len() == 3
+            })
+        }));
+        drop(grant);
+        drop(client);
+        runtime.shutdown().await;
+    }
+
+    struct BoundedKnownFixture {
+        _dir: tempfile::TempDir,
+        app: MarmotApp,
+        runtime: super::super::MarmotAppRuntime,
+        relay: Arc<ScriptedPushRelayClient>,
+        group: GroupId,
+        historical: transport_nostr_peeler::NostrTransportEvent,
+        event_id: [u8; 32],
+        route: storage_sqlite::TransportReconciliationRoute,
+        demand_id: [u8; 16],
+    }
+
+    async fn bounded_known_fixture() -> BoundedKnownFixture {
+        bounded_known_fixture_with_delay(None).await
+    }
+
+    async fn bounded_known_fixture_with_delay(delay_ms: Option<u64>) -> BoundedKnownFixture {
+        use storage_sqlite::RecoveryRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut config = crate::MarmotAppConfig::default();
+        if let Some(delay_ms) = delay_ms {
+            config = config
+                .with_dev_settlement_quiescence_ms(100)
+                .with_dev_scheduled_convergence_delay_ms(delay_ms);
+        }
+        let app = MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example", config)
+            .with_test_relay_client(relay.clone());
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime
+            .shared_services()
+            .bounded_group_recovery_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.publish_key_package("bob").await.unwrap();
+        let group = runtime
+            .create_group_with_options(
+                "alice",
+                "bounded fixture",
+                std::slice::from_ref(&bob.account_id_hex),
+                AppCreateGroupOptions {
+                    relays: Some(vec![
+                        "wss://relay.example".into(),
+                        "wss://relay-two.example".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        runtime
+            .accounts()
+            .workers
+            .lock()
+            .await
+            .remove(&bob.account_id_hex)
+            .unwrap()
+            .shutdown()
+            .await;
+        runtime
+            .send_message("alice", &group, b"known but unreceived".to_vec())
+            .await
+            .unwrap();
+        let historical = relay.last_published_group_event().unwrap();
+        let event_id: [u8; 32] = hex::decode(&historical.id).unwrap().try_into().unwrap();
+        let storage = app.account_storage("bob").unwrap();
+        let route = match historical.to_transport_message().unwrap().envelope {
+            cgka_traits::transport::TransportEnvelope::GroupMessage { transport_group_id } => {
+                storage_sqlite::TransportReconciliationRoute::Group(
+                    transport_group_id.try_into().unwrap(),
+                )
+            }
+            _ => unreachable!(),
+        };
+        runtime.reconcile_accounts().await.unwrap();
+        let demand_id = storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &event_id,
+                },
+                crate::client::recovery::wall_now_ms().unwrap(),
+            )
+            .unwrap()
+            .id;
+        BoundedKnownFixture {
+            _dir: dir,
+            app,
+            runtime,
+            relay,
+            group,
+            historical,
+            event_id,
+            route,
+            demand_id,
+        }
+    }
+
+    async fn advance_bounded_fixture_clock(fixture: &BoundedKnownFixture) {
+        let commands = fixture
+            .runtime
+            .accounts()
+            .worker_commands("bob")
+            .await
+            .unwrap();
+        let (respond, advanced) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::AdvanceRecoveryClock {
+                elapsed: Duration::from_secs(600),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), advanced)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn wake_bounded_fixture(fixture: &BoundedKnownFixture) {
+        advance_bounded_fixture_clock(fixture).await;
+        let commands = fixture
+            .runtime
+            .accounts()
+            .worker_commands("bob")
+            .await
+            .unwrap();
+        let (respond, response) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: fixture.group.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    fn controlled_bounded_result(
+        left: Vec<transport_nostr_peeler::NostrTransportEvent>,
+        left_end: transport_nostr_adapter::NostrAcquisitionEnd,
+        right: Vec<transport_nostr_peeler::NostrTransportEvent>,
+        right_end: transport_nostr_adapter::NostrAcquisitionEnd,
+    ) -> transport_nostr_adapter::NostrAcquisitionResult {
+        transport_nostr_adapter::NostrAcquisitionResult {
+            endpoints: [
+                ("wss://relay.example", left, left_end),
+                ("wss://relay-two.example", right, right_end),
+            ]
+            .into_iter()
+            .map(
+                |(endpoint, events, end)| transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint: cgka_traits::TransportEndpoint(endpoint.into()),
+                    session_generation: Some(1),
+                    events,
+                    end,
+                    stats: Default::default(),
+                },
+            )
+            .collect::<Vec<_>>(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_saturation_preserves_demand_then_partial_result_admits_known_event() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use storage_sqlite::RecoveryScopeOutcome;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        let fixture = bounded_known_fixture().await;
+        let storage = fixture.app.account_storage("bob").unwrap();
+        *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            vec![fixture.historical.clone(); bounded_recovery::MAX_EVENTS_PER_ENDPOINT + 1],
+            NostrAcquisitionEnd::ItemLimitReached,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        fixture
+            .relay
+            .acquisition_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        wake_bounded_fixture(&fixture).await;
+        timeout(
+            Duration::from_secs(5),
+            fixture.relay.acquisition_entered.notified(),
+        )
+        .await
+        .unwrap();
+        fixture.relay.acquisition_release.notify_one();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if storage
+                    .recovery_scope_snapshots(fixture.demand_id)
+                    .unwrap()
+                    .iter()
+                    .any(|scope| {
+                        scope
+                            .checkpoints
+                            .iter()
+                            .any(|checkpoint| checkpoint.outcome == RecoveryScopeOutcome::Unknown)
+                    })
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("saturated response checkpoints without admission");
+        assert!(
+            !storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+        let probes = fixture
+            .runtime
+            .shared_services()
+            .bounded_preparation_probes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let retry = storage.recovery_retry_state().unwrap();
+        let commands = fixture
+            .runtime
+            .accounts()
+            .worker_commands("bob")
+            .await
+            .unwrap();
+        for _ in 0..24 {
+            let (respond, response) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                    group_id: fixture.group.clone(),
+                    respond,
+                })
+                .unwrap();
+            timeout(Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            fixture
+                .runtime
+                .shared_services()
+                .bounded_preparation_probes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            probes,
+            "live command bursts do not re-run bounded preparation during owner cooldown"
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+
+        fixture.runtime.shutdown().await;
+
+        let partial = bounded_known_fixture().await;
+        let partial_storage = partial.app.account_storage("bob").unwrap();
+        *partial.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            vec![partial.historical.clone()],
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        wake_bounded_fixture(&partial).await;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if partial_storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .all(|demand| demand.ticket.id != partial.demand_id)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("partial relay result retains exact known event");
+        assert!(
+            partial_storage
+                .retained_recovery_event(
+                    &partial.route,
+                    &partial.event_id,
+                    None,
+                    partial.historical.created_at
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            partial
+                .relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        partial.runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_stale_loss_and_route_results_cannot_clear_known_demand() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        for new_loss in [true, false] {
+            let fixture = bounded_known_fixture().await;
+            let storage = fixture.app.account_storage("bob").unwrap();
+            let before = storage.recovery_revision_fence().unwrap();
+            *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+                vec![fixture.historical.clone()],
+                NostrAcquisitionEnd::RequestPolicySatisfied,
+                Vec::new(),
+                NostrAcquisitionEnd::Deadline,
+            ));
+            fixture
+                .relay
+                .acquisition_block
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            wake_bounded_fixture(&fixture).await;
+            timeout(
+                Duration::from_secs(5),
+                fixture.relay.acquisition_entered.notified(),
+            )
+            .await
+            .unwrap();
+            if new_loss {
+                storage
+                    .record_account_delivery_loss("bob", 777, 1, crate::unix_now_seconds())
+                    .unwrap();
+                storage.synchronize_account_delivery_loss("bob").unwrap();
+            } else {
+                storage.observe_recovery_route_snapshot([0xAA; 32]).unwrap();
+            }
+            let changed = storage.recovery_revision_fence().unwrap();
+            assert!(if new_loss {
+                changed.loss_revision > before.loss_revision
+            } else {
+                changed.route_revision > before.route_revision
+            });
+            fixture.relay.acquisition_release.notify_one();
+            timeout(
+                Duration::from_secs(5),
+                fixture
+                    .runtime
+                    .shared_services()
+                    .bounded_recovery_finished
+                    .notified(),
+            )
+            .await
+            .expect("stale result finishes without admission");
+            assert!(
+                !storage
+                    .retained_recovery_event(
+                        &fixture.route,
+                        &fixture.event_id,
+                        None,
+                        fixture.historical.created_at,
+                    )
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .any(|demand| demand.ticket.id == fixture.demand_id)
+            );
+            fixture.runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_after_durable_prefix_preserves_pending_demand_on_reopen() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        let fixture = bounded_known_fixture().await;
+        fixture
+            .runtime
+            .shared_services()
+            .bounded_pause_after_first_admission
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            vec![fixture.historical.clone(), fixture.historical.clone()],
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        wake_bounded_fixture(&fixture).await;
+        timeout(
+            Duration::from_secs(5),
+            fixture
+                .runtime
+                .shared_services()
+                .bounded_prefix_admitted
+                .notified(),
+        )
+        .await
+        .expect("first input is durably admitted before the next worker turn");
+        let storage = fixture.app.account_storage("bob").unwrap();
+        assert!(
+            storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id),
+            "an uncheckpointed exact ID remains retryable after its durable prefix"
+        );
+        fixture.runtime.shutdown().await;
+        assert_eq!(
+            bounded_recovery::available_credits(),
+            bounded_recovery::MAX_CONCURRENT_JOBS
+        );
+        drop(storage);
+
+        let reopened = MarmotApp::with_relay(fixture._dir.path(), "wss://relay.example")
+            .with_test_relay_client(fixture.relay.clone());
+        let reopened_storage = reopened.account_storage("bob").unwrap();
+        assert!(
+            reopened_storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            reopened_storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_before_admission_reopens_unretained_demand() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        let fixture = bounded_known_fixture().await;
+        fixture
+            .runtime
+            .shared_services()
+            .bounded_pause_before_admission
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            vec![fixture.historical.clone()],
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        advance_bounded_fixture_clock(&fixture).await;
+        timeout(
+            Duration::from_secs(5),
+            fixture
+                .runtime
+                .shared_services()
+                .bounded_result_ready
+                .notified(),
+        )
+        .await
+        .expect("network result is owned but admission is paused");
+        let storage = fixture.app.account_storage("bob").unwrap();
+        let attempt = storage.recovery_retry_state().unwrap().attempt_serial;
+        assert!(
+            !storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+        fixture.runtime.shutdown().await;
+        assert_eq!(
+            bounded_recovery::available_credits(),
+            bounded_recovery::MAX_CONCURRENT_JOBS
+        );
+        drop(storage);
+
+        let reopened = MarmotApp::with_relay(fixture._dir.path(), "wss://relay.example")
+            .with_test_relay_client(fixture.relay.clone());
+        let reopened_storage = reopened.account_storage("bob").unwrap();
+        assert_eq!(
+            reopened_storage
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            attempt
+        );
+        assert!(
+            !reopened_storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            reopened_storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-policy-overrides")]
+    async fn retained_multi_epoch_backlog_advances_while_bounded_history_waits() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use cgka_traits::storage::ConvergencePassStorage;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        let fixture = bounded_known_fixture_with_delay(Some(60_000)).await;
+        let storage = fixture.app.account_storage("bob").unwrap();
+        let initial_epoch = fixture
+            .runtime
+            .group_mls_state("bob", &fixture.group)
+            .await
+            .unwrap()
+            .epoch;
+        fixture
+            .runtime
+            .update_group_profile("alice", &fixture.group, Some("epoch one".into()), None)
+            .await
+            .unwrap();
+        let first = fixture.relay.last_published_group_event().unwrap();
+        fixture
+            .runtime
+            .update_group_profile("alice", &fixture.group, Some("epoch two".into()), None)
+            .await
+            .unwrap();
+        let second = fixture.relay.last_published_group_event().unwrap();
+        assert_ne!(first.id, second.id);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let retained = [&first, &second].into_iter().all(|event| {
+                    let id: [u8; 32] = hex::decode(&event.id).unwrap().try_into().unwrap();
+                    storage
+                        .retained_recovery_event(&fixture.route, &id, None, event.created_at)
+                        .unwrap()
+                });
+                if retained && storage.convergence_pass(&fixture.group).unwrap().is_some() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("two epoch inputs are retained before acquisition begins");
+        let alice_tip = fixture
+            .runtime
+            .group_mls_state("alice", &fixture.group)
+            .await
+            .unwrap()
+            .epoch;
+        assert!(alice_tip >= initial_epoch + 2);
+        assert!(
+            fixture
+                .runtime
+                .group_mls_state("bob", &fixture.group)
+                .await
+                .unwrap()
+                .epoch
+                < alice_tip
+        );
+        *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        fixture
+            .relay
+            .acquisition_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        wake_bounded_fixture(&fixture).await;
+        timeout(
+            Duration::from_secs(5),
+            fixture.relay.acquisition_entered.notified(),
+        )
+        .await
+        .unwrap();
+        let retry = storage.recovery_retry_state().unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if fixture
+                    .runtime
+                    .group_mls_state("bob", &fixture.group)
+                    .await
+                    .unwrap()
+                    .epoch
+                    > initial_epoch
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first retained epoch advances without a recovery retry");
+        // The next durable pass starts at the new engine epoch and needs its
+        // own 100 ms local settlement window before the scheduled wake.
+        sleep(Duration::from_millis(150)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        let converged = timeout(Duration::from_secs(30), async {
+            loop {
+                let epoch = fixture
+                    .runtime
+                    .group_mls_state("bob", &fixture.group)
+                    .await
+                    .unwrap()
+                    .epoch;
+                let profile = fixture
+                    .app
+                    .group("bob", &hex::encode(&fixture.group))
+                    .unwrap()
+                    .unwrap()
+                    .profile
+                    .name;
+                if epoch >= alice_tip && profile == "epoch two" {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            converged.is_ok(),
+            "retained backlog stalled: bob_epoch={}, alice_epoch={}, bob_profile={}, pass={}",
+            fixture
+                .runtime
+                .group_mls_state("bob", &fixture.group)
+                .await
+                .unwrap()
+                .epoch,
+            alice_tip,
+            fixture
+                .app
+                .group("bob", &hex::encode(&fixture.group))
+                .unwrap()
+                .unwrap()
+                .profile
+                .name,
+            storage.convergence_pass(&fixture.group).unwrap().is_some()
+        );
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            retry.attempt_serial
+        );
+        assert_eq!(
+            fixture
+                .relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        fixture.relay.acquisition_release.notify_one();
+        fixture.runtime.shutdown().await;
     }
 
     #[tokio::test]

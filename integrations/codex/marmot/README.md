@@ -172,7 +172,22 @@ text is returned to Marmot.
 
 ## Inbound attachments
 
-All attachments from one Marmot message are downloaded in message order, copied into one owner-only temporary batch, and passed to one Codex turn. Codex currently accepts image attachments only; a non-image, failed download, invalid local file, count-limit breach, or aggregate-size breach rejects the complete batch before Codex starts. Batch copies are removed after success, failure, timeout, or cancellation, and stale batch directories are reconciled when the connector starts.
+All attachments from one Marmot message are downloaded in message order, copied into one owner-only temporary batch, and passed to one Codex turn. The connector revalidates every staged file immediately before starting Codex and supplies an ordered JSON manifest in the prompt. The manifest marks attachment content and metadata as untrusted data and gives Codex the private path, connector-sanitized staged file name, declared media type, byte size, and source ordinal. Delivery is selected from file bytes, never from sender-controlled MIME strings or extensions:
+
+| File class | Byte-level recognition | Codex delivery |
+| --- | --- | --- |
+| Native images | PNG, JPEG, GIF, or WebP signature | Ordered native `--image` argument plus staged-file manifest entry |
+| Text and source | Complete file is valid UTF-8 and contains no NUL byte (ANSI-coloured logs are accepted) | Staged-file manifest entry |
+| PDF | `%PDF-` signature | Staged-file manifest entry |
+| Audio | WAV, MP3, or FLAC header; or an Ogg first packet identifying Vorbis, Opus, or FLAC | Staged-file manifest entry |
+| Archives | ZIP, gzip, bzip2, xz, 7z, RAR, or ustar-format tar signature | Staged-file manifest entry |
+| Other image formats, opaque binary, or any unrecognized format | No supported signature and not UTF-8 text | Unsupported; reject the complete batch before starting Codex |
+
+The compatibility pin for this matrix is Codex CLI 0.155.1. Its `codex exec` surface exposes native file input only through `--image`; the connector probes `codex exec --help` before any native-image turn and gives an actionable pre-spawn error when that capability is absent or cannot be checked. A failed image capability probe rejects the complete mixed batch instead of silently dropping or demoting an image. Non-image files do not rely on a version-specific CLI flag: their private paths are supplied in the stdin prompt manifest and Codex reads them with its normal file tools. The app-server v2 protocol separately exposes structured local image and audio inputs at [`openai/codex@78245b47`](https://github.com/openai/codex/blob/78245b47af2a7aafcabe025828ceecca69db4df1/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L425-L456), but this connector invokes `codex exec`, not app-server, so audio uses the staged-file fallback instead of being mislabeled as an image.
+
+The same delivery contract applies to new and resumed threads. Missing, size-changed, unreadable, non-regular, unsupported-format, count-limit, or aggregate-size failures reject the complete batch before Codex starts; no attachment is silently dropped. Recognition is capability routing rather than a content-security boundary: short magic signatures can be spoofed, and attachment contents remain untrusted.
+
+Batch copies remain available for the complete turn and are removed after success, failure, timeout, or cancellation. Stale batch directories are reconciled when the connector starts. The staging directory is owner-only and each file is owner-readable only. On Unix, immediate pre-spawn validation refuses a symlink final component and performs an exact-size bounded read through the opened file descriptor; the backend necessarily receives a path, so other processes running as the connector's own operating-system user remain inside the trust boundary.
 
 The optional bearer token grants the complete `wn-agent` control API for every
 account in its home; the sender allowlist does not narrow that authority. Use a
@@ -205,7 +220,10 @@ bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$(awk 'BE
 ```
 
 The real Codex contract test is ignored by default because it requires an
-installed, authenticated Codex and makes a model request:
+installed, authenticated Codex CLI and makes model requests. The documented
+compatibility matrix was validated with Codex CLI 0.155.1.
+Its first turn proves that a staged non-image text attachment is readable, and
+its second turn verifies session resume:
 
 ```sh
 cargo test -p wn-codex real_codex_exec_contract -- --ignored --nocapture

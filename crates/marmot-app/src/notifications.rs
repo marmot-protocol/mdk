@@ -1,28 +1,31 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
 use hkdf::Hkdf;
-use nostr::{
-    Event, EventBuilder, Keys, Kind, NostrSigner, PublicKey, Tag, TagKind, Timestamp,
-    UnsignedEvent,
-    base64::Engine as _,
-    base64::engine::general_purpose::STANDARD as BASE64_STANDARD,
-    secp256k1::{
-        Message, Parity, PublicKey as SecpPublicKey, SECP256K1, SecretKey, XOnlyPublicKey, ecdh,
-        schnorr::Signature as SchnorrSignature,
-    },
+use nostr::nips::nip59::GiftWrapBuilder;
+#[cfg(test)]
+use nostr::prelude::FinalizeEvent;
+use nostr::prelude::{
+    Event, EventBuilder, FinalizeEventAsync, FinalizeUnsignedEvent, Keys, Kind, PublicKey,
+    Signature, Tag, Timestamp, UnsignedEvent,
 };
 use rand::{RngCore, rngs::OsRng};
+use secp256k1::{
+    Parity, PublicKey as SecpPublicKey, Secp256k1, SecretKey, XOnlyPublicKey, ecdh,
+    schnorr::Signature as SchnorrSignature,
+};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{DeserializeOwned, Error as _, IgnoredAny, SeqAccess, Visitor},
 };
 use sha2::{Digest, Sha256};
-use transport_nostr_peeler::NostrTransportEvent;
+use transport_nostr_peeler::{MarmotNostrSigner, NostrTransportEvent};
 
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
 use cgka_traits::app_event::{
@@ -561,7 +564,7 @@ pub fn encrypted_push_token(
     let server_pubkey = SecpPublicKey::from_x_only_public_key(server_xonly, Parity::Even);
 
     let ephemeral_secret = random_secret_key();
-    let ephemeral_pubkey = SecpPublicKey::from_secret_key_global(&ephemeral_secret);
+    let ephemeral_pubkey = SecpPublicKey::from_secret_key(&Secp256k1::new(), &ephemeral_secret);
     let (ephemeral_xonly, _) = ephemeral_pubkey.x_only_public_key();
     let shared_x = secp256k1_ecdh_x(&server_pubkey, &ephemeral_secret);
     let key = push_encryption_key(&shared_x)?;
@@ -747,34 +750,19 @@ fn push_owner_proof_event(
         .map_err(|_| AppError::InvalidPushGossip("member id must be a Nostr pubkey".into()))?;
     let relay = normalized_relay_hint(input.relay_hint).unwrap_or("");
     let mut tags = vec![
-        Tag::custom(TagKind::custom("d"), [input.domain.to_owned()]),
-        Tag::custom(TagKind::custom("group_id"), [input.group_id_hex.to_owned()]),
-        Tag::custom(
-            TagKind::custom("member_id"),
-            [input.member_id_hex.to_owned()],
-        ),
-        Tag::custom(
-            TagKind::custom("leaf_index"),
-            [input.leaf_index.to_string()],
-        ),
-        Tag::custom(
-            TagKind::custom("platform"),
-            [input.platform.as_str().to_owned()],
-        ),
-        Tag::custom(
-            TagKind::custom("server_pubkey"),
-            [input.server_pubkey_hex.to_owned()],
-        ),
-        Tag::custom(
-            TagKind::custom("token_fingerprint"),
-            [input.token_fingerprint.to_owned()],
-        ),
-        Tag::custom(TagKind::custom("owner_ts"), [input.owner_ts.to_string()]),
-        Tag::custom(TagKind::custom("relay_hint"), [relay.to_owned()]),
+        Tag::custom("d", [input.domain.to_owned()]),
+        Tag::custom("group_id", [input.group_id_hex.to_owned()]),
+        Tag::custom("member_id", [input.member_id_hex.to_owned()]),
+        Tag::custom("leaf_index", [input.leaf_index.to_string()]),
+        Tag::custom("platform", [input.platform.as_str().to_owned()]),
+        Tag::custom("server_pubkey", [input.server_pubkey_hex.to_owned()]),
+        Tag::custom("token_fingerprint", [input.token_fingerprint.to_owned()]),
+        Tag::custom("owner_ts", [input.owner_ts.to_string()]),
+        Tag::custom("relay_hint", [relay.to_owned()]),
     ];
     if input.encrypted_token.is_some() {
         tags.push(Tag::custom(
-            TagKind::custom("encrypted_token_encoding"),
+            "encrypted_token_encoding",
             ["base64".to_owned()],
         ));
     }
@@ -782,10 +770,12 @@ fn push_owner_proof_event(
         .encrypted_token
         .map(|token| BASE64_STANDARD.encode(token))
         .unwrap_or_default();
-    Ok(EventBuilder::new(Kind::Custom(kind), content)
+    let mut event = EventBuilder::new(Kind::Custom(kind), content)
         .tags(tags)
         .custom_created_at(Timestamp::zero())
-        .build(member_pubkey))
+        .finalize_unsigned(member_pubkey);
+    event.ensure_id();
+    Ok(event)
 }
 
 fn push_owner_sig_from_signed_event(
@@ -811,7 +801,7 @@ fn push_owner_sig_from_signed_event(
     signed
         .verify()
         .map_err(|err| AppError::Publish(format!("invalid push owner proof signature: {err}")))?;
-    Ok(hex::encode(signed.sig.serialize()))
+    Ok(hex::encode(signed.sig.to_bytes()))
 }
 
 /// Verify a Nostr event signature by `member_id_hex` over the canonical,
@@ -821,7 +811,7 @@ fn verify_push_owner_sig(proof_event: UnsignedEvent, owner_sig_hex: &str) -> boo
     let Ok(sig_bytes) = hex::decode(owner_sig_hex) else {
         return false;
     };
-    let Ok(sig) = SchnorrSignature::from_slice(&sig_bytes) else {
+    let Ok(sig) = Signature::from_slice(&sig_bytes) else {
         return false;
     };
     #[cfg(test)]
@@ -852,11 +842,10 @@ fn verify_push_owner_sig_legacy(
     let Ok(sig) = SchnorrSignature::from_slice(&sig_bytes) else {
         return false;
     };
-    let message = Message::from_digest(digest);
     #[cfg(test)]
     note_owner_signature_verification();
-    SECP256K1
-        .verify_schnorr(&sig, &message, &member_pubkey)
+    Secp256k1::new()
+        .verify_schnorr(&sig, &digest, &member_pubkey)
         .is_ok()
 }
 
@@ -909,7 +898,7 @@ impl GroupPushTokenRecord {
     pub(crate) fn sign_owner(&mut self, keys: &Keys) -> Result<(), AppError> {
         let proof_event = self.owner_proof_event()?;
         let signed = proof_event
-            .sign_with_keys(keys)
+            .finalize(keys)
             .map_err(|err| AppError::Publish(format!("push owner proof: {err}")))?;
         self.owner_sig = push_owner_sig_from_signed_event(&self.owner_proof_event()?, signed)?;
         Ok(())
@@ -917,7 +906,7 @@ impl GroupPushTokenRecord {
 
     pub(crate) async fn sign_owner_with_signer(
         &mut self,
-        signer: &dyn NostrSigner,
+        signer: &dyn MarmotNostrSigner,
     ) -> Result<(), AppError> {
         let proof_event = self.owner_proof_event()?;
         let signed = signer
@@ -1006,7 +995,7 @@ impl PushTokenRemovalRecord {
         let proof_event = self.owner_proof_event(group_id_hex)?;
         let signed = proof_event
             .clone()
-            .sign_with_keys(keys)
+            .finalize(keys)
             .map_err(|err| AppError::Publish(format!("push removal owner proof: {err}")))?;
         self.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed)?;
         Ok(())
@@ -1015,7 +1004,7 @@ impl PushTokenRemovalRecord {
     pub(crate) async fn sign_owner_with_signer(
         &mut self,
         group_id_hex: &str,
-        signer: &dyn NostrSigner,
+        signer: &dyn MarmotNostrSigner,
     ) -> Result<(), AppError> {
         let proof_event = self.owner_proof_event(group_id_hex)?;
         let signed = signer
@@ -1084,12 +1073,10 @@ pub async fn build_notification_gift_wrap(
     let seal_keys = Keys::generate();
     let rumor: UnsignedEvent =
         EventBuilder::new(Kind::Custom(KIND_MARMOT_NOTIFICATION_RUMOR as u16), content)
-            .tags([Tag::custom(
-                TagKind::custom(NOTIFICATION_VERSION_TAG),
-                [PUSH_VERSION],
-            )])
-            .build(seal_keys.public_key());
-    let gift_wrap = EventBuilder::gift_wrap(&seal_keys, &server_pubkey, rumor, [])
+            .tags([Tag::custom(NOTIFICATION_VERSION_TAG, [PUSH_VERSION])])
+            .finalize_unsigned(seal_keys.public_key());
+    let gift_wrap = GiftWrapBuilder::new(server_pubkey, rumor)
+        .finalize_async(&seal_keys)
         .await
         .map_err(|err| AppError::Publish(format!("notification gift wrap: {err}")))?;
     NostrTransportEvent::from_nostr_event(&gift_wrap)
@@ -1101,7 +1088,7 @@ pub(crate) async fn local_token_gossip_payload(
     member_id_hex: String,
     leaf_index: u32,
     registration: &StoredPushRegistration,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
 ) -> Result<(PushTokenGossipPayload, GroupPushTokenRecord), AppError> {
     let encrypted_token = encrypted_push_token(
         registration.registration.platform,
@@ -1136,7 +1123,7 @@ pub(crate) async fn local_token_removal_payload(
     member_id_hex: String,
     leaf_index: u32,
     registration: &PushRegistration,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
 ) -> Result<(PushTokenRemovalPayload, PushTokenRemovalRecord), AppError> {
     let mut record = PushTokenRemovalRecord {
         member_id_hex,

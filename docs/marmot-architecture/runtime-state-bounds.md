@@ -24,6 +24,13 @@ Tracking issue: marmot-protocol/mdk#381.
 
 ## Inventory
 
+### `marmot-app` audit export admission (`src/audit_export_lifecycle.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Process-local account attempt map | At most one active export attempt per account plus entries for account mutations in progress. Each entry holds an account key, attempt id, immutable destination profile, cancellation bit, and one local-work gate; no payload or file handle. | Attempt and mutation RAII drops remove entries as soon as neither is active. Runtime stopping and storage close reject late local admissions without waiting for network futures. The global id counter is process-lifetime and checked for overflow. |
+
+
 ### `marmot-app` account-worker startup (`src/runtime/worker_startup.rs`)
 
 | Structure | Bound | Reclamation |

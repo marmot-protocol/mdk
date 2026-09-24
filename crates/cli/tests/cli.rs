@@ -99,14 +99,14 @@ impl fmt::Debug for RecordingKind5WritePolicy {
 impl WritePolicy for RecordingKind5WritePolicy {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a std::net::SocketAddr,
     ) -> nostr_relay_builder::prelude::BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
             if event.kind.as_u16() != 5 {
                 return PolicyResult::Accept;
             }
-            let targets = kind5_event_targets(event);
+            let targets = kind5_tag_targets(event.tags.iter().map(|tag| tag.as_slice()));
             let mut state = self.state.lock().expect("kind5 policy");
             let reject = targets
                 .iter()
@@ -125,14 +125,15 @@ impl WritePolicy for RecordingKind5WritePolicy {
     }
 }
 
-fn kind5_event_targets(event: &nostr::Event) -> Vec<String> {
-    event
-        .tags
-        .iter()
+fn kind5_event_targets(event: &nostr::prelude::Event) -> Vec<String> {
+    kind5_tag_targets(event.tags.iter().map(|tag| tag.as_slice()))
+}
+
+fn kind5_tag_targets<'a>(tags: impl IntoIterator<Item = &'a [String]>) -> Vec<String> {
+    tags.into_iter()
         .filter_map(|tag| {
-            let slice = tag.as_slice();
-            (slice.first().map(String::as_str) == Some("e"))
-                .then(|| slice.get(1).cloned())
+            (tag.first().map(String::as_str) == Some("e"))
+                .then(|| tag.get(1).cloned())
                 .flatten()
         })
         .collect()
@@ -198,17 +199,18 @@ impl TestRelay {
     }
 
     fn event_count(&self, kind: u16) -> usize {
-        self.fetch_events(nostr::Filter::new().kind(nostr::Kind::Custom(kind)))
+        self.fetch_events(nostr::prelude::Filter::new().kind(nostr::prelude::Kind::Custom(kind)))
             .len()
     }
 
-    fn fetch_events(&self, filter: nostr::Filter) -> Vec<nostr::Event> {
+    fn fetch_events(&self, filter: nostr::prelude::Filter) -> Vec<nostr::prelude::Event> {
         self._runtime.block_on(async {
-            let client = nostr_sdk::Client::default();
+            let client = nostr_sdk::prelude::Client::default();
             client.add_relay(&self.url).await.expect("add mock relay");
             client.connect().await;
             client
-                .fetch_events(filter, Duration::from_secs(2))
+                .fetch_events(filter)
+                .timeout(Duration::from_secs(2))
                 .await
                 .expect("query mock relay")
                 .into_iter()
@@ -216,29 +218,30 @@ impl TestRelay {
         })
     }
 
-    fn key_package_events(&self, author_hex: &str) -> Vec<nostr::Event> {
-        let author = nostr::PublicKey::from_hex(author_hex).expect("account pubkey");
+    fn key_package_events(&self, author_hex: &str) -> Vec<nostr::prelude::Event> {
+        let author = nostr::prelude::PublicKey::from_hex(author_hex).expect("account pubkey");
         self.fetch_events(
-            nostr::Filter::new()
-                .kind(nostr::Kind::Custom(30_443))
+            nostr::prelude::Filter::new()
+                .kind(nostr::prelude::Kind::Custom(30_443))
                 .author(author),
         )
     }
 
-    fn send_event(&self, event: &nostr::Event) {
+    fn send_event(&self, event: &nostr::prelude::Event) {
         self._runtime.block_on(async {
-            let client = nostr_sdk::Client::default();
+            let client = nostr_sdk::prelude::Client::default();
             client.add_relay(&self.url).await.expect("add mock relay");
             client.connect().await;
             client
-                .send_event_to([&self.url], event)
+                .send_event(event)
+                .to([&self.url])
                 .await
                 .expect("republish event to mock relay");
         });
     }
 
     fn kind5_targets(&self) -> Vec<String> {
-        self.fetch_events(nostr::Filter::new().kind(nostr::Kind::EventDeletion))
+        self.fetch_events(nostr::prelude::Filter::new().kind(nostr::prelude::Kind::EventDeletion))
             .into_iter()
             .flat_map(|event| kind5_event_targets(&event))
             .collect()
@@ -1078,7 +1081,7 @@ fn create_account_with_relays(
 }
 
 fn generated_nsec() -> String {
-    nostr::Keys::generate()
+    nostr::prelude::Keys::generate()
         .secret_key()
         .to_bech32()
         .expect("nsec")

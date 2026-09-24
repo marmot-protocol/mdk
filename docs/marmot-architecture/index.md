@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-22
+updated: 2026-09-23
 tags: [marmot, architecture, index]
 ---
 
@@ -48,6 +48,9 @@ Written to be readable in 5 minutes each, shareable as a package.
 - **Doc:** [`overview/nostr-account-transport.md`](./overview/nostr-account-transport.md)
   - **What it covers:** Working note on Nostr user directory, account bootstrap, relay plane, group routing, and relay
     safety policy.
+
+- **Doc:** [`overview/nostr-bounded-acquisition-interface.md`](./overview/nostr-bounded-acquisition-interface.md)
+  - **What it covers:** Optional owned acquisition and notification-loss evidence at the existing relay-client boundary.
 
 - **Doc:** [`overview/transport-agnosticism.md`](./overview/transport-agnosticism.md)
   - **What it covers:** Working note on where transport pluggability stops today: leak inventory from the FIPS spike and

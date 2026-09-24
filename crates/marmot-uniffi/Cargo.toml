@@ -16,6 +16,7 @@ cli = ["uniffi/cli"]
 otlp-export = ["marmot-app/otlp-export"]
 
 [dependencies]
+transport-nostr-peeler.workspace = true
 marmot-app.workspace = true
 marmot-account.workspace = true
 marmot-markdown.workspace = true

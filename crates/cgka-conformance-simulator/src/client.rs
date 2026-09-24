@@ -2,6 +2,8 @@
 //! attachment. Provides scenario-level affordances: `send`, `tick`,
 //! `confirm_all_pending`, `assert_at_epoch`.
 
+use nostr::prelude::FinalizeEvent;
+
 use crate::audit_capture::{AuditCapture, CapturingRecorder};
 use crate::bus::{ClientId, TransportBus};
 use crate::decryptability::DecryptabilityProbeSendStatus;
@@ -71,7 +73,7 @@ pub struct HarnessClient {
     storage: Option<SqliteAccountStorage>,
     storage_backing: HarnessStorageBacking,
     identity: Vec<u8>,
-    signer: nostr::Keys,
+    signer: nostr::prelude::Keys,
     registry: FeatureRegistry,
     protocol_profile: ProtocolProfile,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
@@ -314,6 +316,9 @@ pub(crate) fn merge_engine_metrics(
     target.deferred_peel_candidate_cache_invalidations = target
         .deferred_peel_candidate_cache_invalidations
         .saturating_add(source.deferred_peel_candidate_cache_invalidations);
+    target.past_peel_context_derivations = target
+        .past_peel_context_derivations
+        .saturating_add(source.past_peel_context_derivations);
     merge_histogram(
         &mut target.deferred_peel_candidate_enumeration_ms,
         &source.deferred_peel_candidate_enumeration_ms,
@@ -466,6 +471,7 @@ mod tests {
             deferred_peel_candidate_cache_hits: 54,
             deferred_peel_candidate_cache_misses: 55,
             deferred_peel_candidate_cache_invalidations: 56,
+            past_peel_context_derivations: 70,
             deferred_peel_candidate_enumeration_ms: histogram(57, 58, 59),
             deferred_peel_row_capacity_refusals: 60,
             deferred_peel_group_byte_capacity_refusals: 61,
@@ -854,7 +860,7 @@ mod tests {
 
 pub struct ClientBuilder {
     identity: Vec<u8>,
-    signer: nostr::Keys,
+    signer: nostr::prelude::Keys,
     registry: FeatureRegistry,
     protocol_profile: ProtocolProfile,
     storage_mode: HarnessStorageMode,
@@ -1164,7 +1170,7 @@ struct HarnessEngineOptions<'a> {
 fn build_harness_engine(
     storage: &SqliteAccountStorage,
     identity: &[u8],
-    signer: &nostr::Keys,
+    signer: &nostr::prelude::Keys,
     registry: &FeatureRegistry,
     protocol_profile: ProtocolProfile,
     audit_capture: &AuditCapture,
@@ -1234,7 +1240,7 @@ fn build_harness_engine(
     builder.build().expect("engine builds")
 }
 
-fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
+fn deterministic_nostr_keys(seed: &[u8]) -> nostr::prelude::Keys {
     let mut counter = 0_u64;
     loop {
         let mut hasher = Sha256::new();
@@ -1242,7 +1248,7 @@ fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
         hasher.update(seed);
         hasher.update(counter.to_be_bytes());
         let secret = hasher.finalize();
-        if let Ok(keys) = nostr::Keys::parse(&hex::encode(secret)) {
+        if let Ok(keys) = nostr::prelude::Keys::parse(&hex::encode(secret)) {
             return keys;
         }
         counter = counter
@@ -1378,7 +1384,7 @@ fn send_result_kind(res: &SendResult) -> &'static str {
 
 #[derive(Clone)]
 struct NostrAccountIdentityProofSigner {
-    keys: nostr::Keys,
+    keys: nostr::prelude::Keys,
 }
 
 impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
@@ -1389,11 +1395,9 @@ impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match harness Nostr key".into());
         }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
     }
 }
