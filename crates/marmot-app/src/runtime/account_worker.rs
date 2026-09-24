@@ -5849,6 +5849,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    mod real_sdk_bounded_tests;
+
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     use marmot_account::AccountHome;

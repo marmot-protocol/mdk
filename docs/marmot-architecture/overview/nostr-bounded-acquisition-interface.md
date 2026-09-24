@@ -156,3 +156,40 @@ unknown-history recovery; it
 remains worker-held and can still wait for EOSE. This exact-ID slice does not
 establish unknown-history discovery, bandwidth optimality or the original
 phone/NSE outcome.
+
+### P5 real-SDK qualification progress
+
+`bounded_real_sdk_two_relays_retain_one_encrypted_known_event` exercises the
+production multi-account `NostrSdkRelayClient`, endpoint-validated relay plane,
+account worker, MLS receive path, and SQLCipher storage. A real encrypted
+kind-445 event is published to two local WebSocket relays while its recipient
+is signed out. Their ordinary live subscriptions return EOSE without replaying
+history. The exact-ID request retrieves the event from each relay, and the
+worker retains the eligible event before clearing its known-event obligation.
+The regression asserts one exact-ID REQ per endpoint, one returned EVENT per
+endpoint, and per-endpoint fixture ceilings of 6 KiB inbound text, 9 KiB
+outbound text, 3 KiB inbound event JSON and 8 KiB outbound event JSON. The
+event JSON counters measure normalized JSON after parsing; they are included
+in the text counters, not additional bytes. The measurements are WebSocket
+text payloads at the local relay boundary, excluding TCP/TLS framing, SDK
+allocations, and process memory.
+
+`bounded_real_sdk_missing_eose_keeps_send_and_read_available` withholds one
+relay's exact-ID EOSE. During the outstanding SDK request, the acquiring
+worker completes an outbound send and a committed snapshot read, and a live
+encrypted message from another account reaches its projection. The other
+relay supplies the exact event, so durable retention can still satisfy the
+known-event obligation. This proves progress for that single case, not general
+coverage from partial endpoint evidence.
+
+The activation gate remains closed. These tests do not yet qualify the real
+SDK path for SDK-seen but unretained input, both endpoints returning no data,
+saturation/oversized results, cancellation on either side of a durable
+prefix, stale generation/loss/route fences, restart persistence, or competing
+account recovery demands. An exploratory repeat request for the already
+retained ID remained pending beyond five seconds after a test-clock advance;
+the owner did not satisfy that new obligation within the bound. That needs a
+focused owner-scheduling regression before a no-new-data claim. Controlled
+backend tests cover several of these policies, but they do not establish
+their behavior against production SDK sessions. No public activation or
+platform bandwidth/peak-memory claim follows from the P5 regressions.
