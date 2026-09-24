@@ -1,5 +1,5 @@
 type RelayPoolNotification = nostr_sdk::prelude::ClientNotification;
-use nostr_sdk::prelude::FinalizeEvent;
+use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
 fn test_notification_stream(
     receiver: broadcast::Receiver<RelayPoolNotification>,
 ) -> RelayNotificationStream {
@@ -3258,7 +3258,7 @@ struct PublicAckGate(Arc<tokio::sync::Semaphore>);
 impl nostr_relay_builder::prelude::WritePolicy for PublicAckGate {
     fn admit_event<'a>(
         &'a self,
-        _: &'a nostr::Event,
+        _: &'a nostr_relay_builder::prelude::Event,
         _: &'a std::net::SocketAddr,
     ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult>
     {
@@ -3289,7 +3289,7 @@ struct ObservedPublishClient {
 
 impl ObservedPublishClient {
     async fn new(completion: PublishCompletion) -> Self {
-        let keys = nostr::Keys::generate();
+        let keys = Keys::generate();
         let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
         let inner = NostrSdkRelayClient::multi_account();
         inner
@@ -3379,8 +3379,8 @@ async fn publish_auth_receipts() {
     let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
     let fallback = Arc::new(ObservedPublishClient::new(PublishCompletion::Return).await);
     let adapter = plane.account_adapter(fallback.account_id.clone(), fallback.clone());
-    let signed = nostr::EventBuilder::new(Kind::TextNote, "mixed quorum")
-        .sign_with_keys(&nostr::Keys::generate())
+    let signed = EventBuilder::new(Kind::TextNote, "mixed quorum")
+        .finalize(&Keys::generate())
         .unwrap();
     let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
     let outcome = timeout(
@@ -3440,8 +3440,8 @@ async fn publish_auth_deadline() {
         .unwrap()
         .client()
         .notifications();
-    let signed = nostr::EventBuilder::new(Kind::TextNote, "one total deadline")
-        .sign_with_keys(&nostr::Keys::generate())
+    let signed = EventBuilder::new(Kind::TextNote, "one total deadline")
+        .finalize(&Keys::generate())
         .unwrap();
     let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
     let publisher = fallback.clone();
@@ -3463,11 +3463,10 @@ async fn publish_auth_deadline() {
     timeout(Duration::from_secs(5), async {
         loop {
             if let RelayPoolNotification::Message {
-                relay_url,
-                message: RelayMessage::Ok { status: true, .. },
-                ..
-            } = notifications.recv().await.unwrap()
-                && relay_url == public_url
+                relay_url, message, ..
+            } = notifications.next().await.unwrap()
+                && matches!(*message, RelayMessage::Ok { status: true, .. })
+                && relay_url.as_str() == public_url.as_str()
             {
                 break;
             }
@@ -3551,7 +3550,7 @@ async fn publish_allows_independent_account_registration() {
     .await
     .unwrap();
     let signed = EventBuilder::new(Kind::TextNote, "independent publisher")
-        .sign_with_keys(&Keys::generate())
+        .finalize(&Keys::generate())
         .unwrap();
     let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
     let publication = adapter.publish_signed_event(&fallback, &endpoints, &event, 1);

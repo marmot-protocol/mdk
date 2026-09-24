@@ -4796,7 +4796,7 @@ mod tests {
         let read_relay = MockRelay::run().await.unwrap();
         let sdk = NostrSdkRelayClient::new(Client::builder().build());
         sdk.client()
-            .add_relay(read_relay.url().await)
+            .add_relay(read_relay.url().await.to_string())
             .await
             .unwrap();
         sdk.client()

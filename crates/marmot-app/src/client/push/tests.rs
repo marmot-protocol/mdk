@@ -1,6 +1,6 @@
 use crate::*;
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr_relay_builder::builder::{RateLimit, RelayBuilderNip42, RelayBuilderNip42Mode};
 use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, WritePolicy};
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
