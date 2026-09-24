@@ -5881,6 +5881,8 @@ mod tests {
     mod real_sdk_progress_fairness_tests;
     mod resource_bounds_tests;
     mod selective_history_tests;
+    #[cfg(feature = "test-policy-overrides")]
+    mod worker_wait_attribution_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
