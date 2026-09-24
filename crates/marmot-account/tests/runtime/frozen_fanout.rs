@@ -1357,7 +1357,7 @@ async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
     .await;
     assert!(crashed.unwrap_err().is_panic());
 
-    // `join_all` polls the per-endpoint publishes in order; the crash lands
+    // The stream initially polls publishes in order; the crash lands
     // in the first one, before its siblings are polled.
     let first_attempts = crash_adapter.publishes();
     assert_eq!(first_attempts.len(), 1);
@@ -1442,7 +1442,7 @@ async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
 
 #[tokio::test]
 #[ignore = "diagnostic member-size and stalled-relay timing matrix"]
-async fn send_waits_for_slow_relay() {
+async fn send_skips_slow_relay() {
     for member_count in [2, 5, 9, 17] {
         let dir = tempfile::tempdir().unwrap();
         let key = SqlCipherKey::new("send latency test key").unwrap();
@@ -1513,22 +1513,226 @@ async fn send_waits_for_slow_relay() {
             payload: app_payload_for(&sender, b"latency probe"),
             expected_epoch: None,
         });
-        tokio::pin!(send);
-
-        // The first relay accepts immediately. The second alone holds completion.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut send)
-                .await
-                .is_err()
-        );
-        assert_eq!(adapter.publishes().len(), 2);
-        gate.add_permits(1);
+        // The first acknowledgement releases the caller while the second
+        // relay remains stalled and its exact event stays durable for retry.
         let effects = tokio::time::timeout(Duration::from_secs(1), send)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(effects.published_app_messages.len(), 1);
         assert_eq!(effects.reports[0].required_acks, 1);
-        assert_eq!(effects.reports[0].accepted.len(), 2);
+        assert_eq!(effects.reports[0].accepted.len(), 1);
+        assert_eq!(adapter.publishes().len(), 2);
+        assert_eq!(effects.fanout[0].outstanding_targets, 1);
+    }
+}
+
+/// Poll a gated operation until its expected publish attempts have started.
+async fn wait_for_publish_count<F: std::future::Future>(
+    mut future: std::pin::Pin<&mut F>,
+    adapter: &RecordingAdapter,
+    expected: usize,
+) {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        std::future::poll_fn(|cx| {
+            assert!(
+                future.as_mut().poll(cx).is_pending(),
+                "must wait for quorum"
+            );
+            if adapter.publishes().len() == expected {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("publishes must reach the gated relay");
+}
+
+/// Quorum releases Welcomes once; cancelled relay retries retain their backoff across restart.
+#[tokio::test]
+async fn invite_quorum_survives_restart() {
+    for required_acks in [0, 1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("invite quorum test key").unwrap();
+        let alice_path = dir.path().join("alice.sqlite");
+        let mut alice = session(&alice_path, &key, b"invite-quorum-alice");
+        let mut bob = session(dir.path().join("bob.sqlite"), &key, b"invite-quorum-bob");
+        let created = alice
+            .create_group(CreateGroupRequest {
+                name: "invite quorum".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let group_id = created.group_id;
+        let pending = match &created.effects.publish[0] {
+            PublishWork::GroupCreated { pending, .. } => *pending,
+            other => panic!("expected group creation, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+        let slow = TransportEndpoint("wss://slow.example".into());
+        let routing = StaticTransportRouting::new(vec![])
+            .required_acks(required_acks)
+            .with_inbox_route(
+                bob.self_id(),
+                vec![
+                    TransportEndpoint("wss://inbox-one.example".into()),
+                    TransportEndpoint("wss://inbox-two.example".into()),
+                ],
+            )
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![slow.clone(), TransportEndpoint("wss://fast.example".into())],
+            );
+        let adapter = RecordingAdapter::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *adapter.inner.endpoint_gate.lock().unwrap() = Some((slow.clone(), gate.clone()));
+        let wall = Arc::new(TestWallClock::new(100_000));
+        let mut runtime = AccountDeviceRuntime::new(
+            alice,
+            adapter.clone(),
+            routing.clone(),
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        let first = {
+            let send = runtime.send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![bob.fresh_key_package().await.unwrap()],
+                initial_admins: vec![],
+            });
+            tokio::pin!(send);
+            if required_acks == 2 {
+                wait_for_publish_count(send.as_mut(), &adapter, 2).await;
+                None
+            } else {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(10), send)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            }
+        };
+        let effects = if required_acks == 2 {
+            assert_eq!(adapter.publishes().len(), 2);
+            let fanouts = runtime.session().outbound_fanouts().unwrap();
+            assert_eq!(fanouts[0].outcome().accepted_targets, 1);
+            assert!(matches!(fanouts[0].mls_state(), FanoutMlsState::Pending(_)));
+            drop(runtime);
+            runtime = AccountDeviceRuntime::new(
+                session(&alice_path, &key, b"invite-quorum-alice"),
+                adapter.clone(),
+                routing.clone(),
+                RecordingKeyPackages::default(),
+            );
+            let retry = runtime.resume_outbound_fanouts();
+            tokio::pin!(retry);
+            wait_for_publish_count(retry.as_mut(), &adapter, 3).await;
+            assert_eq!(
+                adapter.publishes().len(),
+                3,
+                "restart must not release Welcome early"
+            );
+            gate.add_permits(1);
+            retry.await.unwrap()
+        } else {
+            first.expect("invite must finish once its acknowledgement threshold is met")
+        };
+        assert!(effects.failures.is_empty());
+        assert!(
+            effects
+                .pending
+                .iter()
+                .any(|pending| matches!(pending, PendingResolution::Confirmed { .. }))
+        );
+        assert_eq!(
+            adapter.publishes().len(),
+            if required_acks == 2 { 4 } else { 3 },
+            "Welcome starts once quorum is met"
+        );
+        assert!(matches!(
+            adapter.publishes().last().unwrap().message.envelope,
+            TransportEnvelope::Welcome { .. }
+        ));
+        if required_acks == 2 {
+            assert!(runtime.session().outbound_fanouts().unwrap().is_empty());
+            continue;
+        }
+        let fanouts = runtime.session().outbound_fanouts().unwrap();
+        assert_eq!(fanouts.len(), 1);
+        assert_eq!(fanouts[0].outcome().accepted_targets, 1);
+        assert_eq!(fanouts[0].outcome().outstanding_targets, 1);
+        assert_eq!(
+            fanouts[0].target_status(0),
+            Some(FanoutTargetStatus::PossiblyExposed)
+        );
+        assert!(fanouts[0].outcome().mls_confirmed);
+        assert!(effects.pending_convergence.contains(&group_id));
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
+            Some(30_000)
+        );
+        drop(runtime);
+
+        let resumed_adapter = RecordingAdapter::default();
+        *resumed_adapter.inner.endpoint_gate.lock().unwrap() = Some((slow.clone(), gate.clone()));
+        let mut resumed = AccountDeviceRuntime::new(
+            session(&alice_path, &key, b"invite-quorum-alice"),
+            resumed_adapter.clone(),
+            routing,
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        let deferred = resumed.resume_outbound_fanouts().await.unwrap();
+        assert!(deferred.reports.is_empty());
+        assert!(resumed_adapter.publishes().is_empty());
+        assert_eq!(
+            resumed.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
+            Some(30_000)
+        );
+        wall.set(100_030);
+        {
+            let retry = resumed.resume_outbound_fanouts();
+            tokio::pin!(retry);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut retry)
+                    .await
+                    .is_err(),
+                "an already-met quorum must not cancel outstanding retries"
+            );
+            gate.add_permits(1);
+            let effects = retry.await.unwrap();
+            assert!(effects.failures.is_empty());
+            assert!(
+                effects.pending.is_empty(),
+                "MLS must not be confirmed twice"
+            );
+        }
+        let attempts = resumed_adapter.publishes();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "retry only the outstanding relay, without repeating the Welcome"
+        );
+        assert_eq!(attempts[0].target.endpoints(), &[slow]);
+        assert_eq!(attempts[0].message, fanouts[0].request().message);
+        assert!(resumed.session().outbound_fanouts().unwrap().is_empty());
     }
 }

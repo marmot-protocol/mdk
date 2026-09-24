@@ -9,8 +9,12 @@
 //! inbox/group route by event id against a durable per-route set, making that
 //! late event discoverable without discarding the cheap timestamp fast path.
 //!
+//! This tests events below the LIVE timestamp cutoff but still above the
+//! retained-inventory comparison floor. It makes no recovery claim for arbitrary
+//! history older than the inventory retention/compaction floor.
+//!
 //! The first test explicitly completes a checkpointing cold boot, then proves
-//! reconciliation downloads a below-floor sibling on the next boot and records
+//! reconciliation downloads a below-live-cutoff sibling on the next boot and records
 //! it in the exact route inventory. A later boot has no set difference for that
 //! sibling, so it avoids replaying the payload again.
 //!
@@ -82,19 +86,19 @@
 //! sends to advance the cursor), the test measures that legitimate count on
 //! the very first (still-live) boot rather than assuming it, then asserts boot
 //! 2 delivers both siblings, with at most one overlapping SDK notification for
-//! the explicit below-floor fetch, and boot 3 returns to
-//! `legitimate_count + 1` because the below-floor event is already present in
+//! the explicit below-live-cutoff fetch, and boot 3 returns to
+//! `legitimate_count + 1` because the below-live-cutoff event is already present in
 //! the exact reconciliation set.
 
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use marmot_account::AccountHome;
 use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime};
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::{
-    Alphabet, Client as NostrSdkClient, EventBuilder, Keys, Kind, SingleLetterTag, Tag, TagKind,
+    Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
 };
 use tokio::time::sleep;
@@ -190,10 +194,69 @@ async fn wait_for_first_catch_up(runtime: &MarmotAppRuntime) {
     }
 }
 
+/// Wait for the automatic startup request through its existing owner tick.
+/// The feature-gated clock changes elapsed time, never the persisted reservation.
+async fn wait_for_paced_comparison(runtime: &MarmotAppRuntime, app: &MarmotApp) {
+    wait_for_first_catch_up(runtime).await;
+    #[cfg(feature = "test-policy-overrides")]
+    {
+        let (before, remaining, pending) = runtime.recovery_retry_snapshot_for_test("bob").await;
+        if pending && !remaining.is_zero() {
+            assert_eq!(
+                app.relay_telemetry().await.metrics.reconciliation_attempts,
+                0,
+                "cold startup must not bypass inherited cooldown"
+            );
+            // Polling/ordinary worker commands do not create or reserve another request.
+            let (after, _, still_pending) = runtime.recovery_retry_snapshot_for_test("bob").await;
+            assert_eq!(before, after);
+            assert!(still_pending);
+            runtime
+                .advance_recovery_clock_for_test("bob", remaining)
+                .await;
+        }
+    }
+    // Production's existing maintenance tick is 15 seconds. No test-only
+    // dispatcher or explicit caller override is used to trigger the comparison.
+    let deadline = Instant::now()
+        + if cfg!(feature = "test-policy-overrides") {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(330) // Default builds wait out the real capped policy.
+        };
+    loop {
+        if app.relay_telemetry().await.metrics.reconciliation_attempts > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "automatic inventory comparison did not run after its shared deadline"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+    #[cfg(feature = "test-policy-overrides")]
+    {
+        // This serialized read waits for the automatic owner's safe checkpoint.
+        loop {
+            let (_, _, pending) = runtime.recovery_retry_snapshot_for_test("bob").await;
+            if !pending {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "successful selected routes must settle the operational request"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+    // A comparison metric precedes ingestion; preserve the existing drain margin.
+    sleep(TELEMETRY_SETTLE_GRACE).await;
+}
+
 /// Keep these cursor-characterization tests scoped to the ordinary incremental
 /// group subscription and the epoch-gap backfill they explicitly arm. New
 /// post-join groups also have an independent full-history maintenance
-/// subscription; allowing that here would recover the below-floor probe
+/// subscription; allowing that here would recover the below-live-cutoff probe
 /// through a different feature and make the assertions meaningless.
 async fn start_with_maintenance_paused(runtime: &MarmotAppRuntime, account_ref: &str) {
     runtime.start().await.unwrap();
@@ -253,12 +316,9 @@ async fn publish_garbage_group_message_at(
     assert!(envelope.len() >= NOSTR_GROUP_CONTENT_MIN_LEN);
     let ephemeral = Keys::generate();
     let signed = EventBuilder::new(Kind::MlsGroupMessage, BASE64_STANDARD.encode(envelope))
-        .tags([Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-            [nostr_group_id_hex.to_owned()],
-        )])
+        .tags([Tag::custom("h", [nostr_group_id_hex.to_owned()])])
         .custom_created_at(NostrTimestamp::from_secs(created_at))
-        .sign_with_keys(&ephemeral)
+        .finalize(&ephemeral)
         .expect("sign ephemeral kind-445 test event");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event");
@@ -358,7 +418,7 @@ async fn cold_restart_reconciles_backlog_below_since_floor() {
     let app_bob_checkpoint = open_store(&dir_bob, &url);
     let runtime_bob_checkpoint = MarmotAppRuntime::new(app_bob_checkpoint.clone());
     start_with_maintenance_paused(&runtime_bob_checkpoint, "bob").await;
-    wait_for_first_catch_up(&runtime_bob_checkpoint).await;
+    wait_for_paced_comparison(&runtime_bob_checkpoint, &app_bob_checkpoint).await;
     sleep(TELEMETRY_SETTLE_GRACE).await;
     let legitimate_delivery_count = inbound_events_delivered(&app_bob_checkpoint).await;
     assert_eq!(
@@ -374,29 +434,45 @@ async fn cold_restart_reconciles_backlog_below_since_floor() {
     // reference_now); the margins below (180s / 60s either side of the
     // assumed floor) comfortably absorb that skew.
     let reference_now = test_unix_now_seconds();
-    let floor_estimate = reference_now.saturating_sub(REBUILD_LOOKBACK_SECS);
-    let below_floor_created_at = floor_estimate.saturating_sub(180);
-    let above_floor_created_at = floor_estimate.saturating_add(60);
-    assert!(above_floor_created_at < reference_now);
+    let live_cutoff_estimate = reference_now.saturating_sub(REBUILD_LOOKBACK_SECS);
+    let below_live_cutoff_created_at = live_cutoff_estimate.saturating_sub(180);
+    let above_live_cutoff_created_at = live_cutoff_estimate.saturating_add(60);
+    assert!(above_live_cutoff_created_at < reference_now);
+    assert!(
+        below_live_cutoff_created_at
+            >= reference_now
+                .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS),
+        "the below-live-cutoff probe must remain within the retained-inventory window"
+    );
 
     // bob is fully offline while the probes are published: a still-open
     // subscription would deliver them live regardless of `created_at` (see
     // the module doc comment).
 
-    publish_garbage_group_message_at(&url, &nostr_group_id_hex, below_floor_created_at, "below")
-        .await;
-    publish_garbage_group_message_at(&url, &nostr_group_id_hex, above_floor_created_at, "above")
-        .await;
+    publish_garbage_group_message_at(
+        &url,
+        &nostr_group_id_hex,
+        below_live_cutoff_created_at,
+        "below",
+    )
+    .await;
+    publish_garbage_group_message_at(
+        &url,
+        &nostr_group_id_hex,
+        above_live_cutoff_created_at,
+        "above",
+    )
+    .await;
 
     // --- boot 2: cold restart, first subscription rebuild and route-set
     // reconciliation since the probes landed ---
     let app_bob_boot2 = open_store(&dir_bob, &url);
     let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2.clone());
     start_with_maintenance_paused(&runtime_bob_boot2, "bob").await;
-    wait_for_first_catch_up(&runtime_bob_boot2).await;
+    wait_for_paced_comparison(&runtime_bob_boot2, &app_bob_boot2).await;
     sleep(TELEMETRY_SETTLE_GRACE).await;
     let delivered_after_boot2 = inbound_events_delivered(&app_bob_boot2).await;
-    // A newly fetched below-floor event may arrive both through the SDK's
+    // A newly fetched below-live-cutoff event may arrive both through the SDK's
     // first-sighting notification and the explicit reconciliation result.
     // The SDK regression `reconciliation_first_sighting_overlap_has_the_fetched_event_id`
     // pins the overlapping id; `inbound_effects_project_every_released_message`
@@ -406,38 +482,38 @@ async fn cold_restart_reconciles_backlog_below_since_floor() {
     assert!(
         (legitimate_delivery_count + 2..=legitimate_delivery_count + 3)
             .contains(&delivered_after_boot2),
-        "normal cold-boot catch-up must reconcile both the above-floor sibling \
-         and the below-floor probe without an independently armed backfill",
+        "normal cold-boot catch-up must reconcile both the above-live-cutoff sibling \
+         and the below-live-cutoff probe without an independently armed backfill",
     );
     let boot2_reconciliation = app_bob_boot2.relay_telemetry().await.metrics;
     assert!(boot2_reconciliation.reconciliation_attempts >= 1);
     assert!(
         boot2_reconciliation.reconciliation_remote_items >= 1,
-        "the route set difference must identify the below-floor probe \
+        "the route set difference must identify the below-live-cutoff probe \
          independently of the subscription timestamp floor"
     );
     assert!(
         boot2_reconciliation.reconciliation_received_items >= 1,
-        "the below-floor route difference must download while the ordinary \
-         subscription owns the above-floor sibling"
+        "the below-live-cutoff route difference must download while the ordinary \
+         subscription owns the above-live-cutoff sibling"
     );
     runtime_bob_boot2.shutdown().await;
 
     // --- boot 3: a second independent cold restart. The durable inventory
     // makes the route set equal, so reconciliation downloads no payload for the
-    // already-observed below-floor event. ---
+    // already-observed below-live-cutoff event. ---
     let app_bob_boot3 = open_store(&dir_bob, &url);
     let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3.clone());
     start_with_maintenance_paused(&runtime_bob_boot3, "bob").await;
-    wait_for_first_catch_up(&runtime_bob_boot3).await;
+    wait_for_paced_comparison(&runtime_bob_boot3, &app_bob_boot3).await;
     sleep(TELEMETRY_SETTLE_GRACE).await;
     let delivered_after_boot3 = inbound_events_delivered(&app_bob_boot3).await;
     assert_eq!(
         delivered_after_boot3,
         legitimate_delivery_count + 1,
-        "the reconciled below-floor event must remain in the durable route set, \
+        "the reconciled below-live-cutoff event must remain in the durable route set, \
          so a second cold boot has no set difference to download and only the \
-         ordinary above-floor sibling is redelivered",
+         ordinary above-live-cutoff sibling is redelivered",
     );
     let boot3_reconciliation = app_bob_boot3.relay_telemetry().await.metrics;
     assert!(boot3_reconciliation.reconciliation_attempts >= 1);
@@ -548,7 +624,7 @@ async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
     let app_bob_checkpoint = open_store(&dir_bob, &url);
     let runtime_bob_checkpoint = MarmotAppRuntime::new(app_bob_checkpoint.clone());
     start_with_maintenance_paused(&runtime_bob_checkpoint, "bob").await;
-    wait_for_first_catch_up(&runtime_bob_checkpoint).await;
+    wait_for_paced_comparison(&runtime_bob_checkpoint, &app_bob_checkpoint).await;
     sleep(TELEMETRY_SETTLE_GRACE).await;
     let legitimate_delivery_count = inbound_events_delivered(&app_bob_checkpoint).await;
     assert_eq!(
@@ -560,10 +636,16 @@ async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
 
     // Same floor placement as the floor-drop test above.
     let reference_now = test_unix_now_seconds();
-    let floor_estimate = reference_now.saturating_sub(REBUILD_LOOKBACK_SECS);
-    let below_floor_created_at = floor_estimate.saturating_sub(180);
-    let above_floor_created_at = floor_estimate.saturating_add(60);
-    assert!(above_floor_created_at < reference_now);
+    let live_cutoff_estimate = reference_now.saturating_sub(REBUILD_LOOKBACK_SECS);
+    let below_live_cutoff_created_at = live_cutoff_estimate.saturating_sub(180);
+    let above_live_cutoff_created_at = live_cutoff_estimate.saturating_add(60);
+    assert!(above_live_cutoff_created_at < reference_now);
+    assert!(
+        below_live_cutoff_created_at
+            >= reference_now
+                .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS),
+        "the below-live-cutoff probe must remain within the retained-inventory window"
+    );
 
     // bob remains fully offline while probes are published (see the module doc
     // comment on live subscriptions ignoring `since`).
@@ -573,7 +655,7 @@ async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
     publish_garbage_group_message_at(
         &url,
         &nostr_group_id_hex,
-        below_floor_created_at,
+        below_live_cutoff_created_at,
         "below-target",
     )
     .await;
@@ -584,7 +666,7 @@ async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
         publish_garbage_group_message_at(
             &url,
             &nostr_group_id_hex,
-            above_floor_created_at,
+            above_live_cutoff_created_at,
             &format!("arm-{arm}"),
         )
         .await;
@@ -593,23 +675,23 @@ async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
     // Expected exact delivery count for the armed cold boot:
     //   legitimate_delivery_count — the catch-up re-fetches the welcome and
     //                               the one ordinary message;
-    // + BACKFILL_THRESHOLD        — the above-floor arming probes arrive
+    // + BACKFILL_THRESHOLD        — the above-live-cutoff arming probes arrive
     //                               through the floored catch-up and arm the
     //                               detector at bob's stalled epoch;
     // + 1                         — route reconciliation discovers the
-    //                               below-floor probe.
-    // The explicit below-floor fetch can also produce an SDK first-sighting
+    //                               below-live-cutoff probe.
+    // The explicit below-live-cutoff fetch can also produce an SDK first-sighting
     // notification (its exact identity is pinned by the SDK first-sighting
     // overlap regression). Allow that one overlapping delivery attempt; boot 3 still
     // requires the exact floored count, proving durable no-redownload behavior.
     let expected_healed = legitimate_delivery_count + BACKFILL_THRESHOLD + 1;
 
     // --- boot 2: reconciliation discovers the target and the same drain's
-    // above-floor probes still arm the epoch-stall detector. ---
+    // above-live-cutoff probes still arm the epoch-stall detector. ---
     let app_bob_boot2 = open_store(&dir_bob, &url);
     let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2.clone());
     start_with_maintenance_paused(&runtime_bob_boot2, "bob").await;
-    wait_for_first_catch_up(&runtime_bob_boot2).await;
+    wait_for_paced_comparison(&runtime_bob_boot2, &app_bob_boot2).await;
     wait_for_inbound_delivered(&app_bob_boot2, expected_healed).await;
     // Settle grace so any spurious extra delivery lands before the
     // bounded delivery-count check (mirrors the floor-drop test's settle).
@@ -618,24 +700,24 @@ async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
         (expected_healed..=expected_healed + 1)
             .contains(&inbound_events_delivered(&app_bob_boot2).await),
         "an armed cold boot must deliver the legitimate re-fetches, arming probes \
-         and reconciled below-floor probe, with at most its overlapping SDK notification",
+         and reconciled below-live-cutoff probe, with at most its overlapping SDK notification",
     );
     runtime_bob_boot2.shutdown().await;
 
     // --- boot 3: reconciliation is durable, not a per-boot replay storm.
     // Boot 2 consumed the arming evidence (ingested event ids persist in the
     // account's seen-event state and are skipped before ingest), so this
-    // independent cold boot re-fetches the above-floor history at the
+    // independent cold boot re-fetches the above-live-cutoff history at the
     // transport layer without re-arming the per-boot, in-memory detector: no
-    // second full-history replay fires, and the below-floor probe — already
+    // second full-history replay fires, and the below-live-cutoff probe — already
     // reconciled once — stays below the rebuilt floor without being
     // re-delivered. Exactly the legitimate re-fetches plus the eight
-    // above-floor probes arrive, and nothing else. ---
+    // above-live-cutoff probes arrive, and nothing else. ---
     let expected_after_heal = legitimate_delivery_count + BACKFILL_THRESHOLD;
     let app_bob_boot3 = open_store(&dir_bob, &url);
     let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3.clone());
     start_with_maintenance_paused(&runtime_bob_boot3, "bob").await;
-    wait_for_first_catch_up(&runtime_bob_boot3).await;
+    wait_for_paced_comparison(&runtime_bob_boot3, &app_bob_boot3).await;
     wait_for_inbound_delivered(&app_bob_boot3, expected_after_heal).await;
     sleep(TELEMETRY_SETTLE_GRACE).await;
     assert_eq!(
@@ -643,7 +725,7 @@ async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
         expected_after_heal,
         "a cold boot after the heal must not replay full history again: the \
          backfill is debounced by the durable seen-event state, so only the \
-         floored catch-up's above-floor re-fetches arrive",
+         floored catch-up's above-live-cutoff re-fetches arrive",
     );
     runtime_bob_boot3.shutdown().await;
 }

@@ -505,23 +505,15 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for intent in intents {
-                let group_id = hex::decode(&intent.group_id_hex).map_err(|error| {
+                let group = hex::decode(&intent.group_id_hex).map_err(|error| {
                     StorageError::Serialization(format!("invalid epoch backfill group id: {error}"))
                 })?;
-                let stalled_epoch = u64_to_i64(intent.stalled_epoch)?;
-                conn.execute_cached(
-                    "INSERT INTO app_epoch_backfill_intents
-                        (group_id, stalled_epoch, updated_at)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(group_id) DO UPDATE SET
-                        stalled_epoch = MAX(
-                            app_epoch_backfill_intents.stalled_epoch,
-                            excluded.stalled_epoch
-                        ),
-                        updated_at = excluded.updated_at",
-                    params![group_id, stalled_epoch, now],
-                )
-                .storage()?;
+                crate::account_recovery::arm_epoch_tx(
+                    &conn,
+                    &group,
+                    u64_to_i64(intent.stalled_epoch)?,
+                    now,
+                )?;
             }
             Ok(())
         })
@@ -533,8 +525,9 @@ impl SqliteAccountStorage {
         let mut statement = conn
             .prepare_cached(
                 "SELECT group_id, stalled_epoch
-                 FROM app_epoch_backfill_intents
-                 ORDER BY updated_at, group_id",
+                 FROM account_recovery_obligations
+                 WHERE cause = 1 AND state = 0
+                 ORDER BY updated_at_ms, group_id",
             )
             .storage()?;
         let rows = statement
@@ -571,8 +564,8 @@ impl SqliteAccountStorage {
                 })?;
                 let stalled_epoch = u64_to_i64(intent.stalled_epoch)?;
                 conn.execute_cached(
-                    "DELETE FROM app_epoch_backfill_intents
-                     WHERE group_id = ?1 AND stalled_epoch = ?2",
+                    "DELETE FROM account_recovery_obligations
+                     WHERE cause = 1 AND group_id = ?1 AND stalled_epoch = ?2",
                     params![group_id, stalled_epoch],
                 )
                 .storage()?;
@@ -601,7 +594,7 @@ impl SqliteAccountStorage {
                     StorageError::Serialization(format!("invalid epoch backfill group id: {error}"))
                 })?;
                 conn.execute_cached(
-                    "DELETE FROM app_epoch_backfill_intents WHERE group_id = ?1",
+                    "DELETE FROM account_recovery_obligations WHERE cause = 1 AND group_id = ?1",
                     params![group_id],
                 )
                 .storage()?;
@@ -617,8 +610,8 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         conn.query_row_cached(
             "SELECT marker_token, pending_since, dropped_count
-             FROM account_delivery_recovery
-             WHERE account_label = ?1",
+             FROM account_recovery_obligations
+             WHERE cause = 0 AND state = 0 AND account_label = ?1",
             params![label],
             |row| {
                 let marker_token = row.get::<_, i64>(0)?;
@@ -644,47 +637,51 @@ impl SqliteAccountStorage {
         marker_token: u64,
         dropped_count: u64,
     ) -> StorageResult<()> {
-        let now = unix_now_seconds_i64();
-        let marker_token = i64::try_from(marker_token).unwrap_or(i64::MAX);
-        let dropped_count = i64::try_from(dropped_count).unwrap_or(i64::MAX);
-        let conn = self.lock()?;
-        conn.execute_cached(
-            "INSERT INTO account_delivery_recovery (
-                account_label, marker_token, pending_since, dropped_count
-             ) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(account_label) DO UPDATE SET
-                marker_token = excluded.marker_token,
-                pending_since = CASE
-                    WHEN account_delivery_recovery.marker_token = excluded.marker_token
-                    THEN account_delivery_recovery.pending_since
-                    ELSE excluded.pending_since
-                END,
-                dropped_count = CASE
-                    WHEN account_delivery_recovery.marker_token = excluded.marker_token
-                    THEN max(account_delivery_recovery.dropped_count, excluded.dropped_count)
-                    ELSE excluded.dropped_count
-                END",
-            params![label, marker_token, now, dropped_count],
-        )
-        .storage()?;
-        Ok(())
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            crate::account_recovery::arm_overflow_tx(
+                &conn,
+                label,
+                i64::try_from(marker_token).unwrap_or(i64::MAX),
+                i64::try_from(dropped_count).unwrap_or(i64::MAX),
+                unix_now_seconds_i64(),
+            )
+        })
     }
 
+    /// Low-level legacy retirement. Recovery completion must use revision-fenced
+    /// owner primitives, not this token-only compatibility operation.
     pub fn clear_account_delivery_recovery(
         &self,
         label: &str,
         marker_token: u64,
     ) -> StorageResult<bool> {
         let marker_token = i64::try_from(marker_token).unwrap_or(i64::MAX);
-        let conn = self.lock()?;
-        let cleared = conn
-            .execute_cached(
-                "DELETE FROM account_delivery_recovery
-                 WHERE account_label = ?1 AND marker_token = ?2",
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let cleared = conn
+                .execute_cached(
+                    "DELETE FROM account_recovery_obligations
+                 WHERE cause = 0 AND account_label = ?1 AND marker_token = ?2",
+                    params![label, marker_token],
+                )
+                .storage()?;
+            if cleared == 0 {
+                return Ok(false);
+            }
+            // Retirement applies only to this token. Keep the imported watermark
+            // against delayed duplicates, but never retire joined generations.
+            conn.execute_cached(
+                "UPDATE account_delivery_loss_evidence
+                SET legacy_retired_count=imported_count
+                WHERE account_label=?1 AND cause=0 AND marker_token=?2",
                 params![label, marker_token],
             )
             .storage()?;
-        Ok(cleared > 0)
+            let remaining = crate::account_recovery::restore_legacy_loss_tx(&conn, label)?;
+            // The legacy caller clears its in-memory flag only on true.
+            Ok(!remaining)
+        })
     }
 
     /// Record a group's frozen-epoch evidence, replacing any earlier row.
@@ -713,6 +710,8 @@ impl SqliteAccountStorage {
                          last_arm_at_ms, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(group_id) DO UPDATE SET
+                        qualified_certificate = CASE WHEN stalled_epoch != excluded.stalled_epoch OR excluded.fruitless_completions < fruitless_completions THEN NULL ELSE qualified_certificate END,
+                        last_sample_at_ms = CASE WHEN stalled_epoch != excluded.stalled_epoch OR excluded.fruitless_completions < fruitless_completions THEN NULL ELSE last_sample_at_ms END,
                         stalled_epoch = excluded.stalled_epoch,
                         fruitless_completions = excluded.fruitless_completions,
                         fruitless_reported = excluded.fruitless_reported,

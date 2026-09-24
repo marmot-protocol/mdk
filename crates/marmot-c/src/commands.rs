@@ -3170,3 +3170,77 @@ pub unsafe extern "C" fn marmot_report_message(
         }
     })
 }
+
+/// Verify a public Nostr event's canonical ID and BIP-340 signature.
+/// Invalid event JSON returns success with `*out = 0`. No client is required.
+/// The caller must enforce application-specific author, kind, and tag policy.
+///
+/// # Safety
+/// `event_json` must be valid NUL-terminated UTF-8 and `out` writable.
+/// Input is borrowed and never retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_verify_public_nostr_event_json(
+    event_json: *const c_char,
+    out: *mut u8,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out(out) });
+        let event_json = try_arg!(unsafe { required_str(event_json) });
+        unsafe {
+            *out = u8::from(marmot_uniffi::verify_public_nostr_event_json(event_json));
+        }
+        MarmotStatus::Ok
+    })
+}
+
+#[cfg(test)]
+mod nostr_verification_tests {
+    use super::*;
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind};
+    use std::{ffi::CString, ptr};
+
+    #[test]
+    fn public_event_verifier_clears_outputs_and_fails_closed() {
+        let signed_event = EventBuilder::new(Kind::TextNote, "public C event")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let event_json = CString::new(signed_event.as_json()).unwrap();
+        let mut event_verified = 0u8;
+        assert_eq!(
+            unsafe {
+                marmot_verify_public_nostr_event_json(event_json.as_ptr(), &raw mut event_verified)
+            },
+            MarmotStatus::Ok
+        );
+        assert_eq!(event_verified, 1);
+
+        let malformed = CString::new("{}").unwrap();
+        let mut out = 1u8;
+        assert_eq!(
+            unsafe { marmot_verify_public_nostr_event_json(malformed.as_ptr(), &raw mut out) },
+            MarmotStatus::Ok
+        );
+        assert_eq!(out, 0);
+
+        out = 1;
+        assert_eq!(
+            unsafe { marmot_verify_public_nostr_event_json(ptr::null(), &raw mut out) },
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(out, 0);
+        assert_eq!(
+            unsafe { marmot_verify_public_nostr_event_json(malformed.as_ptr(), ptr::null_mut()) },
+            MarmotStatus::NullPointer
+        );
+
+        out = 1;
+        let invalid_utf8 = [0xffu8, 0];
+        assert_eq!(
+            unsafe {
+                marmot_verify_public_nostr_event_json(invalid_utf8.as_ptr().cast(), &raw mut out)
+            },
+            MarmotStatus::InvalidUtf8
+        );
+        assert_eq!(out, 0);
+    }
+}

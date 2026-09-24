@@ -483,6 +483,7 @@ fn directory_subscription_id(group: &str, index: usize, authors: &[String]) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::prelude::FinalizeEvent;
 
     fn account_id(value: u8) -> String {
         format!("{value:064x}")
@@ -706,8 +707,8 @@ mod tests {
             event_rx,
             Arc::new(AtomicBool::new(false)),
         ));
-        let mute = nostr::EventBuilder::new(nostr::Kind::MuteList, "")
-            .sign_with_keys(&keys)
+        let mute = nostr::prelude::EventBuilder::new(nostr::prelude::Kind::MuteList, "")
+            .finalize(&keys)
             .unwrap();
         // Fill and exceed the bounded adoption task set while its account is
         // busy. Public records and rebuild responses must still be serviced.
@@ -721,11 +722,13 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let remote = nostr::Keys::generate();
-        let profile =
-            nostr::EventBuilder::new(nostr::Kind::Metadata, r#"{"name":"directory stays live"}"#)
-                .sign_with_keys(&remote)
-                .unwrap();
+        let remote = nostr::prelude::Keys::generate();
+        let profile = nostr::prelude::EventBuilder::new(
+            nostr::prelude::Kind::Metadata,
+            r#"{"name":"directory stays live"}"#,
+        )
+        .finalize(&remote)
+        .unwrap();
         events
             .send(DirectoryRelayPlaneEvent::Record(
                 DirectoryRelayEventRecord {

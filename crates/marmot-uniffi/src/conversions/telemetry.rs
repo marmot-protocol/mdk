@@ -474,6 +474,12 @@ mod tests {
             snapshot.runtime_operations.len(),
             marmot_app::RuntimePerformanceOperation::ALL.len()
         );
+        assert!(
+            snapshot
+                .runtime_operations
+                .iter()
+                .any(|s| { s.operation == "account_startup_retry_suppressed" && s.started == 0 })
+        );
         let s = snapshot
             .runtime_operations
             .iter()

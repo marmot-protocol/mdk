@@ -818,6 +818,11 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
         )
     };
     exporter.since_baseline(batch());
+    telemetry.record_runtime(
+        Op::AccountStartupRetrySuppressed,
+        std::time::Duration::ZERO,
+        Outcome::NotReady,
+    );
     let observation = telemetry.observe(Op::ConversationOpen);
     let (active, _) = exporter.since_baseline(batch());
     let points: Vec<_> = active
@@ -840,6 +845,13 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
             .value
             .clone()
     };
+    assert_eq!(
+        metric(
+            &active,
+            "app_runtime_account_startup_retry_suppressed_not_ready"
+        ),
+        ExportMetricValue::Counter(1)
+    );
     assert_eq!(
         metric(&active, "app_runtime_conversation_open_started"),
         ExportMetricValue::Counter(1)

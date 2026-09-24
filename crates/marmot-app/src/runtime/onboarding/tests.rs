@@ -2,13 +2,14 @@ use super::*;
 use crate::relay_plane::{DirectoryFetchRequest, DirectoryRelayFetcher};
 use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportAdapterError};
-use nostr::prelude::ToBech32;
+use nostr::prelude::{FinalizeEvent, ToBech32};
 use std::sync::atomic::{AtomicBool, Ordering};
 use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
 
 #[derive(Default)]
 struct Network {
     events: StdMutex<Vec<NostrTransportEvent>>,
+    index_events: StdMutex<Vec<NostrTransportEvent>>,
     attempts: StdMutex<Vec<NostrTransportEvent>>,
     fail_reads: AtomicBool,
     return_off_filter_events: AtomicBool,
@@ -24,7 +25,17 @@ impl DirectoryRelayFetcher for Network {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        assert!(
+            crate::relay_plane::RelaySafetyPolicy::default()
+                .classify_endpoints(request.endpoints.iter().map(|e| e.0.clone()).collect())
+                .iter()
+                .all(|e| e.policy == RelayEndpointPolicy::Allowed)
+        );
         if self.fail_reads.load(Ordering::SeqCst)
+            || request
+                .endpoints
+                .iter()
+                .any(|e| e.0.starts_with("wss://relay.customtld"))
             || (self.fail_index_only.load(Ordering::SeqCst)
                 && request
                     .endpoints
@@ -33,10 +44,15 @@ impl DirectoryRelayFetcher for Network {
         {
             return Err("timeout".into());
         }
-        Ok(self
-            .events
-            .lock()
-            .unwrap()
+        let mut events = self.events.lock().unwrap().clone();
+        if request
+            .endpoints
+            .iter()
+            .any(|e| e.0.contains("index.example"))
+        {
+            events.extend(self.index_events.lock().unwrap().iter().cloned());
+        }
+        Ok(events
             .iter()
             .filter(|event| {
                 if self.return_off_filter_events.load(Ordering::SeqCst) {
@@ -57,7 +73,7 @@ impl DirectoryRelayFetcher for Network {
     async fn inspect_directory_events(
         &self,
         request: DirectoryFetchRequest,
-        _signer: Option<Arc<dyn nostr::NostrSigner>>,
+        _signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, crate::relay_plane::DirectoryInspectionError> {
         self.fetch_directory_events(request)
             .await
@@ -177,7 +193,7 @@ async fn onboarding_legacy_setup_admission_does_not_mutate_account() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(directory.path(), network);
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let secret = keys.secret_key().to_bech32().unwrap();
     let account = runtime
         .accounts()
@@ -240,6 +256,12 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
     let (_directory, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
     let pending = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    let now = tokio::time::Instant::now();
+    manager
+        .startup_retries
+        .lock()
+        .unwrap()
+        .fail(id.clone(), now);
     assert!(
         manager
             .retry_onboarding_step(&id, OnboardingStep::Follows)
@@ -247,6 +269,7 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
             .is_err()
     );
     assert_eq!(manager.onboarding_snapshot(&id).unwrap().unwrap(), pending);
+    assert!(!manager.startup_retries.lock().unwrap().allows(&id, now));
     let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
     c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
     c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
@@ -267,6 +290,7 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
         .retry_onboarding_step(&id, OnboardingStep::Profile)
         .await
         .unwrap();
+    assert!(manager.startup_retries.lock().unwrap().allows(&id, now));
     assert_eq!(
         retried.steps[OnboardingStep::Follows.index()].status,
         OnboardingStatus::Skipped
@@ -285,10 +309,16 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
     );
     // Changing sources invalidates even an already acknowledged notice.
     manager.save_onboarding(&mut c).unwrap();
+    manager
+        .startup_retries
+        .lock()
+        .unwrap()
+        .fail(id.clone(), now);
     let changed = manager
         .set_onboarding_discovery_relays(&id, vec!["wss://alternate.example".into()])
         .await
         .unwrap();
+    assert!(manager.startup_retries.lock().unwrap().allows(&id, now));
     assert!(changed.single_device_notice.is_none());
     assert_eq!(
         changed.steps[OnboardingStep::Follows.index()].status,
@@ -323,7 +353,7 @@ async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results
     network.fail_index_only.store(false, Ordering::SeqCst);
     network.events.lock().unwrap().clear();
     network.events.lock().unwrap().push(signed(
-        &nostr::Keys::generate(),
+        &nostr::prelude::Keys::generate(),
         30443,
         vec![vec!["d".into(), "foreign-author".into()]],
         "noise",
@@ -462,6 +492,12 @@ impl NostrRelayClient for Network {
         event: &NostrTransportEvent,
         _: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        assert!(
+            crate::relay_plane::RelaySafetyPolicy::default()
+                .classify_endpoints(endpoints.iter().map(|e| e.0.clone()).collect())
+                .iter()
+                .all(|e| e.policy == RelayEndpointPolicy::Allowed)
+        );
         self.attempts.lock().unwrap().push(event.clone());
         self.publishing.notify_one();
         if self.block_publish.load(Ordering::SeqCst) {
@@ -472,6 +508,16 @@ impl NostrRelayClient for Network {
         }
         self.events.lock().unwrap().push(event.clone());
         Ok(NostrPublishOutcome::accepted(endpoints.iter().cloned()))
+    }
+
+    async fn publish_event_for_account(
+        &self,
+        _account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.publish_event(endpoints, event, required_acks).await
     }
 }
 fn options() -> OnboardingOptions {
@@ -495,13 +541,13 @@ async fn fixture() -> (
     tempfile::TempDir,
     MarmotAppRuntime,
     Arc<Network>,
-    nostr::Keys,
+    nostr::prelude::Keys,
     String,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(dir.path(), network.clone());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let id = keys.public_key().to_hex();
     runtime
         .accounts()
@@ -514,7 +560,7 @@ async fn fixture() -> (
     (dir, runtime, network, keys, id)
 }
 fn signed(
-    keys: &nostr::Keys,
+    keys: &nostr::prelude::Keys,
     kind: u16,
     tags: Vec<Vec<String>>,
     content: &str,
@@ -523,7 +569,7 @@ fn signed(
     let event = EventBuilder::new(Kind::from(kind), content)
         .tags(tags.into_iter().map(|t| Tag::parse(t).unwrap()))
         .custom_created_at(Timestamp::from(at))
-        .sign_with_keys(keys)
+        .finalize(keys)
         .unwrap();
     NostrTransportEvent::from_nostr_event(&event).unwrap()
 }
@@ -984,6 +1030,511 @@ async fn missing_relays(runtime: &MarmotAppRuntime, id: &str) {
     assert_eq!(snapshot.steps[2].status, OnboardingStatus::NeedsInput);
 }
 #[tokio::test]
+async fn defaults_append_relay_roles() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        let tags = if step == OnboardingStep::Relays {
+            vec![
+                vec!["r".into(), "wss://read.example".into(), "read".into()],
+                vec!["r".into(), "wss://write.example".into(), "write".into()],
+                vec!["r".into(), "wss://both.example".into(), "read".into()],
+                vec!["r".into(), "wss://both.example/".into(), "write".into()],
+                vec!["r".into(), "wss://read.example/".into(), "read".into()],
+                vec!["r".into(), "wss://default.example/".into(), "read".into()],
+                vec![
+                    "r".into(),
+                    "wss://future.example/".into(),
+                    "future-role".into(),
+                ],
+            ]
+        } else {
+            vec![
+                vec!["relay".into(), "wss://inbox.example".into()],
+                vec!["relay".into(), "wss://inbox.example/".into()],
+            ]
+        };
+        let event = signed(&keys, step.kind() as u16, tags, "", unix_now_seconds());
+        let manager = runtime.accounts();
+        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        checkpoint.snapshot.proposal = None;
+        checkpoint.records[step.index()] = Some(event.clone());
+        if step == OnboardingStep::Relays {
+            checkpoint
+                .options
+                .default_relays
+                .push("wss://future.example".into());
+        }
+        checkpoint
+            .options
+            .default_relays
+            .push("wss://new.example".into());
+        checkpoint.set(step, OnboardingStatus::NeedsInput, Vec::new());
+        manager.save_onboarding(&mut checkpoint).unwrap();
+        let snapshot = manager
+            .propose_onboarding_relays(&id, step, None)
+            .await
+            .unwrap();
+        let proposal = snapshot.proposal.unwrap();
+        assert_eq!(proposal.previous_event_id, Some(event.id.clone()));
+        if step == OnboardingStep::Relays {
+            assert_eq!(
+                proposal.read_relays,
+                [
+                    "wss://read.example",
+                    "wss://both.example",
+                    "wss://default.example/",
+                    "wss://new.example"
+                ]
+            );
+            assert_eq!(
+                proposal.write_relays,
+                [
+                    "wss://write.example",
+                    "wss://both.example",
+                    "wss://new.example"
+                ]
+            );
+        } else {
+            assert_eq!(
+                proposal.read_relays,
+                [
+                    "wss://inbox.example",
+                    "wss://default.example",
+                    "wss://future.example",
+                    "wss://new.example"
+                ]
+            );
+            assert!(proposal.write_relays.is_empty());
+        }
+        let checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let (tags, _, _) = relay_repair_event(&checkpoint, &proposal);
+        assert!(tags.starts_with(&event.tags));
+        assert_eq!(
+            tags.len(),
+            if step == OnboardingStep::Relays { 8 } else { 5 }
+        );
+        // Explicit editor selections still replace rather than append.
+        let replaced = manager
+            .propose_onboarding_relays(
+                &id,
+                step,
+                Some((
+                    vec!["wss://edit.example".into()],
+                    if step == OnboardingStep::Relays {
+                        vec!["wss://edit.example".into()]
+                    } else {
+                        Vec::new()
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced.proposal.unwrap().read_relays,
+            ["wss://edit.example"]
+        );
+        let checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let (tags, _, _) =
+            relay_repair_event(&checkpoint, checkpoint.snapshot.proposal.as_ref().unwrap());
+        assert_eq!(tags.len(), 1);
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn defaults_preserve_relay_tags() {
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        let (dir, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let mut tags = if step == OnboardingStep::Relays {
+            vec![
+                vec!["r".into(), "ws://read.onion".into(), "read".into()],
+                vec!["r".into(), "ws://write.onion".into(), "write".into()],
+                vec!["r".into(), "wss://secure.onion".into(), "write".into()],
+            ]
+        } else {
+            vec![
+                vec!["relay".into(), "ws://inbox.onion".into()],
+                vec!["relay".into(), "wss://inbox.onion".into()],
+            ]
+        };
+        let tag_name = if step == OnboardingStep::Relays {
+            "r"
+        } else {
+            "relay"
+        };
+        for relay in [
+            "wss://100.64.0.2",
+            "ws://100.64.0.3",
+            "wss://relay.customtld",
+            "wss://relay.nostr.band",
+        ] {
+            tags.push(vec![tag_name.into(), relay.into()]);
+        }
+        // Preserve even entries that cannot be interpreted, including beyond the dial cap.
+        for index in 0..MAX_RELAYS {
+            tags.push(vec![tag_name.into(), format!("not a relay {index}")]);
+            tags.push(vec![
+                tag_name.into(),
+                format!("wss://relay.customtld/{index}"),
+            ]);
+        }
+        tags.push(vec![tag_name.into()]);
+        tags.push(vec![
+            tag_name.into(),
+            "ws://extension.onion".into(),
+            "unknown-role".into(),
+        ]);
+        let event = signed(
+            &keys,
+            step.kind() as u16,
+            tags.clone(),
+            "",
+            unix_now_seconds(),
+        );
+        network.events.lock().unwrap().push(event.clone());
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.records[step.index()] = Some(event);
+        c.set(step, OnboardingStatus::NeedsInput, Vec::new());
+        manager.save_onboarding(&mut c).unwrap();
+        let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
+        assert_eq!(status, OnboardingStatus::NeedsInput);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.issue == OnboardingIssue::NoUsableRoute)
+        );
+
+        manager
+            .propose_onboarding_relays(&id, step, None)
+            .await
+            .unwrap();
+        let revision = manager.onboarding_snapshot(&id).unwrap().unwrap().revision;
+        assert!(network.attempts.lock().unwrap().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+        let runtime = super::tests::runtime(dir.path(), network.clone());
+        let manager = runtime.accounts();
+        manager
+            .approve_onboarding_repair(&id, revision)
+            .await
+            .unwrap();
+        let published = network.attempts.lock().unwrap().last().unwrap().clone();
+        assert!(published.tags.starts_with(&tags));
+        assert_eq!(published.tags.len(), tags.len() + 1);
+        let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
+        assert_eq!(status, OnboardingStatus::Passed, "{findings:?}");
+        assert!(
+            !findings.is_empty(),
+            "unsupported routes remain advisory findings"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.issue != OnboardingIssue::Malformed)
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn append_checkpoint_fences_old() {
+    for epoch in [None, Some("ab".repeat(32))] {
+        let (dir, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let tags = vec![vec![
+            "r".into(),
+            "ws://private.onion".into(),
+            "future-role".into(),
+        ]];
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.version = if epoch.is_some() {
+            RECOVERED_ONBOARDING_VERSION
+        } else {
+            ONBOARDING_VERSION
+        };
+        c.snapshot.recovery_epoch = epoch.clone();
+        c.records[OnboardingStep::Relays.index()] =
+            Some(signed(&keys, 10002, tags.clone(), "", unix_now_seconds()));
+        c.set(
+            OnboardingStep::Relays,
+            OnboardingStatus::NeedsInput,
+            Vec::new(),
+        );
+        manager
+            .app
+            .account_home()
+            .set_account_onboarding(&id, &serde_json::to_vec(&c).unwrap())
+            .unwrap();
+        manager
+            .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+            .await
+            .unwrap();
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        // The crash boundary after approval but before signing must also be fenced.
+        c.approved = true;
+        manager.save_onboarding(&mut c).unwrap();
+        let bytes = manager
+            .app
+            .account_home()
+            .account_onboarding(&id)
+            .unwrap()
+            .unwrap();
+        let saved: OnboardingCheckpoint = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved.version, APPEND_ONBOARDING_VERSION);
+        assert!(saved.approved && saved.signed_repair.is_none());
+        // Freeze the pre-append reader's version/epoch gate.
+        assert!(!matches!(
+            (saved.version, saved.snapshot.recovery_epoch.as_deref()),
+            (3, None) | (4, Some(_))
+        ));
+        assert_eq!(
+            decode_onboarding_checkpoint(&bytes, &id)
+                .unwrap()
+                .snapshot
+                .recovery_epoch,
+            epoch
+        );
+        runtime.shutdown_and_close().await.unwrap();
+        let reopened = super::tests::runtime(dir.path(), network.clone());
+        reopened.accounts().run_onboarding(&id).await.unwrap();
+        assert!(
+            network
+                .attempts
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .tags
+                .starts_with(&tags)
+        );
+        reopened.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn inherited_roles_offer_edit() {
+    for role in ["read", "future-role"] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        network.events.lock().unwrap().push(signed(
+            &keys,
+            10002,
+            vec![
+                vec!["r".into(), "wss://default.example/".into(), role.into()],
+                vec!["r".into(), "ws://private.onion".into(), "write".into()],
+            ],
+            "",
+            unix_now_seconds(),
+        ));
+        missing_relays(&runtime, &id).await;
+        let manager = runtime.accounts();
+        let snapshot = manager.onboarding_snapshot(&id).unwrap().unwrap();
+        let step = &snapshot.steps[OnboardingStep::Relays.index()];
+        assert!(
+            step.findings
+                .iter()
+                .any(|f| f.issue == OnboardingIssue::NoUsableRoute)
+        );
+        assert!(
+            !step
+                .actions
+                .contains(&OnboardingAction::UseRecommendedRelays)
+        );
+        assert!(step.actions.contains(&OnboardingAction::EditRelays));
+        assert!(
+            manager
+                .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+                .await
+                .is_err()
+        );
+        // Older checkpoints may still advertise the impossible append action.
+        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        checkpoint.snapshot.steps[OnboardingStep::Relays.index()]
+            .actions
+            .push(OnboardingAction::UseRecommendedRelays);
+        manager.save_onboarding(&mut checkpoint).unwrap();
+        let restored = manager.onboarding_snapshot(&id).unwrap().unwrap();
+        assert!(
+            !restored.steps[OnboardingStep::Relays.index()]
+                .actions
+                .contains(&OnboardingAction::UseRecommendedRelays)
+        );
+        manager
+            .propose_onboarding_relays(
+                &id,
+                OnboardingStep::Relays,
+                Some((
+                    vec!["wss://default.example".into()],
+                    vec!["wss://default.example".into()],
+                )),
+            )
+            .await
+            .unwrap();
+        assert!(network.attempts.lock().unwrap().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn proposal_requires_route() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    network.events.lock().unwrap().push(signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://read.example".into(), "read".into()],
+            vec!["r".into(), "ws://write.onion".into(), "write".into()],
+        ],
+        "",
+        unix_now_seconds(),
+    ));
+    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let (status, findings, _) = manager
+        .check_onboarding_step(&c, OnboardingStep::Relays)
+        .await;
+    assert_eq!(status, OnboardingStatus::NeedsInput);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::NoUsableRoute)
+    );
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.set(step, OnboardingStatus::NeedsInput, Vec::new());
+        manager.save_onboarding(&mut c).unwrap();
+        for unsupported in [
+            "ws://relay.onion",
+            "wss://relay.onion",
+            "wss://100.64.0.2",
+            "wss://relay.nostr.band",
+        ] {
+            let (reads, writes) = if step == OnboardingStep::Relays {
+                (vec!["wss://read.example".into()], vec![unsupported.into()])
+            } else {
+                (vec![unsupported.into()], Vec::new())
+            };
+            assert!(
+                manager
+                    .propose_onboarding_relays(&id, step, Some((reads, writes)))
+                    .await
+                    .is_err()
+            );
+            // A usable route must not bypass explicit-editor policy for other entries.
+            for (reads, writes) in if step == OnboardingStep::Relays {
+                vec![
+                    (vec![unsupported.into()], vec!["wss://write.example".into()]),
+                    (
+                        vec![],
+                        vec![unsupported.into(), "wss://write.example".into()],
+                    ),
+                ]
+            } else {
+                vec![(
+                    vec![unsupported.into(), "wss://inbox.example".into()],
+                    vec![],
+                )]
+            } {
+                assert!(
+                    manager
+                        .propose_onboarding_relays(&id, step, Some((reads, writes)))
+                        .await
+                        .is_err()
+                );
+            }
+            assert!(
+                manager
+                    .onboarding_snapshot(&id)
+                    .unwrap()
+                    .unwrap()
+                    .proposal
+                    .is_none()
+            );
+        }
+    }
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn partial_lookup_is_not_fresh() {
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let old = signed(&keys, step.kind() as u16, vec![], "", unix_now_seconds());
+        let newer = signed(
+            &keys,
+            step.kind() as u16,
+            vec![],
+            "newer",
+            old.created_at + 1,
+        );
+        network.events.lock().unwrap().push(old.clone());
+        network.index_events.lock().unwrap().push(newer.clone());
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.options
+            .discovery_relays
+            .push("wss://healthy.example".into());
+        c.records[step.index()] = Some(old);
+        for fail_index in [true, false] {
+            c.set(step, OnboardingStatus::NeedsInput, vec![]);
+            manager.save_onboarding(&mut c).unwrap();
+            let proposal = manager
+                .propose_onboarding_relays(&id, step, None)
+                .await
+                .unwrap();
+            network.fail_index_only.store(fail_index, Ordering::SeqCst);
+            let result = manager
+                .approve_onboarding_repair(&id, proposal.revision)
+                .await
+                .unwrap();
+            let state = &result.steps[step.index()];
+            assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+            assert!(result.proposal.is_none());
+            assert!(network.attempts.lock().unwrap().is_empty());
+            let issue = if fail_index {
+                OnboardingIssue::TimedOut
+            } else {
+                OnboardingIssue::RecordChanged
+            };
+            assert!(state.findings.iter().any(|f| f.issue == issue));
+            if !fail_index {
+                let current = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+                assert_eq!(current.records[step.index()].as_ref().unwrap().id, newer.id);
+            }
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn partial_lookup_is_not_absence() {
+    let (_dir, runtime, network, _keys, id) = fixture().await;
+    missing_relays(&runtime, &id).await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.options
+        .discovery_relays
+        .push("wss://healthy.example".into());
+    manager.save_onboarding(&mut c).unwrap();
+    let proposal = manager
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    network.fail_index_only.store(true, Ordering::SeqCst);
+    let result = manager
+        .approve_onboarding_repair(&id, proposal.revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_discovery_never_authorizes_default_replacement() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     network.fail_reads.store(true, Ordering::SeqCst);
@@ -1167,7 +1718,7 @@ async fn optional_repairs_preserve_unknown_profile_fields_and_follow_tag_metadat
     assert_eq!(json["name"], "fixed");
     assert_eq!(json["website"], "https://example.com");
     assert_eq!(tags[0][1], "keep");
-    let retained = nostr::Keys::generate().public_key().to_hex();
+    let retained = nostr::prelude::Keys::generate().public_key().to_hex();
     c.records[1] = Some(signed(
         &keys,
         3,
@@ -1215,7 +1766,7 @@ async fn interactive_import_without_detailed_checkpoint_remains_gated() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(directory.path(), network.clone());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let secret = keys.secret_key().to_bech32().unwrap();
     let id = keys.public_key().to_hex();
     let manager = runtime.accounts();
@@ -1682,7 +2233,10 @@ async fn approve_blocked_repair(
                 .await
                 .unwrap();
             manager
-                .propose_onboarding_follows(id, vec![nostr::Keys::generate().public_key().to_hex()])
+                .propose_onboarding_follows(
+                    id,
+                    vec![nostr::prelude::Keys::generate().public_key().to_hex()],
+                )
                 .await
                 .unwrap()
         }
@@ -1724,7 +2278,7 @@ async fn approve_blocked_repair(
 async fn assert_cancelled_and_fresh(
     runtime: &MarmotAppRuntime,
     network: &Network,
-    keys: &nostr::Keys,
+    keys: &nostr::prelude::Keys,
     id: &str,
     previous_sends: usize,
 ) {
@@ -1848,7 +2402,7 @@ async fn cancel_during_blocked_publish_releases_begin_without_aborting_caller() 
 
 #[derive(Clone)]
 struct BlockingSigner {
-    keys: nostr::Keys,
+    keys: nostr::prelude::Keys,
     block: Arc<AtomicBool>,
     started: Arc<Notify>,
 }
@@ -1859,19 +2413,22 @@ impl std::fmt::Debug for BlockingSigner {
     }
 }
 
-impl nostr::NostrSigner for BlockingSigner {
-    fn backend(&self) -> nostr::signer::SignerBackend<'_> {
-        self.keys.backend()
-    }
+impl transport_nostr_peeler::MarmotNostrSigner for BlockingSigner {
     fn get_public_key(
         &self,
-    ) -> nostr::util::BoxedFuture<'_, Result<nostr::PublicKey, nostr::SignerError>> {
-        self.keys.get_public_key()
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::get_public_key(&self.keys)
     }
     fn sign_event(
         &self,
-        unsigned: nostr::UnsignedEvent,
-    ) -> nostr::util::BoxedFuture<'_, Result<nostr::Event, nostr::SignerError>> {
+        unsigned: nostr::prelude::UnsignedEvent,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
+    > {
         let keys = self.keys.clone();
         let block = self.block.clone();
         let started = self.started.clone();
@@ -1880,36 +2437,48 @@ impl nostr::NostrSigner for BlockingSigner {
             if block.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
-            keys.sign_event(unsigned).await
+            transport_nostr_peeler::MarmotNostrSigner::sign_event(&keys, unsigned).await
         })
     }
     fn nip04_encrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip04_encrypt(public_key, content)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_encrypt(&self.keys, public_key, content)
     }
     fn nip04_decrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
-        encrypted_content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip04_decrypt(public_key, encrypted_content)
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_decrypt(&self.keys, public_key, payload)
     }
     fn nip44_encrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip44_encrypt(public_key, content)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_encrypt(&self.keys, public_key, content)
     }
     fn nip44_decrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         payload: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip44_decrypt(public_key, payload)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_decrypt(&self.keys, public_key, payload)
     }
 }
 
@@ -1921,11 +2490,9 @@ impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for Blockin
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match test signer".into());
         }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
     }
 }
@@ -1935,7 +2502,7 @@ async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(directory.path(), network.clone());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let id = keys.public_key().to_hex();
     let block = Arc::new(AtomicBool::new(false));
     let started = Arc::new(Notify::new());
@@ -3198,7 +3765,7 @@ async fn recovery_retires_blocked_external_signer_and_survives_dropped_caller() 
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(directory.path(), network.clone());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let id = keys.public_key().to_hex();
     let signer = BlockingSigner {
         keys,

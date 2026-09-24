@@ -192,9 +192,79 @@ fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
             .clear_account_delivery_recovery("alice", 10)
             .unwrap()
     );
+    // Token 12 is independent loss, even after the worker re-adopts token 11.
+    // Retiring 11 must leave both durable debt and the caller's pending flag set.
+    assert!(
+        !reopened
+            .clear_account_delivery_recovery("alice", 11)
+            .unwrap()
+    );
+    let remaining = reopened
+        .account_delivery_recovery("alice")
+        .unwrap()
+        .unwrap();
+    assert_eq!((remaining.marker_token, remaining.dropped_count), (12, 1));
+    drop(reopened);
+
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    reopened.synchronize_account_delivery_loss("alice").unwrap();
+    assert_eq!(
+        reopened.account_delivery_recovery("alice").unwrap(),
+        Some(remaining)
+    );
+    assert!(
+        !reopened
+            .clear_account_delivery_recovery("alice", 11)
+            .unwrap()
+    );
+    assert_eq!(
+        reopened.account_delivery_recovery("alice").unwrap(),
+        Some(remaining)
+    );
     assert!(
         reopened
+            .clear_account_delivery_recovery("alice", 12)
+            .unwrap()
+    );
+    assert_eq!(reopened.account_delivery_recovery("alice").unwrap(), None);
+    drop(reopened);
+
+    // Completed retirement survives reopen, and duplicate evidence from either
+    // retired writer cannot resurrect it. Additional loss must still rearm.
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    reopened
+        .record_account_delivery_loss("alice", 11, 7, 1)
+        .unwrap();
+    reopened
+        .record_account_delivery_loss("alice", 12, 1, 1)
+        .unwrap();
+    reopened.synchronize_account_delivery_loss("alice").unwrap();
+    assert_eq!(reopened.account_delivery_recovery("alice").unwrap(), None);
+    reopened
+        .record_account_delivery_loss("alice", 12, 2, 2)
+        .unwrap();
+    reopened.synchronize_account_delivery_loss("alice").unwrap();
+    let additional = reopened
+        .account_delivery_recovery("alice")
+        .unwrap()
+        .unwrap();
+    assert_eq!((additional.marker_token, additional.dropped_count), (12, 2));
+    drop(reopened);
+
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    reopened.synchronize_account_delivery_loss("alice").unwrap();
+    assert_eq!(
+        reopened.account_delivery_recovery("alice").unwrap(),
+        Some(additional)
+    );
+    assert!(
+        !reopened
             .clear_account_delivery_recovery("alice", 11)
+            .unwrap()
+    );
+    assert!(
+        reopened
+            .clear_account_delivery_recovery("alice", 12)
             .unwrap()
     );
     assert_eq!(reopened.account_delivery_recovery("alice").unwrap(), None);

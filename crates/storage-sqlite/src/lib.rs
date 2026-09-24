@@ -11,6 +11,15 @@ pub use group_system::{
 };
 
 mod account_projection;
+mod account_recovery;
+pub use account_recovery::{
+    QualifiedRecoveryStallSample, RecoveryCause, RecoveryComparison, RecoveryComparisonOutcome,
+    RecoveryComparisonPlan, RecoveryDemand, RecoveryDemandTicket, RecoveryEligibility,
+    RecoveryEndpointCheckpoint, RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark,
+    RecoveryPredicate, RecoveryRequest, RecoveryRetryState, RecoveryRevisionFence,
+    RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan, RecoveryScopeToken,
+    StoredRecoveryScope,
+};
 mod agent_stream_sequences;
 mod attachment_acquisition;
 mod attachment_history;

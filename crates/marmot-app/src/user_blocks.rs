@@ -2,10 +2,10 @@
 use crate::relay_plane::DirectoryEventQuery;
 use crate::{AppError, MarmotApp};
 use cgka_traits::{TransportEndpoint, TransportEndpointFailureKind};
-use nostr::{EventBuilder, Kind, PublicKey, Tag, Timestamp};
+use nostr::prelude::{EventBuilder, FinalizeEventAsync, Kind, PublicKey, Tag, Timestamp};
 use std::sync::Arc;
 use storage_sqlite::{PendingBlockPublication, StoredBlockList};
-use transport_nostr_peeler::NostrTransportEvent;
+use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
 pub use storage_sqlite::{BlockListSnapshot, BlockedUser};
 pub(crate) const MUTE_LIST_KIND: u64 = 10000;
@@ -255,7 +255,7 @@ impl MarmotApp {
             let signed = EventBuilder::new(Kind::from(MUTE_LIST_KIND as u16), content)
                 .tags(tags)
                 .custom_created_at(Timestamp::from_secs(at))
-                .sign(&signer)
+                .finalize_async(&SdkSigner(signer.clone()))
                 .await
                 .map_err(|_| AppError::BlockListUnavailable)?;
             let event = NostrTransportEvent::from_nostr_event(&signed)
@@ -329,14 +329,15 @@ fn block_entries(list: &StoredBlockList, own: &str) -> Vec<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::NostrSigner;
+    use nostr::prelude::FinalizeEvent;
+    use transport_nostr_peeler::MarmotNostrSigner;
     #[tokio::test]
     async fn user_blocks_private_legacy_interop_and_unreadable_event_preserves_state() {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relays(dir.path(), vec![]);
         let account = app.account_home().create_account("alice").unwrap();
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let target = nostr::Keys::generate().public_key().to_hex();
+        let target = nostr::prelude::Keys::generate().public_key().to_hex();
         let runtime = app.runtime();
         let mut subscription = runtime.subscribe_blocked_users("alice").unwrap();
         assert!(subscription.snapshot.users.is_empty());
@@ -357,7 +358,7 @@ mod tests {
             };
             let event = EventBuilder::new(Kind::MuteList, content)
                 .custom_created_at(Timestamp::from_secs(crate::unix_now_seconds() + offset))
-                .sign_with_keys(&keys)
+                .finalize(&keys)
                 .unwrap();
             app.ingest_block_list_event(NostrTransportEvent::from_nostr_event(&event).unwrap())
                 .await
@@ -378,7 +379,7 @@ mod tests {
             .unwrap();
         let unreadable = EventBuilder::new(Kind::MuteList, "not ciphertext")
             .custom_created_at(Timestamp::from_secs(crate::unix_now_seconds() + 3))
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
         assert!(
             app.ingest_block_list_event(

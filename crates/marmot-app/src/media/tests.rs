@@ -668,8 +668,8 @@ fn media_upload_request(blossom_server: Option<String>) -> MediaUploadRequest {
     }
 }
 
-fn signing_keys() -> nostr::Keys {
-    nostr::Keys::generate()
+fn signing_keys() -> nostr::prelude::Keys {
+    nostr::prelude::Keys::generate()
 }
 
 fn media_secret() -> [u8; 32] {

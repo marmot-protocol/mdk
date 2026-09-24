@@ -3,12 +3,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
-use nostr::{EventBuilder, JsonUtil, Kind, NostrSigner, Tag, Timestamp as NostrTimestamp};
+use nostr::prelude::{EventBuilder, FinalizeUnsignedEvent, Kind, Tag, Timestamp as NostrTimestamp};
 use serde::Deserialize;
+use transport_nostr_peeler::MarmotNostrSigner;
 use url::{Host, Url};
 
 use super::AttachmentDownloadFailure;
@@ -327,7 +328,7 @@ pub(crate) async fn upload_blossom_blob(
     server: &str,
     blob: Bytes,
     blob_hash_hex: &str,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     transport: &BlossomHttpTransport,
 ) -> Result<String, AppError> {
     upload_blossom_blob_with_content_type(
@@ -346,7 +347,7 @@ pub(crate) async fn upload_blossom_blob_with_content_type(
     server: &str,
     blob: Bytes,
     blob_hash_hex: &str,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     transport: &BlossomHttpTransport,
     content_type: &str,
     fallback_extension: Option<&str>,
@@ -1450,7 +1451,7 @@ pub(crate) fn blossom_content_hash_from_url(url: &str) -> Option<String> {
 }
 
 async fn blossom_authorization_header(
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     server_host: &str,
     encrypted_hash_hex: &str,
 ) -> Result<String, AppError> {
@@ -1469,10 +1470,11 @@ async fn blossom_authorization_header(
         .get_public_key()
         .await
         .map_err(|err| crate::external_signer_error(err, "Blossom auth public key"))?;
-    let unsigned = EventBuilder::new(Kind::Custom(24242), "Upload Blob")
+    let mut unsigned = EventBuilder::new(Kind::Custom(24242), "Upload Blob")
         .tags(tags)
         .custom_created_at(NostrTimestamp::from(now))
-        .build(public_key);
+        .finalize_unsigned(public_key);
+    unsigned.ensure_id();
     let event = signer
         .sign_event(unsigned)
         .await

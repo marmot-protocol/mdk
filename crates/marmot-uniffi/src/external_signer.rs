@@ -4,9 +4,8 @@ use std::sync::Arc;
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
-use nostr::prelude::JsonUtil;
-use nostr::signer::SignerBackend;
-use nostr::{Event, NostrSigner, PublicKey, SignerError, UnsignedEvent};
+use nostr::prelude::{Event, PublicKey, UnsignedEvent};
+use transport_nostr_peeler::{MarmotNostrSigner, MarmotSignerError, SignerFuture};
 
 use crate::MarmotKitError;
 
@@ -54,12 +53,8 @@ impl fmt::Debug for ExternalAccountSignerAdapter {
     }
 }
 
-impl NostrSigner for ExternalAccountSignerAdapter {
-    fn backend(&self) -> SignerBackend<'_> {
-        SignerBackend::Custom("external-account-signer".into())
-    }
-
-    fn get_public_key(&self) -> nostr::util::BoxedFuture<'_, Result<PublicKey, SignerError>> {
+impl MarmotNostrSigner for ExternalAccountSignerAdapter {
+    fn get_public_key(&self) -> SignerFuture<'_, Result<PublicKey, MarmotSignerError>> {
         let signer = self.signer.clone();
         Box::pin(async move {
             let public_key = tokio::task::spawn_blocking(move || signer.public_key())
@@ -73,12 +68,12 @@ impl NostrSigner for ExternalAccountSignerAdapter {
     fn sign_event(
         &self,
         unsigned: UnsignedEvent,
-    ) -> nostr::util::BoxedFuture<'_, Result<Event, SignerError>> {
+    ) -> SignerFuture<'_, Result<Event, MarmotSignerError>> {
         let signer = self.signer.clone();
         Box::pin(async move {
             let expected_id = unsigned
                 .id
-                .ok_or_else(|| SignerError::from("unsigned event id was not set"))?;
+                .ok_or_else(|| MarmotSignerError::from("unsigned event id was not set"))?;
             let expected_pubkey = unsigned.pubkey;
             let unsigned_json = unsigned.as_json();
             let event_json = tokio::task::spawn_blocking(move || signer.sign_event(unsigned_json))
@@ -87,7 +82,7 @@ impl NostrSigner for ExternalAccountSignerAdapter {
                 .map_err(callback_signer_error)?;
             let event = Event::from_json(event_json).map_err(signer_error)?;
             if event.id != expected_id || event.pubkey != expected_pubkey {
-                return Err(SignerError::from(
+                return Err(MarmotSignerError::from(
                     "external signer returned a different event than requested",
                 ));
             }
@@ -100,7 +95,7 @@ impl NostrSigner for ExternalAccountSignerAdapter {
         &'a self,
         public_key: &'a PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
+    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer.clone();
         let public_key = public_key.to_hex();
         let content = content.to_owned();
@@ -116,7 +111,7 @@ impl NostrSigner for ExternalAccountSignerAdapter {
         &'a self,
         public_key: &'a PublicKey,
         encrypted_content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
+    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer.clone();
         let public_key = public_key.to_hex();
         let encrypted_content = encrypted_content.to_owned();
@@ -132,7 +127,7 @@ impl NostrSigner for ExternalAccountSignerAdapter {
         &'a self,
         public_key: &'a PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
+    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer.clone();
         let public_key = public_key.to_hex();
         let content = content.to_owned();
@@ -148,7 +143,7 @@ impl NostrSigner for ExternalAccountSignerAdapter {
         &'a self,
         public_key: &'a PublicKey,
         payload: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
+    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer.clone();
         let public_key = public_key.to_hex();
         let payload = payload.to_owned();
@@ -188,12 +183,12 @@ impl AccountIdentityProofSigner for ExternalAccountSignerAdapter {
     }
 }
 
-fn callback_signer_error(error: MarmotKitError) -> SignerError {
+fn callback_signer_error(error: MarmotKitError) -> MarmotSignerError {
     match error {
         MarmotKitError::ExternalSignerRejected => {
-            SignerError::from(marmot_app::EXTERNAL_SIGNER_REJECTED)
+            MarmotSignerError::from(marmot_app::EXTERNAL_SIGNER_REJECTED)
         }
-        other => SignerError::from(other.to_string()),
+        other => MarmotSignerError::from(other.to_string()),
     }
 }
 
@@ -209,6 +204,6 @@ fn callback_proof_signer_error(error: MarmotKitError) -> String {
     }
 }
 
-fn signer_error(error: impl ToString) -> SignerError {
-    SignerError::from(error.to_string())
+fn signer_error(error: impl ToString) -> MarmotSignerError {
+    MarmotSignerError::from(error.to_string())
 }

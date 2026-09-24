@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 pub(crate) struct RelayProcess {
     client: ProcessClient,
-    publications: std::sync::Mutex<Option<Vec<nostr::Event>>>,
+    publications: std::sync::Mutex<Option<Vec<nostr::prelude::Event>>>,
     _root: TempDir,
 }
 #[derive(Clone)]
@@ -101,14 +101,24 @@ impl RelayBackend {
                 .map_err(|e| e.subject()),
         }
     }
-    pub async fn diagnostic_publications(&self) -> Result<Vec<nostr::Event>, SubjectError> {
+    pub async fn diagnostic_publications(
+        &self,
+    ) -> Result<Vec<nostr::prelude::Event>, SubjectError> {
         if let Self::Remote(p) = self
             && let Some(events) = p.publications.lock().expect("relay cache lock").as_ref()
         {
             return Ok(events.clone());
         }
         match self {
-            Self::Local(c) => Ok(c.diagnostic_publications().await),
+            Self::Local(c) => c
+                .diagnostic_publications()
+                .await
+                .into_iter()
+                .map(|event| {
+                    let json = serde_json::to_string(&event).map_err(super::environment_error)?;
+                    nostr::prelude::Event::from_json(json).map_err(super::environment_error)
+                })
+                .collect(),
             Self::Remote(p) => p
                 .client
                 .call_async("publications", json!([]))

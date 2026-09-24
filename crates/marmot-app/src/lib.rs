@@ -56,7 +56,8 @@ use marmot_account::{
     TransportRoutingPolicy,
 };
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, EventBuilder, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag,
+    Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -83,6 +84,7 @@ mod collector_host_safety;
 pub mod product_analytics;
 pub use product_analytics::*;
 mod audit_log;
+pub mod audit_otlp_sender;
 mod chat_presentation;
 mod client;
 mod config;
@@ -104,8 +106,10 @@ mod profile_pseudonyms;
 #[cfg(feature = "media-benchmarks")]
 #[doc(hidden)]
 pub use media::MediaDownloadBenchmarkTransport;
+mod audit_export_lifecycle;
 mod messages;
 mod nostr_secret;
+mod nostr_verification;
 mod notifications;
 mod projection;
 mod publisher_sequences;
@@ -194,8 +198,8 @@ pub(crate) use client::{
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
     AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
-    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings,
+    RecoveryExecutorMode, RelayTelemetryExportConfig, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
@@ -209,7 +213,7 @@ pub use drafts::{
     MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent,
 };
-pub use error::{AccountCatchUpFailure, AppError};
+pub use error::{AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason};
 pub use groups::{
     AppAgentTextStreamComponent, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandFailureReason,
     AppDisbandRequest, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
@@ -238,6 +242,7 @@ pub use media::{
 };
 pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;
+pub use nostr_verification::verify_public_nostr_event_json;
 pub use notifications::{
     BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
     GroupPushTokenDebugEntry, GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR,
@@ -500,6 +505,7 @@ pub struct MarmotApp {
     /// [`Self::close_storage`] holds the write side across its whole teardown.
     /// See [`Self::begin_storage_open`].
     storage_lifecycle: Arc<RwLock<()>>,
+    audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle,
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
@@ -1272,7 +1278,7 @@ struct OpenAppAccount {
     state: AccountState,
     delivery_overflow_recovery_pending: bool,
     delivery_overflow_recovery_marker_token: Option<u64>,
-    signer: Arc<dyn nostr::NostrSigner>,
+    signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
 }
 
 struct AppAccountSessionGuard {
@@ -1438,6 +1444,7 @@ impl MarmotApp {
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
+            audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
             relay_urls,
             relay_plane,
             config,
@@ -1522,6 +1529,7 @@ impl MarmotApp {
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
+            audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
             relay_urls,
             account_home,
             relay_plane,
@@ -1716,7 +1724,44 @@ impl MarmotApp {
             crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
         };
         let _ = open.runtime.take_maintenance_activity();
+        let recovery_policy = if cfg!(feature = "test-policy-overrides")
+            && let Some(ms) = self.config.dev_epoch_backfill_retry_backoff_ms
+        {
+            client::recovery::RecoveryRetryPolicy {
+                base: Duration::from_millis(ms.max(1)),
+                cap: Duration::from_millis(ms.max(1).saturating_mul(20)),
+            }
+        } else {
+            client::recovery::RecoveryRetryPolicy {
+                base: EPOCH_BACKFILL_RETRY_BACKOFF,
+                cap: EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
+            }
+        };
+        let mut recovery_owner = client::recovery::AccountRecoveryOwner::open(
+            &self.account_storage(&open.state.label)?,
+            client::recovery::wall_now_ms()?,
+            Instant::now(),
+            recovery_policy,
+        )?;
+        recovery_owner.select_executor_mode(self.config.recovery_executor_mode);
+        if relay_plane
+            .subscription_rebuild_since(open.state.last_transport_timestamp)
+            .is_none()
+        {
+            self.account_storage(&open.state.label)?.request_recovery(
+                storage_sqlite::RecoveryRequest::IncrementalHistory,
+                client::recovery::wall_now_ms()?,
+            )?;
+        }
         let mut client = AppClient {
+            #[cfg(test)]
+            test_recovery_evidence: None,
+            #[cfg(test)]
+            test_comparison_results: None,
+            #[cfg(test)]
+            test_comparison_delay: None,
+            recovery_owner,
+            comparison_startup_requested: false,
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,
@@ -1760,14 +1805,13 @@ impl MarmotApp {
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
-            epoch_backfill_retry_not_before: None,
-            pending_epoch_backfill: None,
+            pending_recovery_arm_writes: HashMap::new(),
+            pending_recovery_capacity_writes: HashMap::new(),
             released_backfill_reload_pending: true,
             #[cfg(test)]
             fail_next_released_backfill_reload: false,
             #[cfg(test)]
             fail_next_terminal_recovery_retire: false,
-            queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
@@ -1989,7 +2033,9 @@ impl MarmotApp {
             "contact list",
             "profile metadata",
         ];
-        let batch = relay_client.publish_events_with_timings(&requests).await;
+        let batch = relay_client
+            .publish_events_for_account_with_timings(&account_id, &requests)
+            .await;
         let outcomes = batch.outcomes;
         if outcomes.len() != record_kinds.len() {
             return Err(AppError::Publish(format!(
@@ -2319,7 +2365,10 @@ impl MarmotApp {
                 required_acks: 1,
             });
         }
-        for outcome in relay_client.publish_events(&requests).await {
+        for outcome in relay_client
+            .publish_events_for_account(&account_id, &requests)
+            .await
+        {
             if outcome?.accepted.is_empty() {
                 return Err(AppError::Publish(
                     "relay acknowledged zero account relay-list events".to_owned(),
@@ -3342,28 +3391,6 @@ impl MarmotApp {
         Ok(())
     }
 
-    pub(crate) fn clear_epoch_backfill_intents(
-        &self,
-        label: &str,
-        intents: &[storage_sqlite::StoredEpochBackfillIntent],
-    ) -> Result<(), AppError> {
-        self.ensure_account_state(label)?;
-        self.account_storage(label)?
-            .clear_epoch_backfill_intents(intents)?;
-        Ok(())
-    }
-
-    pub(crate) fn clear_epoch_backfill_intents_for_groups(
-        &self,
-        label: &str,
-        group_ids_hex: &[String],
-    ) -> Result<(), AppError> {
-        self.ensure_account_state(label)?;
-        self.account_storage(label)?
-            .clear_epoch_backfill_intents_for_groups(group_ids_hex)?;
-        Ok(())
-    }
-
     pub(crate) fn record_epoch_stall_evidence(
         &self,
         label: &str,
@@ -3686,16 +3713,23 @@ impl MarmotApp {
         let label = account.label.as_str();
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
-        let delivery_overflow_recovery = self
-            .account_storage(label)?
-            .account_delivery_recovery(label)?;
-        let delivery_overflow_recovery_pending = delivery_overflow_recovery.is_some();
-        let delivery_overflow_recovery_marker_token =
-            delivery_overflow_recovery.map(|recovery| recovery.marker_token);
+        let recovery_storage = self.account_storage(label)?;
+        recovery_storage.restore_unacknowledged_recovery_loss()?;
+        recovery_storage.synchronize_account_delivery_loss(label)?;
+        let delivery_overflow_recovery = recovery_storage.account_delivery_recovery(label)?;
+        let notification_loss = recovery_storage
+            .pending_recovery_demands()?
+            .into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
+        let delivery_overflow_recovery_pending =
+            delivery_overflow_recovery.is_some() || notification_loss.is_some();
+        let delivery_overflow_recovery_marker_token = delivery_overflow_recovery
+            .map(|recovery| recovery.marker_token)
+            .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(nostr_signer.clone());
+        let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer.clone());
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // load_state/account_storage above completed the first database open.
         // Serialize any remaining key-migration probe with other openers.
@@ -3773,7 +3807,12 @@ impl MarmotApp {
         let recovery_marker: relay_plane::AccountDeliveryRecoveryMarker =
             Arc::new(move |marker_token, dropped| {
                 recovery_storage
-                    .mark_account_delivery_recovery(&recovery_label, marker_token, dropped)
+                    .record_account_delivery_loss(
+                        &recovery_label,
+                        marker_token,
+                        dropped,
+                        unix_now_seconds(),
+                    )
                     .map_err(|error| {
                         if error.is_closed() {
                             relay_plane::AccountDeliveryRecoveryMarkerError::Closed
@@ -4502,6 +4541,7 @@ impl MarmotApp {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let account_id_hex = account.account_id_hex;
+        let account_id = MemberId::new(hex::decode(&account_id_hex)?);
         let mut results = targets
             .iter()
             .map(|target| KeyPackageDeletionResult {
@@ -4568,7 +4608,9 @@ impl MarmotApp {
         if !requests.is_empty() {
             let relay_client =
                 self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
-            let outcomes = relay_client.publish_events(&requests).await;
+            let outcomes = relay_client
+                .publish_events_for_account(&account_id, &requests)
+                .await;
             for (index, outcome) in request_indices.into_iter().zip(outcomes) {
                 results[index].result = match outcome {
                     Ok(outcome) if !outcome.accepted.is_empty() => Ok(outcome.accepted.len()),
@@ -5457,6 +5499,27 @@ impl MarmotApp {
         Ok(guard)
     }
 
+    /// Local audit cursor work is admitted under the root owner's storage
+    /// lifecycle. The closure must finish before any HTTP await.
+    pub(crate) fn with_audit_export_admission<T>(
+        &self,
+        attempt: &audit_export_lifecycle::AuditExportAttempt,
+        work: impl FnOnce() -> Result<T, AppError>,
+    ) -> Result<Option<T>, AppError> {
+        let _storage = self.begin_storage_open("audit export")?;
+        if self
+            .root_runtime_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
+            return Err(AppError::AuditLogUpload(
+                "audit export requires exclusive root ownership".into(),
+            ));
+        }
+        self.audit_export_lifecycle.admit(attempt, work).transpose()
+    }
+
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         let permit = self.product_analytics.permit();
         let result = self.account_storage_unobserved(label);
@@ -6135,7 +6198,7 @@ impl MarmotApp {
     fn relay_client_for_account_id(
         &self,
         account_id_hex: &str,
-        signer: Arc<dyn nostr::NostrSigner>,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
         #[cfg(test)]
         if let Some(client) = &self.test_relay_client {
@@ -6151,8 +6214,16 @@ impl MarmotApp {
         clients
             .entry(account_id_hex.to_owned())
             .or_insert_with(|| {
-                let client = NostrSdkClient::builder().signer(signer).build();
-                Arc::new(NostrSdkRelayClient::new(client))
+                let client = NostrSdkClient::builder()
+                    .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+                        transport_nostr_peeler::SdkSigner(signer.clone()),
+                    ))
+                    .build();
+                let account_id =
+                    MemberId::new(hex::decode(account_id_hex).expect("validated account identity"));
+                Arc::new(NostrSdkRelayClient::with_account_signer(
+                    client, account_id, signer,
+                ))
             })
             .clone()
     }
@@ -6301,11 +6372,16 @@ impl MarmotApp {
     }
 }
 
-pub(crate) fn external_signer_public_key_error(error: nostr::SignerError) -> AppError {
+pub(crate) fn external_signer_public_key_error(
+    error: transport_nostr_peeler::MarmotSignerError,
+) -> AppError {
     external_signer_error(error, "external signer public key")
 }
 
-pub(crate) fn external_signer_error(error: nostr::SignerError, context: &str) -> AppError {
+pub(crate) fn external_signer_error(
+    error: transport_nostr_peeler::MarmotSignerError,
+    context: &str,
+) -> AppError {
     if error.to_string().contains(EXTERNAL_SIGNER_REJECTED) {
         AppError::ExternalSignerRejected
     } else {
@@ -6619,13 +6695,14 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             .get_public_key()
             .await
             .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
-        let unsigned = EventBuilder::new(
+        let mut unsigned = EventBuilder::new(
             Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16),
             unsigned_dto.content,
         )
         .tags(tags)
         .custom_created_at(NostrTimestamp::from_secs(publication.created_at.0))
-        .build(public_key);
+        .finalize_unsigned(public_key);
+        unsigned.ensure_id();
         let signed = signer
             .sign_event(unsigned)
             .await

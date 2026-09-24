@@ -186,6 +186,14 @@ mod migration_0089_local_submissions;
 mod migration_0090_poll_response_edges;
 #[path = "migrations/0091_account_local_identity.rs"]
 mod migration_0091_account_local_identity;
+#[path = "migrations/0092_account_recovery_owner.rs"]
+mod migration_0092_account_recovery_owner;
+#[path = "migrations/0093_recovery_route_snapshot.rs"]
+mod migration_0093_recovery_route_snapshot;
+#[path = "migrations/0094_qualified_stall_observations.rs"]
+mod migration_0094_qualified_stall_observations;
+#[path = "migrations/0095_recovery_comparison.rs"]
+mod migration_0095_recovery_comparison;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -657,6 +665,26 @@ const MIGRATIONS: &[Migration] = &[
         name: "0091_account_local_identity",
         apply: migration_0091_account_local_identity::apply,
     },
+    Migration {
+        version: 92,
+        name: "0092_account_recovery_owner",
+        apply: migration_0092_account_recovery_owner::apply,
+    },
+    Migration {
+        version: 93,
+        name: "0093_recovery_route_snapshot",
+        apply: migration_0093_recovery_route_snapshot::apply,
+    },
+    Migration {
+        version: 94,
+        name: "0094_qualified_stall_observations",
+        apply: migration_0094_qualified_stall_observations::apply,
+    },
+    Migration {
+        version: 95,
+        name: "0095_recovery_comparison",
+        apply: migration_0095_recovery_comparison::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
@@ -1015,6 +1043,414 @@ mod tests {
             })
             .unwrap();
         assert_eq!(intent, [0xbb]);
+    }
+
+    fn recovery_completion_rows(
+        conn: &Connection,
+        table: &str,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn recovery_completion_migration_preserves_populated_state_and_rolls_back_interruption() {
+        fn interrupted(tx: &Transaction<'_>) -> StorageResult<()> {
+            migration_0093_recovery_route_snapshot::apply(tx)?;
+            Err(StorageError::Backend(
+                "injected completion migration interruption".into(),
+            ))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery-completion.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..91]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_state(label,updated_at) VALUES ('alice',100);
+            INSERT INTO cgka_groups(id,epoch,record) VALUES (x'aa',7,x'00');
+            INSERT INTO app_epoch_backfill_intents VALUES (x'aa',7,123);
+            INSERT INTO account_delivery_recovery VALUES ('alice',42,124,0);
+            INSERT INTO app_epoch_stall_evidence VALUES (x'aa',7,2,0,123000,123);
+            INSERT INTO cgka_released_transport_receipts VALUES (x'bb',x'aa',7);
+            INSERT INTO cgka_maintenance_obligations VALUES (x'01',x'aa',1,x'1234');
+            INSERT INTO transport_reconciliation_items VALUES (0,x'',zeroblob(32),120);
+            INSERT INTO transport_reconciliation_route_state VALUES (0,x'',119,zeroblob(32));
+            INSERT INTO transport_reconciliation_scheduler VALUES (1,0,x'');",
+        )
+        .unwrap();
+        run(&mut conn, &MIGRATIONS[..92]).unwrap();
+        conn.execute_batch("UPDATE account_recovery_state SET next_attempt=9,retry_ordinal=4,
+            retry_recorded_at_ms=1000,retry_delay_ms=15000,retry_not_before_ms=16000;
+            INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms,caller_origin,urgency)
+            VALUES ('explicit:existing',3,1000,1000,1,1);").unwrap();
+        let preserved = [
+            "account_recovery_obligations",
+            "account_recovery_scopes",
+            "account_delivery_loss_evidence",
+            "app_epoch_stall_evidence",
+            "cgka_released_transport_receipts",
+            "cgka_maintenance_obligations",
+            "transport_reconciliation_items",
+            "transport_reconciliation_route_state",
+            "transport_reconciliation_scheduler",
+        ];
+        let before: Vec<_> = preserved
+            .iter()
+            .map(|table| recovery_completion_rows(&conn, table))
+            .collect();
+        let retry_before = recovery_completion_rows(&conn, "account_recovery_state");
+        assert!(
+            apply_migration(
+                &mut conn,
+                &Migration {
+                    version: 93,
+                    name: "0093_recovery_route_snapshot",
+                    apply: interrupted
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(applied_name(&conn, 93).unwrap(), None);
+        assert!(
+            conn.prepare("SELECT route_snapshot FROM account_recovery_state")
+                .is_err()
+        );
+        assert_eq!(
+            recovery_completion_rows(&conn, "account_recovery_state"),
+            retry_before
+        );
+        assert!(
+            conn.prepare("SELECT inventory_invalidated FROM cgka_released_transport_receipts")
+                .is_err(),
+            "interrupted migration must roll back the journal column too"
+        );
+        for (table, expected) in preserved.iter().zip(&before) {
+            assert_eq!(
+                &recovery_completion_rows(&conn, table),
+                expected,
+                "{table} changed after rollback"
+            );
+        }
+        // Also interrupt the integration's qualified-stagnation migration.
+        // Schema and historical evidence must roll back together before reopen.
+        run(&mut conn, &MIGRATIONS[..93]).unwrap();
+        let before_stall: Vec<_> = preserved
+            .iter()
+            .map(|table| recovery_completion_rows(&conn, table))
+            .collect();
+        let state_before_stall = recovery_completion_rows(&conn, "account_recovery_state");
+        fn interrupted_stall(tx: &Transaction<'_>) -> StorageResult<()> {
+            migration_0094_qualified_stall_observations::apply(tx)?;
+            Err(StorageError::Backend(
+                "injected qualified observation migration interruption".into(),
+            ))
+        }
+        assert!(
+            apply_migration(
+                &mut conn,
+                &Migration {
+                    version: 94,
+                    name: "0094_qualified_stall_observations",
+                    apply: interrupted_stall,
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(applied_name(&conn, 94).unwrap(), None);
+        assert!(
+            conn.prepare("SELECT qualified_certificate FROM app_epoch_stall_evidence")
+                .is_err()
+        );
+        assert_eq!(
+            recovery_completion_rows(&conn, "account_recovery_state"),
+            state_before_stall
+        );
+        for (table, expected) in preserved.iter().zip(&before_stall) {
+            assert_eq!(
+                &recovery_completion_rows(&conn, table),
+                expected,
+                "{table} changed after qualified observation migration rollback"
+            );
+        }
+        run(&mut conn, &MIGRATIONS[..94]).unwrap();
+        let before_comparison = recovery_completion_rows(&conn, "account_recovery_state");
+        fn interrupted_comparison(tx: &Transaction<'_>) -> StorageResult<()> {
+            migration_0095_recovery_comparison::apply(tx)?;
+            Err(StorageError::Backend(
+                "injected comparison migration interruption".into(),
+            ))
+        }
+        assert!(
+            apply_migration(
+                &mut conn,
+                &Migration {
+                    version: 95,
+                    name: "0095_recovery_comparison",
+                    apply: interrupted_comparison,
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(applied_name(&conn, 95).unwrap(), None);
+        assert!(
+            conn.prepare("SELECT revision FROM account_recovery_comparison")
+                .is_err()
+        );
+        assert_eq!(
+            recovery_completion_rows(&conn, "account_recovery_state"),
+            before_comparison
+        );
+        run_all(&mut conn).unwrap();
+        assert!(
+            run(&mut conn, &MIGRATIONS[..92]).is_err(),
+            "old runner must refuse schema 93"
+        );
+        drop(conn);
+        let mut conn = keyed_connection(&path);
+        assert_eq!(run_all(&mut conn).unwrap(), 0);
+        for (table, expected) in preserved.iter().zip(&before) {
+            let mut upgraded = expected.clone();
+            if *table == "cgka_released_transport_receipts" {
+                // Existing journals have no proof that invalidation ran.
+                for row in &mut upgraded {
+                    row.push(rusqlite::types::Value::Integer(0));
+                }
+            }
+            if *table == "app_epoch_stall_evidence" {
+                // Preserve every legacy counter and warning, but never promote
+                // old EOSE observations into qualified stagnation evidence.
+                for row in &mut upgraded {
+                    use rusqlite::types::Value::{Integer, Null};
+                    row.extend([Null, Integer(0), Integer(0), Null]);
+                }
+            }
+            assert_eq!(
+                &recovery_completion_rows(&conn, table),
+                &upgraded,
+                "{table} changed after reopen"
+            );
+        }
+        let state = recovery_completion_rows(&conn, "account_recovery_state");
+        assert_eq!(
+            &state[0][..retry_before[0].len()],
+            retry_before[0].as_slice()
+        );
+        use rusqlite::types::Value::{Integer, Null};
+        assert_eq!(
+            &state[0][retry_before[0].len()..],
+            &[Null, Integer(0), Integer(0)],
+            "route identity and qualified observation allocators must start empty"
+        );
+        assert!(conn.execute("INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms) VALUES ('explicit:second',3,1001,1001)",[]).is_err());
+        assert_eq!(
+            &recovery_completion_rows(&conn, "account_recovery_obligations"),
+            &before[0]
+        );
+    }
+
+    #[test]
+    fn recovery_completion_migration_refuses_duplicate_explicit_rows_without_losing_debt() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..92]).unwrap();
+        // The published foundation has no explicit-demand writer. Unexpected
+        // preexisting rows still fail closed rather than silently discarding debt.
+        conn.execute_batch(
+            "INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms)
+            VALUES ('explicit:first',3,1000,1000),('explicit:second',3,1001,1001);",
+        )
+        .unwrap();
+        let before = recovery_completion_rows(&conn, "account_recovery_obligations");
+        assert!(run_all(&mut conn).is_err());
+        assert_eq!(applied_name(&conn, 93).unwrap(), None);
+        assert!(
+            conn.prepare("SELECT route_snapshot FROM account_recovery_state")
+                .is_err()
+        );
+        assert_eq!(
+            recovery_completion_rows(&conn, "account_recovery_obligations"),
+            before
+        );
+    }
+
+    #[test]
+    fn recovery_owner_migration_preserves_populated_demand_and_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery-owner.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..91]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_state(label, updated_at) VALUES ('alice', 100);
+             INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 7, x'00');
+             INSERT INTO app_epoch_backfill_intents VALUES (x'aa', 7, 123);
+             INSERT INTO cgka_groups(id, epoch, record) VALUES (x'abcd', 3, x'01');
+             INSERT INTO app_epoch_backfill_intents VALUES (x'abcd', 3, 122);
+             INSERT INTO account_delivery_recovery VALUES ('alice', 42, 124, 9);
+             INSERT INTO app_epoch_stall_evidence VALUES (x'aa', 7, 2, 0, 123000, 123);
+             INSERT INTO cgka_released_transport_receipts VALUES (x'bb', x'aa', 7);
+             INSERT INTO cgka_maintenance_obligations VALUES (x'01', x'aa', 1, x'1234');
+             INSERT INTO transport_reconciliation_items VALUES (0, x'', zeroblob(32), 120);
+             INSERT INTO transport_reconciliation_route_state VALUES (0, x'', 119, zeroblob(32));
+             INSERT INTO transport_reconciliation_scheduler VALUES (1, 0, x'');",
+        )
+        .unwrap();
+        let preserved = [
+            "app_epoch_stall_evidence",
+            "cgka_released_transport_receipts",
+            "cgka_maintenance_obligations",
+            "transport_reconciliation_items",
+            "transport_reconciliation_route_state",
+            "transport_reconciliation_scheduler",
+        ];
+        fn rows(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+        let before: Vec<_> = preserved.iter().map(|table| rows(&conn, table)).collect();
+        run_all(&mut conn).unwrap();
+        for (table, expected) in preserved.iter().zip(&before) {
+            let mut upgraded = expected.clone();
+            if *table == "cgka_released_transport_receipts" {
+                // Existing journals have no proof that invalidation ran.
+                for row in &mut upgraded {
+                    row.push(rusqlite::types::Value::Integer(0));
+                }
+            }
+            if *table == "app_epoch_stall_evidence" {
+                // Preserve every legacy counter and warning, but never promote
+                // old EOSE observations into qualified stagnation evidence.
+                for row in &mut upgraded {
+                    use rusqlite::types::Value::{Integer, Null};
+                    row.extend([Null, Integer(0), Integer(0), Null]);
+                }
+            }
+            assert_eq!(
+                &rows(&conn, table),
+                &upgraded,
+                "{table} changed during migration"
+            );
+        }
+        let demands: Vec<(i64, Option<i64>, Option<i64>)> = conn
+            .prepare("SELECT cause, stalled_epoch, marker_token FROM account_recovery_obligations ORDER BY cause, stalled_epoch")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            demands,
+            vec![(0, None, Some(42)), (1, Some(3), None), (1, Some(7), None)]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM account_recovery_scopes WHERE snapshot_state = 0",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT dropped_count FROM account_delivery_loss_evidence",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            9
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT fruitless_completions FROM app_epoch_stall_evidence",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM cgka_released_transport_receipts",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            run(&mut conn, &MIGRATIONS[..91]).is_err(),
+            "old binary must refuse the new schema"
+        );
+        drop(conn);
+        let mut conn = keyed_connection(&path);
+        run_all(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM account_recovery_obligations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn recovery_owner_interrupted_migration_keeps_old_authority() {
+        fn fail_after_conversion(tx: &Transaction<'_>) -> StorageResult<()> {
+            migration_0092_account_recovery_owner::apply(tx)?;
+            Err(StorageError::Backend(
+                "injected migration interruption".into(),
+            ))
+        }
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..91]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_state(label, updated_at) VALUES ('alice', 100);
+             INSERT INTO account_delivery_recovery VALUES ('alice', 42, 124, 9);",
+        )
+        .unwrap();
+        let migration = Migration {
+            version: 92,
+            name: "0092_account_recovery_owner",
+            apply: fail_after_conversion,
+        };
+        assert!(apply_migration(&mut conn, &migration).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT marker_token FROM account_delivery_recovery",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            42
+        );
+        assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'account_recovery_obligations')", [], |r| r.get::<_, bool>(0)).unwrap());
+        assert_eq!(applied_name(&conn, 92).unwrap(), None);
+        run_all(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT marker_token FROM account_recovery_obligations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            42
+        );
     }
 
     #[test]
@@ -2922,7 +3358,7 @@ mod tests {
             "durable removal intent must survive projection group deletion"
         );
         assert_eq!(
-            foreign_key(&conn, "app_epoch_backfill_intents", "group_id"),
+            foreign_key(&conn, "account_recovery_obligations", "group_id"),
             Some(("cgka_groups".to_owned(), "CASCADE".to_owned())),
             "durable recovery intent must survive projection deletion but cascade with its protocol group"
         );

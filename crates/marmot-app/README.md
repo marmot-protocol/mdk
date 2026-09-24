@@ -145,6 +145,16 @@ catch-up continue asynchronously. Hosts should render local chat projections at 
 separately, and allow subsequent relay events to refresh or reorder the rendered rows. Mutating worker commands received
 during initial catch-up are deferred and replayed in order once the live client is ready.
 
+Worker startup is isolated per account. A failed open does not discard a sibling that reached
+local readiness. Failed accounts have an in-memory, per-account retry delay starting at one second,
+doubling to a 60-second cap; the next reconcile or worker request after expiry admits one attempt.
+There is no background retry timer. `restart_account` explicitly retries an eligible account, while
+successful sign-in, signer registration, and committed setup/onboarding transitions reset that
+account's delay. Reconcile and start still report an error if any eligible account failed or is
+cooling down; a healthy worker remains usable through account-scoped commands. Successful startup
+clears its failure record. Account removal, deactivation, and runtime shutdown discard the record.
+Signed-out, missing-signer, and onboarding-gated accounts remain ineligible even after a reset.
+
 The crate root now keeps app construction, shared state, storage/projector wiring, directory bootstrap, account relay
 list helpers, and public re-exports. Runtime orchestration lives in the `src/runtime/` module, app-client commands and queries
 live in the `src/client/` module, group DTOs/component projection helpers live in `src/groups.rs`, and encrypted-media
@@ -177,21 +187,30 @@ See [`AGENTS.md`](AGENTS.md) for the module map and privacy-safe telemetry rules
 
 ## Explicit full-history repair
 
-`MarmotAppRuntime::repair_full_history` keeps one unfloored relay activation and its frozen endpoint EOSE coverage
-across checkpointed drain quanta. A quantum yield alone does not fail or resubscribe the repair. All required relay
-endpoints must confirm completion; silence, a fast subset, and EOSE from a superseded attempt cannot satisfy it.
-Explicit overflow recovery uses the same continuation and retains generation-checked durable marker clearing.
+`MarmotAppRuntime::repair_full_history` requests one owner-authorized unfloored attempt and retains its frozen
+scope and endpoint session across checkpointed drain quanta. A quantum yield does not resubscribe or buy another
+retry. Success requires qualified exhaustive history and durable admission for every required endpoint/scope;
+EOSE alone, a fast subset, or a superseded session cannot certify completion. The current SDK supplies no such
+exhaustiveness certificate, so it honestly returns incomplete even if all endpoints report EOSE. Known-event
+recovery can instead complete from a validated retained copy. Maintenance uses its separately fenced boundary.
 
-The explicit attempt has a 60-second overall cooperative budget, including setup, reconciliation, and overflow
-recovery. A started ingest/checkpoint always finishes before observing the deadline or caller/runtime cancellation;
-this is not a hard wall-clock bound on an individual storage or network operation. A terminal transport failure or
-an earlier drain silence verdict still ends the attempt. Partial progress remains durable and incomplete overflow
-markers survive restart. A later call starts a new attempt; live continuation state is not persisted across restart.
+The Rust `AppError::FullHistoryRepairIncomplete` preserves a bounded `FullHistoryRepairIncompleteReason` and an
+independent `delivery_loss_pending` flag. Worker/binding calls retain their existing error channel; their safe
+error code reports outstanding delivery loss when present, with cancellation taking precedence. No incomplete
+attempt is converted to a success. Rust callers can inspect
+`AppError::full_history_repair_incomplete()` for the typed reason and independent loss flag,
+including through `AccountCatchUp`. It never parses display strings. The API shape for repair calls is unchanged.
+
+The explicit attempt has a 60-second overall cooperative budget, including setup and reconciliation. A started
+ingest/checkpoint finishes before deadline or caller/runtime cancellation is observed; this is not a hard bound
+on an individual storage or network operation. An earlier terminal transport or drain-silence verdict also ends
+the attempt. Partial progress remains durable, outstanding loss survives reopen, and only qualified completion
+plus the exact live acknowledgment can reclaim captured loss evidence and release its cursor fence.
 
 The account remains serialized during repair. The worker can serve committed member/roster snapshots while relay
-I/O waits; mutations, subsequent repair requests, and reads behind queued mutations retain FIFO order. This does
-not yet provide send fairness during repair or isolate network tasks from synchronous engine work. Automatic
-backfill and automatic overflow scheduling retain their existing single-quantum behavior.
+I/O waits; mutations, subsequent repair requests, and reads behind queued mutations retain FIFO order. Send fairness
+and isolated nonblocking network acquisition remain #1947 work. All automatic history triggers use the same
+owner and durable pacing; bounded investigation can leave unresolved debt parked for new evidence or explicit repair.
 
 ## User blocking
 

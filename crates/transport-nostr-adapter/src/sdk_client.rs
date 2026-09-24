@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -10,18 +11,27 @@ use cgka_traits::{
     TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
     TransportPublishFailure, collapse_publish_failure_summaries,
 };
+use futures::StreamExt;
+use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
-    Alphabet, Client, Event, EventBuilder, EventId, Filter, Kind, PublicKey, RelayMessage,
-    RelayPoolNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscriptionId, SyncDirection,
-    SyncOptions, Tag, TagKind, Timestamp as NostrTimestamp,
+    AcquisitionEnd as SdkAcquisitionEnd, AcquisitionLimits as SdkAcquisitionLimits, Client,
+    ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder, EventId, Filter,
+    FinalizeEventAsync, Kind, PublicKey, RelayAcquisition, RelayCapabilities, RelayMessage,
+    RelayStatus, RelayUrl, ReqTarget, SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions,
+    Tag, Timestamp as NostrTimestamp,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
-use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
+use transport_nostr_peeler::{
+    KIND_MARMOT_GROUP_MESSAGE, MarmotNostrSigner, NostrTransportEvent, SdkSigner,
+};
 
 use crate::{
-    NostrEventPublishRequest, NostrPublishBatch, NostrPublishOutcome, NostrRelayClient,
+    NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
+    NostrAcquisitionError, NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope,
+    NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
+    NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome, NostrRelayClient,
     NostrRelayEvent, NostrSubscription, NostrTransportAdapter,
 };
 
@@ -152,6 +162,122 @@ pub struct NostrSdkRelayHealth {
     pub connection_successes: usize,
 }
 
+impl NostrSdkRelayHealth {
+    fn add(&mut self, other: Self) {
+        self.total_relays += other.total_relays;
+        self.initialized += other.initialized;
+        self.pending += other.pending;
+        self.connecting += other.connecting;
+        self.connected += other.connected;
+        self.disconnected += other.disconnected;
+        self.terminated += other.terminated;
+        self.banned += other.banned;
+        self.sleeping += other.sleeping;
+        self.connection_attempts += other.connection_attempts;
+        self.connection_successes += other.connection_successes;
+    }
+}
+
+fn acquisition_filter(request: &NostrAcquisitionRequest) -> Result<Filter, NostrAcquisitionError> {
+    Ok(match &request.scope {
+        NostrAcquisitionScope::KnownEventIds(ids) => {
+            Filter::new().ids(ids.iter().copied().map(EventId::from_byte_array))
+        }
+        NostrAcquisitionScope::AccountInboxWindow { since, until } => {
+            let recipient = PublicKey::from_slice(request.account_id.as_slice())
+                .map_err(|_| NostrAcquisitionError::InvalidRequest)?;
+            Filter::new()
+                .kind(Kind::GiftWrap)
+                .pubkey(recipient)
+                .since(NostrTimestamp::from_secs(*since))
+                .until(NostrTimestamp::from_secs(*until))
+        }
+        NostrAcquisitionScope::GroupWindow {
+            transport_group_id,
+            since,
+            until,
+        } => Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tags(
+                SingleLetterTag::from_char('h').expect("h is a valid single-letter tag"),
+                [hex::encode(transport_group_id)],
+            )
+            .since(NostrTimestamp::from_secs(*since))
+            .until(NostrTimestamp::from_secs(*until)),
+    })
+}
+
+fn project_acquisition(
+    endpoint: TransportEndpoint,
+    outcome: Option<RelayAcquisition>,
+) -> NostrAcquisitionEndpoint {
+    let Some(outcome) = outcome else {
+        return NostrAcquisitionEndpoint {
+            endpoint,
+            session_generation: None,
+            events: Vec::new(),
+            end: NostrAcquisitionEnd::SetupFailed,
+            stats: NostrAcquisitionStats::default(),
+        };
+    };
+    let (mut end, skipped) = match outcome.end {
+        SdkAcquisitionEnd::Completed => (NostrAcquisitionEnd::RequestPolicySatisfied, 0),
+        SdkAcquisitionEnd::ExitLimitReached => (NostrAcquisitionEnd::UnexpectedExitLimit, 0),
+        SdkAcquisitionEnd::ItemBudgetExceeded => (NostrAcquisitionEnd::ItemLimitReached, 0),
+        SdkAcquisitionEnd::ByteBudgetExceeded => (NostrAcquisitionEnd::ByteLimitReached, 0),
+        SdkAcquisitionEnd::Cancelled => (NostrAcquisitionEnd::Cancelled, 0),
+        SdkAcquisitionEnd::TimedOut => (NostrAcquisitionEnd::Deadline, 0),
+        SdkAcquisitionEnd::Disconnected => (NostrAcquisitionEnd::Disconnected, 0),
+        SdkAcquisitionEnd::ReceiveLoss(skipped) => (NostrAcquisitionEnd::ReceiveLoss, skipped),
+        SdkAcquisitionEnd::ReceiverClosed => (NostrAcquisitionEnd::ReceiverClosed, 0),
+        SdkAcquisitionEnd::AuthenticationFailed => (NostrAcquisitionEnd::AuthenticationFailed, 0),
+        SdkAcquisitionEnd::Rejected(_) => (NostrAcquisitionEnd::Rejected, 0),
+        SdkAcquisitionEnd::RelayClosed(_) => (NostrAcquisitionEnd::RelayClosed, 0),
+        SdkAcquisitionEnd::Failed(_) => (NostrAcquisitionEnd::SetupFailed, 0),
+    };
+    let mut events = Vec::with_capacity(outcome.events.len());
+    for event in &outcome.events {
+        match NostrTransportEvent::from_nostr_event(event) {
+            Ok(event) => events.push(event),
+            Err(_) => end = NostrAcquisitionEnd::SetupFailed,
+        }
+    }
+    NostrAcquisitionEndpoint {
+        endpoint,
+        session_generation: None,
+        events,
+        end,
+        stats: NostrAcquisitionStats {
+            received_items: outcome.received_items,
+            serialized_event_bytes: outcome.received_event_bytes,
+            duplicates: outcome.duplicates,
+            retained_high_water_items: outcome.high_water_items,
+            retained_high_water_event_bytes: outcome.high_water_event_bytes,
+            receiver_skipped_notifications: skipped,
+        },
+    }
+}
+
+fn empty_acquisition(
+    request: &NostrAcquisitionRequest,
+    end: NostrAcquisitionEnd,
+) -> NostrAcquisitionResult {
+    NostrAcquisitionResult {
+        endpoints: request
+            .endpoints
+            .iter()
+            .cloned()
+            .map(|endpoint| NostrAcquisitionEndpoint {
+                endpoint,
+                session_generation: None,
+                events: Vec::new(),
+                end,
+                stats: NostrAcquisitionStats::default(),
+            })
+            .collect(),
+    }
+}
+
 /// One relay's subscription-registration outcome, surfaced to the app so it can
 /// be recorded in the forensic audit log's `subscription_rebuild` row.
 ///
@@ -171,12 +297,19 @@ pub struct RelayRegistrationOutcome {
 #[derive(Clone)]
 pub struct NostrSdkRelayClient {
     client: Client,
+    signer: Option<SdkSigner>,
+    account_id: Option<MemberId>,
+    account_clients: Arc<RwLock<HashMap<MemberId, NostrSdkRelayClient>>>,
+    notification_loss_tx: watch::Sender<Option<NostrNotificationLoss>>,
+    require_account_context: bool,
     account_subscriptions: Arc<RwLock<HashMap<MemberId, Vec<SubscriptionId>>>>,
     publish_relay_refs: Arc<Mutex<HashMap<RelayUrl, usize>>>,
     #[cfg(test)]
     publish_connect_attempts: Arc<Mutex<HashMap<RelayUrl, usize>>>,
     #[cfg(test)]
     publish_release_attempts: Arc<Mutex<HashMap<RelayUrl, usize>>>,
+    #[cfg(test)]
+    forwarder_event_entered: Arc<AtomicBool>,
     #[cfg(test)]
     publish_relay_pin_failure_stage: Arc<AtomicU8>,
     /// Relays that explicitly rejected NIP-77 are skipped for the rest of this
@@ -194,6 +327,27 @@ pub struct NostrSdkRelayClient {
     /// the adapter drives during activation and the clone the app holds observe
     /// the same log.
     registration_log: Arc<Mutex<HashMap<MemberId, HashMap<RelayUrl, bool>>>>,
+}
+
+/// An aborted public forwarder must not detach a blocked delivery child. It
+/// also preserves evidence for any work abandoned by that abrupt teardown.
+struct ForwarderWorkerGuard {
+    abort: tokio::task::AbortHandle,
+    pending: Arc<AtomicU64>,
+    loss: NostrSdkRelayClient,
+    loss_accounted: bool,
+}
+
+impl Drop for ForwarderWorkerGuard {
+    fn drop(&mut self) {
+        if !self.loss_accounted {
+            let abandoned = self.pending.load(Ordering::SeqCst);
+            if abandoned > 0 {
+                self.loss.record_notification_gap(abandoned);
+            }
+        }
+        self.abort.abort();
+    }
 }
 
 struct ScopedPublishRelayLease {
@@ -258,6 +412,11 @@ impl NostrSdkRelayClient {
     pub fn new(client: Client) -> Self {
         Self {
             client,
+            signer: None,
+            account_id: None,
+            account_clients: Arc::new(RwLock::new(HashMap::new())),
+            notification_loss_tx: watch::channel(None).0,
+            require_account_context: false,
             account_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             publish_relay_refs: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -265,14 +424,190 @@ impl NostrSdkRelayClient {
             #[cfg(test)]
             publish_release_attempts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
+            forwarder_event_entered: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
             reconciliation_unsupported_relays: Arc::new(RwLock::new(HashSet::new())),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Multi-account transport root. Every account operation must resolve to
+    /// a registered immutable client; the root's anonymous client never
+    /// inherits credentials or handles account traffic.
+    pub fn multi_account() -> Self {
+        let mut this = Self::new(Client::builder().build());
+        this.require_account_context = true;
+        this
+    }
+
+    /// Construct a client with one immutable account signer. The SDK client
+    /// must be built separately with the same signer as its authenticator.
+    pub fn with_account_signer(
+        client: Client,
+        account_id: MemberId,
+        signer: Arc<dyn MarmotNostrSigner>,
+    ) -> Self {
+        let mut this = Self::new(client);
+        this.signer = Some(SdkSigner(signer));
+        this.account_id = Some(account_id);
+        this
+    }
+
+    /// Install one immutable authentication context. Repeated registration
+    /// with the same signer preserves live subscriptions and sockets; a
+    /// different signer requires explicit account removal first.
+    pub async fn register_account(
+        &self,
+        account_id: MemberId,
+        signer: Arc<dyn MarmotNostrSigner>,
+    ) -> Result<NostrSdkRelayClient, TransportAdapterError> {
+        if !self.require_account_context {
+            return Err(TransportAdapterError::Subscription(
+                "account registration requires a multi-account client".to_owned(),
+            ));
+        }
+        let signer_pubkey = signer.get_public_key().await.map_err(|_| {
+            TransportAdapterError::Subscription("read account signer public key failed".to_owned())
+        })?;
+        if signer_pubkey.to_bytes().as_slice() != account_id.as_slice() {
+            return Err(TransportAdapterError::Subscription(
+                "account signer does not match account identity".to_owned(),
+            ));
+        }
+        let mut clients = self.account_clients.write().await;
+        if let Some(existing) = clients.get(&account_id) {
+            if existing
+                .signer
+                .as_ref()
+                .is_some_and(|existing| Arc::ptr_eq(&existing.0, &signer))
+            {
+                return Ok(existing.clone());
+            }
+            return Err(TransportAdapterError::Subscription(
+                "account signer changed without removing prior context".to_owned(),
+            ));
+        }
+        let client = Client::builder()
+            .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+                SdkSigner(signer.clone()),
+            ))
+            .build();
+        let context = Self::with_account_signer(client, account_id.clone(), signer);
+        clients.insert(account_id, context.clone());
+        Ok(context)
+    }
+
+    async fn account_client(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<NostrSdkRelayClient>, TransportAdapterError> {
+        if !self.require_account_context {
+            if self
+                .account_id
+                .as_ref()
+                .is_some_and(|registered| registered != account_id)
+            {
+                return Err(TransportAdapterError::Subscription(
+                    "account context does not match requested account".to_owned(),
+                ));
+            }
+            return Ok(None);
+        }
+        self.account_clients
+            .read()
+            .await
+            .get(account_id)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                TransportAdapterError::Subscription(
+                    "account has no authentication context".to_owned(),
+                )
+            })
+    }
+
+    async fn validate_publish_context(&self) -> Result<(), TransportAdapterError> {
+        if self.require_account_context {
+            return Err(TransportAdapterError::Publish(
+                "account identity required for publication".to_owned(),
+            ));
+        }
+        if let Some(account_id) = &self.account_id {
+            let signer = self.signer.as_ref().ok_or_else(|| {
+                TransportAdapterError::Publish("account signer missing".to_owned())
+            })?;
+            let public_key = signer.0.get_public_key().await.map_err(|_| {
+                TransportAdapterError::Publish("read account signer public key failed".to_owned())
+            })?;
+            if public_key.to_bytes().as_slice() != account_id.as_slice() {
+                return Err(TransportAdapterError::Publish(
+                    "account signer does not match account identity".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    pub fn is_multi_account(&self) -> bool {
+        self.require_account_context
+    }
+
+    /// Record a gap on this client's receiver before event processing can
+    /// block. A replacement keeps the cumulative count and advances only the
+    /// receiver generation; each account has its own sender.
+    pub fn record_notification_gap(&self, skipped: u64) {
+        if skipped == 0 {
+            return;
+        }
+        let scope = self
+            .account_id
+            .as_ref()
+            .map(|account_id| NostrNotificationLossScope::AccountReceiver {
+                account_id: account_id.clone(),
+            })
+            .unwrap_or(NostrNotificationLossScope::SharedReceiver);
+        self.notification_loss_tx.send_modify(|current| {
+            let loss = current.get_or_insert(NostrNotificationLoss {
+                scope,
+                receiver_generation: 0,
+                cumulative_skipped: 0,
+            });
+            loss.cumulative_skipped = loss.cumulative_skipped.saturating_add(skipped);
+        });
+    }
+
+    pub fn notification_receiver_replaced(&self) {
+        self.notification_loss_tx.send_modify(|current| {
+            if let Some(loss) = current {
+                loss.receiver_generation = loss.receiver_generation.saturating_add(1);
+            }
+        });
+    }
+
+    /// Remove only one account's sockets and authentication context.
+    pub async fn remove_account(&self, account_id: &MemberId) {
+        if let Some(client) = self.account_clients.write().await.remove(account_id) {
+            client.client.shutdown().await;
+        }
+    }
+
+    /// Close all registered account clients before the root is shut down.
+    pub async fn shutdown_accounts(&self) {
+        let clients = self
+            .account_clients
+            .write()
+            .await
+            .drain()
+            .map(|(_, client)| client)
+            .collect::<Vec<_>>();
+        for client in clients {
+            client.client.shutdown().await;
+        }
     }
 
     /// Reconcile one route's event set against durable account admission.
@@ -287,6 +622,16 @@ impl NostrSdkRelayClient {
         reconcile_until: u64,
         progress: &dyn NostrReconciliationProgress,
     ) -> Result<(NostrReconciliationSummary, Vec<NostrRelayEvent>), TransportAdapterError> {
+        if let Some(account_client) = self.account_client(subscription.account_id()).await? {
+            return Box::pin(account_client.reconcile_subscription(
+                subscription,
+                local_items,
+                reconcile_since,
+                reconcile_until,
+                progress,
+            ))
+            .await;
+        }
         let mut plan = Self::plan_subscription(&subscription)?;
         // Startup compares the gap below the subscription floor; explicit
         // backfill also compares its current window so upstream SDK dedup
@@ -325,36 +670,48 @@ impl NostrSdkRelayClient {
                 )
             })
             .collect::<Vec<_>>();
-        let targets = endpoints
-            .iter()
-            .cloned()
-            .map(|endpoint| (endpoint, (plan.filter.clone(), items.clone())))
-            .collect::<Vec<_>>();
         let options = SyncOptions::new()
             .initial_timeout(SDK_RECONCILIATION_NEGOTIATION_WAIT)
             .direction(SyncDirection::Down)
             .dry_run();
         let deadline = tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT;
-        let output = timeout_at(
-            deadline,
-            self.client.pool().sync_targeted(targets, &options),
-        )
-        .await
-        .map_err(|_| {
-            TransportAdapterError::Subscription("NIP-77 reconciliation timed out".to_owned())
-        })?
-        .map_err(|_| {
-            TransportAdapterError::Subscription("NIP-77 reconciliation failed".to_owned())
-        })?;
-        let newly_unsupported = output
-            .failed
-            .iter()
-            .filter(|(_, error)| {
-                error.as_str() == "negentropy not supported"
-                    || error.as_str() == "unsupported negentropy protocol version"
-            })
-            .map(|(endpoint, _)| endpoint.clone())
-            .collect::<Vec<_>>();
+        let syncs = endpoints.iter().cloned().map(|endpoint| {
+            let client = self.client.clone();
+            let filter = plan.filter.clone();
+            let items = items.clone();
+            let options = options.clone();
+            async move {
+                let result = match client.relay(&endpoint).await {
+                    Ok(Some(relay)) => Some(relay.sync(filter).items(items).opts(options).await),
+                    Ok(None) | Err(_) => None,
+                };
+                (endpoint, result)
+            }
+        });
+        let outcomes = timeout_at(deadline, futures::future::join_all(syncs))
+            .await
+            .map_err(|_| {
+                TransportAdapterError::Subscription("NIP-77 reconciliation timed out".to_owned())
+            })?;
+        let mut remote = HashSet::new();
+        let mut relays_succeeded = 0;
+        let mut relays_failed = unsupported_count;
+        let mut newly_unsupported = Vec::new();
+        for (endpoint, result) in outcomes {
+            match result {
+                Some(Ok(summary)) => {
+                    relays_succeeded += 1;
+                    remote.extend(summary.remote);
+                }
+                Some(Err(error)) => {
+                    relays_failed += 1;
+                    if error.kind() == SdkErrorKind::Unsupported {
+                        newly_unsupported.push(endpoint);
+                    }
+                }
+                None => relays_failed += 1,
+            }
+        }
         if !newly_unsupported.is_empty() {
             self.reconciliation_unsupported_relays
                 .write()
@@ -366,8 +723,8 @@ impl NostrSdkRelayClient {
         // all useful progress. Instead, deterministically request a bounded
         // rotating batch so even a completely refused batch cannot starve
         // later dependencies; durable app ingestion shrinks the next diff.
-        let remote_item_count = output.val.remote.len();
-        let remote_ids = select_reconciliation_remote_ids(&output.val.remote, progress)?;
+        let remote_item_count = remote.len();
+        let remote_ids = select_reconciliation_remote_ids(&remote, progress)?;
         let mut sdk_events = Vec::new();
         let mut missing_ids = Vec::new();
         for event_id in remote_ids {
@@ -398,7 +755,10 @@ impl NostrSdkRelayClient {
                 // any concurrent first-sighting notification.
                 let fetched = self
                     .client
-                    .fetch_events_from(endpoints, Filter::new().ids(missing_ids), remaining)
+                    .fetch_events(ReqTarget::manual(endpoints.into_iter().map(|endpoint| {
+                        (endpoint, vec![Filter::new().ids(missing_ids.clone())])
+                    })))
+                    .timeout(remaining)
                     .await
                     .map_err(|_| {
                         TransportAdapterError::Subscription(
@@ -428,8 +788,8 @@ impl NostrSdkRelayClient {
             });
         }
         let summary = NostrReconciliationSummary {
-            relays_succeeded: output.success.len(),
-            relays_failed: output.failed.len().saturating_add(unsupported_count),
+            relays_succeeded,
+            relays_failed,
             remote_items: remote_item_count,
             received_items: remote_events.len(),
         };
@@ -438,6 +798,20 @@ impl NostrSdkRelayClient {
 
     /// Summarize SDK-owned relay health without exposing relay URLs.
     pub async fn relay_health(&self) -> NostrSdkRelayHealth {
+        if self.require_account_context {
+            let clients = self
+                .account_clients
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut combined = NostrSdkRelayHealth::default();
+            for client in clients {
+                combined.add(Box::pin(client.relay_health()).await);
+            }
+            return combined;
+        }
         let mut health = NostrSdkRelayHealth::default();
         for relay in self.client.relays().await.into_values() {
             health.total_relays += 1;
@@ -465,6 +839,12 @@ impl NostrSdkRelayClient {
         &self,
         account: &MemberId,
     ) -> Vec<RelayRegistrationOutcome> {
+        if self.require_account_context {
+            if let Some(client) = self.account_clients.read().await.get(account).cloned() {
+                return Box::pin(client.take_subscription_registrations(account)).await;
+            }
+            return Vec::new();
+        }
         let mut log = self.registration_log.lock().await;
         let mut outcomes: Vec<RelayRegistrationOutcome> = log
             .remove(account)
@@ -483,51 +863,50 @@ impl NostrSdkRelayClient {
     /// queue. The task exits when the relay pool shuts down.
     pub fn spawn_notification_forwarder(&self, adapter: NostrTransportAdapter) -> JoinHandle<()> {
         let client = self.client.clone();
+        let loss = self.clone();
         tokio::spawn(async move {
-            let _ = client
-                .handle_notifications(move |notification| {
-                    let adapter = adapter.clone();
-                    async move {
-                        match notification {
-                            RelayPoolNotification::Event {
-                                relay_url,
+            loss.notification_receiver_replaced();
+            const EVENT_QUEUE_CAPACITY: usize = 256;
+            let (sender, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+            let pending = Arc::new(AtomicU64::new(0));
+            let worker_pending = pending.clone();
+            #[cfg(test)]
+            let forwarder_event_entered = loss.forwarder_event_entered.clone();
+            let mut worker = tokio::spawn(async move {
+                while let Some(notification) = event_rx.recv().await {
+                    #[cfg(test)]
+                    if matches!(notification, ClientNotification::Event { .. }) {
+                        forwarder_event_entered.store(true, Ordering::SeqCst);
+                    }
+                    match notification {
+                        ClientNotification::Event {
+                            relay_url,
+                            subscription_id,
+                            event,
+                        } => {
+                            if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
+                                tracing::trace!(
+                                    target: "transport_nostr_adapter::sdk_client",
+                                    method = "spawn_notification_forwarder",
+                                    "forwarding SDK relay event"
+                                );
+                                let _ = adapter
+                                    .handle_relay_event(NostrRelayEvent {
+                                        endpoint: TransportEndpoint(relay_url.to_string()),
+                                        subscription_id: Some(subscription_id.to_string()),
+                                        event,
+                                    })
+                                    .await;
+                            }
+                        }
+                        ClientNotification::Message { relay_url, message } => match *message {
+                            RelayMessage::Event {
                                 subscription_id,
                                 event,
                             } => {
+                                // Every relay copy is telemetry only; delivery uses
+                                // the SDK's deduplicated Event notification above.
                                 if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                                    tracing::trace!(
-                                        target: "transport_nostr_adapter::sdk_client",
-                                        method = "spawn_notification_forwarder",
-                                        "forwarding SDK relay event"
-                                    );
-                                    let _ = adapter
-                                        .handle_relay_event(NostrRelayEvent {
-                                            endpoint: TransportEndpoint(relay_url.to_string()),
-                                            subscription_id: Some(subscription_id.to_string()),
-                                            event,
-                                        })
-                                        .await;
-                                }
-                                Ok(false)
-                            }
-                            RelayPoolNotification::Message {
-                                relay_url,
-                                message:
-                                    RelayMessage::Event {
-                                        subscription_id,
-                                        event,
-                                    },
-                            } => {
-                                // Raw per-relay copy (not deduplicated): telemetry
-                                // only, so cross-relay spread sees every relay's
-                                // copy. Delivery happens on the deduplicated
-                                // `Event` notification above.
-                                if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                                    tracing::trace!(
-                                        target: "transport_nostr_adapter::sdk_client",
-                                        method = "spawn_notification_forwarder",
-                                        "observing per-relay event copy"
-                                    );
                                     adapter
                                         .observe_relay_event(NostrRelayEvent {
                                             endpoint: TransportEndpoint(relay_url.to_string()),
@@ -536,38 +915,77 @@ impl NostrSdkRelayClient {
                                         })
                                         .await;
                                 }
-                                Ok(false)
                             }
-                            RelayPoolNotification::Message {
-                                relay_url,
-                                message: RelayMessage::EndOfStoredEvents(subscription_id),
-                            } => {
-                                tracing::trace!(
-                                    target: "transport_nostr_adapter::sdk_client",
-                                    method = "spawn_notification_forwarder",
-                                    "forwarding SDK relay EOSE"
-                                );
+                            RelayMessage::EndOfStoredEvents(subscription_id) => {
                                 adapter
                                     .handle_relay_eose(
                                         TransportEndpoint(relay_url.to_string()),
                                         subscription_id.to_string(),
                                     )
                                     .await;
-                                Ok(false)
                             }
-                            RelayPoolNotification::Shutdown => {
-                                tracing::debug!(
-                                    target: "transport_nostr_adapter::sdk_client",
-                                    method = "spawn_notification_forwarder",
-                                    "SDK relay pool shutdown observed"
-                                );
-                                Ok(true)
-                            }
-                            _ => Ok(false),
+                            _ => {}
+                        },
+                        ClientNotification::Shutdown => {
+                            worker_pending.fetch_sub(1, Ordering::SeqCst);
+                            break;
                         }
                     }
-                })
-                .await;
+                    worker_pending.fetch_sub(1, Ordering::SeqCst);
+                }
+            });
+            let mut worker_guard = ForwarderWorkerGuard {
+                abort: worker.abort_handle(),
+                pending: pending.clone(),
+                loss: loss.clone(),
+                loss_accounted: false,
+            };
+            let mut notifications = client.notifications_with_gaps();
+            loop {
+                let update = tokio::select! {
+                    _ = &mut worker => {
+                        worker_guard.loss_accounted = true;
+                        let abandoned = pending.load(Ordering::SeqCst);
+                        if abandoned > 0 {
+                            loss.record_notification_gap(abandoned);
+                        }
+                        return;
+                    }
+                    update = notifications.next() => update,
+                };
+                let Some(update) = update else { break };
+                match update {
+                    NotificationUpdate::Notification(ClientNotification::Shutdown) => break,
+                    NotificationUpdate::Notification(notification) => {
+                        pending.fetch_add(1, Ordering::SeqCst);
+                        if sender.try_send(notification).is_err() {
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                            let abandoned = 1 + pending.load(Ordering::SeqCst);
+                            worker_guard.loss_accounted = true;
+                            loss.record_notification_gap(abandoned);
+                            worker.abort();
+                            let _ = worker.await;
+                            return;
+                        }
+                    }
+                    NotificationUpdate::Lagged { skipped } => {
+                        let abandoned = skipped.saturating_add(pending.load(Ordering::SeqCst));
+                        worker_guard.loss_accounted = true;
+                        loss.record_notification_gap(abandoned);
+                        worker.abort();
+                        let _ = worker.await;
+                        return;
+                    }
+                }
+            }
+            let abandoned = pending.load(Ordering::SeqCst);
+            worker_guard.loss_accounted = true;
+            if abandoned > 0 {
+                loss.record_notification_gap(abandoned);
+                worker.abort();
+            }
+            drop(sender);
+            let _ = worker.await;
         })
     }
 
@@ -605,9 +1023,10 @@ impl NostrSdkRelayClient {
                 ..
             } => {
                 let h_tag = hex::encode(transport_group_id);
-                let mut filter = Filter::new()
-                    .kind(Kind::MlsGroupMessage)
-                    .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [h_tag.clone()]);
+                let mut filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+                    SingleLetterTag::from_char('h').expect("h is a tag"),
+                    [h_tag.clone()],
+                );
                 if let Some(since) = since {
                     filter = filter.since(NostrTimestamp::from_secs(since.0));
                 }
@@ -626,9 +1045,10 @@ impl NostrSdkRelayClient {
                 endpoints,
             } => {
                 let h_tag = hex::encode(transport_group_id);
-                let filter = Filter::new()
-                    .kind(Kind::MlsGroupMessage)
-                    .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [h_tag.clone()]);
+                let filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+                    SingleLetterTag::from_char('h').expect("h is a tag"),
+                    [h_tag.clone()],
+                );
                 let subscription_id = SubscriptionId::new(subscription.subscription_id());
                 Ok(NostrSdkSubscriptionPlan {
                     account_id: account_id.clone(),
@@ -665,6 +1085,11 @@ impl NostrSdkRelayClient {
             ));
         }
 
+        let signer = self.signer.as_ref().ok_or_else(|| {
+            TransportAdapterError::Publish(
+                "unsigned event requires an explicit account signer".to_owned(),
+            )
+        })?;
         let kind = u16::try_from(event.kind).map(Kind::from).map_err(|_| {
             TransportAdapterError::Publish(format!("unsupported kind {}", event.kind))
         })?;
@@ -673,13 +1098,12 @@ impl NostrSdkRelayClient {
             .iter()
             .map(|tag| nostr_tag_from_vec(tag))
             .collect::<Result<Vec<_>, _>>()?;
-        let builder = EventBuilder::new(kind, event.content.clone())
+        EventBuilder::new(kind, event.content.clone())
             .tags(tags)
-            .custom_created_at(NostrTimestamp::from_secs(event.created_at));
-        self.client
-            .sign_event_builder(builder)
+            .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+            .finalize_async(signer)
             .await
-            .map_err(|e| TransportAdapterError::Publish(format!("sign event: {e}")))
+            .map_err(|_| TransportAdapterError::Publish("sign event failed".to_owned()))
     }
 
     async fn connect_publish_relay(
@@ -739,13 +1163,13 @@ impl NostrSdkRelayClient {
         for attempt in 1..=SDK_RELAY_PUBLISH_ATTEMPTS {
             match timeout(
                 SDK_RELAY_PUBLISH_WAIT,
-                client.send_event_to([endpoint.clone()], &event),
+                client.send_event(&event).to([endpoint.clone()]),
             )
             .await
             {
                 Ok(Ok(output))
                     if relay_endpoint_publish_accepted(
-                        output.success.contains(&endpoint),
+                        output.success.contains_key(&endpoint),
                         output.failed.get(&endpoint).map(String::as_str),
                     ) =>
                 {
@@ -1091,13 +1515,17 @@ impl NostrSdkRelayClient {
         if self.publish_relay_pin_failure_stage.load(Ordering::Relaxed) == 1 {
             return Err(());
         }
-        let options = self
+        let relay = self
             .client
             .relays()
             .await
             .get(endpoint)
-            .map(|relay| relay.opts().clone())
-            .ok_or(())?
+            .cloned()
+            .ok_or(())?;
+        let capabilities = relay.capabilities().load();
+        let options = relay
+            .opts()
+            .clone()
             .retry_interval(SDK_RELAY_RETRY_INTERVAL)
             .adjust_retry_interval(false);
         self.client
@@ -1110,8 +1538,9 @@ impl NostrSdkRelayClient {
         }
         match self
             .client
-            .pool()
-            .add_relay(endpoint.clone(), options)
+            .add_relay(endpoint.clone())
+            .capabilities(capabilities)
+            .opts(options)
             .await
         {
             Ok(true) => Ok(()),
@@ -1147,6 +1576,35 @@ impl NostrSdkRelayClient {
         Ok(())
     }
 
+    /// Register a history-only endpoint without upgrading an existing
+    /// write-only publication socket to READ. Request subscriptions remain
+    /// SDK-owned and close on finish, cancellation, or dropped work; a newly
+    /// registered relay stays in this account's compatible connection pool.
+    async fn add_acquisition_relay(&self, endpoint: &RelayUrl) -> Result<(), ()> {
+        let _relay_lifecycle = self.publish_relay_refs.lock().await;
+        if self.client.relays().await.contains_key(endpoint) {
+            return Ok(());
+        }
+        let added = self
+            .client
+            .add_relay(endpoint.clone())
+            .capabilities(RelayCapabilities::READ)
+            .await
+            .map_err(|_| ())?;
+        if added && self.pin_new_relay_retry_interval(endpoint).await.is_err() {
+            if self.client.relays().await.contains_key(endpoint) {
+                tracing::warn!(
+                    target: "transport_nostr_adapter::sdk_client",
+                    method = "add_acquisition_relay",
+                    "new acquisition relay kept SDK retry defaults after configuration failed"
+                );
+            } else {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
     async fn retain_publish_relay(
         &self,
         endpoint: &RelayUrl,
@@ -1158,7 +1616,12 @@ impl NostrSdkRelayClient {
             return Ok(true);
         }
 
-        if self.client.relays().await.contains_key(endpoint) {
+        if let Some(relay) = self.client.relays().await.get(endpoint) {
+            // A prior bounded history request may have registered this relay
+            // with READ only. Publication is now explicitly requested, so
+            // enable WRITE on that same compatible account connection. This
+            // does not add READ to a one-shot write-only publication relay.
+            relay.capabilities().add(RelayCapabilities::WRITE);
             return Ok(false);
         }
 
@@ -1166,7 +1629,12 @@ impl NostrSdkRelayClient {
         // READ relays inherit pool subscriptions in nostr-sdk, which would leak
         // account/group filters to a relay that was only selected for event
         // delivery.
-        match self.client.add_write_relay(endpoint.clone()).await {
+        match self
+            .client
+            .add_relay(endpoint.clone())
+            .capabilities(RelayCapabilities::WRITE)
+            .await
+        {
             Ok(true) => {
                 if self.pin_new_relay_retry_interval(endpoint).await.is_err() {
                     if self.client.relays().await.contains_key(endpoint) {
@@ -1237,7 +1705,7 @@ impl NostrSdkRelayClient {
             .relays()
             .await
             .get(&endpoint)
-            .is_some_and(|relay| relay.flags().has_read());
+            .is_some_and(|relay| relay.capabilities().can_read());
         if relay_is_now_read {
             return Ok(());
         }
@@ -1318,6 +1786,178 @@ impl NostrSdkRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for NostrSdkRelayClient {
+    fn notification_loss(
+        &self,
+    ) -> Result<watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError> {
+        if self.require_account_context {
+            return Err(NostrAcquisitionError::Unsupported);
+        }
+        Ok(self.notification_loss_tx.subscribe())
+    }
+
+    async fn notification_loss_for_account(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError> {
+        if self.require_account_context {
+            let account = self
+                .account_clients
+                .read()
+                .await
+                .get(account_id)
+                .cloned()
+                .ok_or(NostrAcquisitionError::InvalidRequest)?;
+            return account.notification_loss();
+        }
+        if self
+            .account_id
+            .as_ref()
+            .is_some_and(|own| own != account_id)
+        {
+            return Err(NostrAcquisitionError::InvalidRequest);
+        }
+        self.notification_loss()
+    }
+
+    async fn acquire_history(
+        &self,
+        mut request: NostrAcquisitionRequest,
+        cancellation: NostrAcquisitionCancellation,
+    ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
+        request.validate()?;
+        let deadline = tokio::time::Instant::now() + request.limits.max_duration;
+        let filter = acquisition_filter(&request)?;
+        let endpoints = request
+            .endpoints
+            .iter()
+            .map(|endpoint| RelayUrl::parse(endpoint.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| NostrAcquisitionError::InvalidRequest)?;
+        if self.require_account_context {
+            let clients = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Cancelled));
+                }
+                result = timeout_at(deadline, self.account_clients.read()) => {
+                    match result {
+                        Ok(clients) => clients,
+                        Err(_) => return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline)),
+                    }
+                }
+            };
+            let account = clients
+                .get(&request.account_id)
+                .cloned()
+                .ok_or(NostrAcquisitionError::InvalidRequest)?;
+            drop(clients);
+            request.limits.max_duration =
+                deadline.saturating_duration_since(tokio::time::Instant::now());
+            if request.limits.max_duration.is_zero() {
+                return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline));
+            }
+            return Box::pin(account.acquire_history(request, cancellation)).await;
+        }
+        if self
+            .account_id
+            .as_ref()
+            .is_some_and(|account_id| account_id != &request.account_id)
+        {
+            return Err(NostrAcquisitionError::InvalidRequest);
+        }
+        if cancellation.is_cancelled() {
+            return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Cancelled));
+        }
+        for endpoint in &endpoints {
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Cancelled));
+                }
+                result = timeout_at(deadline, self.add_acquisition_relay(endpoint)) => result,
+            };
+            if result.is_err() {
+                return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline));
+            }
+            // A failed registration remains a typed per-endpoint setup result
+            // when the SDK sees that endpoint absent from its pool.
+        }
+        let connected = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Cancelled));
+            }
+            result = timeout_at(deadline, self.client.connect()) => result,
+        };
+        if connected.is_err() {
+            return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline));
+        }
+        // The SDK owns the request-local REQs and returns partial data when
+        // its endpoint deadline fires. Reserve a short slice of the declared
+        // whole-call budget to collect and project that report.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline));
+        }
+        let endpoint_budget = remaining.mul_f32(0.9);
+        let limits = SdkAcquisitionLimits::new(
+            request.limits.max_endpoints,
+            request.limits.max_received_items_per_endpoint,
+            request.limits.max_serialized_event_bytes_per_endpoint,
+            endpoint_budget.max(Duration::from_millis(1)),
+        );
+        let target = ReqTarget::manual(
+            endpoints
+                .iter()
+                .cloned()
+                .map(|endpoint| (endpoint, vec![filter.clone()])),
+        );
+        let handle = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Cancelled));
+            }
+            result = timeout_at(deadline, self.client.acquire_events(target, limits)) => {
+                match result {
+                    Ok(Ok(handle)) => handle,
+                    Ok(Err(_)) => return Ok(empty_acquisition(&request, NostrAcquisitionEnd::SetupFailed)),
+                    Err(_) => return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline)),
+                }
+            }
+        };
+        let canceller = handle.canceller();
+        let mut finish = Box::pin(handle.finish());
+        let report = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                canceller.cancel();
+                timeout_at(deadline, finish.as_mut()).await
+            }
+            result = timeout_at(deadline, finish.as_mut()) => result,
+        };
+        let Ok(Ok(report)) = report else {
+            // Dropping finish aborts only this acquisition's REQs. A setup or
+            // deadline failure has no report to project; never claim EOSE.
+            return Ok(empty_acquisition(
+                &request,
+                if cancellation.is_cancelled() {
+                    NostrAcquisitionEnd::Cancelled
+                } else {
+                    NostrAcquisitionEnd::Deadline
+                },
+            ));
+        };
+        let mut outcomes = report.relays;
+        Ok(NostrAcquisitionResult {
+            endpoints: request
+                .endpoints
+                .into_iter()
+                .zip(endpoints)
+                .map(|(endpoint, url)| project_acquisition(endpoint, outcomes.remove(&url)))
+                .collect(),
+        })
+    }
+
     fn supports_scoped_subscriptions(&self) -> bool {
         true
     }
@@ -1334,6 +1974,9 @@ impl NostrRelayClient for NostrSdkRelayClient {
         subscription: NostrSubscription,
         subscription_id: String,
     ) -> Result<(), TransportAdapterError> {
+        if let Some(account_client) = self.account_client(subscription.account_id()).await? {
+            return Box::pin(account_client.subscribe_scoped(subscription, subscription_id)).await;
+        }
         let mut plan = Self::plan_subscription(&subscription)?;
         plan.subscription_id = SubscriptionId::new(subscription_id);
         tracing::debug!(
@@ -1355,12 +1998,13 @@ impl NostrRelayClient for NostrSdkRelayClient {
 
         let output = self
             .client
-            .subscribe_with_id_to(
-                plan.endpoints.clone(),
-                plan.subscription_id.clone(),
-                plan.filter,
-                None,
-            )
+            .subscribe(ReqTarget::manual(
+                plan.endpoints
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| (endpoint, vec![plan.filter.clone()])),
+            ))
+            .with_id(plan.subscription_id.clone())
             .await
             .map_err(|_| TransportAdapterError::Subscription("subscribe failed".to_owned()))?;
 
@@ -1396,7 +2040,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
         let outcomes = plan
             .endpoints
             .iter()
-            .map(|endpoint| (endpoint.clone(), output.success.contains(endpoint)));
+            .map(|endpoint| (endpoint.clone(), output.success.contains_key(endpoint)));
         merge_registration_log(
             self.registration_log
                 .lock()
@@ -1428,6 +2072,10 @@ impl NostrRelayClient for NostrSdkRelayClient {
         subscription: NostrSubscription,
         subscription_id: String,
     ) -> Result<(), TransportAdapterError> {
+        if let Some(account_client) = self.account_client(subscription.account_id()).await? {
+            return Box::pin(account_client.unsubscribe_scoped(subscription, subscription_id))
+                .await;
+        }
         let mut plan = Self::plan_subscription(&subscription)?;
         plan.subscription_id = SubscriptionId::new(subscription_id);
         tracing::debug!(
@@ -1435,7 +2083,10 @@ impl NostrRelayClient for NostrSdkRelayClient {
             method = "unsubscribe",
             "unsubscribing SDK relay plan"
         );
-        self.client.unsubscribe(&plan.subscription_id).await;
+        self.client
+            .unsubscribe(&plan.subscription_id)
+            .await
+            .map_err(|_| TransportAdapterError::Subscription("unsubscribe failed".to_owned()))?;
         if let Some(ids) = self
             .account_subscriptions
             .write()
@@ -1451,6 +2102,22 @@ impl NostrRelayClient for NostrSdkRelayClient {
         &self,
         account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
+        if self.require_account_context {
+            let client = self.account_clients.read().await.get(account_id).cloned();
+            return match client {
+                Some(client) => Box::pin(client.unsubscribe_account(account_id)).await,
+                None => Ok(()),
+            };
+        }
+        if self
+            .account_id
+            .as_ref()
+            .is_some_and(|registered| registered != account_id)
+        {
+            return Err(TransportAdapterError::Subscription(
+                "account context does not match requested account".to_owned(),
+            ));
+        }
         // Drop the account's undrained registration bucket along with its
         // subscriptions: a sign-out between a subscribe and the next sync's
         // drain would otherwise orphan the bucket, and a later reactivation
@@ -1469,8 +2136,22 @@ impl NostrRelayClient for NostrSdkRelayClient {
             subscription_count = ids.len(),
             "unsubscribing SDK account subscriptions"
         );
+        let mut failed = Vec::new();
         for id in ids {
-            self.client.unsubscribe(&id).await;
+            if self.client.unsubscribe(&id).await.is_err() {
+                failed.push(id);
+            }
+        }
+        if !failed.is_empty() {
+            self.account_subscriptions
+                .write()
+                .await
+                .entry(account_id.clone())
+                .or_default()
+                .extend(failed);
+            return Err(TransportAdapterError::Subscription(
+                "unsubscribe account failed".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -1493,6 +2174,71 @@ impl NostrRelayClient for NostrSdkRelayClient {
             .expect("single-event batch returns one outcome")
     }
 
+    async fn publish_event_for_account(
+        &self,
+        account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        if self.require_account_context {
+            let client = self.account_client(account_id).await.map_err(|_| {
+                TransportAdapterError::Publish("account has no authentication context".to_owned())
+            })?;
+            return Box::pin(
+                client
+                    .expect("multi-account lookup returns a client")
+                    .publish_event_for_account(account_id, endpoints, event, required_acks),
+            )
+            .await;
+        }
+        if self.account_id.as_ref() != Some(account_id) {
+            return Err(TransportAdapterError::Publish(
+                "publication account does not match authentication context".to_owned(),
+            ));
+        }
+        self.publish_event(endpoints, event, required_acks).await
+    }
+
+    async fn publish_events_for_account(
+        &self,
+        account_id: &MemberId,
+        requests: &[NostrEventPublishRequest],
+    ) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
+        self.publish_events_for_account_with_timings(account_id, requests)
+            .await
+            .outcomes
+    }
+
+    async fn publish_events_for_account_with_timings(
+        &self,
+        account_id: &MemberId,
+        requests: &[NostrEventPublishRequest],
+    ) -> NostrPublishBatch {
+        let started_at = std::time::Instant::now();
+        let client = if self.require_account_context {
+            self.account_client(account_id).await.ok().flatten()
+        } else if self.account_id.as_ref() == Some(account_id) {
+            Some(self.clone())
+        } else {
+            None
+        };
+        match client {
+            Some(client) => client.publish_events_with_timings(requests).await,
+            None => NostrPublishBatch {
+                outcomes: requests
+                    .iter()
+                    .map(|_| {
+                        Err(TransportAdapterError::Publish(
+                            "publication account has no matching authentication context".to_owned(),
+                        ))
+                    })
+                    .collect(),
+                request_durations: vec![started_at.elapsed(); requests.len()],
+            },
+        }
+    }
+
     async fn publish_events(
         &self,
         requests: &[NostrEventPublishRequest],
@@ -1505,6 +2251,19 @@ impl NostrRelayClient for NostrSdkRelayClient {
         requests: &[NostrEventPublishRequest],
     ) -> NostrPublishBatch {
         let batch_started_at = std::time::Instant::now();
+        if self.validate_publish_context().await.is_err() {
+            return NostrPublishBatch {
+                outcomes: requests
+                    .iter()
+                    .map(|_| {
+                        Err(TransportAdapterError::Publish(
+                            "invalid publication account context".to_owned(),
+                        ))
+                    })
+                    .collect(),
+                request_durations: vec![batch_started_at.elapsed(); requests.len()],
+            };
+        }
         let mut prepared = Vec::with_capacity(requests.len());
         for request in requests {
             let endpoints = match parse_endpoints(&request.endpoints, "publish") {
@@ -1565,6 +2324,7 @@ impl NostrSdkRelayHealth {
             RelayStatus::Terminated => self.terminated += 1,
             RelayStatus::Banned => self.banned += 1,
             RelayStatus::Sleeping => self.sleeping += 1,
+            RelayStatus::Shutdown => self.terminated += 1,
         }
     }
 }
@@ -1602,10 +2362,7 @@ fn nostr_tag_from_vec(values: &[String]) -> Result<Tag, TransportAdapterError> {
             "cannot publish Nostr event with empty tag".into(),
         ));
     };
-    Ok(Tag::custom(
-        TagKind::custom(kind.clone()),
-        values.iter().skip(1).cloned(),
-    ))
+    Ok(Tag::custom(kind.clone(), values.iter().skip(1).cloned()))
 }
 
 trait PushUnique<T> {
@@ -1686,6 +2443,7 @@ fn map_relay_rejection_category(
         Prefix::Unsupported => TransportEndpointRejectionCategory::Unsupported,
         Prefix::AuthRequired => TransportEndpointRejectionCategory::AuthRequired,
         Prefix::Restricted => TransportEndpointRejectionCategory::Restricted,
+        Prefix::Custom(_) => TransportEndpointRejectionCategory::Error,
     }
 }
 
@@ -1745,14 +2503,498 @@ fn relay_rejection_endpoint_failure(
 mod tests {
     use super::*;
     use crate::{NostrKeyPackagePublication, SubscriptionAttempt};
-    use cgka_traits::Timestamp;
     use cgka_traits::engine::KeyPackage;
+    use cgka_traits::{Timestamp, TransportAdapter};
     use futures::{SinkExt, StreamExt};
     use nostr_relay_builder::MockRelay;
-    use nostr_sdk::prelude::{DatabaseEventStatus, EventBuilder, Keys, Kind, Tag};
+    use nostr_sdk::prelude::{DatabaseEventStatus, EventBuilder, FinalizeEvent, Keys, Kind, Tag};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, advance, timeout};
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
+
+    fn acquisition_request(
+        account_id: MemberId,
+        endpoint: RelayUrl,
+        ids: Vec<[u8; 32]>,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> NostrAcquisitionRequest {
+        NostrAcquisitionRequest {
+            account_id,
+            scope: NostrAcquisitionScope::KnownEventIds(ids),
+            endpoints: vec![TransportEndpoint(endpoint.to_string())],
+            limits: crate::NostrAcquisitionLimits {
+                max_endpoints: 1,
+                max_requested_event_ids: 16,
+                max_received_items_per_endpoint: max_items,
+                max_serialized_event_bytes_per_endpoint: max_bytes,
+                max_duration: Duration::from_secs(3),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn production_acquisition_preserves_partial_and_byte_limit_evidence() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let keys = Keys::generate();
+        let events = (0..4)
+            .map(|index| {
+                EventBuilder::new(Kind::TextNote, format!("bounded-{index}"))
+                    .finalize(&keys)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for event in &events {
+            relay.add_event(event.clone()).await.unwrap();
+        }
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let ids = events.iter().map(|event| event.id.to_bytes()).collect();
+        let report = sdk
+            .acquire_history(
+                acquisition_request(account_id.clone(), url.clone(), ids, 2, 100_000),
+                NostrAcquisitionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.endpoints.len(), 1);
+        let partial = &report.endpoints[0];
+        assert_eq!(partial.end, NostrAcquisitionEnd::ItemLimitReached);
+        assert_eq!(partial.events.len(), 2);
+        assert_eq!(partial.stats.received_items, 3);
+        assert_eq!(partial.stats.retained_high_water_items, 2);
+
+        let one_id = vec![events[0].id.to_bytes()];
+        let report = sdk
+            .acquire_history(
+                acquisition_request(account_id, url, one_id, 4, 1),
+                NostrAcquisitionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        let oversized = &report.endpoints[0];
+        assert_eq!(oversized.end, NostrAcquisitionEnd::ByteLimitReached);
+        assert!(oversized.events.is_empty());
+        assert_eq!(oversized.stats.received_items, 1);
+        assert!(oversized.stats.serialized_event_bytes > 1);
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn history_registered_relay_can_later_publish_without_subscription() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let endpoint = TransportEndpoint(url.to_string());
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let sdk = signed_sdk(keys);
+
+        let history = timeout(
+            Duration::from_secs(5),
+            sdk.acquire_history(
+                acquisition_request(account_id, url.clone(), vec![[0x42; 32]], 4, 100_000),
+                NostrAcquisitionCancellation::new(),
+            ),
+        )
+        .await
+        .expect("history request completes")
+        .unwrap();
+        assert_eq!(history.endpoints.len(), 1);
+        let registered = sdk.client.relays().await.get(&url).cloned().unwrap();
+        assert!(registered.capabilities().load().can_read());
+        assert!(!registered.capabilities().load().can_write());
+
+        let outcome = timeout(
+            Duration::from_secs(5),
+            sdk.publish_event(
+                std::slice::from_ref(&endpoint),
+                &signed_group_event_dto(),
+                1,
+            ),
+        )
+        .await
+        .expect("publication completes")
+        .expect("history-only relay is upgraded for the requested publication");
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(outcome.accepted[0].endpoint, endpoint);
+        assert!(registered.capabilities().load().can_write());
+        assert_eq!(sdk.relay_health().await.total_relays, 1);
+        sdk.client.shutdown().await;
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn production_acquisition_cancel_and_drop_preserve_live_interest() {
+        use tokio::sync::mpsc;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let keys = Keys::generate();
+        let live_events = (0..2)
+            .map(|index| {
+                EventBuilder::new(Kind::TextNote, format!("live-after-history-{index}"))
+                    .finalize(&keys)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let expected_ids = live_events.iter().map(|event| event.id).collect::<Vec<_>>();
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<(String, String)>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut live_id = None;
+            let mut next_live = 0;
+            while let Some(Ok(message)) = websocket.next().await {
+                let Ok(text) = message.into_text() else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                let Some(items) = value.as_array() else {
+                    continue;
+                };
+                let (Some(kind), Some(id)) = (
+                    items.first().and_then(serde_json::Value::as_str),
+                    items.get(1).and_then(serde_json::Value::as_str),
+                ) else {
+                    continue;
+                };
+                if kind == "REQ" && id == "live" {
+                    live_id = Some(id.to_owned());
+                }
+                if kind == "CLOSE" && id != "live" && next_live < live_events.len() {
+                    let frame = serde_json::json!([
+                        "EVENT",
+                        live_id
+                            .as_deref()
+                            .expect("live interest remains registered"),
+                        live_events[next_live],
+                    ]);
+                    next_live += 1;
+                    websocket
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                seen_tx.send((kind.to_owned(), id.to_owned())).unwrap();
+            }
+        });
+
+        let client = Client::default();
+        client.add_relay(url.clone()).await.unwrap();
+        client
+            .try_connect_relay(url.clone(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut notifications = client.notifications();
+        client
+            .subscribe(ReqTarget::single(
+                &url,
+                [Filter::new().kind(Kind::TextNote)],
+            ))
+            .with_id(SubscriptionId::new("live"))
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), seen_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ("REQ".into(), "live".into())
+        );
+
+        let sdk = NostrSdkRelayClient::new(client.clone());
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let request = acquisition_request(account_id, url.clone(), vec![[7; 32]], 4, 100_000);
+        let cancellation = NostrAcquisitionCancellation::new();
+        let first = tokio::spawn({
+            let sdk = sdk.clone();
+            let request = request.clone();
+            let cancellation = cancellation.clone();
+            async move { sdk.acquire_history(request, cancellation).await.unwrap() }
+        });
+        let (kind, first_id) = timeout(Duration::from_secs(2), seen_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kind, "REQ");
+        assert_ne!(first_id, "live");
+        cancellation.cancel();
+        let result = timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.endpoints[0].end, NostrAcquisitionEnd::Cancelled);
+        assert_eq!(
+            timeout(Duration::from_secs(2), seen_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ("CLOSE".into(), first_id)
+        );
+        let first_live = timeout(Duration::from_secs(2), async {
+            loop {
+                match notifications.next().await {
+                    Some(ClientNotification::Event { event, .. }) => break event.id,
+                    Some(_) => {}
+                    None => panic!("live notification stream closed"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(first_live, expected_ids[0]);
+
+        let dropped = tokio::spawn({
+            let sdk = sdk.clone();
+            async move {
+                sdk.acquire_history(request, NostrAcquisitionCancellation::new())
+                    .await
+            }
+        });
+        let (kind, second_id) = timeout(Duration::from_secs(2), seen_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kind, "REQ");
+        assert_ne!(second_id, "live");
+        dropped.abort();
+        let _ = dropped.await;
+        assert_eq!(
+            timeout(Duration::from_secs(2), seen_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ("CLOSE".into(), second_id)
+        );
+        let second_live = timeout(Duration::from_secs(2), async {
+            loop {
+                match notifications.next().await {
+                    Some(ClientNotification::Event { event, .. }) => break event.id,
+                    Some(_) => {}
+                    None => panic!("live notification stream closed"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(second_live, expected_ids[1]);
+        assert!(client.relay(&url).await.unwrap().is_some());
+        client.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn account_notification_watermarks_remain_independent_across_replacement() {
+        let root = NostrSdkRelayClient::multi_account();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let alice_id = MemberId::new(alice.public_key().to_bytes().to_vec());
+        let bob_id = MemberId::new(bob.public_key().to_bytes().to_vec());
+        let alice_client = root
+            .register_account(alice_id.clone(), Arc::new(alice))
+            .await
+            .unwrap();
+        let bob_client = root
+            .register_account(bob_id.clone(), Arc::new(bob))
+            .await
+            .unwrap();
+        assert!(matches!(
+            root.notification_loss(),
+            Err(NostrAcquisitionError::Unsupported)
+        ));
+        let alice_watch = root.notification_loss_for_account(&alice_id).await.unwrap();
+        let bob_watch = root.notification_loss_for_account(&bob_id).await.unwrap();
+        alice_client.record_notification_gap(4);
+        alice_client.notification_receiver_replaced();
+        alice_client.record_notification_gap(2);
+        assert_eq!(alice_watch.borrow().as_ref().unwrap().cumulative_skipped, 6);
+        assert_eq!(
+            alice_watch.borrow().as_ref().unwrap().receiver_generation,
+            1
+        );
+        assert!(bob_watch.borrow().is_none());
+        bob_client.record_notification_gap(1);
+        assert_eq!(bob_watch.borrow().as_ref().unwrap().cumulative_skipped, 1);
+        assert_eq!(alice_watch.borrow().as_ref().unwrap().cumulative_skipped, 6);
+        root.remove_account(&bob_id).await;
+        assert!(root.notification_loss_for_account(&bob_id).await.is_err());
+        assert_eq!(alice_watch.borrow().as_ref().unwrap().cumulative_skipped, 6);
+        root.shutdown_accounts().await;
+    }
+
+    #[tokio::test]
+    async fn public_forwarder_reports_loss_while_delivery_is_blocked() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let account = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+        let mut loss = sdk.notification_loss().unwrap();
+        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account,
+                inbox_endpoints: vec![endpoint],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+        // Reserve every adapter delivery slot. The forwarder's event worker
+        // blocks, while its loss-aware SDK reader must keep running.
+        let held_delivery_slots = adapter
+            .delivery_tx
+            .reserve_many(crate::DELIVERY_BUFFER)
+            .await
+            .unwrap();
+        for index in 0..400 {
+            let event = EventBuilder::new(Kind::GiftWrap, format!("blocked-{index}"))
+                .tag(Tag::public_key(keys.public_key()))
+                .finalize(&keys)
+                .unwrap();
+            relay.add_event(event).await.unwrap();
+        }
+        timeout(Duration::from_secs(10), async {
+            loop {
+                loss.changed().await.unwrap();
+                if loss
+                    .borrow_and_update()
+                    .as_ref()
+                    .is_some_and(|gap| gap.cumulative_skipped > 0)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("loss watch advances while event delivery is blocked");
+        assert!(loss.borrow().as_ref().unwrap().cumulative_skipped > 0);
+        drop(held_delivery_slots);
+        timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("lossy forwarder exits after recording its gap")
+            .unwrap();
+        let generation = loss
+            .borrow_and_update()
+            .as_ref()
+            .unwrap()
+            .receiver_generation;
+        let replacement = sdk.spawn_notification_forwarder(adapter);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                loss.changed().await.unwrap();
+                if loss
+                    .borrow_and_update()
+                    .as_ref()
+                    .unwrap()
+                    .receiver_generation
+                    > generation
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("replacement advances the control generation");
+        assert_eq!(
+            loss.borrow().as_ref().unwrap().receiver_generation,
+            generation + 1
+        );
+        sdk.client.shutdown().await;
+        timeout(Duration::from_secs(2), replacement)
+            .await
+            .expect("replacement exits on shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborting_public_forwarder_cancels_blocked_delivery_child() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let account = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+        let loss = sdk.notification_loss().unwrap();
+        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account,
+                inbox_endpoints: vec![endpoint],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+        let held_delivery_slots = adapter
+            .delivery_tx
+            .reserve_many(crate::DELIVERY_BUFFER)
+            .await
+            .unwrap();
+        let event = EventBuilder::new(Kind::GiftWrap, "blocked before parent abort")
+            .tag(Tag::public_key(keys.public_key()))
+            .finalize(&keys)
+            .unwrap();
+        relay.add_event(event).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !sdk.forwarder_event_entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder worker starts the relay event");
+
+        forwarder.abort();
+        assert!(forwarder.await.unwrap_err().is_cancelled());
+        assert!(
+            loss.borrow()
+                .as_ref()
+                .is_some_and(|gap| gap.cumulative_skipped >= 1),
+            "aborted work advances the independent loss watch"
+        );
+        let replacement = sdk.spawn_notification_forwarder(adapter.clone());
+        drop(held_delivery_slots);
+        assert!(
+            timeout(Duration::from_millis(200), adapter.receive())
+                .await
+                .is_err(),
+            "the cancelled child must not deliver the old event after receiver replacement"
+        );
+        let fresh = EventBuilder::new(Kind::GiftWrap, "after parent replacement")
+            .tag(Tag::public_key(keys.public_key()))
+            .finalize(&keys)
+            .unwrap();
+        relay.add_event(fresh).await.unwrap();
+        timeout(Duration::from_secs(5), adapter.receive())
+            .await
+            .expect("replacement forwarder delivers new work")
+            .unwrap()
+            .expect("fresh relay event is delivered");
+        sdk.client.shutdown().await;
+        timeout(Duration::from_secs(2), replacement)
+            .await
+            .expect("replacement exits on shutdown")
+            .unwrap();
+        relay.shutdown();
+    }
+
+    fn signed_sdk_from_client(client: Client, keys: Keys) -> NostrSdkRelayClient {
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        NostrSdkRelayClient::with_account_signer(client, account_id, Arc::new(keys))
+    }
+
+    fn signed_sdk(keys: Keys) -> NostrSdkRelayClient {
+        let signer = SdkSigner(Arc::new(keys.clone()));
+        let client = Client::builder()
+            .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(signer))
+            .build();
+        signed_sdk_from_client(client, keys)
+    }
 
     #[derive(Default)]
     struct TestReconciliationProgress {
@@ -1830,12 +3072,9 @@ mod tests {
     fn signed_group_event_dto() -> NostrTransportEvent {
         let ephemeral = Keys::generate();
         let signed = EventBuilder::new(Kind::MlsGroupMessage, "outer encrypted body")
-            .tags([Tag::custom(
-                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-                ["cc".repeat(32)],
-            )])
+            .tags([Tag::custom("h", ["cc".repeat(32)])])
             .custom_created_at(NostrTimestamp::from_secs(1_700_000_010))
-            .sign_with_keys(&ephemeral)
+            .finalize(&ephemeral)
             .expect("sign ephemeral 445");
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
     }
@@ -1844,23 +3083,23 @@ mod tests {
     /// the same id. Cache misses do not identify which path owns delivery.
     #[tokio::test]
     async fn reconciliation_first_sighting_overlap_has_the_fetched_event_id() {
+        use nostr_relay_builder::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
         use nostr_relay_builder::{LocalRelay, RelayBuilder};
-        use nostr_sdk::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
         let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
             events: true,
             max_events: Some(16),
         });
         let event = EventBuilder::new(Kind::MlsGroupMessage, "below-floor probe")
-            .tags([Tag::custom(
-                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-                ["c3".repeat(32)],
-            )])
-            .sign_with_keys(&Keys::generate())
+            .tags([Tag::custom("h", ["c3".repeat(32)])])
+            .finalize(&Keys::generate())
             .unwrap();
-        database.save_event(&event).await.unwrap();
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
         let relay = LocalRelay::new(RelayBuilder::default().database(database));
         relay.run().await.unwrap();
-        let endpoint = relay.url().await;
+        let endpoint = RelayUrl::parse(&relay.url().await.to_string()).unwrap();
         let sdk = NostrSdkRelayClient::new(Client::builder().build());
         let progress = TestReconciliationProgress::default();
         let mut notifications = sdk.client.notifications();
@@ -1882,8 +3121,7 @@ mod tests {
         assert_eq!(fetched[0].event.id, event.id.to_hex());
         let announced_id = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let RelayPoolNotification::Event { event, .. } =
-                    notifications.recv().await.unwrap()
+                if let ClientNotification::Event { event, .. } = notifications.next().await.unwrap()
                 {
                     break event.id;
                 }
@@ -1924,8 +3162,8 @@ mod tests {
     async fn reconciliation_redelivers_seen_but_unretained_events_with_default_sdk_cache() {
         use nostr_relay_builder::LocalRelay;
 
-        let database = nostr_sdk::prelude::MemoryDatabase::with_opts(
-            nostr_sdk::prelude::MemoryDatabaseOptions {
+        let database = nostr_relay_builder::prelude::MemoryDatabase::with_opts(
+            nostr_relay_builder::prelude::MemoryDatabaseOptions {
                 events: true,
                 max_events: Some(1024),
             },
@@ -1933,31 +3171,31 @@ mod tests {
         let mut published = Vec::new();
         for index in 0..SDK_RECONCILIATION_REPLAY_BATCH + 9 {
             let event = EventBuilder::new(Kind::MlsGroupMessage, format!("synthetic-{index}"))
-                .tags([Tag::custom(
-                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-                    ["c3".repeat(32)],
-                )])
-                .sign_with_keys(&Keys::generate())
+                .tags([Tag::custom("h", ["c3".repeat(32)])])
+                .finalize(&Keys::generate())
                 .unwrap();
-            nostr_sdk::prelude::NostrDatabase::save_event(&database, &event)
-                .await
-                .unwrap();
+            nostr_relay_builder::prelude::NostrDatabase::save_event(
+                &database,
+                &serde_json::from_str(event.as_json().as_str()).unwrap(),
+            )
+            .await
+            .unwrap();
             published.push(event);
         }
         let unrelated = EventBuilder::new(Kind::MlsGroupMessage, "unrelated group")
-            .tags([Tag::custom(
-                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-                ["d4".repeat(32)],
-            )])
-            .sign_with_keys(&Keys::generate())
+            .tags([Tag::custom("h", ["d4".repeat(32)])])
+            .finalize(&Keys::generate())
             .unwrap();
-        nostr_sdk::prelude::NostrDatabase::save_event(&database, &unrelated)
-            .await
-            .unwrap();
+        nostr_relay_builder::prelude::NostrDatabase::save_event(
+            &database,
+            &serde_json::from_str(unrelated.as_json().as_str()).unwrap(),
+        )
+        .await
+        .unwrap();
         let relay =
             LocalRelay::new(nostr_relay_builder::RelayBuilder::default().database(database));
         relay.run().await.unwrap();
-        let endpoint = relay.url().await;
+        let endpoint = RelayUrl::parse(&relay.url().await.to_string()).unwrap();
         let sdk = NostrSdkRelayClient::new(Client::builder().build());
         let progress = TestReconciliationProgress::default();
         sdk.client.add_relay(endpoint.clone()).await.unwrap();
@@ -1976,10 +3214,7 @@ mod tests {
             .filter;
         let seen = sdk
             .client
-            .fetch_events(
-                filter.limit(SDK_RECONCILIATION_SET_LIMIT),
-                Duration::from_secs(2),
-            )
+            .fetch_events(filter.limit(SDK_RECONCILIATION_SET_LIMIT))
             .await
             .unwrap();
         assert_eq!(seen.len(), published.len());
@@ -2024,9 +3259,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.len(), SDK_RECONCILIATION_REPLAY_BATCH);
-        while let Ok(notification) = notifications.try_recv() {
+        while let Some(notification) =
+            tokio::time::timeout(Duration::from_millis(10), notifications.next())
+                .await
+                .ok()
+                .flatten()
+        {
             assert!(
-                !matches!(notification, nostr_sdk::RelayPoolNotification::Event { .. }),
+                !matches!(notification, ClientNotification::Event { .. }),
                 "already-seen events must be owned by explicit replay, not first-seen notifications"
             );
         }
@@ -2604,8 +3844,7 @@ mod tests {
         // rather than stamp the account signer onto the routing-visible
         // envelope.
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys.clone()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         let dto = NostrTransportEvent {
             id: "11".repeat(32),
             pubkey: "22".repeat(32),
@@ -2628,8 +3867,7 @@ mod tests {
     #[tokio::test]
     async fn unsigned_marmot_key_package_event_is_signed_as_kind_30443() {
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys.clone()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         let dto = NostrKeyPackagePublication {
             client_name: None,
             account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
@@ -2657,8 +3895,8 @@ mod tests {
     async fn concurrent_batch_clients_keep_account_signers_isolated() {
         let keys_a = Keys::generate();
         let keys_b = Keys::generate();
-        let sdk_a = NostrSdkRelayClient::new(Client::builder().signer(keys_a.clone()).build());
-        let sdk_b = NostrSdkRelayClient::new(Client::builder().signer(keys_b.clone()).build());
+        let sdk_a = signed_sdk(keys_a.clone());
+        let sdk_b = signed_sdk(keys_b.clone());
         let event_a = NostrTransportEvent::new_unsigned(
             keys_a.public_key().to_hex(),
             5,
@@ -2705,8 +3943,7 @@ mod tests {
         let reachable = TransportEndpoint(relay.url().await.to_string());
         let silent = TransportEndpoint(silent_relay_url().await);
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
         // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
         let dto = signed_group_event_dto();
@@ -2734,8 +3971,7 @@ mod tests {
         let reachable = TransportEndpoint(relay.url().await.to_string());
         let hung_connect = TransportEndpoint(hanging_connect_relay_url().await);
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         let dto = signed_group_event_dto();
 
         let outcome = timeout(
@@ -2760,7 +3996,7 @@ mod tests {
         let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = TransportEndpoint(format!("ws://{}", reservation.local_addr().unwrap()));
         drop(reservation);
-        let sdk = NostrSdkRelayClient::new(Client::builder().signer(Keys::generate()).build());
+        let sdk = signed_sdk(Keys::generate());
         let dto = signed_group_event_dto();
 
         let error = timeout(
@@ -2786,8 +4022,7 @@ mod tests {
         let stored_ids = Arc::new(Mutex::new(Vec::new()));
         let endpoint = TransportEndpoint(storing_no_ack_relay_url(stored_ids.clone()).await);
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
         // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
         let dto = signed_group_event_dto();
@@ -2834,7 +4069,11 @@ mod tests {
         let (relay_url, connection_count, stale_connection_closed) =
             stale_then_healthy_relay_url().await;
         let endpoint = TransportEndpoint(relay_url);
-        let client = Client::builder().signer(Keys::generate()).build();
+        let client = Client::builder()
+            .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+                SdkSigner(Arc::new(Keys::generate())),
+            ))
+            .build();
         client
             .add_relay(endpoint.as_str())
             .await
@@ -2888,8 +4127,7 @@ mod tests {
     async fn relay_that_stores_event_but_withholds_ok_is_possibly_exposed() {
         let stored_ids = Arc::new(Mutex::new(Vec::new()));
         let endpoint = TransportEndpoint(storing_no_ack_relay_url(stored_ids.clone()).await);
-        let client = Client::builder().signer(Keys::generate()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(Keys::generate());
         let dto = signed_group_event_dto();
         let expected_id = dto.id.clone();
         let publish_sdk = sdk.clone();
@@ -2931,8 +4169,7 @@ mod tests {
     async fn publish_event_retains_relay_promoted_to_durable_during_publish() {
         let endpoint = TransportEndpoint(silent_relay_url().await);
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
         // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
         let dto = signed_group_event_dto();
@@ -2966,7 +4203,7 @@ mod tests {
             .expect("publish task should not panic")
             .expect_err("silent relay should miss the required ack deadline");
 
-        assert!(err.to_string().contains("publish timed out"));
+        assert_eq!(err.publish_endpoint_failures().len(), 1);
         assert_eq!(sdk.relay_health().await.total_relays, 1);
     }
 
@@ -2975,8 +4212,7 @@ mod tests {
         let relay = MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys.clone()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         let dto = NostrKeyPackagePublication {
             client_name: None,
             account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
@@ -3017,8 +4253,7 @@ mod tests {
         let relay = MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
         // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
         let dto = signed_group_event_dto();
@@ -3137,7 +4372,11 @@ mod tests {
         let relay = MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys).build();
+        let client = Client::builder()
+            .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+                SdkSigner(Arc::new(keys)),
+            ))
+            .build();
         client.add_relay(endpoint.as_str()).await.unwrap();
         let sdk = NostrSdkRelayClient::new(client);
         // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
@@ -3162,8 +4401,7 @@ mod tests {
         let relay = MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
         // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
         let dto = signed_group_event_dto();
@@ -3181,8 +4419,7 @@ mod tests {
         let relay = MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
-        let client = Client::builder().signer(Keys::generate()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(Keys::generate());
         let requests = [
             NostrEventPublishRequest {
                 endpoints: vec![endpoint.clone()],
@@ -3223,12 +4460,11 @@ mod tests {
         observer.connect().await;
         let subscription_id = SubscriptionId::new("concurrent-batch-observer");
         observer
-            .subscribe_with_id_to(
-                [healthy_endpoint.as_str()],
-                subscription_id,
-                Filter::new().kind(Kind::MlsGroupMessage),
-                None,
-            )
+            .subscribe(ReqTarget::manual(vec![(
+                RelayUrl::parse(healthy_endpoint.as_str()).unwrap(),
+                vec![Filter::new().kind(Kind::MlsGroupMessage)],
+            )]))
+            .with_id(subscription_id)
             .await
             .unwrap();
 
@@ -3257,11 +4493,11 @@ mod tests {
         timeout(Duration::from_secs(2), async {
             loop {
                 match notifications
-                    .recv()
+                    .next()
                     .await
                     .expect("observer notification channel remains open")
                 {
-                    RelayPoolNotification::Event { event, .. }
+                    ClientNotification::Event { event, .. }
                         if event.id.to_hex() == healthy_event_id =>
                     {
                         break;
@@ -3400,8 +4636,7 @@ mod tests {
         let endpoint_b = TransportEndpoint(relay_b.url().await.to_string());
         let relay_url_a = RelayUrl::parse(endpoint_a.as_str()).unwrap();
         let relay_url_b = RelayUrl::parse(endpoint_b.as_str()).unwrap();
-        let client = Client::builder().signer(Keys::generate()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(Keys::generate());
         let requests = [
             NostrEventPublishRequest {
                 endpoints: vec![endpoint_a.clone(), endpoint_b.clone(), endpoint_a],
@@ -3431,8 +4666,7 @@ mod tests {
         let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
         drop(listener);
         let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
-        let client = Client::builder().signer(Keys::generate()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(Keys::generate());
 
         let err = sdk
             .publish_events(&[NostrEventPublishRequest {
@@ -3456,8 +4690,7 @@ mod tests {
     async fn cancelled_publish_batch_cleans_write_only_relay() {
         let endpoint = TransportEndpoint(silent_relay_url().await);
         let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
-        let client = Client::builder().signer(Keys::generate()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(Keys::generate());
         let publish_sdk = sdk.clone();
         let publish = tokio::spawn(async move {
             publish_sdk
@@ -3487,9 +4720,9 @@ mod tests {
             .get(&relay_url)
             .cloned()
             .expect("batch must retain its transient relay");
-        assert!(relay.flags().has_write());
+        assert!(relay.capabilities().has_write());
         assert!(
-            !relay.flags().has_read(),
+            !relay.capabilities().has_read(),
             "publish-only relay must not inherit subscriptions"
         );
 
@@ -3513,20 +4746,17 @@ mod tests {
     async fn sdk_does_not_cache_failed_signature_verification() {
         let transport_group_id = vec![0xCC; 32];
         let event = EventBuilder::new(Kind::MlsGroupMessage, "outer encrypted body")
-            .tags([Tag::custom(
-                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-                [hex::encode(&transport_group_id)],
-            )])
-            .sign_with_keys(&Keys::generate())
+            .tags([Tag::custom("h", [hex::encode(&transport_group_id)])])
+            .finalize(&Keys::generate())
             .expect("sign test event");
         let mut first_invalid = event.clone();
         first_invalid.sig = EventBuilder::new(Kind::TextNote, "wrong signature")
-            .sign_with_keys(&Keys::generate())
+            .finalize(&Keys::generate())
             .expect("sign replacement signature")
             .sig;
         let mut second_invalid = event.clone();
         second_invalid.sig = EventBuilder::new(Kind::TextNote, "another wrong signature")
-            .sign_with_keys(&Keys::generate())
+            .finalize(&Keys::generate())
             .expect("sign second replacement signature")
             .sig;
         assert!(first_invalid.verify().is_err());
@@ -3582,15 +4812,14 @@ mod tests {
         client.connect().await;
         let subscription_id = SubscriptionId::new("cache-poisoning-regression");
         client
-            .subscribe_with_id_to(
-                [endpoint],
-                subscription_id,
-                Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
-                    SingleLetterTag::lowercase(Alphabet::H),
+            .subscribe(ReqTarget::manual(vec![(
+                endpoint,
+                vec![Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+                    SingleLetterTag::from_char('h').unwrap(),
                     [hex::encode(&transport_group_id)],
-                ),
-                None,
-            )
+                )],
+            )]))
+            .with_id(subscription_id)
             .await
             .unwrap();
 
@@ -3598,17 +4827,18 @@ mod tests {
         timeout(RELAY_EOSE_TIMEOUT, async {
             loop {
                 match notifications
-                    .recv()
+                    .next()
                     .await
                     .expect("notification channel remains open")
                 {
-                    RelayPoolNotification::Event { .. } => {
+                    ClientNotification::Event { .. } => {
                         panic!("failed signature verification must not emit a trusted event")
                     }
-                    RelayPoolNotification::Message {
-                        message: RelayMessage::EndOfStoredEvents(_),
-                        ..
-                    } => break,
+                    ClientNotification::Message { message, .. }
+                        if matches!(*message, RelayMessage::EndOfStoredEvents(_)) =>
+                    {
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -3711,7 +4941,7 @@ mod tests {
     impl nostr_relay_builder::prelude::WritePolicy for RejectAllWrites {
         fn admit_event<'a>(
             &'a self,
-            _event: &'a nostr::Event,
+            _event: &'a nostr_relay_builder::prelude::Event,
             _addr: &'a std::net::SocketAddr,
         ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult>
         {
@@ -3735,8 +4965,7 @@ mod tests {
         relay.run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys.clone()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         let deletion = NostrTransportEvent::new_unsigned(
             keys.public_key().to_hex(),
             5,
@@ -3768,8 +4997,7 @@ mod tests {
         let endpoint_a = TransportEndpoint(relay_a.url().await.to_string());
         let endpoint_b = TransportEndpoint(relay_b.url().await.to_string());
         let keys = Keys::generate();
-        let client = Client::builder().signer(keys.clone()).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk = signed_sdk(keys.clone());
         let deletion = NostrTransportEvent::new_unsigned(
             keys.public_key().to_hex(),
             5,

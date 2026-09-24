@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 33] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 34] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -202,8 +202,15 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 33] = [
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),
+    // #1946 preserves A10 values; only qualified local evaluations count,
+    // and the account recovery owner alone grants network attempts.
     decision(
         "A10",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    decision(
+        "A11",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

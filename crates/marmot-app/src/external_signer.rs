@@ -4,10 +4,8 @@ use std::sync::Arc;
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
-use nostr::signer::SignerBackend;
-use nostr::{
-    Event, NostrSigner, PublicKey, SignerError, UnsignedEvent, secp256k1::schnorr::Signature,
-};
+use nostr::prelude::{Event, FinalizeEvent, PublicKey, Signature, UnsignedEvent};
+use transport_nostr_peeler::{MarmotNostrSigner, MarmotSignerError, SignerFuture};
 
 pub const EXTERNAL_SIGNER_REJECTED: &str = "external_signer_rejected";
 
@@ -17,18 +15,18 @@ pub const EXTERNAL_SIGNER_REJECTED: &str = "external_signer_rejected";
 /// account-identity proof signature. The proof signature is produced by signing
 /// a canonical unpublished Nostr event, so Amber/NIP-55-style signers can
 /// participate without exposing raw digest signing.
-pub trait ExternalAccountSigner: NostrSigner + AccountIdentityProofSigner {}
+pub trait ExternalAccountSigner: MarmotNostrSigner + AccountIdentityProofSigner {}
 
-impl<T> ExternalAccountSigner for T where T: NostrSigner + AccountIdentityProofSigner {}
+impl<T> ExternalAccountSigner for T where T: MarmotNostrSigner + AccountIdentityProofSigner {}
 
 #[derive(Clone)]
 pub(crate) enum AccountSigner {
-    Local(nostr::Keys),
+    Local(nostr::prelude::Keys),
     External(RegisteredExternalSigner),
 }
 
 impl AccountSigner {
-    pub(crate) fn as_nostr_signer(&self) -> Arc<dyn NostrSigner> {
+    pub(crate) fn as_nostr_signer(&self) -> Arc<dyn MarmotNostrSigner> {
         match self {
             Self::Local(keys) => Arc::new(keys.clone()),
             Self::External(signer) => Arc::new(signer.clone()),
@@ -54,7 +52,7 @@ impl fmt::Debug for AccountSigner {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalAccountIdentityProofSigner {
-    keys: nostr::Keys,
+    keys: nostr::prelude::Keys,
 }
 
 impl AccountIdentityProofSigner for LocalAccountIdentityProofSigner {
@@ -65,11 +63,9 @@ impl AccountIdentityProofSigner for LocalAccountIdentityProofSigner {
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match local Nostr key".into());
         }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
     }
 }
@@ -98,12 +94,8 @@ impl fmt::Debug for RegisteredExternalSigner {
     }
 }
 
-impl NostrSigner for RegisteredExternalSigner {
-    fn backend(&self) -> SignerBackend<'_> {
-        self.signer.backend()
-    }
-
-    fn get_public_key(&self) -> nostr::util::BoxedFuture<'_, Result<PublicKey, SignerError>> {
+impl MarmotNostrSigner for RegisteredExternalSigner {
+    fn get_public_key(&self) -> SignerFuture<'_, Result<PublicKey, MarmotSignerError>> {
         let public_key = self.public_key;
         Box::pin(async move { Ok(public_key) })
     }
@@ -111,22 +103,22 @@ impl NostrSigner for RegisteredExternalSigner {
     fn sign_event(
         &self,
         unsigned: UnsignedEvent,
-    ) -> nostr::util::BoxedFuture<'_, Result<Event, SignerError>> {
+    ) -> SignerFuture<'_, Result<Event, MarmotSignerError>> {
         let public_key = self.public_key;
         let signer = self.signer.clone();
         Box::pin(async move {
             let expected_id = unsigned
                 .id
-                .ok_or_else(|| SignerError::from("unsigned event id was not set"))?;
+                .ok_or_else(|| MarmotSignerError::from("unsigned event id was not set"))?;
             let event = signer.sign_event(unsigned).await?;
             if event.pubkey != public_key || event.id != expected_id {
-                return Err(SignerError::from(
+                return Err(MarmotSignerError::from(
                     "external signer returned a different event than requested",
                 ));
             }
             event
                 .verify()
-                .map_err(|err| SignerError::from(err.to_string()))?;
+                .map_err(|err| MarmotSignerError::from(err.to_string()))?;
             Ok(event)
         })
     }
@@ -135,7 +127,7 @@ impl NostrSigner for RegisteredExternalSigner {
         &'a self,
         public_key: &'a PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
+    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         self.signer.nip04_encrypt(public_key, content)
     }
 
@@ -143,7 +135,7 @@ impl NostrSigner for RegisteredExternalSigner {
         &'a self,
         public_key: &'a PublicKey,
         encrypted_content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
+    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         self.signer.nip04_decrypt(public_key, encrypted_content)
     }
 
@@ -151,7 +143,7 @@ impl NostrSigner for RegisteredExternalSigner {
         &'a self,
         public_key: &'a PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
+    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         self.signer.nip44_encrypt(public_key, content)
     }
 
@@ -159,7 +151,7 @@ impl NostrSigner for RegisteredExternalSigner {
         &'a self,
         public_key: &'a PublicKey,
         payload: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
+    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         self.signer.nip44_decrypt(public_key, payload)
     }
 }
@@ -187,58 +179,58 @@ impl AccountIdentityProofSigner for RegisteredExternalSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::nips::nip59::GiftWrapSealBuilder;
+    use nostr::prelude::{EventBuilder, FinalizeEventAsync, FinalizeUnsignedEvent, Kind, RelayUrl};
+    use nostr_sdk::authenticator::{Authenticator, SignerAuthenticator};
+    use transport_nostr_peeler::SdkSigner;
 
     #[derive(Clone, Debug)]
     struct TestExternalSigner {
-        keys: nostr::Keys,
+        keys: nostr::prelude::Keys,
     }
 
-    impl NostrSigner for TestExternalSigner {
-        fn backend(&self) -> SignerBackend<'_> {
-            self.keys.backend()
-        }
-
-        fn get_public_key(&self) -> nostr::util::BoxedFuture<'_, Result<PublicKey, SignerError>> {
-            self.keys.get_public_key()
+    impl MarmotNostrSigner for TestExternalSigner {
+        fn get_public_key(&self) -> SignerFuture<'_, Result<PublicKey, MarmotSignerError>> {
+            MarmotNostrSigner::get_public_key(&self.keys)
         }
 
         fn sign_event(
             &self,
             unsigned: UnsignedEvent,
-        ) -> nostr::util::BoxedFuture<'_, Result<Event, SignerError>> {
-            self.keys.sign_event(unsigned)
+        ) -> SignerFuture<'_, Result<Event, MarmotSignerError>> {
+            MarmotNostrSigner::sign_event(&self.keys, unsigned)
         }
 
         fn nip04_encrypt<'a>(
             &'a self,
             public_key: &'a PublicKey,
             content: &'a str,
-        ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
-            self.keys.nip04_encrypt(public_key, content)
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            MarmotNostrSigner::nip04_encrypt(&self.keys, public_key, content)
         }
 
         fn nip04_decrypt<'a>(
             &'a self,
             public_key: &'a PublicKey,
             encrypted_content: &'a str,
-        ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
-            self.keys.nip04_decrypt(public_key, encrypted_content)
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            MarmotNostrSigner::nip04_decrypt(&self.keys, public_key, encrypted_content)
         }
 
         fn nip44_encrypt<'a>(
             &'a self,
             public_key: &'a PublicKey,
             content: &'a str,
-        ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
-            self.keys.nip44_encrypt(public_key, content)
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            MarmotNostrSigner::nip44_encrypt(&self.keys, public_key, content)
         }
 
         fn nip44_decrypt<'a>(
             &'a self,
             public_key: &'a PublicKey,
             payload: &'a str,
-        ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
-            self.keys.nip44_decrypt(public_key, payload)
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            MarmotNostrSigner::nip44_decrypt(&self.keys, public_key, payload)
         }
     }
 
@@ -247,21 +239,19 @@ mod tests {
             &self,
             request: &AccountIdentityProofRequest,
         ) -> Result<[u8; 64], String> {
-            let event = request.proof_event().and_then(|event| {
-                event
-                    .sign_with_keys(&self.keys)
-                    .map_err(|err| err.to_string())
-            })?;
+            let event = request
+                .proof_event()
+                .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
             request.signature_from_signed_event(event)
         }
     }
 
     #[tokio::test]
     async fn account_signer_uses_registered_public_key_for_external_accounts() {
-        use nostr::{EventBuilder, Kind};
+        use nostr::prelude::{EventBuilder, Kind};
 
-        let registered_keys = nostr::Keys::generate();
-        let stale_callback_keys = nostr::Keys::generate();
+        let registered_keys = nostr::prelude::Keys::generate();
+        let stale_callback_keys = nostr::prelude::Keys::generate();
         let registered = RegisteredExternalSigner::new(
             registered_keys.public_key(),
             Arc::new(TestExternalSigner {
@@ -276,11 +266,42 @@ mod tests {
             registered_keys.public_key()
         );
 
-        let unsigned =
-            EventBuilder::new(Kind::TextNote, "hello").build(registered_keys.public_key());
+        let mut unsigned = EventBuilder::new(Kind::TextNote, "hello")
+            .finalize_unsigned(registered_keys.public_key());
+        unsigned.ensure_id();
         assert!(
             signer.sign_event(unsigned).await.is_err(),
             "registered external signer must reject events signed by a stale callback key"
         );
+    }
+
+    #[tokio::test]
+    async fn registered_external_signer_seals_welcomes_and_authenticates() {
+        let keys = nostr::prelude::Keys::generate();
+        let receiver = nostr::prelude::Keys::generate();
+        let registered = RegisteredExternalSigner::new(
+            keys.public_key(),
+            Arc::new(TestExternalSigner { keys: keys.clone() }),
+        );
+        let signer = Arc::new(registered) as Arc<dyn MarmotNostrSigner>;
+        let sdk_signer = SdkSigner(signer);
+        let rumor = EventBuilder::new(Kind::TextNote, "welcome fixture")
+            .finalize_unsigned(keys.public_key());
+        let seal = GiftWrapSealBuilder::new(rumor, receiver.public_key())
+            .finalize_async(&sdk_signer)
+            .await
+            .expect("registered external signer seals a Welcome rumor");
+        seal.verify()
+            .expect("sealed event has the requested id and signature");
+        assert_eq!(seal.pubkey, keys.public_key());
+
+        let relay = RelayUrl::parse("wss://relay.example").unwrap();
+        let auth = SignerAuthenticator::new(sdk_signer)
+            .make_auth_event(&relay, "challenge")
+            .await
+            .expect("registered external signer signs NIP-42 AUTH");
+        auth.verify()
+            .expect("AUTH has the requested id and signature");
+        assert_eq!(auth.pubkey, keys.public_key());
     }
 }

@@ -1,4 +1,6 @@
 pub mod audit;
+#[cfg(unix)]
+pub mod local_delivery;
 
 pub use audit::{
     AUDIT_LOG_SCHEMA_VERSION, AUDIT_LOG_SEGMENT_MAX_BYTES, AccountRefHex, AuditConvergenceContext,

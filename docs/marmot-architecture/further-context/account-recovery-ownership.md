@@ -112,10 +112,10 @@ endpoint strings leave encrypted storage in diagnostics.
 
 | Table / key | Authoritative columns and constraints |
 | --- | --- |
-| `account_recovery_state`, singleton `1` | `next_attempt`, `loss_revision`, `route_revision`, `inventory_revision`; `retry_ordinal`, `retry_recorded_at_ms`, `retry_delay_ms`, `retry_not_before_ms`. `inventory_revision` invalidates coverage on release/removal/compaction, not every positive admission. Rollback executor selection is process-local configuration, not persisted schema |
+| `account_recovery_state`, singleton `1` | `next_attempt`, `loss_revision`, `route_revision`, `inventory_revision`; `retry_ordinal`, `retry_recorded_at_ms`, `retry_delay_ms`, `retry_not_before_ms`. `inventory_revision` fences reservation and plan installation on release/removal/compaction. Installed scope tokens/proof are invalidated for overlapping route/window removals (exact event for a known-event predicate), so unrelated/out-of-window eviction triggered by positive admission cannot prevent bounded completion. Receipt-journal consumption conservatively invalidates all installed proof when route/time is unavailable. Qualified completion and loss acknowledgment recheck scope proof, rather than rejecting unrelated account inventory churn. Rollback executor selection is process-local configuration, not persisted schema |
 | `account_recovery_obligations`, `id` BLOB PK | Unique typed `demand_key`; `cause`, nullable group FK/`stalled_epoch`, legacy account label/loss token/count/time where applicable; `revision`, `predicate`, `urgency`, timestamps, `state` (`pending`, `satisfied`, `retired`), `eligibility` (`ready`, `retry`, `waiting_capacity`, `waiting_capability`, `needs_deep_repair`), `incomplete_reason`, durable/caller origin. Account-wide demand has NULL group |
 | `account_recovery_scopes`, `(obligation_id, scope_id)` | FK cascade; route kind/role/MLS group/transport ID, `route_revision`, `since` (NULL = unbounded older request), frozen `until`, optional 32-byte `known_event_id`; `scope_revision`, `snapshot_state` (`unresolved`, `ready`), inventory floor/rotation progress. `scope_format = 1` versions an explicitly decoded plan/outcome blob containing canonical requested/admitted endpoints, endpoint policy, qualified endpoint checkpoints, attempt token and captured revision fences. Unknown versions fail closed. One latest checkpoint per scope, no separate attempt log or known-event table |
-| `account_delivery_loss_evidence`, `(account_label, cause, marker_token)` PK | Loss token, first-observed time, max observed count, owner-imported count and nullable legacy-retired count. Copy old 0053 rows with imported count equal to observed count because their demand is migrated in the same transaction. The approved off-worker writer may only insert/increase queue-loss evidence; notification evidence is worker-written. Only the owner advances imported count/acknowledges it. Distinct tokens cannot overwrite one another; cause separates queue omissions from notification-consumer loss. No evidence row authorizes I/O or clears demand |
+| `account_delivery_loss_evidence`, `(account_label, cause, marker_token)` PK | Loss token, first-observed time, max observed count, nullable owner-imported count (NULL means never imported, including zero-count observations) and nullable legacy-retired count. Copy old 0053 rows with imported count equal to observed count because their demand is migrated in the same transaction. The approved off-worker writer may only insert/increase queue-loss evidence; notification evidence is worker-written. Only the owner advances imported count/acknowledges it. Distinct tokens cannot overwrite one another; cause separates queue omissions from notification-consumer loss. No evidence row authorizes I/O or clears demand |
 
 `demand_key` is a typed encoding: overflow + account label (normally one per database);
 notification-consumer loss + account label; epoch gap + MLS group; maintenance prerequisite + durable job ID + predicate; explicit repair +
@@ -164,9 +164,14 @@ intent still creates demand atomically when the existing receipt consumer runs.
 Create the four tables, convert and validate row counts/keys, then remove the two
 old demand tables within the same migration transaction. Copy each old loss row
 into the evidence table with `imported_count = observed_count`, as well as preserving
-its demand in the ledger. The owner imports subsequent evidence transactionally: only an increased `(token, count)` advances the
-loss/obligation revision, and imported counts cannot regress. A late old callback
-cannot overwrite a newer token. Retain the current evidence watermark until the
+its demand in the ledger. Only new loss changes the imported watermark. Changing
+which token the compatibility pointer represents also advances loss/obligation
+revisions, so a grant cannot keep the same fence across generation adoption;
+adopting already-imported evidence does not reset quiescence or retry state.
+Already-imported callback duplicates cannot replace that pointer. An unrecognized
+token is joined with a changed pointer, making an older token-only clear fail closed;
+random token values do not establish generation order. Every generation retains
+its own import/legacy-retirement watermark. Retain the current evidence until the
 plane confirms its marker writer is finished; reclaim it only after fenced
 completion. Reopen has no surviving old callback. Compare unimported evidence
 inside the completion transaction; a newer count is not hidden behind the worker
@@ -180,6 +185,7 @@ is not retired; retained watermarks suppress late duplicates while count growth
 rearms demand. Qualified owner completion remains the only evidence-reclamation path.
 Keep the public storage clear signatures and their documented token/epoch-exact
 low-level retirement semantics, restricted to the corresponding legacy cause;
+legacy retirement retains imported loss watermarks and cannot reclaim them;
 they cannot certify qualified completion or clear explicit/maintenance demand.
 Add revision-aware CAS primitives for all internal completion. No owner/executor
 path may call the old clears. This preserves supported lower-level methods without
@@ -338,6 +344,14 @@ is distinguished from unsupported scope. `retired` is only group terminality or
 explicit authorized withdrawal, never the result of unavailable coverage. No debt
 is marked satisfied to stop traffic. Test zero additional activations across
 multiple capped retry windows and reopen, followed by each permitted rearm cause.
+
+Approved #1992 amendment: cold startup may join one bounded retained-inventory
+comparison even while older coverage is parked. Its durable singleton shares the
+same owner, reservation and retry cost. Per-route servicing never completes
+coverage or acknowledges loss. The live timestamp cutoff and retained-inventory
+floor are distinct; see
+[the concrete comparison amendment](account-recovery-incremental-comparison-proposal.md)
+for mixed-result settlement, repeated-start behavior and acceptance tests.
 
 Apply that eligibility rule by cause, without changing completion predicates:
 
@@ -509,3 +523,14 @@ live-session guard, converting unclean close into unknown-scope debt. It would n
 additional lifecycle design and recovery after process death, including the existing
 close-before-graceful-cleanup shutdown order. Merely queueing the write behind a
 blocking worker would weaken loss durability and was not proposed as safe.
+
+### Approved exception: unresolved durable loss retention
+
+On 2026-09-23 the task owner approved retaining unresolved per-generation loss
+watermarks without a fixed disk-row cap. Qualified completion and the exact live
+acknowledgment remain the only reclamation path; the current backend cannot
+certify exhaustive history. Repeated unresolved generations can therefore grow
+this table even after automatic investigation stops. Do not evict, merge away or
+legacy-retire another generation to enforce a cap. This exception does not permit
+unbounded active snapshots, completed metadata or automatic replay. Their
+lifetimes and bounds are tracked in `../runtime-state-bounds.md`.

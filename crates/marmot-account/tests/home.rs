@@ -111,7 +111,7 @@ fn account_home_import_accepts_nsec_and_reopens_the_same_identity() {
 #[test]
 fn runtime_import_recovers_journal_before_secret_or_account_record() {
     let dir = tempfile::tempdir().unwrap();
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let account_id = keys.public_key().to_hex();
     let account_dir = dir.path().join("accounts").join(&account_id);
     std::fs::create_dir_all(&account_dir).unwrap();
@@ -144,7 +144,7 @@ fn runtime_import_recovers_journal_before_secret_or_account_record() {
 fn runtime_import_recovers_journal_and_secret_before_account_record() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let account_id = keys.public_key().to_hex();
     let account = home
         .import_nostr_account(&keys.secret_key().to_secret_hex())
@@ -274,7 +274,7 @@ fn account_home_idempotent_import_reactivates_signed_out_identity() {
 #[test]
 fn account_home_idempotent_import_repairs_interrupted_record_first_import() {
     let dir = tempfile::tempdir().unwrap();
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let account = AccountSummary {
         label: "agent".to_owned(),
         account_id_hex: keys.public_key().to_hex(),
@@ -367,7 +367,9 @@ fn account_home_rejects_path_like_labels() {
 fn account_home_rejects_windows_drive_relative_labels() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let secret_hex = nostr::Keys::generate().secret_key().to_secret_hex();
+    let secret_hex = nostr::prelude::Keys::generate()
+        .secret_key()
+        .to_secret_hex();
 
     assert!(matches!(
         home.import_account("C:evil", &secret_hex),
@@ -380,7 +382,9 @@ fn account_home_rejects_windows_drive_relative_labels() {
 fn account_home_rejects_control_characters_in_labels() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let secret_hex = nostr::Keys::generate().secret_key().to_secret_hex();
+    let secret_hex = nostr::prelude::Keys::generate()
+        .secret_key()
+        .to_secret_hex();
 
     for label in ["evil\nlabel", "evil\rlabel", "evil\u{1b}[2Klabel"] {
         assert!(matches!(
@@ -421,7 +425,7 @@ fn account_home_can_store_public_nostr_identity_without_secret() {
 fn account_home_can_store_external_signer_identity_without_secret() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let public_key = nostr::Keys::generate().public_key().to_hex();
+    let public_key = nostr::prelude::Keys::generate().public_key().to_hex();
 
     let account = home.add_external_signer_account(&public_key).unwrap();
 
@@ -442,7 +446,7 @@ fn account_home_can_store_external_signer_identity_without_secret() {
 fn account_home_upgrades_public_identity_to_external_signer_identity() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let public_key = nostr::Keys::generate().public_key().to_hex();
+    let public_key = nostr::prelude::Keys::generate().public_key().to_hex();
     let public = home.add_public_account(&public_key).unwrap();
 
     let external = home.add_external_signer_account(&public_key).unwrap();
@@ -530,7 +534,7 @@ fn account_home_persists_reversible_sign_out_marker() {
 fn account_home_persists_reversible_external_signer_sign_out_marker() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let public_key = nostr::Keys::generate().public_key().to_hex();
+    let public_key = nostr::prelude::Keys::generate().public_key().to_hex();
 
     let created = home.add_external_signer_account(&public_key).unwrap();
     assert!(created.external_signing);
@@ -569,7 +573,9 @@ fn account_home_keychain_rejects_second_label_for_same_account_id() {
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open_with_keychain(dir.path(), "com.marmot.test.dup-guard").unwrap();
-    let secret_hex = nostr::Keys::generate().secret_key().to_secret_hex();
+    let secret_hex = nostr::prelude::Keys::generate()
+        .secret_key()
+        .to_secret_hex();
 
     home.import_account("label-one", &secret_hex).unwrap();
 
@@ -585,7 +591,7 @@ fn account_home_idempotent_import_recovers_orphaned_keychain_credential() {
     let dir = tempfile::tempdir().unwrap();
     let home =
         AccountHome::open_with_keychain(dir.path(), "com.marmot.test.orphan-recovery").unwrap();
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let secret_hex = keys.secret_key().to_secret_hex();
     let original = home.import_account("old-label", &secret_hex).unwrap();
     std::fs::remove_dir_all(home.account_dir(&original.label)).unwrap();
@@ -607,8 +613,8 @@ fn account_home_idempotent_import_recovers_orphaned_keychain_credential() {
 fn account_home_runtime_import_does_not_capture_mismatched_keychain_credential() {
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
-    let requested_keys = nostr::Keys::generate();
-    let unrelated_keys = nostr::Keys::generate();
+    let requested_keys = nostr::prelude::Keys::generate();
+    let unrelated_keys = nostr::prelude::Keys::generate();
     let account_id = requested_keys.public_key().to_hex();
     let account = AccountSummary {
         label: account_id.clone(),
@@ -637,7 +643,7 @@ fn account_home_runtime_import_does_not_capture_mismatched_keychain_credential()
 fn runtime_import_resumes_only_while_durable_setup_is_incomplete() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let secret = keys.secret_key().to_secret_hex();
 
     let first = home.import_nostr_account_idempotent(&secret).unwrap();
@@ -662,7 +668,7 @@ fn account_home_keychain_keeps_signing_secret_when_public_twin_record_is_removed
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open_with_keychain(dir.path(), "com.marmot.test.public-twin").unwrap();
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let account_id = keys.public_key().to_hex();
     let secret_hex = keys.secret_key().to_secret_hex();
 
@@ -690,7 +696,7 @@ fn account_home_keychain_keeps_public_twin_when_signing_record_is_removed_first(
     let dir = tempfile::tempdir().unwrap();
     let home =
         AccountHome::open_with_keychain(dir.path(), "com.marmot.test.public-twin-reverse").unwrap();
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let account_id = keys.public_key().to_hex();
     let secret_hex = keys.secret_key().to_secret_hex();
 
@@ -715,7 +721,7 @@ fn account_home_keychain_keeps_shared_credential_for_surviving_signing_record() 
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open_with_keychain(dir.path(), "com.marmot.test.legacy-twin").unwrap();
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let account_id = keys.public_key().to_hex();
 
     home.import_account("label-one", &keys.secret_key().to_secret_hex())
@@ -753,7 +759,7 @@ fn account_home_keychain_keeps_shared_credential_for_surviving_signing_record() 
 fn account_home_file_store_keeps_per_label_secrets_for_same_account_id() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let secret_hex = keys.secret_key().to_secret_hex();
 
     // Label-keyed stores hold one secret per label, so the same key may be
@@ -824,7 +830,7 @@ fn account_home_reveal_nsec_round_trips_to_stored_account_id() {
     assert!(revealed.starts_with("nsec1"));
     // The revealed nsec parses back to the same public key as the account id.
     assert_eq!(
-        nostr::Keys::parse(revealed.as_str())
+        nostr::prelude::Keys::parse(revealed.as_str())
             .unwrap()
             .public_key()
             .to_hex(),
@@ -975,7 +981,7 @@ impl AccountSecretStore for MemorySecretStore {
     fn write_secret(
         &self,
         account: &marmot_account::AccountSummary,
-        keys: &nostr::Keys,
+        keys: &nostr::prelude::Keys,
     ) -> AccountHomeResult<()> {
         self.keys
             .lock()
@@ -987,7 +993,7 @@ impl AccountSecretStore for MemorySecretStore {
     fn load_secret(
         &self,
         account: &marmot_account::AccountSummary,
-    ) -> AccountHomeResult<nostr::Keys> {
+    ) -> AccountHomeResult<nostr::prelude::Keys> {
         let secret = self
             .keys
             .lock()
@@ -995,7 +1001,7 @@ impl AccountSecretStore for MemorySecretStore {
             .get(&account.label)
             .unwrap()
             .clone();
-        Ok(nostr::Keys::parse(&secret).unwrap())
+        Ok(nostr::prelude::Keys::parse(&secret).unwrap())
     }
 
     fn remove_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<()> {

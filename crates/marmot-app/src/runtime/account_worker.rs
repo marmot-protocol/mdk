@@ -2,6 +2,7 @@
 //! and the runtime-event publishing helpers the loop drives.
 
 mod attachments;
+mod bounded_recovery;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
@@ -469,6 +470,16 @@ pub(crate) enum AccountWorkerCommand {
     },
     /// Count seeded groups the session has not fully hydrated yet, without
     /// promoting them on demand (mdk#1337 regression probe).
+    /// Controlled-clock fixture; changes no durable row and grants no I/O.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    AdvanceRecoveryClock {
+        elapsed: Duration,
+        respond: oneshot::Sender<()>,
+    },
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    RecoveryRetrySnapshot {
+        respond: oneshot::Sender<(storage_sqlite::RecoveryRetryState, Duration, bool)>,
+    },
     #[cfg(test)]
     UnhydratedGroupCount {
         respond: oneshot::Sender<usize>,
@@ -804,7 +815,7 @@ async fn run_app_runtime_account_worker(
                 barrier.wait().await;
             }
             let summary = client
-                .sync_with_stage_telemetry(&startup_stage_telemetry)
+                .sync_with_stage_telemetry(&startup_stage_telemetry, false)
                 .await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
@@ -938,19 +949,10 @@ async fn run_app_runtime_account_worker(
             )
             .await;
             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
-            let backfill_result = run_pending_epoch_backfill_reporting_arm(
-                &mut client,
-                &events,
-                &account_id_hex,
-                &account_label,
-                &shared,
-                EpochBackfillExecutionSeam::Startup,
-            )
-            .await;
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
             }
-            backfill_result
+            Ok(())
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
@@ -1138,7 +1140,56 @@ async fn run_app_runtime_account_worker(
         });
 
     let mut yield_to_convergence = false;
+    let mut bounded_recovery: Option<bounded_recovery::Job> = None;
+    let mut yield_to_bounded_admission = false;
+    let mut bounded_probe_at = TokioInstant::now();
+    let mut bounded_prepare_error_reported = false;
     'worker: loop {
+        // Activation is deliberately test-only until #1358 supplies and
+        // qualifies the real backend. This is the actual worker dispatch seam:
+        // the grant is captured here, while only the owned request crosses the
+        // network await. The active owner lease prevents legacy overlap.
+        let bounded_enabled = shared
+            .bounded_group_recovery_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if bounded_enabled && bounded_recovery.is_none() && TokioInstant::now() >= bounded_probe_at
+        {
+            let now = TokioInstant::now();
+            bounded_probe_at = now + bounded_recovery::PROBE_INTERVAL;
+            let probe = (|| -> Result<Option<bounded_recovery::Plan>, AppError> {
+                let storage = client.app.account_storage(&client.state.label)?;
+                let remaining = client
+                    .recovery_owner
+                    .retry_remaining(&storage, Instant::now())?;
+                if !remaining.is_zero() {
+                    bounded_probe_at = now + remaining.min(bounded_recovery::PROBE_INTERVAL);
+                    return Ok(None);
+                }
+                #[cfg(test)]
+                shared
+                    .bounded_preparation_probes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance)
+            })();
+            match probe {
+                Ok(Some(plan)) => {
+                    bounded_prepare_error_reported = false;
+                    bounded_recovery = Some(bounded_recovery::Job::start(&client, plan))
+                }
+                Ok(None) => bounded_prepare_error_reported = false,
+                Err(error) => {
+                    if !bounded_prepare_error_reported {
+                        publish_app_runtime_account_error(
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            account_error_message("bounded recovery preparation failed", &error),
+                        );
+                        bounded_prepare_error_reported = true;
+                    }
+                }
+            }
+        }
         let ready_command = ready_command_index(&pending, &media_http);
         tokio::select! {
             biased;
@@ -1147,6 +1198,15 @@ async fn run_app_runtime_account_worker(
             }
             _ = &mut shutdown => {
                 return;
+            }
+            _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
+            completed = async {
+                bounded_recovery.as_mut().expect("bounded task exists").wait().await
+            }, if bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
+                bounded_recovery.as_mut().expect("bounded task exists").accept(completed);
+                #[cfg(test)]
+                shared.bounded_result_ready.notify_one();
+                yield_to_bounded_admission = true;
             }
             recovered = async {
                 let recovery = welcome_recovery
@@ -1201,8 +1261,10 @@ async fn run_app_runtime_account_worker(
                     Some(command) => Some(command),
                     None => commands.recv().await,
                 }
-            }, if !yield_to_convergence || !scheduled_convergence.has_ready() => {
+            }, if (!yield_to_convergence || !scheduled_convergence.has_ready())
+                && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
+                yield_to_bounded_admission = true;
                 match command {
                     Some(command) => {
                         let command = match command {
@@ -1272,8 +1334,10 @@ async fn run_app_runtime_account_worker(
                     None => return,
                 }
             }
-            _ = scheduled_convergence.timer.as_mut() => {
+            _ = scheduled_convergence.timer.as_mut(), if !yield_to_bounded_admission
+                || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
                 yield_to_convergence = false;
+                yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence);
                 // Recovery owns the live client, but member/roster reads can
@@ -1381,7 +1445,58 @@ async fn run_app_runtime_account_worker(
 
                 phase.finish(TelemetryOutcome::Success);
             }
+            _ = async {}, if yield_to_bounded_admission
+                && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)
+                && !bounded_admission_test_paused(&shared, bounded_recovery.as_ref()) => {
+                let job = bounded_recovery.as_mut().expect("bounded admission job exists");
+                for _ in 0..bounded_recovery::MAX_ADMISSION_PER_TURN {
+                    #[cfg(test)]
+                    let had_input = job.has_input();
+                    match job.admit_one(&mut client).await {
+                        Ok(summary) => {
+                            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                            publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
+                            schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                            #[cfg(test)]
+                            if had_input {
+                                shared.bounded_prefix_admitted.notify_one();
+                            }
+                        }
+                        Err(error) => {
+                            publish_app_runtime_account_error(&events, &account_id_hex, &account_label,
+                                account_error_message("bounded recovery admission failed", &error));
+                            // The durable demand and successfully admitted prefix survive.
+                            bounded_recovery = None;
+                            #[cfg(test)]
+                            shared.bounded_recovery_finished.notify_one();
+                            break;
+                        }
+                    }
+                }
+                if bounded_recovery.as_ref().is_some_and(|job| job.ready() && !job.has_input())
+                    && let Some(job) = bounded_recovery.take() {
+                        if let Err(error) = job.finish(&mut client) {
+                            publish_app_runtime_account_error(&events, &account_id_hex, &account_label,
+                                account_error_message("bounded recovery checkpoint failed", &error));
+                        }
+                        #[cfg(test)]
+                        shared.bounded_recovery_finished.notify_one();
+                }
+                yield_to_bounded_admission = false;
+            }
+            _ = async {
+                #[cfg(test)]
+                if shared.bounded_pause_before_admission.load(std::sync::atomic::Ordering::SeqCst)
+                    || shared.bounded_pause_after_first_admission.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                sleep(bounded_recovery::ADMISSION_YIELD_DELAY).await;
+            }, if !yield_to_bounded_admission
+                && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
+                yield_to_bounded_admission = true;
+            }
             received = client.receive_next_delivery() => {
+                yield_to_bounded_admission = true;
                 // Only the transport wait participates in `select!`. Once a
                 // delivery has been claimed, finish ingest + incidental
                 // publish + projection as one uncancelled worker operation;
@@ -1802,7 +1917,7 @@ async fn run_app_runtime_account_worker(
                         crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
                     );
                     let catch_up = timeout(
-                        Duration::from_secs(15), client.sync_with_partial_progress(),
+                        Duration::from_secs(15), client.sync_automatically_with_partial_progress(),
                     ).await;
                     let outcome = match &catch_up {
                         Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
@@ -2000,7 +2115,7 @@ async fn handle_account_worker_catch_up(
     let sync_started_at = Instant::now();
     let stage_telemetry = context.shared.app_performance_telemetry();
     let sync_result = {
-        let mut sync = std::pin::pin!(client.sync_with_stage_telemetry(&stage_telemetry));
+        let mut sync = std::pin::pin!(client.sync_with_stage_telemetry(&stage_telemetry, true));
         loop {
             let command = if let Some(command) = pending.pop_front() {
                 Some(command)
@@ -2118,19 +2233,10 @@ async fn handle_account_worker_catch_up(
                 context.account_label,
             )
             .await;
-            let backfill_result = run_pending_epoch_backfill_reporting_arm(
-                client,
-                context.events,
-                context.account_id_hex,
-                context.account_label,
-                context.shared,
-                EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await;
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 context.shared.schedule_audit_log_tracker_update("catch_up");
             }
-            backfill_result
+            Ok(())
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
@@ -2610,6 +2716,15 @@ async fn handle_startup_hydration_command(
                     .retry_pending_push_registration_shares_best_effort()
                     .await;
             }
+        }
+        #[cfg(any(test, feature = "test-policy-overrides"))]
+        AccountWorkerCommand::RecoveryRetrySnapshot { respond } => {
+            let storage = client.app.account_storage(&client.state.label).unwrap();
+            let _ = respond.send((
+                storage.recovery_retry_state().unwrap(),
+                client.recovery_owner.test_retry_remaining(&storage),
+                storage.recovery_comparison().unwrap().pending(),
+            ));
         }
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => {
@@ -3245,6 +3360,22 @@ fn account_worker_command_future<'a>(
             );
             false
         }),
+        #[cfg(any(test, feature = "test-policy-overrides"))]
+        AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond } => Box::pin(async move {
+            client.recovery_owner.test_advance_clock(elapsed);
+            let _ = respond.send(());
+            true
+        }),
+        #[cfg(any(test, feature = "test-policy-overrides"))]
+        AccountWorkerCommand::RecoveryRetrySnapshot { respond } => Box::pin(async move {
+            let storage = client.app.account_storage(&client.state.label).unwrap();
+            let _ = respond.send((
+                storage.recovery_retry_state().unwrap(),
+                client.recovery_owner.test_retry_remaining(&storage),
+                storage.recovery_comparison().unwrap().pending(),
+            ));
+            true
+        }),
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => Box::pin(async move {
             let count = client.runtime.session().unhydrated_group_ids().len();
@@ -3262,19 +3393,10 @@ fn account_worker_command_future<'a>(
                         account_id_hex,
                         account_label,
                     );
-                    let backfill_result = run_pending_epoch_backfill_reporting_arm(
-                        client,
-                        events,
-                        account_id_hex,
-                        account_label,
-                        shared,
-                        EpochBackfillExecutionSeam::ExplicitCatchUp,
-                    )
-                    .await;
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("catch_up");
                     }
-                    backfill_result
+                    Ok(())
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
@@ -3367,10 +3489,7 @@ fn account_worker_command_future<'a>(
                         account_label,
                         message.clone(),
                     );
-                    Err(AccountCatchUpFailure::new(
-                        message,
-                        failure.classification(),
-                    ))
+                    Err(AccountCatchUpFailure::from_sync_failure(message, &failure))
                 }
             };
             shared.app_performance_telemetry().record_classified_result(
@@ -5345,6 +5464,22 @@ async fn start_post_join_history_after_visibility(
     if summary.joined_groups.is_empty() {
         return;
     }
+    // Visibility is already published. Install ordinary live interest now,
+    // independently of the history owner's cooldown. Waiting for the retry
+    // timer leaves a newly joined account unrouted while another local account
+    // can already receive the SDK's single deduplicated copy of a group event.
+    // Failures retain the existing bounded registration-retry intent.
+    if let Err(error) = client
+        .retry_pending_runtime_group_subscription_refresh()
+        .await
+    {
+        publish_app_runtime_account_error(
+            events,
+            account_id_hex,
+            account_label,
+            account_error_message("post-join live subscription refresh failed", &error),
+        );
+    }
     if let Err(error) = client.advance_post_join_maintenance_subscriptions().await {
         publish_app_runtime_account_error(
             events,
@@ -5427,7 +5562,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
             Err(_) => "failure",
         });
     }
-    let mut result = match backfill_result {
+    let result = match backfill_result {
         // An incomplete replay published the same real summary: it ingested
         // whatever it reached before the relays failed to confirm they had
         // served the account's stored history. Its intent stays pending, so the
@@ -5460,43 +5595,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
     if backfill_armed {
         shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
     }
-    // An epoch replay is itself a large relay burst and can discover the
-    // bounded account queue's overflow record. Resolve that distinct durable
-    // gap immediately instead of waiting for unrelated later traffic to wake
-    // another sync seam.
-    if result.is_ok() && client.delivery_overflow_recovery_pending {
-        result = match client.recover_delivery_overflow().await {
-            Ok(
-                DeliveryOverflowRecoveryOutcome::Completed(summary)
-                | DeliveryOverflowRecoveryOutcome::Incomplete(summary),
-            ) => {
-                publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
-                Ok(())
-            }
-            Err(failure) => {
-                publish_app_runtime_summary(
-                    events,
-                    account_id_hex,
-                    account_label,
-                    &failure.partial_summary,
-                );
-                let message = account_error_message(
-                    "account delivery overflow recovery failed",
-                    &failure.source,
-                );
-                publish_app_runtime_account_error(
-                    events,
-                    account_id_hex,
-                    account_label,
-                    message.clone(),
-                );
-                Err(AccountCatchUpFailure::new(
-                    message,
-                    failure.classification(),
-                ))
-            }
-        };
-    }
+
     result
 }
 
@@ -5699,6 +5798,29 @@ fn account_error_message(prefix: &str, err: &AppError) -> String {
     format!("{prefix}: {}", err.privacy_safe_kind())
 }
 
+fn bounded_admission_test_paused(
+    shared: &RuntimeSharedServices,
+    job: Option<&bounded_recovery::Job>,
+) -> bool {
+    #[cfg(test)]
+    {
+        job.is_some_and(|job| {
+            shared
+                .bounded_pause_before_admission
+                .load(std::sync::atomic::Ordering::SeqCst)
+                || (shared
+                    .bounded_pause_after_first_admission
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && job.has_admitted_prefix())
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (shared, job);
+        false
+    }
+}
+
 async fn release_startup_client_if_opened(
     open_client: Pin<&mut impl std::future::Future<Output = Result<AppClient, AppError>>>,
 ) {
@@ -5726,6 +5848,8 @@ fn publish_app_runtime_account_error(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     use marmot_account::AccountHome;
 
@@ -5852,6 +5976,1012 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_known_group_acquisition_wait_keeps_worker_and_live_subscriptions_available() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use storage_sqlite::RecoveryRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime
+            .shared_services()
+            .bounded_group_recovery_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.publish_key_package("bob").await.unwrap();
+        let group = runtime
+            .create_group_with_options(
+                "alice",
+                "bounded",
+                std::slice::from_ref(&bob.account_id_hex),
+                AppCreateGroupOptions {
+                    relays: Some(vec![
+                        "wss://relay.example".into(),
+                        "wss://relay-two.example".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        runtime
+            .accounts()
+            .workers
+            .lock()
+            .await
+            .remove(&bob.account_id_hex)
+            .unwrap()
+            .shutdown()
+            .await;
+        runtime
+            .send_message("alice", &group, b"known but unreceived".to_vec())
+            .await
+            .unwrap();
+        let historical = relay
+            .last_published_group_event()
+            .expect("real group ciphertext was published");
+        let event_id: [u8; 32] = hex::decode(&historical.id).unwrap().try_into().unwrap();
+        let storage = app.account_storage("bob").unwrap();
+        let group_route = match historical.to_transport_message().unwrap().envelope {
+            cgka_traits::transport::TransportEnvelope::GroupMessage { transport_group_id } => {
+                storage_sqlite::TransportReconciliationRoute::Group(
+                    transport_group_id.try_into().unwrap(),
+                )
+            }
+            _ => unreachable!("published event is group ciphertext"),
+        };
+        assert!(
+            !storage
+                .retained_recovery_event(&group_route, &event_id, None, historical.created_at)
+                .unwrap(),
+            "the controlled SDK has seen this ID, but MDK has not retained it"
+        );
+        runtime.reconcile_accounts().await.unwrap();
+        storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &event_id,
+                },
+                crate::client::recovery::wall_now_ms().unwrap(),
+            )
+            .unwrap();
+        *relay.acquisition_result.lock().unwrap() =
+            Some(transport_nostr_adapter::NostrAcquisitionResult {
+                endpoints:
+                    ["wss://relay.example", "wss://relay-two.example"]
+                        .into_iter()
+                        .map(
+                            |endpoint| {
+                                transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint: cgka_traits::TransportEndpoint(endpoint.into()),
+                    session_generation: Some(1),
+                    events: vec![historical.clone()],
+                    end: transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
+                    stats: Default::default(),
+                }
+                            },
+                        )
+                        .collect(),
+            });
+        relay
+            .acquisition_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let commands = runtime.accounts().worker_commands("bob").await.unwrap();
+        let (respond, advanced) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::AdvanceRecoveryClock {
+                elapsed: Duration::from_secs(600),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), advanced)
+            .await
+            .unwrap()
+            .unwrap();
+        let (respond, response) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), relay.acquisition_entered.notified())
+            .await
+            .expect("owner-authorized acquisition starts");
+        let subscriptions = relay.subscription_count();
+        timeout(
+            Duration::from_secs(5),
+            runtime.send_message("bob", &group, b"live while history waits".to_vec()),
+        )
+        .await
+        .expect("queued send must not wait for EOSE")
+        .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if app.messages("alice").unwrap().iter().any(|message| {
+                    message.group_id_hex == hex::encode(&group)
+                        && message.plaintext == "live while history waits"
+                }) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live projection continues while history waits");
+        runtime
+            .send_message("alice", &group, b"incoming while history waits".to_vec())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if app.messages("bob").unwrap().iter().any(|message| {
+                    message.group_id_hex == hex::encode(&group)
+                        && message.plaintext == "incoming while history waits"
+                }) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("acquiring account projects live input while history waits");
+        let bob_commands = runtime.accounts().worker_commands("alice").await.unwrap();
+        let (respond, response) = oneshot::channel();
+        bob_commands
+            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .unwrap();
+        timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            relay.subscription_count(),
+            subscriptions,
+            "bounded history does not rebuild live interests"
+        );
+        assert_eq!(
+            relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.known_event_id == Some(event_id))
+        );
+        relay.acquisition_release.notify_one();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .all(|demand| demand.known_event_id != Some(event_id))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("known event becomes durably disposed after duplicate copies");
+        assert!(
+            storage
+                .retained_recovery_event(&group_route, &event_id, None, historical.created_at)
+                .unwrap()
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_three_relay_scope_leaves_legacy_attempt_eligible() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use storage_sqlite::RecoveryRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.publish_key_package("bob").await.unwrap();
+        let group = runtime
+            .create_group_with_options(
+                "alice",
+                "three relays",
+                std::slice::from_ref(&bob.account_id_hex),
+                AppCreateGroupOptions {
+                    relays: Some(vec![
+                        "wss://relay.example".into(),
+                        "wss://relay-two.example".into(),
+                        "wss://relay-three.example".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        runtime
+            .accounts()
+            .workers
+            .lock()
+            .await
+            .remove(&bob.account_id_hex)
+            .unwrap()
+            .shutdown()
+            .await;
+        runtime
+            .send_message("alice", &group, b"known but unreceived".to_vec())
+            .await
+            .unwrap();
+        let historical = relay.last_published_group_event().unwrap();
+        let event_id: [u8; 32] = hex::decode(&historical.id).unwrap().try_into().unwrap();
+        let storage = app.account_storage("bob").unwrap();
+        storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &event_id,
+                },
+                crate::client::recovery::wall_now_ms().unwrap(),
+            )
+            .unwrap();
+        let mut client = app.client("bob").await.unwrap();
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let before = storage.recovery_retry_state().unwrap();
+        assert!(
+            bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance)
+                .unwrap()
+                .is_none()
+        );
+        let after = storage.recovery_retry_state().unwrap();
+        assert_eq!(after.attempt_serial, before.attempt_serial);
+        assert_eq!(after.not_before_ms, before.not_before_ms);
+        assert_eq!(
+            relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let grant = client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .expect("legacy executor remains eligible for the full route");
+        assert!(grant.plan().unwrap().iter().any(|obligation| {
+            obligation.scopes.iter().any(|scope| {
+                scope.goal.known_event_id == Some(event_id)
+                    && scope.goal.required_endpoints.len() == 3
+            })
+        }));
+        drop(grant);
+        drop(client);
+        runtime.shutdown().await;
+    }
+
+    struct BoundedKnownFixture {
+        _dir: tempfile::TempDir,
+        app: MarmotApp,
+        runtime: super::super::MarmotAppRuntime,
+        relay: Arc<ScriptedPushRelayClient>,
+        group: GroupId,
+        historical: transport_nostr_peeler::NostrTransportEvent,
+        event_id: [u8; 32],
+        route: storage_sqlite::TransportReconciliationRoute,
+        demand_id: [u8; 16],
+    }
+
+    async fn bounded_known_fixture() -> BoundedKnownFixture {
+        bounded_known_fixture_with_delay(None).await
+    }
+
+    async fn bounded_known_fixture_with_delay(delay_ms: Option<u64>) -> BoundedKnownFixture {
+        use storage_sqlite::RecoveryRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut config = crate::MarmotAppConfig::default();
+        if let Some(delay_ms) = delay_ms {
+            config = config
+                .with_dev_settlement_quiescence_ms(100)
+                .with_dev_scheduled_convergence_delay_ms(delay_ms);
+        }
+        let app = MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example", config)
+            .with_test_relay_client(relay.clone());
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime
+            .shared_services()
+            .bounded_group_recovery_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.publish_key_package("bob").await.unwrap();
+        let group = runtime
+            .create_group_with_options(
+                "alice",
+                "bounded fixture",
+                std::slice::from_ref(&bob.account_id_hex),
+                AppCreateGroupOptions {
+                    relays: Some(vec![
+                        "wss://relay.example".into(),
+                        "wss://relay-two.example".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        runtime
+            .accounts()
+            .workers
+            .lock()
+            .await
+            .remove(&bob.account_id_hex)
+            .unwrap()
+            .shutdown()
+            .await;
+        runtime
+            .send_message("alice", &group, b"known but unreceived".to_vec())
+            .await
+            .unwrap();
+        let historical = relay.last_published_group_event().unwrap();
+        let event_id: [u8; 32] = hex::decode(&historical.id).unwrap().try_into().unwrap();
+        let storage = app.account_storage("bob").unwrap();
+        let route = match historical.to_transport_message().unwrap().envelope {
+            cgka_traits::transport::TransportEnvelope::GroupMessage { transport_group_id } => {
+                storage_sqlite::TransportReconciliationRoute::Group(
+                    transport_group_id.try_into().unwrap(),
+                )
+            }
+            _ => unreachable!(),
+        };
+        runtime.reconcile_accounts().await.unwrap();
+        let demand_id = storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &event_id,
+                },
+                crate::client::recovery::wall_now_ms().unwrap(),
+            )
+            .unwrap()
+            .id;
+        BoundedKnownFixture {
+            _dir: dir,
+            app,
+            runtime,
+            relay,
+            group,
+            historical,
+            event_id,
+            route,
+            demand_id,
+        }
+    }
+
+    async fn advance_bounded_fixture_clock(fixture: &BoundedKnownFixture) {
+        let commands = fixture
+            .runtime
+            .accounts()
+            .worker_commands("bob")
+            .await
+            .unwrap();
+        let (respond, advanced) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::AdvanceRecoveryClock {
+                elapsed: Duration::from_secs(600),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), advanced)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn wake_bounded_fixture(fixture: &BoundedKnownFixture) {
+        advance_bounded_fixture_clock(fixture).await;
+        let commands = fixture
+            .runtime
+            .accounts()
+            .worker_commands("bob")
+            .await
+            .unwrap();
+        let (respond, response) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: fixture.group.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    fn controlled_bounded_result(
+        left: Vec<transport_nostr_peeler::NostrTransportEvent>,
+        left_end: transport_nostr_adapter::NostrAcquisitionEnd,
+        right: Vec<transport_nostr_peeler::NostrTransportEvent>,
+        right_end: transport_nostr_adapter::NostrAcquisitionEnd,
+    ) -> transport_nostr_adapter::NostrAcquisitionResult {
+        transport_nostr_adapter::NostrAcquisitionResult {
+            endpoints: [
+                ("wss://relay.example", left, left_end),
+                ("wss://relay-two.example", right, right_end),
+            ]
+            .into_iter()
+            .map(
+                |(endpoint, events, end)| transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint: cgka_traits::TransportEndpoint(endpoint.into()),
+                    session_generation: Some(1),
+                    events,
+                    end,
+                    stats: Default::default(),
+                },
+            )
+            .collect::<Vec<_>>(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_saturation_preserves_demand_then_partial_result_admits_known_event() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use storage_sqlite::RecoveryScopeOutcome;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        let fixture = bounded_known_fixture().await;
+        let storage = fixture.app.account_storage("bob").unwrap();
+        *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            vec![fixture.historical.clone(); bounded_recovery::MAX_EVENTS_PER_ENDPOINT + 1],
+            NostrAcquisitionEnd::ItemLimitReached,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        fixture
+            .relay
+            .acquisition_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        wake_bounded_fixture(&fixture).await;
+        timeout(
+            Duration::from_secs(5),
+            fixture.relay.acquisition_entered.notified(),
+        )
+        .await
+        .unwrap();
+        fixture.relay.acquisition_release.notify_one();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if storage
+                    .recovery_scope_snapshots(fixture.demand_id)
+                    .unwrap()
+                    .iter()
+                    .any(|scope| {
+                        scope
+                            .checkpoints
+                            .iter()
+                            .any(|checkpoint| checkpoint.outcome == RecoveryScopeOutcome::Unknown)
+                    })
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("saturated response checkpoints without admission");
+        assert!(
+            !storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+        let probes = fixture
+            .runtime
+            .shared_services()
+            .bounded_preparation_probes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let retry = storage.recovery_retry_state().unwrap();
+        let commands = fixture
+            .runtime
+            .accounts()
+            .worker_commands("bob")
+            .await
+            .unwrap();
+        for _ in 0..24 {
+            let (respond, response) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                    group_id: fixture.group.clone(),
+                    respond,
+                })
+                .unwrap();
+            timeout(Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            fixture
+                .runtime
+                .shared_services()
+                .bounded_preparation_probes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            probes,
+            "live command bursts do not re-run bounded preparation during owner cooldown"
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+
+        fixture.runtime.shutdown().await;
+
+        let partial = bounded_known_fixture().await;
+        let partial_storage = partial.app.account_storage("bob").unwrap();
+        *partial.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            vec![partial.historical.clone()],
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        wake_bounded_fixture(&partial).await;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if partial_storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .all(|demand| demand.ticket.id != partial.demand_id)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("partial relay result retains exact known event");
+        assert!(
+            partial_storage
+                .retained_recovery_event(
+                    &partial.route,
+                    &partial.event_id,
+                    None,
+                    partial.historical.created_at
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            partial
+                .relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        partial.runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_stale_loss_and_route_results_cannot_clear_known_demand() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        for new_loss in [true, false] {
+            let fixture = bounded_known_fixture().await;
+            let storage = fixture.app.account_storage("bob").unwrap();
+            let before = storage.recovery_revision_fence().unwrap();
+            *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+                vec![fixture.historical.clone()],
+                NostrAcquisitionEnd::RequestPolicySatisfied,
+                Vec::new(),
+                NostrAcquisitionEnd::Deadline,
+            ));
+            fixture
+                .relay
+                .acquisition_block
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            wake_bounded_fixture(&fixture).await;
+            timeout(
+                Duration::from_secs(5),
+                fixture.relay.acquisition_entered.notified(),
+            )
+            .await
+            .unwrap();
+            if new_loss {
+                storage
+                    .record_account_delivery_loss("bob", 777, 1, crate::unix_now_seconds())
+                    .unwrap();
+                storage.synchronize_account_delivery_loss("bob").unwrap();
+            } else {
+                storage.observe_recovery_route_snapshot([0xAA; 32]).unwrap();
+            }
+            let changed = storage.recovery_revision_fence().unwrap();
+            assert!(if new_loss {
+                changed.loss_revision > before.loss_revision
+            } else {
+                changed.route_revision > before.route_revision
+            });
+            fixture.relay.acquisition_release.notify_one();
+            timeout(
+                Duration::from_secs(5),
+                fixture
+                    .runtime
+                    .shared_services()
+                    .bounded_recovery_finished
+                    .notified(),
+            )
+            .await
+            .expect("stale result finishes without admission");
+            assert!(
+                !storage
+                    .retained_recovery_event(
+                        &fixture.route,
+                        &fixture.event_id,
+                        None,
+                        fixture.historical.created_at,
+                    )
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .any(|demand| demand.ticket.id == fixture.demand_id)
+            );
+            fixture.runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_after_durable_prefix_preserves_pending_demand_on_reopen() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        let fixture = bounded_known_fixture().await;
+        fixture
+            .runtime
+            .shared_services()
+            .bounded_pause_after_first_admission
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            vec![fixture.historical.clone(), fixture.historical.clone()],
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        wake_bounded_fixture(&fixture).await;
+        timeout(
+            Duration::from_secs(5),
+            fixture
+                .runtime
+                .shared_services()
+                .bounded_prefix_admitted
+                .notified(),
+        )
+        .await
+        .expect("first input is durably admitted before the next worker turn");
+        let storage = fixture.app.account_storage("bob").unwrap();
+        assert!(
+            storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id),
+            "an uncheckpointed exact ID remains retryable after its durable prefix"
+        );
+        fixture.runtime.shutdown().await;
+        assert_eq!(
+            bounded_recovery::available_credits(),
+            bounded_recovery::MAX_CONCURRENT_JOBS
+        );
+        drop(storage);
+
+        let reopened = MarmotApp::with_relay(fixture._dir.path(), "wss://relay.example")
+            .with_test_relay_client(fixture.relay.clone());
+        let reopened_storage = reopened.account_storage("bob").unwrap();
+        assert!(
+            reopened_storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            reopened_storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_before_admission_reopens_unretained_demand() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        let fixture = bounded_known_fixture().await;
+        fixture
+            .runtime
+            .shared_services()
+            .bounded_pause_before_admission
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            vec![fixture.historical.clone()],
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        advance_bounded_fixture_clock(&fixture).await;
+        timeout(
+            Duration::from_secs(5),
+            fixture
+                .runtime
+                .shared_services()
+                .bounded_result_ready
+                .notified(),
+        )
+        .await
+        .expect("network result is owned but admission is paused");
+        let storage = fixture.app.account_storage("bob").unwrap();
+        let attempt = storage.recovery_retry_state().unwrap().attempt_serial;
+        assert!(
+            !storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+        fixture.runtime.shutdown().await;
+        assert_eq!(
+            bounded_recovery::available_credits(),
+            bounded_recovery::MAX_CONCURRENT_JOBS
+        );
+        drop(storage);
+
+        let reopened = MarmotApp::with_relay(fixture._dir.path(), "wss://relay.example")
+            .with_test_relay_client(fixture.relay.clone());
+        let reopened_storage = reopened.account_storage("bob").unwrap();
+        assert_eq!(
+            reopened_storage
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            attempt
+        );
+        assert!(
+            !reopened_storage
+                .retained_recovery_event(
+                    &fixture.route,
+                    &fixture.event_id,
+                    None,
+                    fixture.historical.created_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            reopened_storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == fixture.demand_id)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-policy-overrides")]
+    async fn retained_multi_epoch_backlog_advances_while_bounded_history_waits() {
+        let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+        use cgka_traits::storage::ConvergencePassStorage;
+        use transport_nostr_adapter::NostrAcquisitionEnd;
+        let fixture = bounded_known_fixture_with_delay(Some(60_000)).await;
+        let storage = fixture.app.account_storage("bob").unwrap();
+        let initial_epoch = fixture
+            .runtime
+            .group_mls_state("bob", &fixture.group)
+            .await
+            .unwrap()
+            .epoch;
+        fixture
+            .runtime
+            .update_group_profile("alice", &fixture.group, Some("epoch one".into()), None)
+            .await
+            .unwrap();
+        let first = fixture.relay.last_published_group_event().unwrap();
+        fixture
+            .runtime
+            .update_group_profile("alice", &fixture.group, Some("epoch two".into()), None)
+            .await
+            .unwrap();
+        let second = fixture.relay.last_published_group_event().unwrap();
+        assert_ne!(first.id, second.id);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let retained = [&first, &second].into_iter().all(|event| {
+                    let id: [u8; 32] = hex::decode(&event.id).unwrap().try_into().unwrap();
+                    storage
+                        .retained_recovery_event(&fixture.route, &id, None, event.created_at)
+                        .unwrap()
+                });
+                if retained && storage.convergence_pass(&fixture.group).unwrap().is_some() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("two epoch inputs are retained before acquisition begins");
+        let alice_tip = fixture
+            .runtime
+            .group_mls_state("alice", &fixture.group)
+            .await
+            .unwrap()
+            .epoch;
+        assert!(alice_tip >= initial_epoch + 2);
+        assert!(
+            fixture
+                .runtime
+                .group_mls_state("bob", &fixture.group)
+                .await
+                .unwrap()
+                .epoch
+                < alice_tip
+        );
+        *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+            Vec::new(),
+            NostrAcquisitionEnd::Deadline,
+        ));
+        fixture
+            .relay
+            .acquisition_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        wake_bounded_fixture(&fixture).await;
+        timeout(
+            Duration::from_secs(5),
+            fixture.relay.acquisition_entered.notified(),
+        )
+        .await
+        .unwrap();
+        let retry = storage.recovery_retry_state().unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if fixture
+                    .runtime
+                    .group_mls_state("bob", &fixture.group)
+                    .await
+                    .unwrap()
+                    .epoch
+                    > initial_epoch
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first retained epoch advances without a recovery retry");
+        // The next durable pass starts at the new engine epoch and needs its
+        // own 100 ms local settlement window before the scheduled wake.
+        sleep(Duration::from_millis(150)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        let converged = timeout(Duration::from_secs(30), async {
+            loop {
+                let epoch = fixture
+                    .runtime
+                    .group_mls_state("bob", &fixture.group)
+                    .await
+                    .unwrap()
+                    .epoch;
+                let profile = fixture
+                    .app
+                    .group("bob", &hex::encode(&fixture.group))
+                    .unwrap()
+                    .unwrap()
+                    .profile
+                    .name;
+                if epoch >= alice_tip && profile == "epoch two" {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            converged.is_ok(),
+            "retained backlog stalled: bob_epoch={}, alice_epoch={}, bob_profile={}, pass={}",
+            fixture
+                .runtime
+                .group_mls_state("bob", &fixture.group)
+                .await
+                .unwrap()
+                .epoch,
+            alice_tip,
+            fixture
+                .app
+                .group("bob", &hex::encode(&fixture.group))
+                .unwrap()
+                .unwrap()
+                .profile
+                .name,
+            storage.convergence_pass(&fixture.group).unwrap().is_some()
+        );
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            retry.attempt_serial
+        );
+        assert_eq!(
+            fixture
+                .relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        fixture.relay.acquisition_release.notify_one();
+        fixture.runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     #[cfg(feature = "test-policy-overrides")]
     async fn due_convergence_interleaves_with_a_backlog_of_worker_commands() {
         let dir = tempfile::tempdir().unwrap();
@@ -5864,9 +6994,10 @@ mod tests {
             "wss://relay.example",
             crate::MarmotAppConfig::default()
                 .with_dev_settlement_quiescence_ms(100)
-                .with_dev_scheduled_convergence_delay_ms(60_000),
+                .with_dev_scheduled_convergence_delay_ms(60_000)
+                .with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
-        .with_test_relay_client(relay);
+        .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
         runtime.reconcile_accounts().await.unwrap();
@@ -5926,6 +7057,13 @@ mod tests {
             .unwrap()
             .shutdown()
             .await;
+        // Lost history remains independent of the runnable local passes. The
+        // account already owes the cooldown reserved by catch-up.
+        let retry = storage.recovery_retry_state().unwrap();
+        let activations = relay.subscription_count();
+        storage
+            .record_account_delivery_loss("bob", 771, 1, crate::unix_now_seconds())
+            .unwrap();
         let first_pass = Arc::new(tokio::sync::Barrier::new(2));
         runtime
             .shared_services()
@@ -5984,6 +7122,23 @@ mod tests {
         })
         .await
         .expect("recovery must not starve the queued commands");
+        assert_eq!(
+            storage.recovery_retry_state().unwrap(),
+            retry,
+            "both actual scheduled convergence passes preserve history retry cost"
+        );
+        assert_eq!(
+            relay.subscription_count(),
+            activations,
+            "post-convergence and maintenance cannot bypass the owner cooldown"
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|d| d.cause == storage_sqlite::RecoveryCause::QueueLoss)
+        );
         runtime.drain_in_flight_work().await.unwrap();
         runtime.shutdown_and_close().await.unwrap();
     }
@@ -6016,9 +7171,18 @@ mod tests {
                 .observe_resource_refusal(group_id.clone(), epoch, 1),
             BackfillDecision::Arm
         );
-        for _ in 0..3 {
-            let _ = client.epoch_stall.observe_fruitless_completion([&group_id]);
-        }
+        // This test exercises notification delivery from a durable warning,
+        // not qualification. Actual evidence counting is covered by the
+        // qualified local-evaluation and storage certificate tests.
+        client.epoch_stall.restore_wedge_evidence([(
+            group_id.clone(),
+            crate::client::epoch_stall::EpochStallEvidence {
+                stalled_epoch: epoch.0,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: 1,
+            },
+        )]);
         client.persist_epoch_stall_evidence([&group_id]);
         client
             .finish_scheduled_convergence_effects(
@@ -6850,92 +8014,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_epoch_backfill_success_records_correlated_lifecycle_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(AuditLogSettings { enabled: true })
-            .unwrap();
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("successful epoch backfill audit", &[])
+    async fn pending_epoch_backfill_records_correlated_qualified_and_incomplete_attempts() {
+        for qualified in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay_and_config(
+                dir.path(),
+                "wss://relay.example".to_owned(),
+                bounded_epoch_backfill_config(),
+            )
+            .with_test_relay_client(relay.clone());
+            app.set_audit_log_settings(AuditLogSettings { enabled: true })
+                .unwrap();
+            let _eose =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let group_id = client
+                .create_group("successful epoch backfill audit", &[])
+                .await
+                .unwrap();
+            let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+            client.apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            );
+
+            if qualified {
+                client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
+            }
+            let (events, _subscriber) = broadcast::channel(4);
+            let shared = RuntimeSharedServices::default();
+            run_pending_epoch_backfill_reporting_arm(
+                &mut client,
+                &events,
+                "account-id",
+                "alice",
+                &shared,
+                EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
 
-        let (events, _subscriber) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        run_pending_epoch_backfill_reporting_arm(
-            &mut client,
-            &events,
-            "account-id",
-            "alice",
-            &shared,
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
-        )
-        .await
-        .unwrap();
-
-        let rows: Vec<serde_json::Value> = app
-            .audit_log_files()
-            .unwrap()
-            .into_iter()
-            .flat_map(|file| {
-                std::fs::read_to_string(file.path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let attempt_id = rows
-            .iter()
-            .find(|row| row["kind"]["type"] == "epoch_stall_backfill_armed")
-            .and_then(|row| row["context"]["operation_id"].as_str())
-            .expect("armed row must carry operation_id");
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
-                .count(),
-            1
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
-                .count(),
-            1
-        );
-        assert!(
-            rows.iter()
-                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
-                .count()
-                == 0
-        );
-        assert!(rows.iter().all(|row| {
-            !matches!(
-                row["kind"]["type"].as_str(),
-                Some(
-                    "epoch_stall_backfill_started"
-                        | "epoch_stall_backfill_completed"
-                        | "epoch_stall_backfill_failed"
-                )
-            ) || row["context"]["operation_id"].as_str() == Some(attempt_id)
-        }));
+            let rows: Vec<serde_json::Value> = app
+                .audit_log_files()
+                .unwrap()
+                .into_iter()
+                .flat_map(|file| {
+                    std::fs::read_to_string(file.path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let attempt_id = rows
+                .iter()
+                .find(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+                .and_then(|row| row["context"]["operation_id"].as_str())
+                .expect("owner attempt must carry operation_id");
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
+                    .count(),
+                usize::from(qualified)
+            );
+            assert!(
+                rows.iter()
+                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+                    .count()
+                    == usize::from(!qualified)
+            );
+            assert!(rows.iter().all(|row| {
+                !matches!(
+                    row["kind"]["type"].as_str(),
+                    Some(
+                        "epoch_stall_backfill_started"
+                            | "epoch_stall_backfill_completed"
+                            | "epoch_stall_backfill_failed"
+                    )
+                ) || row["context"]["operation_id"].as_str() == Some(attempt_id)
+            }));
+        }
     }
 
     #[tokio::test]
@@ -6948,7 +8118,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
         .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(AuditLogSettings { enabled: true })
@@ -7020,8 +8190,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!client.has_pending_epoch_backfill());
+        assert!(client.has_pending_epoch_backfill());
         let subscriptions_after_replay = relay.subscription_count();
+        let retry = app
+            .account_storage("alice")
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap();
+        assert_eq!(retry.attempt_serial, 2);
 
         run_pending_epoch_backfill_reporting_arm(
             &mut client,
@@ -7029,18 +8205,25 @@ mod tests {
             "account-id",
             "alice",
             &shared,
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
+            EpochBackfillExecutionSeam::Maintenance,
         )
         .await
         .unwrap();
         assert_eq!(relay.subscription_count(), subscriptions_after_replay);
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap(),
+            retry
+        );
     }
 
-    /// Phase-A characterization for #1946. Keep the same workload when the
-    /// recovery owner replaces this seam; then invert the bypass assertions.
+    /// The Phase-A workload: epoch and overflow join one owner reservation;
+    /// a later receive seam cannot bypass the durable account cooldown.
     #[cfg(feature = "test-policy-overrides")]
     #[tokio::test]
-    async fn recovery_ownership_baseline_overflow_bypasses_epoch_cooldown() {
+    async fn recovery_owner_coalesces_overflow_and_epoch_demand_across_seams() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -7075,16 +8258,20 @@ mod tests {
         let (events, _subscriber) = broadcast::channel(16);
         let shared = RuntimeSharedServices::default();
         let before = relay.unfloored_account_subscription_count();
+        client
+            .sync_with_stage_telemetry(&shared.app_performance_telemetry(), false)
+            .await
+            .unwrap();
         for (seam, expected_activations, reason) in [
             (
                 EpochBackfillExecutionSeam::Maintenance,
-                2,
-                "epoch replay chains straight into overflow",
+                1,
+                "startup joined compatible epoch, incremental and overflow demand in one activation",
             ),
             (
                 EpochBackfillExecutionSeam::Receive,
-                3,
-                "overflow runs again while the epoch replay is paced",
+                1,
+                "receive cannot bypass the account owner cooldown",
             ),
         ] {
             run_pending_epoch_backfill_reporting_arm(
@@ -7097,13 +8284,63 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(client.epoch_backfill_retry_is_paced(seam));
+            let retry = app
+                .account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap();
+            assert_eq!(retry.attempt_serial, 1);
+            assert_eq!(retry.not_before_ms - retry.recorded_at_ms, 300_000);
             assert_eq!(
                 relay.unfloored_account_subscription_count() - before,
                 expected_activations,
-                "baseline: {reason}",
+                "{reason}",
             );
         }
+        let retry = app
+            .account_storage("alice")
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap();
+        client
+            .advance_convergence_after_runtime_sync(&group)
+            .await
+            .unwrap();
+        run_pending_epoch_backfill_reporting_arm(
+            &mut client,
+            &events,
+            "account-id",
+            "alice",
+            &shared,
+            EpochBackfillExecutionSeam::Maintenance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap(),
+            retry
+        );
+        assert_eq!(relay.unfloored_account_subscription_count() - before, 1);
+        client
+            .sync_with_classified_partial_progress()
+            .await
+            .unwrap();
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            2
+        );
+        assert_eq!(
+            relay.unfloored_account_subscription_count() - before,
+            2,
+            "one genuine explicit caller spends one override without a nested overflow replay"
+        );
         assert!(client.has_pending_epoch_backfill());
         assert!(client.delivery_overflow_recovery_pending);
         assert_eq!(
@@ -7187,6 +8424,7 @@ mod tests {
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
 
+        let before = relay.unfloored_account_subscription_count();
         let (events, _subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
         let (command_tx, mut commands) = mpsc::channel(1);
@@ -7205,12 +8443,17 @@ mod tests {
 
         response.await.unwrap().unwrap();
         assert!(
-            !client.has_pending_epoch_backfill(),
-            "catch-up must consume the replay intent before sending success",
+            client.has_pending_epoch_backfill(),
+            "ordinary catch-up cannot certify complete historical coverage",
         );
-        assert!(
-            relay.subscription_count() >= 2,
-            "catch-up must perform its floored sync and the pending unfloored replay",
+        assert_eq!(relay.unfloored_account_subscription_count(), before + 1);
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            1
         );
         drop(command_tx);
     }
@@ -7236,15 +8479,16 @@ mod tests {
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        client
-            .pending_epoch_backfill
-            .as_mut()
-            .expect("backfill must be armed")
-            .groups
-            .insert(
-                test_group_id(0xde),
-                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
-            );
+        let storage = app.account_storage("alice").unwrap();
+        let mut orphan = client.runtime.group_record(&group_id).unwrap();
+        orphan.id = test_group_id(0xde);
+        cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
+        storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(orphan.id.as_slice()),
+                stalled_epoch: 1,
+            }])
+            .unwrap();
         let subscriptions_before = relay.subscription_count();
 
         let (events, _subscriber) = broadcast::channel(4);
@@ -7276,7 +8520,7 @@ mod tests {
             "the unavailable recovery intent must remain pending"
         );
         let outcome = client
-            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::ExplicitCatchUp)
+            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
             .await
             .expect("rechecking a deferred intent must not fail");
         assert!(
@@ -7288,73 +8532,96 @@ mod tests {
 
     #[tokio::test]
     async fn full_history_repair_consumes_prearmed_backfill_without_replaying_twice() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_test_relay_client(relay.clone());
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("full-history epoch backfill", &[])
-            .await
-            .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        let subscriptions_before_repair = relay.subscription_count();
+        for qualified in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay_and_config(
+                dir.path(),
+                "wss://relay.example".to_owned(),
+                bounded_epoch_backfill_config(),
+            )
+            .with_test_relay_client(relay.clone());
+            let _eose =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let group_id = client
+                .create_group("full-history epoch backfill", &[])
+                .await
+                .unwrap();
+            let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+            client.apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            );
+            if qualified {
+                client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
+            }
+            let subscriptions_before_repair = relay.subscription_count();
 
-        let (events, _subscriber) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        let (respond, response) = oneshot::channel();
-        let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
-        let (media_http_worker_lifetime, _) = watch::channel(());
-        let media_http = MediaHttpContext {
-            product: Default::default(),
-            tx: media_http_tx,
-            permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
-            prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
-            worker_lifetime: media_http_worker_lifetime,
-        };
-        let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
-        let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
-        handle_account_worker_command(
-            &mut client,
-            AccountWorkerCommand::RepairFullHistory { respond },
-            AccountWorkerCommandContext {
-                commands: &mut unused_commands,
-                pending: &mut unused_pending,
-                app: &app,
-                events: &events,
-                account_id_hex: "account-id",
-                account_label: "alice",
-                shared: &shared,
-                media_http: &media_http,
-                scheduled_convergence: &mut scheduled_convergence,
-            },
-        )
-        .await;
+            let (events, _subscriber) = broadcast::channel(4);
+            let shared = RuntimeSharedServices::default();
+            let (respond, response) = oneshot::channel();
+            let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
+            let (media_http_worker_lifetime, _) = watch::channel(());
+            let media_http = MediaHttpContext {
+                product: Default::default(),
+                tx: media_http_tx,
+                permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+                prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                worker_lifetime: media_http_worker_lifetime,
+            };
+            let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
+            let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
+            handle_account_worker_command(
+                &mut client,
+                AccountWorkerCommand::RepairFullHistory { respond },
+                AccountWorkerCommandContext {
+                    commands: &mut unused_commands,
+                    pending: &mut unused_pending,
+                    app: &app,
+                    events: &events,
+                    account_id_hex: "account-id",
+                    account_label: "alice",
+                    shared: &shared,
+                    media_http: &media_http,
+                    scheduled_convergence: &mut scheduled_convergence,
+                },
+            )
+            .await;
 
-        response.await.unwrap().unwrap();
-        assert!(
-            !client.has_pending_epoch_backfill(),
-            "every successful sync seam must consume an armed replay intent",
-        );
-        assert_eq!(
-            relay.subscription_count(),
-            subscriptions_before_repair + 2,
-            "the explicit unfloored repair already fulfills the pending replay",
-        );
+            let result = response.await.unwrap();
+            if qualified {
+                result.unwrap();
+                assert!(!client.has_pending_epoch_backfill());
+            } else {
+                let failure = result.unwrap_err();
+                assert!(
+                    failure
+                        .to_string()
+                        .contains("full_history_coverage_unproven"),
+                    "{failure}"
+                );
+                assert!(client.has_pending_epoch_backfill());
+            }
+            assert_eq!(
+                app.account_storage("alice")
+                    .unwrap()
+                    .recovery_retry_state()
+                    .unwrap()
+                    .attempt_serial,
+                1
+            );
+            assert_eq!(
+                relay.subscription_count(),
+                subscriptions_before_repair + 2,
+                "one activation serves the coalesced demands without a second replay",
+            );
+        }
     }
 
     #[tokio::test]
@@ -7394,17 +8661,17 @@ mod tests {
         client
             .repair_full_history()
             .await
-            .expect("both EOSE-confirmed recovery obligations must complete");
+            .expect_err("EOSE alone cannot complete either recovery predicate");
 
-        assert!(!client.has_pending_epoch_backfill());
-        assert!(!client.delivery_overflow_recovery_pending);
+        assert!(client.has_pending_epoch_backfill());
+        assert!(client.delivery_overflow_recovery_pending);
         assert!(
             app.account_storage("alice")
                 .unwrap()
                 .account_delivery_recovery("alice")
                 .unwrap()
-                .is_none(),
-            "success must clear the durable overflow marker",
+                .is_some(),
+            "unproven coverage must preserve the durable overflow marker",
         );
     }
 
@@ -7440,11 +8707,23 @@ mod tests {
             SyncFailureStage::RelayReceive
         );
         assert!(
-            failure
-                .source
-                .to_string()
-                .contains("account_delivery_queue_overflow"),
+            failure.source.privacy_safe_kind() == "account_delivery_queue_overflow",
             "the public failure must identify the unresolved durable gap",
+        );
+        assert!(
+            matches!(
+                failure.source,
+                AppError::FullHistoryRepairIncomplete {
+                    reason,
+                    delivery_loss_pending: true,
+                } if reason == if cfg!(feature = "test-policy-overrides") {
+                    crate::FullHistoryRepairIncompleteReason::NoRelayEose
+                } else {
+                    crate::FullHistoryRepairIncompleteReason::Deadline
+                }
+            ),
+            "the stop reason and independent loss fact must both survive: {:?}",
+            failure.source
         );
         assert!(
             client.delivery_overflow_recovery_pending,
@@ -7486,21 +8765,22 @@ mod tests {
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        client
-            .pending_epoch_backfill
-            .as_mut()
-            .expect("backfill must be armed")
-            .groups
-            .insert(
-                test_group_id(0xde),
-                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
-            );
+        let storage = app.account_storage("alice").unwrap();
+        let mut orphan = client.runtime.group_record(&group_id).unwrap();
+        orphan.id = test_group_id(0xde);
+        cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
+        storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(orphan.id.as_slice()),
+                stalled_epoch: 1,
+            }])
+            .unwrap();
         let subscriptions_before = relay.subscription_count();
 
         client
             .repair_full_history()
             .await
-            .expect("explicit repair must fall back to its ordinary unfloored replay");
+            .expect_err("one owner attempt retains unproven and unresolved history");
 
         assert_eq!(
             relay.subscription_count(),
@@ -7514,7 +8794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_history_repair_runs_queued_intent_after_primary_defers() {
+    async fn full_history_repair_coalesces_new_demand_after_an_inflight_failure() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -7522,79 +8802,58 @@ mod tests {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
-            "wss://relay.example".to_owned(),
+            "wss://relay.example",
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_a = client.create_group("queued repair a", &[]).await.unwrap();
-        let group_b = client.create_group("queued repair b", &[]).await.unwrap();
-
-        let stalled_epoch_a = client.group_mls_state(&group_a).unwrap().epoch;
+        let group_a = client.create_group("demand a", &[]).await.unwrap();
+        let group_b = client.create_group("demand b", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
         client.apply_backfill_decision(
             &group_a,
-            stalled_epoch_a,
+            client.group_mls_state(&group_a).unwrap().epoch,
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        let execution = client
-            .begin_epoch_backfill_execution(EpochBackfillExecutionSeam::Maintenance)
-            .expect("first intent must begin");
-        let operation_a = execution.pending.attempt_id.clone();
-
-        let stalled_epoch_b = client.group_mls_state(&group_b).unwrap().epoch;
+        let grant = client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
         client.apply_backfill_decision(
             &group_b,
-            stalled_epoch_b,
+            client.group_mls_state(&group_b).unwrap().epoch,
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        let operation_b = client
-            .pending_epoch_backfill
-            .as_ref()
-            .expect("second intent must arm in flight")
-            .attempt_id
-            .clone();
-        client.test_finish_epoch_backfill_execution(execution, false);
-        client
-            .pending_epoch_backfill
-            .as_mut()
-            .expect("newer intent must be primary")
-            .groups
-            .insert(
-                test_group_id(0xde),
-                crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch: 1 },
-            );
-        let unfloored_before = relay.unfloored_account_subscription_count();
-
-        client
-            .repair_full_history()
-            .await
-            .expect("repair must run the queued observable intent");
-
+        relay.fail_next_subscribe();
+        assert!(
+            client
+                .execute_recovery_grant(grant, None, None)
+                .await
+                .is_err()
+        );
+        let before = relay.unfloored_account_subscription_count();
+        let attempts = storage.recovery_retry_state().unwrap().attempt_serial;
+        assert!(
+            client
+                .repair_full_history()
+                .await
+                .unwrap_err()
+                .source
+                .to_string()
+                .contains("full_history_coverage_unproven")
+        );
+        assert_eq!(relay.unfloored_account_subscription_count(), before + 1);
         assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            unfloored_before + 1,
-            "the queued intent must execute exactly one account-wide replay"
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            attempts + 1
         );
-        assert!(
-            client
-                .queued_epoch_backfills
-                .iter()
-                .any(|pending| pending.attempt_id == operation_b),
-            "the unavailable intent must remain queued"
-        );
-        assert!(
-            client
-                .pending_epoch_backfill
-                .as_ref()
-                .is_none_or(|pending| pending.attempt_id != operation_a)
-                && client
-                    .queued_epoch_backfills
-                    .iter()
-                    .all(|pending| pending.attempt_id != operation_a),
-            "the queued observable intent must be consumed"
+        assert_eq!(
+            storage.pending_epoch_backfill_intents().unwrap().len(),
+            2,
+            "both independent gap predicates remain incomplete after the shared EOSE"
         );
     }
 
@@ -8020,6 +9279,7 @@ mod tests {
             AccountHome::open(dir.path())
                 .create_account("alice")
                 .unwrap();
+            AccountHome::open(dir.path()).create_account("bob").unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
             let app = MarmotApp::with_relay_and_config(
                 dir.path(),
@@ -8028,6 +9288,11 @@ mod tests {
             )
             .with_test_relay_client(relay.clone());
             let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let mut bob = client_on_app_relay_plane(&app, "bob").await;
+            let bob_id = cgka_traits::MemberId::new(
+                hex::decode(app.account_home().account("bob").unwrap().account_id_hex).unwrap(),
+            );
+            let bob_before = relay.inbox_subscription_count(&bob_id);
             let before = relay.subscription_count();
             let (events, _subscriber) = broadcast::channel(4);
             let shared = RuntimeSharedServices::default();
@@ -8080,6 +9345,29 @@ mod tests {
                     response.try_recv(),
                     Err(oneshot::error::TryRecvError::Empty)
                 ));
+                // Another account uses its own worker catch-up path while
+                // Alice's history drain still waits for cancellation. No relay
+                // boundary is supplied to manufacture either completion.
+                let (bob_tx, mut bob_commands) = mpsc::channel(1);
+                let mut bob_pending = VecDeque::new();
+                let (bob_respond, bob_response) = oneshot::channel();
+                handle_account_worker_catch_up(
+                    &mut bob,
+                    bob_respond,
+                    &mut bob_commands,
+                    &mut bob_pending,
+                    AccountWorkerCatchUpContext {
+                        app: &app,
+                        events: &events,
+                        account_id_hex: "bob-id",
+                        account_label: "bob",
+                        shared: &shared,
+                    },
+                )
+                .await;
+                bob_response.await.unwrap().unwrap();
+                assert_eq!(relay.inbox_subscription_count(&bob_id), bob_before + 1);
+                drop(bob_tx);
                 if caller_cancels {
                     drop(response);
                 } else {
@@ -8096,7 +9384,15 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(relay.subscription_count(), before + 1);
+            assert_eq!(relay.subscription_count(), before + 2);
+            assert_eq!(
+                app.account_storage("bob")
+                    .unwrap()
+                    .recovery_retry_state()
+                    .unwrap()
+                    .attempt_serial,
+                1
+            );
         }
     }
 }

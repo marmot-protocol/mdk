@@ -1820,6 +1820,23 @@ async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
     runtime.start().await.unwrap();
     runtime.sign_in_account(&live_account.label).await.unwrap();
     let live_path = runtime.audit_log_files().unwrap()[0].path.clone();
+    // Sign-in returns when commands are available, before startup catch-up.
+    // A quiet file interval during acquisition is not completion: wait for the
+    // real completion signal before sampling the pre-disable body.
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .account_sync
+            .attempts
+            == 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup catch-up completed before testing live audit disable");
     let before_disable_body = wait_for_audit_file_quiesce(&live_path).await;
     let before_toggle = source_events(&live_path);
     assert_eq!(

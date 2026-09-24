@@ -3,7 +3,7 @@ use zeroize::Zeroizing;
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::app_telemetry::runtime::Outcome as TelemetryOutcome;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,7 +15,8 @@ use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::transport_adapter::TransportEndpointRejectionCategory;
-use cgka_traits::{GroupId, SecretBytes, TransportAdapterError, TransportEndpoint};
+use cgka_traits::{GroupId, MemberId, SecretBytes, TransportAdapterError, TransportEndpoint};
+use futures::stream::{FuturesUnordered, StreamExt};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
     NostrAccountImport,
@@ -70,6 +71,7 @@ pub use agent_publisher::{
     AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
 };
 mod account_attention;
+mod audit_otlp_delivery;
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -77,6 +79,7 @@ pub use account_attention::{
 };
 mod chat_list_window;
 mod conversation_window;
+mod worker_startup;
 pub(crate) use conversation_window::SendCapture;
 pub use conversation_window::{
     CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
@@ -236,8 +239,10 @@ pub struct AccountManager {
     events: broadcast::Sender<MarmotAppEvent>,
     shared: RuntimeSharedServices,
     workers: Arc<Mutex<HashMap<String, ManagedAccountWorker>>>,
+    worker_reapers: Arc<StdMutex<Vec<TrackedWorkerReaper>>>,
     tearing_down: Arc<StdMutex<HashSet<String>>>,
     worker_transactions: Arc<Mutex<()>>,
+    startup_retries: Arc<StdMutex<worker_startup::WorkerStartupRetries>>,
     generated_setup_local_transaction: Arc<Mutex<()>>,
     onboarding_transactions: Arc<StdMutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
     onboarding_state: Arc<StdMutex<HashMap<String, std::sync::Weak<StdMutex<()>>>>>,
@@ -248,11 +253,54 @@ pub struct AccountManager {
     #[cfg(test)]
     onboarding_test_holds: Arc<OnboardingTestHolds>,
     #[cfg(test)]
-    reconcile_rollback_waiters: Arc<StdMutex<Vec<std::sync::mpsc::Sender<()>>>>,
-    #[cfg(test)]
     reconcile_invocations: Arc<std::sync::atomic::AtomicU64>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
     generated_setup_tasks: Arc<StdMutex<GeneratedSetupTasks>>,
+}
+
+#[derive(Default)]
+struct WorkerReconcileReport {
+    // Internal IDs select only the requested account's outcome. They never
+    // reach logs, telemetry, or public error text.
+    failures: BTreeMap<String, AppError>,
+}
+
+impl WorkerReconcileReport {
+    fn into_result(self) -> Result<(), AppError> {
+        self.failures.into_values().next().map_or(Ok(()), Err)
+    }
+
+    fn for_account(mut self, account_id: &str) -> Result<(), AppError> {
+        self.failures.remove(account_id).map_or(Ok(()), Err)
+    }
+}
+
+struct AccountTeardownGuard<'a> {
+    manager: &'a AccountManager,
+    account_id: String,
+}
+
+#[derive(Clone)]
+struct TrackedWorkerReaper {
+    account_id: String,
+    handle: Arc<Mutex<JoinHandle<Result<(), AppError>>>>,
+}
+
+impl<'a> AccountTeardownGuard<'a> {
+    fn new(manager: &'a AccountManager, account_id: String) -> Self {
+        manager.set_account_tearing_down(&account_id, true);
+        Self {
+            manager,
+            account_id,
+        }
+    }
+}
+
+impl Drop for AccountTeardownGuard<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .set_account_tearing_down(&self.account_id, false);
+    }
 }
 
 struct InviteCatchUpTasks {
@@ -279,6 +327,21 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
+    /// Off until the production SDK acquisition backend passes its two-relay
+    /// conformance gate. Controlled worker fixtures opt in explicitly.
+    pub(crate) bounded_group_recovery_enabled: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) bounded_recovery_finished: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_preparation_probes: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) bounded_result_ready: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_prefix_admitted: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_pause_before_admission: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) bounded_pause_after_first_admission: Arc<AtomicBool>,
     local_submission_wakeups: watch::Sender<()>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
@@ -371,6 +434,19 @@ impl MessageSubscriptionSeenIds {
 impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
+            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_recovery_finished: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            bounded_result_ready: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_prefix_admitted: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             local_submission_wakeups: watch::channel(()).0,
             attachment_updates: watch::channel(()).0,
@@ -418,6 +494,19 @@ impl RuntimeSharedServices {
             lifecycle.clone(),
         );
         Self {
+            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_recovery_finished: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            bounded_result_ready: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_prefix_admitted: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
             local_submission_wakeups: watch::channel(()).0,
@@ -1359,6 +1448,33 @@ impl MarmotAppRuntime {
 
     pub fn accounts(&self) -> AccountManager {
         self.accounts.clone()
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub async fn advance_recovery_clock_for_test(&self, account: &str, elapsed: Duration) {
+        let commands = self.accounts.worker_commands(account).await.unwrap();
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond })
+            .await
+            .unwrap();
+        response.await.unwrap();
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub async fn recovery_retry_snapshot_for_test(
+        &self,
+        account: &str,
+    ) -> (storage_sqlite::RecoveryRetryState, Duration, bool) {
+        let commands = self.accounts.worker_commands(account).await.unwrap();
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::RecoveryRetrySnapshot { respond })
+            .await
+            .unwrap();
+        response.await.unwrap()
     }
 
     pub fn shared_services(&self) -> RuntimeSharedServices {
@@ -5129,6 +5245,11 @@ impl MarmotAppRuntime {
             key_package_result.is_ok(),
         );
         let key_package_bytes = key_package_result?;
+        if phase == AccountSetupPhase::LocalStateCreated && !schedule_background {
+            self.accounts
+                .reset_startup_retry(&account.account_id_hex)
+                .await;
+        }
 
         let relay_lists = self
             .accounts
@@ -5137,7 +5258,15 @@ impl MarmotAppRuntime {
         let readiness = self.account_setup_readiness(&account.label)?;
         if schedule_background {
             let handoff_started_at = Instant::now();
-            let handoff_result = self.accounts.reconcile().await;
+            let handoff_result = if phase == AccountSetupPhase::LocalStateCreated {
+                self.accounts
+                    .retry_and_reconcile_for_account(&account.account_id_hex)
+                    .await
+            } else {
+                self.accounts
+                    .reconcile_for_account(&account.account_id_hex)
+                    .await
+            };
             self.shared.app_performance_telemetry().record(
                 AppPerformanceOperation::AccountSetupLocalReadyHandoff,
                 handoff_started_at.elapsed(),
@@ -5635,8 +5764,12 @@ impl AccountManager {
             events,
             shared,
             workers: Arc::new(Mutex::new(HashMap::new())),
+            worker_reapers: Arc::new(StdMutex::new(Vec::new())),
             tearing_down: Arc::new(StdMutex::new(HashSet::new())),
             worker_transactions: Arc::new(Mutex::new(())),
+            startup_retries: Arc::new(StdMutex::new(
+                worker_startup::WorkerStartupRetries::default(),
+            )),
             generated_setup_local_transaction: Arc::new(Mutex::new(())),
             onboarding_transactions: Arc::new(StdMutex::new(HashMap::new())),
             onboarding_state: Arc::new(StdMutex::new(HashMap::new())),
@@ -5650,8 +5783,6 @@ impl AccountManager {
             onboarding_retirements: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(test)]
             onboarding_test_holds: Arc::new(OnboardingTestHolds::default()),
-            #[cfg(test)]
-            reconcile_rollback_waiters: Arc::new(StdMutex::new(Vec::new())),
             #[cfg(test)]
             reconcile_invocations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
@@ -5677,25 +5808,6 @@ impl AccountManager {
     #[cfg(test)]
     pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
         &self.app
-    }
-
-    #[cfg(test)]
-    pub(crate) fn register_reconcile_rollback_waiter(&self, notify: std::sync::mpsc::Sender<()>) {
-        self.reconcile_rollback_waiters
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(notify);
-    }
-
-    #[cfg(test)]
-    fn signal_reconcile_rollback(&self) {
-        let mut waiters = self
-            .reconcile_rollback_waiters
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for notify in waiters.drain(..) {
-            let _ = notify.send(());
-        }
     }
 
     fn set_account_tearing_down(&self, account_id_hex: &str, tearing_down: bool) {
@@ -5724,18 +5836,132 @@ impl AccountManager {
             let mut workers = self.workers.lock().await;
             account_ids
                 .iter()
-                .filter_map(|account_id| workers.remove(account_id))
+                .filter_map(|account_id| {
+                    workers
+                        .remove(account_id)
+                        .map(|worker| (account_id.clone(), worker))
+                })
                 .collect::<Vec<_>>()
         };
-        #[cfg(test)]
-        self.signal_reconcile_rollback();
-        let mut shutdowns = JoinSet::new();
-        for worker in workers {
-            shutdowns.spawn(async move {
-                worker.shutdown().await;
-            });
+        self.register_worker_reapers(workers);
+        let _ = self.finish_worker_reapers().await;
+    }
+
+    fn register_worker_reapers(&self, workers: Vec<(String, ManagedAccountWorker)>) {
+        // Register cleanup synchronously after removing workers from the map.
+        // There must be no cancellation point that loses the owning handle.
+        {
+            let mut reapers = self
+                .worker_reapers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (account_id, worker) in workers {
+                let relay_plane = self.shared.relay_plane().clone();
+                let retired_account = account_id.clone();
+                reapers.push(TrackedWorkerReaper {
+                    account_id,
+                    handle: Arc::new(Mutex::new(tokio::spawn(async move {
+                        worker.shutdown().await;
+                        let member = MemberId::new(hex::decode(retired_account)?);
+                        relay_plane.deactivate_account_context(&member).await?;
+                        Ok(())
+                    }))),
+                });
+            }
         }
-        while shutdowns.join_next().await.is_some() {}
+    }
+
+    async fn finish_worker_reapers(&self) -> HashSet<String> {
+        // Observe unrelated cleanup without making it hold the global worker
+        // transaction. An unfinished reaper still fences its own account.
+        let reapers = self
+            .worker_reapers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for reaper in reapers {
+            let mut handle = reaper.handle.lock().await;
+            let completed = handle.is_finished();
+            if completed && let Ok(Err(error)) = (&mut *handle).await {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "finish_worker_reapers",
+                    error_kind = error.privacy_safe_kind(),
+                    "account transport retirement failed",
+                );
+            }
+            drop(handle);
+            if completed {
+                self.worker_reapers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|tracked| !Arc::ptr_eq(&tracked.handle, &reaper.handle));
+            }
+        }
+        self.worker_reapers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|reaper| reaper.account_id.clone())
+            .collect()
+    }
+
+    async fn ensure_worker_reaped(&self, account_id: &str) -> Result<(), AppError> {
+        // The worker gets five seconds to stop gracefully, then aborts and
+        // releases its session guard. Give that abort a separate five-second
+        // margin, while keeping a truly uncooperative task fenced and tracked.
+        let deadline =
+            tokio::time::Instant::now() + APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT.saturating_mul(2);
+        let reapers = self
+            .worker_reapers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|reaper| reaper.account_id == account_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for reaper in reapers {
+            let mut handle = reaper.handle.lock().await;
+            let result = tokio::time::timeout_at(deadline, &mut *handle)
+                .await
+                .map_err(|_| {
+                    AppError::BlockingTask("account worker cleanup still in progress".into())
+                })?;
+            drop(handle);
+            self.worker_reapers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|tracked| !Arc::ptr_eq(&tracked.handle, &reaper.handle));
+            result
+                .map_err(|_| AppError::BlockingTask("account worker cleanup failed".into()))??;
+        }
+        Ok(())
+    }
+
+    async fn finish_worker_reapers_unbounded(&self) {
+        loop {
+            let reaper = self
+                .worker_reapers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .first()
+                .cloned();
+            let Some(reaper) = reaper else { break };
+            let mut handle = reaper.handle.lock().await;
+            if let Ok(Err(error)) = (&mut *handle).await {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "finish_worker_reapers_unbounded",
+                    error_kind = error.privacy_safe_kind(),
+                    "account transport retirement failed",
+                );
+            }
+            drop(handle);
+            self.worker_reapers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|tracked| !Arc::ptr_eq(&tracked.handle, &reaper.handle));
+        }
     }
 
     pub fn managed_accounts(&self) -> Result<Vec<ManagedAccount>, AppError> {
@@ -5779,15 +6005,21 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
-        self.set_account_tearing_down(&account.account_id_hex, true);
-        let result = async {
+        let audit_export = self.app.audit_export_lifecycle.clone();
+        let account_id = account.account_id_hex.clone();
+        let _audit_export_mutation =
+            blocking_app_task(move || Ok(audit_export.mutate_account(&account_id))).await?;
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
+        let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
+        async {
             self.shared
                 .attachment_permissions
                 .forget_account(&account.account_id_hex);
             self.shared.attachment_cancellations.send_modify(|_| {});
             let worker = self.workers.lock().await.remove(&account.account_id_hex);
             if let Some(worker) = worker {
-                worker.shutdown().await;
+                self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
+                self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
             // Evict every in-memory handle and warm flag for this label BEFORE
             // the account directory is deleted. Otherwise the cached account
@@ -5798,6 +6030,7 @@ impl AccountManager {
             self.app
                 .remove_account_key_package_artifacts(&account.label)?;
             self.app.account_home().remove_account(&account.label)?;
+            self.clear_startup_retry(&account.account_id_hex);
             // The account no longer exists on this device, so the host callback
             // handle it registered must not outlive it. This runs only after
             // the removal commit point: a removal that failed leaves the
@@ -5810,9 +6043,7 @@ impl AccountManager {
                 .remove(&account.account_id_hex);
             Ok(())
         }
-        .await;
-        self.set_account_tearing_down(&account.account_id_hex, false);
-        result
+        .await
     }
 
     /// Explicit recovery for an account created before durable setup journals.
@@ -5873,10 +6104,13 @@ impl AccountManager {
             return Err(AppError::AccountSetupKeyPackageRecoveryAvailable);
         }
 
-        self.set_account_tearing_down(&account.account_id_hex, true);
-        let result = async {
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
+
+        let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
+        async {
             if let Some(worker) = self.workers.lock().await.remove(&account.account_id_hex) {
-                worker.shutdown().await;
+                self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
+                self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
             self.app.drop_account_caches(&account.label);
             self.app
@@ -5886,9 +6120,7 @@ impl AccountManager {
                 .reset_incomplete_setup_preserving_credential(&account.label)?;
             Ok(())
         }
-        .await;
-        self.set_account_tearing_down(&account.account_id_hex, false);
-        result
+        .await
     }
 
     /// Non-destructive deactivation of an account on this device: persist a
@@ -5917,25 +6149,26 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
-        self.set_account_tearing_down(&account.account_id_hex, true);
-        let result = async {
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
+        let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
+        async {
+            let worker = self.workers.lock().await.remove(&account.account_id_hex);
+            if let Some(worker) = worker {
+                self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
+                self.ensure_worker_reaped(&account.account_id_hex).await?;
+            }
             self.app
                 .account_home()
                 .set_account_signed_out(&account.label, true)?;
+            self.clear_startup_retry(&account.account_id_hex);
             self.shared
                 .attachment_permissions
                 .forget_account(&account.account_id_hex);
             self.shared.attachment_cancellations.send_modify(|_| {});
-            let worker = self.workers.lock().await.remove(&account.account_id_hex);
-            if let Some(worker) = worker {
-                worker.shutdown().await;
-            }
             self.app.drop_account_caches(&account.label);
             Ok(())
         }
-        .await;
-        self.set_account_tearing_down(&account.account_id_hex, false);
-        result
+        .await
     }
 
     async fn restore_signed_out_after_key_package_failure(&self, account_ref: &str) {
@@ -5978,7 +6211,10 @@ impl AccountManager {
             .app
             .account_home()
             .set_account_signed_out(account_ref, false)?;
-        self.reconcile_locked().await?;
+        self.clear_startup_retry(&account.account_id_hex);
+        self.reconcile_locked_report_for(Some(&account.account_id_hex))
+            .await?
+            .for_account(&account.account_id_hex)?;
         let running = self
             .workers
             .lock()
@@ -6007,7 +6243,57 @@ impl AccountManager {
         self.reconcile_locked().await
     }
 
+    async fn reconcile_for_account(&self, account_id: &str) -> Result<(), AppError> {
+        self.reconcile_for_account_inner(account_id, false).await
+    }
+
+    async fn retry_and_reconcile_for_account(&self, account_id: &str) -> Result<(), AppError> {
+        self.reconcile_for_account_inner(account_id, true).await
+    }
+
+    async fn reconcile_for_account_inner(
+        &self,
+        account_id: &str,
+        reset_retry: bool,
+    ) -> Result<(), AppError> {
+        let lock_wait = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::LifecycleLockWait);
+        let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
+        if reset_retry {
+            self.clear_startup_retry(account_id);
+        }
+        self.reconcile_locked_report_for(Some(account_id))
+            .await?
+            .for_account(account_id)
+    }
+
+    async fn reset_startup_retry(&self, account_id: &str) {
+        let _worker_transaction = self.worker_transactions.lock().await;
+        self.clear_startup_retry(account_id);
+    }
+
+    fn clear_startup_retry(&self, account_id: &str) {
+        self.startup_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear(account_id);
+    }
+
     async fn reconcile_locked(&self) -> Result<(), AppError> {
+        self.reconcile_locked_report().await?.into_result()
+    }
+
+    async fn reconcile_locked_report(&self) -> Result<WorkerReconcileReport, AppError> {
+        self.reconcile_locked_report_for(None).await
+    }
+
+    async fn reconcile_locked_report_for(
+        &self,
+        target_account_id: Option<&str>,
+    ) -> Result<WorkerReconcileReport, AppError> {
         self.app.presentation_signals.catalog_changed();
         let started_at = Instant::now();
         let result = async {
@@ -6044,6 +6330,10 @@ impl AccountManager {
                 .iter()
                 .map(|account| account.account_id_hex.clone())
                 .collect::<HashSet<_>>();
+            self.startup_retries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain_eligible(&active_account_ids);
 
             let (existing_account_ids, stale_workers) = {
                 let mut workers = self.workers.lock().await;
@@ -6064,18 +6354,42 @@ impl AccountManager {
                     .collect::<Vec<_>>();
                 let stale_workers = stale_account_ids
                     .into_iter()
-                    .filter_map(|account_id| workers.remove(&account_id))
+                    .filter_map(|account_id| {
+                        workers
+                            .remove(&account_id)
+                            .map(|worker| (account_id, worker))
+                    })
                     .collect::<Vec<_>>();
                 (
                     workers.keys().cloned().collect::<HashSet<_>>(),
                     stale_workers,
                 )
             };
-            // Worker task teardown releases AppClient's account-session guard.
-            // Reap stale tasks before opening replacements for the same labels.
-            for worker in stale_workers {
+            // Finished tasks have already released their session guards and
+            // can be joined immediately. Register still-running tasks before
+            // any await so cancellation cannot lose their cleanup handles.
+            let (finished_workers, running_workers): (Vec<_>, Vec<_>) = stale_workers
+                .into_iter()
+                .partition(|(_, worker)| worker.handle.is_finished());
+            self.register_worker_reapers(running_workers);
+            for (_, worker) in finished_workers {
                 worker.shutdown().await;
             }
+            if let Some(account_id) = target_account_id {
+                let retry_allowed = self
+                    .startup_retries
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .allows(account_id, tokio::time::Instant::now());
+                if retry_allowed && let Err(error) = self.ensure_worker_reaped(account_id).await {
+                    self.startup_retries
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .fail(account_id.to_owned(), tokio::time::Instant::now());
+                    return Err(error);
+                }
+            }
+            let pending_reapers = self.finish_worker_reapers().await;
 
             let pending = accounts
                 .into_iter()
@@ -6083,7 +6397,7 @@ impl AccountManager {
                 .collect::<Vec<_>>();
 
             let mut ready_receivers = Vec::new();
-            let mut spawned_account_ids = Vec::new();
+            let mut report = WorkerReconcileReport::default();
             {
                 let mut workers = self.workers.lock().await;
                 for account in pending {
@@ -6092,7 +6406,35 @@ impl AccountManager {
                     {
                         continue;
                     }
-                    spawned_account_ids.push(account.account_id_hex.clone());
+                    if !self
+                        .startup_retries
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .allows(&account.account_id_hex, tokio::time::Instant::now())
+                    {
+                        self.shared.app_performance_telemetry().record_runtime(
+                            RuntimeOp::AccountStartupRetrySuppressed,
+                            Duration::ZERO,
+                            TelemetryOutcome::NotReady,
+                        );
+                        report.failures.insert(
+                            account.account_id_hex,
+                            AppError::BlockingTask(
+                                "account worker startup retry deferred by backoff".into(),
+                            ),
+                        );
+                        continue;
+                    }
+                    if pending_reapers.contains(&account.account_id_hex) {
+                        report.failures.insert(
+                            account.account_id_hex,
+                            AppError::BlockingTask(
+                                "account worker cleanup still in progress".into(),
+                            ),
+                        );
+                        continue;
+                    }
+                    let account_id = account.account_id_hex.clone();
                     let (ready_tx, ready_rx) = oneshot::channel();
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
@@ -6121,83 +6463,97 @@ impl AccountManager {
                             shutdown: shutdown_tx,
                         },
                     );
-                    ready_receivers.push((Instant::now(), ready_rx));
+                    ready_receivers.push((account_id, Instant::now(), ready_rx));
                 }
             }
-            let mut ready_waits = JoinSet::new();
-            for (account_started_at, ready) in ready_receivers {
-                ready_waits.spawn(async move {
+            let mut ready_waits = FuturesUnordered::new();
+            for (account_id, account_started_at, ready) in ready_receivers {
+                ready_waits.push(async move {
                     let ready_result = timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await;
-                    (account_started_at.elapsed(), ready_result)
+                    (account_id, account_started_at.elapsed(), ready_result)
                 });
             }
-            while let Some(joined) = ready_waits.join_next().await {
-                let (account_open_elapsed, ready_result) = match joined {
-                    Ok(joined) => joined,
-                    Err(err) => {
-                        self.shutdown_workers_for_account_ids(&spawned_account_ids)
-                            .await;
-                        return Err(AppError::BlockingTask(format!(
-                            "account worker readiness wait failed: {err}"
-                        )));
+            let mut failed_account_ids = Vec::new();
+            while let Some((account_id, account_open_elapsed, ready_result)) =
+                ready_waits.next().await
+            {
+                let (mut outcome, mut classification) = match ready_result {
+                    Ok(Ok(Ok(()))) => (Ok(()), None),
+                    Ok(Ok(Err(error))) => {
+                        let class = error.sync_error_class();
+                        (
+                            Err(error),
+                            Some(SyncFailureClassification::new(
+                                SyncFailureStage::AccountWorker,
+                                class,
+                            )),
+                        )
                     }
+                    Ok(Err(_)) => (
+                        Err(AppError::TransportClosed),
+                        Some(SyncFailureClassification::new(
+                            SyncFailureStage::AccountWorker,
+                            SyncErrorClass::TransportClosed,
+                        )),
+                    ),
+                    Err(_) => (
+                        Err(AppError::BlockingTask(
+                            "account worker startup timed out".into(),
+                        )),
+                        Some(SyncFailureClassification::new(
+                            SyncFailureStage::AccountWorker,
+                            SyncErrorClass::Timeout,
+                        )),
+                    ),
                 };
+                if outcome.is_ok() {
+                    let mut workers = self.workers.lock().await;
+                    match workers.get_mut(&account_id) {
+                        Some(worker)
+                            if !worker.handle.is_finished() && !worker.commands.is_closed() =>
+                        {
+                            worker.ready = true;
+                        }
+                        _ => {
+                            outcome = Err(AppError::TransportClosed);
+                            classification = Some(SyncFailureClassification::new(
+                                SyncFailureStage::AccountWorker,
+                                SyncErrorClass::TransportClosed,
+                            ));
+                        }
+                    }
+                }
                 self.shared
                     .app_performance_telemetry()
                     .record_classified_result(
                         AppPerformanceOperation::AccountOpen,
                         account_open_elapsed,
-                        match &ready_result {
-                            Ok(Ok(Ok(()))) => None,
-                            Ok(Ok(Err(error))) => Some(SyncFailureClassification::new(
-                                SyncFailureStage::AccountWorker,
-                                error.sync_error_class(),
-                            )),
-                            Ok(Err(_)) => Some(SyncFailureClassification::new(
-                                SyncFailureStage::AccountWorker,
-                                crate::SyncErrorClass::TransportClosed,
-                            )),
-                            Err(_) => Some(SyncFailureClassification::new(
-                                SyncFailureStage::AccountWorker,
-                                crate::SyncErrorClass::Timeout,
-                            )),
-                        },
+                        classification,
                     );
-                match ready_result {
-                    Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(error))) => {
-                        self.shutdown_workers_for_account_ids(&spawned_account_ids)
-                            .await;
-                        return Err(error);
-                    }
-                    Ok(Err(_closed)) => {
-                        self.shutdown_workers_for_account_ids(&spawned_account_ids)
-                            .await;
-                        return Err(AppError::TransportClosed);
-                    }
-                    Err(_elapsed) => {
-                        self.shutdown_workers_for_account_ids(&spawned_account_ids)
-                            .await;
-                        return Err(AppError::BlockingTask(
-                            "account worker startup timed out".into(),
-                        ));
-                    }
+                if let Err(error) = outcome {
+                    self.startup_retries
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .fail(account_id.clone(), tokio::time::Instant::now());
+                    failed_account_ids.push(account_id.clone());
+                    report.failures.insert(account_id, error);
+                } else {
+                    self.clear_startup_retry(&account_id);
                 }
             }
-            // Publish fast-path eligibility only after the entire startup batch succeeds.
-            let mut workers = self.workers.lock().await;
-            for account_id in spawned_account_ids {
-                if let Some(worker) = workers.get_mut(&account_id) {
-                    worker.ready = true;
-                }
+            if !failed_account_ids.is_empty() {
+                self.shutdown_workers_for_account_ids(&failed_account_ids)
+                    .await;
             }
-            Ok(())
+            Ok(report)
         }
         .await;
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountReconcile,
             started_at.elapsed(),
-            result.is_ok(),
+            result
+                .as_ref()
+                .is_ok_and(|report| report.failures.is_empty()),
         );
         result
     }
@@ -6210,13 +6566,25 @@ impl AccountManager {
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
+        let account = self
+            .app
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex)
+            .ok_or_else(|| AccountHomeError::UnknownAccount(account_id_hex.to_owned()))?;
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
         let worker = self.workers.lock().await.remove(account_id_hex);
         if let Some(worker) = worker {
             // The worker owns the AppClient and its account-session guard.
             // Await teardown before reconcile opens the replacement.
-            worker.shutdown().await;
+            self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
+            self.ensure_worker_reaped(&account.account_id_hex).await?;
         }
-        self.reconcile_locked().await
+        self.clear_startup_retry(&account.account_id_hex);
+        self.reconcile_locked_report_for(Some(&account.account_id_hex))
+            .await?
+            .for_account(&account.account_id_hex)
     }
 
     pub async fn catch_up_accounts(&self) -> Result<CatchUpAccountsSummary, AppError> {
@@ -6227,10 +6595,12 @@ impl AccountManager {
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
-            self.reconcile().await?;
+            let reconcile_result = self.reconcile().await;
             let commands = self.running_account_commands().await;
             let accounts_considered = commands.len();
-            self.catch_up_account_commands(commands).await?;
+            let catch_up_result = self.catch_up_account_commands(commands).await;
+            catch_up_result?;
+            reconcile_result?;
             Ok(CatchUpAccountsSummary {
                 accounts_considered,
             })
@@ -6282,6 +6652,9 @@ impl AccountManager {
             .lock()
             .await
             .values()
+            .filter(|worker| {
+                worker.ready && !worker.handle.is_finished() && !worker.commands.is_closed()
+            })
             .map(|worker| worker.commands.clone())
             .collect()
     }
@@ -6312,6 +6685,15 @@ impl AccountManager {
         path: &str,
     ) -> Result<AuditLogDeleteOutcome, AppError> {
         let (path, owner_account_id_hex) = self.app.resolve_audit_log_path(path)?;
+        let audit_export = self.app.audit_export_lifecycle.clone();
+        let fence_owner = owner_account_id_hex.clone();
+        let _audit_export_mutation = blocking_app_task(move || {
+            Ok(match fence_owner.as_deref() {
+                Some(account) => audit_export.mutate_account(account),
+                None => audit_export.mutate_all(),
+            })
+        })
+        .await?;
         if let Some(account_id_hex) = owner_account_id_hex {
             let commands = {
                 let workers = self.workers.lock().await;
@@ -6324,15 +6706,20 @@ impl AccountManager {
                 // A send error means the worker channel is closed, so its
                 // session — and thus any file handle — is gone; fall through to
                 // a direct removal, which is then safe.
-                if commands
+                let queued = commands
                     .send(AccountWorkerCommand::DeleteAuditLog {
                         path: path.clone(),
                         respond,
                     })
                     .await
-                    .is_ok()
-                    && account_worker_response(response).await?
-                {
+                    .is_ok();
+                #[cfg(test)]
+                if queued {
+                    self.app
+                        .audit_export_lifecycle
+                        .notify_delete_queued_for_test();
+                }
+                if queued && account_worker_response(response).await? {
                     // The live recorder owned this file and rotated it: old
                     // file gone, fresh file already recording.
                     return Ok(AuditLogDeleteOutcome {
@@ -6542,11 +6929,19 @@ impl AccountManager {
                         return Ok((worker.commands.clone(), worker.media_admission.clone()));
                     }
                 }
-                self.reconcile().await?;
+                self.reconcile_for_account(&account.account_id_hex).await?;
                 let workers = self.workers.lock().await;
+                self.shared.lifecycle().ensure_running()?;
                 workers
                     .get(&account.account_id_hex)
-                    .filter(|worker| worker.ready)
+                    .filter(|worker| {
+                        worker.ready
+                            && !worker.handle.is_finished()
+                            && !worker.commands.is_closed()
+                            && !self.account_is_tearing_down(&account.account_id_hex)
+                            && (!account.external_signing
+                                || self.app.has_external_signer(&account.account_id_hex))
+                    })
                     .map(|worker| (worker.commands.clone(), worker.media_admission.clone()))
                     .ok_or_else(|| {
                         AppError::RelayDirectory(
@@ -6781,7 +7176,8 @@ impl AccountManager {
                 .set_account_signed_out(&account.label, false)?;
             self.app.presentation_signals.catalog_changed();
         }
-        self.reconcile().await?;
+        self.retry_and_reconcile_for_account(&account.account_id_hex)
+            .await?;
         self.app
             .account_home()
             .complete_account_setup(&account.label)?;
@@ -6992,7 +7388,8 @@ impl AccountManager {
                 .set_account_signed_out(&account.label, false)?;
             self.app.presentation_signals.catalog_changed();
         }
-        self.reconcile().await?;
+        self.retry_and_reconcile_for_account(&account.account_id_hex)
+            .await?;
         self.app
             .account_home()
             .complete_account_setup(&account.label)?;
@@ -7018,7 +7415,12 @@ impl AccountManager {
         self.app
             .register_external_signer(account_ref, signer)
             .await?;
-        self.reconcile().await
+        let account = self.resolve(account_ref)?;
+        let _worker_transaction = self.worker_transactions.lock().await;
+        self.clear_startup_retry(&account.account_id_hex);
+        self.reconcile_locked_report_for(Some(&account.account_id_hex))
+            .await?
+            .for_account(&account.account_id_hex)
     }
 
     async fn preflight_existing_account_directory(
@@ -7682,6 +8084,7 @@ impl AccountManager {
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
+        self.finish_worker_reapers_unbounded().await;
         // An admitted cancellation or reconcile can register a worker reaper
         // after the first handle snapshot. Cancellation tasks have now joined,
         // and this lock excludes every remaining reaper producer. Reapers do
@@ -7698,18 +8101,14 @@ impl AccountManager {
         }
         let workers = {
             let mut workers = self.workers.lock().await;
-            workers
-                .drain()
-                .map(|(_, worker)| worker)
-                .collect::<Vec<_>>()
+            workers.drain().collect::<Vec<_>>()
         };
-        let mut shutdowns = JoinSet::new();
-        for worker in workers {
-            shutdowns.spawn(async move {
-                worker.shutdown().await;
-            });
-        }
-        while shutdowns.join_next().await.is_some() {}
+        self.register_worker_reapers(workers);
+        self.finish_worker_reapers_unbounded().await;
+        self.startup_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear_all();
     }
 }
 
@@ -7786,6 +8185,8 @@ const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[
     "wss://purplepag.es",
     VERTEX_DIRECTORY_RELAY,
     "wss://nos.lol",
+    "wss://relay.ditto.pub",
+    "wss://relay.primal.net",
 ];
 
 pub fn default_directory_discovery_relays() -> Vec<TransportEndpoint> {

@@ -1,3 +1,4 @@
+use cgka_traits::MaintenanceStorage;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,10 +31,10 @@ use marmot_account::{
     TransportRoutingPolicy,
 };
 use marmot_forensics::AuditEventContext;
-use nostr::NostrSigner;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use storage_sqlite::{PreparedGroupImageUploadRecord, PreparedGroupImageUploadState};
+use transport_nostr_peeler::MarmotNostrSigner;
 use zeroize::Zeroizing;
 
 use crate::app_telemetry::AppPerformanceOperation;
@@ -71,6 +72,7 @@ mod invite_recovery;
 mod projection;
 mod push;
 mod receipts;
+pub(crate) mod recovery;
 mod retention;
 mod sync;
 
@@ -134,7 +136,7 @@ pub(crate) struct EncryptedMediaUploadHttp {
     request: MediaUploadRequest,
     source_epoch: u64,
     media_secret: SecretBytes,
-    nostr_signer: Arc<dyn NostrSigner>,
+    nostr_signer: Arc<dyn MarmotNostrSigner>,
     version: EncryptedMediaVersion,
     default_endpoints: Vec<AppBlobEndpoint>,
     allowed_locator_kinds: Vec<String>,
@@ -328,6 +330,17 @@ pub(crate) struct GroupRouteRefresh {
 }
 
 pub struct AppClient {
+    /// Synthetic endpoint certificates for executor/completion contract tests.
+    /// Never enabled by EOSE or by the production SDK adapter.
+    #[cfg(test)]
+    pub(crate) test_recovery_evidence: Option<recovery::TestRecoveryEvidence>,
+    #[cfg(test)]
+    pub(super) test_comparison_results:
+        Option<std::collections::VecDeque<sync::TestComparisonResult>>,
+    #[cfg(test)]
+    pub(super) test_comparison_delay: Option<std::time::Duration>,
+    pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
+    pub(super) comparison_startup_requested: bool,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,
@@ -340,7 +353,7 @@ pub struct AppClient {
     pub(crate) adapter: MarmotRelayPlaneAccountAdapter,
     pub(crate) routing: AppTransportRouting,
     pub(crate) relay_plane: MarmotRelayPlane,
-    pub(crate) transport_signer: Arc<dyn nostr::NostrSigner>,
+    pub(crate) transport_signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     pub(crate) blossom_http_transport: BlossomHttpTransport,
     pub(crate) state: AccountState,
     /// O(1) membership index over `state.seen_events`, kept in lockstep by
@@ -443,15 +456,10 @@ pub struct AppClient {
     /// counts the distinct undecryptable messages a group accumulates at a
     /// stalled epoch. Ephemeral session state, like the pending sets above.
     pub(crate) epoch_stall: EpochStallDetector,
-    /// Earliest instant an automatic seam may retry a pending epoch-gap
-    /// backfill whose last attempt could not confirm its replay.
-    ///
-    /// Process-local on purpose: the intent it paces is durable, so a restart
-    /// costs at most one unpaced attempt, while persisting a monotonic deadline
-    /// would mean durable schema for a scheduling hint.
-    pub(crate) epoch_backfill_retry_not_before: Option<Instant>,
-    /// Armed epoch-gap recovery intent awaiting its account-wide replay.
-    pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
+    /// Detector observations whose SQL write failed. At most one epoch per
+    /// group; this buffer owns no dispatch, completion or retry policy.
+    pub(crate) pending_recovery_arm_writes: HashMap<GroupId, u64>,
+    pub(crate) pending_recovery_capacity_writes: HashMap<GroupId, u64>,
     /// Initial account open or release consumption requires a backfill reload.
     /// Keep this armed after a failed read even if the journal is already empty;
     /// the next synchronized receipt access retries on this same client.
@@ -463,10 +471,6 @@ pub struct AppClient {
     /// retirement, for the retry path its callers depend on.
     #[cfg(test)]
     pub(crate) fail_next_terminal_recovery_retire: bool,
-    /// Additional armed intents queued behind [`Self::pending_epoch_backfill`]
-    /// when a replay failure must not overwrite a newer arm minted in flight.
-    pub(crate) queued_epoch_backfills:
-        std::collections::VecDeque<epoch_stall::PendingEpochBackfill>,
     /// Temporary full-history subscriptions installed only while a post-join
     /// maintenance obligation is waiting for its first relay EOSE.
     pub(crate) post_join_maintenance_subscriptions:
@@ -1052,12 +1056,12 @@ impl AppClient {
             let active = self
                 .post_join_maintenance_subscriptions
                 .iter()
-                .map(|(group_id, (_, route))| (group_id.clone(), route.clone()))
+                .map(|(group_id, (subscription, _))| (group_id.clone(), subscription.clone()))
                 .collect::<Vec<_>>();
-            for (group_id, route) in active {
+            for (group_id, subscription) in active {
                 if let Err(_error) = self
                     .adapter
-                    .remove_group_maintenance_subscription(&route)
+                    .remove_group_maintenance_subscription(&subscription)
                     .await
                 {
                     tracing::warn!(
@@ -1069,10 +1073,37 @@ impl AppClient {
                     continue;
                 }
                 self.post_join_maintenance_subscriptions.remove(&group_id);
+                self.recovery_owner
+                    .maintenance_observations
+                    .remove(&group_id);
             }
             return Ok(());
         }
-        let routes = self.routing.snapshot().group_routes;
+        let storage = self.app.account_storage(&self.state.label)?;
+        let active_jobs = storage
+            .list_maintenance_obligations()?
+            .into_iter()
+            .filter(|job| {
+                job.trigger == cgka_traits::MaintenanceTrigger::PostJoin
+                    && matches!(
+                        job.phase,
+                        cgka_traits::MaintenancePhase::CatchUp
+                            | cgka_traits::MaintenancePhase::EoseTimeout
+                            | cgka_traits::MaintenancePhase::Grace
+                    )
+            })
+            .map(|job| {
+                serde_json::to_vec(&(job.id.as_slice(), job.semantic_rearm_count))
+                    .map(|key| (key, job.group_id.as_slice().to_vec()))
+                    .map_err(|_| {
+                        cgka_traits::storage::StorageError::Serialization(
+                            "invalid maintenance recovery identity".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        storage.retain_recovery_maintenance_jobs(&active_jobs)?;
+        let mut requested = false;
         let mut waiting = HashSet::new();
 
         for group in self.state.groups.clone() {
@@ -1100,7 +1131,7 @@ impl AppClient {
                     continue;
                 }
             };
-            let needs_subscription = status.obligations.iter().any(|obligation| {
+            let prerequisite = status.obligations.iter().find(|obligation| {
                 obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
                     && matches!(
                         obligation.phase,
@@ -1109,83 +1140,47 @@ impl AppClient {
                             | cgka_traits::MaintenancePhase::Grace
                     )
             });
-            if !needs_subscription {
+            let Some(prerequisite) = prerequisite else {
                 continue;
-            }
+            };
             waiting.insert(group_id.clone());
 
+            if let Some((subscription, _)) = self.post_join_maintenance_subscriptions.get(&group_id)
+                && self
+                    .adapter
+                    .group_maintenance_any_eose(subscription)
+                    .await
+                    .is_none()
+            {
+                self.post_join_maintenance_subscriptions.remove(&group_id);
+                self.recovery_owner
+                    .maintenance_observations
+                    .remove(&group_id);
+            }
             if !self
                 .post_join_maintenance_subscriptions
                 .contains_key(&group_id)
             {
-                let Some(route) = routes
-                    .iter()
-                    .find(|route| route.group_id == group_id)
-                    .cloned()
-                else {
-                    tracing::warn!(
-                        target: "marmot_app::maintenance",
-                        method = "advance_post_join_maintenance_subscriptions",
-                        error_kind = "missing_route",
-                        "skipping post-join maintenance group without a route"
-                    );
-                    continue;
-                };
-                let subscription_id = match self
-                    .adapter
-                    .install_group_maintenance_subscription(route.clone())
-                    .await
-                {
-                    Ok(subscription_id) => subscription_id,
-                    Err(_error) => {
-                        tracing::warn!(
-                            target: "marmot_app::maintenance",
-                            method = "advance_post_join_maintenance_subscriptions",
-                            error_kind = "subscription_install_failed",
-                            "post-join maintenance subscription installation failed"
-                        );
-                        continue;
-                    }
-                };
-                if let Err(_error) = self
-                    .runtime
-                    .mark_post_join_subscription_installed(&group_id)
-                {
-                    let _ = self
-                        .adapter
-                        .remove_group_maintenance_subscription(&route)
-                        .await;
-                    tracing::warn!(
-                        target: "marmot_app::maintenance",
-                        method = "advance_post_join_maintenance_subscriptions",
-                        error_kind = "state_update_failed",
-                        "compensated post-join subscription after state update failure"
-                    );
-                    continue;
-                }
-                self.post_join_maintenance_subscriptions
-                    .insert(group_id.clone(), (subscription_id, route));
+                let job = serde_json::to_vec(&(
+                    prerequisite.id.as_slice(),
+                    prerequisite.semantic_rearm_count,
+                ))
+                .map_err(|_| {
+                    cgka_traits::storage::StorageError::Serialization(
+                        "invalid maintenance recovery identity".into(),
+                    )
+                })?;
+                let ticket = storage.request_recovery(
+                    storage_sqlite::RecoveryRequest::MaintenanceBoundary {
+                        job_id: &job,
+                        group_id: group_id.as_slice(),
+                    },
+                    unix_now_seconds().saturating_mul(1000),
+                )?;
+                storage.restore_recovery_maintenance_session(ticket)?;
+                requested = true;
             }
-
-            let first_eose = if let Some((subscription_id, _)) =
-                self.post_join_maintenance_subscriptions.get(&group_id)
-            {
-                self.adapter
-                    .group_maintenance_any_eose(subscription_id)
-                    .await
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-            if first_eose && let Err(_error) = self.runtime.mark_post_join_eose(&group_id) {
-                tracing::warn!(
-                    target: "marmot_app::maintenance",
-                    method = "advance_post_join_maintenance_subscriptions",
-                    error_kind = "eose_state_update_failed",
-                    "could not advance post-join maintenance after EOSE"
-                );
-                continue;
-            }
+            self.observe_post_join_recovery_boundary(&group_id).await?;
         }
 
         let stale = self
@@ -1195,13 +1190,13 @@ impl AppClient {
             .cloned()
             .collect::<Vec<_>>();
         for group_id in stale {
-            if let Some((_, route)) = self
+            if let Some((subscription, _)) = self
                 .post_join_maintenance_subscriptions
                 .get(&group_id)
                 .cloned()
                 && let Err(_error) = self
                     .adapter
-                    .remove_group_maintenance_subscription(&route)
+                    .remove_group_maintenance_subscription(&subscription)
                     .await
             {
                 tracing::warn!(
@@ -1213,6 +1208,24 @@ impl AppClient {
                 continue;
             }
             self.post_join_maintenance_subscriptions.remove(&group_id);
+            self.recovery_owner
+                .maintenance_observations
+                .remove(&group_id);
+        }
+        if requested
+            && let Some(grant) = self.authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )?
+        {
+            match self.execute_recovery_grant(grant, None, None).await {
+                Ok(summary) => self.pending_applied_sync_summary.merge(summary),
+                Err(failure) => {
+                    self.pending_applied_sync_summary
+                        .merge(failure.partial_summary);
+                    return Err(failure.source);
+                }
+            }
         }
         Ok(())
     }
@@ -2708,22 +2721,8 @@ impl AppClient {
         self.pending_epoch_stall_escalations
             .retain(|event| &event.group_id != group_id);
         self.epoch_stall.clear_recovered_group(group_id);
-        for pending in self
-            .pending_epoch_backfill
-            .iter_mut()
-            .chain(self.queued_epoch_backfills.iter_mut())
-        {
-            pending.groups.remove(group_id);
-        }
-        if self
-            .pending_epoch_backfill
-            .as_ref()
-            .is_some_and(|pending| pending.groups.is_empty())
-        {
-            self.pending_epoch_backfill = None;
-        }
-        self.queued_epoch_backfills
-            .retain(|pending| !pending.groups.is_empty());
+        self.pending_recovery_arm_writes.remove(group_id);
+        self.pending_recovery_capacity_writes.remove(group_id);
         self.encrypted_media_not_required_epochs.remove(&group_hex);
         self.pending_convergence_groups.remove(group_id);
         for summary in [
@@ -2751,14 +2750,14 @@ impl AppClient {
             tracing::warn!(target: "marmot_app::client", method = "forget_group_local",
                 "forgotten group subscription cleanup remains pending");
         }
-        if let Some((_, route)) = self
+        if let Some((subscription, _)) = self
             .post_join_maintenance_subscriptions
             .get(group_id)
             .cloned()
         {
             if self
                 .adapter
-                .remove_group_maintenance_subscription(&route)
+                .remove_group_maintenance_subscription(&subscription)
                 .await
                 .is_ok()
             {
@@ -6007,13 +6006,16 @@ impl AppClient {
                 // The canonical group already populated routing. Its REQs and
                 // founding Welcome publication can progress independently.
                 let adapter = self.adapter.clone();
-                let sync = TransportGroupSync {
-                    account_id: adapter.account_id().clone(),
-                    group_subscriptions: self.routing.group_subscriptions(),
-                    since: self.subscription_rebuild_since(),
-                };
+                let sync = self
+                    .subscription_rebuild_since()
+                    .map(|since| TransportGroupSync {
+                        account_id: adapter.account_id().clone(),
+                        group_subscriptions: self.routing.group_subscriptions(),
+                        since,
+                    });
                 self.pending_runtime_group_subscription_refresh = true;
                 let register = async {
+                    let sync = sync?;
                     let started = Instant::now();
                     let result = adapter
                         .sync_account_groups(sync)

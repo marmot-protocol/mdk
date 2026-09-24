@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-22
+updated: 2026-09-23
 tags: [marmot, architecture, index]
 ---
 
@@ -48,6 +48,9 @@ Written to be readable in 5 minutes each, shareable as a package.
 - **Doc:** [`overview/nostr-account-transport.md`](./overview/nostr-account-transport.md)
   - **What it covers:** Working note on Nostr user directory, account bootstrap, relay plane, group routing, and relay
     safety policy.
+
+- **Doc:** [`overview/nostr-bounded-acquisition-interface.md`](./overview/nostr-bounded-acquisition-interface.md)
+  - **What it covers:** Optional owned acquisition and notification-loss evidence at the existing relay-client boundary.
 
 - **Doc:** [`overview/transport-agnosticism.md`](./overview/transport-agnosticism.md)
   - **What it covers:** Working note on where transport pluggability stops today: leak inventory from the FIPS spike and
@@ -176,6 +179,10 @@ These are longer working documents. Go here when you need depth, not orientation
   - **What it covers:** Per-attempt collector and forensic-audit HTTP inventory behind the dial-safety overview:
     structural URL gates, resolve/validate/pin, disabled redirects and proxies, timeout budgets, and privacy-safe
     errors.
+
+- **Doc:** [`further-context/audit-delivery-local-slice.md`](./further-context/audit-delivery-local-slice.md)
+  - **What it covers:** Measured JSONL recorder boundaries and the testable local cursor, prepared range, and gap
+    behavior before production delivery is activated.
 
 - **Doc:** [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.

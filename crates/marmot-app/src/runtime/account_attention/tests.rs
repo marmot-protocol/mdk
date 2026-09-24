@@ -382,7 +382,7 @@ async fn catalog_tracks_creation_sign_out_removal_and_external_accounts_without_
     let external = f
         .app()
         .account_home()
-        .add_external_signer_account(&nostr::Keys::generate().public_key().to_hex())
+        .add_external_signer_account(&nostr::prelude::Keys::generate().public_key().to_hex())
         .unwrap();
     // Public AccountHome writes are observed when callers reconcile runtime membership.
     f.runtime.reconcile_accounts().await.unwrap();

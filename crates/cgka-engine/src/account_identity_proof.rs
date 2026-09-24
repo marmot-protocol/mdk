@@ -28,10 +28,9 @@ use cgka_traits::app_components::{ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, decode_co
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::types::MemberId;
-use nostr::prelude::JsonUtil;
-use nostr::{
-    Event, EventBuilder, Kind, PublicKey, Tag, TagKind, Timestamp, UnsignedEvent,
-    secp256k1::schnorr::Signature,
+use nostr::prelude::{
+    Event, EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Signature, Tag, Timestamp,
+    UnsignedEvent,
 };
 use openmls::extensions::{Extension, ExtensionType, Extensions, UnknownExtension};
 use openmls::group::{GroupContext as OpenMlsGroupContext, MlsGroup, StagedCommit};
@@ -102,69 +101,57 @@ impl AccountIdentityProofRequest {
         match self.protocol_profile {
             ProtocolProfile::Legacy => {
                 let tags = [
+                    Tag::custom("d", [ACCOUNT_IDENTITY_PROOF_DOMAIN.to_string()]),
                     Tag::custom(
-                        TagKind::custom("d"),
-                        [ACCOUNT_IDENTITY_PROOF_DOMAIN.to_string()],
-                    ),
-                    Tag::custom(
-                        TagKind::custom("extension"),
+                        "extension",
                         [format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}")],
                     ),
                     Tag::custom(
-                        TagKind::custom("version"),
+                        "version",
                         [LEGACY_ACCOUNT_IDENTITY_PROOF_VERSION.to_string()],
                     ),
+                    Tag::custom("ciphersuite", [self.ciphersuite.to_string()]),
+                    Tag::custom("signature_scheme", [self.signature_scheme.to_string()]),
                     Tag::custom(
-                        TagKind::custom("ciphersuite"),
-                        [self.ciphersuite.to_string()],
-                    ),
-                    Tag::custom(
-                        TagKind::custom("signature_scheme"),
-                        [self.signature_scheme.to_string()],
-                    ),
-                    Tag::custom(
-                        TagKind::custom("mls_signature_key"),
+                        "mls_signature_key",
                         [hex::encode(&self.mls_signature_public_key)],
                     ),
                 ];
-                Ok(
+                let mut event =
                     EventBuilder::new(Kind::Custom(ACCOUNT_IDENTITY_PROOF_EVENT_KIND), "")
                         .tags(tags)
                         .custom_created_at(Timestamp::zero())
-                        .build(public_key),
-                )
+                        .finalize_unsigned(public_key);
+                event.ensure_id();
+                Ok(event)
             }
             ProtocolProfile::Current => {
                 validate_current_timestamp(self.created_at)?;
                 let tags = [
+                    Tag::custom("d", [ACCOUNT_IDENTITY_PROOF_DOMAIN.to_string()]),
                     Tag::custom(
-                        TagKind::custom("d"),
-                        [ACCOUNT_IDENTITY_PROOF_DOMAIN.to_string()],
-                    ),
-                    Tag::custom(
-                        TagKind::custom("component"),
+                        "component",
                         [format!("0x{ACCOUNT_IDENTITY_PROOF_COMPONENT_ID:04x}")],
                     ),
+                    Tag::custom("ciphersuite", [format!("0x{:04x}", self.ciphersuite)]),
                     Tag::custom(
-                        TagKind::custom("ciphersuite"),
-                        [format!("0x{:04x}", self.ciphersuite)],
-                    ),
-                    Tag::custom(
-                        TagKind::custom("signature_scheme"),
+                        "signature_scheme",
                         [format!("0x{:04x}", self.signature_scheme)],
                     ),
                     Tag::custom(
-                        TagKind::custom("mls_signature_key"),
+                        "mls_signature_key",
                         [hex::encode(&self.mls_signature_public_key)],
                     ),
                 ];
-                Ok(EventBuilder::new(
+                let mut event = EventBuilder::new(
                     Kind::Custom(ACCOUNT_IDENTITY_PROOF_EVENT_KIND),
                     ACCOUNT_IDENTITY_PROOF_CONTENT,
                 )
                 .tags(tags)
                 .custom_created_at(Timestamp::from_secs(self.created_at))
-                .build(public_key))
+                .finalize_unsigned(public_key);
+                event.ensure_id();
+                Ok(event)
             }
         }
     }
@@ -194,7 +181,7 @@ impl AccountIdentityProofRequest {
         event
             .verify()
             .map_err(|err| format!("invalid signed proof event: {err}"))?;
-        Ok(event.sig.serialize())
+        Ok(event.sig.to_bytes())
     }
 }
 
@@ -730,6 +717,7 @@ fn read_exact<'a>(cursor: &mut &'a [u8], len: usize, field: &str) -> Result<&'a 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::prelude::FinalizeEvent;
 
     struct FixedSigner([u8; 64]);
 
@@ -742,7 +730,7 @@ mod tests {
         }
     }
 
-    fn request(keys: &nostr::Keys, leaf_key: &[u8]) -> AccountIdentityProofRequest {
+    fn request(keys: &nostr::prelude::Keys, leaf_key: &[u8]) -> AccountIdentityProofRequest {
         AccountIdentityProofRequest {
             account_identity: keys.public_key().to_bytes().to_vec(),
             mls_signature_public_key: leaf_key.to_vec(),
@@ -755,7 +743,7 @@ mod tests {
 
     #[test]
     fn legacy_proof_event_remains_the_deployed_zero_timestamp_shape() {
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let request = request(&keys, b"leaf-key");
         let event = request.proof_event().unwrap();
 
@@ -778,7 +766,7 @@ mod tests {
 
     #[test]
     fn current_proof_event_is_the_exact_kind_450_spec_shape() {
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let request = AccountIdentityProofRequest::current(
             keys.public_key().to_bytes(),
             [0xAB; 32],
@@ -812,7 +800,7 @@ mod tests {
 
     #[test]
     fn current_proof_rejects_zero_and_out_of_range_timestamps() {
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         for created_at in [0, MAX_NIP01_TIMESTAMP + 1] {
             let request = AccountIdentityProofRequest::current(
                 keys.public_key().to_bytes(),
@@ -870,14 +858,10 @@ mod tests {
 
     #[test]
     fn proof_signature_must_match_the_exact_request_event() {
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let original = request(&keys, b"leaf-key-a");
         let tampered = request(&keys, b"leaf-key-b");
-        let signed_tampered = tampered
-            .proof_event()
-            .unwrap()
-            .sign_with_keys(&keys)
-            .unwrap();
+        let signed_tampered = tampered.proof_event().unwrap().finalize(&keys).unwrap();
 
         assert!(
             original
