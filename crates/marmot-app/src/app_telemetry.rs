@@ -126,7 +126,9 @@ pub enum HostPerformanceOperation {
     InboundMessageVisible,
     ConversationLocalVisible,
     ConversationComposerReady,
+    /// From host startup entry to entering the vault gate; excludes unlock input and vault work.
     LinuxStartupBeforeVault,
+    /// From post-unlock runtime setup to the first main-loop presentation return; excludes the vault gate.
     LinuxStartupAfterVault,
     /// Initialize the host window or root UI surface.
     WindowInit,
@@ -146,8 +148,11 @@ pub enum HostPerformanceOperation {
     FrameDraw,
     /// Execute the host presentation call, including any wait it performs.
     FramePresent,
+    /// Process post-presentation frame work; excludes the presentation call and idle wait.
     LinuxFramePostPresent,
+    /// From main-loop frame start through presentation return; includes update, layout, draw and present.
     LinuxFrameUntilPresent,
+    /// Wait for an event or idle-refresh deadline after frame work; excludes waits inside presentation.
     LinuxFrameIdleWait,
     /// Read and prepare the active chat list in the host.
     ChatListLoad,
@@ -185,9 +190,13 @@ pub enum HostPerformanceOperation {
     MediaDecode,
     /// Install prepared media in the UI, including GPU resource creation.
     MediaApply,
+    /// Derive the vault encryption key with Argon2id; excludes vault file I/O.
     LinuxVaultDeriveKey,
+    /// Open an existing vault through decrypted state installation; includes file I/O and any key derivation.
     LinuxVaultOpen,
+    /// Create an unlocked vault through initial persistence; includes lock wait, key derivation and writing.
     LinuxVaultCreate,
+    /// Serialize and encrypt vault state through atomic file replacement and any dev-cache update.
     LinuxVaultPersist,
     /// Serialize and persist host preferences.
     SettingsSave,
