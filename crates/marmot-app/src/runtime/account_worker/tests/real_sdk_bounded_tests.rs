@@ -1007,26 +1007,17 @@ async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
             futures::FutureExt::now_or_never(network_result.as_mut()).is_none(),
             "the worker has not accepted an SDK acquisition result"
         );
-        if !new_loss {
-            // The left relay has sent the historical EVENT while the right
-            // acquisition remains open. It must stay outside SQLCipher until
-            // the bounded result crosses the worker's admission fence.
-            assert!(left.counts().sent_events >= 1);
-            assert!(
-                !storage
-                    .retained_recovery_event(&route, &event_id, None, created_at)
-                    .unwrap(),
-                "request-local SDK input bypassed the bounded result fence"
-            );
-        }
-        if new_loss {
-            let retained_before_loss = storage
+        // The left relay has sent the historical EVENT while the right
+        // acquisition remains open. It must stay outside SQLCipher until
+        // the bounded result crosses the worker's admission fence.
+        assert!(left.counts().sent_events >= 1);
+        assert!(
+            !storage
                 .retained_recovery_event(&route, &event_id, None, created_at)
-                .unwrap();
-            assert!(
-                !retained_before_loss,
-                "the earlier relay's unadmitted acquisition must remain request-local"
-            );
+                .unwrap(),
+            "request-local SDK input bypassed the bounded result fence"
+        );
+        if new_loss {
             let demand_id = storage
                 .pending_recovery_demands()
                 .unwrap()
@@ -1038,8 +1029,8 @@ async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
             let scope_before = storage.recovery_scope_snapshots(demand_id).unwrap();
             assert!(!scope_before.is_empty());
             assert!(scope_before.iter().all(|scope| !scope.retained_known_event));
-            // finish() would report retained=true for this already-durable ID.
-            // An accepted stale checkpoint would flip this frozen scope bit.
+            // An accepted stale checkpoint would rewrite the frozen scope's
+            // endpoint checkpoints even though the event is still unadmitted.
             let before = storage.recovery_revision_fence().unwrap();
             storage
                 .record_account_delivery_loss(&alice.label, 777, 1, crate::unix_now_seconds())

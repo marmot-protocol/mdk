@@ -1,18 +1,19 @@
 ---
-title: "P5 resource bounds qualification"
+title: "#1947 P5 resource bounds qualification"
 created: 2026-09-24
 updated: 2026-09-24
 tags: [marmot, nostr, recovery, resources]
 status: qualification
 ---
 
-# P5 resource bounds qualification
+# #1947 P5 resource bounds qualification
 
 This is a bounded fixture for the inactive exact-known-event worker path, not
 a production activation decision. Its source baseline is MDK
 `b9ffb8f0aa7214a8e4ca3f3d1415dab53e3b5612` with rust-nostr pinned to
-`0efbb4ee20cd2d48ff9ffc19d307ec5a3658d6b9`. This companion branch pins
-the isolation candidate `63384e485d55097cb3d9e57a2146f453a5742570`.
+`0efbb4ee20cd2d48ff9ffc19d307ec5a3658d6b9`. This branch pins the
+reviewed SDK isolation head `63384e485d55097cb3d9e57a2146f453a5742570`
+from merged rust-nostr PR #2.
 The focused tests are in
 `crates/marmot-app/src/runtime/account_worker/tests/resource_bounds_tests.rs`.
 
@@ -33,8 +34,9 @@ separate evidence.
 
 The existing conforming-relay worker fixture joins a comparison and thereby
 creates an `IncrementalHistory` obligation. An isolated CI-profile run observed
-two retry reservations after the known event cleared without a new frozen scope
-or comparison settlement. That failure remains under separate owner diagnosis;
+two retry reservations after the known event cleared without comparison
+settlement. The later reservation selected the comparison; the reason it did
+not settle in that run remains under separate owner diagnosis.
 this resource slice does not establish comparison progress or general fairness.
 
 ## Accounting boundaries
@@ -51,7 +53,7 @@ after parsing, before its request-local deduplication. They can be smaller than
 the relay's sent counts because the relay may have already queued more frames
 when the request stops.
 
-One local run of the six focused tests against the isolation candidate reported:
+One local run of the six focused tests against the reviewed SDK pin reported:
 
 | Scenario | Client text bytes | Relay text bytes | Relay EVENT JSON bytes | SDK received / retained items |
 | --- | ---: | ---: | ---: | ---: |
@@ -89,13 +91,14 @@ notification path before the request-local item/byte check. That path can
 reach the app's live queue and durable admission independently of the bounded
 result. The baseline failed the new real SDK/worker/SQLCipher fence assertion
 while a second relay withheld EOSE and `bounded_result_ready` was pending.
-With the temporary isolation-candidate revision, that assertion and the
+With the reviewed SDK isolation revision, that assertion and the
 stale-new-loss regression passed. All five real-SDK worker cases passed in a
 subsequent complete run. The first run had one comparison-case timeout while
 other builds were active; that case also passed alone on rerun. This is
 candidate evidence, not a guarantee that the comparison fixture is stable: a
-later isolated CI-profile run failed without retries after two unfrozen owner
-reservations. Companion CI/review and comparison owner diagnosis remain gates;
+later isolated CI-profile run failed without retries after two owner
+reservations. The SDK fix merged separately; this MDK PR's CI and comparison
+owner diagnosis remain gates;
 activation stays off.
 
 The fixture does not bound shared connection queues, WebSocket/parser
