@@ -3308,7 +3308,7 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Edit a prior message: publish a kind-1010 event whose single `e` tag
+    /// Edit a prior message: publish a kind-1009 event whose single `e` tag
     /// references `target_message_id` and whose content is the replacement
     /// text. Authorship is enforced on read (an edit is only honored when its
     /// authenticated author matches the target's author), and the chat-list

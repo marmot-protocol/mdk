@@ -3668,11 +3668,32 @@ impl AppClient {
         let group = GroupId::new(hex::decode(&submission.group_id_hex).map_err(|_| {
             AppError::InvalidAppMessagePayload("invalid local submission group".into())
         })?);
-        let request = crate::local_submissions::LocalMessageRequest::decode_retained(
-            submission.request_json.as_deref().ok_or_else(|| {
-                AppError::InvalidAppMessagePayload("missing local submission request".into())
-            })?,
-        )?;
+        let (request, edit_of_client_token) =
+            crate::local_submissions::LocalMessageRequest::decode_retained(
+                submission.request_json.as_deref().ok_or_else(|| {
+                    AppError::InvalidAppMessagePayload("missing local submission request".into())
+                })?,
+            )?;
+        let intent = if let Some(original_token) = edit_of_client_token {
+            let original = self
+                .app
+                .account_storage(&self.state.label)?
+                .local_submission(&submission.group_id_hex, &original_token)?
+                .ok_or_else(|| {
+                    AppError::InvalidAppMessagePayload("original local send was not found".into())
+                })?;
+            if original.state != 1 {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "original local send was not accepted by the engine".into(),
+                ));
+            }
+            crate::messages::AppMessageIntent::Edit {
+                target_message_id: original.message_id_hex,
+                content: request.content.clone(),
+            }
+        } else {
+            request.intent()
+        };
         let (event, payload) = crate::local_submissions::retained_event(submission)?;
         if !request.attachments.is_empty() {
             self.sync_runtime_groups().await?;
@@ -3680,7 +3701,7 @@ impl AppClient {
         }
         self.send_app_event_with_context(
             &group,
-            request.intent(),
+            intent,
             on_projection,
             None,
             Some((event, payload)),

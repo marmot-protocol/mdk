@@ -68,6 +68,34 @@ publication independently. Engine queue/fanout persistence atomically transfers
 ownership, preventing a restart from admitting the same payload twice. Shutdown
 leaves undrained work durable for a subsequent account worker.
 
+## Edits of a pending local send (unreleased source)
+
+Call `edit_local_message_with_client_token(account_ref, group_id_hex,
+original_client_token, content, edit_client_token)` when a user submits a
+revision before the original token-aware text or reply has settled. Give each
+submitted revision its own edit token. The call returns a
+`LocalSendAcceptanceFfi` after MDK durably records the edit. It does not claim
+that the edit reached the relay or was accepted by recipients.
+
+MDK resolves the original token inside the same account and group, creates a
+kind-1009 edit targeting its stable message ID, and queues the edit after the
+original. The worker publishes the edit only after the original is owned by
+the engine's durable queue. If the original was rejected before engine
+acceptance, the edit becomes `Rejected` in `local_send_status` and its pending
+projection is invalidated. A process restart retains both the edit and its
+dependency. Repeating the same edit token and content is an identity lookup;
+changed content requires a new token. Multiple queued revisions retain order,
+and MDK assigns strictly increasing edit times when rapid submissions share a
+second, so the latest accepted edit wins. If that would move an edit more than
+30 seconds ahead of the current clock, admission fails and the host should keep
+the revision for a later retry.
+
+The host should continue to show the submitted revision as pending until its
+edit token completes, and keep the text available for retry or copy if it is
+rejected. Unsubmitted composer text remains host UI state. Existing
+`edit_message` remains the direct API for an established message with a known
+authoritative target ID.
+
 ## Media
 
 `upload_media_with_client_token` first uploads encrypted media and, when `send` is

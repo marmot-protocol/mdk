@@ -25,7 +25,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
 | [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
-| [Durable local sends](LOCAL-SENDS.md) | 0.10.4 early acceptance, exact optimistic-bubble correlation and retry semantics. |
+| [Durable local sends](LOCAL-SENDS.md) | 0.10.4 early acceptance and exact optimistic-bubble correlation; unreleased source adds durable edits of pending local sends. |
 | [Polls](POLLS.md) | Encrypted NIP-88 creation, replacement votes, bounded validation and deterministic timeline results. |
 | [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership. |
 

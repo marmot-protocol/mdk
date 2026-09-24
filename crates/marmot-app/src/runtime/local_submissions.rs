@@ -97,6 +97,7 @@ impl MarmotAppRuntime {
                 attachments,
             },
             None,
+            None,
         )
         .await
     }
@@ -122,6 +123,7 @@ impl MarmotAppRuntime {
                 attachments: vec![],
             },
             None,
+            None,
         )
         .await
     }
@@ -143,6 +145,7 @@ impl MarmotAppRuntime {
                 reply_to: Some(target),
                 attachments: vec![],
             },
+            None,
             None,
         )
         .await
@@ -166,6 +169,32 @@ impl MarmotAppRuntime {
                 attachments,
             },
             Some(revision),
+            None,
+        )
+        .await
+    }
+
+    /// Admit an edit tied to a durable local send. The edit is retained across
+    /// restart and the worker publishes it only after the original is engine-owned.
+    pub async fn submit_edit_for_local_send(
+        &self,
+        account: &str,
+        group: &GroupId,
+        original_client_token: String,
+        content: String,
+        edit_client_token: String,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_local_message(
+            account,
+            group,
+            edit_client_token,
+            LocalMessageRequest {
+                content,
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some(original_client_token),
         )
         .await
     }
@@ -177,6 +206,7 @@ impl MarmotAppRuntime {
         token: String,
         request: LocalMessageRequest,
         draft: Option<crate::MessageDraftRevision>,
+        edit_of_client_token: Option<String>,
     ) -> Result<crate::LocalSendAcceptance, AppError> {
         self.accounts.worker_commands(account).await?;
         let account = self.accounts.resolve(account)?;
@@ -188,8 +218,11 @@ impl MarmotAppRuntime {
         // projection publication belong inside the same owned task.
         blocking_app_task(move || {
             shared.lifecycle().ensure_running()?;
-            let (accepted, update) =
-                app.admit_local_message(&account.label, &group, token, request, draft)?;
+            let (accepted, update) = if let Some(original) = edit_of_client_token {
+                app.admit_local_edit(&account.label, &group, original, request.content, token)?
+            } else {
+                app.admit_local_message(&account.label, &group, token, request, draft)?
+            };
             if let Some(update) = update {
                 account_worker::publish_app_runtime_projection_update(
                     &events,
