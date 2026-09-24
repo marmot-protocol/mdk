@@ -378,7 +378,7 @@ Gate designs evaluated against real exports and deliberately **rejected**:
 - Real exports are the manual pre-PR verification set:
   `cargo run -p incident-replay -- <export.json | export.ndjson>`.
   The CLI sniffs the format from the first non-empty line (read under the
-  per-line bound). An `agent-state.json` document is read whole and rejected
+  per-line and line-count bounds). An `agent-state.json` document is read whole and rejected
   over 256 MiB before parsing; a stream is parsed line by line under the
   per-line and line-count bounds, with no total-size cap.
 - Keep real inputs under ignored `incident-exports/` and generated local output under `target/` or ignored

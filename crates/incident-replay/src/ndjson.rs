@@ -68,12 +68,16 @@ pub fn is_stream(input: &str) -> bool {
 
 /// [`is_stream`] for a reader: whether its first non-empty line carries the
 /// stream's `t` discriminator, reading at most [`MAX_STREAM_LINE_BYTES`] of any
-/// line. A line too long or not UTF-8 cannot be a stream line, so the answer is
-/// `false` and the caller's document parser, bounded by its own cap, rejects
-/// what it cannot adopt.
+/// line and at most [`MAX_STREAM_LINES`] lines. Input that exceeds either bound,
+/// or is not UTF-8, cannot open a stream, so the answer is `false` and the
+/// caller's document parser, bounded by its own cap, rejects what it cannot
+/// adopt.
 pub fn starts_as_stream(input: &mut impl BufRead) -> io::Result<bool> {
     let mut buffer = Vec::new();
-    while read_bounded_line(input, &mut buffer)? {
+    for _ in 0..MAX_STREAM_LINES {
+        if !read_bounded_line(input, &mut buffer)? {
+            break;
+        }
         if buffer.len() as u64 > MAX_STREAM_LINE_BYTES {
             return Ok(false);
         }
@@ -185,14 +189,14 @@ pub fn parse_stream(mut input: impl BufRead) -> Result<AgentStateExport, StreamP
 }
 
 /// Read the next line into `buffer` without its `\n` or `\r\n` terminator,
-/// matching [`str::lines`]; `false` at end of input. The read stops one byte
-/// past [`MAX_STREAM_LINE_BYTES`], so an oversized line shows as a longer
-/// buffer, never by holding the whole line.
+/// matching [`str::lines`]; `false` at end of input. The read stops just past
+/// [`MAX_STREAM_LINE_BYTES`] plus room for a `\r\n`, so an oversized line shows
+/// as a longer buffer, never by holding the whole line.
 fn read_bounded_line(input: &mut impl BufRead, buffer: &mut Vec<u8>) -> io::Result<bool> {
     buffer.clear();
     if input
         .by_ref()
-        .take(MAX_STREAM_LINE_BYTES + 1)
+        .take(MAX_STREAM_LINE_BYTES + 2)
         .read_until(b'\n', buffer)?
         == 0
     {

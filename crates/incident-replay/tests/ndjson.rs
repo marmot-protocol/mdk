@@ -3,7 +3,7 @@
 
 use incident_replay::{
     BehindEngine, BehindMode, MAX_STREAM_LINE_BYTES, MAX_STREAM_LINES, QuarantineReason,
-    StreamParseError, Verdict, classify, is_stream, parse_stream,
+    StreamParseError, Verdict, classify, is_stream, parse_stream, starts_as_stream,
 };
 
 fn load(name: &str) -> String {
@@ -276,6 +276,17 @@ fn a_line_at_the_line_bound_is_accepted() {
     parse_stream(input.as_slice()).expect("a line at the bound parses");
 }
 
+/// The bound counts content, not the terminator, so a CRLF line at the bound
+/// is as acceptable as an LF one.
+#[test]
+fn a_crlf_line_at_the_line_bound_is_accepted() {
+    let mut input = br#"{"t":"manifest"}"#.to_vec();
+    input.resize(MAX_STREAM_LINE_BYTES as usize, b' ');
+    input.extend_from_slice(b"\r\n{\"t\":\"eof\",\"complete\":true,\"counts\":{}}\r\n");
+
+    parse_stream(input.as_slice()).expect("a CRLF line at the bound parses");
+}
+
 #[test]
 fn a_line_that_is_not_utf8_fails_closed() {
     let mut input = MANIFEST_LINE.as_bytes().to_vec();
@@ -299,4 +310,14 @@ fn a_stream_over_the_line_bound_fails_closed() {
         parse_stream(input.as_slice()),
         Err(StreamParseError::TooManyLines { .. })
     ));
+}
+
+/// The format probe is held to the same line bound as the parser: a stream
+/// cannot open past it, so the probe stops there instead of reading on.
+#[test]
+fn the_format_probe_stops_at_the_line_bound() {
+    let mut input = vec![b'\n'; MAX_STREAM_LINES];
+    input.extend_from_slice(MANIFEST_LINE.as_bytes());
+
+    assert!(!starts_as_stream(&mut input.as_slice()).unwrap());
 }
