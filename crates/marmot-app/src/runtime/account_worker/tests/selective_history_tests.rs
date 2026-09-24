@@ -128,6 +128,25 @@ impl NostrReconciliationProgress for Cursor {
 }
 
 #[tokio::test]
+async fn empty_endpoint_comparison_keeps_public_no_op_result() {
+    let sdk = NostrSdkRelayClient::new(SdkClient::builder().build());
+    let subscription = NostrSubscription::Group {
+        account_id: cgka_traits::MemberId::new(vec![0xa1; 32]),
+        group_id: GroupId::new(vec![0xb2; 16]),
+        transport_group_id: vec![0xc3; 32],
+        endpoints: Vec::new(),
+        since: None,
+        attempt: SubscriptionAttempt::INITIAL,
+    };
+    let (summary, events) = sdk
+        .reconcile_subscription(subscription, &[], 0, u64::MAX, &Cursor::default())
+        .await
+        .expect("empty endpoint set remains a no-op");
+    assert_eq!(summary, Default::default());
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
 async fn unsupported_endpoint_is_reprobed_after_connection_generation_changes() {
     let _guard = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let left_database = MemoryDatabase::with_opts(MemoryDatabaseOptions {

@@ -641,9 +641,11 @@ impl NostrSdkRelayClient {
         // than carrying a stale process-lifetime rejection across sessions.
         // The app recovery owner paces its calls; direct callers own their rate.
         let endpoints = plan.endpoints;
-        let replay_endpoint = endpoints.first().cloned().ok_or_else(|| {
-            TransportAdapterError::Subscription("reconciliation has no endpoints".to_owned())
-        })?;
+        let Some(replay_endpoint) = endpoints.first().cloned() else {
+            // Preserve the public no-op result for an empty route set. It is
+            // neither relay coverage nor backend-wide incapability evidence.
+            return Ok((NostrReconciliationSummary::default(), Vec::new()));
+        };
         let subscription_id = plan.subscription_id.to_string();
         let items = local_items
             .iter()
