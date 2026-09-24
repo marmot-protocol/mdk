@@ -7,7 +7,7 @@ The production activation flag remains off.
 
 | Acceptance question | Source boundary | Focused witness |
 | --- | --- | --- |
-| Can ready local work advance while history waits? | `account_worker.rs`: bounded `Job::wait` is selected alongside commands, receive, and scheduled convergence; admission is one event per turn. | In Normal mode, a conforming local relay holds an exact request for the group creator. An admin peer publishes three valid MLS profile commits and an update in a second group. All four are durably retained before scheduled local passes. Epoch, projection, another group, send, read, and live receive are checked before the SDK result is accepted. |
+| Can ready local work advance while history waits? | `account_worker.rs`: bounded `Job::wait` is selected alongside commands, receive, and scheduled convergence; admission is one event per turn. | In Normal mode, an admin peer publishes three valid MLS profile commits and an update in a second group. A test-only account-specific hold defers the creator's scheduled pass while receive and commands continue; all four events are durably retained with the local epoch unchanged. A conforming relay then holds an exact request. After the pass hold is released, epoch, projection, another group, send, read, and live receive are checked before the SDK result is accepted. |
 | Do distinct missing known IDs get owner turns? | `bounded_recovery::prepare` chooses one known-event ticket, then the recovery owner freezes a one-obligation grant. | Two real MLS messages are published while the receiving account is signed out. The local relay refuses ordinary history. Direct retained-event checks prove both IDs missing at the first held query, the first present after its demand clears, and the second still missing at its held query. Exact request counts and frozen scopes show distinct turns with no restart of the first request. |
 | Can a broad comparison occupy the worker separately from exact acquisition? | `run_pending_epoch_backfill_reporting_arm` awaits `client.run_pending_epoch_backfill` on the serialized worker. | Unqualified in this slice. A separate real-SDK experiment observed a held NIP-77 frame and a queued send, but comparison grant selection and frame-to-worker attribution were not repeatable enough for a regression assertion. |
 
@@ -29,18 +29,22 @@ The exact-request fixture uses a five-second SDK request limit. Its order
 assertions require useful work before the result-ready notification and while
 the durable known-event request remains pending. The local convergence
 settlement override is 100 ms and the extra scheduled delay is 500 ms in the
-`test-policy-overrides` build. A four-second elapsed-time assertion from relay
-entry covers retention, local backlog and other-group progress, send/read,
-and live receive before the five-second SDK request expires. The test also allows at
+`test-policy-overrides` build. Retention and the unchanged epoch are checked
+before the exact request starts. A four-second elapsed-time assertion from
+relay entry then covers local backlog and other-group progress, send/read, and
+live receive before the five-second SDK request expires. The test allows at
 most three seconds between observed local epoch advances. These are
-controlled CI fixture values, not production latency guarantees.
+controlled ready-work fixture values, not natural-arrival scheduling fairness
+or production latency guarantees.
 
 ## Limits
 
 - The retained-epoch fixture proves progress for a creator account with three small
   valid commits from an admin peer, one other due group, and a held known-event request. It does
   not prove the approximately 36-group/11,000-event/51-member workload or
-  device latency budgets from #1947 and #1948.
+  device latency budgets from #1947 and #1948. Its test-only timer hold
+  controls when already-ready local work may run; it does not qualify how
+  naturally arriving commits interleave with a running scheduler.
 - The two-ID fixture proves consecutive owner opportunities after the retry
   gate is crossed, using the frozen ticket and attempt serial while each
   relay query is held. It does not establish a global scheduling weight or

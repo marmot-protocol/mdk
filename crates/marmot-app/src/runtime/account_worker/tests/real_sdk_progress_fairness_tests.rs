@@ -11,6 +11,33 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(feature = "test-policy-overrides")]
+struct HeldScheduledConvergence(String);
+
+#[cfg(feature = "test-policy-overrides")]
+impl HeldScheduledConvergence {
+    fn for_account(account_id_hex: &str) -> Self {
+        assert!(
+            super::super::HELD_SCHEDULED_CONVERGENCE_ACCOUNTS
+                .lock()
+                .unwrap()
+                .insert(account_id_hex.to_owned()),
+            "this account already has a scheduled-convergence hold"
+        );
+        Self(account_id_hex.to_owned())
+    }
+}
+
+#[cfg(feature = "test-policy-overrides")]
+impl Drop for HeldScheduledConvergence {
+    fn drop(&mut self) {
+        super::super::HELD_SCHEDULED_CONVERGENCE_ACCOUNTS
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ExactGate {
     reject_broad: Arc<AtomicBool>,
@@ -225,78 +252,9 @@ async fn bounded_real_sdk_retained_epochs_and_other_group_progress_before_exact_
     })
     .await
     .expect("history probe is already durably retained");
-    let exact_before = gate.exact.lock().unwrap().clone();
-    gate.hold_exact.store(true, Ordering::SeqCst);
-    let shared = runtime.shared_services();
-    let mut network_result = Box::pin(shared.bounded_result_ready.notified());
-    network_result.as_mut().enable();
-    storage
-        .request_recovery(
-            storage_sqlite::RecoveryRequest::KnownEvent {
-                group_id: groups[0].as_slice(),
-                event_id: &history_id,
-            },
-            crate::client::recovery::wall_now_ms().unwrap(),
-        )
-        .unwrap();
-    let mut entered = Box::pin(gate.entered.notified());
-    entered.as_mut().enable();
-    let mut activated = false;
-    for _ in 0..4 {
-        let (_, remaining, _) = runtime.recovery_retry_snapshot_for_test(&alice.label).await;
-        runtime
-            .advance_recovery_clock_for_test(&alice.label, remaining + Duration::from_millis(1))
-            .await;
-        if timeout(Duration::from_secs(3), entered.as_mut())
-            .await
-            .is_ok()
-        {
-            activated = true;
-            break;
-        }
-    }
-    assert!(
-        activated,
-        "separate exact request is held at the conforming relay: exact_requests={}, comparison={:?}, retry={:?}, demands={:?}",
-        gate.exact.lock().unwrap().values().sum::<usize>(),
-        {
-            let c = storage.recovery_comparison().unwrap();
-            (c.revision, c.settled_revision, c.attempt_serial)
-        },
-        storage.recovery_retry_state().unwrap(),
-        storage
-            .pending_recovery_demands()
-            .unwrap()
-            .iter()
-            .map(|d| format!("{:?}", d.cause))
-            .collect::<Vec<_>>(),
-    );
-    let held_at = TokioInstant::now();
-    let selected_hex = gate
-        .exact
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(id, count)| **count > exact_before.get(*id).copied().unwrap_or(0))
-        .map(|(id, _)| id.clone())
-        .expect("the held query names the actual selected event");
-    let selected_id: [u8; 32] = hex::decode(selected_hex).unwrap().try_into().unwrap();
-    let selected_ticket = storage
-        .pending_recovery_demands()
-        .unwrap()
-        .into_iter()
-        .find(|d| d.known_event_id == Some(selected_id))
-        .expect("held exact request belongs to an outstanding known-event ticket")
-        .ticket
-        .id;
-    let selected_scope = storage.recovery_scope_snapshots(selected_ticket).unwrap();
-    assert_eq!(selected_scope.len(), 1);
-    assert!(
-        selected_scope[0].plan.known_event_id == Some(selected_id),
-        "frozen scope selected the held event"
-    );
-    let attempt = storage.recovery_retry_state().unwrap().attempt_serial;
-    assert_eq!(selected_scope[0].attempt_serial, attempt);
+    // Defer Alice's scheduled pass without blocking her receive or command
+    // turns. All four peer commits must be retained before the measured pass.
+    let convergence_hold = HeldScheduledConvergence::for_account(&alice.account_id_hex);
     let initial = runtime
         .group_mls_state(&alice.label, &groups[1])
         .await
@@ -425,6 +383,81 @@ async fn bounded_real_sdk_retained_epochs_and_other_group_progress_before_exact_
         "other progress",
         "the second group is due but has not yet projected"
     );
+    let exact_before = gate.exact.lock().unwrap().clone();
+    gate.hold_exact.store(true, Ordering::SeqCst);
+    let shared = runtime.shared_services();
+    let mut network_result = Box::pin(shared.bounded_result_ready.notified());
+    network_result.as_mut().enable();
+    storage
+        .request_recovery(
+            storage_sqlite::RecoveryRequest::KnownEvent {
+                group_id: groups[0].as_slice(),
+                event_id: &history_id,
+            },
+            crate::client::recovery::wall_now_ms().unwrap(),
+        )
+        .unwrap();
+    let mut entered = Box::pin(gate.entered.notified());
+    entered.as_mut().enable();
+    let mut activated = false;
+    for _ in 0..4 {
+        let (_, remaining, _) = runtime.recovery_retry_snapshot_for_test(&alice.label).await;
+        runtime
+            .advance_recovery_clock_for_test(&alice.label, remaining + Duration::from_millis(1))
+            .await;
+        if timeout(Duration::from_secs(3), entered.as_mut())
+            .await
+            .is_ok()
+        {
+            activated = true;
+            break;
+        }
+    }
+    assert!(
+        activated,
+        "separate exact request is held at the conforming relay: exact_requests={}, comparison={:?}, retry={:?}, demands={:?}",
+        gate.exact.lock().unwrap().values().sum::<usize>(),
+        {
+            let c = storage.recovery_comparison().unwrap();
+            (c.revision, c.settled_revision, c.attempt_serial)
+        },
+        storage.recovery_retry_state().unwrap(),
+        storage
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .map(|d| format!("{:?}", d.cause))
+            .collect::<Vec<_>>(),
+    );
+    let held_at = TokioInstant::now();
+    let selected_hex = gate
+        .exact
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(id, count)| **count > exact_before.get(*id).copied().unwrap_or(0))
+        .map(|(id, _)| id.clone())
+        .expect("the held query names the actual selected event");
+    let selected_id: [u8; 32] = hex::decode(selected_hex).unwrap().try_into().unwrap();
+    let selected_ticket = storage
+        .pending_recovery_demands()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.known_event_id == Some(selected_id))
+        .expect("held exact request belongs to an outstanding known-event ticket")
+        .ticket
+        .id;
+    let selected_scope = storage.recovery_scope_snapshots(selected_ticket).unwrap();
+    assert_eq!(selected_scope.len(), 1);
+    assert!(
+        selected_scope[0].plan.known_event_id == Some(selected_id),
+        "frozen scope selected the held event"
+    );
+    let attempt = storage.recovery_retry_state().unwrap().attempt_serial;
+    assert_eq!(selected_scope[0].attempt_serial, attempt);
+    drop(convergence_hold);
+    // Re-evaluate the already-due timer after removing the test-only guard.
+    let _ = runtime.recovery_retry_snapshot_for_test(&alice.label).await;
     let bob_tip = runtime
         .group_mls_state(&bob.label, &groups[1])
         .await

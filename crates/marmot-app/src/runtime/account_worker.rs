@@ -1261,7 +1261,7 @@ async fn run_app_runtime_account_worker(
                     Some(command) => Some(command),
                     None => commands.recv().await,
                 }
-            }, if (!yield_to_convergence || !scheduled_convergence.has_ready())
+            }, if (!yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
                 && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
                 yield_to_bounded_admission = true;
@@ -1334,8 +1334,9 @@ async fn run_app_runtime_account_worker(
                     None => return,
                 }
             }
-            _ = scheduled_convergence.timer.as_mut(), if !yield_to_bounded_admission
-                || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
+            _ = scheduled_convergence.timer.as_mut(), if (!yield_to_bounded_admission
+                || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready))
+                && !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
                 yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
@@ -5156,6 +5157,23 @@ const CONVERGENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// After this many unsettled re-arms, fall back to error-style backoff so a
 /// never-settling input cannot keep the worker waking every ~1.1s indefinitely.
 const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
+
+#[cfg(test)]
+static HELD_SCHEDULED_CONVERGENCE_ACCOUNTS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+fn scheduled_convergence_held_for_test(account_id_hex: &str) -> bool {
+    HELD_SCHEDULED_CONVERGENCE_ACCOUNTS
+        .lock()
+        .unwrap()
+        .contains(account_id_hex)
+}
+
+#[cfg(not(test))]
+fn scheduled_convergence_held_for_test(_account_id_hex: &str) -> bool {
+    false
+}
 
 struct ScheduledConvergence {
     delay: Duration,
