@@ -31,6 +31,12 @@ approved the attempt. The saturated fixture does not establish resumption of
 that same demand after capacity returns. The fresh partial-result fixture is
 separate evidence.
 
+The existing conforming-relay worker fixture joins a comparison and thereby
+creates an `IncrementalHistory` obligation. An isolated CI-profile run observed
+two retry reservations after the known event cleared without a new frozen scope
+or comparison settlement. That failure remains under separate owner diagnosis;
+this resource slice does not establish comparison progress or general fairness.
+
 ## Accounting boundaries
 
 The relay fixture counts UTF-8 WebSocket text payloads before SDK filtering.
@@ -87,8 +93,10 @@ With the temporary isolation-candidate revision, that assertion and the
 stale-new-loss regression passed. All five real-SDK worker cases passed in a
 subsequent complete run. The first run had one comparison-case timeout while
 other builds were active; that case also passed alone on rerun. This is
-candidate evidence, not a production pin or activation decision. The SDK and
-companion reviews remain gates.
+candidate evidence, not a guarantee that the comparison fixture is stable: a
+later isolated CI-profile run failed without retries after two unfrozen owner
+reservations. Companion CI/review and comparison owner diagnosis remain gates;
+activation stays off.
 
 The fixture does not bound shared connection queues, WebSocket/parser
 allocation, one oversized in-flight event, all account concurrency, or the
