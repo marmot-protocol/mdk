@@ -271,6 +271,7 @@ async fn bounded_real_sdk_retained_epochs_and_other_group_progress_before_exact_
             .map(|d| format!("{:?}", d.cause))
             .collect::<Vec<_>>(),
     );
+    let held_at = TokioInstant::now();
     let selected_hex = gate
         .exact
         .lock()
@@ -510,6 +511,11 @@ async fn bounded_real_sdk_retained_epochs_and_other_group_progress_before_exact_
             .copied()
             .unwrap_or(0)
             + 1
+    );
+    let held_for = held_at.elapsed();
+    assert!(
+        held_for < Duration::from_secs(4),
+        "fixture progress took {held_for:?} after relay entry, beyond the four-second budget for a five-second SDK request"
     );
     assert!(
         futures::FutureExt::now_or_never(network_result.as_mut()).is_none(),

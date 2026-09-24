@@ -29,10 +29,11 @@ The exact-request fixture uses a five-second SDK request limit. Its order
 assertions require useful work before the result-ready notification and while
 the durable known-event request remains pending. The local convergence
 settlement override is 100 ms and the extra scheduled delay is 500 ms in the
-`test-policy-overrides` build. The test allows four seconds for the retained
-backlog plus the other group to progress and at most three seconds between
-observed local epoch advances. These are controlled CI fixture values, not
-production latency guarantees.
+`test-policy-overrides` build. A four-second elapsed-time assertion from relay
+entry covers retention, local backlog and other-group progress, send/read,
+and live receive before the five-second SDK request expires. The test also allows at
+most three seconds between observed local epoch advances. These are
+controlled CI fixture values, not production latency guarantees.
 
 ## Limits
 
