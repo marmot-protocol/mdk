@@ -67,6 +67,7 @@ fn inbound_wire_metadata(
 }
 
 mod key_package;
+mod publish_accounting;
 mod relay_list;
 #[cfg(feature = "sdk")]
 mod sdk_client;
@@ -326,8 +327,14 @@ pub struct NostrAdapterMetrics {
     pub inbound_events_seen: usize,
     pub inbound_events_delivered: usize,
     pub inbound_events_dropped: usize,
+    /// Logical publishes that entered a relay client. Endpoint fanout is not a
+    /// separate attempt. In flight, this can exceed successes + failures.
     pub publish_attempts: usize,
+    /// Terminal publishes whose accepted-endpoint count meets
+    /// `required_acks.max(1)`.
     pub publish_successes: usize,
+    /// Terminal errors, below-threshold outcomes (including empty acceptance),
+    /// and started publishes dropped before a terminal outcome.
     pub publish_failures: usize,
     /// Route-level NIP-77 passes attempted after ordinary subscription rebuilds.
     #[serde(default)]
@@ -554,6 +561,8 @@ pub struct NostrTransportAdapter {
     subscription_lock: Arc<Mutex<()>>,
     /// Local monotonic origin for delivery telemetry. Never `created_at`.
     monotonic_start: std::time::Instant,
+    /// Shared by [`Clone`] and by every account adapter on this relay plane.
+    publish_accounting: Arc<publish_accounting::PublishAccounting>,
 }
 
 impl NostrTransportAdapter {
@@ -566,6 +575,7 @@ impl NostrTransportAdapter {
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             subscription_lock: Arc::new(Mutex::new(())),
             monotonic_start: std::time::Instant::now(),
+            publish_accounting: publish_accounting::PublishAccounting::new(),
         }
     }
 
@@ -575,17 +585,80 @@ impl NostrTransportAdapter {
             method = "metrics",
             "snapshotting adapter metrics"
         );
-        let state = self.state.read().await;
-        let mut metrics = state.metrics.clone();
-        metrics.active_accounts = state.accounts.len();
-        metrics.active_group_subscriptions = state
-            .accounts
-            .values()
-            .map(|account| account.groups.len())
-            .sum();
-        metrics.unsubscribe_retries_pending =
-            state.pending_unsubscribes.len() + state.pending_scoped_unsubscribes.len();
+        let mut metrics = {
+            let state = self.state.read().await;
+            let mut metrics = state.metrics.clone();
+            metrics.active_accounts = state.accounts.len();
+            metrics.active_group_subscriptions = state
+                .accounts
+                .values()
+                .map(|account| account.groups.len())
+                .sum();
+            metrics.unsubscribe_retries_pending =
+                state.pending_unsubscribes.len() + state.pending_scoped_unsubscribes.len();
+            metrics
+        };
+        let publish = self.publish_accounting.snapshot();
+        metrics.publish_attempts = publish.attempts;
+        metrics.publish_successes = publish.successes;
+        metrics.publish_failures = publish.failures;
         metrics
+    }
+
+    /// Publish one already-validated event through `client` and record it.
+    ///
+    /// Callers keep account, endpoint-safety, and envelope checks. This method
+    /// does not revalidate, build a request, or fan out locally. Success
+    /// follows [`cgka_traits::TransportPublishReport::met_required_acks`]:
+    /// `accepted >= required_acks.max(1)`. Any other `Ok` outcome, any `Err`,
+    /// and dropping this future after it has started count as one failure.
+    /// Cancellation before the future is polled counts nothing. The client's
+    /// outcome or error is returned unchanged.
+    pub async fn publish_event_with_client(
+        &self,
+        client: &dyn NostrRelayClient,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        let mut attempt = self.publish_accounting.begin();
+        let outcome = client.publish_event(endpoints, event, required_acks).await;
+        match &outcome {
+            Ok(result)
+                if publish_accounting::outcome_met_required_acks(
+                    result.accepted.len(),
+                    required_acks,
+                ) =>
+            {
+                attempt.succeed();
+                tracing::debug!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "publish_event_with_client",
+                    accepted_count = result.accepted.len(),
+                    failed_count = result.failed.len(),
+                    "transport publish completed"
+                );
+            }
+            Ok(result) => {
+                attempt.fail();
+                tracing::debug!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "publish_event_with_client",
+                    accepted_count = result.accepted.len(),
+                    failed_count = result.failed.len(),
+                    "transport publish fell below the acceptance threshold"
+                );
+            }
+            Err(_) => {
+                attempt.fail();
+                tracing::warn!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "publish_event_with_client",
+                    "transport publish failed"
+                );
+            }
+        }
+        outcome
     }
 
     /// Record one privacy-safe aggregate NIP-77 result. These counters are
@@ -1385,33 +1458,14 @@ impl TransportAdapter for NostrTransportAdapter {
 
         let event = NostrTransportEvent::from_transport_message(&request.message)
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
-        self.state.write().await.record_publish_attempt();
-        let outcome = match self
-            .relay_client
-            .publish_event(request.target.endpoints(), &event, request.required_acks)
-            .await
-        {
-            Ok(outcome) => {
-                self.state.write().await.record_publish_success();
-                tracing::debug!(
-                    target: "transport_nostr_adapter::adapter",
-                    method = "publish",
-                    accepted_count = outcome.accepted.len(),
-                    failed_count = outcome.failed.len(),
-                    "transport publish completed"
-                );
-                outcome
-            }
-            Err(e) => {
-                self.state.write().await.record_publish_failure();
-                tracing::warn!(
-                    target: "transport_nostr_adapter::adapter",
-                    method = "publish",
-                    "transport publish failed"
-                );
-                return Err(e);
-            }
-        };
+        let outcome = self
+            .publish_event_with_client(
+                self.relay_client.as_ref(),
+                request.target.endpoints(),
+                &event,
+                request.required_acks,
+            )
+            .await?;
 
         Ok(TransportPublishReport {
             message_id: outcome.message_id.unwrap_or(request.message.id),
@@ -2023,18 +2077,6 @@ impl AdapterState {
         for coverage in self.account_replay_coverage.values_mut() {
             coverage.record_eose(subscription_id, relay);
         }
-    }
-
-    fn record_publish_attempt(&mut self) {
-        self.metrics.publish_attempts += 1;
-    }
-
-    fn record_publish_success(&mut self) {
-        self.metrics.publish_successes += 1;
-    }
-
-    fn record_publish_failure(&mut self) {
-        self.metrics.publish_failures += 1;
     }
 
     fn routes_for(

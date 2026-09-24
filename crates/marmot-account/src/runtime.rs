@@ -1419,7 +1419,21 @@ where
     }
 
     pub fn mark_post_join_eose(&self, group_id: &GroupId) -> AccountResult<()> {
+        for obligation in self.post_join_eose_updates(group_id)? {
+            self.persist_maintenance_obligation(&obligation)?;
+        }
+        Ok(())
+    }
+
+    /// Prepare the domain transition without writing. The exclusive account
+    /// worker can atomically persist these records with its recovery proof on
+    /// one storage connection. Already-running grace timers are left unchanged.
+    pub fn post_join_eose_updates(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Vec<MaintenanceObligation>> {
         let now = self.wall_clock.now();
+        let mut updates = Vec::new();
         for mut obligation in self.session.maintenance_obligations_for_group(group_id)? {
             if obligation.trigger == MaintenanceTrigger::PostJoin
                 && matches!(
@@ -1432,10 +1446,10 @@ where
                     now.0
                         .saturating_add(self.maintenance_timing.post_eose_grace.as_secs()),
                 ));
-                self.persist_maintenance_obligation(&obligation)?;
+                updates.push(obligation);
             }
         }
-        Ok(())
+        Ok(updates)
     }
 
     /// Only call this for authenticated, valid MLS commits or proposals.

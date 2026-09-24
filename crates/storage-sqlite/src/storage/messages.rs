@@ -79,18 +79,27 @@ impl SqliteAccountStorage {
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?;
+            let mut unknown_bounds = false;
             for id in &ids {
-                retire_transport_receipts(&conn, &MessageId::new(id.clone()))?;
+                let invalidated:bool=conn.query_row_cached("SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",[id],|r|r.get(0)).storage()?;
+                let removed = retire_transport_receipts(&conn, &MessageId::new(id.clone()))?;
+                unknown_bounds |= removed == 0 && !invalidated;
             }
-            conn.execute_cached(
-                "INSERT INTO app_epoch_backfill_intents(group_id, stalled_epoch, updated_at)
-                 SELECT group_id, MAX(epoch), ?1 FROM cgka_released_transport_receipts
-                 GROUP BY group_id
-                 ON CONFLICT(group_id) DO UPDATE SET
-                    stalled_epoch = MAX(app_epoch_backfill_intents.stalled_epoch, excluded.stalled_epoch),
-                    updated_at = excluded.updated_at",
-                params![unix_now_seconds_i64()],
-            ).storage()?;
+            let groups = conn.prepare_cached(
+                "SELECT group_id, MAX(epoch) FROM cgka_released_transport_receipts GROUP BY group_id",
+            ).storage()?.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)))
+                .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
+            for (group_id, epoch) in groups {
+                crate::account_recovery::arm_released_epoch_tx(
+                    &conn,
+                    &group_id,
+                    epoch,
+                    unix_now_seconds_i64(),
+                )?;
+            }
+            if unknown_bounds {
+                crate::account_recovery::invalidate_inventory_tx(&conn)?;
+            }
             conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
                 .storage()?;
             Ok(ids.into_iter().map(MessageId::new).collect())
@@ -301,7 +310,18 @@ impl MessageStorage for SqliteAccountStorage {
                     "released transport receipt journal is full".into(),
                 ));
             }
-            retire_transport_receipts(&conn, &record.id)?;
+            let invalidated: bool = conn.query_row_cached(
+                "SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",
+                [record.id.as_slice()], |row| row.get(0),
+            ).storage()?;
+            if retire_transport_receipts(&conn, &record.id)? == 0 && !invalidated {
+                crate::account_recovery::invalidate_inventory_tx(&conn)?;
+            }
+            conn.execute_cached(
+                "UPDATE cgka_released_transport_receipts SET inventory_invalidated=1 WHERE id=?1",
+                [record.id.as_slice()],
+            )
+            .storage()?;
             delete_message_on_connection(&conn, &record.id)
         };
         if self.connection.is_current_thread_transaction_owner() {
@@ -1055,18 +1075,13 @@ fn update_message_state_on_connection(
     Ok(())
 }
 
-fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
+fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<usize> {
     conn.execute_cached(
         "DELETE FROM seen_events WHERE event_id = ?1",
         params![hex::encode(id.as_slice())],
     )
     .storage()?;
-    conn.execute_cached(
-        "DELETE FROM transport_reconciliation_items WHERE event_id = ?1",
-        params![id.as_slice()],
-    )
-    .storage()?;
-    Ok(())
+    crate::account_recovery::delete_inventory_tx(conn, "event_id = ?1", params![id.as_slice()])
 }
 
 /// Delete a protocol message and its not-yet-acknowledged application event on

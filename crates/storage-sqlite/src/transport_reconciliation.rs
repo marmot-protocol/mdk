@@ -58,29 +58,24 @@ fn route_state_floor_tx(
     route_id: &[u8],
     configured_floor: i64,
 ) -> StorageResult<i64> {
-    tx.execute_cached(
-        "INSERT INTO transport_reconciliation_route_state (
+    let floor = tx
+        .query_row_cached(
+            "INSERT INTO transport_reconciliation_route_state (
              route_kind, route_id, inventory_since
          ) VALUES (?1, ?2, ?3)
          ON CONFLICT(route_kind, route_id) DO UPDATE SET
-             inventory_since = MAX(inventory_since, excluded.inventory_since)",
+             inventory_since = MAX(inventory_since, excluded.inventory_since)
+         RETURNING inventory_since",
+            params![route_kind, route_id, configured_floor],
+            |row| row.get(0),
+        )
+        .storage()?;
+    crate::account_recovery::delete_inventory_tx(
+        tx,
+        "route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
         params![route_kind, route_id, configured_floor],
-    )
-    .storage()?;
-    tx.execute_cached(
-        "DELETE FROM transport_reconciliation_items
-         WHERE route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
-        params![route_kind, route_id, configured_floor],
-    )
-    .storage()?;
-    tx.query_row_cached(
-        "SELECT inventory_since
-         FROM transport_reconciliation_route_state
-         WHERE route_kind = ?1 AND route_id = ?2",
-        params![route_kind, route_id],
-        |row| row.get(0),
-    )
-    .storage()
+    )?;
+    Ok(floor)
 }
 
 fn compact_route_tx(tx: &Transaction<'_>, route_kind: i64, route_id: &[u8]) -> StorageResult<()> {
@@ -108,12 +103,11 @@ fn compact_route_tx(tx: &Transaction<'_>, route_kind: i64, route_id: &[u8]) -> S
         return Ok(());
     };
     let compacted_floor = overflow_cutoff.saturating_add(1);
-    tx.execute_cached(
-        "DELETE FROM transport_reconciliation_items
-         WHERE route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
+    crate::account_recovery::delete_inventory_tx(
+        tx,
+        "route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
         params![route_kind, route_id, compacted_floor],
-    )
-    .storage()?;
+    )?;
     tx.execute_cached(
         "UPDATE transport_reconciliation_route_state
          SET inventory_since = MAX(inventory_since, ?3)
@@ -170,6 +164,39 @@ impl SqliteAccountStorage {
             tx.commit().storage()?;
             Ok(())
         })
+    }
+
+    /// Exact worker-retained membership, after the caller synchronizes release
+    /// receipts. SDK seen caches and successful fetches are not admission proof.
+    /// Inventory eviction may return false conservatively for an older copy.
+    pub fn retained_recovery_event(
+        &self,
+        route: &TransportReconciliationRoute,
+        event_id: &[u8; 32],
+        since: Option<u64>,
+        until: u64,
+    ) -> StorageResult<bool> {
+        let (kind, route_id) = route.storage_key();
+        let bound = |value| {
+            i64::try_from(value).map_err(|_| {
+                StorageError::Serialization("recovery timestamp exceeds SQLite range".into())
+            })
+        };
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM transport_reconciliation_items
+             WHERE route_kind=?1 AND route_id=?2 AND event_id=?3
+             AND created_at >= ?4 AND created_at <= ?5)",
+                params![
+                    kind,
+                    route_id,
+                    event_id.as_slice(),
+                    bound(since.unwrap_or(0))?,
+                    bound(until)?
+                ],
+                |row| row.get(0),
+            )
+            .storage()
     }
 
     /// Read the advisory replay position of an existing account-owned route.
@@ -523,6 +550,139 @@ mod tests {
     }
 
     #[test]
+    fn recovery_inventory_retirement_fences_are_atomic_for_every_delete_path() {
+        use crate::storage::test_support::{gid, sample_group, sample_message};
+        use cgka_traits::{
+            EpochId,
+            storage::{GroupStorage, MessageStorage},
+        };
+        for path in 0..5 {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let group = sample_group(gid(1), 1, 1);
+            let message = sample_message(
+                cgka_traits::MessageId::new(vec![7; 32]),
+                group.id.clone(),
+                1,
+            );
+            store.ensure_account_projection("alice").unwrap();
+            store.put_group(&group).unwrap();
+            store.put_message(&message).unwrap();
+            store
+                .put_transport_group_route(&[4; 32], &group.id, EpochId(1))
+                .unwrap();
+            let route = TransportReconciliationRoute::Group([4; 32]);
+            let now = unix_now_secs().unwrap();
+            let item = TransportReconciliationItem {
+                event_id: message.id.as_slice().try_into().unwrap(),
+                created_at: now,
+            };
+            store
+                .record_transport_reconciliation_item(&route, &item)
+                .unwrap();
+            let before = store.recovery_revision_fence().unwrap();
+            let retire = || match path {
+                0 => store.release_message_for_replay(&message),
+                1 => store.delete_group(&group.id),
+                2 => store.delete_transport_group_route(&[4; 32]),
+                3 => store.delete_transport_group_routes_below_epoch(&group.id, EpochId(2)),
+                _ => store.delete_transport_group_routes_for_group(&group.id),
+            };
+            store.lock().unwrap().execute_batch("CREATE TRIGGER reject_recovery_fence BEFORE UPDATE ON account_recovery_state BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+            assert!(
+                retire().is_err(),
+                "path {path} must include the invalidation write"
+            );
+            assert_eq!(store.recovery_revision_fence().unwrap(), before);
+            assert!(
+                store
+                    .retained_recovery_event(&route, &item.event_id, None, now)
+                    .unwrap()
+            );
+            assert!(store.get_group(&group.id).is_ok());
+            assert!(store.get_message(&message.id).is_ok());
+            assert_eq!(store.list_transport_group_routes().unwrap().len(), 1);
+            store
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TRIGGER reject_recovery_fence")
+                .unwrap();
+            retire().unwrap();
+            assert!(
+                !store
+                    .retained_recovery_event(&route, &item.event_id, None, now)
+                    .unwrap()
+            );
+            assert_eq!(
+                store.recovery_revision_fence().unwrap().inventory_revision,
+                before.inventory_revision + 1
+            );
+            if path != 1 {
+                retire().unwrap();
+                assert_eq!(
+                    store.recovery_revision_fence().unwrap().inventory_revision,
+                    before.inventory_revision + 1,
+                    "idempotent deletion must not invalidate proof again"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_known_event_proof_requires_retained_route_and_frozen_window() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let now = unix_now_secs().unwrap();
+        let route = TransportReconciliationRoute::Group([4; 32]);
+        let item = TransportReconciliationItem {
+            event_id: [7; 32],
+            created_at: now,
+        };
+        assert!(
+            !store
+                .retained_recovery_event(&route, &item.event_id, None, now)
+                .unwrap()
+        );
+        store
+            .record_transport_reconciliation_item(&route, &item)
+            .unwrap();
+        assert!(
+            store
+                .retained_recovery_event(&route, &item.event_id, Some(now), now)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .retained_recovery_event(
+                    &TransportReconciliationRoute::Inbox,
+                    &item.event_id,
+                    None,
+                    now
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .retained_recovery_event(&route, &item.event_id, None, now - 1)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .retained_recovery_event(&route, &item.event_id, Some(now + 1), now + 2)
+                .unwrap()
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM transport_reconciliation_items", [])
+            .unwrap();
+        assert!(
+            !store
+                .retained_recovery_event(&route, &item.event_id, None, now)
+                .unwrap(),
+            "released or evicted copy is not admission proof"
+        );
+    }
+
+    #[test]
     fn reconciliation_items_are_route_scoped_deduplicated_and_ordered() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let inbox = TransportReconciliationRoute::Inbox;
@@ -625,6 +785,7 @@ mod tests {
             tx.commit().unwrap();
         }
 
+        let before_revision = store.recovery_revision_fence().unwrap().inventory_revision;
         let inventory = store
             .transport_reconciliation_inventory(&route, now)
             .unwrap();
@@ -644,6 +805,10 @@ mod tests {
             .transport_reconciliation_inventory(&route, now)
             .unwrap();
         assert_eq!(reopened, inventory);
+        assert_eq!(
+            store.recovery_revision_fence().unwrap().inventory_revision,
+            before_revision + 1
+        );
     }
 
     #[test]
@@ -676,5 +841,62 @@ mod tests {
             id[24..].copy_from_slice(&value.to_be_bytes());
             id
         }
+    }
+    #[test]
+    fn recovery_inventory_fence_is_atomic_with_expiration_and_ignores_positive_admission() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let route = TransportReconciliationRoute::Inbox;
+        let now = unix_now_secs().unwrap();
+        let item = TransportReconciliationItem {
+            event_id: [7; 32],
+            created_at: now,
+        };
+        let before = store.recovery_revision_fence().unwrap();
+        store
+            .record_transport_reconciliation_item(&route, &item)
+            .unwrap();
+        store
+            .record_transport_reconciliation_item(&route, &item)
+            .unwrap();
+        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_inventory_fence BEFORE UPDATE ON account_recovery_state
+            BEGIN SELECT RAISE(ABORT,'injected'); END;",
+            )
+            .unwrap();
+        let expired_at = now + TRANSPORT_RECONCILIATION_RETENTION_SECS + 1;
+        assert!(
+            store
+                .transport_reconciliation_inventory(&route, expired_at)
+                .is_err()
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_inventory_fence")
+            .unwrap();
+        assert_eq!(
+            store
+                .transport_reconciliation_inventory(&route, now)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        assert!(
+            store
+                .transport_reconciliation_inventory(&route, expired_at)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            store.recovery_revision_fence().unwrap().inventory_revision,
+            before.inventory_revision + 1
+        );
     }
 }

@@ -2442,6 +2442,93 @@ mod otlp {
             assert_eq!(point.count, 6);
             assert_eq!(point.sum, Some(123.0));
         }
+
+        #[tokio::test]
+        async fn account_publish_counters_round_trip_as_unlabeled_cumulative_sums() {
+            use std::time::UNIX_EPOCH;
+
+            use crate::config::{RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig};
+            use crate::relay_plane::publish_accounting_tests::{
+                AccountPublishFixture, PublishScript,
+            };
+
+            let fixture = AccountPublishFixture::activate().await;
+            let exporter = fixture
+                .plane
+                .telemetry_exporter(
+                    RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+                        .with_runtime_config(RelayTelemetryRuntimeConfig {
+                            otlp_endpoint: Some("https://otlp.example/v1/metrics".into()),
+                            authorization_bearer_token: Some("token".into()),
+                            resource: Some(test_resource()),
+                        }),
+                    crate::product_analytics::test_permit(),
+                )
+                .expect("opted-in exporter");
+            let (primed, _) = exporter.since_baseline(exporter.build_batch(None).await);
+            let primed_value = |name: &str| match primed
+                .points
+                .iter()
+                .find(|point| point.name == name)
+                .map(|point| &point.value)
+            {
+                Some(ExportMetricValue::Counter(value)) => *value,
+                other => panic!("primed {name} should be a counter, got {other:?}"),
+            };
+            assert_eq!(primed_value(metric_names::PUBLISH_ATTEMPTS), 0);
+            assert_eq!(primed_value(metric_names::PUBLISH_SUCCESSES), 0);
+            assert_eq!(primed_value(metric_names::PUBLISH_FAILURES), 0);
+
+            fixture
+                .publish(PublishScript::Accept, 1)
+                .await
+                .expect("success");
+            fixture
+                .publish(PublishScript::Error, 1)
+                .await
+                .expect_err("failure");
+            let (delta, started) = exporter.since_baseline(exporter.build_batch(None).await);
+            let start_ns = started
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let request = to_request(
+                &delta,
+                &test_resource(),
+                start_ns,
+                start_ns.saturating_add(1),
+            );
+            let decoded = ExportMetricsServiceRequest::decode(request.encode_to_vec().as_slice())
+                .expect("prost round trip");
+            let sum = |name: &str| {
+                let metric = decoded.resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .iter()
+                    .find(|metric| metric.name == name)
+                    .unwrap_or_else(|| panic!("missing {name}"));
+                let sum = match &metric.data {
+                    Some(metric::Data::Sum(sum)) => sum,
+                    other => panic!("{name} should be a sum, got {other:?}"),
+                };
+                assert!(sum.is_monotonic, "{name} must be monotonic");
+                assert_eq!(
+                    sum.aggregation_temporality,
+                    AggregationTemporality::Cumulative as i32
+                );
+                let point = &sum.data_points[0];
+                assert!(
+                    point.attributes.is_empty(),
+                    "{name} data point must not carry relay, failure, or identity attributes"
+                );
+                match point.value {
+                    Some(number_data_point::Value::AsInt(value)) => value,
+                    ref other => panic!("{name} value {other:?}"),
+                }
+            };
+            assert_eq!(sum(metric_names::PUBLISH_ATTEMPTS), 2);
+            assert_eq!(sum(metric_names::PUBLISH_SUCCESSES), 1);
+            assert_eq!(sum(metric_names::PUBLISH_FAILURES), 1);
+        }
     }
 }
 

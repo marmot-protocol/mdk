@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- Add qualified recovery scope checkpoints, independent completion predicates, exact loss
+  acknowledgment guards and atomic inventory invalidation. Schema 0093 preserves existing
+  demand/retry evidence and bounds serialized explicit-history callers to one row. This
+  storage slice remains gated on coordinated runtime owner integration. (#1946)
+
+- Add schema 0092 recovery-ledger groundwork: migrate overflow and epoch demand, preserve
+  release/maintenance/inventory evidence, and provide restart-safe attempt reservations.
+  Legacy storage APIs use the new ledger. Runtime owner integration is still required. (#1946)
+
 ## 0.10.4 - 2026-09-20
 
 ### Fixed

@@ -88,6 +88,8 @@ binding.
 | `cross_relay_spread_ms` | histogram | `RelayDeliverySpread` (global, not per-relay) | population delivery jitter → quiescence |
 | `message_observed` / `message_corroborated` / `message_single_source` | counters | `RelayDeliverySpread` population counts | coverage health |
 
+The catalogue row `relay_publish_accept` / `relay_publish_reject` (by kind) is not what ships today. The implemented series are the unlabeled device-wide counters `relay_publish_attempts`, `relay_publish_successes`, and `relay_publish_failures`. One logical attempt is one admitted `TransportAdapter` publish, shared by the direct adapter and every account adapter on the relay plane, not one per endpoint or per application retry. Success means the relay client returned an outcome whose accepted count is at least `max(required_acks, 1)`. Errors, partial acceptance below that threshold, empty acceptance, and dropping a started call count as failures. Rejection before the client is invoked, and a future dropped before it is polled, count as nothing. Local fanout happens after that terminal count and does not change it. Those three series are relay diagnostics; application publish metrics (`app_outbound_message_publish_*` and the other app-performance counters) stay separate. Per-relay and per-kind publish labels remain future work.
+
 `cross_relay_spread_ms` is exported as a population-level distribution (no relay label — it is inherently cross-relay), and
 is the direct input to the static quiescence decision in `relay-delivery-telemetry.md`. The per-relay metrics are the
 ranking signal. Per-relay attribution of the latency histograms and the first-deliverer rate is **recorded today**,

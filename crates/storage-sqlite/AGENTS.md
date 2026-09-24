@@ -20,6 +20,7 @@ not "fix" it into the per-account database.
 | `src/storage/` | Marmot storage tables by concern. |
 | `src/storage/snapshots/` | Snapshot/checkpoint capture, restoration and the consistent replay-state fingerprint; see its local `AGENTS.md`. |
 | `src/openmls_storage/` | Custom OpenMLS storage adapter. |
+| `src/account_recovery.rs` | Account-private recovery ledger, evidence import and durable retry reservations; `account_recovery/` holds typed joins, frozen scope checkpoints and loss acknowledgment. The app owner supplies validated facts and owns execution policy. |
 | `src/account_projection.rs` | Account-level event projection. |
 | `src/chat_list.rs` | Chat-list projection, including avatar URLs. |
 | `src/attachment_acquisition.rs` | Source-bound durable acquisition jobs, leased attempts, protected retained bytes, bounded worker demand and explicit-removal suppression. Network orchestration stays in marmot-app. |

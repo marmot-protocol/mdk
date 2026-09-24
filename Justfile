@@ -366,6 +366,9 @@ app-stack-campaign out *args:
 app-stack-campaign-contract:
     python3 -m unittest discover -s scripts/tests -p 'test_app_stack_campaign.py'
 
+audit-otlp-receiver-contract:
+    uv run --with 'jsonschema==4.25.1' python -m unittest discover -s scripts/audit-otlp-receiver -p 'test_receiver.py' -v
+
 # Prove that the generic nightly lane restores exactly the generated batches
 # intentionally removed from the PR smoke lane.
 simulator-filter-contract:
@@ -426,7 +429,7 @@ focused-convergence-regressions:
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=restarted_committer_without_source_anchor_halts_through_convergence)'
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=verified_welcome_repair_survives_the_next_convergence_drain)'
     cargo nextest run -p cgka-engine --test record_write_atomicity --locked -E 'test(=leave_persistence_failure_rolls_back_every_transactional_write)'
-    cargo nextest run -p marmot-app --lib --locked -E 'test(=tests::explicit_catch_up_arms_and_replays_without_later_traffic)'
+    cargo nextest run -p marmot-app --lib --locked -E 'test(=tests::explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic)'
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork)'
 
 # Capability-level entry points used by the scheduled workflows. PR checks
@@ -652,6 +655,6 @@ release-profile-gate:
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate check clippy test-convergence-policy-pin test

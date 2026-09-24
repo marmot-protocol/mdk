@@ -21,6 +21,7 @@ for reconnect/backoff and relay status mechanics.
 | Path | Owns |
 | --- | --- |
 | `src/lib.rs` | Adapter implementation, relay-client boundary, routing state, lifecycle metrics. |
+| `src/publish_accounting.rs` | Shared logical publish counters and the cancellation guard used by direct and account publish paths. |
 | `src/key_package.rs` | Marmot kind `30443` KeyPackage event building/publishing (`NostrKeyPackagePublication`, `NostrKeyPackagePublisher`). |
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |

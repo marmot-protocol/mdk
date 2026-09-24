@@ -53,12 +53,15 @@ pub struct RelayTelemetryRollup {
     pub connection_attempts: u64,
     /// Device-wide successful relay connections.
     pub connection_successes: u64,
-    /// Device-wide publish attempts (aggregate; per-relay/per-kind publish
-    /// attribution is a future adapter enhancement, see `relay-observability.md`).
+    /// Device-wide logical publish attempts that entered a relay client.
+    /// Per-relay and per-kind attribution remains future work; see
+    /// `relay-observability.md`.
     pub publish_attempts: u64,
-    /// Device-wide accepted publishes.
+    /// Device-wide publishes whose accepted-endpoint count met
+    /// `required_acks.max(1)`.
     pub publish_successes: u64,
-    /// Device-wide failed publishes.
+    /// Device-wide publish errors, below-threshold outcomes, and started
+    /// publishes dropped before a terminal outcome.
     pub publish_failures: u64,
     /// Optional engine-side reorg metrics, folded in once the parallel
     /// `observed_reorg_rate` workstream lands. `None` until then.

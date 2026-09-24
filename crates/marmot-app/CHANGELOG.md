@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- Restrict the account-local overflow marker writer to durable loss evidence. The account
+  mutation path imports that evidence into recovery demand; runtime dispatch consolidation
+  remains separate integration work. (#1946)
+
+### Fixed
+
+- Count account-scoped relay publishes on the shared device-wide publish counters, including partial acceptance and publishes dropped in flight. (#1950)
+
 ## 0.10.4 - 2026-09-20
 
 ### Fixed
