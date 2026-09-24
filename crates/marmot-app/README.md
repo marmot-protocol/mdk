@@ -194,7 +194,11 @@ starts applying protocol format validation to bytes already committed in live
 groups. Nothing coordinates ids between applications, so treat the range as
 first-come and version the payload.
 
-Payloads are capped at `APP_COMPONENT_DATA_MAX_LEN` (4096 bytes). Component
+Payloads are capped at `APP_COMPONENT_DATA_MAX_LEN` (4096 bytes). Before staging
+an application update, MDK limits the resulting application-owned state to
+32 entries and 8192 encoded bytes, including each entry's id and TLS length
+prefix. Replacements count once; empty values still occupy a slot. These are
+local authoring limits; unknown optional state received from peers stays opaque. Component
 state is re-encoded into the GroupContext of every later commit and into the
 GroupInfo of every Welcome, so an oversized value inflates every commit and can
 push a Welcome past a relay's event-size limit — after the commit is already

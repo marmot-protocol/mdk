@@ -1101,13 +1101,7 @@ fn validate_current_profile_group_context(
     }
 
     for entry in dictionary.dictionary().entries() {
-        let component_id = entry.id();
-        if is_known_group_component(component_id) {
-            validate_app_component_update(&AppComponentData {
-                component_id,
-                data: entry.data().to_vec(),
-            })?;
-        }
+        validate_app_component_bytes(entry.id(), entry.data())?;
     }
     for component_id in &required_components.ids {
         if CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(component_id) {
@@ -1587,6 +1581,7 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         APP_COMPONENTS_COMPONENT_ID
         | SAFE_AAD_COMPONENT_ID
         | ACCOUNT_IDENTITY_PROOF_COMPONENT_ID
+        | MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID
         | GROUP_PROFILE_COMPONENT_ID
         | GROUP_ADMIN_POLICY_COMPONENT_ID => Err(EngineError::Other(
             "group creation request cannot override engine-owned app components".into(),
@@ -1639,6 +1634,9 @@ fn validate_app_component_bytes(
         )),
         ACCOUNT_IDENTITY_PROOF_COMPONENT_ID => Err(EngineError::Other(
             "account identity proof is LeafNode-only and cannot be updated in GroupContext".into(),
+        )),
+        MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID => Err(EngineError::Other(
+            "multi-device join authorization is ephemeral-only and cannot be stored in GroupContext".into(),
         )),
         GROUP_PROFILE_COMPONENT_ID => decode_group_profile(data).map(|_| ()),
         GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(data).map(|_| ()),
@@ -1997,6 +1995,47 @@ mod tests {
 
         assert!(validate_initial_app_component(&component).is_err());
         assert!(validate_app_component_update(&component).is_err());
+    }
+
+    #[test]
+    fn ephemeral_state_is_rejected() {
+        let component = AppComponentData {
+            component_id: MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
+            data: vec![0; 104],
+        };
+        assert!(validate_initial_app_component(&component).is_err());
+        assert!(validate_app_component_update(&component).is_err());
+        assert!(
+            validate_standalone_app_data_update(&AppDataUpdateProposal::update(
+                component.component_id,
+                component.data.clone(),
+            ))
+            .is_err()
+        );
+
+        let extensions = current_profile_extensions(
+            [
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+            ],
+            true,
+            false,
+            &[ExtensionType::AppDataDictionary],
+            &[ProposalType::AppDataUpdate],
+        );
+        let mut dictionary = extensions
+            .app_data_dictionary()
+            .unwrap()
+            .dictionary()
+            .clone();
+        dictionary.insert(component.component_id, component.data);
+        let extensions = Extensions::from_vec(vec![
+            Extension::RequiredCapabilities(extensions.required_capabilities().unwrap().clone()),
+            Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+        ])
+        .unwrap();
+        let error = validate_current_profile_group_context(&extensions, "test").unwrap_err();
+        assert!(error.to_string().contains("ephemeral-only"));
     }
 
     #[test]
