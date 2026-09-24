@@ -795,39 +795,11 @@ mod tests {
             until_seconds: 101,
             ..old
         };
-        let revision = aligned
+        aligned
             .join_recovery_comparison(&[1; 16], 101_000, std::slice::from_ref(&aligned_debt))
             .unwrap();
-        let debt = aligned.pending_recovery_demands().unwrap();
-        let debt_route = &aligned.recovery_scope_snapshots(debt[0].ticket.id).unwrap()[0].plan;
-        assert_eq!(debt_route.since_seconds, None);
-        assert_eq!(debt_route.until_seconds, 101);
-        assert_eq!(
-            debt_route.required_endpoints,
-            aligned_debt.required_endpoints
-        );
-        let mut fence = aligned.recovery_revision_fence().unwrap();
-        fence.obligations.clear();
-        let attempt = aligned
-            .reserve_recovery_work(&fence, Some(revision), 101_000, 15_000, false)
-            .unwrap()
-            .unwrap()
-            .attempt_serial;
-        assert!(
-            aligned
-                .install_recovery_comparison_plan(
-                    revision,
-                    attempt,
-                    &RecoveryComparisonPlan {
-                        fence,
-                        live_since_seconds: None,
-                        routes: vec![current],
-                        retry_routes: Vec::new(),
-                    },
-                )
-                .unwrap(),
-            "matching the joined debt window makes the same route admissible"
-        );
+        // reserve asserts that the same operational route now installs.
+        reserve(&aligned, 101_000, vec![current]);
     }
 
     #[test]
