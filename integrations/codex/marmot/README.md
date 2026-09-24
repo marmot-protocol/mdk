@@ -135,7 +135,7 @@ instruction alive across thread resets and Codex-side context compaction.
 | `MARMOT_HARNESS_EXECUTION_PROFILE` | `inherit` | Shared `inherit`, `autonomous`, or `unrestricted` execution policy |
 | `WN_CODEX_IDLE_TIMEOUT_SECS` | `120` | Presentation-idle interval before liveness is reported as unknown; does not stop the invocation |
 | `WN_CODEX_TIMEOUT_SECS` | `3600` | Total invocation cap |
-| `WN_CODEX_REQUEST_TIMEOUT_SECS` | `30` | Control request timeout |
+| `WN_CODEX_REQUEST_TIMEOUT_SECS` | `30` | Control connect/write and ordinary response timeout; inbound media-download responses have a sixteen-minute minimum |
 | `WN_CODEX_MAX_REPLY_BYTES` | `30000` | Durable reply chunk limit |
 | `WN_CODEX_MAX_PENDING_PER_GROUP` | `4` | Per-group prompt queue limit |
 | `WN_CODEX_MAX_ATTACHMENTS` | `8` | Maximum inbound files in one turn |
@@ -173,6 +173,8 @@ text is returned to Marmot.
 ## Inbound attachments
 
 All attachments from one Marmot message are downloaded in message order, copied into one owner-only temporary batch, and passed to one Codex turn. The connector revalidates every staged file immediately before starting Codex and supplies an ordered JSON manifest in the prompt. The manifest marks attachment content and metadata as untrusted data and gives Codex the private path, connector-sanitized staged file name, declared media type, byte size, and source ordinal. Delivery is selected from file bytes, never from sender-controlled MIME strings or extensions:
+
+The ordinary 30-second control timeout applies to socket connection and request writing, but not to waiting for a media download: that response gets at least sixteen minutes. This permits the runtime's full fifteen-minute acquisition plus local validation without making unrelated control calls hang for minutes. A failed download still rejects the whole batch before Codex starts; this timeout change does not weaken file or ciphertext validation.
 
 | File class | Byte-level recognition | Codex delivery |
 | --- | --- | --- |

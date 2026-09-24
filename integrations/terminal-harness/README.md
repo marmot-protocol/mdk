@@ -106,9 +106,14 @@ All connectors:
 - reconcile text-only final-delivery acknowledgements idempotently before later
   FIFO work, without replaying the backend invocation;
 - preserve every inbound media reference in message order, download the complete batch through `wn-agent`, and expose one validated private staging copy per item at the backend boundary;
+- keep short connect/write and ordinary control-response deadlines, but allow a media-download response at least sixteen minutes so the runtime's fifteen-minute acquisition can finish before the connector deadline;
 - reject a complete attachment batch before backend invocation when any download, regular-file/ownership check, count limit, or aggregate-byte limit fails;
 - remove batch copies after every terminal path and reconcile stale connector-owned batch directories on startup;
 - keep diagnostics free of identifiers, paths, prompts, attachment names, and backend output.
+
+Download timeouts, connector rejections, and local file-validation failures have
+distinct privacy-safe pre-backend replies. The connector never forwards a
+server-provided error string or attachment metadata into those replies.
 
 ## Chat Commands
 

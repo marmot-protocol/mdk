@@ -33,6 +33,11 @@ pub(crate) struct DownloadedMedia {
     pub(crate) size_bytes: u64,
 }
 
+// Marmot's encrypted-media acquisition has a fifteen-minute global transfer
+// deadline. The ordinary control timeout (30 seconds by default) must not
+// abort it before wn-agent can validate and return the result.
+const MIN_MEDIA_DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16 * 60);
+
 impl ControlClient {
     pub(crate) fn new(
         socket: PathBuf,
@@ -149,13 +154,14 @@ impl ControlClient {
         media: AgentControlMediaRef,
     ) -> Result<DownloadedMedia> {
         match self
-            .call(
+            .call_with_response_timeout(
                 "download_media",
                 AgentControlRequest::DownloadMedia {
                     account_id_hex: account_ref.to_owned(),
                     group_id_hex: group_ref.to_owned(),
                     media,
                 },
+                self.media_download_response_timeout(),
             )
             .await?
         {
@@ -354,6 +360,16 @@ impl ControlClient {
         method: &'static str,
         request: AgentControlRequest,
     ) -> Result<AgentControlResponse> {
+        self.call_with_response_timeout(method, request, self.request_timeout)
+            .await
+    }
+
+    async fn call_with_response_timeout(
+        &self,
+        method: &'static str,
+        request: AgentControlRequest,
+        response_timeout: Duration,
+    ) -> Result<AgentControlResponse> {
         let stream = timeout(self.request_timeout, UnixStream::connect(&self.socket))
             .await
             .map_err(|_| HarnessError::ControlTimedOut { method })??;
@@ -366,7 +382,7 @@ impl ControlClient {
         }
         write_request(method, &mut write_half, &envelope, self.request_timeout).await?;
         let response = timeout(
-            self.request_timeout,
+            response_timeout,
             read_envelope::<_, AgentControlResponse>(&mut reader),
         )
         .await
@@ -379,6 +395,11 @@ impl ControlClient {
     fn next_request_id(&self) -> String {
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{}-{}-{seq}", self.request_prefix, std::process::id())
+    }
+
+    fn media_download_response_timeout(&self) -> Duration {
+        self.request_timeout
+            .max(MIN_MEDIA_DOWNLOAD_RESPONSE_TIMEOUT)
     }
 }
 
@@ -478,6 +499,127 @@ mod tests {
             "wn-pi",
         );
         assert!(client.next_request_id().starts_with("wn-pi-"));
+    }
+
+    #[test]
+    fn media_download_response_has_a_separate_budget() {
+        let client = ControlClient::new(
+            PathBuf::from("/unused"),
+            None,
+            Duration::from_secs(30),
+            "wn-test",
+        );
+        assert_eq!(
+            client.media_download_response_timeout(),
+            Duration::from_secs(16 * 60)
+        );
+        assert_eq!(client.request_timeout, Duration::from_secs(30));
+
+        let custom = ControlClient::new(
+            PathBuf::from("/unused"),
+            None,
+            Duration::from_secs(20 * 60),
+            "wn-test",
+        );
+        assert_eq!(
+            custom.media_download_response_timeout(),
+            Duration::from_secs(20 * 60)
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_media_reply_can_outlast_ordinary_control_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let request: AgentControlEnvelope<AgentControlRequest> =
+                read_envelope(&mut reader).await.unwrap().unwrap();
+            assert!(matches!(
+                request.payload,
+                AgentControlRequest::DownloadMedia { .. }
+            ));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let response = AgentControlEnvelope::request(
+                request.id,
+                AgentControlResponse::MediaDownloaded {
+                    path: "/private/file.pdf".to_owned(),
+                    media_type: "application/pdf".to_owned(),
+                    file_name: "file.pdf".to_owned(),
+                    size_bytes: 7,
+                },
+            );
+            write_frame(&mut write_half, &response).await.unwrap();
+        });
+
+        let client = ControlClient::new(socket, None, Duration::from_millis(500), "wn-test");
+        let response = client
+            .call_with_response_timeout(
+                "download_media",
+                AgentControlRequest::DownloadMedia {
+                    account_id_hex: "account".to_owned(),
+                    group_id_hex: "group".to_owned(),
+                    media: AgentControlMediaRef {
+                        media_type: "application/pdf".to_owned(),
+                        file_name: "file.pdf".to_owned(),
+                        ciphertext_sha256: "ciphertext".to_owned(),
+                        plaintext_sha256: "plaintext".to_owned(),
+                        nonce_hex: "nonce".to_owned(),
+                        version: "v1".to_owned(),
+                        source_epoch: 1,
+                        locators: Vec::new(),
+                        dim: None,
+                        thumbhash: None,
+                    },
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            AgentControlResponse::MediaDownloaded { .. }
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_control_reply_keeps_short_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let request: AgentControlEnvelope<AgentControlRequest> =
+                read_envelope(&mut reader).await.unwrap().unwrap();
+            assert!(matches!(request.payload, AgentControlRequest::AccountList));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let response = AgentControlEnvelope::request(
+                request.id,
+                AgentControlResponse::AccountList {
+                    accounts: Vec::new(),
+                },
+            );
+            let _ = write_frame(&mut write_half, &response).await;
+        });
+
+        let client = ControlClient::new(socket, None, Duration::from_millis(500), "wn-test");
+        let error = client
+            .call("account_list", AgentControlRequest::AccountList)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HarnessError::ControlTimedOut {
+                method: "account_list"
+            }
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]
