@@ -337,6 +337,12 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
             .unwrap()
     );
     let comparison_before = storage.recovery_comparison().unwrap();
+    let fence_before = storage.recovery_revision_fence().unwrap();
+    assert_ne!(
+        comparison_before.blocked_route_revision,
+        Some(fence_before.route_revision),
+        "the conforming relay must leave comparison selectable"
+    );
     let telemetry_before = app.relay_telemetry().await.metrics.reconciliation_attempts;
     let prior_routes = comparison_before
         .plan
@@ -352,6 +358,9 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
         )
         .unwrap();
     assert!(storage.recovery_comparison().unwrap().pending());
+    let shared = runtime.shared_services();
+    let mut bounded_finished = Box::pin(shared.bounded_recovery_finished.notified());
+    bounded_finished.as_mut().enable();
     storage
         .request_recovery(
             storage_sqlite::RecoveryRequest::KnownEvent {
@@ -392,8 +401,20 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
     let comparison_settled = storage.recovery_comparison().unwrap().settled_revision
         > comparison_before.settled_revision;
     if !known_cleared || !comparison_settled {
+        if known_cleared {
+            timeout(Duration::from_secs(10), bounded_finished.as_mut())
+                .await
+                .expect("the selected bounded KnownEvent attempt finishes before retry");
+        }
+        let (retry_before_next, remaining, comparison_pending) =
+            runtime.recovery_retry_snapshot_for_test(&alice.label).await;
+        assert!(remaining > Duration::ZERO);
+        assert_eq!(
+            comparison_pending, !comparison_settled,
+            "the next opportunity observes the durable comparison state"
+        );
         runtime
-            .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
+            .advance_recovery_clock_for_test(&alice.label, remaining + Duration::from_millis(1))
             .await;
         timeout(Duration::from_secs(20), async {
             loop {
@@ -418,7 +439,7 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
                     let comparison = storage.recovery_comparison().unwrap();
                     (comparison.revision, comparison.settled_revision, comparison.attempt_serial)
                 },
-                storage.recovery_retry_state().unwrap(),
+                (retry_before_next, storage.recovery_retry_state().unwrap(), storage.recovery_comparison().unwrap().blocked_route_revision, storage.recovery_revision_fence().unwrap().route_revision),
                 storage.pending_recovery_demands().unwrap().iter().map(|d| (format!("{:?}", d.cause), d.known_event_id.is_some())).collect::<Vec<_>>(),
             )
         });
