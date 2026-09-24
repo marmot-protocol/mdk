@@ -34,9 +34,12 @@ retention remains false. Releasing a distinct seeded receipt through
 `release_message_for_replay` advances the inventory revision. The returned
 result then fails its admission fence, leaves the target event unretained,
 and preserves the exact-ID demand. The fixture asserts one positive result
-and one exact request per endpoint, the revision transition, unchanged
-persisted cursor and retained-scope evidence after
-rejection, and demand survival. The released receipt is synthetic; it tests
+and one exact request per endpoint, the revision transition, an unchanged
+persisted cursor below the missing event's timestamp, no retained-known-event
+or admission-complete endpoint checkpoint, and demand survival. The installed
+scope may retain nonexhaustive endpoint evidence from the returned result;
+that evidence does not satisfy the obligation. The released receipt is
+synthetic; it tests
 the actual release transaction and fence, not release of the target event.
 This witness establishes transport receipt and rejection; it does not assert
 MLS decryption or projection for the target.

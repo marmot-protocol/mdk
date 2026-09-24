@@ -223,6 +223,17 @@ async fn real_sdk_returned_event_rejected_after_receipt_release() {
         .load_account_projection_state(&alice.label, 0)
         .unwrap()
         .last_transport_timestamp;
+    assert!(
+        cursor_before.is_none_or(|cursor| cursor < created_at),
+        "the sampled cursor must be below the missing event"
+    );
+    let scopes_before = storage.recovery_scope_snapshots(demand_id).unwrap();
+    assert!(!scopes_before.is_empty());
+    assert!(
+        scopes_before
+            .iter()
+            .all(|scope| !scope.retained_known_event)
+    );
     let before_release = storage.recovery_revision_fence().unwrap();
     storage.release_message_for_replay(&released).unwrap();
     assert!(
@@ -262,13 +273,23 @@ async fn real_sdk_returned_event_rejected_after_receipt_release() {
             .last_transport_timestamp,
         cursor_before
     );
-    assert!(
-        storage
-            .recovery_scope_snapshots(demand_id)
-            .unwrap()
-            .iter()
-            .all(|scope| !scope.retained_known_event)
-    );
+    let scopes_after = storage.recovery_scope_snapshots(demand_id).unwrap();
+    assert_eq!(scopes_after.len(), scopes_before.len());
+    for (before, after) in scopes_before.iter().zip(&scopes_after) {
+        assert!(after.token == before.token);
+        assert_eq!(after.attempt_serial, before.attempt_serial);
+        assert_eq!(after.obligation_revision, before.obligation_revision);
+        assert_eq!(after.loss_revision, before.loss_revision);
+        assert_eq!(after.route_revision, before.route_revision);
+        assert_eq!(after.inventory_revision, before.inventory_revision);
+        assert_eq!(after.retained_known_event, before.retained_known_event);
+        assert!(
+            after
+                .checkpoints
+                .iter()
+                .all(|checkpoint| !checkpoint.exhaustive && !checkpoint.admission_complete)
+        );
+    }
     runtime.shutdown_and_close().await.unwrap();
     bootstrap.shutdown();
 }
