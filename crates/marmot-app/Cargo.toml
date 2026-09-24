@@ -78,3 +78,8 @@ tokio-tungstenite = "0.26"
 name = "media_download_backlog"
 harness = false
 required-features = ["media-benchmarks"]
+
+[[bench]]
+name = "android_media_download"
+harness = false
+required-features = ["media-benchmarks"]
