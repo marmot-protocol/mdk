@@ -1007,13 +1007,25 @@ async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
             futures::FutureExt::now_or_never(network_result.as_mut()).is_none(),
             "the worker has not accepted an SDK acquisition result"
         );
+        if !new_loss {
+            // The left relay has sent the historical EVENT while the right
+            // acquisition remains open. It must stay outside SQLCipher until
+            // the bounded result crosses the worker's admission fence.
+            assert!(left.counts().sent_events >= 1);
+            assert!(
+                !storage
+                    .retained_recovery_event(&route, &event_id, None, created_at)
+                    .unwrap(),
+                "request-local SDK input bypassed the bounded result fence"
+            );
+        }
         if new_loss {
             let retained_before_loss = storage
                 .retained_recovery_event(&route, &event_id, None, created_at)
                 .unwrap();
             assert!(
-                retained_before_loss,
-                "the other relay already supplied valid retained evidence"
+                !retained_before_loss,
+                "the earlier relay's unadmitted acquisition must remain request-local"
             );
             let demand_id = storage
                 .pending_recovery_demands()
@@ -1064,6 +1076,12 @@ async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
                 storage.recovery_retry_state().unwrap().attempt_serial,
                 retry_before_finish.attempt_serial,
                 "no newer owner attempt may be confused with this stale result"
+            );
+            assert!(
+                !storage
+                    .retained_recovery_event(&route, &event_id, None, created_at)
+                    .unwrap(),
+                "the stale result must not retain its exact event after a newer loss"
             );
             assert!(
                 storage
