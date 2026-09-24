@@ -12325,6 +12325,26 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
         })
         .await
         .expect("the undrained history must overflow the account queue");
+        // The drop metric advances before the account-local marker writer has
+        // persisted its count. Wait for that evidence so the first recovery
+        // reservation cannot race its asynchronous loss import.
+        let storage = app.account_storage("alice").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let watermarks = storage
+                    .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
+                    .unwrap();
+                if watermarks.len() == 1
+                    && watermarks[0].observed_count
+                        == (HISTORY - crate::relay_plane::ACCOUNT_DELIVERY_BUFFER) as u64
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the complete queue loss count must be durable before recovery");
 
         for ordinal in 0..2 {
             if ordinal > 0 {
