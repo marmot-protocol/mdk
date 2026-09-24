@@ -12336,16 +12336,41 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                 )
                 .await
                 .unwrap();
-            assert!(
-                matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
-                "overflow attempt {ordinal} returned {outcome:?}; retry state: {:?}",
-                client
-                    .app
-                    .account_storage(&client.state.label)
-                    .unwrap()
-                    .recovery_retry_state()
-                    .unwrap()
-            );
+            if !matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)) {
+                let storage = client.app.account_storage(&client.state.label).unwrap();
+                let routing = client.routing.snapshot();
+                let group_endpoints = routing
+                    .group_routes
+                    .iter()
+                    .map(|route| route.endpoints.len())
+                    .sum::<usize>();
+                let admitted_inbox = client
+                    .adapter
+                    .recovery_admitted_endpoints(&routing.local_inbox_endpoints)
+                    .len();
+                let admitted_groups = routing
+                    .group_routes
+                    .iter()
+                    .map(|route| {
+                        client
+                            .adapter
+                            .recovery_admitted_endpoints(&route.endpoints)
+                            .len()
+                    })
+                    .sum::<usize>();
+                panic!(
+                    "overflow attempt {ordinal} returned {outcome:?}; retry state: {:?}; pending demands: {}; eligible obligations: {}; inbox endpoints: {}; group endpoints: {group_endpoints}; admitted inbox: {admitted_inbox}; admitted groups: {admitted_groups}; cursor frozen: {}",
+                    storage.recovery_retry_state().unwrap(),
+                    storage.pending_recovery_demands().unwrap().len(),
+                    storage
+                        .recovery_eligible_revision_fence(false)
+                        .unwrap()
+                        .obligations
+                        .len(),
+                    routing.local_inbox_endpoints.len(),
+                    client.app.cursor_persistence() == crate::CursorPersistence::Frozen,
+                );
+            }
             let storage = client.app.account_storage(&client.state.label).unwrap();
             let retry = storage.recovery_retry_state().unwrap();
             let expected = Duration::from_secs(15 * (1 << ordinal));
