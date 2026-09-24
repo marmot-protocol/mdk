@@ -198,11 +198,17 @@ endpoint returns the event.
 The activation gate remains closed. These tests do not yet qualify the real
 SDK path for SDK-seen but unretained input, both endpoints returning no data,
 saturation/oversized results, cancellation on either side of a durable
-prefix, stale generation/loss/route fences, restart persistence, or competing
-account recovery demands. An exploratory repeat request for the already
-retained ID remained pending beyond five seconds after a test-clock advance;
-the owner did not satisfy that new obligation within the bound. That needs a
-focused owner-scheduling regression before a no-new-data claim. Controlled
-backend tests cover several of these policies, but they do not establish
+prefix, stale generation/route fences, or restart persistence. Two further
+real-SDK controls exercise competing recovery demands and a newer delivery
+loss. On a conforming NIP-77 relay, an already-retained known ID and a fresh
+comparison both settle through automatic worker service after the injected
+test clock moves past the current shared retry deadline. The fixture allows
+either owner-selection order and establishes no real-time latency bound. In a
+separate two-relay run, one exact-ID EOSE stays withheld after the event has
+been durably retained from the other relay. A newer queue-loss revision then
+prevents that in-flight exact result from checkpointing its stale scope;
+the queue-loss demand remains pending. These controls do not qualify all
+competing account recovery demands or every stale loss outcome. Controlled
+backend tests cover several remaining policies, but they do not establish
 their behavior against production SDK sessions. No public activation or
 platform bandwidth/peak-memory claim follows from the P5 regressions.

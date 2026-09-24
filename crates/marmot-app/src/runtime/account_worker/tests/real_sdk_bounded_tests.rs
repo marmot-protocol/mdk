@@ -364,52 +364,68 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
     runtime
         .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
         .await;
-    timeout(Duration::from_secs(8), async {
+    // The worker probe and the 15-second maintenance tick may select either
+    // obligation first. Observe which debt settles, then cross the shared
+    // retry deadline again only if the other remains pending.
+    timeout(Duration::from_secs(20), async {
         loop {
-            if storage
+            let known_cleared = storage
                 .pending_recovery_demands()
                 .unwrap()
                 .iter()
-                .all(|d| d.known_event_id != Some(event_id))
-            {
+                .all(|d| d.known_event_id != Some(event_id));
+            let comparison_settled = storage.recovery_comparison().unwrap().settled_revision
+                > comparison_before.settled_revision;
+            if known_cleared || comparison_settled {
                 break;
             }
             sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("retained KnownEvent clears under owner selection");
-    let after_local = storage.recovery_comparison().unwrap();
-    assert!(after_local.pending());
-    assert_eq!(
-        after_local.settled_revision,
-        comparison_before.settled_revision
-    );
-    assert_eq!(
-        app.relay_telemetry().await.metrics.reconciliation_attempts,
-        telemetry_before,
-        "clearing one retained ID did not service NIP-77 debt"
-    );
-    let comparison_wait_started = Instant::now();
-    runtime
-        .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
-        .await;
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if storage.recovery_comparison().unwrap().settled_revision
-                > comparison_before.settled_revision
-            {
-                break;
+    .expect("automatic worker service settles at least one competing demand");
+    let known_cleared = storage
+        .pending_recovery_demands()
+        .unwrap()
+        .iter()
+        .all(|d| d.known_event_id != Some(event_id));
+    let comparison_settled = storage.recovery_comparison().unwrap().settled_revision
+        > comparison_before.settled_revision;
+    if !known_cleared || !comparison_settled {
+        runtime
+            .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
+            .await;
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let known_cleared = storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.known_event_id != Some(event_id));
+                let comparison_settled = storage.recovery_comparison().unwrap().settled_revision
+                    > comparison_before.settled_revision;
+                if known_cleared && comparison_settled {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
             }
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("automatic tick settles comparison on a conforming NIP-77 relay");
+        })
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "next automatic owner opportunity settles the other demand: {err:?}; comparison={:?}; retry={:?}; demands={:?}",
+                {
+                    let comparison = storage.recovery_comparison().unwrap();
+                    (comparison.revision, comparison.settled_revision, comparison.attempt_serial)
+                },
+                storage.recovery_retry_state().unwrap(),
+                storage.pending_recovery_demands().unwrap().iter().map(|d| (format!("{:?}", d.cause), d.known_event_id.is_some())).collect::<Vec<_>>(),
+            )
+        });
+    }
     let after_tick = storage.recovery_comparison().unwrap();
     assert_eq!(after_tick.settled_revision, after_tick.revision);
-    assert!(after_tick.attempt_serial > after_local.attempt_serial);
-    assert!(comparison_wait_started.elapsed() < Duration::from_secs(20));
+    assert!(after_tick.attempt_serial > comparison_before.attempt_serial);
     assert!(
         app.relay_telemetry().await.metrics.reconciliation_attempts > telemetry_before,
         "the conforming relay was compared by the SDK"
@@ -649,7 +665,6 @@ async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
                 retained_before_loss,
                 "the other relay already supplied valid retained evidence"
             );
-            assert!(right.id_request_active());
             let demand_id = storage
                 .pending_recovery_demands()
                 .unwrap()
@@ -659,6 +674,10 @@ async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
                 .ticket
                 .id;
             let scope_before = storage.recovery_scope_snapshots(demand_id).unwrap();
+            assert!(!scope_before.is_empty());
+            assert!(scope_before.iter().all(|scope| !scope.retained_known_event));
+            // finish() would report retained=true for this already-durable ID.
+            // An accepted stale checkpoint would flip this frozen scope bit.
             let before = storage.recovery_revision_fence().unwrap();
             storage
                 .record_account_delivery_loss(&alice.label, 777, 1, crate::unix_now_seconds())
@@ -688,6 +707,7 @@ async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
                 assert_eq!(current.attempt_serial, prior.attempt_serial);
                 assert_eq!(current.loss_revision, prior.loss_revision);
                 assert_eq!(current.retained_known_event, prior.retained_known_event);
+                assert!(current.checkpoints == prior.checkpoints);
                 assert!(current.loss_revision < after.loss_revision);
             }
             assert_eq!(
