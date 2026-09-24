@@ -455,6 +455,24 @@ async fn bounded_real_sdk_retained_epochs_and_other_group_progress_before_exact_
     );
     let attempt = storage.recovery_retry_state().unwrap().attempt_serial;
     assert_eq!(selected_scope[0].attempt_serial, attempt);
+    assert_eq!(
+        runtime
+            .group_mls_state(&alice.label, &groups[1])
+            .await
+            .unwrap()
+            .epoch,
+        initial,
+        "all retained dependencies remain unprocessed at hold release"
+    );
+    assert_ne!(
+        app.group(&alice.label, &hex::encode(&groups[2]))
+            .unwrap()
+            .unwrap()
+            .profile
+            .name,
+        "other progress",
+        "the second group is still due at hold release"
+    );
     drop(convergence_hold);
     // Re-evaluate the already-due timer after removing the test-only guard.
     let _ = runtime.recovery_retry_snapshot_for_test(&alice.label).await;

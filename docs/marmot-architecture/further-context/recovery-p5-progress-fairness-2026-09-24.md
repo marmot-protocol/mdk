@@ -30,10 +30,12 @@ assertions require useful work before the result-ready notification and while
 the durable known-event request remains pending. The local convergence
 settlement override is 100 ms and the extra scheduled delay is 500 ms in the
 `test-policy-overrides` build. Retention and the unchanged epoch are checked
-before the exact request starts. A four-second elapsed-time assertion from
-relay entry then covers local backlog and other-group progress, send/read, and
-live receive before the five-second SDK request expires. The test allows at
-most three seconds between observed local epoch advances. These are
+before the exact request starts, and the unchanged epoch and other-group
+projection are checked again immediately before the hold is released. A
+four-second elapsed-time assertion from relay entry then covers local backlog
+and other-group progress, send/read, and live receive before the five-second
+SDK request expires. The test allows at most three seconds between observed
+local epoch advances. These are
 controlled ready-work fixture values, not natural-arrival scheduling fairness
 or production latency guarantees.
 
