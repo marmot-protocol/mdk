@@ -1942,6 +1942,12 @@ impl AppClient {
         self.group_mls_state_unchecked(group_id)
     }
 
+    /// Builds one roster response from live group state while overlaying the
+    /// durable, event-owned self-membership projection.
+    ///
+    /// Roster completeness is validated by the host and is not used here to
+    /// infer a departure: only the one-time legacy backfill and authenticated
+    /// membership events may advance stored self-membership.
     pub(crate) fn group_roster_session(
         &self,
         group_id: &GroupId,
@@ -6584,6 +6590,7 @@ mod self_membership_backfill_tests {
     use cgka_traits::storage::GroupStorage;
     use std::sync::Arc;
 
+    /// Builds the minimal engine member needed by the backfill predicate tests.
     fn member(id_hex: &str) -> Member {
         Member {
             id: MemberId::new(hex::decode(id_hex).unwrap()),
@@ -6591,6 +6598,7 @@ mod self_membership_backfill_tests {
         }
     }
 
+    /// A case-insensitive local identity match must preserve active membership.
     #[test]
     fn local_account_in_roster_is_not_removed() {
         let roster = vec![member("aa"), member("bb")];
@@ -6600,6 +6608,7 @@ mod self_membership_backfill_tests {
         assert!(!local_account_removed_from_roster(&roster, "AA"));
     }
 
+    /// A complete roster without the local identity is authoritative migration evidence.
     #[test]
     fn local_account_absent_from_roster_is_removed() {
         // Roster has only peers; the local account ("aa") was removed/left.
@@ -6607,11 +6616,13 @@ mod self_membership_backfill_tests {
         assert!(local_account_removed_from_roster(&roster, "aa"));
     }
 
+    /// An empty but successfully read roster also proves legacy membership is stale.
     #[test]
     fn empty_roster_is_treated_as_removed() {
         assert!(local_account_removed_from_roster(&[], "aa"));
     }
 
+    /// Ordinary roster reads must preserve membership even when live members are incomplete.
     #[tokio::test]
     async fn incomplete_ordinary_roster_read_never_persists_a_removal() {
         let dir = tempfile::tempdir().unwrap();
