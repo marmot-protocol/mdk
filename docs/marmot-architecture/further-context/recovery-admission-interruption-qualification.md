@@ -32,8 +32,9 @@ same-request durable-prefix or process-kill durability.
 
 ## Acquisition and ordinary delivery overlap
 
-In the currently pinned rust-nostr fork, an acquisition REQ's validated
-first-seen EVENT also emits a global `ClientNotification::Event`. MDK's
+At the rust-nostr revision `0efbb4ee` pinned by this test tree, an acquisition
+REQ's validated first-seen EVENT also emits a global
+`ClientNotification::Event`. MDK's
 `NostrSdkRelayClient::spawn_notification_forwarder` forwards that notification
 to `NostrTransportAdapter::handle_relay_event`, which routes by event envelope
 and endpoint, not by acquisition subscription identity. Consequently ordinary
@@ -41,8 +42,9 @@ account delivery may retain a valid event before the bounded acquisition
 result or EOSE. A controlled attempt observed that ordering while the bounded
 result was still pending; relay transmission alone was not used as proof of
 SDK acceptance. The SDK/adapter boundary and its accounting are being
-qualified separately. No test here attributes ordinary retention to bounded
-result admission.
+qualified separately. The merged [fork correction](https://github.com/erskingardner/rust-nostr/pull/2)
+is being adopted in MDK through a separate change. No test here attributes
+ordinary retention to bounded result admission.
 
 ## Remaining acceptance work
 
