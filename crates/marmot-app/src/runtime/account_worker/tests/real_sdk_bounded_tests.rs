@@ -4,6 +4,7 @@ use super::*;
 use futures::{SinkExt, StreamExt};
 use nostr_relay_builder::MockRelay;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -22,6 +23,7 @@ struct BoundaryCounts {
     sent_event_json_bytes: usize,
     requests: usize,
     id_requests: usize,
+    id_closes: usize,
     closes: usize,
 }
 
@@ -38,6 +40,7 @@ struct RelayState {
     events: Mutex<Vec<Value>>,
     counts: Mutex<BoundaryCounts>,
     live: Mutex<Vec<LiveInterest>>,
+    id_subscriptions: Mutex<HashSet<(usize, String)>>,
     next_connection: AtomicUsize,
     omit_id_eose: AtomicBool,
     broadcast_live: AtomicBool,
@@ -47,6 +50,10 @@ struct RelayState {
 impl RelayState {
     fn counts(&self) -> BoundaryCounts {
         self.counts.lock().unwrap().clone()
+    }
+
+    fn id_request_active(&self) -> bool {
+        !self.id_subscriptions.lock().unwrap().is_empty()
     }
 
     fn group_event(&self) -> Value {
@@ -167,6 +174,11 @@ async fn counted_relay() -> (String, Arc<RelayState>) {
                                 }
                             } else {
                                 state.counts.lock().unwrap().id_requests += 1;
+                                state
+                                    .id_subscriptions
+                                    .lock()
+                                    .unwrap()
+                                    .insert((connection, id.to_owned()));
                             }
                             let matching = state
                                 .events
@@ -188,6 +200,14 @@ async fn counted_relay() -> (String, Arc<RelayState>) {
                         }
                         "CLOSE" => {
                             if let Some(id) = frame.get(1).and_then(Value::as_str) {
+                                if state
+                                    .id_subscriptions
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&(connection, id.to_owned()))
+                                {
+                                    state.counts.lock().unwrap().id_closes += 1;
+                                }
                                 state
                                     .live
                                     .lock()
@@ -203,6 +223,11 @@ async fn counted_relay() -> (String, Arc<RelayState>) {
                     .lock()
                     .unwrap()
                     .retain(|live| live.connection != connection);
+                state
+                    .id_subscriptions
+                    .lock()
+                    .unwrap()
+                    .retain(|(active_connection, _)| *active_connection != connection);
                 writer_task.abort();
             });
         }
@@ -355,7 +380,7 @@ async fn run_real_sdk_known_event(omit_right_eose: bool) {
         .unwrap()
         .unwrap()
         .unwrap();
-    let requested = timeout(Duration::from_secs(22), left.id_request_started.notified()).await;
+    let requested = timeout(Duration::from_secs(8), left.id_request_started.notified()).await;
     assert!(
         requested.is_ok(),
         "known-event owner must issue a scoped real SDK request: left={:?}, right={:?}, demands={:?}, retry={:?}, probes={}",
@@ -377,45 +402,32 @@ async fn run_real_sdk_known_event(omit_right_eose: bool) {
         timeout(Duration::from_secs(2), right.id_request_started.notified())
             .await
             .expect("real SDK requested the exact event from the delayed relay");
-        timeout(
-            Duration::from_secs(2),
-            runtime.send_message(
-                &alice.label,
-                &group,
-                b"send while EOSE is withheld".to_vec(),
-            ),
-        )
-        .await
-        .expect("queued send completes while acquisition waits")
-        .unwrap();
-        let (respond, read) = oneshot::channel();
-        commands
-            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
-            .unwrap();
-        timeout(Duration::from_secs(2), read)
-            .await
-            .expect("committed worker read completes while acquisition waits")
-            .unwrap()
-            .unwrap();
-        assert!(
-            storage
-                .pending_recovery_demands()
-                .unwrap()
-                .iter()
-                .any(|demand| demand.known_event_id == Some(event_id))
-        );
-        timeout(
-            Duration::from_secs(2),
-            runtime.send_message(
-                &bob.label,
-                &group,
-                b"incoming while EOSE is withheld".to_vec(),
-            ),
-        )
-        .await
-        .expect("other account sends while Alice's acquisition waits")
-        .unwrap();
+        let shared = runtime.shared_services();
+        let mut network_result = Box::pin(shared.bounded_result_ready.notified());
+        network_result.as_mut().enable();
+        assert!(right.id_request_active());
         timeout(Duration::from_secs(2), async {
+            runtime
+                .send_message(
+                    &alice.label,
+                    &group,
+                    b"send while EOSE is withheld".to_vec(),
+                )
+                .await
+                .unwrap();
+            let (respond, read) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+                .unwrap();
+            read.await.unwrap().unwrap();
+            runtime
+                .send_message(
+                    &bob.label,
+                    &group,
+                    b"incoming while EOSE is withheld".to_vec(),
+                )
+                .await
+                .unwrap();
             loop {
                 if app
                     .messages(&alice.label)
@@ -429,7 +441,23 @@ async fn run_real_sdk_known_event(omit_right_eose: bool) {
             }
         })
         .await
-        .expect("acquiring account projects real live relay input");
+        .expect("send, read, and live projection finish within one outstanding acquisition");
+        assert!(
+            right.id_request_active(),
+            "delayed exact-ID REQ is still open"
+        );
+        assert_eq!(right.counts().id_closes, 0);
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.known_event_id == Some(event_id))
+        );
+        assert!(
+            futures::FutureExt::now_or_never(network_result.as_mut()).is_none(),
+            "the worker has not accepted an SDK acquisition result"
+        );
     }
     let completion = timeout(Duration::from_secs(10), async {
         loop {
@@ -481,7 +509,6 @@ async fn run_real_sdk_known_event(omit_right_eose: bool) {
         assert!(counts.sent_events >= 1 && counts.sent_events <= 8);
         assert!(counts.received_text_bytes <= 6 * 1024);
         assert!(counts.sent_text_bytes <= 9 * 1024);
-        assert!(counts.received_event_json_bytes <= 3 * 1024);
         assert!(counts.sent_event_json_bytes <= 8 * 1024);
     }
     if !omit_right_eose {

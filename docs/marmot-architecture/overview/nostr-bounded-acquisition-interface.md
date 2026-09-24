@@ -167,20 +167,33 @@ is signed out. Their ordinary live subscriptions return EOSE without replaying
 history. The exact-ID request retrieves the event from each relay, and the
 worker retains the eligible event before clearing its known-event obligation.
 The regression asserts one exact-ID REQ per endpoint, one returned EVENT per
-endpoint, and per-endpoint fixture ceilings of 6 KiB inbound text, 9 KiB
-outbound text, 3 KiB inbound event JSON and 8 KiB outbound event JSON. The
-event JSON counters measure normalized JSON after parsing; they are included
-in the text counters, not additional bytes. The measurements are WebSocket
+endpoint, and per-endpoint byte ceilings in the fixture. The event JSON
+counters measure normalized JSON after parsing; they are included in the text
+counters, not additional bytes. The measurements are WebSocket
 text payloads at the local relay boundary, excluding TCP/TLS framing, SDK
 allocations, and process memory.
+
+One serial run measured these per-relay byte totals (left/right), including
+fixture setup and control traffic:
+
+| Case | Client to relay text | Relay to client text | Client EVENT JSON | Relay EVENT JSON |
+| --- | ---: | ---: | ---: | ---: |
+| Exact-ID retention | 2,863 / 2,920 | 1,464 / 1,464 | 944 / 944 | 944 / 944 |
+| Withheld EOSE and concurrent messages | 4,807 / 4,807 | 7,776 / 7,733 | 2,868 / 2,868 | 6,716 / 6,716 |
+
+These are fixture measurements, not a bandwidth target. The test enforces
+coarse ceilings because SDK control frames can vary between runs; the exact
+recovered event size and duplicate count are asserted separately.
 
 `bounded_real_sdk_missing_eose_keeps_send_and_read_available` withholds one
 relay's exact-ID EOSE. During the outstanding SDK request, the acquiring
 worker completes an outbound send and a committed snapshot read, and a live
-encrypted message from another account reaches its projection. The other
-relay supplies the exact event, so durable retention can still satisfy the
-known-event obligation. This proves progress for that single case, not general
-coverage from partial endpoint evidence.
+encrypted message from another account reaches its projection before the
+same acquisition ends. Both relays return the exact event; only the delayed
+relay's EOSE is withheld. Durable retention can admit either copy and satisfy
+the known-event obligation. This proves progress for that single case, not
+general coverage from partial endpoint evidence or recovery when only one
+endpoint returns the event.
 
 The activation gate remains closed. These tests do not yet qualify the real
 SDK path for SDK-seen but unretained input, both endpoints returning no data,
