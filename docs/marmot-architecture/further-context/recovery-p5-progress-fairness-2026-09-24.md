@@ -8,7 +8,7 @@ The production activation flag remains off.
 | Acceptance question | Source boundary | Focused witness |
 | --- | --- | --- |
 | Can ready local work advance while history waits? | `account_worker.rs`: bounded `Job::wait` is selected alongside commands, receive, and scheduled convergence; admission is one event per turn. | In Normal mode, a conforming local relay holds an exact request for the group creator. An admin peer publishes three valid MLS profile commits and an update in a second group. All four are durably retained before scheduled local passes. Epoch, projection, another group, send, read, and live receive are checked before the SDK result is accepted. |
-| Do distinct missing known IDs get owner turns? | `bounded_recovery::prepare` chooses one known-event ticket, then the recovery owner freezes a one-obligation grant. | Two real MLS messages are published while the receiving account is signed out. The local relay refuses ordinary history. Exact request counts and durable ticket state show distinct turns, no duplicate grant, and no restart of the first request. |
+| Do distinct missing known IDs get owner turns? | `bounded_recovery::prepare` chooses one known-event ticket, then the recovery owner freezes a one-obligation grant. | Two real MLS messages are published while the receiving account is signed out. The local relay refuses ordinary history. Direct retained-event checks prove both IDs missing at the first held query, the first present after its demand clears, and the second still missing at its held query. Exact request counts and frozen scopes show distinct turns with no restart of the first request. |
 | Can a broad comparison occupy the worker separately from exact acquisition? | `run_pending_epoch_backfill_reporting_arm` awaits `client.run_pending_epoch_backfill` on the serialized worker. | Unqualified in this slice. A separate real-SDK experiment observed a held NIP-77 frame and a queued send, but comparison grant selection and frame-to-worker attribution were not repeatable enough for a regression assertion. |
 
 The source-level P5 responsiveness gap remains: the worker's receive,
@@ -43,10 +43,12 @@ production latency guarantees.
 - The two-ID fixture proves consecutive owner opportunities after the retry
   gate is crossed, using the frozen ticket and attempt serial while each
   relay query is held. It does not establish a global scheduling weight or
-  fairness across arbitrary accounts and relay failures. The pinned SDK may
-  also route acquisition events into its ordinary notification path, so
-  durable retention in this fixture must not be attributed solely to bounded
-  result admission.
+  fairness across arbitrary accounts and relay failures. This branch pins
+  rust-nostr at `0efbb4ee20cd2d48ff9ffc19d307ec5a3658d6b9`, which can
+  also route acquisition events into its ordinary notification path. The
+  overlapping path means durable retention here cannot be attributed solely
+  to bounded result admission. [SDK PR #2](https://github.com/erskingardner/rust-nostr/pull/2)
+  has merged, but this slice does not change or qualify the production pin.
 - The command responsiveness requirement under broad comparison remains
   unqualified until the worker-held wait and comparison selection are covered
   by a separately reviewed P5 execution change and deterministic regression.

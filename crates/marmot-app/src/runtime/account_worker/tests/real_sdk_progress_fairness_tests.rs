@@ -615,17 +615,43 @@ async fn bounded_real_sdk_two_missing_known_ids_receive_distinct_owner_turns() {
         .timeout(Duration::from_secs(10))
         .await
         .unwrap();
-    let mut ids = events
+    let mut published = events
         .iter()
-        .map(|event| event.id.to_bytes())
+        .map(|event| (event.id.to_bytes(), event.created_at.as_secs()))
         .collect::<Vec<_>>();
-    ids.sort();
-    ids.dedup();
-    assert_eq!(ids.len(), 2, "fixture published two valid MLS group events");
+    published.sort_by_key(|(id, _)| *id);
+    published.dedup_by_key(|(id, _)| *id);
+    assert_eq!(
+        published.len(),
+        2,
+        "fixture published two valid MLS group events"
+    );
+    let ids = published.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let event_times = published.into_iter().collect::<HashMap<_, _>>();
     inspector.disconnect().await;
     gate.reject_broad.store(true, Ordering::SeqCst);
     runtime.sign_in_account(&alice.label).await.unwrap();
     let storage = app.account_storage(&alice.label).unwrap();
+    let route: [u8; 32] = hex::decode(
+        app.group(&alice.label, &hex::encode(&group))
+            .unwrap()
+            .unwrap()
+            .nostr_routing
+            .nostr_group_id_hex,
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let retained = |id: [u8; 32]| {
+        storage
+            .retained_recovery_event(
+                &storage_sqlite::TransportReconciliationRoute::Group(route),
+                &id,
+                None,
+                event_times[&id],
+            )
+            .unwrap()
+    };
     for id in &ids {
         storage
             .request_recovery(
@@ -663,6 +689,10 @@ async fn bounded_real_sdk_two_missing_known_ids_receive_distinct_owner_turns() {
         .unwrap()
         .1;
     let second = selected.iter().find(|(_, id)| *id != first).unwrap().1;
+    assert!(
+        !retained(first) && !retained(second),
+        "both published events are still durably missing when the first exact query is held"
+    );
     assert_eq!(
         gate.count(&first),
         1,
@@ -708,6 +738,10 @@ async fn bounded_real_sdk_two_missing_known_ids_receive_distinct_owner_turns() {
     })
     .await
     .expect("first valid MLS event is durably admitted");
+    assert!(
+        retained(first),
+        "the first event is durably present when its known-event demand clears"
+    );
     *gate.held_id.lock().unwrap() = Some(hex::encode(second));
     gate.hold_exact.store(true, Ordering::SeqCst);
     let mut second_entered = Box::pin(gate.entered.notified());
@@ -719,6 +753,10 @@ async fn bounded_real_sdk_two_missing_known_ids_receive_distinct_owner_turns() {
     timeout(Duration::from_secs(20), second_entered.as_mut())
         .await
         .expect("other ticket receives the next owner opportunity");
+    assert!(
+        !retained(second),
+        "the second event remains durably missing while its exact query is held"
+    );
     assert_eq!(
         gate.count(&first),
         1,
