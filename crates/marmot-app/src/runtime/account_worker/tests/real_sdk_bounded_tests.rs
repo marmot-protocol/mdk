@@ -2,9 +2,11 @@
 
 use super::*;
 use futures::{SinkExt, StreamExt};
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::prelude::{BoxedFuture, Filter as RelayFilter, PolicyResult, QueryPolicy};
+use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -12,6 +14,48 @@ use std::sync::{
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+#[derive(Clone, Debug, Default)]
+struct HeldExactQuery {
+    event_id_hex: Arc<Mutex<String>>,
+    hold_exact: Arc<AtomicBool>,
+    reject_broad: Arc<AtomicBool>,
+    exact_queries: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl QueryPolicy for HeldExactQuery {
+    fn admit_query<'a>(
+        &'a self,
+        query: &'a RelayFilter,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            let wanted = self.event_id_hex.lock().unwrap().clone();
+            let exact = !wanted.is_empty()
+                && query
+                    .ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.iter().any(|id| id.to_hex() == wanted));
+            if exact {
+                self.exact_queries.fetch_add(1, Ordering::SeqCst);
+                if self.hold_exact.load(Ordering::SeqCst) {
+                    let released = self.release.notified();
+                    tokio::pin!(released);
+                    released.as_mut().enable();
+                    self.entered.notify_one();
+                    released.await;
+                }
+                PolicyResult::Accept
+            } else if self.reject_broad.load(Ordering::SeqCst) && query.ids.is_none() {
+                PolicyResult::Reject("controlled ordinary-history gate".into())
+            } else {
+                PolicyResult::Accept
+            }
+        })
+    }
+}
 
 #[derive(Default, Clone, Debug)]
 struct BoundaryCounts {
@@ -452,6 +496,248 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
         "the conforming relay was compared by the SDK"
     );
     runtime.shutdown_and_close().await.unwrap();
+    relay.shutdown();
+}
+
+#[tokio::test]
+async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
+    use base64::Engine as _;
+    use nostr_sdk::prelude::{
+        Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
+    };
+    use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
+
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let gate = HeldExactQuery::default();
+    let relay = LocalRelay::new(RelayBuilder::default().query_policy(gate.clone()));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let config = crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
+    runtime
+        .shared_services()
+        .bounded_group_recovery_enabled
+        .store(true, Ordering::SeqCst);
+    crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.publish_key_package("bob").await.unwrap();
+    let group = runtime
+        .create_group_with_options(
+            &alice.label,
+            "conforming cancel",
+            std::slice::from_ref(&bob.account_id_hex),
+            AppCreateGroupOptions {
+                relays: Some(vec![url.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            runtime.catch_up_accounts().await.unwrap();
+            if app
+                .group(&bob.label, &hex::encode(&group))
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let route_hex = app
+        .group(&alice.label, &hex::encode(&group))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let route = storage_sqlite::TransportReconciliationRoute::Group(
+        hex::decode(&route_hex).unwrap().try_into().unwrap(),
+    );
+    let mut envelope = vec![0u8; 12];
+    envelope.extend_from_slice(b"conforming-cancel-unretained-encrypted-probe");
+    assert!(envelope.len() >= transport_nostr_peeler::NOSTR_GROUP_CONTENT_MIN_LEN);
+    let signed = EventBuilder::new(
+        Kind::MlsGroupMessage,
+        base64::engine::general_purpose::STANDARD.encode(envelope),
+    )
+    .tags([Tag::custom("h", [route_hex])])
+    .finalize(&Keys::generate())
+    .unwrap();
+    let event_id = signed.id.to_bytes();
+    let created_at = signed.created_at.as_secs();
+    *gate.event_id_hex.lock().unwrap() = signed.id.to_hex();
+    gate.hold_exact.store(true, Ordering::SeqCst);
+    // Suppress ordinary history REQs so only the bounded exact-ID path can
+    // acquire this probe; NIP-77 comparison remains available on the relay.
+    gate.reject_broad.store(true, Ordering::SeqCst);
+    let storage = app.account_storage(&alice.label).unwrap();
+    storage
+        .request_recovery(
+            storage_sqlite::RecoveryRequest::KnownEvent {
+                group_id: group.as_slice(),
+                event_id: &event_id,
+            },
+            crate::client::recovery::wall_now_ms().unwrap(),
+        )
+        .unwrap();
+    runtime
+        .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
+        .await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if gate.exact_queries.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("first exact-ID request enters the real relay's query gate");
+    let first_retry = storage.recovery_retry_state().unwrap();
+    assert_eq!(gate.exact_queries.load(Ordering::SeqCst), 1);
+    assert!(first_retry.not_before_ms > first_retry.recorded_at_ms);
+    assert!(
+        !storage
+            .retained_recovery_event(&route, &event_id, None, created_at)
+            .unwrap()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+    gate.release.notify_waiters();
+    drop(storage);
+    drop(runtime);
+    drop(app);
+
+    let reopened_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let reopened_runtime = super::super::super::MarmotAppRuntime::new(reopened_app.clone());
+    reopened_runtime
+        .shared_services()
+        .bounded_group_recovery_enabled
+        .store(true, Ordering::SeqCst);
+    timeout(
+        Duration::from_secs(20),
+        reopened_runtime.reconcile_accounts(),
+    )
+    .await
+    .expect("reopened runtime starts")
+    .unwrap();
+    let reopened_storage = reopened_app.account_storage(&alice.label).unwrap();
+    let reopened_retry = reopened_storage.recovery_retry_state().unwrap();
+    assert_eq!(reopened_retry.attempt_serial, first_retry.attempt_serial);
+    assert_eq!(gate.exact_queries.load(Ordering::SeqCst), 1);
+    assert!(
+        !reopened_storage
+            .retained_recovery_event(&route, &event_id, None, created_at)
+            .unwrap()
+    );
+    assert!(
+        reopened_storage
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .any(|d| d.known_event_id == Some(event_id))
+    );
+    let comparison_before = reopened_storage.recovery_comparison().unwrap();
+    reopened_runtime
+        .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
+        .await;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if reopened_storage
+                .recovery_comparison()
+                .unwrap()
+                .settled_revision
+                > comparison_before.settled_revision
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("conforming comparison settles after reopening");
+    let comparison_retry = reopened_storage.recovery_retry_state().unwrap();
+    assert_eq!(
+        comparison_retry.attempt_serial,
+        first_retry.attempt_serial + 1
+    );
+    assert_eq!(
+        reopened_storage
+            .recovery_comparison()
+            .unwrap()
+            .attempt_serial,
+        comparison_retry.attempt_serial
+    );
+    assert!(comparison_retry.not_before_ms > comparison_retry.recorded_at_ms);
+    assert_eq!(gate.exact_queries.load(Ordering::SeqCst), 1);
+    assert!(
+        reopened_storage
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .any(|d| d.known_event_id == Some(event_id))
+    );
+    assert!(
+        !reopened_storage
+            .retained_recovery_event(&route, &event_id, None, created_at)
+            .unwrap()
+    );
+    assert_eq!(
+        reopened_storage.recovery_retry_state().unwrap(),
+        comparison_retry
+    );
+    assert_eq!(gate.exact_queries.load(Ordering::SeqCst), 1);
+    let transport_event =
+        transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&signed).unwrap();
+    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    relay_client
+        .publish_event(&[cgka_traits::TransportEndpoint(url)], &transport_event, 1)
+        .await
+        .unwrap();
+    assert!(
+        !reopened_storage
+            .retained_recovery_event(&route, &event_id, None, created_at)
+            .unwrap()
+    );
+    gate.hold_exact.store(false, Ordering::SeqCst);
+    gate.release.notify_waiters();
+    reopened_runtime
+        .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
+        .await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if gate.exact_queries.load(Ordering::SeqCst) >= 2
+                && reopened_storage
+                    .retained_recovery_event(&route, &event_id, None, created_at)
+                    .unwrap()
+                && reopened_storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.known_event_id != Some(event_id))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("fresh exact request retains the Nostr event after reopen");
+    let final_retry = reopened_storage.recovery_retry_state().unwrap();
+    assert_eq!(
+        final_retry.attempt_serial,
+        comparison_retry.attempt_serial + 1
+    );
+    assert_eq!(gate.exact_queries.load(Ordering::SeqCst), 2);
+    reopened_runtime.shutdown_and_close().await.unwrap();
     relay.shutdown();
 }
 
