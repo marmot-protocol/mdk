@@ -198,8 +198,10 @@ endpoint returns the event.
 The activation gate remains closed. These tests do not yet qualify the real
 SDK path for SDK-seen but unretained input, both endpoints returning no data,
 saturation/oversized results, cancellation on either side of a durable
-prefix, stale generation/route fences, or restart persistence. Two further
-real-SDK controls exercise competing recovery demands and a newer delivery
+prefix, stale generation/route fences, or restart persistence. Focused
+worker admission and completion fences, with their exact limits, are recorded
+in [recovery admission and interruption qualification](../further-context/recovery-admission-interruption-qualification.md).
+Two real-SDK controls exercise competing recovery demands and a newer delivery
 loss. On a conforming NIP-77 relay, an already-retained known ID and a fresh
 comparison both settle through automatic worker service after the injected
 test clock moves past the current shared retry deadline. The fixture allows
