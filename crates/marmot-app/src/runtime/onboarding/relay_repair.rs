@@ -311,11 +311,23 @@ impl AccountManager {
         {
             return Err(onboarding_error());
         }
-        let (repair, read_relays, write_relays) = self.minimal_relay_repair(
+        let (mut repair, mut read_relays, mut write_relays) = self.minimal_relay_repair(
             step,
             c.records[step.index()].as_ref(),
             &c.options.default_relays,
         );
+        // Removing a retired declaration cannot make a timed-out usable route
+        // complete inspection. Do not present that removal as an approvable fix.
+        if repair.mode == OnboardingRelayRepairMode::RemovalOnly
+            && c.snapshot.steps[step.index()]
+                .findings
+                .iter()
+                .any(|finding| finding.issue == OnboardingIssue::NoUsableRoute)
+        {
+            repair = manual_review(c.records[step.index()].as_ref(), repair.before_tags);
+            read_relays.clear();
+            write_relays.clear();
+        }
         let manual = repair.mode == OnboardingRelayRepairMode::ManualReview;
         c.snapshot.proposal = Some(OnboardingRepairProposal {
             step,

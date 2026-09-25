@@ -2190,7 +2190,12 @@ impl AccountManager {
                 c.records[proposal.step.index()].as_ref(),
                 &c.options.default_relays,
             );
-            if expected.mode == OnboardingRelayRepairMode::ManualReview
+            if (repair.mode == OnboardingRelayRepairMode::RemovalOnly
+                && c.snapshot.steps[proposal.step.index()]
+                    .findings
+                    .iter()
+                    .any(|finding| finding.issue == OnboardingIssue::NoUsableRoute))
+                || expected.mode == OnboardingRelayRepairMode::ManualReview
                 || *repair != expected
                 || proposal.read_relays != read_relays
                 || proposal.write_relays != write_relays

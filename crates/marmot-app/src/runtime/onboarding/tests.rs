@@ -858,6 +858,91 @@ async fn inspection_failures_never_select_allowed_endpoints_for_removal() {
 }
 
 #[tokio::test]
+async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://custom.example".into()],
+            vec!["r".into(), "wss://relay.damus.io".into()],
+        ],
+        "",
+        unix_now_seconds() - 1,
+    );
+    let mut checkpoint = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.set(
+        OnboardingStep::Relays,
+        OnboardingStatus::NeedsInput,
+        vec![
+            finding(OnboardingIssue::TimedOut),
+            finding(OnboardingIssue::NoUsableRoute),
+        ],
+    );
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(source.clone());
+    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+
+    let snapshot = runtime
+        .accounts()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let revision = snapshot.revision;
+    let repair = snapshot.proposal.unwrap().relay_repair.unwrap();
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::ManualReview);
+    assert_eq!(repair.before_tags, repair.after_tags);
+    assert_eq!(repair.after_tags[0].fields, source.tags[0]);
+    assert_eq!(repair.after_tags[1].fields, source.tags[1]);
+    assert_eq!(
+        snapshot.steps[OnboardingStep::Relays.index()].actions,
+        vec![
+            OnboardingAction::EditRelays,
+            OnboardingAction::CancelRepair,
+            OnboardingAction::CancelOnboarding,
+        ]
+    );
+    assert!(
+        runtime
+            .accounts()
+            .approve_onboarding_repair(&id, revision)
+            .await
+            .is_err()
+    );
+    // A removal-only preview saved by an older build must not bypass the
+    // no-usable-route gate when the account resumes on this build.
+    let (old_repair, read_relays, write_relays) = runtime.accounts().minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&source),
+        &checkpoint.options.default_relays,
+    );
+    assert_eq!(old_repair.mode, OnboardingRelayRepairMode::RemovalOnly);
+    let mut stale = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    let proposal = stale.snapshot.proposal.as_mut().unwrap();
+    proposal.relay_repair = Some(old_repair);
+    proposal.read_relays = read_relays;
+    proposal.write_relays = write_relays;
+    proposal.revision = stale.snapshot.revision + 1;
+    runtime.accounts().save_onboarding(&mut stale).unwrap();
+    assert!(
+        runtime
+            .accounts()
+            .approve_onboarding_repair(&id, stale.snapshot.revision)
+            .await
+            .is_err()
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn typed_relay_repair_checkpoint_fences_pre_preview_readers() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();

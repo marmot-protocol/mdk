@@ -34,7 +34,7 @@ fn verify_bip340_signature(public_key_hex: &str, message_hex: &str, signature_he
 /// caller remains responsible for application-specific kind, author, and tag
 /// policy, and should bound any untrusted network body before passing it here.
 pub fn verify_public_nostr_event_json(event_json: &str) -> bool {
-    serde_json::from_str::<Event>(event_json).is_ok_and(|event| event.verify().is_ok())
+    Event::from_json(event_json).is_ok_and(|event| event.verify().is_ok())
 }
 
 #[cfg(test)]
@@ -85,7 +85,7 @@ mod tests {
         let event = EventBuilder::new(Kind::TextNote, "public event")
             .finalize(&Keys::generate())
             .unwrap();
-        let json = serde_json::to_string(&event).unwrap();
+        let json = event.as_json();
         assert!(verify_public_nostr_event_json(&json));
 
         let mut changed: serde_json::Value = serde_json::from_str(&json).unwrap();

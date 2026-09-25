@@ -3117,6 +3117,16 @@ Prepare a relay proposal without publishing; inbox proposals require an empty wr
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotpropose_onboarding_relays) · [Header contract](include/marmot.h#L8627)
 
+### `marmot_propose_onboarding_relay_repair`
+
+```c
+MarmotStatus marmot_propose_onboarding_relay_repair(const struct MarmotClient *client, const char *account_ref, uint32_t step, struct MarmotOnboardingSnapshot **out);
+```
+
+Return an owned snapshot with a non-publishing, exact relay-repair preview in `proposal->relay_repair`. Inspect its ordered source and proposed tags, unchanged content, typed occurrence diff, and mode before asking for approval. `MARMOT_ONBOARDING_RELAY_REPAIR_MODE_MANUAL_REVIEW` has no approval action; use a separate manual editor or explicitly labeled full reset. The borrowed `account_ref` and validated `step` must identify the current onboarding attempt; free the result with `marmot_onboarding_snapshot_free` and approve only the displayed revision (and recovery epoch where present).
+
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotpropose_onboarding_relay_repair) · [Header contract](include/marmot.h#L8645)
+
 ### `marmot_propose_onboarding_profile`
 
 ```c
@@ -4894,20 +4904,5 @@ bound untrusted JSON and separately enforce author, kind, tag, relay provenance,
 and MLS membership policy. Pair this header with the exact matching library.
 
 [Header contract](include/marmot.h#L8877)
-
-</details>
-
-<details>
-<summary>New exports — complete and organize before merging</summary>
-
-### `marmot_propose_onboarding_relay_repair`
-
-```c
-MarmotStatus marmot_propose_onboarding_relay_repair(const struct MarmotClient *client, const char *account_ref, uint32_t step, struct MarmotOnboardingSnapshot **out);
-```
-
-Return an owned snapshot with a non-publishing, exact relay-repair preview in `proposal->relay_repair`. Inspect its ordered source and proposed tags, unchanged content, typed occurrence diff, and mode before asking for approval. `MARMOT_ONBOARDING_RELAY_REPAIR_MODE_MANUAL_REVIEW` has no approval action; use a separate manual editor or explicitly labeled full reset. The borrowed `account_ref` and validated `step` must identify the current onboarding attempt; free the result with `marmot_onboarding_snapshot_free` and approve only the displayed revision (and recovery epoch where present).
-
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotpropose_onboarding_relay_repair) · [Header contract](include/marmot.h#L8645)
 
 </details>
