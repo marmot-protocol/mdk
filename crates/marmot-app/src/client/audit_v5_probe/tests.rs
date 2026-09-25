@@ -45,6 +45,7 @@ struct Scenario {
     bob_app: MarmotApp,
     bob_id: String,
     key_package_event_id: [u8; 32],
+    retained_welcome: Option<TransportMessage>,
 }
 
 impl Scenario {
@@ -90,6 +91,7 @@ impl Scenario {
             bob_app,
             bob_id,
             key_package_event_id,
+            retained_welcome: None,
         }
     }
 
@@ -126,6 +128,7 @@ impl Scenario {
                 .count(),
             1
         );
+        self.retained_welcome = Some(retained[0].1.clone());
         self.alice.drive_unpublished_welcome_delivery(None).await;
         // Independent sender-side product oracle: enough actual relay ACKs
         // completed the retained delivery obligation. This is not a v5 ACK row.
@@ -158,6 +161,17 @@ impl Scenario {
             .collect()
     }
 
+    fn joins(&self) -> Vec<(&Record, &WelcomeJoinFinished)> {
+        self.capture()
+            .rows
+            .iter()
+            .filter_map(|row| match &row.fields().event {
+                Event::WelcomeJoinFinished(event) => Some((row, event)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn assert_clean(&self) {
         for capture in [self.sender_capture(), self.capture()] {
             assert_eq!(capture.invalid, 0);
@@ -168,6 +182,86 @@ impl Scenario {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn duplicate_delivery_does_not_rejoin() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let group = scenario.create().await;
+        scenario.bob.sync().await.unwrap();
+        let original_join = scenario.joins()[0].1.clone();
+        let original_epoch = scenario.bob.runtime.group_record(&group).unwrap().epoch;
+        let delivery = cgka_traits::TransportDelivery {
+            account_id: cgka_traits::MemberId::new(hex::decode(&scenario.bob_id).unwrap()),
+            group_id_hint: None,
+            message: scenario.retained_welcome.clone().unwrap(),
+            received_at: cgka_traits::transport::Timestamp(1_700_000_002),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".into()),
+                plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        };
+        let replay = scenario
+            .bob
+            .ingest_received_delivery(delivery)
+            .await
+            .unwrap();
+        assert!(replay.joined_groups.is_empty());
+        assert_eq!(
+            scenario.bob.runtime.group_record(&group).unwrap().epoch,
+            original_epoch
+        );
+        assert_eq!(scenario.joins().len(), 1);
+        assert_eq!(scenario.joins()[0].1, &original_join);
+        scenario.assert_clean();
+    })
+    .await
+    .expect("bounded duplicate Welcome scenario");
+}
+
+#[tokio::test]
+async fn join_row_uses_install_anchor_and_omits_ambiguous_replacement() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let group = scenario.create().await;
+        scenario.bob.sync().await.unwrap();
+        let observed = scenario
+            .capture()
+            .rows
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomeObserved(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        let receive = (
+            observed.receive_id.clone(),
+            observed.outer_event_ref.clone(),
+        );
+        let mut later = scenario.bob.runtime.group_record(&group).unwrap();
+        later.epoch.0 += 1;
+        let mut capture = probe();
+        capture.joined(receive.clone(), &later);
+        let Event::WelcomeJoinFinished(join) = &capture.rows[0].fields().event else {
+            panic!("expected join row")
+        };
+        assert_eq!(join.epoch, Some(later.local_copy_install_epoch.0.into()));
+        assert_ne!(join.epoch, Some(later.epoch.0.into()));
+
+        // A replacement resets this lower bound. Even if the current group
+        // happens to be readable, this initial-join slice must omit it.
+        later.join_epoch.0 = 0;
+        let before = capture.rows.len();
+        capture.joined(receive, &later);
+        assert_eq!(capture.rows.len(), before);
+        scenario.assert_clean();
+    })
+    .await
+    .expect("bounded join-anchor scenario");
 }
 
 #[tokio::test]
@@ -217,6 +311,31 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
                 &scenario.key_package_event_id
             ))
         );
+        let joins = scenario.joins();
+        let [(join_row, join)] = joins.as_slice() else {
+            panic!("one actual engine join completion")
+        };
+        let committed_group = scenario.bob.runtime.group_record(&group).unwrap();
+        assert_eq!(committed_group.members.len(), 2);
+        assert_eq!(committed_group.protocol_profile, ProtocolProfile::Current);
+        assert_eq!(
+            committed_group.join_epoch,
+            committed_group.local_copy_install_epoch
+        );
+        assert_eq!(
+            join_row.fields().group_ref,
+            Some(GroupRef::from_group_id(group.as_slice()).unwrap())
+        );
+        assert_eq!(join.receive_id, observed.receive_id);
+        assert_eq!(join.outer_event_ref, outer);
+        assert_eq!(join.result, JoinResult::Joined);
+        assert_eq!(join.reason, None);
+        assert_eq!(join.engine_commit, EngineCommit::Committed);
+        assert_eq!(
+            join.epoch,
+            Some(committed_group.local_copy_install_epoch.0.into())
+        );
+        assert_eq!(join.elapsed_us, None);
         let prepared = scenario
             .sender_capture()
             .rows
@@ -254,6 +373,17 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
             unwrapped.key_package_event_ref
         );
         assert_eq!(observed.acquisition, Acquisition::Unknown);
+        assert!(
+            join_row.fields().seq
+                < scenario
+                    .capture()
+                    .rows
+                    .iter()
+                    .find(|r| matches!(r.fields().event, Event::AppGroupUpdateFinished(_)))
+                    .unwrap()
+                    .fields()
+                    .seq
+        );
         assert_eq!(scenario.updates().len(), 1);
         assert_eq!(scenario.updates()[0].outer_event_ref, outer);
         assert_eq!(scenario.updates()[0].cause, UpdateCause::WelcomeJoin);
@@ -295,7 +425,7 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
         );
         assert_eq!(
             scenario.capture().rows.len(),
-            4,
+            5,
             "ordinary message work adds no Welcome rows"
         );
         scenario.assert_clean();
@@ -323,13 +453,13 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
                 assert!(!text.contains(forbidden));
             }
         }
-        // A gross-regression bound for this four-row subset, not a bandwidth
+        // A gross-regression bound for this five-row subset, not a bandwidth
         // target for the complete Welcome lifecycle or an upload measurement.
-        assert!(total < 5200);
+        assert!(total < 6500);
         println!(
-            "v5 recipient subset: rows=4 body_bytes={total} \
+            "v5 recipient subset: rows=5 body_bytes={total} \
              jsonl_bytes={} largest_body_bytes={largest} by_kind={by_kind:?}",
-            total + 4
+            total + 5
         );
         let sender_rows = &scenario.sender_capture().rows;
         let sender_body: usize = sender_rows
@@ -643,6 +773,7 @@ async fn hash_valid_unsigned_gift_wrap_is_observed_then_rejected_without_inner_r
         assert!(rejected.rumor_event_ref.is_none());
         assert!(rejected.key_package_event_ref.is_none());
         assert!(rows.iter().all(|r| r.fields().group_ref.is_none()));
+        assert!(scenario.joins().is_empty());
         assert!(
             rows.iter()
                 .all(|r| !matches!(r.fields().event, Event::AppGroupUpdateFinished(_)))
@@ -747,6 +878,16 @@ async fn engine_join_survives_app_checkpoint_failure_without_false_success() {
         // Actual canonical MLS state already exists even though the pending
         // invitation has not crossed the app checkpoint transaction.
         assert_eq!(scenario.bob.members(&group).unwrap().len(), 2);
+        let joins = scenario.joins();
+        let [(join_row, join)] = joins.as_slice() else {
+            panic!("engine commit survives app checkpoint failure")
+        };
+        assert_eq!(
+            join_row.fields().group_ref,
+            Some(GroupRef::from_group_id(group.as_slice()).unwrap())
+        );
+        assert_eq!(join.engine_commit, EngineCommit::Committed);
+        assert_eq!(join.result, JoinResult::Joined);
         assert!(
             scenario
                 .bob_app
@@ -764,6 +905,13 @@ async fn engine_join_survives_app_checkpoint_failure_without_false_success() {
                     && e.invite_state == InviteState::Unknown)
         );
         let failed = scenario.updates()[0];
+        let failed_row = scenario
+            .capture()
+            .rows
+            .iter()
+            .find(|row| matches!(row.fields().event, Event::AppGroupUpdateFinished(_)))
+            .unwrap();
+        assert!(join_row.fields().seq < failed_row.fields().seq);
         assert_eq!(failed.compute, Compute::Completed);
         assert_eq!(failed.checkpoint, Checkpoint::FailedBeforeCommit);
         assert_eq!(failed.invite_state, InviteState::Unknown);
@@ -811,6 +959,7 @@ async fn no_op_welcome_replay_does_not_label_unrelated_checkpoint() {
             .find(|event| matches!(event, GroupEvent::GroupJoined { .. }))
             .expect("actual retained Welcome event");
         let before = scenario.capture().rows.len();
+        assert_eq!(scenario.joins().len(), 1);
         scenario
             .bob
             .observe_drained_session_events(&marmot_account::AccountDeviceEffects {
@@ -830,6 +979,7 @@ async fn no_op_welcome_replay_does_not_label_unrelated_checkpoint() {
                 .archived
         );
         assert_eq!(scenario.capture().rows.len(), before);
+        assert_eq!(scenario.joins().len(), 1);
         scenario.assert_clean();
     })
     .await

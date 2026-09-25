@@ -24,6 +24,7 @@ its output is checked to remain v4. Probe records stay in bounded memory.
 | `welcome_prepared` | On the sender's current-profile founding path, the runtime preparation call returns after the engine atomically retained the canonical group and exact outbound Welcome as `Sent`. The test-only probe matches the returned artifact to the selected, relay-validated public KeyPackage event by recipient identity and checks the outer event hash. | A relay send, ACK, recipient observation, engine join, or app/UI availability. Failure before the returned artifact has no terminal row in this subset. |
 | `welcome_observed` | The app admits a Welcome envelope to its ingest path, after checking its NIP-01 event hash for reference derivation. | Signature/unwrap validity, engine join, endpoint provenance, live versus history acquisition. Acquisition is explicitly `unknown`. |
 | `welcome_unwrapped` | The same engine-invoked Nostr peeler either validates the authenticated rumor and strict inner `e` KeyPackage event ID, or returns a typed transport error. The row shares the receive ID and outer reference with `welcome_observed`. | MLS KeyPackage secret availability, engine join, app checkpoint, or sender publication. SDK NIP-59 extraction errors are coarsely `failed/unwrap_failed`, not a specific bad-key diagnosis. |
+| `welcome_join_finished`, `joined` | This exact observed Welcome returns `Processed` with its own `GroupJoined` event, which the engine journaled in the successful join transaction. The row uses the group's durable local-copy install epoch, written by that transaction; it precedes any fallible app checkpoint. | App persistence or acceptance, UI display, recipient history completeness, or another delivery's join. This subset omits other join dispositions and ambiguous initial/replacement cases. |
 | `app_group_update_finished`, `welcome_join` | A dirty group projection from an observed engine Welcome event reaches the account checkpoint. | The entire engine transaction history, every projection row, UI rendering or notification delivery. |
 | `app_group_update_finished`, `invite_confirmation` | Explicit acceptance prepares a changed app row and returns from its checkpoint. | Recipient notification or screen visibility. |
 
@@ -46,6 +47,19 @@ message and errors as before; the concrete peeler also has a narrow provenance
 return for the test wrapper. The SDK verifies the signed gift wrap and seal but
 does not verify an optional ID on its unsigned rumor, so the probe references the
 rumor's computed NIP-01 ID from authenticated fields, never that optional claim.
+The join row uses the same per-delivery receive ID and exact outer ID, requires
+`Processed` plus a unique returned `GroupJoined` whose `via_welcome` matches
+that outer ID, and reads the current-profile group under the same AppClient
+ingest. The engine writes `local_copy_install_epoch` and the durable
+`GroupJoined` event in one transaction. Unlike the current group epoch, this
+install anchor remains the joined epoch after buffered group messages advance
+the copy. The initial-join guard requires `join_epoch` to equal that anchor
+and be nonzero; an epoch-zero first join is deliberately omitted because a
+replacement also resets `join_epoch` to zero. A replacement/explicit consent,
+duplicate delivery, or older event drained alongside unrelated input cannot
+produce another join row. Account effect-publication or buffered-replay errors
+after the engine transaction can leave a real commit without a row; absence
+does not imply rollback. No new engine/account observer or replay ledger is used.
 Generic checkpoint errors use `checkpoint: unknown` and `invite_state: unknown`:
 an error alone is insufficient to assert that no commit occurred. Only the
 explicit fault placed before all checkpoint writes produces
@@ -78,7 +92,7 @@ facts are taken from the running scenario, not converted from v4 records.
    invitation; explicit acceptance checkpoints accepted state. Independent
    product assertions inspect persisted app rows, member count, matching epochs,
    and a subsequent delivered plaintext message. The audit assertions correlate
-   the receive and checkpoint records by outer reference.
+   the receive, committed join, and checkpoint records by outer reference.
 2. The engine joins, then a unit-test-only fault stops the app checkpoint before
    its first write. The MLS roster exists while the persisted app invitation
    does not. Evidence records failure/unknown invitation, followed by a distinct
@@ -102,6 +116,12 @@ facts are taken from the running scenario, not converted from v4 records.
    Two actual selected recipients yield two distinct retained artifacts and sender rows;
    reordering the artifacts in a probe check preserves recipient-to-KeyPackage
    links, while a missing selection emits no partial success rows.
+9. Direct redelivery of the exact retained Welcome keeps one joined group and
+   one join row. A separate bounded mapping check raises the current epoch of
+   an actual joined group record and confirms the row still names its install
+   epoch; resetting its first-membership anchor suppresses an ambiguous
+   replacement row. This is not a claim that the test caused a later network
+   Commit to replay in the same ingress call.
 
 The probe discards its pending operation token when runtime preparation returns
 an error, but this subset has no real post-selection fault injection and does
@@ -124,17 +144,23 @@ run. Two recipients produced two such rows, 1,832 body bytes/1,834 JSONL bytes,
 with a 916-byte largest body. These are local compact JSON bytes by kind and
 account-device source; no HTTP request or full-v5 budget is measured.
 
-The successful scenario emits one sender row and four recipient rows: one
-receive, one unwrap, one pending checkpoint and one accepted checkpoint. Its
+With `welcome_join_finished` added, a 2026-09-25 focused run measured five
+recipient rows: 3,525 body bytes, 3,530 JSONL bytes, largest body 764 bytes.
+The join row contributed 689 body bytes. The sender still emitted one
+`welcome_prepared` row of 915 body/916 JSONL bytes. These counts are from the
+local selected-probe success scenario; they are not transport or upload bytes.
+
+The successful scenario emits one sender row and five recipient rows: one
+receive, one unwrap, one committed join, one pending checkpoint and one accepted checkpoint. Its
 command prints per-kind counts/body
 bytes, total compact JSON body bytes, JSONL bytes (including one newline per
-row), and largest body. The 5.2 KiB aggregate assertion is only a gross
-regression guard for the four-row recipient subset. No v5 HTTP request is
+row), and largest body. The 6.5 KiB aggregate assertion is only a gross
+regression guard for the five-row recipient subset. No v5 HTTP request is
 sent; these are **not upload bytes**, a full Welcome budget, or a device/day
 estimate. Source/session identifiers have fixed encoded width; timing values can
 change the byte count between runs.
 
-Sender publication, engine disposition records, roster baselines,
+Sender publication, non-success engine disposition records, roster baselines,
 process-reopen capture, broad rejected-input classification, and reader
 missing-source conclusions remain separate slices. In
 particular this does not claim complete W01/W03/W04/W08 acceptance or resolve

@@ -3,8 +3,8 @@
 //!
 //! A received envelope, its actual transport peel, and a committed app
 //! checkpoint are distinct evidence boundaries. A sender founding preparation
-//! also records the returned retained artifact. This does not record recipient
-//! engine commit, baseline capture, or relay ACKs.
+//! also records the returned retained artifact and recipient engine join.
+//! This does not record baseline capture or relay ACKs.
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use cgka_session::{PublishWork, SessionEffects};
 use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::error::PeelerError;
+use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::PeeledMessage;
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
@@ -452,6 +453,38 @@ impl WelcomeProbe {
                     .map(|p| NostrEventRef::from_validated_event_id(&p.key_package_event_id)),
                 reason: completion.reason,
                 elapsed_us: Some(completion.elapsed_us.into()),
+            }),
+        );
+    }
+
+    /// The matching GroupJoined was durably journaled in the engine's join
+    /// transaction. The copy-install epoch is written there too; a buffered
+    /// group message can advance `group.epoch` before this call returns.
+    pub(super) fn joined(&mut self, receive: (LocalId, NostrEventRef), group: &Group) {
+        // A replacement Welcome resets join_epoch to zero. Epoch zero can
+        // also be a valid first join, so omit that ambiguous case rather than
+        // classify a replacement as an initial join.
+        if group.protocol_profile != ProtocolProfile::Current
+            || group.is_terminal()
+            || group.join_epoch.0 == 0
+            || group.join_epoch != group.local_copy_install_epoch
+        {
+            return;
+        }
+        let Ok(group_ref) = GroupRef::from_group_id(group.id.as_slice()) else {
+            self.invalid += 1;
+            return;
+        };
+        self.record(
+            Some(group_ref),
+            Event::WelcomeJoinFinished(WelcomeJoinFinished {
+                receive_id: receive.0,
+                outer_event_ref: receive.1,
+                result: JoinResult::Joined,
+                reason: None,
+                epoch: Some(group.local_copy_install_epoch.0.into()),
+                engine_commit: EngineCommit::Committed,
+                elapsed_us: None,
             }),
         );
     }

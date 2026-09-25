@@ -2721,7 +2721,7 @@ impl AppClient {
         let telemetry = client.runtime_telemetry.clone();
         let ingest_observation = telemetry.as_ref().map(|t| t.observe(RuntimeOp::Ingest));
         #[cfg(test)]
-        if let (Some(slot), Some(receive)) = (&client.audit_v5_peel_slot, probe_receive) {
+        if let (Some(slot), Some(receive)) = (&client.audit_v5_peel_slot, probe_receive.clone()) {
             slot.lock().unwrap().arm(&delivery.message, receive);
         }
         let ingest = client
@@ -2751,6 +2751,34 @@ impl AppClient {
             && let Some(completion) = slot.lock().unwrap().take()
         {
             probe.unwrapped(completion);
+        }
+        #[cfg(test)]
+        if let (Some(probe), Some(receive), Ok(effects)) =
+            (&mut client.audit_v5_probe, probe_receive, &ingest)
+            && matches!(effects.outcome, IngestOutcome::Processed)
+        {
+            // The event is journaled in the join transaction. Only this
+            // delivery's exact Welcome may turn it into a join row: the same
+            // effects can also drain older application events.
+            let mut joins = effects
+                .effects
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    cgka_traits::engine::GroupEvent::GroupJoined {
+                        group_id,
+                        via_welcome,
+                        explicitly_confirmed: false,
+                        ..
+                    } if via_welcome == &source_message_id => Some(group_id),
+                    _ => None,
+                });
+            if let Some(group_id) = joins.next()
+                && joins.next().is_none()
+                && let Ok(group) = client.runtime.group_record(group_id)
+            {
+                probe.joined(receive, &group);
+            }
         }
         if let Some(observation) = ingest_observation {
             observation.finish(if ingest.is_ok() {
