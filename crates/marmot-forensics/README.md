@@ -19,6 +19,13 @@ implementations used by the engine and app runtime when operators enable forensi
 See [`docs/marmot-architecture/audit-logging.md`](../../docs/marmot-architecture/audit-logging.md) for the full
 implementation inventory.
 
+## Inactive v5 Welcome foundation
+
+The separate `v5` module provides checked record types, a versioned schema and
+synthetic contract/reference fixtures. See [V5-WELCOME.md](V5-WELCOME.md) for the
+validated boundary and its limits. It does not change the active v4 recorder,
+delivery path, receiver acceptance or upload defaults.
+
 ## Run the tests
 
 ```sh

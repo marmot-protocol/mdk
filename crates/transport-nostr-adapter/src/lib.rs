@@ -68,6 +68,7 @@ fn inbound_wire_metadata(
 
 mod acquisition;
 mod key_package;
+mod publish_accounting;
 mod relay_list;
 #[cfg(feature = "sdk")]
 mod sdk_client;
@@ -333,9 +334,21 @@ pub struct NostrAdapterMetrics {
     pub inbound_events_seen: usize,
     pub inbound_events_delivered: usize,
     pub inbound_events_dropped: usize,
+    /// `TransportAdapter` publish calls that entered a relay client. One call
+    /// is one attempt however many endpoints it targets. Once every started
+    /// call has resolved or been dropped, attempts equal successes + failures
+    /// + cancellations.
     pub publish_attempts: usize,
+    /// Calls whose accepted-endpoint count met `required_acks.max(1)`.
     pub publish_successes: usize,
+    /// Client errors and outcomes below that threshold, including empty
+    /// acceptance.
     pub publish_failures: usize,
+    /// Started calls whose caller dropped them before the client returned,
+    /// such as outstanding endpoints abandoned once a fanout reaches quorum.
+    /// These are not relay failures and may still have reached a relay.
+    #[serde(default)]
+    pub publish_cancellations: usize,
     /// Route-level NIP-77 passes attempted after ordinary subscription rebuilds.
     #[serde(default)]
     pub reconciliation_attempts: usize,
@@ -647,6 +660,8 @@ pub struct NostrTransportAdapter {
     subscription_lock: Arc<Mutex<()>>,
     /// Local monotonic origin for delivery telemetry. Never `created_at`.
     monotonic_start: std::time::Instant,
+    /// Shared by [`Clone`] and by every account adapter on this relay plane.
+    publish_accounting: Arc<publish_accounting::PublishAccounting>,
 }
 
 impl NostrTransportAdapter {
@@ -659,6 +674,7 @@ impl NostrTransportAdapter {
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             subscription_lock: Arc::new(Mutex::new(())),
             monotonic_start: std::time::Instant::now(),
+            publish_accounting: publish_accounting::PublishAccounting::new(),
         }
     }
 
@@ -700,17 +716,85 @@ impl NostrTransportAdapter {
             method = "metrics",
             "snapshotting adapter metrics"
         );
-        let state = self.state.read().await;
-        let mut metrics = state.metrics.clone();
-        metrics.active_accounts = state.accounts.len();
-        metrics.active_group_subscriptions = state
-            .accounts
-            .values()
-            .map(|account| account.groups.len())
-            .sum();
-        metrics.unsubscribe_retries_pending =
-            state.pending_unsubscribes.len() + state.pending_scoped_unsubscribes.len();
+        let mut metrics = {
+            let state = self.state.read().await;
+            let mut metrics = state.metrics.clone();
+            metrics.active_accounts = state.accounts.len();
+            metrics.active_group_subscriptions = state
+                .accounts
+                .values()
+                .map(|account| account.groups.len())
+                .sum();
+            metrics.unsubscribe_retries_pending =
+                state.pending_unsubscribes.len() + state.pending_scoped_unsubscribes.len();
+            metrics
+        };
+        let publish = self.publish_accounting.snapshot();
+        metrics.publish_attempts = publish.attempts;
+        metrics.publish_successes = publish.successes;
+        metrics.publish_failures = publish.failures;
+        metrics.publish_cancellations = publish.cancellations;
         metrics
+    }
+
+    /// Publish one already-validated event through `client` for `account_id`
+    /// and record it on this adapter's shared publish counters.
+    ///
+    /// Callers keep account, endpoint-safety, and envelope checks. This method
+    /// does not revalidate, build a request, or fan out locally. Success
+    /// follows [`cgka_traits::TransportPublishReport::met_required_acks`]:
+    /// `accepted >= required_acks.max(1)`. Any other `Ok` outcome and any
+    /// `Err` count as one failure. Dropping this future after it has started
+    /// counts as one cancellation; dropping it before it is polled counts
+    /// nothing. The client's outcome or error is returned unchanged.
+    pub async fn publish_event_with_client(
+        &self,
+        client: &dyn NostrRelayClient,
+        account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        let mut attempt = self.publish_accounting.begin();
+        let outcome = client
+            .publish_event_for_account(account_id, endpoints, event, required_acks)
+            .await;
+        match &outcome {
+            Ok(result)
+                if publish_accounting::outcome_met_required_acks(
+                    result.accepted.len(),
+                    required_acks,
+                ) =>
+            {
+                attempt.succeed();
+                tracing::debug!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "publish_event_with_client",
+                    accepted_count = result.accepted.len(),
+                    failed_count = result.failed.len(),
+                    "transport publish completed"
+                );
+            }
+            Ok(result) => {
+                attempt.fail();
+                tracing::debug!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "publish_event_with_client",
+                    accepted_count = result.accepted.len(),
+                    failed_count = result.failed.len(),
+                    "transport publish fell below the acceptance threshold"
+                );
+            }
+            Err(_) => {
+                attempt.fail();
+                tracing::warn!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "publish_event_with_client",
+                    "transport publish failed"
+                );
+            }
+        }
+        outcome
     }
 
     /// Record one privacy-safe aggregate NIP-77 result. These counters are
@@ -1510,38 +1594,15 @@ impl TransportAdapter for NostrTransportAdapter {
 
         let event = NostrTransportEvent::from_transport_message(&request.message)
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
-        self.state.write().await.record_publish_attempt();
-        let outcome = match self
-            .relay_client
-            .publish_event_for_account(
+        let outcome = self
+            .publish_event_with_client(
+                self.relay_client.as_ref(),
                 &request.account_id,
                 request.target.endpoints(),
                 &event,
                 request.required_acks,
             )
-            .await
-        {
-            Ok(outcome) => {
-                self.state.write().await.record_publish_success();
-                tracing::debug!(
-                    target: "transport_nostr_adapter::adapter",
-                    method = "publish",
-                    accepted_count = outcome.accepted.len(),
-                    failed_count = outcome.failed.len(),
-                    "transport publish completed"
-                );
-                outcome
-            }
-            Err(e) => {
-                self.state.write().await.record_publish_failure();
-                tracing::warn!(
-                    target: "transport_nostr_adapter::adapter",
-                    method = "publish",
-                    "transport publish failed"
-                );
-                return Err(e);
-            }
-        };
+            .await?;
 
         Ok(TransportPublishReport {
             message_id: outcome.message_id.unwrap_or(request.message.id),
@@ -2153,18 +2214,6 @@ impl AdapterState {
         for coverage in self.account_replay_coverage.values_mut() {
             coverage.record_eose(subscription_id, relay);
         }
-    }
-
-    fn record_publish_attempt(&mut self) {
-        self.metrics.publish_attempts += 1;
-    }
-
-    fn record_publish_success(&mut self) {
-        self.metrics.publish_successes += 1;
-    }
-
-    fn record_publish_failure(&mut self) {
-        self.metrics.publish_failures += 1;
     }
 
     fn routes_for(

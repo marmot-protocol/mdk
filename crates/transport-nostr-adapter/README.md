@@ -98,18 +98,33 @@ See [`AGENTS.md`](AGENTS.md) for scope, the `sdk` feature, and privacy-safe tele
 
 `NostrSdkRelayClient::reconcile_subscription` requires a `NostrReconciliationProgress` store for
 that account and route. Hosts serialize reconciliation per route and preserve its cursor across
-subscription rebuilds. Selection saves the next position before fetching, including when the
-caller later cancels. A failed progress read or write stops replay; it must not silently restart
-at a refused prefix. Empty remote sets preserve the cursor: failed relay comparisons can also
-produce an empty set, and the next nonempty set wraps around the saved position.
+subscription rebuilds. Each selected ID is checkpointed before its exact-ID request, including
+when the caller later cancels. An ID left unattempted by the pass budget does not move the cursor.
+A failed progress read or write stops replay; it must not silently restart at a refused prefix.
+Empty remote sets preserve the cursor: failed relay comparisons can also produce an empty set, and
+the next nonempty set wraps around the saved position.
 
 MarmotApp stores the cursor in its encrypted account database alongside existing route inventory
 (migration 0061). Route retirement deletes it, and a late replay cannot recreate deleted route
 state. The SDK no longer has a shared 256-entry replay cursor cache, so activity on other routes
 cannot evict an active route's progress. State adds at most one 32-byte cursor to each existing
-route row; the 128-event fetch batch and 16,384-ID reconciliation set bounds remain unchanged.
+route row. The NIP-77 remote-only selection still holds at most 128 IDs from a 16,384-ID
+reconciliation set. Each pass now sends at most 16 request-local one-ID acquisitions within the
+existing two-second comparison deadline and ordinary aggregate 16-item / 128-KiB-serialized-event
+allowance. One event up to 5 MiB can occupy an otherwise empty pass, matching the pinned SDK's
+default normalized-message ceiling; larger events remain incomplete. Full-event SDK cache hits
+share this rule with fetched events. The first exact-ID request may temporarily retain up to 5 MiB
+per endpoint before deduplication, and the SDK can observe one rejected boundary event beyond its
+byte limit. The largest endpoint's received count/bytes conservatively charges each network
+request. Fast endpoint failures leave that endpoint incomplete while healthy IDs continue within
+the same pass budgets; a silent endpoint can still consume most of the two-second deadline. A
+byte/item/deadline exit retains partial events but leaves comparison incomplete. These are
+returned-result and SDK-received budgets, not complete wire or memory ceilings.
 
-Replay position is advisory, separate from admitted event inventory. Failed or cancelled fetches
-advance position but acknowledge no delivery. Refused events recur on wrap; only durable app
-ingestion removes an event from the missing set. SDK callers must supply this new progress
+Replay position is advisory, separate from admitted event inventory. A cancelled fetch retains its
+pre-I/O cursor advance. A completed byte-limit rejection of an otherwise eligible network ID
+restores the preceding cursor when earlier results consumed this pass's allowance, so the ID leads
+the next pass even if that earlier result stays unadmitted. Repeated route URLs are counted once
+after parsing, preserving one acquisition obligation per distinct relay. Refused and over-ceiling
+events recur on wrap; only durable app ingestion removes an event from the missing set. SDK callers must supply this new progress
 argument; no FFI signature changes are required.

@@ -207,6 +207,9 @@ The [real-SDK receipt-release fence qualification](../further-context/recovery-i
 adds positive returned-content evidence while retaining the redelivery limit.
 The [real-SDK attempt/scope replacement qualification](../further-context/recovery-lifecycle-generation-qualification.md)
 checks durable admission from an old result without allowing its completion to clear the newer scope.
+The [ordinary SDK sighting and bounded redelivery qualification](../further-context/recovery-ordinary-seen-redelivery-qualification.md)
+checks an event seen on a live ordinary subscription but absent from account
+storage before exact-ID worker admission.
 The [progress and fairness qualification](../further-context/recovery-p5-progress-fairness-2026-09-24.md)
 records controlled ready-work and distinct known-ID owner turns; this branch
 also runs those fixtures against the isolated SDK pin. Its broad recovery and

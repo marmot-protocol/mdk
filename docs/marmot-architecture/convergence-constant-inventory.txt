@@ -54,3 +54,7 @@ A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|MAX_CONCURR
 A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|ADMISSION_YIELD_DELAY
 A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|PROBE_INTERVAL
 A11|crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs|MAX_REQUEST_DURATION
+A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_ID_REQUESTS
+A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
+A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
+A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES

@@ -4217,16 +4217,19 @@ mod tests {
                     .inventory
                     .iter()
                     .map(|inventory| {
-                        Ok(Some(transport_nostr_adapter::NostrReconciliationSummary {
-                            relays_succeeded: 1,
-                            // Even one failed endpoint keeps the entire group route
-                            // retryable when the backend has only aggregate results.
-                            relays_failed: usize::from(matches!(
-                                inventory.route,
-                                storage_sqlite::TransportReconciliationRoute::Group(_)
-                            )),
-                            ..Default::default()
-                        }))
+                        Ok(Some((
+                            transport_nostr_adapter::NostrReconciliationSummary {
+                                relays_succeeded: 1,
+                                // Even one failed endpoint keeps the entire group route
+                                // retryable when the backend has only aggregate results.
+                                relays_failed: usize::from(matches!(
+                                    inventory.route,
+                                    storage_sqlite::TransportReconciliationRoute::Group(_)
+                                )),
+                                ..Default::default()
+                            },
+                            Vec::new(),
+                        )))
                     })
                     .collect(),
             );
@@ -4276,12 +4279,13 @@ mod tests {
                 storage_sqlite::TransportReconciliationRoute::Group(_)
             ));
             client.test_comparison_results = Some(
-                [Ok(Some(
+                [Ok(Some((
                     transport_nostr_adapter::NostrReconciliationSummary {
                         relays_succeeded: 1,
                         ..Default::default()
                     },
-                ))]
+                    Vec::new(),
+                )))]
                 .into(),
             );
             client
@@ -4454,8 +4458,13 @@ mod tests {
             .unwrap();
         assert_eq!(grant.inventory.len(), 2);
         let first = grant.inventory[0].route.clone();
-        client.test_comparison_results =
-            Some([Ok(Some(Default::default())), Ok(Some(Default::default()))].into());
+        client.test_comparison_results = Some(
+            [
+                Ok(Some((Default::default(), Vec::new()))),
+                Ok(Some((Default::default(), Vec::new()))),
+            ]
+            .into(),
+        );
         client.test_comparison_delay = Some(Duration::from_secs(60));
         tokio::time::timeout(
             Duration::from_secs(15),

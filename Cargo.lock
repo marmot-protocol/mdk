@@ -6703,6 +6703,7 @@ dependencies = [
  "futures",
  "hex",
  "nostr 0.45.5",
+ "nostr-memory",
  "nostr-relay-builder",
  "nostr-sdk",
  "serde",

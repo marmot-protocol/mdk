@@ -1,0 +1,27 @@
+[
+  {
+    "kind": "group",
+    "input_hex": "000102030405060708090a0b0c0d0e0f",
+    "expected": "2a04bbc43f7a064c151bf521ccd6023a84454b6128e305a22052c7742a3f3633"
+  },
+  {
+    "kind": "group",
+    "input_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "expected": "e88b59057994eb345e54fba5bf20c87227010c7bb362dbed5bb292a780cdc4aa"
+  },
+  {
+    "kind": "member",
+    "input_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "expected": "9eb8f6f60ce663616720f94a34aae5c8ce3f6c0b36461aa0206aed3a06972a8c"
+  },
+  {
+    "kind": "nostr_event",
+    "input_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "expected": "0d18a440cc8dbffcf0c801b38038f27d03233c7189e802c25be9fbf513a9bcd2"
+  },
+  {
+    "kind": "engine_message",
+    "input_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "expected": "d211a69516cf7893cf4866f8c5b12f32ebfb2b602d2a615778df5bccad6e9ef9"
+  }
+]

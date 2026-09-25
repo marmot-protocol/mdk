@@ -1,0 +1,37 @@
+[
+  {
+    "raw": "wss://RELAY.invalid",
+    "normalized": "wss://relay.invalid/",
+    "expected": "03ed2da7d8811cb3c4caa9e866af1950c3a9f6843f05daab52194e16ee413d10"
+  },
+  {
+    "raw": "wss://relay.invalid:443/",
+    "normalized": "wss://relay.invalid/",
+    "expected": "03ed2da7d8811cb3c4caa9e866af1950c3a9f6843f05daab52194e16ee413d10"
+  },
+  {
+    "raw": "ws://relay.invalid:80",
+    "normalized": "ws://relay.invalid/",
+    "expected": "9cb5feea4b8de5468db8c860e00611b276d00d5be5ce1a6fc3803405c4b50834"
+  },
+  {
+    "raw": "wss://relay.invalid/a",
+    "normalized": "wss://relay.invalid/a",
+    "expected": "ada92165b49ffd35c678dbca72e33900809258702afba0c965c7b6dc9498b2b4"
+  },
+  {
+    "raw": "wss://relay.invalid/a/",
+    "normalized": "wss://relay.invalid/a/",
+    "expected": "e25a865a07807ec2e6580c858e95a3e870d32fc9f20252954f49df6125100d83"
+  },
+  {
+    "raw": "wss://relay.invalid/a?x=1",
+    "normalized": "wss://relay.invalid/a?x=1",
+    "expected": "adb18415691080f237c1b6629c1a24611aaf16edb07ca89169ef008096781f86"
+  },
+  {
+    "raw": "wss://relay.invalid/a?x=2",
+    "normalized": "wss://relay.invalid/a?x=2",
+    "expected": "92c66bc53e2868c767a1b7db6653385ff362843aa5c1de48c242806d23937ec1"
+  }
+]

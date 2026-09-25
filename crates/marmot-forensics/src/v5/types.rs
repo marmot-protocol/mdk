@@ -1,0 +1,491 @@
+//! Data-only candidate types. Use `Record::new` / `Record::from_json` to enforce
+//! cross-field constraints and bounds; deserializing candidates alone is not validation.
+use super::primitives::*;
+use serde::{Deserialize, Deserializer, Serialize};
+
+// deserialize_with deliberately makes nullable fields required on the wire.
+fn nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaVersion {
+    #[serde(rename = "marmot-forensics-audit/v5")]
+    V5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildProfile {
+    Release,
+    Debug,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    Ios,
+    Macos,
+    Android,
+    Linux,
+    Windows,
+    Wasm,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    Founding,
+    Invite,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Construction {
+    Constructed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Retention {
+    Committed,
+    Failed,
+    NotAttempted,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationStage {
+    Selection,
+    Validation,
+    Construction,
+    Retention,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationReason {
+    NoUsableKeyPackage,
+    KeyPackageInvalid,
+    ConstructionFailed,
+    RetentionFailed,
+    StorageFailed,
+    InternalFailed,
+    Unclassified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteSource {
+    ResolvedInbox,
+    RetainedTarget,
+    ConfiguredFallback,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointStatus {
+    Acknowledged,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointFailureKind {
+    TerminalRejected,
+    NotExposed,
+    PossiblyExposed,
+    RetryableUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionCategory {
+    #[serde(rename = "duplicate")]
+    Duplicate,
+    #[serde(rename = "pow")]
+    Pow,
+    #[serde(rename = "blocked")]
+    Blocked,
+    #[serde(rename = "rate-limited")]
+    RateLimited,
+    #[serde(rename = "invalid")]
+    Invalid,
+    #[serde(rename = "error")]
+    Error,
+    #[serde(rename = "unsupported")]
+    Unsupported,
+    #[serde(rename = "auth-required")]
+    AuthRequired,
+    #[serde(rename = "restricted")]
+    Restricted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Policy {
+    Met,
+    Unmet,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetainedState {
+    Pending,
+    Completed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotStartedReason {
+    NoEligibleRoute,
+    RouteResolutionFailed,
+    RetainedStateFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Acquisition {
+    Live,
+    History,
+    LocalReplay,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnwrapResult {
+    Validated,
+    Rejected,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnwrapReason {
+    WrongRecipient,
+    InvalidSignature,
+    InvalidEncoding,
+    UnwrapFailed,
+    InternalFailed,
+    Unclassified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinResult {
+    Joined,
+    Duplicate,
+    Deferred,
+    Rejected,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinReason {
+    WrongRecipient,
+    InvalidSignature,
+    InvalidEncoding,
+    UnsupportedFeature,
+    AuthorizationFailed,
+    MissingKeyPackage,
+    RejoinConfirmationRequired,
+    Duplicate,
+    StorageFailed,
+    InternalFailed,
+    Unclassified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineCommit {
+    Committed,
+    RolledBack,
+    NotAttempted,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateCause {
+    WelcomeJoin,
+    InviteConfirmation,
+    RetainedEventReplay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Compute {
+    Completed,
+    Unchanged,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Checkpoint {
+    Committed,
+    FailedBeforeCommit,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteState {
+    PendingConfirmation,
+    Accepted,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateReason {
+    StorageFailed,
+    ProjectionFailed,
+    InternalFailed,
+    Unclassified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineReason {
+    Created,
+    Joined,
+    AuditEnabled,
+    Opened,
+    ActiveRefresh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Limitation {
+    MemberLimit,
+    ByteLimit,
+    AdminPolicyUnavailable,
+    StateUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capture {
+    Complete,
+    Partial,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Basis {
+    Founding {},
+    Commit { commit_ref: EngineMessageRef },
+    Unavailable {},
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Producer {
+    pub mdk_revision: Revision,
+    pub build_profile: BuildProfile,
+    pub platform: Platform,
+    #[serde(deserialize_with = "nullable")]
+    pub host_build: Option<BuildToken>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointResult {
+    pub endpoint_ref: EndpointRef,
+    pub status: EndpointStatus,
+    #[serde(deserialize_with = "nullable")]
+    pub failure_kind: Option<EndpointFailureKind>,
+    #[serde(deserialize_with = "nullable")]
+    pub rejection_category: Option<RejectionCategory>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineMember {
+    pub member_ref: MemberRef,
+    #[serde(deserialize_with = "nullable")]
+    pub admin: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomePrepared {
+    pub op_id: LocalId,
+    pub recipient_ref: MemberRef,
+    pub mode: Mode,
+    pub basis: Basis,
+    #[serde(deserialize_with = "nullable")]
+    pub key_package_event_ref: Option<NostrEventRef>,
+    #[serde(deserialize_with = "nullable")]
+    pub outer_event_ref: Option<NostrEventRef>,
+    pub construction: Construction,
+    pub retention: Retention,
+    #[serde(deserialize_with = "nullable")]
+    pub failure_stage: Option<PreparationStage>,
+    #[serde(deserialize_with = "nullable")]
+    pub reason: Option<PreparationReason>,
+    #[serde(deserialize_with = "nullable")]
+    pub elapsed_us: Option<U64String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomePublishStarted {
+    pub op_id: LocalId,
+    pub attempt_id: LocalId,
+    pub outer_event_ref: NostrEventRef,
+    pub recipient_ref: MemberRef,
+    pub route_source: RouteSource,
+    pub targets: Vec<EndpointRef>,
+    #[serde(deserialize_with = "nullable")]
+    pub target_count: Option<u32>,
+    pub targets_complete: bool,
+    pub required_acks: u32,
+    pub accepted_before_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomePublishFinished {
+    pub attempt_id: LocalId,
+    pub outer_event_ref: NostrEventRef,
+    pub results: Vec<EndpointResult>,
+    pub results_complete: bool,
+    pub accepted_this_attempt_count: u32,
+    pub accepted_total_count: u32,
+    pub required_acks: u32,
+    pub policy: Policy,
+    pub retained_state: RetainedState,
+    #[serde(deserialize_with = "nullable")]
+    pub elapsed_us: Option<U64String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomePublishNotStarted {
+    pub op_id: LocalId,
+    pub outer_event_ref: NostrEventRef,
+    pub recipient_ref: MemberRef,
+    pub reason: NotStartedReason,
+    #[serde(deserialize_with = "nullable")]
+    pub elapsed_us: Option<U64String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomeObserved {
+    pub receive_id: LocalId,
+    pub outer_event_ref: NostrEventRef,
+    pub acquisition: Acquisition,
+    #[serde(deserialize_with = "nullable")]
+    pub endpoint_ref: Option<EndpointRef>,
+    #[serde(deserialize_with = "nullable")]
+    pub fetch_id: Option<LocalId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomeUnwrapped {
+    pub receive_id: LocalId,
+    pub outer_event_ref: NostrEventRef,
+    pub result: UnwrapResult,
+    #[serde(deserialize_with = "nullable")]
+    pub rumor_event_ref: Option<NostrEventRef>,
+    #[serde(deserialize_with = "nullable")]
+    pub key_package_event_ref: Option<NostrEventRef>,
+    #[serde(deserialize_with = "nullable")]
+    pub reason: Option<UnwrapReason>,
+    #[serde(deserialize_with = "nullable")]
+    pub elapsed_us: Option<U64String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WelcomeJoinFinished {
+    pub receive_id: LocalId,
+    pub outer_event_ref: NostrEventRef,
+    pub result: JoinResult,
+    #[serde(deserialize_with = "nullable")]
+    pub reason: Option<JoinReason>,
+    #[serde(deserialize_with = "nullable")]
+    pub epoch: Option<U64String>,
+    pub engine_commit: EngineCommit,
+    #[serde(deserialize_with = "nullable")]
+    pub elapsed_us: Option<U64String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppGroupUpdateFinished {
+    pub update_id: LocalId,
+    pub outer_event_ref: NostrEventRef,
+    pub cause: UpdateCause,
+    pub compute: Compute,
+    pub checkpoint: Checkpoint,
+    pub invite_state: InviteState,
+    #[serde(deserialize_with = "nullable")]
+    pub reason: Option<UpdateReason>,
+    #[serde(deserialize_with = "nullable")]
+    pub elapsed_us: Option<U64String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupBaseline {
+    pub reason: BaselineReason,
+    #[serde(deserialize_with = "nullable")]
+    pub cause_outer_event_ref: Option<NostrEventRef>,
+    #[serde(deserialize_with = "nullable")]
+    pub epoch: Option<U64String>,
+    pub basis: Basis,
+    pub members: Vec<BaselineMember>,
+    #[serde(deserialize_with = "nullable")]
+    pub member_count: Option<u32>,
+    pub members_complete: bool,
+    pub limitations: Vec<Limitation>,
+    pub capture: Capture,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordFields {
+    pub schema_version: SchemaVersion,
+    pub source_ref: SourceRef,
+    pub session_id: SessionId,
+    pub seq: U64String,
+    pub wall_time_ms: I64String,
+    pub mono_us: U64String,
+    pub producer: Producer,
+    #[serde(deserialize_with = "nullable")]
+    pub group_ref: Option<GroupRef>,
+    pub event: Event,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    WelcomePrepared(WelcomePrepared),
+    WelcomePublishStarted(WelcomePublishStarted),
+    WelcomePublishFinished(WelcomePublishFinished),
+    WelcomePublishNotStarted(WelcomePublishNotStarted),
+    WelcomeObserved(WelcomeObserved),
+    WelcomeUnwrapped(WelcomeUnwrapped),
+    WelcomeJoinFinished(WelcomeJoinFinished),
+    AppGroupUpdateFinished(AppGroupUpdateFinished),
+    GroupBaseline(GroupBaseline),
+}

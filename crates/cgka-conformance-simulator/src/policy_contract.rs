@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 34] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 35] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -211,6 +211,11 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 34] = [
     ),
     decision(
         "A11",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    decision(
+        "A12",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

@@ -48,7 +48,8 @@ The test-only result witness proves request-local acquisition of the bytes.
 It does not prove insertion into an SDK ordinary-delivery seen registry. The
 request-local isolation revision keeps acquisition subscriptions distinct
 from ordinary notifications. SDK-seen-but-unretained redelivery at that
-ordinary registry boundary remains unproved.
+ordinary registry boundary is qualified separately in the
+[ordinary sighting fixture](recovery-ordinary-seen-redelivery-qualification.md).
 
 An earlier exploratory single-relay fixture tried to prove a second bounded
 acquisition in the same live runtime. A second exact relay query and target
@@ -80,10 +81,12 @@ prefix and scope replacement after valid retention. Existing real-SDK tests
 cover cancellation/reopen before admission and two-endpoint exact-ID
 retention. This new fixture stops after first-result rejection, before a
 competing owner can change its postconditions. Together these cases do not
-establish the distinct same-attempt suffix, same-live-SDK redelivery through
-bounded admission, abrupt process-kill durability, device behavior, whole-wire
-or RSS bounds, or production activation. EOSE remains endpoint evidence rather than durable
-admission. The in-process SQLCipher reopen cases are not crash proof.
+establish the distinct same-attempt suffix, abrupt process-kill durability,
+device behavior, whole-wire or RSS bounds, or production activation. EOSE
+remains endpoint evidence rather than durable admission. The in-process
+SQLCipher reopen cases are not crash proof.
+The separate [ordinary sighting fixture](recovery-ordinary-seen-redelivery-qualification.md)
+qualifies same-live-SDK redelivery through bounded admission.
 
 ## Verification
 

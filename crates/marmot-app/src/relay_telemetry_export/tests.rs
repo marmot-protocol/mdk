@@ -875,6 +875,51 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
     );
 }
 
+#[tokio::test]
+async fn account_publish_counters_are_unlabeled_population_points() {
+    use crate::relay_plane::publish_accounting_tests::{AccountPublishFixture, PublishScript};
+
+    let fixture = AccountPublishFixture::activate().await;
+    let exporter = fixture
+        .plane
+        .telemetry_exporter(
+            RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+                .with_runtime_config(runtime_config()),
+            crate::product_analytics::test_permit(),
+        )
+        .expect("opted-in exporter");
+    fixture
+        .publish(PublishScript::Accept, 1)
+        .await
+        .expect("success");
+    fixture
+        .publish(PublishScript::Error, 1)
+        .await
+        .expect_err("failure");
+    fixture.cancel_in_flight().await;
+    let batch = exporter.build_batch(None).await;
+    let counter = |name: &str| {
+        let point = batch
+            .points
+            .iter()
+            .find(|point| point.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert!(point.relay.is_none(), "{name} must not carry a relay label");
+        assert!(
+            point.failure.is_none(),
+            "{name} must not carry a failure classification"
+        );
+        match point.value {
+            ExportMetricValue::Counter(value) => value,
+            ref other => panic!("{name} should be a counter, got {other:?}"),
+        }
+    };
+    assert_eq!(counter(metric_names::PUBLISH_ATTEMPTS), 3);
+    assert_eq!(counter(metric_names::PUBLISH_SUCCESSES), 1);
+    assert_eq!(counter(metric_names::PUBLISH_FAILURES), 1);
+    assert_eq!(counter(metric_names::PUBLISH_CANCELLATIONS), 1);
+}
+
 #[test]
 fn host_stages_use_registry() {
     use crate::app_telemetry::{

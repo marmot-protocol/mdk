@@ -53,13 +53,19 @@ pub struct RelayTelemetryRollup {
     pub connection_attempts: u64,
     /// Device-wide successful relay connections.
     pub connection_successes: u64,
-    /// Device-wide publish attempts (aggregate; per-relay/per-kind publish
-    /// attribution is a future adapter enhancement, see `relay-observability.md`).
+    /// Device-wide `TransportAdapter` publish calls that entered a relay
+    /// client. Per-relay and per-kind attribution remains future work; see
+    /// `relay-observability.md`.
     pub publish_attempts: u64,
-    /// Device-wide accepted publishes.
+    /// Device-wide publishes whose accepted-endpoint count met
+    /// `required_acks.max(1)`.
     pub publish_successes: u64,
-    /// Device-wide failed publishes.
+    /// Device-wide publish errors and below-threshold outcomes.
     pub publish_failures: u64,
+    /// Device-wide started publishes the caller dropped before the relay
+    /// client returned (for example, endpoints abandoned after quorum).
+    #[serde(default)]
+    pub publish_cancellations: u64,
     /// Optional engine-side reorg metrics, folded in once the parallel
     /// `observed_reorg_rate` workstream lands. `None` until then.
     pub engine: Option<EngineReorgMetrics>,
@@ -184,6 +190,7 @@ pub(crate) fn rollup_from_snapshots(
         publish_attempts: metrics.publish_attempts as u64,
         publish_successes: metrics.publish_successes as u64,
         publish_failures: metrics.publish_failures as u64,
+        publish_cancellations: metrics.publish_cancellations as u64,
         engine,
     }
 }

@@ -71,8 +71,11 @@ pub(crate) fn relay_stats_plain(snapshot: &RelayTelemetrySnapshot) -> String {
         metrics.inbound_events_dropped,
     ));
     lines.push(format!(
-        "publish: attempts={} successes={} failures={}",
-        metrics.publish_attempts, metrics.publish_successes, metrics.publish_failures,
+        "publish: attempts={} successes={} failures={} cancellations={}",
+        metrics.publish_attempts,
+        metrics.publish_successes,
+        metrics.publish_failures,
+        metrics.publish_cancellations,
     ));
     lines.push(format!(
         "delivery spread: observed={} corroborated={} single_source={} samples={} p50={} p99={}",

@@ -2191,6 +2191,17 @@ async fn published_group_event_is_fanned_out_to_matching_local_accounts() {
         bob_delivery.source.subscription_id.as_deref(),
         Some("local-publish")
     );
+    // Empty acceptance fails the at-least-one rule even when required_acks is 0,
+    // while the historical local-delivery fallback above stays in place.
+    let metrics = relay_plane.relay_telemetry().await.metrics;
+    assert_eq!(
+        (
+            metrics.publish_attempts,
+            metrics.publish_successes,
+            metrics.publish_failures
+        ),
+        (1, 0, 1)
+    );
 }
 
 async fn directory_plane_with_active_subscription(

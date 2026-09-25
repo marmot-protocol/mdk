@@ -1508,6 +1508,28 @@ async fn run_app_runtime_account_worker(
             }
             received = client.receive_next_delivery() => {
                 yield_to_bounded_admission = true;
+                #[cfg(test)]
+                if let Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) = &received
+                    && let (Ok(event_id), Some(subscription_id)) = (
+                        <[u8; 32]>::try_from(delivery.message.id.as_slice()),
+                        delivery.source.subscription_id.as_ref(),
+                    )
+                {
+                    let drop_this = shared
+                        .ordinary_drop_once
+                        .lock()
+                        .unwrap()
+                        .take_if(|target| {
+                            target.account_label == account_label && target.event_id == event_id
+                        })
+                        .is_some();
+                    if drop_this {
+                        *shared.ordinary_drop_witness.lock().unwrap() =
+                            Some(subscription_id.clone());
+                        shared.ordinary_delivery_dropped.notify_one();
+                        continue 'worker;
+                    }
+                }
                 // Only the transport wait participates in `select!`. Once a
                 // delivery has been claimed, finish ingest + incidental
                 // publish + projection as one uncancelled worker operation;
@@ -5881,6 +5903,7 @@ mod tests {
     mod real_sdk_progress_fairness_tests;
     mod resource_bounds_tests;
     mod selective_history_tests;
+    mod worker_recovery_resume_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod worker_wait_attribution_tests;
 
