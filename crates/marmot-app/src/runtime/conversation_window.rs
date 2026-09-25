@@ -374,11 +374,12 @@ pub(super) fn capture_conversation(
     }
 }
 
-/// Commands apply to the supplied snapshot revision. Every command can return
-/// `StaleWindow` if a replacement was published first; consume the latest snapshot
-/// and reassess the user's intent before retrying. In particular, paging is relative
-/// to that snapshot's retained viewport, not to a newer position changed concurrently.
-/// Commands from another handle generation are always rejected.
+/// Commands apply to the current retained viewport. Background replacements (new
+/// rows, delivery state, reactions, header, draft) never supersede a revision; once
+/// a replacement showing a command's viewport move is published, every earlier
+/// revision returns `StaleWindow`. Consume the latest snapshot and reassess the
+/// user's intent before retrying. Commands from another handle generation are
+/// always rejected.
 #[derive(Clone)]
 pub struct ConversationWindowHandle {
     commands: mpsc::Sender<Command>,
@@ -956,8 +957,14 @@ fn command_position(
     command: &Command,
     current: &ConversationWindowSnapshot,
     position: &ConversationWindowQuery,
+    viewport_sequence: u64,
 ) -> Result<ConversationWindowQuery, ConversationWindowError> {
-    if command.revision != current.revision {
+    // Background replacements never supersede a revision; only a published
+    // command viewport move or another generation does.
+    let quoted = &command.revision;
+    if quoted.generation != current.revision.generation
+        || !(viewport_sequence..=current.revision.sequence).contains(&quoted.sequence)
+    {
         return Err(ConversationWindowError::StaleWindow);
     }
     let mut next = position.clone();
@@ -1073,6 +1080,10 @@ async fn run(
     let mut failed = false;
     let mut retry_delayed = false;
     let mut last_good_position = position.clone();
+    // First published sequence showing the viewport the latest command moved to.
+    // A move kept through a quiet failure takes effect when a retry publishes it.
+    let mut viewport_sequence = current.revision.sequence;
+    let mut viewport_moved = false;
     let mut deferred_command = None;
     loop {
         let mut stopping = sources.stopping.clone();
@@ -1094,7 +1105,7 @@ async fn run(
         };
         let next = match command
             .as_ref()
-            .map(|c| command_position(c, &current, &position))
+            .map(|c| command_position(c, &current, &position, viewport_sequence))
             .transpose()
         {
             Ok(next) => next.unwrap_or_else(|| position.clone()),
@@ -1145,6 +1156,10 @@ async fn run(
                 reader.send_capture.set_query(&position);
                 last_good_position = position.clone();
                 current = replacement;
+                if changed && (viewport_moved || command.is_some()) {
+                    viewport_sequence = current.revision.sequence;
+                }
+                viewport_moved = false;
                 if current.presentation.header.epoch.is_some()
                     && let Some(observation) = reader.authority_ready.take()
                 {
@@ -1176,6 +1191,7 @@ async fn run(
                 retry_delayed = false;
             }
             Err(error) => {
+                let commanded = command.is_some();
                 let terminal = error.terminal();
                 let terminal_outcome = if matches!(error, ConversationWindowError::Closed) {
                     TelemetryOutcome::Cancelled
@@ -1197,6 +1213,7 @@ async fn run(
                     // disappear before retry. Report it, then resume the last
                     // successful viewport rather than killing the live stream.
                     position = last_good_position.clone();
+                    viewport_moved = false;
                     dirty = true;
                     failed = true;
                     retry_delayed = true;
@@ -1213,6 +1230,7 @@ async fn run(
                 if !query_error {
                     // Preserve accepted viewport commands through a quiet failure.
                     position = next;
+                    viewport_moved |= commanded;
                     dirty = true;
                     // Quiet NotReady retries must not suppress a later real
                     // storage error that the receiver has not yet seen.
