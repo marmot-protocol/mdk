@@ -53,16 +53,16 @@ impl Record {
             return Err(ContractError::rule("invalid body framing or size"));
         }
         let value = strict_json::parse(body)?;
-        // Serde's nested tagged-enum buffer can treat numeric Basis tags as
-        // variant indexes even though the wire contract requires strings.
-        if value
-            .pointer("/event/basis/kind")
-            .is_some_and(|kind| !kind.is_string())
-        {
+        let fields = serde_json::from_value(value.clone())
+            .map_err(|_| ContractError::rule("invalid v5 record shape or scalar"))?;
+        // Serde accepts enum indexes and object-form unit variants that the
+        // wire schema rejects. Compare parsed values, not original JSON text:
+        // key order, whitespace and equivalent string escapes remain valid.
+        let encoded = serde_json::to_value(&fields)
+            .map_err(|_| ContractError::rule("record serialization failed"))?;
+        if encoded != value {
             return Err(ContractError::rule("invalid v5 record shape or scalar"));
         }
-        let fields = serde_json::from_value(value)
-            .map_err(|_| ContractError::rule("invalid v5 record shape or scalar"))?;
         Self::new(fields)
     }
     /// Compact UTF-8 JSON body, excluding the JSONL newline.

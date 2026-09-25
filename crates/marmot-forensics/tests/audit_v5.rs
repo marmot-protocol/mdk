@@ -51,7 +51,7 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
 }
 
 #[test]
-fn numeric_basis_tags_are_rejected_by_rust_and_schema() {
+fn noncanonical_enum_shapes_are_rejected_by_rust_and_schema() {
     let schema = validator();
     let mut basis_kinds = std::collections::BTreeSet::new();
     for f in fixtures() {
@@ -82,16 +82,72 @@ fn numeric_basis_tags_are_rejected_by_rust_and_schema() {
             .collect()
     );
 
-    for (name, path, index) in [
-        ("prepared_founding", "/event/type", 0),
-        ("prepared_founding", "/event/mode", 0),
-        ("selection_failed", "/event/failure_stage", 0),
-        ("prepared_founding", "/producer/build_profile", 1),
+    for (name, path, alias) in [
+        ("prepared_founding", "/event/type", json!(0)),
+        ("prepared_founding", "/event/mode", json!({"founding":null})),
+        (
+            "prepared_founding",
+            "/event/construction",
+            json!({"constructed":null}),
+        ),
+        (
+            "selection_failed",
+            "/event/failure_stage",
+            json!({"selection":null}),
+        ),
+        (
+            "prepared_founding",
+            "/producer/build_profile",
+            json!({"debug":null}),
+        ),
+        (
+            "prepared_founding",
+            "/producer/platform",
+            json!({"macos":null}),
+        ),
+        (
+            "publish_finished",
+            "/event/results/0/status",
+            json!({"acknowledged":null}),
+        ),
     ] {
         let mut body = fixture(name);
-        *body.pointer_mut(path).unwrap() = json!(index);
+        *body.pointer_mut(path).unwrap() = alias;
         assert!(!schema.is_valid(&body), "schema accepted {name} {path}");
-        assert!(decode(&body).is_err(), "Rust accepted {name} {path}");
+        let error = decode(&body).expect_err("Rust accepted enum alias");
+        assert_eq!(error.to_string(), "invalid v5 record shape or scalar");
+    }
+}
+
+#[test]
+fn equivalent_json_representations_remain_valid() {
+    let schema = validator();
+    let canonical = serde_json::to_string(&fixture("prepared_founding")).unwrap();
+    let escaped = canonical.replacen("\"founding\"", "\"fou\\u006eding\"", 1);
+    assert_ne!(escaped, canonical);
+    let record = fixture("prepared_founding");
+    let fields = record.as_object().unwrap();
+    let reversed_keys = format!(
+        "{{{}}}",
+        fields
+            .iter()
+            .rev()
+            .map(|(key, value)| format!(
+                "{}:{}",
+                serde_json::to_string(key).unwrap(),
+                serde_json::to_string(value).unwrap()
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for body in [format!(" \t{canonical}\t "), escaped, reversed_keys] {
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert!(schema.is_valid(&value));
+        let decoded = Record::from_json(body.as_bytes()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&decoded.to_json().unwrap()).unwrap(),
+            value
+        );
     }
 }
 
