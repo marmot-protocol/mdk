@@ -1351,20 +1351,20 @@ async fn run_app_runtime_account_worker(
             // nonempty command channel must not starve group convergence.
             command = async {
                 match ready_command.and_then(|index| pending.remove(index)) {
-                    Some(command) => Some(command),
-                    None => commands.recv().await,
+                    Some(command) => Some((command, true)),
+                    None => commands.recv().await.map(|command| (command, false)),
                 }
             }, if (!yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
                 && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
                 yield_to_bounded_admission = true;
                 match command {
-                    Some(command) => {
-                        // An explicit catch-up would revise the selected
-                        // comparison while its grant lease is live. Preserve
-                        // its FIFO barrier for later commands, including Drain,
-                        // while allowing read-only status requests through.
-                        if comparison_maintenance.is_some()
+                    Some((command, approved_pending)) => {
+                        // ready_command_index has already approved pending work
+                        // before the CatchUp barrier. Apply this extra gate only
+                        // to fresh channel arrivals, or the earlier work would
+                        // be requeued behind CatchUp after capacity returns.
+                        if comparison_maintenance.is_some() && !approved_pending
                             && (matches!(command, AccountWorkerCommand::CatchUp { .. })
                                 || (pending.iter().any(|queued| {
                                     matches!(queued, AccountWorkerCommand::CatchUp { .. })

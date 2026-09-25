@@ -60,28 +60,34 @@ impl QueryPolicy for HeldComparisonId {
 
 #[tokio::test]
 async fn comparison_worker_held_sdk_request_keeps_status_command_ready() {
-    run_held_comparison(false, false, false).await;
+    run_held_comparison(false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn explicit_catch_up_waits_for_held_comparison_before_revising_it() {
-    run_held_comparison(false, false, true).await;
+    run_held_comparison(false, false, true, false).await;
+}
+
+#[tokio::test]
+async fn prebarrier_media_runs_before_deferred_explicit_catch_up() {
+    run_held_comparison(false, false, true, true).await;
 }
 
 #[tokio::test]
 async fn comparison_shutdown_reaps_task_and_releases_credit() {
-    run_held_comparison(true, false, false).await;
+    run_held_comparison(true, false, false, false).await;
 }
 
 #[tokio::test]
 async fn comparison_and_known_worker_share_two_credits_during_shutdown() {
-    run_held_comparison(true, true, false).await;
+    run_held_comparison(true, true, false, false).await;
 }
 
 async fn run_held_comparison(
     shutdown_while_held: bool,
     known_competes: bool,
     catch_up_while_held: bool,
+    prebarrier_media: bool,
 ) {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldComparisonId::default();
@@ -268,6 +274,55 @@ async fn run_held_comparison(
             .unwrap(),
         None
     );
+    let mut held_media = Vec::new();
+    let prebarrier = if prebarrier_media {
+        let accounts = runtime.accounts();
+        let workers = accounts.workers.lock().await;
+        let admission = workers
+            .get(&alice.account_id_hex)
+            .expect("Alice worker is running")
+            .media_admission
+            .clone();
+        drop(workers);
+        for _ in 0..MEDIA_HTTP_IN_FLIGHT_LIMIT {
+            let (started, entered) = oneshot::channel();
+            let (release, wait) = oneshot::channel();
+            let (respond, completed) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::HoldMediaHttp {
+                    admission: admission.clone().try_acquire_owned().unwrap(),
+                    started,
+                    release: wait,
+                    respond,
+                })
+                .unwrap();
+            timeout(Duration::from_secs(5), entered)
+                .await
+                .expect("media slot becomes held")
+                .unwrap();
+            held_media.push((release, completed));
+        }
+        let (started, mut entered) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let (respond, completed) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::HoldMediaHttp {
+                admission: admission.try_acquire_owned().unwrap(),
+                started,
+                release: wait,
+                respond,
+            })
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), &mut entered)
+                .await
+                .is_err(),
+            "earlier media command is parked before CatchUp"
+        );
+        Some((entered, release, completed))
+    } else {
+        None
+    };
     let catch_up = if catch_up_while_held {
         let revision = storage.recovery_comparison().unwrap().revision;
         let (respond, waiting) = oneshot::channel();
@@ -294,6 +349,38 @@ async fn run_held_comparison(
             .expect("read after queued catch-up stays serviceable")
             .unwrap()
             .unwrap();
+        if let Some((entered, release, completed)) = prebarrier {
+            let (first_release, first_completed) = held_media.remove(0);
+            first_release.send(()).unwrap();
+            timeout(Duration::from_secs(5), first_completed)
+                .await
+                .expect("one media slot is released")
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(5), entered)
+                .await
+                .expect("pre-barrier media runs before CatchUp joins")
+                .unwrap();
+            assert_eq!(
+                storage.recovery_comparison().unwrap().revision,
+                revision,
+                "earlier media work did not cross the deferred CatchUp"
+            );
+            release.send(()).unwrap();
+            timeout(Duration::from_secs(5), completed)
+                .await
+                .expect("pre-barrier media completes")
+                .unwrap()
+                .unwrap();
+            for (release, completed) in held_media.drain(..) {
+                release.send(()).unwrap();
+                timeout(Duration::from_secs(5), completed)
+                    .await
+                    .expect("held media completes")
+                    .unwrap()
+                    .unwrap();
+            }
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             matches!(
