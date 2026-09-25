@@ -62,6 +62,11 @@ pubkeys, plaintext, ciphertext, or payload-derived values.
 Tracing in this crate uses explicit `target` and `method` fields such as `transport_nostr_adapter::adapter` / `publish`.
 Keep future tracing on the same pattern so crate/module/method are visible without leaking routing data.
 
+`NostrTransportAdapter::publish_event_with_client` wraps the complete publication future.
+Direct and account-adapter sends share these counters. Endpoint fanout and authentication retries
+remain one logical attempt; dropping an in-flight publication records one cancellation.
+Account, endpoint-safety, and envelope validation stay outside this accounting boundary.
+
 ## Boundary shape
 
 Inbound:

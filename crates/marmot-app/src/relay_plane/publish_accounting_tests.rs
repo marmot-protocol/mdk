@@ -250,6 +250,72 @@ fn failure(endpoint: &TransportEndpoint) -> TransportEndpointFailure {
 }
 
 #[tokio::test]
+async fn signed_fanout_counts_once() {
+    use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
+    use nostr_relay_builder::{LocalRelay, RelayBuilder};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+
+    let public = LocalRelay::new(RelayBuilder::default());
+    let authenticated = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+        mode: RelayBuilderNip42Mode::Write,
+    }));
+    public.run().await.unwrap();
+    authenticated.run().await.unwrap();
+    let endpoints = vec![
+        TransportEndpoint(public.url().await.to_string()),
+        TransportEndpoint(authenticated.url().await.to_string()),
+    ];
+    let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
+    let keys = Arc::new(Keys::generate());
+    let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+    plane.set_transport_signer(&account_id, keys).await.unwrap();
+    let client = plane
+        .inner
+        .transport
+        .sdk_relay_client
+        .as_ref()
+        .unwrap()
+        .clone();
+    let adapter = plane.account_adapter(account_id.clone(), Arc::new(client));
+    let transport_group_id = vec![0xD4; 32];
+    let signed = EventBuilder::new(Kind::MlsGroupMessage, "accounted signed publication")
+        .tags([Tag::custom("h", [hex::encode(&transport_group_id)])])
+        .finalize(&Keys::generate())
+        .unwrap();
+    let message = NostrTransportEvent::from_nostr_event(&signed)
+        .unwrap()
+        .to_transport_message()
+        .unwrap();
+    let report = timeout(
+        Duration::from_secs(10),
+        adapter.publish(TransportPublishRequest {
+            account_id,
+            message,
+            target: TransportPublishTarget::Group {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id,
+                endpoints: endpoints.clone(),
+            },
+            required_acks: 2,
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(report.met_required_acks());
+    for endpoint in &endpoints {
+        assert!(
+            report
+                .accepted
+                .iter()
+                .any(|receipt| &receipt.endpoint == endpoint)
+        );
+    }
+    assert_eq!(counts(&plane).await, (1, 1, 0, 0));
+    plane.shutdown().await;
+}
+
+#[tokio::test]
 async fn account_publish_classifies_against_met_required_acks() {
     let fixture = AccountPublishFixture::activate().await;
     let admitted = fixture

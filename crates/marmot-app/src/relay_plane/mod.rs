@@ -2881,27 +2881,36 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
         // Welcome fanout keeps its account publisher; a blocked inbox write
         // cannot stall the independent anonymous group publisher.
-        let outcome = if matches!(
-            request.target,
-            cgka_traits::TransportPublishTarget::Group { .. }
-        ) {
-            self.publish_signed_event(
-                self.publish_client.as_ref(),
-                request.target.endpoints(),
-                &event,
-                request.required_acks,
-            )
-            .await?
-        } else {
-            self.publish_client
-                .publish_event_for_account(
-                    &self.account_id,
+        let publication = async {
+            if matches!(
+                request.target,
+                cgka_traits::TransportPublishTarget::Group { .. }
+            ) {
+                self.publish_signed_event(
+                    self.publish_client.as_ref(),
                     request.target.endpoints(),
                     &event,
                     request.required_acks,
                 )
-                .await?
+                .await
+            } else {
+                self.publish_client
+                    .publish_event_for_account(
+                        &self.account_id,
+                        request.target.endpoints(),
+                        &event,
+                        request.required_acks,
+                    )
+                    .await
+            }
         };
+        let outcome = self
+            .relay_plane
+            .inner
+            .transport
+            .adapter
+            .publish_event_with_client(publication, request.required_acks)
+            .await?;
         let local_fanout_endpoints = if !outcome.accepted.is_empty() {
             outcome
                 .accepted
