@@ -196,6 +196,7 @@ struct PreparedLegacyPublishAttempt {
         audit_v5::NostrEventRef,
         audit_v5::LocalId,
         audit_v5::MemberRef,
+        audit_v5::GroupRef,
     )>,
     wire: AuditTransportWire,
     artifact_kind: Option<MessageArtifactKind>,
@@ -4244,11 +4245,18 @@ where
                 TransportEnvelope::Welcome { recipient } => publish_context
                     .v5_welcome_refs
                     .iter()
-                    .find(|(id, _, _)| id == &msg_id_hex)
-                    .and_then(|(_, outer, op_id)| {
+                    .find(|(id, _, _, _)| id == &msg_id_hex)
+                    .and_then(|(_, outer, op_id, group_ref)| {
                         audit_v5::MemberRef::from_member_identity(recipient.as_slice())
                             .ok()
-                            .map(|recipient_ref| (op_id.clone(), outer.clone(), recipient_ref))
+                            .map(|recipient_ref| {
+                                (
+                                    op_id.clone(),
+                                    outer.clone(),
+                                    recipient_ref,
+                                    group_ref.clone(),
+                                )
+                            })
                     }),
                 _ => None,
             }
@@ -4270,9 +4278,11 @@ where
             match self.routing.publish_target(&message) {
                 Ok(target) => target,
                 Err(e) => {
-                    if let Some((op_id, outer_event_ref, recipient_ref)) = &v5_welcome_identity {
+                    if let Some((op_id, outer_event_ref, recipient_ref, group_ref)) =
+                        &v5_welcome_identity
+                    {
                         self.session.record_v5_event(
-                            None,
+                            Some(group_ref.clone()),
                             audit_v5::Event::WelcomePublishNotStarted(
                                 audit_v5::WelcomePublishNotStarted {
                                     op_id: op_id.clone(),
@@ -4420,7 +4430,7 @@ where
             .max(1)
             .min(retry_endpoints.len());
 
-        let v5_welcome = v5_welcome_identity.map(|(op_id, outer, recipient_ref)| {
+        let v5_welcome = v5_welcome_identity.map(|(op_id, outer, recipient_ref, group_ref)| {
             let ordinal = fanout
                 .targets
                 .iter()
@@ -4430,10 +4440,9 @@ where
                 .saturating_add(1);
             let attempt_id =
                 v5_local_id(b"welcome-publish-attempt", message_id.as_slice(), ordinal);
-            (op_id, outer, attempt_id, recipient_ref)
+            (op_id, outer, attempt_id, recipient_ref, group_ref)
         });
-        if let Some((op_id, outer, attempt_id, recipient_ref)) = &v5_welcome
-            && let Some(group_ref) = target_group_id.as_ref().and_then(v5_group_ref)
+        if let Some((op_id, outer, attempt_id, recipient_ref, group_ref)) = &v5_welcome
             && let (Ok(target_count), Ok(required_acks), Ok(accepted_before_count)) = (
                 u32::try_from(retry_endpoints.len()),
                 u32::try_from(required_acks),
@@ -4450,7 +4459,7 @@ where
                 targets.len() == retry_endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
             targets.truncate(audit_v5::MAX_ENDPOINTS);
             self.session.record_v5_event(
-                Some(group_ref),
+                Some(group_ref.clone()),
                 audit_v5::Event::WelcomePublishStarted(audit_v5::WelcomePublishStarted {
                     op_id: op_id.clone(),
                     attempt_id: attempt_id.clone(),
@@ -4539,7 +4548,6 @@ where
                 self.session.put_transport_fanout(&fanout)?;
                 self.record_v5_welcome_publish_finished(
                     &v5_welcome,
-                    target_group_id.as_ref(),
                     None,
                     &retry_endpoints,
                     accepted_before,
@@ -4588,7 +4596,6 @@ where
             .count();
         self.record_v5_welcome_publish_finished(
             &v5_welcome,
-            target_group_id.as_ref(),
             Some(&report),
             &retry_endpoints,
             accepted_total,
@@ -4664,17 +4671,14 @@ where
             audit_v5::NostrEventRef,
             audit_v5::LocalId,
             audit_v5::MemberRef,
+            audit_v5::GroupRef,
         )>,
-        group_id: Option<&GroupId>,
         report: Option<&TransportPublishReport>,
         attempted: &[TransportEndpoint],
         accepted_total: usize,
         required_acks: usize,
     ) {
-        let Some((_, outer, attempt_id, _)) = identity else {
-            return;
-        };
-        let Some(group_ref) = group_id.and_then(v5_group_ref) else {
+        let Some((_, outer, attempt_id, _, group_ref)) = identity else {
             return;
         };
         let Ok(required_acks) = u32::try_from(required_acks) else {
@@ -4727,7 +4731,7 @@ where
             audit_v5::Policy::Unmet
         };
         self.session.record_v5_event(
-            Some(group_ref),
+            Some(group_ref.clone()),
             audit_v5::Event::WelcomePublishFinished(audit_v5::WelcomePublishFinished {
                 attempt_id: attempt_id.clone(),
                 outer_event_ref: outer.clone(),
@@ -5522,10 +5526,6 @@ mod tests {
             );
         }
     }
-}
-
-fn v5_group_ref(group_id: &GroupId) -> Option<audit_v5::GroupRef> {
-    audit_v5::GroupRef::from_group_id(group_id.as_slice()).ok()
 }
 
 fn v5_endpoint_ref(endpoint: &TransportEndpoint) -> Option<audit_v5::EndpointRef> {

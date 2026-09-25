@@ -100,6 +100,34 @@ impl AppClient {
             self.runtime.session().record_v5_event(group_ref, event);
         }
     }
+
+    /// Seed an enabled recorder with bounded authoritative state at an ordinary
+    /// hydrated account open. The per-group snapshot is observational; an
+    /// unreadable group is omitted without changing account-open behavior.
+    pub(crate) fn record_open_v5_baselines(&mut self) {
+        if !self.audit_v5_enabled() {
+            return;
+        }
+        let Ok(mut group_ids) = self.runtime.live_group_ids() else {
+            return;
+        };
+        group_ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        for group_id in group_ids.into_iter().take(64) {
+            let Ok(group) = self.runtime.group_record(&group_id) else {
+                continue;
+            };
+            let admins = self.runtime.admin_pubkeys(&group_id).ok();
+            if let Some(probe) = &mut self.audit_v5_probe {
+                probe.baseline(
+                    &group,
+                    admins.as_deref(),
+                    marmot_forensics::v5::BaselineReason::Opened,
+                    None,
+                );
+            }
+        }
+        self.flush_live_v5_events();
+    }
     pub(crate) fn local_human_action_context(
         action: impl Into<String>,
         fields: Vec<&'static str>,

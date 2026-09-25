@@ -1845,6 +1845,7 @@ impl MarmotApp {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
             client.reconcile_hydrated_account_state()?;
+            client.record_open_v5_baselines();
         }
         Ok(client)
     }

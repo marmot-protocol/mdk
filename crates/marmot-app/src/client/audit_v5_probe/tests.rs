@@ -4,6 +4,31 @@ use marmot_account::AccountHome;
 use nostr_relay_builder::MockRelay;
 use std::{path::Path, time::Duration};
 
+fn actual_v5_rows(app: &MarmotApp, account: &str) -> Vec<Record> {
+    let dir = app.account_dir(account);
+    let paths = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-v5.jsonl")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 1, "one active v5 recorder per account");
+    let body = std::fs::read_to_string(&paths[0]).unwrap();
+    assert!(body.len() < 256 * 1024, "bounded local scenario volume");
+    assert!(!body.contains("wss://"));
+    assert!(!body.contains("synthetic private group title"));
+    body.lines()
+        .map(|line| {
+            assert!(line.len() < 65_535);
+            Record::from_json(line.as_bytes()).unwrap()
+        })
+        .collect()
+}
+
 fn probe_with_ids(source: u8, session: u8) -> WelcomeProbe {
     // Explicit synthetic source/build metadata, not an assertion of production
     // identity persistence or artifact provenance. All event facts come from
@@ -34,6 +59,181 @@ fn app(path: &Path, relay: &str) -> MarmotApp {
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     app
+}
+
+#[tokio::test]
+async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let relay = MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+        AccountHome::open(alice_dir.path())
+            .create_account("alice")
+            .unwrap();
+        let bob_id = AccountHome::open(bob_dir.path())
+            .create_account("bob")
+            .unwrap()
+            .account_id_hex;
+        let alice_app = app(alice_dir.path(), &relay_url);
+        let bob_app = app(bob_dir.path(), &relay_url);
+        let mut alice = alice_app.client("alice").await.unwrap();
+        let mut bob = bob_app.client("bob").await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let group = alice
+            .create_group_with_initial_source_and_optional_telemetry(
+                "synthetic private group title",
+                &[&bob_id],
+                crate::AppCreateGroupOptions::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .group_id;
+        let retained = alice.runtime.outstanding_welcome_deliveries().unwrap();
+        assert_eq!(retained.len(), 1);
+        let outer_id = <[u8; 32]>::try_from(retained[0].1.id.as_slice()).unwrap();
+        alice.drive_unpublished_welcome_delivery(None).await;
+        assert!(
+            alice
+                .runtime
+                .outstanding_welcome_deliveries()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(bob.sync().await.unwrap().joined_groups.contains(&group));
+        assert_eq!(bob.runtime.group_record(&group).unwrap().members.len(), 2);
+        alice
+            .send(&group, b"private audit integration message")
+            .await
+            .unwrap();
+
+        let sender = actual_v5_rows(&alice_app, "alice");
+        let recipient = actual_v5_rows(&bob_app, "bob");
+        for rows in [&sender, &recipient] {
+            let mut bytes_by_kind = std::collections::BTreeMap::<String, usize>::new();
+            for row in rows {
+                let kind = serde_json::to_value(&row.fields().event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                *bytes_by_kind.entry(kind).or_default() += row.to_json().unwrap().len();
+            }
+            assert!(bytes_by_kind.values().all(|bytes| *bytes < 64 * 1024));
+            let body = rows
+                .iter()
+                .flat_map(|row| row.to_json().unwrap())
+                .collect::<Vec<_>>();
+            let text = String::from_utf8(body).unwrap();
+            assert!(!text.contains(&bob_id));
+            assert!(!text.contains(&hex::encode(group.as_slice())));
+            assert!(!text.contains(&hex::encode(outer_id)));
+            assert!(!text.contains("private audit integration message"));
+        }
+        let sender_types = sender
+            .iter()
+            .map(|row| {
+                serde_json::to_value(&row.fields().event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let recipient_types = recipient
+            .iter()
+            .map(|row| {
+                serde_json::to_value(&row.fields().event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for kind in [
+            "welcome_prepared",
+            "welcome_publish_started",
+            "welcome_publish_finished",
+            "group_baseline",
+            "publish_outcome",
+        ] {
+            assert!(
+                sender_types.contains(kind),
+                "missing sender {kind}: {sender_types:?}"
+            );
+        }
+        for kind in [
+            "welcome_observed",
+            "welcome_unwrapped",
+            "welcome_join_finished",
+            "app_group_update_finished",
+            "group_baseline",
+        ] {
+            assert!(
+                recipient_types.contains(kind),
+                "missing recipient {kind}: {recipient_types:?}"
+            );
+        }
+        let outer = NostrEventRef::from_validated_event_id(&outer_id);
+        let prepared = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePrepared(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        let published = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePublishFinished(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        let observed = recipient
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomeObserved(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(prepared.outer_event_ref.as_ref(), Some(&outer));
+        assert_eq!(published.outer_event_ref, outer);
+        assert_eq!(observed.outer_event_ref, outer);
+        assert_eq!(published.policy, Policy::Met);
+        assert_eq!(
+            prepared.op_id,
+            sender
+                .iter()
+                .find_map(|row| match &row.fields().event {
+                    Event::WelcomePublishStarted(event) => Some(event.op_id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        );
+        assert_ne!(
+            sender[0].fields().source_ref,
+            recipient[0].fields().source_ref
+        );
+        assert_ne!(
+            sender[0].fields().session_id,
+            recipient[0].fields().session_id
+        );
+        drop(alice);
+        let reopened = alice_app.client("alice").await.unwrap();
+        assert_eq!(
+            reopened.runtime.group_record(&group).unwrap().members.len(),
+            2
+        );
+        assert!(
+            actual_v5_rows(&alice_app, "alice")
+                .iter()
+                .any(|row| matches!(
+                    &row.fields().event,
+                    Event::GroupBaseline(baseline) if baseline.reason == BaselineReason::Opened
+                ))
+        );
+    })
+    .await
+    .expect("bounded live v5 scenario");
 }
 
 struct Scenario {

@@ -1,10 +1,11 @@
-//! Unit-test-only observations of real sender and recipient app paths. Not a v5 recorder
-//! option, upload source, or native API. Production does not compile this module.
+//! Bounded Welcome observations from the normal app operation path. When a v5
+//! recorder is enabled, the same events are written by its source/session;
+//! tests can inspect a private in-memory probe without changing product flow.
 //!
 //! A received envelope, its actual transport peel, and a committed app
 //! checkpoint are distinct evidence boundaries. A sender founding preparation
 //! also records the returned retained artifact and recipient engine join.
-//! This does not record baseline capture or relay ACKs.
+//! Publication receipts are captured at the account owner boundary.
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -183,7 +184,7 @@ pub(crate) struct WelcomeProbe {
     pub(super) rows: Vec<Record>,
     live: bool,
     pending_live: Vec<(Option<GroupRef>, Event)>,
-    validated_refs: Vec<(String, NostrEventRef, LocalId)>,
+    validated_refs: Vec<(String, NostrEventRef, LocalId, GroupRef)>,
     // Only origins observed at an actual projection path are eligible. Absence
     // of a receive row never implies local replay or successful computation.
     projections: BTreeMap<String, UpdateCause>,
@@ -262,7 +263,9 @@ impl WelcomeProbe {
         std::mem::take(&mut self.pending_live)
     }
 
-    pub(super) fn take_validated_refs(&mut self) -> Vec<(String, NostrEventRef, LocalId)> {
+    pub(super) fn take_validated_refs(
+        &mut self,
+    ) -> Vec<(String, NostrEventRef, LocalId, GroupRef)> {
         std::mem::take(&mut self.validated_refs)
     }
 
@@ -419,6 +422,7 @@ impl WelcomeProbe {
                 hex::encode(outer_event_id),
                 NostrEventRef::from_validated_event_id(&outer_event_id),
                 op_id.clone(),
+                group_ref.clone(),
             ));
             self.record(
                 Some(group_ref.clone()),

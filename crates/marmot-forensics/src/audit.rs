@@ -160,7 +160,12 @@ pub struct AuditEventContext {
     /// batch. Never serialized into v4 or operational v5 contexts; account
     /// publication consumes this only while the operation is in memory.
     #[serde(skip)]
-    pub v5_welcome_refs: Vec<(MessageRefHex, crate::v5::NostrEventRef, crate::v5::LocalId)>,
+    pub v5_welcome_refs: Vec<(
+        MessageRefHex,
+        crate::v5::NostrEventRef,
+        crate::v5::LocalId,
+        crate::v5::GroupRef,
+    )>,
 }
 
 /// Identifies the account/device/app that produced an audit log, for upload

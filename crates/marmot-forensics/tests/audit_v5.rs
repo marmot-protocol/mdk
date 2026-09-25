@@ -360,6 +360,26 @@ fn semantic_count_and_identity_rules_supplement_json_schema() {
 }
 
 #[test]
+fn incomplete_publication_keeps_discarded_ack_counts_unknown() {
+    let schema = validator();
+    let mut body = fixture("publish_finished");
+    body["event"]["results_complete"] = json!(false);
+    body["event"]["accepted_this_attempt_count"] = Value::Null;
+    body["event"]["accepted_total_count"] = Value::Null;
+    body["event"]["policy"] = json!("unknown");
+    body["event"]["retained_state"] = json!("pending");
+    assert!(schema.is_valid(&body));
+    assert!(decode(&body).is_ok());
+
+    let mut false_success = body.clone();
+    false_success["event"]["policy"] = json!("met");
+    assert!(decode(&false_success).is_err());
+    let mut false_complete = body;
+    false_complete["event"]["results_complete"] = json!(true);
+    assert!(decode(&false_complete).is_err());
+}
+
+#[test]
 fn canonical_integer_strings_and_strict_json_boundaries() {
     let schema = validator();
     for text in [
