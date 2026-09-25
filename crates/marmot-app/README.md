@@ -87,10 +87,8 @@ U+2029 become LF, and interior blank lines stay. Every other known string (`name
 Both modes remove tab and every other control, including NUL, ESC, BEL, DEL, and C1
 (U+0085 is removed, not treated as a newline). Ends are trimmed after filtering, then the
 value is capped at 4,096 Unicode scalars and any trailing whitespace exposed by that cap
-is trimmed. An equal `created_at` normally keeps the cached row. For accounts not held on
-this device, a refetch that only restores `about` line breaks an older build flattened
-replaces it. A local account's own flattened bio stays until that account publishes again,
-because a same-second publish that removed line breaks looks identical.
+is trimmed. A previously cached bio that already lost its line breaks is left in place
+until a newer event is accepted; an equal `created_at` does not replace the cached row.
 Publishing a local profile caches the submitted value directly and does not reparse it.
 
 The user directory is keyed by Nostr pubkey. Account setup and the daemon can refresh a local account's contact-list

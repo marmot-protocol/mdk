@@ -27,9 +27,9 @@ use crate::directory::records::{
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
     cached_identity_projection, display_name_for_profile, follow_list_from_record,
     latest_follow_list_from_records, latest_fresh_profiles_from_records, profile_content_json,
-    profile_from_record, public_directory_user_record, restores_flattened_about,
-    select_newer_directory_entry, source_relays_from_record, upsert_newer_directory_entry,
-    user_directory_record_from_public, user_record_match,
+    profile_from_record, public_directory_user_record, select_newer_directory_entry,
+    source_relays_from_record, upsert_newer_directory_entry, user_directory_record_from_public,
+    user_record_match,
 };
 use crate::directory::{
     DirectoryCache, DirectorySyncHandle, DirectorySyncPlan, sort_user_search_results,
@@ -1488,16 +1488,12 @@ impl MarmotApp {
         // local edit (mdk#206). Keeping the cache on equality protects
         // the local edit; an equal-timestamp event re-fetched from a relay is
         // either the user's own echoed publish (identical content) or a stale
-        // copy that must not win. The exception is a refetch that only
-        // restores `about` line breaks an older build flattened (mdk#1973).
-        // It is limited to accounts not held on this device: only a local
-        // account can have a just-published row, and a publish that removed
-        // bio line breaks looks exactly like a flattened legacy row.
+        // copy that must not win.
         if let Some(entry) = self.directory_entry_for_account_id(account_id_hex)?
-            && entry.profile.as_ref().is_some_and(|cached| {
-                cached.created_at >= profile.created_at
-                    && (entry.local_account.is_some() || !restores_flattened_about(cached, profile))
-            })
+            && entry
+                .profile
+                .as_ref()
+                .is_some_and(|cached| cached.created_at >= profile.created_at)
         {
             return Ok(());
         }

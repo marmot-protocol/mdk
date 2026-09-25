@@ -10838,112 +10838,66 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
 }
 
 #[test]
-fn refetched_kind0_repairs_bio_flattened_by_older_filter() {
-    // mdk#1973: older builds dropped LF from `about`. Relays keep serving the
-    // same event, so the equal-timestamp guard alone would never repair it.
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let author = format!("{:064x}", 1973);
-    let created_at = 1_700_001_973;
-    let mut flattened = test_directory_record(&author, "bob", created_at);
-    flattened.profile.as_mut().unwrap().about = Some("first linesecond line".to_owned());
-    app.save_directory_entry(&flattened).unwrap();
-
-    let ingest = |content: serde_json::Value| {
-        let mut event = NostrTransportEvent::new_unsigned(
-            author.clone(),
-            KIND_NOSTR_METADATA,
-            Vec::new(),
-            content.to_string(),
-        );
-        event.created_at = created_at;
-        app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
-            endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
-            event,
-        })
-        .unwrap();
-        app.directory_entry_for_account_id(&author)
-            .unwrap()
-            .unwrap()
-            .profile
-            .unwrap()
-    };
-
-    // A same-second copy that changes more than line breaks still loses.
-    let stale = ingest(serde_json::json!({
-        "name": "stale",
-        "about": "first line\nsecond line",
-    }));
-    assert_eq!(stale.name.as_deref(), Some("bob"));
-    assert_eq!(stale.about.as_deref(), Some("first linesecond line"));
-    let stale = ingest(serde_json::json!({
-        "name": "bob",
-        "about": "first line\nother line",
-    }));
-    assert_eq!(stale.about.as_deref(), Some("first linesecond line"));
-
-    // The same event refetched restores the line break.
-    let repaired = ingest(serde_json::json!({
-        "name": "bob",
-        "about": "first line\r\nsecond line",
-    }));
-    assert_eq!(repaired.name.as_deref(), Some("bob"));
-    assert_eq!(repaired.about.as_deref(), Some("first line\nsecond line"));
-    assert_eq!(repaired.created_at, created_at);
-
-    // Once repaired, the equal-timestamp guard keeps it.
-    let kept = ingest(serde_json::json!({
-        "name": "bob",
-        "about": "first linesecond line",
-    }));
-    assert_eq!(kept.about.as_deref(), Some("first line\nsecond line"));
-}
-
-#[test]
-fn same_second_refetch_keeps_local_publish_that_removed_bio_line_breaks() {
-    // A local publish that only removes bio line breaks matches the
-    // flattened-bio repair on content alone. A lagging relay's previous
-    // same-second event must not revert it (mdk#206).
+fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
+    // Equal timestamps stay immutable even when the events differ only by bio
+    // line breaks: a cached `onetwo` may be a current same-second edit, not a
+    // row flattened by the pre-#1973 filter (mdk#206). Only a newer event
+    // replaces it, for peers and for accounts held on this device alike.
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let alice = home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let created_at = 1_700_002_038;
-    app.remember_directory_profile(
-        &alice.account_id_hex,
-        &UserProfileMetadata {
-            name: Some("alice".to_owned()),
-            about: Some("onetwo".to_owned()),
-            created_at,
-            ..UserProfileMetadata::default()
-        },
-    )
-    .unwrap();
-
-    let mut previous = NostrTransportEvent::new_unsigned(
-        alice.account_id_hex.clone(),
-        KIND_NOSTR_METADATA,
-        Vec::new(),
-        serde_json::json!({ "name": "alice", "about": "one\ntwo" }).to_string(),
-    );
-    previous.created_at = created_at;
-    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
-        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
-        event: previous,
-    })
-    .unwrap();
-
-    let entry = app
-        .directory_entry_for_account_id(&alice.account_id_hex)
-        .unwrap()
+    let peer = format!("{:064x}", 1973);
+    let created_at = 1_700_001_973;
+    for (account_id, local) in [
+        (peer.as_str(), false),
+        (alice.account_id_hex.as_str(), true),
+    ] {
+        app.remember_directory_profile(
+            account_id,
+            &UserProfileMetadata {
+                name: Some("bob".to_owned()),
+                about: Some("onetwo".to_owned()),
+                created_at,
+                ..UserProfileMetadata::default()
+            },
+        )
         .unwrap();
-    assert!(entry.local_account.is_some());
-    assert_eq!(
-        entry.profile.and_then(|profile| profile.about).as_deref(),
-        Some("onetwo")
-    );
+        let ingest = |created_at: u64| {
+            let mut event = NostrTransportEvent::new_unsigned(
+                account_id.to_owned(),
+                KIND_NOSTR_METADATA,
+                Vec::new(),
+                serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
+            );
+            event.created_at = created_at;
+            app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+                event,
+            })
+            .unwrap();
+            app.directory_entry_for_account_id(account_id)
+                .unwrap()
+                .unwrap()
+        };
+
+        let same_second = ingest(created_at);
+        assert_eq!(same_second.local_account.is_some(), local);
+        assert_eq!(
+            same_second
+                .profile
+                .and_then(|profile| profile.about)
+                .as_deref(),
+            Some("onetwo"),
+            "local={local}"
+        );
+        let newer = ingest(created_at + 1);
+        assert_eq!(
+            newer.profile.and_then(|profile| profile.about).as_deref(),
+            Some("one\ntwo"),
+            "local={local}"
+        );
+    }
 }
 
 #[test]

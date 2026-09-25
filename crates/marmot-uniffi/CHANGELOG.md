@@ -5,9 +5,7 @@
 ### Fixed
 
 - Fetched kind:0 `about` text keeps normalized line breaks. Other known profile strings
-  stay single-line, and unsafe controls are still removed. A bio an older build cached
-  without its line breaks is repaired on the next profile fetch; a local account's own
-  bio recovers on its next profile publish. (#1973)
+  stay single-line, and unsafe controls are still removed. (#1973)
 
 - Package Android `arm64-v8a` and `x86_64` MarmotKit libraries with 16 KB ELF load-segment alignment, and reject a release or exact-head candidate whose packaged libraries do not meet that alignment. The page-size flags are appended on the final library link so configured Cargo rustflags stay in effect.
 

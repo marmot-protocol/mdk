@@ -327,8 +327,9 @@ pub(crate) fn upsert_newer_directory_entry(
 /// Parse incoming profile metadata and bound the fields retained on ingestion.
 /// The full event is parsed first; this is not a cap on transient parse memory.
 /// Previously cached rows are not rewritten here: their bounds take effect when
-/// a newer profile is ingested and replaces the cached metadata. The one
-/// equal-timestamp exception is [`restores_flattened_about`].
+/// a newer profile is ingested and replaces the cached metadata. Equal
+/// timestamps keep the cached row, so a bio flattened by the older filter is
+/// not repaired until a newer event arrives.
 ///
 /// `about` keeps normalized LF line breaks. Other known strings stay
 /// single-line. Both modes drop tab and every other control, including NUL,
@@ -470,8 +471,8 @@ const MAX_PROFILE_FIELD_CHARS: usize = 4096;
 /// most 4,096 Unicode scalars, then trim trailing whitespace exposed by that
 /// cap. The walk retains at most that many scalars; it does not allocate a
 /// full normalized copy first. This does not cap JSON parse memory. A cached
-/// bio flattened by the older filter is repaired by
-/// [`restores_flattened_about`] when the same event is fetched again.
+/// row that was ingested before this policy keeps its flattened text until a
+/// newer event replaces it. Equal timestamps still keep the cached row.
 #[derive(Clone, Copy)]
 enum ProfileStringPolicy {
     SingleLine,
@@ -534,37 +535,6 @@ where
             other => return Some(other),
         }
     }
-}
-
-/// Whether an equal-timestamp `fetched` profile only restores `about` line
-/// breaks that the pre-#1973 filter removed from `cached`.
-///
-/// Equal timestamps normally keep the cached row so a stale same-second relay
-/// copy cannot revert a local edit (mdk#206). Without this exception a bio
-/// flattened by an older build would never recover, because relays keep
-/// serving the same event. The fields alone cannot tell a flattened row from a
-/// same-second publish that removed only line breaks, so callers apply this
-/// only to accounts that are not local to this device.
-pub(crate) fn restores_flattened_about(
-    cached: &UserProfileMetadata,
-    fetched: &UserProfileMetadata,
-) -> bool {
-    let (Some(cached_about), Some(fetched_about)) =
-        (cached.about.as_deref(), fetched.about.as_deref())
-    else {
-        return false;
-    };
-    cached.created_at == fetched.created_at
-        && fetched_about.contains('\n')
-        && !cached_about.contains('\n')
-        && fetched_about.replace('\n', "") == cached_about
-        && cached.name == fetched.name
-        && cached.display_name == fetched.display_name
-        && cached.picture == fetched.picture
-        && cached.banner == fetched.banner
-        && cached.nip05 == fetched.nip05
-        && cached.lud16 == fetched.lud16
-        && cached.extra == fetched.extra
 }
 
 pub(crate) fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
@@ -1516,47 +1486,6 @@ mod tests {
             sanitize_profile_string(&exposed, ProfileStringPolicy::SingleLine).as_deref(),
             Some(before_break.as_str())
         );
-    }
-
-    #[test]
-    fn restores_flattened_about_accepts_only_a_line_break_repair() {
-        let profile = |about: Option<&str>| UserProfileMetadata {
-            name: Some("bob".to_owned()),
-            about: about.map(str::to_owned),
-            created_at: 1_700_000_000,
-            ..UserProfileMetadata::default()
-        };
-        let flattened = profile(Some("onetwo"));
-        let multiline = profile(Some("one\ntwo"));
-        assert!(restores_flattened_about(&flattened, &multiline));
-        assert!(!restores_flattened_about(&multiline, &flattened));
-        assert!(!restores_flattened_about(&multiline, &multiline));
-        assert!(!restores_flattened_about(&flattened, &flattened));
-        assert!(!restores_flattened_about(
-            &flattened,
-            &profile(Some("one\nthree"))
-        ));
-        assert!(!restores_flattened_about(
-            &profile(Some("one\ntw")),
-            &multiline
-        ));
-        assert!(!restores_flattened_about(&profile(None), &multiline));
-        assert!(!restores_flattened_about(&flattened, &profile(None)));
-
-        let mut renamed = multiline.clone();
-        renamed.name = Some("stale".to_owned());
-        assert!(!restores_flattened_about(&flattened, &renamed));
-        let mut extended = multiline.clone();
-        extended
-            .extra
-            .insert("website".to_owned(), serde_json::json!("https://x.test"));
-        assert!(!restores_flattened_about(&flattened, &extended));
-        let mut later = multiline.clone();
-        later.created_at += 1;
-        assert!(!restores_flattened_about(&flattened, &later));
-        let mut relayed = multiline.clone();
-        relayed.source_relays = vec!["wss://relay.example".to_owned()];
-        assert!(restores_flattened_about(&flattened, &relayed));
     }
 
     #[test]

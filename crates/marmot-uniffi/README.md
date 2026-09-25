@@ -312,9 +312,8 @@ profile keeps normalized LF line breaks; `name`, `displayName`, `picture`,
 removed on ingest. `publishUserProfile` caches the submitted local value
 without reparsing it, so a same-instance publish/read does not show incoming
 sanitization. Read another account through `refreshProfile`, then
-`userProfile` or `cachedIdentityProjections`. A bio an older build stored
-without line breaks is repaired when the profile is fetched again. A local
-account's own flattened bio stays until that account publishes again.
+`userProfile` or `cachedIdentityProjections`. A bio already stored without
+line breaks stays until a newer event replaces it.
 
 `accountKeyPackages` lists the current KeyPackage winner per addressable slot
 plus local-only rows. `accountKeyPackageRelayEvents` is the additive observed
