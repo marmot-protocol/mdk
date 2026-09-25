@@ -258,6 +258,8 @@ async fn join_row_uses_install_anchor_and_omits_ambiguous_replacement() {
         let before = capture.rows.len();
         capture.joined(receive, &later);
         assert_eq!(capture.rows.len(), before);
+        assert_eq!(capture.invalid, 0);
+        assert_eq!(capture.dropped, 0);
         scenario.assert_clean();
     })
     .await

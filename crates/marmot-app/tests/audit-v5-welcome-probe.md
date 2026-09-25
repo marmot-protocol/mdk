@@ -54,8 +54,8 @@ ingest. The engine writes `local_copy_install_epoch` and the durable
 `GroupJoined` event in one transaction. Unlike the current group epoch, this
 install anchor remains the joined epoch after buffered group messages advance
 the copy. The initial-join guard requires `join_epoch` to equal that anchor
-and be nonzero; an epoch-zero first join is deliberately omitted because a
-replacement also resets `join_epoch` to zero. A replacement/explicit consent,
+and be nonzero. Zero is the stored unknown-bound sentinel, and a replacement
+also resets `join_epoch` to zero. A replacement/explicit consent,
 duplicate delivery, or older event drained alongside unrelated input cannot
 produce another join row. Account effect-publication or buffered-replay errors
 after the engine transaction can leave a real commit without a row; absence

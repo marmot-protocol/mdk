@@ -461,9 +461,9 @@ impl WelcomeProbe {
     /// transaction. The copy-install epoch is written there too; a buffered
     /// group message can advance `group.epoch` before this call returns.
     pub(super) fn joined(&mut self, receive: (LocalId, NostrEventRef), group: &Group) {
-        // A replacement Welcome resets join_epoch to zero. Epoch zero can
-        // also be a valid first join, so omit that ambiguous case rather than
-        // classify a replacement as an initial join.
+        // A replacement Welcome resets join_epoch to zero. Zero is also the
+        // stored unknown-bound sentinel; only equal, known first-join and
+        // copy-install epochs establish this subset's initial-join scope.
         if group.protocol_profile != ProtocolProfile::Current
             || group.is_terminal()
             || group.join_epoch.0 == 0
