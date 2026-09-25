@@ -115,21 +115,33 @@ impl AppClient {
             self.flush_live_v5_events();
             return;
         };
-        let Ok(eligible) = u32::try_from(group_ids.len()) else {
-            if let Some(probe) = &mut self.audit_v5_probe {
-                probe.baseline_inventory(reason, None);
-            }
-            self.flush_live_v5_events();
-            return;
-        };
         group_ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-        let selected = eligible.min(64);
-        let mut failed_read = 0u32;
-        for group_id in group_ids.into_iter().take(selected as usize) {
+        let mut eligible = 0u32;
+        let mut selected_groups = Vec::new();
+        let mut classification_complete = true;
+        for group_id in group_ids {
             let Ok(group) = self.runtime.group_record(&group_id) else {
-                failed_read += 1;
+                // An unreadable group's profile is unknown. Do not claim an
+                // exact eligible/omitted count from a partial classification.
+                classification_complete = false;
                 continue;
             };
+            if group.protocol_profile != cgka_traits::group::ProtocolProfile::Current
+                || group.is_terminal()
+            {
+                continue;
+            }
+            let Some(next_eligible) = eligible.checked_add(1) else {
+                classification_complete = false;
+                continue;
+            };
+            eligible = next_eligible;
+            if selected_groups.len() < 64 {
+                selected_groups.push((group_id, group));
+            }
+        }
+        let selected = selected_groups.len() as u32;
+        for (group_id, group) in selected_groups {
             let admins = self.runtime.admin_pubkeys(&group_id).ok();
             if let Some(probe) = &mut self.audit_v5_probe {
                 probe.baseline(&group, admins.as_deref(), reason, None);
@@ -138,7 +150,7 @@ impl AppClient {
         if let Some(probe) = &mut self.audit_v5_probe {
             probe.baseline_inventory(
                 reason,
-                Some((eligible, selected, eligible - selected, failed_read)),
+                classification_complete.then_some((eligible, selected, eligible - selected, 0)),
             );
         }
         self.flush_live_v5_events();

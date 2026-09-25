@@ -145,6 +145,93 @@ fn safe_category(input: &str) -> String {
     }
 }
 
+/// Error/reason fields may originate in generic adapters or `Display` text.
+/// Only the established semantic vocabulary can cross the v5 boundary; a
+/// short alphanumeric string alone is not evidence that it is a category.
+fn safe_failure_category(input: &str) -> String {
+    match input {
+        "open"
+        | "pre_commit"
+        | "publish_confirmed"
+        | "already_seen"
+        | "timeout"
+        | "unknown_group"
+        | "unknown_member"
+        | "unknown_pending"
+        | "group_not_hydrated"
+        | "not_a_member"
+        | "not_group_admin"
+        | "invalid_credential_identity"
+        | "admin_cannot_self_remove"
+        | "leave_already_requested"
+        | "admin_depletion"
+        | "missing_required_capabilities"
+        | "disbanding_unsupported_members"
+        | "disbanding_not_enabled"
+        | "unsupported_ciphersuite"
+        | "invalid_app_message_payload"
+        | "invalid_account_identity_proof"
+        | "invalid_key_package_lifetime"
+        | "invalid_key_package_capabilities"
+        | "app_message_epoch_mismatch"
+        | "app_message_epoch_unsettled"
+        | "forked_epoch"
+        | "queued_outbound_at_capacity"
+        | "group_unrecoverable_repair_required"
+        | "invalid_transition"
+        | "storage"
+        | "peeler"
+        | "serialize"
+        | "invalid_welcome"
+        | "missing_welcome_key_package"
+        | "welcome_already_processed"
+        | "backend"
+        | "other"
+        | "malformed"
+        | "invalid_signature"
+        | "wrong_recipient"
+        | "decrypt_failed"
+        | "stale_epoch"
+        | "missing_context"
+        | "wrap_failed"
+        | "account_transport"
+        | "history_coverage_unproven"
+        | "group_epoch_unavailable"
+        | "backfill_drain_no_progress_quantum_yield"
+        | "missing_retained_anchor"
+        | "frozen_pass_integrity_failure"
+        | "frozen_member_integrity"
+        | "group_quarantined"
+        | "already_unrecoverable"
+        | "no_eligible_input"
+        | "blocked"
+        | "group_not_stable"
+        | "fork_rival_missing_retained_anchor"
+        | "queued_outbound_intent_discarded_group_removed"
+        | "set_group_convergence_policy"
+        | "input_window_open"
+        | "not_lowest_index"
+        | "fork_loser"
+        | "unattributable_sender"
+        | "fanout_adapter_error"
+        | "fanout_endpoint_did_not_acknowledge"
+        | "insufficient_publish_acknowledgements"
+        | "publish_acknowledgement_unknown"
+        | "publish_attempt_failed_before_exposure"
+        | "unclassified" => input.to_owned(),
+        "fanout adapter error" => "fanout_adapter_error".to_owned(),
+        "fanout endpoint did not acknowledge" => "fanout_endpoint_did_not_acknowledge".to_owned(),
+        "insufficient publish acknowledgements" => {
+            "insufficient_publish_acknowledgements".to_owned()
+        }
+        "publish acknowledgement unknown" => "publish_acknowledgement_unknown".to_owned(),
+        "publish attempt failed before exposure" => {
+            "publish_attempt_failed_before_exposure".to_owned()
+        }
+        _ => "unclassified".to_owned(),
+    }
+}
+
 fn safe_metadata(input: &str, punctuation: &[u8]) -> String {
     if !input.is_empty()
         && input.len() <= 64
@@ -314,9 +401,11 @@ fn protect(value: &mut Value) -> Result<(), ContractError> {
                     | "incumbent_digest" | "tip_digest" | "digest" => {
                         map_strings(&mut child, |s| preserve_legacy_hex(s, 32))?;
                     }
-                    "reason"
-                    | "error_kind"
-                    | "action"
+                    "reason" | "error_kind" | "stale_reason" | "rejection_reasons"
+                    | "error_kinds" => {
+                        map_strings(&mut child, |s| Ok(safe_failure_category(s)))?;
+                    }
+                    "action"
                     | "origin"
                     | "phase"
                     | "target_kind"
@@ -339,12 +428,9 @@ fn protect(value: &mut Value) -> Result<(), ContractError> {
                     | "fields"
                     | "tip_priority"
                     | "retained_anchor_status"
-                    | "rejection_reasons"
-                    | "stale_reason"
                     | "previous_state"
                     | "new_state"
                     | "decisive_rule"
-                    | "error_kinds"
                     | "artifact_kind"
                     | "recipient_scope"
                     | "membership_change_source"
@@ -540,5 +626,29 @@ mod tests {
         assert!(protect(&mut future).is_err());
         let mut known = json!({"type":"send_entry", "intent_kind":"application"});
         assert!(protect(&mut known).is_ok());
+    }
+
+    #[test]
+    fn short_free_form_transport_and_error_reasons_are_not_exported() {
+        let mut event = json!({
+            "type": "publish_outcome",
+            "failed_relays": [{"relay_url": "wss://relay.example", "reason": "Secret42"}],
+            "error_kind": "TokenABC",
+            "rejection_reasons": ["Bearer123"],
+            "stale_reason": "timeout"
+        });
+        protect(&mut event).unwrap();
+        assert_eq!(event["failed_relays"][0]["reason"], "unclassified");
+        assert_eq!(event["error_kind"], "unclassified");
+        assert_eq!(event["rejection_reasons"][0], "unclassified");
+        assert_eq!(event["stale_reason"], "timeout");
+        let encoded = event.to_string();
+        assert!(!encoded.contains("Secret42"));
+        assert!(!encoded.contains("TokenABC"));
+        assert!(!encoded.contains("Bearer123"));
+
+        let mut failure = json!({"type": "publish_failure", "reason": "ApiKey7"});
+        protect(&mut failure).unwrap();
+        assert_eq!(failure["reason"], "unclassified");
     }
 }

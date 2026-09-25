@@ -1626,21 +1626,25 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
                 std::fs::read_to_string(file.path)
                     .unwrap()
                     .lines()
-                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .map(|line| {
+                        marmot_forensics::v5::Record::from_json(line.as_bytes())
+                            .expect("real v5 recovery row");
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let armed_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_armed")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_armed")
             .collect();
         let started_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_started")
             .collect();
         let failed_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
             .collect();
         assert_eq!(armed_rows.len(), 1);
         assert_eq!(
@@ -1651,17 +1655,21 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
         let completed_rows: Vec<_> = failed_rows
             .into_iter()
             .filter(|row| {
-                row["context"]["operation_id"] == started_rows[0]["context"]["operation_id"]
+                row["event"]["record_context"]["operation_ref"]
+                    == started_rows[0]["event"]["record_context"]["operation_ref"]
             })
             .collect();
         assert_eq!(completed_rows.len(), 1);
         assert_eq!(
-            completed_rows[0]["kind"]["error_kind"],
+            completed_rows[0]["event"]["error_kind"],
             "history_coverage_unproven"
         );
-        assert_eq!(started_rows[0]["kind"]["seam"], "maintenance");
-        assert_eq!(completed_rows[0]["kind"]["activation_outcome"], "succeeded");
-        assert!(completed_rows[0]["kind"]["deliveries"].as_u64().unwrap() >= 1);
+        assert_eq!(started_rows[0]["event"]["seam"], "maintenance");
+        assert_eq!(
+            completed_rows[0]["event"]["activation_outcome"],
+            "succeeded"
+        );
+        assert!(completed_rows[0]["event"]["deliveries"].as_u64().unwrap() >= 1);
         assert!(
             storage
                 .pending_recovery_demands()
@@ -1669,16 +1677,16 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
         );
-        let audited_epoch_before = completed_rows[0]["kind"]["local_epoch_before"]
+        let audited_epoch_before = completed_rows[0]["event"]["local_epoch_before"]
             .as_u64()
             .expect("completed row local epoch before");
         assert_eq!(
-            completed_rows[0]["kind"]["local_epoch_after"].as_u64(),
+            completed_rows[0]["event"]["local_epoch_after"].as_u64(),
             Some(final_local_epoch),
             "the terminal row must report the observed final local epoch"
         );
         assert_eq!(
-            completed_rows[0]["kind"]["group_advanced"].as_bool(),
+            completed_rows[0]["event"]["group_advanced"].as_bool(),
             Some(final_local_epoch > audited_epoch_before),
             "activation success and group epoch recovery must remain distinct"
         );
@@ -1758,25 +1766,29 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
                 std::fs::read_to_string(file.path)
                     .unwrap()
                     .lines()
-                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .map(|line| {
+                        marmot_forensics::v5::Record::from_json(line.as_bytes())
+                            .expect("real v5 recovery row");
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let rows_of_kind = |kind: &str| {
             audit_rows
                 .iter()
-                .filter(|row| row["kind"]["type"] == kind)
+                .filter(|row| row["event"]["type"] == kind)
                 .collect::<Vec<_>>()
         };
         let armed = rows_of_kind("epoch_stall_backfill_armed");
         let started = rows_of_kind("epoch_stall_backfill_started");
         let failed = rows_of_kind("epoch_stall_backfill_failed")
             .into_iter()
-            .filter(|row| row["kind"]["activation_outcome"] == "failed")
+            .filter(|row| row["event"]["activation_outcome"] == "failed")
             .collect::<Vec<_>>();
         let completed = rows_of_kind("epoch_stall_backfill_failed")
             .into_iter()
-            .filter(|row| row["kind"]["error_kind"] == "history_coverage_unproven")
+            .filter(|row| row["event"]["error_kind"] == "history_coverage_unproven")
             .collect::<Vec<_>>();
         assert_eq!(armed.len(), 1, "one recovery intent must arm once");
         assert_eq!(started.len(), 2, "failure plus retry must start twice");
@@ -1791,32 +1803,33 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             "retry must have one honest incomplete terminal"
         );
         assert_eq!(
-            started[0]["context"]["operation_id"],
-            failed[0]["context"]["operation_id"]
+            started[0]["event"]["record_context"]["operation_ref"],
+            failed[0]["event"]["record_context"]["operation_ref"]
         );
         assert_eq!(
-            started[1]["context"]["operation_id"],
-            completed[0]["context"]["operation_id"]
+            started[1]["event"]["record_context"]["operation_ref"],
+            completed[0]["event"]["record_context"]["operation_ref"]
         );
         assert_ne!(
-            started[0]["context"]["operation_id"], started[1]["context"]["operation_id"],
+            started[0]["event"]["record_context"]["operation_ref"],
+            started[1]["event"]["record_context"]["operation_ref"],
             "each actual owner attempt has its own durable serial"
         );
-        assert_eq!(started[0]["kind"]["retry_ordinal"], 0);
-        assert_eq!(failed[0]["kind"]["retry_ordinal"], 0);
-        assert_eq!(started[1]["kind"]["retry_ordinal"], 1);
-        assert_eq!(completed[0]["kind"]["retry_ordinal"], 1);
+        assert_eq!(started[0]["event"]["retry_ordinal"], 0);
+        assert_eq!(failed[0]["event"]["retry_ordinal"], 0);
+        assert_eq!(started[1]["event"]["retry_ordinal"], 1);
+        assert_eq!(completed[0]["event"]["retry_ordinal"], 1);
         assert_eq!(
-            failed[0]["kind"]["activation_outcome"].as_str(),
+            failed[0]["event"]["activation_outcome"].as_str(),
             Some("failed")
         );
-        assert_eq!(failed[0]["kind"]["deliveries"], 0);
-        assert_eq!(failed[0]["kind"]["group_advanced"], false);
+        assert_eq!(failed[0]["event"]["deliveries"], 0);
+        assert_eq!(failed[0]["event"]["group_advanced"], false);
         // This run did read the group's post-replay epoch, so `group_advanced:
         // false` here is a measurement and the row says so. Without the
         // companion flag a reader cannot separate this row from one whose
         // after-read failed and defaulted to the before-epoch.
-        assert_eq!(failed[0]["kind"]["group_advanced_observed"], true);
+        assert_eq!(failed[0]["event"]["group_advanced_observed"], true);
     });
 }
 
@@ -1867,7 +1880,9 @@ async fn armed_epoch_backfill(
     (app, client, group_id)
 }
 
-/// Every audit row this app has recorded so far.
+/// Every v5 audit row this app has recorded so far. Keep the old `kind` key in
+/// this test-only view so the recovery assertions below continue to examine
+/// their original numeric and categorical facts, after strict v5 admission.
 fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
     app.audit_log_files()
         .unwrap()
@@ -1877,10 +1892,10 @@ fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
                 .unwrap()
                 .lines()
                 .map(|line| {
-                    let row = serde_json::from_str::<serde_json::Value>(line).unwrap();
-                    crate::audit_log::AUDIT_UPLOAD_SCHEMA
-                        .validate(&row)
-                        .expect("real recorder output must satisfy the upload schema");
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real recorder output must satisfy the v5 contract");
+                    let mut row = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                    row["kind"] = row["event"].clone();
                     row
                 })
                 .collect::<Vec<_>>()
@@ -17890,10 +17905,14 @@ fn audit_rows_of_kind(app: &MarmotApp, kind: &str) -> usize {
             std::fs::read_to_string(&file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real v5 recovery row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
                 .collect::<Vec<_>>()
         })
-        .filter(|row| row["kind"]["type"] == kind)
+        .filter(|row| row["event"]["type"] == kind)
         .count()
 }
 

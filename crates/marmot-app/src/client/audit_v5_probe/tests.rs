@@ -1,5 +1,6 @@
 use super::*;
 use crate::{AppClient, AuditLogSettings, MarmotApp, MarmotAppConfig};
+use cgka_traits::{group::ProtocolProfile, storage::GroupStorage};
 use marmot_account::AccountHome;
 use nostr_relay_builder::MockRelay;
 use std::{path::Path, time::Duration};
@@ -55,10 +56,72 @@ fn app(path: &Path, relay: &str) -> MarmotApp {
         relay.to_owned(),
         MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
-    // The existing recorder remains v4 even while the private probe is selected.
+    // Enable the same v5 recorder used by the live app path.
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     app
+}
+
+#[tokio::test]
+async fn opened_inventory_selects_current_groups_before_the_64_group_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let mut client = app.client("alice").await.unwrap();
+    let mut ids = Vec::new();
+    for index in 0..65 {
+        ids.push(
+            client
+                .create_group(&format!("mixed profile group {index}"), &[])
+                .await
+                .unwrap(),
+        );
+    }
+    ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let current_id = ids.pop().unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    for id in ids {
+        let mut group = storage.get_group(&id).unwrap();
+        group.protocol_profile = ProtocolProfile::Legacy;
+        storage.put_group(&group).unwrap();
+    }
+
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    client.set_audit_recording(true);
+    drop(client);
+    let rows = actual_v5_rows(&app, "alice");
+    let inventory = rows
+        .iter()
+        .find_map(|row| match &row.fields().event {
+            Event::GroupBaselineInventory(event)
+                if event.reason == BaselineReason::AuditEnabled =>
+            {
+                Some(event)
+            }
+            _ => None,
+        })
+        .expect("audit enable inventory");
+    assert_eq!(inventory.eligible_group_count, Some(1));
+    assert_eq!(inventory.selected_group_count, Some(1));
+    assert_eq!(inventory.omitted_by_limit_count, Some(0));
+    assert_eq!(inventory.failed_read_count, Some(0));
+    let selected = rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                &row.fields().event,
+                Event::GroupBaseline(event) if event.reason == BaselineReason::AuditEnabled
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected[0].fields().group_ref.as_ref(),
+        Some(&GroupRef::from_group_id(current_id.as_slice()).unwrap())
+    );
 }
 
 #[tokio::test]
