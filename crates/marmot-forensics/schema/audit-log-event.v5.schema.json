@@ -1,0 +1,2151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.marmot.dev/forensics/audit-log-event.v5.schema.json",
+  "title": "Inactive Marmot audit v5 Welcome contract",
+  "$comment": "Structural validation only. Enforce strict JSON framing/duplicate rejection and <=65535 UTF-8 bytes before validation. Record::new additionally enforces sorted reference lists, endpoint-key uniqueness and cross-field count/completeness/policy invariants which standard JSON Schema cannot express. No chronology, authenticity, owner-transaction or whole-investigation coverage is established by this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_ref",
+    "session_id",
+    "seq",
+    "wall_time_ms",
+    "mono_us",
+    "producer",
+    "group_ref",
+    "event"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "#/$defs/SchemaVersion"
+    },
+    "source_ref": {
+      "$ref": "#/$defs/SourceRef"
+    },
+    "session_id": {
+      "$ref": "#/$defs/SessionId"
+    },
+    "seq": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/U64String"
+        },
+        {
+          "not": {
+            "const": "0"
+          }
+        }
+      ]
+    },
+    "wall_time_ms": {
+      "$ref": "#/$defs/I64String"
+    },
+    "mono_us": {
+      "$ref": "#/$defs/U64String"
+    },
+    "producer": {
+      "$ref": "#/$defs/Producer"
+    },
+    "group_ref": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GroupRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "event": {
+      "$ref": "#/$defs/Event"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "app_group_update_finished"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "group_baseline"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "welcome_prepared"
+              },
+              "construction": {
+                "const": "constructed"
+              }
+            },
+            "required": [
+              "type",
+              "construction"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "welcome_join_finished"
+              },
+              "result": {
+                "const": "joined"
+              }
+            },
+            "required": [
+              "type",
+              "result"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "SourceRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "minLength": 32,
+      "maxLength": 32
+    },
+    "SessionId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "minLength": 32,
+      "maxLength": 32
+    },
+    "LocalId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "minLength": 32,
+      "maxLength": 32
+    },
+    "GroupRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "MemberRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "NostrEventRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "EngineMessageRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "EndpointRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "Revision": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+      "minLength": 40,
+      "maxLength": 64
+    },
+    "BuildToken": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9._+\\-]+$"
+    },
+    "U64String": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+      "minLength": 1,
+      "maxLength": 20
+    },
+    "I64String": {
+      "type": "string",
+      "pattern": "^(?:(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)|-(?!0(?:$))(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-7]|9223372036854775808))$",
+      "minLength": 1,
+      "maxLength": 20
+    },
+    "SchemaVersion": {
+      "enum": [
+        "marmot-forensics-audit/v5"
+      ]
+    },
+    "BuildProfile": {
+      "enum": [
+        "release",
+        "debug"
+      ]
+    },
+    "Platform": {
+      "enum": [
+        "ios",
+        "macos",
+        "android",
+        "linux",
+        "windows",
+        "wasm",
+        "other"
+      ]
+    },
+    "Mode": {
+      "enum": [
+        "founding",
+        "invite"
+      ]
+    },
+    "Construction": {
+      "enum": [
+        "constructed",
+        "failed"
+      ]
+    },
+    "Retention": {
+      "enum": [
+        "committed",
+        "failed",
+        "not_attempted",
+        "unknown"
+      ]
+    },
+    "PreparationStage": {
+      "enum": [
+        "selection",
+        "validation",
+        "construction",
+        "retention"
+      ]
+    },
+    "PreparationReason": {
+      "enum": [
+        "no_usable_key_package",
+        "key_package_invalid",
+        "construction_failed",
+        "retention_failed",
+        "storage_failed",
+        "internal_failed",
+        "unclassified"
+      ]
+    },
+    "RouteSource": {
+      "enum": [
+        "resolved_inbox",
+        "retained_target",
+        "configured_fallback",
+        "unknown"
+      ]
+    },
+    "EndpointStatus": {
+      "enum": [
+        "acknowledged",
+        "failed"
+      ]
+    },
+    "EndpointFailureKind": {
+      "enum": [
+        "terminal_rejected",
+        "not_exposed",
+        "possibly_exposed",
+        "retryable_unavailable"
+      ]
+    },
+    "RejectionCategory": {
+      "enum": [
+        "duplicate",
+        "pow",
+        "blocked",
+        "rate-limited",
+        "invalid",
+        "error",
+        "unsupported",
+        "auth-required",
+        "restricted"
+      ]
+    },
+    "Policy": {
+      "enum": [
+        "met",
+        "unmet",
+        "unknown"
+      ]
+    },
+    "RetainedState": {
+      "enum": [
+        "pending",
+        "completed",
+        "unknown"
+      ]
+    },
+    "NotStartedReason": {
+      "enum": [
+        "no_eligible_route",
+        "route_resolution_failed",
+        "retained_state_failed"
+      ]
+    },
+    "Acquisition": {
+      "enum": [
+        "live",
+        "history",
+        "local_replay",
+        "unknown"
+      ]
+    },
+    "UnwrapResult": {
+      "enum": [
+        "validated",
+        "rejected",
+        "failed"
+      ]
+    },
+    "UnwrapReason": {
+      "enum": [
+        "wrong_recipient",
+        "invalid_signature",
+        "invalid_encoding",
+        "unwrap_failed",
+        "internal_failed",
+        "unclassified"
+      ]
+    },
+    "JoinResult": {
+      "enum": [
+        "joined",
+        "duplicate",
+        "deferred",
+        "rejected",
+        "failed"
+      ]
+    },
+    "JoinReason": {
+      "enum": [
+        "wrong_recipient",
+        "invalid_signature",
+        "invalid_encoding",
+        "unsupported_feature",
+        "authorization_failed",
+        "missing_key_package",
+        "rejoin_confirmation_required",
+        "duplicate",
+        "storage_failed",
+        "internal_failed",
+        "unclassified"
+      ]
+    },
+    "EngineCommit": {
+      "enum": [
+        "committed",
+        "rolled_back",
+        "not_attempted",
+        "unknown"
+      ]
+    },
+    "UpdateCause": {
+      "enum": [
+        "welcome_join",
+        "invite_confirmation",
+        "retained_event_replay"
+      ]
+    },
+    "Compute": {
+      "enum": [
+        "completed",
+        "unchanged",
+        "failed"
+      ]
+    },
+    "Checkpoint": {
+      "enum": [
+        "committed",
+        "failed_before_commit",
+        "unknown"
+      ]
+    },
+    "InviteState": {
+      "enum": [
+        "pending_confirmation",
+        "accepted",
+        "unknown"
+      ]
+    },
+    "UpdateReason": {
+      "enum": [
+        "storage_failed",
+        "projection_failed",
+        "internal_failed",
+        "unclassified"
+      ]
+    },
+    "BaselineReason": {
+      "enum": [
+        "created",
+        "joined",
+        "audit_enabled",
+        "opened",
+        "active_refresh"
+      ]
+    },
+    "Limitation": {
+      "enum": [
+        "member_limit",
+        "byte_limit",
+        "admin_policy_unavailable",
+        "state_unavailable"
+      ]
+    },
+    "Capture": {
+      "enum": [
+        "complete",
+        "partial",
+        "failed"
+      ]
+    },
+    "Basis": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "founding"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "commit_ref"
+          ],
+          "properties": {
+            "kind": {
+              "const": "commit"
+            },
+            "commit_ref": {
+              "$ref": "#/$defs/EngineMessageRef"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "unavailable"
+            }
+          }
+        }
+      ]
+    },
+    "Producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mdk_revision",
+        "build_profile",
+        "platform",
+        "host_build"
+      ],
+      "properties": {
+        "mdk_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "build_profile": {
+          "$ref": "#/$defs/BuildProfile"
+        },
+        "platform": {
+          "$ref": "#/$defs/Platform"
+        },
+        "host_build": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BuildToken"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "EndpointResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint_ref",
+        "status",
+        "failure_kind",
+        "rejection_category"
+      ],
+      "properties": {
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "status": {
+          "$ref": "#/$defs/EndpointStatus"
+        },
+        "failure_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointFailureKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rejection_category": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RejectionCategory"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "acknowledged"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "failure_kind": {
+                "type": "null"
+              },
+              "rejection_category": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "failure_kind": {
+                "$ref": "#/$defs/EndpointFailureKind"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "BaselineMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "member_ref",
+        "admin"
+      ],
+      "properties": {
+        "member_ref": {
+          "$ref": "#/$defs/MemberRef"
+        },
+        "admin": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "WelcomePrepared": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "op_id",
+        "recipient_ref",
+        "mode",
+        "basis",
+        "key_package_event_ref",
+        "outer_event_ref",
+        "construction",
+        "retention",
+        "failure_stage",
+        "reason",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_prepared"
+        },
+        "op_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "recipient_ref": {
+          "$ref": "#/$defs/MemberRef"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "basis": {
+          "$ref": "#/$defs/Basis"
+        },
+        "key_package_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outer_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "construction": {
+          "$ref": "#/$defs/Construction"
+        },
+        "retention": {
+          "$ref": "#/$defs/Retention"
+        },
+        "failure_stage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PreparationStage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PreparationReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "founding"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "basis": {
+                "properties": {
+                  "kind": {
+                    "const": "founding"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "invite"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "basis": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "commit",
+                      "unavailable"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "construction"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outer_event_ref": {
+                "type": "null"
+              },
+              "retention": {
+                "const": "not_attempted"
+              },
+              "failure_stage": {
+                "enum": [
+                  "selection",
+                  "validation",
+                  "construction"
+                ]
+              },
+              "reason": {
+                "$ref": "#/$defs/PreparationReason"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "constructed"
+              }
+            },
+            "required": [
+              "construction"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outer_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              },
+              "key_package_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "constructed"
+              },
+              "mode": {
+                "const": "invite"
+              }
+            },
+            "required": [
+              "construction",
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "basis": {
+                "properties": {
+                  "kind": {
+                    "const": "commit"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "constructed"
+              },
+              "retention": {
+                "enum": [
+                  "committed",
+                  "not_attempted"
+                ]
+              }
+            },
+            "required": [
+              "construction",
+              "retention"
+            ]
+          },
+          "then": {
+            "properties": {
+              "failure_stage": {
+                "type": "null"
+              },
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "constructed"
+              },
+              "retention": {
+                "enum": [
+                  "failed",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "construction",
+              "retention"
+            ]
+          },
+          "then": {
+            "properties": {
+              "failure_stage": {
+                "const": "retention"
+              },
+              "reason": {
+                "enum": [
+                  "retention_failed",
+                  "storage_failed",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "failed"
+              },
+              "failure_stage": {
+                "const": "selection"
+              }
+            },
+            "required": [
+              "construction",
+              "failure_stage"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "no_usable_key_package",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              },
+              "key_package_event_ref": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "failed"
+              },
+              "failure_stage": {
+                "const": "validation"
+              }
+            },
+            "required": [
+              "construction",
+              "failure_stage"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "key_package_invalid",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "failed"
+              },
+              "failure_stage": {
+                "const": "construction"
+              }
+            },
+            "required": [
+              "construction",
+              "failure_stage"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "construction_failed",
+                  "storage_failed",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomePublishStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "op_id",
+        "attempt_id",
+        "outer_event_ref",
+        "recipient_ref",
+        "route_source",
+        "targets",
+        "target_count",
+        "targets_complete",
+        "required_acks",
+        "accepted_before_count"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_publish_started"
+        },
+        "op_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "recipient_ref": {
+          "$ref": "#/$defs/MemberRef"
+        },
+        "route_source": {
+          "$ref": "#/$defs/RouteSource"
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EndpointRef"
+          },
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "target_count": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targets_complete": {
+          "type": "boolean"
+        },
+        "required_acks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "accepted_before_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "targets_complete": {
+                "const": true
+              }
+            },
+            "required": [
+              "targets_complete"
+            ]
+          },
+          "then": {
+            "properties": {
+              "targets": {
+                "minItems": 1
+              },
+              "target_count": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "target_count": {
+              "not": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomePublishFinished": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "attempt_id",
+        "outer_event_ref",
+        "results",
+        "results_complete",
+        "accepted_this_attempt_count",
+        "accepted_total_count",
+        "required_acks",
+        "policy",
+        "retained_state",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_publish_finished"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EndpointResult"
+          },
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "results_complete": {
+          "type": "boolean"
+        },
+        "accepted_this_attempt_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "accepted_total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "required_acks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "policy": {
+          "$ref": "#/$defs/Policy"
+        },
+        "retained_state": {
+          "$ref": "#/$defs/RetainedState"
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "retained_state": {
+                "const": "completed"
+              }
+            },
+            "required": [
+              "retained_state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "policy": {
+                "const": "met"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomePublishNotStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "op_id",
+        "outer_event_ref",
+        "recipient_ref",
+        "reason",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_publish_not_started"
+        },
+        "op_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "recipient_ref": {
+          "$ref": "#/$defs/MemberRef"
+        },
+        "reason": {
+          "$ref": "#/$defs/NotStartedReason"
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "WelcomeObserved": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "receive_id",
+        "outer_event_ref",
+        "acquisition",
+        "endpoint_ref",
+        "fetch_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_observed"
+        },
+        "receive_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "acquisition": {
+          "$ref": "#/$defs/Acquisition"
+        },
+        "endpoint_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fetch_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "acquisition": {
+                "const": "local_replay"
+              }
+            },
+            "required": [
+              "acquisition"
+            ]
+          },
+          "then": {
+            "properties": {
+              "endpoint_ref": {
+                "type": "null"
+              },
+              "fetch_id": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomeUnwrapped": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "receive_id",
+        "outer_event_ref",
+        "result",
+        "rumor_event_ref",
+        "key_package_event_ref",
+        "reason",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_unwrapped"
+        },
+        "receive_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "result": {
+          "$ref": "#/$defs/UnwrapResult"
+        },
+        "rumor_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "key_package_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnwrapReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "validated"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "rumor_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              },
+              "key_package_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              },
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "enum": [
+                  "rejected",
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "rumor_event_ref": {
+                "type": "null"
+              },
+              "key_package_event_ref": {
+                "type": "null"
+              },
+              "reason": {
+                "$ref": "#/$defs/UnwrapReason"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomeJoinFinished": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "receive_id",
+        "outer_event_ref",
+        "result",
+        "reason",
+        "epoch",
+        "engine_commit",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_join_finished"
+        },
+        "receive_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "result": {
+          "$ref": "#/$defs/JoinResult"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JoinReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "epoch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "engine_commit": {
+          "$ref": "#/$defs/EngineCommit"
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "joined"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "epoch": {
+                "$ref": "#/$defs/U64String"
+              },
+              "engine_commit": {
+                "const": "committed"
+              },
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "enum": [
+                  "duplicate",
+                  "deferred",
+                  "rejected",
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "engine_commit": {
+                "enum": [
+                  "rolled_back",
+                  "not_attempted",
+                  "unknown"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "duplicate"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "const": "duplicate"
+              },
+              "engine_commit": {
+                "const": "not_attempted"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "deferred"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "const": "rejoin_confirmation_required"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "rejected"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "wrong_recipient",
+                  "invalid_signature",
+                  "invalid_encoding",
+                  "unsupported_feature",
+                  "authorization_failed",
+                  "missing_key_package",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "storage_failed",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "AppGroupUpdateFinished": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "update_id",
+        "outer_event_ref",
+        "cause",
+        "compute",
+        "checkpoint",
+        "invite_state",
+        "reason",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "app_group_update_finished"
+        },
+        "update_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "cause": {
+          "$ref": "#/$defs/UpdateCause"
+        },
+        "compute": {
+          "$ref": "#/$defs/Compute"
+        },
+        "checkpoint": {
+          "$ref": "#/$defs/Checkpoint"
+        },
+        "invite_state": {
+          "$ref": "#/$defs/InviteState"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpdateReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "checkpoint": {
+                "const": "committed"
+              }
+            },
+            "required": [
+              "checkpoint"
+            ]
+          },
+          "then": {
+            "properties": {
+              "compute": {
+                "enum": [
+                  "completed",
+                  "unchanged"
+                ]
+              },
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "checkpoint": {
+                "const": "committed"
+              },
+              "cause": {
+                "const": "invite_confirmation"
+              }
+            },
+            "required": [
+              "checkpoint",
+              "cause"
+            ]
+          },
+          "then": {
+            "properties": {
+              "invite_state": {
+                "const": "accepted"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "checkpoint": {
+                "enum": [
+                  "failed_before_commit",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "checkpoint"
+            ]
+          },
+          "then": {
+            "properties": {
+              "invite_state": {
+                "const": "unknown"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "checkpoint": {
+                "const": "failed_before_commit"
+              }
+            },
+            "required": [
+              "checkpoint"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "$ref": "#/$defs/UpdateReason"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "compute": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "compute"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "$ref": "#/$defs/UpdateReason"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "GroupBaseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "reason",
+        "cause_outer_event_ref",
+        "epoch",
+        "basis",
+        "members",
+        "member_count",
+        "members_complete",
+        "limitations",
+        "capture"
+      ],
+      "properties": {
+        "type": {
+          "const": "group_baseline"
+        },
+        "reason": {
+          "$ref": "#/$defs/BaselineReason"
+        },
+        "cause_outer_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "epoch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "basis": {
+          "$ref": "#/$defs/Basis"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BaselineMember"
+          },
+          "maxItems": 64,
+          "uniqueItems": true
+        },
+        "member_count": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "members_complete": {
+          "type": "boolean"
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Limitation"
+          },
+          "maxItems": 4,
+          "uniqueItems": true
+        },
+        "capture": {
+          "$ref": "#/$defs/Capture"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capture": {
+                "const": "complete"
+              }
+            },
+            "required": [
+              "capture"
+            ]
+          },
+          "then": {
+            "properties": {
+              "epoch": {
+                "$ref": "#/$defs/U64String"
+              },
+              "member_count": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "members_complete": {
+                "const": true
+              },
+              "limitations": {
+                "maxItems": 0
+              },
+              "members": {
+                "minItems": 1,
+                "items": {
+                  "properties": {
+                    "admin": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "capture": {
+                "const": "partial"
+              }
+            },
+            "required": [
+              "capture"
+            ]
+          },
+          "then": {
+            "properties": {
+              "limitations": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "capture": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "capture"
+            ]
+          },
+          "then": {
+            "properties": {
+              "epoch": {
+                "type": "null"
+              },
+              "member_count": {
+                "type": "null"
+              },
+              "members_complete": {
+                "const": false
+              },
+              "members": {
+                "maxItems": 0
+              },
+              "limitations": {
+                "contains": {
+                  "const": "state_unavailable"
+                }
+              },
+              "basis": {
+                "properties": {
+                  "kind": {
+                    "const": "unavailable"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "epoch": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "epoch"
+            ]
+          },
+          "then": {
+            "properties": {
+              "limitations": {
+                "contains": {
+                  "const": "state_unavailable"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "members": {
+                "contains": {
+                  "properties": {
+                    "admin": {
+                      "type": "null"
+                    }
+                  },
+                  "required": [
+                    "admin"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "members"
+            ]
+          },
+          "then": {
+            "properties": {
+              "limitations": {
+                "contains": {
+                  "const": "admin_policy_unavailable"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "limitations": {
+                "contains": {
+                  "enum": [
+                    "member_limit",
+                    "byte_limit"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "limitations"
+            ]
+          },
+          "then": {
+            "properties": {
+              "members_complete": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "joined"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "properties": {
+              "cause_outer_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "members_complete": {
+                "const": true
+              }
+            },
+            "required": [
+              "members_complete"
+            ]
+          },
+          "then": {
+            "properties": {
+              "member_count": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Event": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/WelcomePrepared"
+        },
+        {
+          "$ref": "#/$defs/WelcomePublishStarted"
+        },
+        {
+          "$ref": "#/$defs/WelcomePublishFinished"
+        },
+        {
+          "$ref": "#/$defs/WelcomePublishNotStarted"
+        },
+        {
+          "$ref": "#/$defs/WelcomeObserved"
+        },
+        {
+          "$ref": "#/$defs/WelcomeUnwrapped"
+        },
+        {
+          "$ref": "#/$defs/WelcomeJoinFinished"
+        },
+        {
+          "$ref": "#/$defs/AppGroupUpdateFinished"
+        },
+        {
+          "$ref": "#/$defs/GroupBaseline"
+        }
+      ]
+    }
+  }
+}

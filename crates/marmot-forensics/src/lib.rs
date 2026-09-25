@@ -1,6 +1,8 @@
 pub mod audit;
 #[cfg(unix)]
 pub mod local_delivery;
+/// Inactive next-version Welcome contract; does not change recorder output.
+pub mod v5;
 
 pub use audit::{
     AUDIT_LOG_SCHEMA_VERSION, AUDIT_LOG_SEGMENT_MAX_BYTES, AccountRefHex, AuditConvergenceContext,
