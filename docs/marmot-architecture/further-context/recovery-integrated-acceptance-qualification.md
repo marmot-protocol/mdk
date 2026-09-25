@@ -48,8 +48,17 @@ timed-out SDK request, so this result does **not** prove that the request stayed
 active through the status response or that a live message was delivered
 concurrently with its network wait. A separate healthy-route one-shot publish
 returned successfully, but its live receipt did not appear within five
-seconds and was removed as an acceptance assertion. The initial credit
-assertion expected one available credit and observed two. The first
+seconds and was removed as an acceptance assertion. In that first fixture,
+the target and healthy groups used the same local relay connection. The
+`nostr-relay-builder` 0.44.0 WebSocket loop awaits `QueryPolicy::admit_query`
+for the held exact-ID `REQ` before it polls its new-event broadcast arm on
+that connection. A successful publish from Bob's separate socket therefore
+cannot reach Alice's same-socket live subscription until the query is
+released. This fixture constraint does not identify an account-worker receive
+failure. The follow-up live-service experiment places the healthy group on
+an independent local relay connection and keeps the target relay and missing
+MLS history unchanged; its result must be reported separately. The initial
+credit assertion expected one available credit and observed two. The first
 cancellation assertion expected the server handler to stop immediately and
 observed it still active; cancellation and durable debt preservation need a
 separate composed test.
