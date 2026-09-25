@@ -443,15 +443,13 @@ fn evaluated_onboarding_status(
     findings: &[OnboardingFinding],
     relay_status: Option<OnboardingStatus>,
 ) -> OnboardingStatus {
-    // Endpoint health is advisory once a safe, directionally complete route
-    // has answered. Structural defects stay blocking and an internal task
-    // interruption is retryable, not evidence of a usable route.
-    if findings.iter().any(|finding| {
-        matches!(
-            finding.issue,
-            OnboardingIssue::Malformed | OnboardingIssue::TooManyRelays
-        )
-    }) {
+    // Endpoint health and the local inspection cap are advisory once a safe,
+    // directionally complete route has answered. A malformed declaration still
+    // blocks, and an internal interruption is not evidence of a usable route.
+    if findings
+        .iter()
+        .any(|finding| finding.issue == OnboardingIssue::Malformed)
+    {
         OnboardingStatus::NeedsInput
     } else if relay_status.is_some()
         && findings
@@ -1851,6 +1849,8 @@ impl AccountManager {
                 } else {
                     let mut endpoints = state.relays;
                     if step == OnboardingStep::Relays {
+                        // A declared read route can complete the bounded check
+                        // when an allowed write route is temporarily unreachable.
                         for endpoint in state.read_relays {
                             if !endpoints.contains(&endpoint) {
                                 endpoints.push(endpoint);
@@ -1881,7 +1881,8 @@ impl AccountManager {
                         )
                         .await;
                     findings.extend(failures);
-                    if completed.is_disjoint(&allowed) {
+                    // Inspection only dials allowed routes from this declaration.
+                    if completed.is_empty() {
                         findings.push(finding(OnboardingIssue::NoUsableRoute));
                         relay_status = Some(OnboardingStatus::RetryableFailure);
                     } else {

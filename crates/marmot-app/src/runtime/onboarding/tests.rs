@@ -540,6 +540,52 @@ async fn transient_endpoint_failures_are_warnings_when_another_declared_route_co
 }
 
 #[tokio::test]
+async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_route_times_out() {
+    use crate::relay_plane::DirectoryInspectionError;
+
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let declaration = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://read.example".into(), "read".into()],
+            vec!["r".into(), "wss://write.example".into(), "write".into()],
+        ],
+        "unchanged",
+        unix_now_seconds(),
+    );
+    *network.events.lock().unwrap() = vec![declaration.clone()];
+    network
+        .inspection_errors
+        .lock()
+        .unwrap()
+        .insert("write.example".into(), DirectoryInspectionError::TimedOut);
+
+    let (status, findings, observed) = manager
+        .check_onboarding_step(&c, OnboardingStep::Relays)
+        .await;
+    assert_eq!(status, OnboardingStatus::Passed);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::TimedOut)
+    );
+    assert_eq!(observed, Some(declaration));
+    assert!(network.attempts.lock().unwrap().is_empty());
+    assert!(
+        network
+            .inspected_endpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|endpoint| endpoint.contains("read.example"))
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn relay_directionality_and_inconclusive_checks_never_produce_false_readiness() {
     use crate::relay_plane::DirectoryInspectionError;
 
@@ -642,7 +688,7 @@ async fn relay_directionality_and_inconclusive_checks_never_produce_false_readin
 }
 
 #[test]
-fn relay_status_never_treats_internal_interruption_or_over_limit_routes_as_degraded_pass() {
+fn relay_status_keeps_the_inspection_cap_advisory_only_after_a_completed_check() {
     assert_eq!(
         evaluated_onboarding_status(
             &[finding(OnboardingIssue::Interrupted)],
@@ -655,7 +701,14 @@ fn relay_status_never_treats_internal_interruption_or_over_limit_routes_as_degra
             &[finding(OnboardingIssue::TooManyRelays)],
             Some(OnboardingStatus::Passed),
         ),
-        OnboardingStatus::NeedsInput
+        OnboardingStatus::Passed
+    );
+    assert_eq!(
+        evaluated_onboarding_status(
+            &[finding(OnboardingIssue::TooManyRelays)],
+            Some(OnboardingStatus::RetryableFailure),
+        ),
+        OnboardingStatus::RetryableFailure
     );
     assert_eq!(
         evaluated_onboarding_status(
@@ -1038,7 +1091,7 @@ async fn defaults_preserve_relay_tags() {
         c.set(step, OnboardingStatus::NeedsInput, Vec::new());
         manager.save_onboarding(&mut c).unwrap();
         let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
-        assert_eq!(status, OnboardingStatus::NeedsInput);
+        assert_eq!(status, OnboardingStatus::RetryableFailure);
         assert!(
             findings
                 .iter()
@@ -1063,9 +1116,9 @@ async fn defaults_preserve_relay_tags() {
         assert_eq!(published.tags.len(), tags.len() + 1);
         let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
         let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
-        // Appending preserves the signed declaration but cannot make an
-        // over-limit route set safe to accept automatically.
-        assert_eq!(status, OnboardingStatus::NeedsInput, "{findings:?}");
+        // A completed recommended route permits continuation without rewriting
+        // the existing declaration; the local dial cap remains visible.
+        assert_eq!(status, OnboardingStatus::Passed, "{findings:?}");
         assert!(
             findings
                 .iter()
