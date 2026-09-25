@@ -87,6 +87,12 @@ impl Drop for ComparisonNetworkJob {
 }
 
 impl ComparisonNetworkJob {
+    /// Cancel the request and wait until its future has dropped the shared credit.
+    pub(crate) async fn abort_and_wait(mut self) {
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
+    }
+
     pub(crate) fn start(
         client: &AppClient,
         grant: &AttemptGrant,
@@ -482,6 +488,29 @@ mod tests {
         })
         .await
         .expect("cancelled task releases its own permit");
+        assert_eq!(capacity.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_and_wait_reaps_network_future_before_returning() {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let credit = capacity.clone().try_acquire_owned().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let waiting = entered.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        let handle = tokio::spawn({
+            let entered = entered.clone();
+            async move {
+                entered.notify_one();
+                std::future::pending::<()>().await;
+                (credit, ComparisonNetworkResult { routes: Vec::new() })
+            }
+        });
+        let job = ComparisonNetworkJob { handle };
+        waiting.await;
+        assert_eq!(capacity.available_permits(), 0);
+        job.abort_and_wait().await;
         assert_eq!(capacity.available_permits(), 1);
     }
 

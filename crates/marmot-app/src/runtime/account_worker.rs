@@ -1232,10 +1232,10 @@ async fn run_app_runtime_account_worker(
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-                return;
+                break 'worker;
             }
             _ = &mut shutdown => {
-                return;
+                break 'worker;
             }
             _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
             completed = async {
@@ -1344,7 +1344,7 @@ async fn run_app_runtime_account_worker(
                             &mut client,
                         );
                     }
-                    None => return,
+                    None => break 'worker,
                 }
             }
             // Alternate a command and a ready recovery quantum. A permanently
@@ -1437,7 +1437,7 @@ async fn run_app_runtime_account_worker(
                             );
                         }
                     }
-                    None => return,
+                    None => break 'worker,
                 }
             }
             _ = scheduled_convergence.timer.as_mut(), if (!yield_to_bounded_admission
@@ -1759,8 +1759,8 @@ async fn run_app_runtime_account_worker(
                                 std::pin::pin!(sleep(reconnect_backoff.next_delay()));
                             loop {
                                 tokio::select! {
-                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                    _ = &mut shutdown => return,
+                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
+                                    _ = &mut shutdown => break 'worker,
                                     _ = &mut retry_delay => break,
                                     command = commands.recv() => {
                                         match command {
@@ -1820,7 +1820,7 @@ async fn run_app_runtime_account_worker(
                                                 shared.app_performance_telemetry().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
                                                 drop(command);
                                             },
-                                            None => return,
+                                            None => break 'worker,
                                         }
                                     }
                                 }
@@ -1828,8 +1828,8 @@ async fn run_app_runtime_account_worker(
                             reconnect_wait.finish(TelemetryOutcome::Success);
                             let reopen = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReopen);
                             let reopened_result = tokio::select! {
-                                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                _ = &mut shutdown => return,
+                                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
+                                _ = &mut shutdown => break 'worker,
                                 result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
                             };
                             reopen.finish_app(&reopened_result);
@@ -1865,8 +1865,8 @@ async fn run_app_runtime_account_worker(
                                     // required.
                                     let telemetry = shared.app_performance_telemetry();
                                     let prepare_transport = tokio::select! {
-                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                        _ = &mut shutdown => return,
+                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
+                                        _ = &mut shutdown => break 'worker,
                                         result = reopened.prepare_transport_with_telemetry(Some(&telemetry)) => result,
                                     };
                                     if let Err(transport_err) = prepare_transport {
@@ -2222,6 +2222,9 @@ async fn run_app_runtime_account_worker(
                 phase.finish(TelemetryOutcome::Success);
             }
         }
+    }
+    if let Some(job) = comparison_maintenance {
+        job.network.abort_and_wait().await;
     }
 }
 
@@ -3369,7 +3372,8 @@ fn capture_group_read_snapshot(
 /// Serve safe snapshot reads while `work` exclusively borrows the live client.
 /// Mutations stay queued FIFO behind `work`; reads continue observing the
 /// snapshot until it completes. Worker-owned catch-up runs afterward because
-/// create/invite spawn it immediately after the caller-visible reply.
+/// create/invite spawn it immediately after the caller-visible reply. Keep
+/// later deferred commands behind that catch-up in their arrival order.
 async fn serve_snapshot_reads_until<Fut>(
     read_snapshot: Option<crate::client::GroupReadSnapshot>,
     work: Fut,
@@ -3383,6 +3387,7 @@ where
 {
     let mut deferred = VecDeque::new();
     let mut follow_up = VecDeque::new();
+    let mut catch_up_seen = false;
     let mut commands_open = true;
     let mut work = std::pin::pin!(work);
     let output = loop {
@@ -3453,11 +3458,13 @@ where
                 let _ = respond.send(Ok(snapshot.quarantined_groups()));
             }
             AccountWorkerCommand::CatchUp { .. } => {
+                catch_up_seen = true;
                 follow_up.push_back(command);
             }
             AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
                 let _ = respond.send(true);
             }
+            command if catch_up_seen => follow_up.push_back(command),
             command => deferred.push_back(command),
         }
     };
@@ -6266,6 +6273,91 @@ mod tests {
             pending.pop_front(),
             Some(AccountWorkerCommand::ConnectivityRestored { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_work_preserves_catch_up_barrier_across_pending_and_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let client = app.client("alice").await.unwrap();
+        let snapshot = client.group_read_snapshot().unwrap();
+        let (commands, mut receiver) = mpsc::channel(8);
+        let mut pending = VecDeque::new();
+        let (respond, mut before) = oneshot::channel();
+        pending.push_back(AccountWorkerCommand::ConnectivityRestored { respond });
+        let (respond, mut catch_up) = oneshot::channel();
+        pending.push_back(AccountWorkerCommand::CatchUp { respond });
+        let (respond, mut after) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
+            .unwrap();
+        let (respond, mut drain) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::Drain { respond })
+            .unwrap();
+        let (respond, read) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .unwrap();
+        let (release, work) = oneshot::channel::<()>();
+        let serve = serve_snapshot_reads_until(
+            Some(snapshot),
+            work,
+            &mut receiver,
+            &mut pending,
+            &app,
+            "alice",
+        );
+        let check = async {
+            assert!(
+                timeout(Duration::from_secs(1), read)
+                    .await
+                    .expect("snapshot read remains ready while work is held")
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(matches!(
+                before.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                catch_up.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                after.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                drain.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(serve, check);
+        result.unwrap();
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::ConnectivityRestored { .. })
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::CatchUp { .. })
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::ConnectivityRestored { .. })
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::Drain { .. })
+        ));
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
