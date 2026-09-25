@@ -76,7 +76,8 @@ impl Marmot {
     /// `about` keeps normalized LF line breaks, and every other known
     /// string stays single-line. Tab and other controls (NUL, ESC, BEL,
     /// DEL, C1) are removed. A cached bio flattened by an older build is
-    /// repaired when the same profile is fetched again.
+    /// repaired when the same profile is fetched again, except for a local
+    /// account's own bio, which stays until that account publishes again.
     /// Returns `None` when nothing is cached yet.
     pub fn user_profile(
         &self,

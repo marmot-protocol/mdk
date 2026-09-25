@@ -542,9 +542,9 @@ where
 /// Equal timestamps normally keep the cached row so a stale same-second relay
 /// copy cannot revert a local edit (mdk#206). Without this exception a bio
 /// flattened by an older build would never recover, because relays keep
-/// serving the same event. Every other field must already match, so the only
-/// same-second edit this can revert is one that removed nothing but line
-/// breaks from `about`.
+/// serving the same event. The fields alone cannot tell a flattened row from a
+/// same-second publish that removed only line breaks, so callers apply this
+/// only to accounts that are not local to this device.
 pub(crate) fn restores_flattened_about(
     cached: &UserProfileMetadata,
     fetched: &UserProfileMetadata,

@@ -10902,6 +10902,51 @@ fn refetched_kind0_repairs_bio_flattened_by_older_filter() {
 }
 
 #[test]
+fn same_second_refetch_keeps_local_publish_that_removed_bio_line_breaks() {
+    // A local publish that only removes bio line breaks matches the
+    // flattened-bio repair on content alone. A lagging relay's previous
+    // same-second event must not revert it (mdk#206).
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let created_at = 1_700_002_038;
+    app.remember_directory_profile(
+        &alice.account_id_hex,
+        &UserProfileMetadata {
+            name: Some("alice".to_owned()),
+            about: Some("onetwo".to_owned()),
+            created_at,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .unwrap();
+
+    let mut previous = NostrTransportEvent::new_unsigned(
+        alice.account_id_hex.clone(),
+        KIND_NOSTR_METADATA,
+        Vec::new(),
+        serde_json::json!({ "name": "alice", "about": "one\ntwo" }).to_string(),
+    );
+    previous.created_at = created_at;
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+        event: previous,
+    })
+    .unwrap();
+
+    let entry = app
+        .directory_entry_for_account_id(&alice.account_id_hex)
+        .unwrap()
+        .unwrap();
+    assert!(entry.local_account.is_some());
+    assert_eq!(
+        entry.profile.and_then(|profile| profile.about).as_deref(),
+        Some("onetwo")
+    );
+}
+
+#[test]
 fn roster_labels_keep_profiles() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

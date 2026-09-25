@@ -1490,10 +1490,13 @@ impl MarmotApp {
         // either the user's own echoed publish (identical content) or a stale
         // copy that must not win. The exception is a refetch that only
         // restores `about` line breaks an older build flattened (mdk#1973).
+        // It is limited to accounts not held on this device: only a local
+        // account can have a just-published row, and a publish that removed
+        // bio line breaks looks exactly like a flattened legacy row.
         if let Some(entry) = self.directory_entry_for_account_id(account_id_hex)?
             && entry.profile.as_ref().is_some_and(|cached| {
                 cached.created_at >= profile.created_at
-                    && !restores_flattened_about(cached, profile)
+                    && (entry.local_account.is_some() || !restores_flattened_about(cached, profile))
             })
         {
             return Ok(());
