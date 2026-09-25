@@ -334,6 +334,21 @@ pub(crate) struct BoundedResultWitness {
     pub(crate) matching_items: usize,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct OrdinaryDeliveryDropTarget {
+    pub(crate) account_label: String,
+    pub(crate) event_id: [u8; 32],
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct OrdinaryDeliveryDropWitness {
+    pub(crate) account_label: String,
+    pub(crate) event_id: [u8; 32],
+    pub(crate) subscription_id: String,
+}
+
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     /// Off until the production SDK acquisition backend passes its two-relay
@@ -353,6 +368,13 @@ pub struct RuntimeSharedServices {
     pub(crate) bounded_pause_before_admission: Arc<AtomicBool>,
     #[cfg(test)]
     pub(crate) bounded_pause_after_first_admission: Arc<AtomicBool>,
+    /// One exact ordinary SDK delivery may be omitted before worker ingest.
+    #[cfg(test)]
+    pub(crate) ordinary_drop_once: Arc<StdMutex<Option<OrdinaryDeliveryDropTarget>>>,
+    #[cfg(test)]
+    pub(crate) ordinary_drop_witness: Arc<StdMutex<Option<OrdinaryDeliveryDropWitness>>>,
+    #[cfg(test)]
+    pub(crate) ordinary_delivery_dropped: Arc<Notify>,
     local_submission_wakeups: watch::Sender<()>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
@@ -460,6 +482,12 @@ impl Default for RuntimeSharedServices {
             bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            ordinary_drop_once: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            ordinary_drop_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            ordinary_delivery_dropped: Arc::new(Notify::new()),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             local_submission_wakeups: watch::channel(()).0,
             attachment_updates: watch::channel(()).0,
@@ -522,6 +550,12 @@ impl RuntimeSharedServices {
             bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            ordinary_drop_once: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            ordinary_drop_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            ordinary_delivery_dropped: Arc::new(Notify::new()),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
             local_submission_wakeups: watch::channel(()).0,

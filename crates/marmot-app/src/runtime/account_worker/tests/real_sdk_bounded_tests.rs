@@ -21,6 +21,8 @@ mod admission_interruption_tests;
 mod interruption_redelivery_tests;
 #[path = "recovery_lifecycle_generation_tests.rs"]
 mod recovery_lifecycle_generation_tests;
+#[path = "recovery_ordinary_seen_redelivery_tests.rs"]
+mod recovery_ordinary_seen_redelivery_tests;
 #[path = "recovery_session_generation_tests.rs"]
 mod recovery_session_generation_tests;
 
