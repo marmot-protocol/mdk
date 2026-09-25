@@ -27,6 +27,7 @@ use marmot_app::{
     SignOutOptions, TimelineMessageQuery, TimelinePagination, UserDirectorySearch,
     UserProfileMetadata, tag_value,
 };
+use marmot_forensics::v5::{EndpointRef, Record as V5Record};
 use nostr_relay_builder::prelude::{
     BoxedFuture, Kind as OldKind, PolicyResult, QueryPolicy, WritePolicy,
 };
@@ -10567,7 +10568,10 @@ async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
             std::fs::read_to_string(&file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    V5Record::from_json(line.as_bytes()).expect("strict v5 audit row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -10578,34 +10582,33 @@ async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
     // relay the SDK-backed plane must have marked it accepted.
     let rebuild = events
         .iter()
-        .find(|event| event["kind"]["type"] == "subscription_rebuild")
+        .find(|event| event["event"]["type"] == "subscription_rebuild")
         .expect("a subscription_rebuild row is emitted per rebuild");
     assert!(
-        rebuild["kind"]["lookback_secs"].is_u64(),
+        rebuild["event"]["lookback_secs"].is_u64(),
         "rebuild records the lookback: {rebuild}"
     );
-    let relay_results = rebuild["kind"]["relay_results"]
+    let relay_results = rebuild["event"]["relay_results"]
         .as_array()
         .expect("relay_results is an array");
+    let expected_endpoint = EndpointRef::from_normalized_url(&url).unwrap();
     assert!(
         relay_results.iter().any(|entry| {
-            entry["relay_url"]
-                .as_str()
-                .is_some_and(|relay_url| relay_url.contains("127.0.0.1"))
-                && entry["accepted"] == true
+            entry["endpoint_ref"] == expected_endpoint.as_str() && entry["accepted"] == true
         }),
         "the mock relay registered the subscription: {rebuild}"
     );
+    assert!(!rebuild.to_string().contains(&url), "raw relay URL leaked");
 
     // sync_drain: exact wire tag and scalar drain accounting present. A fresh
     // account drains no inbound 445s, so `deliveries` is 0 and the cursor
     // fields stay absent (no delivery advanced the cursor) — both valid.
     let drain = events
         .iter()
-        .find(|event| event["kind"]["type"] == "sync_drain")
+        .find(|event| event["event"]["type"] == "sync_drain")
         .expect("a sync_drain row is emitted at the drain exit");
-    assert!(drain["kind"]["duration_ms"].is_u64(), "{drain}");
-    assert!(drain["kind"]["deliveries"].is_u64(), "{drain}");
+    assert!(drain["event"]["duration_ms"].is_u64(), "{drain}");
+    assert!(drain["event"]["deliveries"].is_u64(), "{drain}");
 
     runtime.shutdown().await;
 }
