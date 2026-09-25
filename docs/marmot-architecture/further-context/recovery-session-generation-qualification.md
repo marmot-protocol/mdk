@@ -15,14 +15,15 @@ remains off.
 ## Boundary and fixture
 
 `real_sdk_returned_result_is_dropped_on_account_restart_before_new_session_recovery`
-uses the real SDK, two conforming local relays, the managed account worker and
-the account SQLCipher store. A signed kind-445 event for an existing group is
-saved once into each relay's database after the initial, empty comparison has
-settled. This models a late relay-store import. The query policy accepts every
-query and records peer socket addresses. It neither hides the target from NIP-77
-nor emits a synthetic comparison result. The event timestamp is captured once,
-inside the 30-day retained-inventory window and strictly before the ordinary
-live subscription cutoff. An exact known-ID request has no `since` bound.
+uses one account, the real SDK, two conforming local relays, the managed
+account worker and the account SQLCipher store. A signed kind-445 event for
+Alice's group is saved once into each relay's database after the initial,
+empty comparison has settled. This models a late relay-store import. The query
+policy accepts every query and records peer socket addresses. It neither hides
+the target from NIP-77 nor emits a synthetic comparison result. The event
+timestamp is captured once, inside the 30-day retained-inventory window and
+strictly before the ordinary live subscription cutoff. An exact known-ID
+request has no `since` bound.
 
 The event has a valid signed Nostr wrapper and a deliberately nondecryptable MLS
 payload. Its useful durable outcome is a raw `PeelDeferred` row, not plaintext,
@@ -42,11 +43,11 @@ boundary removes the old job before its admission or completion methods run.
 The source path from `restart_account` awaits the worker reaper; that reaper
 calls `MarmotRelayPlane::deactivate_account_context`, which removes and shuts
 down the SDK's account client. Reconciliation registers a new account client.
-Each relay observes a replacement group-query peer socket distinct from the
-old exact-request peer. The adapter currently reports
-`NostrAcquisitionEndpoint.session_generation = None`, so the fixture records
-physical connection replacement and source-owned client replacement rather
-than claiming an SDK generation token.
+With Alice as the only account, each relay observes a replacement h-tag group
+query from a peer socket distinct from the old exact-request peer. The adapter
+currently reports `NostrAcquisitionEndpoint.session_generation = None`, so the
+fixture records physical connection replacement and source-owned client
+replacement rather than claiming an SDK generation token.
 
 The replacement worker's finite NIP-77 comparison covers the imported event's
 timestamp. While bounded admission is still paused, that replacement session

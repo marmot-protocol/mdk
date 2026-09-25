@@ -4,7 +4,7 @@
 
 use super::*;
 use base64::Engine as _;
-use cgka_traits::{MessageId, storage::MessageStorage};
+use cgka_traits::{MessageId, StorageError, storage::MessageStorage};
 use nostr_relay_builder::prelude::{
     Event as RelayEvent, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase,
 };
@@ -80,7 +80,6 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let alice = home.create_account("alice").unwrap();
-    let bob = home.create_account("bob").unwrap();
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         bootstrap_url.clone(),
@@ -91,14 +90,12 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
     shared
         .bounded_group_recovery_enabled
         .store(true, Ordering::SeqCst);
-    crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &bootstrap_url);
     runtime.reconcile_accounts().await.unwrap();
-    runtime.publish_key_package("bob").await.unwrap();
     let group = runtime
         .create_group_with_options(
             &alice.label,
             "session replacement",
-            std::slice::from_ref(&bob.account_id_hex),
+            &[],
             AppCreateGroupOptions {
                 relays: Some(vec![left_url.clone(), right_url.clone()]),
                 ..Default::default()
@@ -106,21 +103,6 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
         )
         .await
         .unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            runtime.catch_up_accounts().await.unwrap();
-            if app
-                .group(&bob.label, &hex::encode(&group))
-                .unwrap()
-                .is_some()
-            {
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("Bob joins before the historical event");
 
     let route: [u8; 32] = hex::decode(
         app.group(&alice.label, &hex::encode(&group))
@@ -310,6 +292,10 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
             .retained_recovery_event(&route, &event_id, None, created_at)
             .unwrap()
     );
+    assert!(matches!(
+        storage.get_message(&MessageId::new(event_id)),
+        Err(StorageError::NotFound)
+    ));
     assert!(
         !storage
             .has_ingress_dedup_marker(&MessageId::new(event_id))
@@ -342,6 +328,10 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
             .unwrap(),
         "teardown cannot admit the old result"
     );
+    assert!(matches!(
+        storage.get_message(&MessageId::new(event_id)),
+        Err(StorageError::NotFound)
+    ));
     assert!(
         storage
             .pending_recovery_demands()
@@ -428,7 +418,7 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
             queries[group_queries_before_restart[index]..]
                 .iter()
                 .any(|peer| *peer != old_exact_peers[index]),
-            "replacement group comparison uses a new socket"
+            "replacement h-tag group query uses a new socket"
         );
     }
     assert!(
