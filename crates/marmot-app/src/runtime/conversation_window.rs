@@ -1083,7 +1083,6 @@ async fn run(
     // First published sequence showing the viewport the latest command moved to.
     // A move kept through a quiet failure takes effect when a retry publishes it.
     let mut viewport_sequence = current.revision.sequence;
-    let mut viewport_moved = false;
     let mut deferred_command = None;
     loop {
         let mut stopping = sources.stopping.clone();
@@ -1116,7 +1115,8 @@ async fn run(
                 continue;
             }
         };
-        let moves_viewport = next != position;
+        // `last_good_position` is the viewport `current` shows.
+        let moves_viewport = next != last_good_position;
         sources.drain(); // only the queued prefix; mutations during capture remain queued
         // Following the tail may use the send's coherent pre-publication capture.
         // capture_live sets the requested query first, invalidating any capture
@@ -1157,10 +1157,9 @@ async fn run(
                 reader.send_capture.set_query(&position);
                 last_good_position = position.clone();
                 current = replacement;
-                if changed && (viewport_moved || moves_viewport) {
+                if changed && moves_viewport {
                     viewport_sequence = current.revision.sequence;
                 }
-                viewport_moved = false;
                 if current.presentation.header.epoch.is_some()
                     && let Some(observation) = reader.authority_ready.take()
                 {
@@ -1213,7 +1212,6 @@ async fn run(
                     // disappear before retry. Report it, then resume the last
                     // successful viewport rather than killing the live stream.
                     position = last_good_position.clone();
-                    viewport_moved = false;
                     dirty = true;
                     failed = true;
                     retry_delayed = true;
@@ -1230,7 +1228,6 @@ async fn run(
                 if !query_error {
                     // Preserve accepted viewport commands through a quiet failure.
                     position = next;
-                    viewport_moved |= moves_viewport;
                     dirty = true;
                     // Quiet NotReady retries must not suppress a later real
                     // storage error that the receiver has not yet seen.

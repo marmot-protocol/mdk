@@ -557,6 +557,36 @@ async fn viewport_move_kept_through_a_transient_failure_supersedes_revisions_onc
 }
 
 #[tokio::test]
+async fn viewport_moves_undone_before_publication_do_not_supersede_revisions() {
+    let f = Fixture::new(20).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    let quoted = sub.snapshot.revision.clone();
+    f.mode.store(2, Ordering::SeqCst);
+    assert!(matches!(
+        handle.set_visible_anchor(&quoted, &id(17)).await,
+        Err(ConversationWindowError::App(_))
+    ));
+    assert!(matches!(
+        handle.return_to_latest(&quoted).await,
+        Err(ConversationWindowError::App(_))
+    ));
+    assert!(matches!(
+        sub.recv().await,
+        Err(ConversationWindowError::App(_))
+    ));
+    f.draft("saved after returning to the published viewport");
+    f.mode.store(0, Ordering::SeqCst);
+    next_with_draft(&mut sub, "saved after returning to the published viewport").await;
+    let paged = handle
+        .page(&quoted, ConversationPageDirection::Older, 5)
+        .await
+        .unwrap();
+    assert_eq!(ids(&paged), (10..20).map(id).collect::<Vec<_>>());
+    f.close().await;
+}
+
+#[tokio::test]
 async fn viewport_move_abandoned_after_its_target_expires_does_not_supersede_revisions() {
     let f = Fixture::new(20).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
