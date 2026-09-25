@@ -1658,6 +1658,13 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
+            #[cfg(test)]
+            if let Some(probe) = &mut self.audit_v5_probe {
+                probe.projected(
+                    event,
+                    marmot_forensics::v5::UpdateCause::RetainedEventReplay,
+                );
+            }
             routes_dirty |=
                 self.observe_event_projection_effects(event, &local_account_id_hex, &mut summary)?;
             let can_ack_application_event = if crosses_frontier {
@@ -2633,6 +2640,10 @@ impl AppClient {
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
+        #[cfg(test)]
+        if welcome && let Some(probe) = &mut client.audit_v5_probe {
+            probe.observe(&delivery.message);
+        }
         // Hold the same account policy lock through admission and projection, so a
         // block cannot commit between authenticating the inviter and creating state.
         let policy_lock = client.app.block_update_lock(&client.state.label).await;
@@ -4711,7 +4722,29 @@ impl AppClient {
             .runtime_telemetry
             .as_ref()
             .map(|t| t.observe(RuntimeOp::ProjectionCheckpoint));
+        #[cfg(test)]
+        let audit_updates = self
+            .audit_v5_probe
+            .as_ref()
+            .map(|probe| {
+                probe.pending_updates(&self.state.groups, &self.pending_group_projection_updates)
+            })
+            .unwrap_or_default();
+        // This fault exists only in unit-test binaries and occurs before any
+        // projection checkpoint write; the engine's join is already committed.
+        #[cfg(test)]
+        let audit_fail_before_commit = !audit_updates.is_empty()
+            && self
+                .audit_v5_probe
+                .as_mut()
+                .is_some_and(|probe| probe.reject_checkpoints);
         let result = (|| {
+            #[cfg(test)]
+            if audit_fail_before_commit {
+                return Err(AppError::BlockingTask(
+                    "injected v5 probe checkpoint failure".into(),
+                ));
+            }
             let seen_events = self.transport_receipts()?.pending_seen_events();
             let frontiers_to_clear = self
                 .pending_local_group_deletion_frontier_clears
@@ -4765,6 +4798,10 @@ impl AppClient {
         })();
         if let Some(observation) = observation {
             observation.finish_app(&result);
+        }
+        #[cfg(test)]
+        if let Some(probe) = &mut self.audit_v5_probe {
+            probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);
         }
         result
     }
@@ -5047,6 +5084,10 @@ impl AppClient {
                 updated_group.as_ref(),
                 &event_source,
             );
+            #[cfg(test)]
+            if let Some(probe) = &mut self.audit_v5_probe {
+                probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
+            }
             routes_dirty |=
                 self.observe_event_projection_effects(event, &local_account_id_hex, summary)?;
             if self.state.groups.len() != before {
