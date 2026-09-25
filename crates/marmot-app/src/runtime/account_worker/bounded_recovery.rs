@@ -32,6 +32,13 @@ static ACQUISITION_CREDITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_JOBS
 #[cfg(test)]
 static CREDIT_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
+/// Both owner-authorized history jobs reserve from the same process-wide
+/// capacity before spending a durable attempt, then retain it through worker
+/// admission and checkpoint.
+pub(super) fn try_acquire_recovery_credit() -> Option<SemaphorePermit<'static>> {
+    ACQUISITION_CREDITS.try_acquire().ok()
+}
+
 #[cfg(test)]
 pub(super) fn available_credits() -> usize {
     ACQUISITION_CREDITS.available_permits()
@@ -146,7 +153,7 @@ pub(super) fn prepare(
     }
     // Reserve process capacity before spending the owner's durable attempt.
     // No waiter or completed result can exist without a credit.
-    let Ok(credit) = ACQUISITION_CREDITS.try_acquire() else {
+    let Some(credit) = try_acquire_recovery_credit() else {
         #[cfg(test)]
         CREDIT_REFUSALS.fetch_add(1, Ordering::SeqCst);
         return Ok(None);
