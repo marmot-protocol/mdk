@@ -75,8 +75,8 @@ impl Marmot {
     /// `refresh_profile` / `refresh_directory` and are sanitized on ingest:
     /// `about` keeps normalized LF line breaks, and every other known
     /// string stays single-line. Tab and other controls (NUL, ESC, BEL,
-    /// DEL, C1) are removed. A cached bio flattened by an older build stays
-    /// until a newer event replaces it; an equal timestamp does not.
+    /// DEL, C1) are removed. A cached bio flattened by an older build is
+    /// repaired when the same profile is fetched again.
     /// Returns `None` when nothing is cached yet.
     pub fn user_profile(
         &self,

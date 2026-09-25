@@ -5,8 +5,8 @@
 ### Fixed
 
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
-  unsafe controls from every known profile string. Previously flattened cached bios stay
-  until a newer event replaces them. (#1973)
+  unsafe controls from every known profile string. A bio an older build cached without
+  its line breaks is repaired when the same event is fetched again. (#1973)
 
 - Judge epoch-backfill overflow retry backoff by the durable delay. A loaded runner
   can spend more than a second after that reservation is written, which previously

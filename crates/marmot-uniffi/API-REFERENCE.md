@@ -1140,7 +1140,7 @@ Parse plaintext message content into the same Markdown AST returned on message a
 pub fn user_profile( &self, account_id_hex: String, ) -> Result<Option<UserProfileMetadataFfi>, MarmotKitError>
 ```
 
-Full cached Nostr kind:0 profile for an account id (name, display name, about, picture, nip05, lud16), if the runtime has one projected. The local account's own profile is cached immediately after `publish_user_profile` from the submitted value, without reparsing it. Other accounts' profiles populate via `refresh_profile` / `refresh_directory` and are sanitized on ingest: `about` keeps normalized LF line breaks, and every other known string stays single-line. Tab and other controls (NUL, ESC, BEL, DEL, C1) are removed. A cached bio flattened by an older build stays until a newer event replaces it; an equal timestamp does not. Returns `None` when nothing is cached yet.
+Full cached Nostr kind:0 profile for an account id (name, display name, about, picture, nip05, lud16), if the runtime has one projected. The local account's own profile is cached immediately after `publish_user_profile` from the submitted value, without reparsing it. Other accounts' profiles populate via `refresh_profile` / `refresh_directory` and are sanitized on ingest: `about` keeps normalized LF line breaks, and every other known string stays single-line. Tab and other controls (NUL, ESC, BEL, DEL, C1) are removed. A cached bio flattened by an older build is repaired when the same profile is fetched again. Returns `None` when nothing is cached yet.
 
 [Source](src/commands/directory.rs#L81)
 

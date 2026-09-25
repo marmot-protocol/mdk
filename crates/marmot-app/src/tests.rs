@@ -10838,6 +10838,70 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
 }
 
 #[test]
+fn refetched_kind0_repairs_bio_flattened_by_older_filter() {
+    // mdk#1973: older builds dropped LF from `about`. Relays keep serving the
+    // same event, so the equal-timestamp guard alone would never repair it.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let author = format!("{:064x}", 1973);
+    let created_at = 1_700_001_973;
+    let mut flattened = test_directory_record(&author, "bob", created_at);
+    flattened.profile.as_mut().unwrap().about = Some("first linesecond line".to_owned());
+    app.save_directory_entry(&flattened).unwrap();
+
+    let ingest = |content: serde_json::Value| {
+        let mut event = NostrTransportEvent::new_unsigned(
+            author.clone(),
+            KIND_NOSTR_METADATA,
+            Vec::new(),
+            content.to_string(),
+        );
+        event.created_at = created_at;
+        app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+            event,
+        })
+        .unwrap();
+        app.directory_entry_for_account_id(&author)
+            .unwrap()
+            .unwrap()
+            .profile
+            .unwrap()
+    };
+
+    // A same-second copy that changes more than line breaks still loses.
+    let stale = ingest(serde_json::json!({
+        "name": "stale",
+        "about": "first line\nsecond line",
+    }));
+    assert_eq!(stale.name.as_deref(), Some("bob"));
+    assert_eq!(stale.about.as_deref(), Some("first linesecond line"));
+    let stale = ingest(serde_json::json!({
+        "name": "bob",
+        "about": "first line\nother line",
+    }));
+    assert_eq!(stale.about.as_deref(), Some("first linesecond line"));
+
+    // The same event refetched restores the line break.
+    let repaired = ingest(serde_json::json!({
+        "name": "bob",
+        "about": "first line\r\nsecond line",
+    }));
+    assert_eq!(repaired.name.as_deref(), Some("bob"));
+    assert_eq!(repaired.about.as_deref(), Some("first line\nsecond line"));
+    assert_eq!(repaired.created_at, created_at);
+
+    // Once repaired, the equal-timestamp guard keeps it.
+    let kept = ingest(serde_json::json!({
+        "name": "bob",
+        "about": "first linesecond line",
+    }));
+    assert_eq!(kept.about.as_deref(), Some("first line\nsecond line"));
+}
+
+#[test]
 fn roster_labels_keep_profiles() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
