@@ -44,10 +44,13 @@ use super::epoch_stall::BackfillDecision;
 use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
 use crate::config::CursorPersistence;
 
+mod comparison_job;
+pub(crate) use comparison_job::ComparisonNetworkJob;
+
 pub(crate) enum PendingRecoverySelection {
     NotPending,
     Deferred,
-    Grant(AttemptGrant),
+    Grant(Box<AttemptGrant>),
 }
 
 /// Account-wide startup budget for the timestamp-independent correctness pass.
@@ -3654,7 +3657,7 @@ impl AppClient {
             PendingRecoverySelection::NotPending => Ok(EpochBackfillRunOutcome::NotPending),
             PendingRecoverySelection::Deferred => Ok(EpochBackfillRunOutcome::Deferred),
             PendingRecoverySelection::Grant(grant) => {
-                self.execute_pending_epoch_backfill_grant(grant).await
+                self.execute_pending_epoch_backfill_grant(*grant).await
             }
         }
     }
@@ -3679,7 +3682,7 @@ impl AppClient {
         let Some(grant) = self.authorize_account_recovery(permit, seam)? else {
             return Ok(PendingRecoverySelection::Deferred);
         };
-        Ok(PendingRecoverySelection::Grant(grant))
+        Ok(PendingRecoverySelection::Grant(Box::new(grant)))
     }
 
     pub(crate) async fn execute_pending_epoch_backfill_grant(

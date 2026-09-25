@@ -33,8 +33,10 @@ use super::{
     wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
+use crate::client::recovery::AttemptGrant;
 use crate::client::{
-    CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
+    ComparisonNetworkJob, CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish,
+    PreparedGroupImageUploadStart,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -52,6 +54,18 @@ use crate::{
     SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
+use tokio::sync::SemaphorePermit;
+use transport_nostr_adapter::SubscriptionAttempt;
+
+struct ComparisonMaintenanceJob {
+    grant: AttemptGrant,
+    subscription_attempt: SubscriptionAttempt,
+    network: ComparisonNetworkJob,
+    _credit: SemaphorePermit<'static>,
+    observation: Option<crate::product_analytics::ProductObservation>,
+    backfill_armed: bool,
+    phase: Observation,
+}
 
 pub(crate) struct ManagedAccountWorker {
     pub(super) ready: bool,
@@ -1141,6 +1155,7 @@ async fn run_app_runtime_account_worker(
 
     let mut yield_to_convergence = false;
     let mut bounded_recovery: Option<bounded_recovery::Job> = None;
+    let mut comparison_maintenance: Option<ComparisonMaintenanceJob> = None;
     let mut yield_to_bounded_admission = false;
     let mut bounded_probe_at = TokioInstant::now();
     let mut bounded_prepare_error_reported = false;
@@ -1200,6 +1215,34 @@ async fn run_app_runtime_account_worker(
                 return;
             }
             _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
+            completed = async {
+                comparison_maintenance.as_mut().expect("comparison task exists").network.wait().await
+            }, if comparison_maintenance.is_some() => {
+                let job = comparison_maintenance.take().expect("completed comparison task exists");
+                let result = match completed {
+                    Ok(network) => client.finish_comparison_grant(
+                        job.grant, job.subscription_attempt, network,
+                    ).await,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "marmot_app::account_worker",
+                            method = "comparison_maintenance",
+                            error_kind = if error.is_panic() { "panic" } else { "cancelled" },
+                            "comparison task ended before worker admission"
+                        );
+                        Ok(EpochBackfillRunOutcome::Deferred)
+                    }
+                };
+                let _ = report_pending_epoch_backfill_result(
+                    result, job.backfill_armed, job.observation,
+                    &events, &account_id_hex, &account_label, &shared,
+                );
+                finish_periodic_maintenance_after_recovery(
+                    &mut client, &events, &account_id_hex, &account_label,
+                    &shared, &product_backlog, &mut scheduled_convergence,
+                ).await;
+                job.phase.finish(TelemetryOutcome::Success);
+            }
             completed = async {
                 bounded_recovery.as_mut().expect("bounded task exists").wait().await
             }, if bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
@@ -1933,6 +1976,9 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
+                if comparison_maintenance.is_some() {
+                    continue 'worker;
+                }
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
                 if client.backfill_content_reports().is_err() {
                     tracing::warn!(
@@ -2027,15 +2073,48 @@ async fn run_app_runtime_account_worker(
                     client.has_pending_runtime_group_subscription_refresh(),
                     &command_tx,
                 );
-                let _ = run_pending_epoch_backfill_reporting_arm(
-                    &mut client,
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    &shared,
-                    EpochBackfillExecutionSeam::Maintenance,
-                )
-                .await;
+                let backfill_armed = client.has_pending_epoch_backfill();
+                let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                    crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
+                )).flatten();
+                let mut credit = bounded_recovery::try_acquire_recovery_credit();
+                let selection = if credit.is_none() && client.comparison_only_waiting_for_credit().unwrap_or(false) {
+                    Ok(crate::client::PendingRecoverySelection::Deferred)
+                } else {
+                    client.select_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
+                };
+                let backfill_result = match selection {
+                    Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
+                        let grant = *grant;
+                        if credit.is_some() && client.comparison_offload_eligible(&grant).unwrap_or(false) {
+                            match client.activate_comparison_grant(&grant).await {
+                                Ok(subscription_attempt) => match ComparisonNetworkJob::start(&client, &grant) {
+                                    Ok(network) => {
+                                        comparison_maintenance = Some(ComparisonMaintenanceJob {
+                                            grant, subscription_attempt, network,
+                                            _credit: credit.take().expect("offloaded grant owns credit"),
+                                            observation, backfill_armed, phase,
+                                        });
+                                        continue 'worker;
+                                    }
+                                    Err(error) => Some(Err(error)),
+                                },
+                                Err(error) => Some(Err(error)),
+                            }
+                        } else {
+                            drop(credit.take());
+                            Some(client.execute_pending_epoch_backfill_grant(grant).await)
+                        }
+                    }
+                    Ok(crate::client::PendingRecoverySelection::Deferred) => Some(Ok(EpochBackfillRunOutcome::Deferred)),
+                    Ok(crate::client::PendingRecoverySelection::NotPending) => Some(Ok(EpochBackfillRunOutcome::NotPending)),
+                    Err(error) => Some(Err(error)),
+                };
+                drop(credit.take());
+                let _ = report_pending_epoch_backfill_result(
+                    backfill_result.expect("inline maintenance result"), backfill_armed,
+                    observation, &events, &account_id_hex, &account_label, &shared,
+                );
                 finish_periodic_maintenance_after_recovery(
                     &mut client,
                     &events,
@@ -5949,6 +6028,7 @@ mod tests {
     mod real_sdk_progress_fairness_tests;
     mod resource_bounds_tests;
     mod selective_history_tests;
+    mod worker_comparison_resume_tests;
     mod worker_recovery_resume_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod worker_wait_attribution_tests;

@@ -2337,6 +2337,17 @@ impl MarmotRelayPlaneAccountAdapter {
         &self.account_id
     }
 
+    /// Read only the live activation ordinal for worker-owned comparison
+    /// admission. An SDK connection generation is a different lifetime.
+    pub(crate) async fn account_subscription_attempt(&self) -> Option<SubscriptionAttempt> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .account_subscription_attempt(&self.account_id)
+            .await
+    }
+
     pub(crate) async fn reconcile_inbox_history(
         &self,
         endpoints: Vec<TransportEndpoint>,

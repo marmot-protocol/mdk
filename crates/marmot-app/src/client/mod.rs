@@ -81,7 +81,8 @@ use push::notification_trigger_for_intent;
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
-    ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
+    ComparisonNetworkJob, ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome,
+    EpochBackfillRunOutcome, PendingRecoverySelection,
 };
 
 #[cfg(test)]
