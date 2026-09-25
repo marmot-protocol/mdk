@@ -19353,12 +19353,15 @@ pub(crate) async fn undecryptable_probe_route(
     (app, client, route)
 }
 
-/// Every `ingest_outcome` audit row the engine recorded for `msg_id`.
+/// Every `ingest_outcome` audit row the engine recorded for raw `msg_id`.
 fn recorded_ingest_outcomes(app: &MarmotApp, msg_id: &str) -> Vec<String> {
+    let raw = hex::decode(msg_id).expect("transport message id is hex");
+    let message_ref = marmot_forensics::v5::EngineMessageRef::from_message_id(&raw)
+        .expect("transport message id has the engine reference shape");
     recorded_audit_rows(app)
         .iter()
         .filter(|row| row["kind"]["type"] == "ingest_outcome")
-        .filter(|row| row["kind"]["msg_id"].as_str() == Some(msg_id))
+        .filter(|row| row["kind"]["message_ref"].as_str() == Some(message_ref.as_str()))
         .filter_map(|row| row["kind"]["outcome_kind"].as_str().map(ToOwned::to_owned))
         .collect()
 }

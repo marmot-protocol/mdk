@@ -218,6 +218,196 @@ fn safe_failure_category(input: &str) -> String {
         | "insufficient_publish_acknowledgements"
         | "publish_acknowledgement_unknown"
         | "publish_attempt_failed_before_exposure"
+        // Closed categories emitted by the typed app, recovery, storage,
+        // and engine outcome producers. Keep them explicit: generic adapter
+        // and Display text must still fall through to `unclassified`.
+        | "account_catch_up"
+        | "account_clock_skew_blocked"
+        | "account_delivery_queue_overflow"
+        | "account_home_account_exists"
+        | "account_home_account_id_in_use"
+        | "account_home_account_id_mismatch"
+        | "account_home_empty_passphrase"
+        | "account_home_empty_secret_store_service"
+        | "account_home_encrypted_secret_export"
+        | "account_home_hex"
+        | "account_home_invalid_account_label"
+        | "account_home_invalid_public_key"
+        | "account_home_invalid_secret_key"
+        | "account_home_io"
+        | "account_home_json"
+        | "account_home_secret_not_found"
+        | "account_home_secret_store"
+        | "account_home_secret_store_not_initialized"
+        | "account_home_secret_store_unavailable"
+        | "account_home_setup_state_missing"
+        | "account_home_unknown_account"
+        | "account_home_unsupported_secret_backend"
+        | "account_key_package"
+        | "account_key_package_rotation_in_progress"
+        | "account_session_busy"
+        | "account_setup_key_package_recovery_available"
+        | "account_setup_recovery_required"
+        | "account_setup_reset_not_applicable"
+        | "account_setup_retry_required"
+        | "account_transport_routing"
+        | "account_unknown"
+        | "account_worker_busy"
+        | "account_worker_response_timed_out"
+        | "account_wrong_delivery"
+        | "agent_stream_finish_mismatch"
+        | "agent_stream_invalid_candidate"
+        | "agent_stream_missing_candidate"
+        | "agent_stream_missing_start"
+        | "agent_stream_publisher"
+        | "agent_stream_send_failed"
+        | "agent_stream_start_not_confirmed"
+        | "agent_stream_unsupported_route"
+        | "already_at_epoch"
+        | "attachment_account_signed_out"
+        | "attachment_mode_required"
+        | "audit_log_upload"
+        | "authorization_failed"
+        | "backfill_drain_eose_timeout"
+        | "backfill_drain_no_relay_eose"
+        | "backfill_drain_novel_progress_quantum_yield"
+        | "beyond_anchor"
+        | "beyond_app_retention"
+        | "beyond_rollback_horizon"
+        | "blob_store"
+        | "block_list_unavailable"
+        | "block_publication_uncertain"
+        | "blocking_task"
+        | "chat_presentation_not_ready"
+        | "created_group_projection_unavailable"
+        | "direct_conversation_index_not_ready"
+        | "duplicate"
+        | "external_signer_mismatch"
+        | "external_signer_rejected"
+        | "external_signer_unavailable"
+        | "follow_list_unavailable"
+        | "full_history_coverage_unproven"
+        | "full_history_repair_cancelled"
+        | "full_history_repair_deadline"
+        | "full_history_repair_unconfirmed"
+        | "group_create_includes_creator"
+        | "group_disbanding"
+        | "group_invite_not_pending"
+        | "group_removed"
+        | "hex"
+        | "identity_key_mismatch"
+        | "invalid_against_canonical_state"
+        | "invalid_agent_text_stream_policy"
+        | "invalid_audit_log_file"
+        | "invalid_cached_identity_page"
+        | "invalid_chat_pin"
+        | "invalid_directory_search"
+        | "invalid_encoding"
+        | "invalid_encrypted_media"
+        | "invalid_group_avatar_url"
+        | "invalid_group_membership_page"
+        | "invalid_group_profile"
+        | "invalid_key_package_event"
+        | "invalid_message_draft"
+        | "invalid_nostr_routing"
+        | "invalid_public_key"
+        | "invalid_push_gossip"
+        | "invalid_push_server"
+        | "invalid_push_token"
+        | "invalid_relay_telemetry_settings"
+        | "invalid_self_remove"
+        | "io"
+        | "json"
+        | "losing_branch"
+        | "media_attachment_rejected"
+        | "media_download_failed"
+        | "media_reference_epoch_unsettled"
+        | "media_reference_stale_epoch"
+        | "media_unfetchable"
+        | "media_upload_timed_out"
+        | "message_draft_revision_conflict"
+        | "missing_default_relays"
+        | "missing_directory_entry"
+        | "missing_key_package"
+        | "missing_member_inbox_route"
+        | "missing_relay_lists"
+        | "not_for_this_client"
+        | "notifications_disabled"
+        | "onboarding_action_unavailable"
+        | "onboarding_required"
+        | "own_echo"
+        | "pre_membership"
+        | "predates_local_copy"
+        | "publish"
+        | "quarantined"
+        | "reaction_not_found"
+        | "rejoin_confirmation_required"
+        | "relay_directory"
+        | "removed"
+        | "resource_refused_deferred_capacity"
+        | "resource_refused_residence_budget"
+        | "resource_refused_retry_budget"
+        | "runtime_busy"
+        | "runtime_stopping"
+        | "self_evicted"
+        | "sqlcipher_key_derivation"
+        | "sqlite"
+        | "storage_already_exists"
+        | "storage_backend"
+        | "storage_busy"
+        | "storage_capacity"
+        | "storage_closed"
+        | "storage_corruption"
+        | "storage_not_found"
+        | "storage_serialization"
+        | "storage_snapshot_missing"
+        | "storage_timeline_cursor_expired"
+        | "storage_unsupported_schema_version"
+        | "transport"
+        | "transport_closed"
+        | "transport_deferred"
+        | "unexpected_private_key"
+        | "unsafe_media_fetch"
+        | "unsupported_proposal"
+        | "unsupported_required_feature"
+        | "usage_diagnostics"
+        | "user_blocked"
+        | "admin_set_unreadable"
+        | "buffered_into_convergence"
+        | "leaver_identity_malformed"
+        | "leaver_still_admin"
+        | "proposal_not_self_remove"
+        | "self_remove_remaining_member"
+        | "sender_not_member"
+        | "we_are_target"
+        | "openmls_load_failed"
+        | "openmls_group_missing"
+        | "member_validation_failed"
+        | "group_record_load_failed"
+        | "pending_commit_recovery_failed"
+        | "founding_welcome_persisted"
+        | "founding_create"
+        | "superseded_by_replacement_welcome"
+        | "beyond_retained_anchor"
+        | "superseded_processed_commit"
+        | "publish_failed"
+        | "update_group_data_stage_failed"
+        | "create_group"
+        | "hydrate_unrecoverable_group"
+        | "hydrate_durable_group_evolution"
+        | "canonical_application_drain"
+        | "persist"
+        | "state_update"
+        | "terminal_group"
+        | "stale_epoch_no_snapshot"
+        | "auto_commit_stage_failed"
+        | "begin_pending"
+        | "hydrate_removed_group"
+        | "hydrate_seed_group"
+        | "hydrate_stable_group"
+        | "join_welcome_repair"
+        | "recipient_confirmed_rejoin"
+        | "join_welcome"
         | "unclassified" => input.to_owned(),
         "fanout adapter error" => "fanout_adapter_error".to_owned(),
         "fanout endpoint did not acknowledge" => "fanout_endpoint_did_not_acknowledge".to_owned(),
@@ -228,6 +418,24 @@ fn safe_failure_category(input: &str) -> String {
         "publish attempt failed before exposure" => {
             "publish_attempt_failed_before_exposure".to_owned()
         }
+        // Fixed Nostr adapter failure phrases. The SDK's free-form relay
+        // suffix is never preserved; only typed protocol-prefix outcomes and
+        // these locally authored phrases have an audit category.
+        "connect relay failed" => "connect_relay_failed".to_owned(),
+        "send event failed" => "send_event_failed".to_owned(),
+        "relay did not acknowledge event" => "relay_did_not_acknowledge_event".to_owned(),
+        "send event timed out" => "send_event_timed_out".to_owned(),
+        "configure publish relay failed" => "configure_publish_relay_failed".to_owned(),
+        "add publish relay failed" => "add_publish_relay_failed".to_owned(),
+        "publish acknowledgement unknown (error)" => "publish_acknowledgement_unknown".to_owned(),
+        "relay rejected event (duplicate)" => "relay_rejected_duplicate".to_owned(),
+        "relay rejected event (pow)" => "relay_rejected_pow".to_owned(),
+        "relay rejected event (blocked)" => "relay_rejected_blocked".to_owned(),
+        "relay rejected event (rate-limited)" => "relay_rejected_rate_limited".to_owned(),
+        "relay rejected event (invalid)" => "relay_rejected_invalid".to_owned(),
+        "relay rejected event (unsupported)" => "relay_rejected_unsupported".to_owned(),
+        "relay rejected event (auth-required)" => "relay_rejected_auth_required".to_owned(),
+        "relay rejected event (restricted)" => "relay_rejected_restricted".to_owned(),
         _ => "unclassified".to_owned(),
     }
 }
@@ -626,6 +834,69 @@ mod tests {
         assert!(protect(&mut future).is_err());
         let mut known = json!({"type":"send_entry", "intent_kind":"application"});
         assert!(protect(&mut known).is_ok());
+    }
+
+    #[test]
+    fn typed_recovery_and_engine_failure_categories_survive_protection() {
+        for category in [
+            "account_delivery_queue_overflow",
+            "backfill_drain_eose_timeout",
+            "backfill_drain_no_relay_eose",
+            "backfill_drain_novel_progress_quantum_yield",
+            "backfill_drain_no_progress_quantum_yield",
+            "full_history_repair_deadline",
+            "resource_refused_deferred_capacity",
+            "transport_deferred",
+            "authorization_failed",
+            "leaver_still_admin",
+            "storage_busy",
+        ] {
+            let mut event = json!({"type": "epoch_stall_backfill_failed", "error_kind": category});
+            protect(&mut event).unwrap();
+            assert_eq!(event["error_kind"], category);
+        }
+    }
+
+    #[test]
+    fn fixed_adapter_phrases_keep_categories_without_remote_suffixes() {
+        for (source, expected) in [
+            ("connect relay failed", "connect_relay_failed"),
+            ("send event failed", "send_event_failed"),
+            (
+                "relay did not acknowledge event",
+                "relay_did_not_acknowledge_event",
+            ),
+            ("send event timed out", "send_event_timed_out"),
+            (
+                "configure publish relay failed",
+                "configure_publish_relay_failed",
+            ),
+            ("add publish relay failed", "add_publish_relay_failed"),
+            (
+                "publish acknowledgement unknown (error)",
+                "publish_acknowledgement_unknown",
+            ),
+            ("relay rejected event (blocked)", "relay_rejected_blocked"),
+            (
+                "relay rejected event (rate-limited)",
+                "relay_rejected_rate_limited",
+            ),
+            (
+                "relay rejected event (auth-required)",
+                "relay_rejected_auth_required",
+            ),
+        ] {
+            let mut event = json!({
+                "type": "publish_outcome",
+                "failed_relays": [{"relay_url": "wss://relay.example", "reason": source}]
+            });
+            protect(&mut event).unwrap();
+            assert_eq!(event["failed_relays"][0]["reason"], expected);
+        }
+        let mut arbitrary =
+            json!({"type": "publish_failure", "reason": "relay rejected event (Secret42)"});
+        protect(&mut arbitrary).unwrap();
+        assert_eq!(arbitrary["reason"], "unclassified");
     }
 
     #[test]
