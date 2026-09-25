@@ -12,12 +12,13 @@ use crate::Marmot;
 use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
     AppGroupRecordFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandRequestFfi,
-    GroupConversationSnapshotFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
-    GroupMaintenanceStatusFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
-    GroupMutationResultFfi, GroupRosterFfi, KeyPackageMaintenanceStatusFfi,
-    MaintenanceRunSummaryFfi, MemberRefFfi, PeriodicMaintenancePolicyFfi, SendSummaryFfi,
-    group_conversation_snapshot_ffi, group_details_from_conversation_snapshot_ffi,
-    group_id_from_hex, group_management_state_ffi, group_roster_ffi, normalize_member_ref_ffi,
+    GroupAppComponentFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
+    GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi, GroupManagementStateFfi,
+    GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
+    KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
+    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_conversation_snapshot_ffi,
+    group_details_from_conversation_snapshot_ffi, group_id_from_hex, group_management_state_ffi,
+    group_roster_ffi, normalize_member_ref_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -856,6 +857,44 @@ impl Marmot {
             .await?)
     }
 
+    /// Read local committed application-owned state; None means absent.
+    /// Refresh on group events. Ids below the application range
+    /// (`APP_OWNED_APP_COMPONENT_ID_START`, 0xf000) are protocol space and
+    /// are rejected.
+    pub async fn group_app_component(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        component_id: u16,
+    ) -> Result<Option<GroupAppComponentFfi>, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .group_app_component(&account_ref, &group_id, component_id)
+            .await?
+            .map(|data| GroupAppComponentFfi { component_id, data }))
+    }
+
+    /// Admin-only replacement of optional application-owned group state.
+    /// Ids below the application range (0xf000), required components and data
+    /// over `APP_COMPONENT_DATA_MAX_LEN` are rejected. Empty bytes do not
+    /// remove the component. State survives message expiry and is included in
+    /// Welcomes, so it is re-encoded into every later commit; keep it small.
+    pub async fn update_app_component(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        component_id: u16,
+        data: Vec<u8>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .update_app_component(&account_ref, &group_id, component_id, data)
+            .await?
+            .into())
+    }
+
     /// Set the per-group disappearing-message retention, wrapping the engine's
     /// `update_message_retention`. `disappearing_message_secs` of `0` disables
     /// expiry; any positive value is the retention window in seconds. Thin
@@ -1395,6 +1434,70 @@ mod tests {
     use nostr_relay_builder::MockRelay;
 
     use super::*;
+
+    #[tokio::test]
+    async fn app_component_ffi_roundtrip() {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            root.path(),
+            url.clone(),
+            marmot_app::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        );
+        let kit = Marmot {
+            runtime: app.runtime(),
+            app,
+        };
+        let endpoint = TransportEndpoint(url);
+        let account = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .unwrap()
+            .account
+            .account_id_hex;
+        let group = kit
+            .create_group(account.clone(), "components".into(), vec![], None)
+            .await
+            .unwrap();
+        assert!(
+            kit.group_app_component(account.clone(), group.clone(), 0xf301)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for data in [vec![0, 1, 255], vec![]] {
+            kit.update_app_component(account.clone(), group.clone(), 0xf301, data.clone())
+                .await
+                .unwrap();
+            let value = kit
+                .group_app_component(account.clone(), group.clone(), 0xf301)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(value.component_id, 0xf301);
+            assert_eq!(value.data, data);
+        }
+        let invalid = kit
+            .update_app_component(account.clone(), group.clone(), 0x8003, vec![])
+            .await;
+        assert!(matches!(
+            invalid,
+            Err(MarmotKitError::InvalidAppComponent { .. })
+        ));
+        let malformed = kit
+            .group_app_component(account, "not hex".into(), 0xf301)
+            .await;
+        assert!(matches!(malformed, Err(MarmotKitError::InvalidHex { .. })));
+        kit.runtime.shutdown_and_close().await.unwrap();
+    }
 
     #[test]
     fn group_conversation_snapshot_round_trips_shape_and_errors() {

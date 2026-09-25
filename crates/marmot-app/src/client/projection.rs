@@ -1142,6 +1142,7 @@ fn build_group_system_projection(
 
 fn read_marker_error_code(error: &AppError) -> &'static str {
     match error {
+        AppError::InvalidAppComponent(_) => "read_marker_failed:invalid_app_component",
         AppError::ProductAnalytics(_) => "read_marker_failed:usage_diagnostics",
         AppError::Account(_) => "read_marker_failed:account",
         AppError::AccountHome(_) => "read_marker_failed:account_home",

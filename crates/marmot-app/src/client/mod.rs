@@ -735,6 +735,32 @@ fn record_app_performance(
     }
 }
 
+/// Admit only ids in the application range, and only payloads small enough
+/// to ride in every later commit and Welcome.
+///
+/// The range test is deliberately not "any private-use id the registry has
+/// not taken yet": the registry allocates upward from 0x8001, so such an id
+/// can be assigned later, which would both break the app's own writes and
+/// start applying protocol format validation to bytes already committed in
+/// live groups.
+fn validate_app_component(component_id: u16, data: &[u8]) -> Result<(), AppError> {
+    use cgka_traits::app_components::{
+        APP_COMPONENT_DATA_MAX_LEN, APP_OWNED_APP_COMPONENT_ID_START,
+    };
+    if component_id < APP_OWNED_APP_COMPONENT_ID_START {
+        return Err(AppError::InvalidAppComponent(format!(
+            "component id {component_id:#06x} is protocol space; applications allocate at or above {APP_OWNED_APP_COMPONENT_ID_START:#06x}"
+        )));
+    }
+    if data.len() > APP_COMPONENT_DATA_MAX_LEN {
+        return Err(AppError::InvalidAppComponent(format!(
+            "component data is {} bytes, over the {APP_COMPONENT_DATA_MAX_LEN}-byte maximum",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
 impl AppClient {
     /// Persist the exact first KeyPackage and signed publication artifact
     /// without activating transport or contacting a relay.
@@ -3409,6 +3435,69 @@ impl AppClient {
             &effects.events,
         )
         .await;
+        Ok(send_summary_from_effects(&effects))
+    }
+
+    /// Read opaque application-owned group state. Absent and empty differ.
+    pub fn group_app_component(
+        &self,
+        group_id: &GroupId,
+        component_id: u16,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        validate_app_component(component_id, &[])?;
+        self.ensure_group(group_id)?;
+        Ok(self.runtime.app_component(group_id, component_id)?)
+    }
+
+    /// Replace optional application-owned state through an admin MLS commit.
+    pub async fn update_app_component(
+        &mut self,
+        group_id: &GroupId,
+        component_id: u16,
+        data: Vec<u8>,
+    ) -> Result<SendSummary, AppError> {
+        validate_app_component(component_id, &data)?;
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        // `required_capabilities` is read out of the MLS GroupContext, not
+        // from local config, so any admin in the group can mark an
+        // application component required — including a peer on another
+        // implementation. No MDK binding produces that state, which is why
+        // the sync above matters: the requirement can arrive from the network
+        // between two local calls.
+        if self
+            .runtime
+            .group_record(group_id)?
+            .required_capabilities
+            .app_components
+            .contains(component_id)
+        {
+            return Err(AppError::InvalidAppComponent(
+                "component is required by the group".into(),
+            ));
+        }
+        let audit_context = Self::local_human_action_context(
+            "update_app_component",
+            vec!["app_component"],
+            vec![component_id],
+            None,
+        );
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![AppComponentData { component_id, data }],
+                },
+                audit_context.clone(),
+            )
+            .await?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -6634,6 +6723,54 @@ mod post_canonical_create_tests {
         });
 
         assert_eq!(collect_bounded_ordered(work, 2).await, Err("first"));
+    }
+}
+
+#[cfg(test)]
+mod app_component_gate_tests {
+    use super::validate_app_component;
+    use crate::AppError;
+    use cgka_traits::app_components::{
+        APP_COMPONENT_DATA_MAX_LEN, APP_OWNED_APP_COMPONENT_ID_START,
+        MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID, PROTOCOL_OWNED_APP_COMPONENT_IDS,
+    };
+
+    fn rejected(component_id: u16, data: &[u8]) -> bool {
+        matches!(
+            validate_app_component(component_id, data),
+            Err(AppError::InvalidAppComponent(_))
+        )
+    }
+
+    #[test]
+    fn only_the_application_range_is_writable() {
+        for id in PROTOCOL_OWNED_APP_COMPONENT_IDS
+            .iter()
+            .copied()
+            .chain([0, 1, 2, 0x7fff, 0x8000])
+        {
+            assert!(rejected(id, &[]), "{id:#06x} must be refused");
+        }
+        for id in [APP_OWNED_APP_COMPONENT_ID_START, 0xf301, 0xffff] {
+            assert!(validate_app_component(id, &[1, 2, 3]).is_ok());
+        }
+    }
+
+    #[test]
+    fn registry_draft_and_unassigned_protocol_ids_are_refused() {
+        // 0x800a is assigned to marmot.authorization.multi-device-join.v1 and
+        // 0x800d is the registry's next id. Both were writable while the gate
+        // admitted "private-use minus today's protocol list".
+        assert!(rejected(MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID, &[]));
+        assert!(rejected(0x800a, &[]));
+        assert!(rejected(0x800d, &[]));
+    }
+
+    #[test]
+    fn payload_length_is_bounded() {
+        let id = APP_OWNED_APP_COMPONENT_ID_START;
+        assert!(validate_app_component(id, &vec![0u8; APP_COMPONENT_DATA_MAX_LEN]).is_ok());
+        assert!(rejected(id, &vec![0u8; APP_COMPONENT_DATA_MAX_LEN + 1]));
     }
 }
 

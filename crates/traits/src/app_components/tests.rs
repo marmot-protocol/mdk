@@ -893,3 +893,27 @@ fn group_avatar_hint_length_is_bounded() {
     };
     assert!(encode_group_avatar_url_v1(&avatar).is_err());
 }
+
+#[test]
+fn protocol_component_ids_stay_below_the_application_range() {
+    // The app-facing write gate admits ids purely by this boundary, so the
+    // boundary is only sound while the registry stays underneath it. A new
+    // protocol component at or above 0xf000 would silently become writable
+    // by applications and collide with whatever already claimed that id.
+    for id in super::PROTOCOL_OWNED_APP_COMPONENT_IDS {
+        assert!(
+            *id < super::APP_OWNED_APP_COMPONENT_ID_START,
+            "protocol component {id:#06x} reaches into the application range"
+        );
+    }
+}
+
+#[test]
+fn multi_device_join_authorization_is_protocol_owned() {
+    // Registry id 0x800a is draft and AppEphemeral-only. It must still be
+    // refused to applications; being unassigned in MDK once made it writable.
+    assert!(
+        super::PROTOCOL_OWNED_APP_COMPONENT_IDS
+            .contains(&super::MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID)
+    );
+}

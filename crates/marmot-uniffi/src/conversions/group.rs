@@ -18,6 +18,13 @@ use super::common::SelfMembershipFfi;
 use super::media::EncryptedMediaVersionFfi;
 use crate::errors::MarmotKitError;
 
+/// Opaque application-owned state. Empty data is present state.
+#[derive(Clone, uniffi::Record)]
+pub struct GroupAppComponentFfi {
+    pub component_id: u16,
+    pub data: Vec<u8>,
+}
+
 /// Canonical create result carrying the exact durable chat-list projection.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct CreatedGroupFfi {

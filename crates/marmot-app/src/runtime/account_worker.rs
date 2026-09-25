@@ -345,6 +345,17 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<Vec<u8>, AppError>>,
     },
+    GroupAppComponent {
+        group_id: GroupId,
+        component_id: u16,
+        respond: oneshot::Sender<Result<Option<Vec<u8>>, AppError>>,
+    },
+    UpdateAppComponent {
+        group_id: GroupId,
+        component_id: u16,
+        data: Vec<u8>,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     UpdateMessageRetention {
         group_id: GroupId,
         disappearing_message_secs: u64,
@@ -4627,6 +4638,47 @@ fn account_worker_command_future<'a>(
                 true
             })
         }
+        AccountWorkerCommand::GroupAppComponent {
+            group_id,
+            component_id,
+            respond,
+        } => Box::pin(async move {
+            let result = (|| {
+                client
+                    .runtime
+                    .session_mut()
+                    .ensure_group_hydrated(&group_id)?;
+                client.group_app_component(&group_id, component_id)
+            })();
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::UpdateAppComponent {
+            group_id,
+            component_id,
+            data,
+            respond,
+        } => Box::pin(async move {
+            let result = client
+                .update_app_component(&group_id, component_id, data)
+                .await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::UpdateMessageRetention {
             group_id,
             disappearing_message_secs,

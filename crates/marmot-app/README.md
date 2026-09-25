@@ -187,6 +187,49 @@ Encrypted group images differ: no endpoint is stored in group state, so upload a
 build's primary endpoint. Clients compiled with different defaults therefore look for group images in different
 places; re-setting the group image on a current build republishes it to the current primary endpoint.
 
+## Application-owned group state
+
+`MarmotAppRuntime::group_app_component` reads opaque application-owned
+component bytes from local MLS state; `update_app_component` replaces one
+optional component through an admin-authorized MLS commit. The same methods are
+exported by UniFFI and C. Updates to required components are rejected; use the
+existing typed APIs for protocol settings.
+
+Applications allocate their own component ids at or above
+`APP_OWNED_APP_COMPONENT_ID_START` (`0xf000`) and version their own payloads.
+Ids below that boundary are refused. The boundary exists because the protocol
+registry allocates upward from `0x8001` and is still growing: an application
+that picked the next unassigned private-use id would have that id assigned out
+from under it by a later registry entry, which both breaks its own writes and
+starts applying protocol format validation to bytes already committed in live
+groups. Nothing coordinates ids between applications, so treat the range as
+first-come and version the payload.
+
+Payloads are capped at `APP_COMPONENT_DATA_MAX_LEN` (4096 bytes). Before staging
+an application update, MDK limits the resulting application-owned state to
+32 entries and 8192 encoded bytes, including each entry's id and TLS length
+prefix. Replacements count once; empty values still occupy a slot. These are
+local authoring limits; unknown optional state received from peers stays opaque. Component
+state is re-encoded into the GroupContext of every later commit and into the
+GroupInfo of every Welcome, so an oversized value inflates every commit and can
+push a Welcome past a relay's event-size limit — after the commit is already
+staged. This is a settings channel, not a blob store; put bulk data behind a
+reference.
+
+An absent component returns `None`; a present empty payload returns
+`Some(Vec::new())`. Empty payloads do not remove a component. The state survives
+message expiry and reaches newly invited members in their Welcome, without
+sharing earlier application-message history. Unsupported clients preserve
+optional component bytes without interpreting them.
+
+Refresh on runtime group events (including `EpochChanged` and convergence)
+and after local updates. Reads are serialized through the account worker and
+may wait behind an in-flight mutation. Updates use existing publication and
+convergence semantics; hosts must handle publication uncertainty and
+`GroupChangeSuperseded` rather than assuming a successful local change wins
+every later concurrent commit. This API does not add automatic retries of an
+application's desired value.
+
 ## Run the tests
 
 ```sh
