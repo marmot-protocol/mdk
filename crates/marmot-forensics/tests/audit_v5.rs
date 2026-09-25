@@ -51,6 +51,51 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
 }
 
 #[test]
+fn numeric_basis_tags_are_rejected_by_rust_and_schema() {
+    let schema = validator();
+    let mut basis_kinds = std::collections::BTreeSet::new();
+    for f in fixtures() {
+        let Some(kind) = f["record"].pointer("/event/basis/kind") else {
+            continue;
+        };
+        let kind = kind
+            .as_str()
+            .unwrap_or_else(|| panic!("{} has a non-string basis fixture", f["name"]));
+        basis_kinds.insert(kind.to_owned());
+        for index in 0..=2 {
+            let mut body = f["record"].clone();
+            *body.pointer_mut("/event/basis/kind").unwrap() = json!(index);
+            assert!(
+                !schema.is_valid(&body),
+                "schema accepted numeric basis tag {index} in {}",
+                f["name"]
+            );
+            let error = decode(&body).expect_err("Rust accepted numeric basis tag");
+            assert_eq!(error.to_string(), "invalid v5 record shape or scalar");
+        }
+    }
+    assert_eq!(
+        basis_kinds,
+        ["founding", "commit", "unavailable"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    );
+
+    for (name, path, index) in [
+        ("prepared_founding", "/event/type", 0),
+        ("prepared_founding", "/event/mode", 0),
+        ("selection_failed", "/event/failure_stage", 0),
+        ("prepared_founding", "/producer/build_profile", 1),
+    ] {
+        let mut body = fixture(name);
+        *body.pointer_mut(path).unwrap() = json!(index);
+        assert!(!schema.is_valid(&body), "schema accepted {name} {path}");
+        assert!(decode(&body).is_err(), "Rust accepted {name} {path}");
+    }
+}
+
+#[test]
 fn every_object_field_is_required_and_unknown_fields_are_rejected() {
     fn mutations(value: &Value, root: &Value, path: &str, out: &mut Vec<(String, Value)>) {
         match value {

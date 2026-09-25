@@ -53,6 +53,14 @@ impl Record {
             return Err(ContractError::rule("invalid body framing or size"));
         }
         let value = strict_json::parse(body)?;
+        // Serde's nested tagged-enum buffer can treat numeric Basis tags as
+        // variant indexes even though the wire contract requires strings.
+        if value
+            .pointer("/event/basis/kind")
+            .is_some_and(|kind| !kind.is_string())
+        {
+            return Err(ContractError::rule("invalid v5 record shape or scalar"));
+        }
         let fields = serde_json::from_value(value)
             .map_err(|_| ContractError::rule("invalid v5 record shape or scalar"))?;
         Self::new(fields)
