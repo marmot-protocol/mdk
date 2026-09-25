@@ -2975,16 +2975,17 @@ impl AppClient {
     /// `'removed'`. This backfill closes that gap by deriving membership from
     /// current engine state once, right after the account is opened. The pass
     /// first reads every candidate roster and performs no membership writes if
-    /// any roster is unavailable, so a deferred-hydration retry cannot partly
-    /// classify healthy groups and then classify them again on a later pass.
+    /// any roster is unavailable or reflects a pending local publication, so a
+    /// deferred-hydration or publication retry cannot partly classify healthy
+    /// groups and then classify them again on a later pass.
     ///
     /// For each row carrying `'member'`, it asks the engine for the group's
     /// roster (`runtime.members`, sourced from the hydrated Marmot record's
     /// post-merge member set) and plans `Removed` only when the local account id
-    /// is absent. An engine error or malformed id aborts before any plan is
-    /// written, so uncertainty never suppresses. The work is gated behind a
-    /// once-only account-import marker, so subsequent opens are a single marker
-    /// read and the hot path stays projection-only.
+    /// is absent. A pending publication, engine error, or malformed id aborts
+    /// before any plan is written, so uncertainty never suppresses. The work is
+    /// gated behind a once-only account-import marker, so subsequent opens are
+    /// a single marker read and the hot path stays projection-only.
     ///
     /// A backfilled departure is recorded as `Removed`, not `Left`: roster
     /// absence cannot tell us *why* the account is gone, and `Removed`
@@ -3010,16 +3011,40 @@ impl AppClient {
             .account_group_ids_defaulting_to_member(&self.state.label)?
         {
             let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "backfill_self_membership_once",
+                    abort_reason = "malformed_group_id",
+                    "aborting self-membership backfill"
+                );
                 return Ok(());
             };
             let group_id = GroupId::new(group_id_bytes);
+            // `members()` deliberately exposes the projected post-merge roster
+            // while a local commit awaits publication. That projection can be
+            // rolled back, so it cannot durably classify an account departure.
+            if matches!(
+                self.runtime.epoch_state(&group_id),
+                Some(cgka_traits::EpochState::PendingPublish(_))
+            ) {
+                return Ok(());
+            }
             // Authoritative roster from engine state. On any engine error
             // (unknown/quarantined group, partially-missing live state), abort
             // the whole pass before writing anything. The preserving defaults
             // remain and the unset marker makes the next open retry.
             let members = match self.runtime.members(&group_id) {
                 Ok(members) => members,
-                Err(_) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "backfill_self_membership_once",
+                        abort_reason = "roster_unavailable",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "aborting self-membership backfill"
+                    );
+                    return Ok(());
+                }
             };
             reconciliation.push((
                 group_id_hex,
@@ -6575,6 +6600,7 @@ mod self_membership_backfill_tests {
         }
     }
 
+    /// A roster containing the local account preserves the member classification.
     #[test]
     fn local_account_in_roster_is_not_removed() {
         let roster = vec![member("aa"), member("bb")];
@@ -6584,6 +6610,7 @@ mod self_membership_backfill_tests {
         assert!(!local_account_removed_from_roster(&roster, "AA"));
     }
 
+    /// A non-empty roster without the local account classifies a legacy row as removed.
     #[test]
     fn local_account_absent_from_roster_is_removed() {
         // Roster has only peers; the local account ("aa") was removed/left.
@@ -6591,9 +6618,62 @@ mod self_membership_backfill_tests {
         assert!(local_account_removed_from_roster(&roster, "aa"));
     }
 
+    /// An empty authoritative roster classifies a legacy row as removed.
     #[test]
     fn empty_roster_is_treated_as_removed() {
         assert!(local_account_removed_from_roster(&[], "aa"));
+    }
+
+    /// A projected roster from `PendingPublish` cannot complete or mutate the backfill.
+    #[tokio::test]
+    async fn pending_publish_defers_self_membership_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("pending group", &[]).await.unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .reset_direct_conversation_members_backfill(crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
+            .unwrap();
+
+        client
+            .runtime
+            .session_mut()
+            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.runtime.epoch_state(&group_id),
+            Some(cgka_traits::EpochState::PendingPublish(_))
+        ));
+
+        // Model a projected post-merge roster that temporarily omits the local
+        // account. Publication failure would restore this engine record, but it
+        // cannot repair an app-local membership row or a completed marker.
+        let mut projected = storage.get_group(&group_id).unwrap();
+        projected.members.clear();
+        storage.put_group(&projected).unwrap();
+
+        client.backfill_self_membership_once().unwrap();
+
+        assert_eq!(
+            app.stored_group_self_membership("alice", &group_id_hex)
+                .unwrap(),
+            Some(SelfMembership::Member),
+            "pending projection must not persist a departure",
+        );
+        assert!(
+            !app.account_import_marker("alice", crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
+                .unwrap(),
+            "pending projection must leave the marker unset for retry",
+        );
     }
 
     /// Ordinary roster reads must preserve membership even when live members are incomplete.
