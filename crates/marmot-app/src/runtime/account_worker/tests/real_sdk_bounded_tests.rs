@@ -19,6 +19,8 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 mod admission_interruption_tests;
 #[path = "interruption_redelivery_tests.rs"]
 mod interruption_redelivery_tests;
+#[path = "recovery_lifecycle_generation_tests.rs"]
+mod recovery_lifecycle_generation_tests;
 
 #[derive(Clone, Debug, Default)]
 struct HeldExactQuery {
