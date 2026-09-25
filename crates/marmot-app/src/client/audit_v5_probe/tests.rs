@@ -4,13 +4,13 @@ use marmot_account::AccountHome;
 use nostr_relay_builder::MockRelay;
 use std::{path::Path, time::Duration};
 
-fn probe() -> WelcomeProbe {
+fn probe_with_ids(source: u8, session: u8) -> WelcomeProbe {
     // Explicit synthetic source/build metadata, not an assertion of production
     // identity persistence or artifact provenance. All event facts come from
     // the instrumented app path below, not from hand-built event fixtures.
     WelcomeProbe::new(
-        "11".repeat(16).try_into().unwrap(),
-        "22".repeat(16).try_into().unwrap(),
+        format!("{source:02x}").repeat(16).try_into().unwrap(),
+        format!("{session:02x}").repeat(16).try_into().unwrap(),
         Producer {
             mdk_revision: "00".repeat(20).try_into().unwrap(),
             build_profile: BuildProfile::Debug,
@@ -18,6 +18,10 @@ fn probe() -> WelcomeProbe {
             host_build: Some("unit-test-probe".to_owned().try_into().unwrap()),
         },
     )
+}
+
+fn probe() -> WelcomeProbe {
+    probe_with_ids(0x11, 0x22)
 }
 
 fn app(path: &Path, relay: &str) -> MarmotApp {
@@ -62,7 +66,7 @@ impl Scenario {
             "bob".into(),
             std::sync::Arc::new(std::sync::Mutex::new(PeelSlot::default())),
         ));
-        let alice = alice_app.client("alice").await.unwrap();
+        let mut alice = alice_app.client("alice").await.unwrap();
         let mut bob = bob_app.client("bob").await.unwrap();
         bob.publish_key_package().await.unwrap();
         let key_package_event_id: [u8; 32] = bob
@@ -76,6 +80,7 @@ impl Scenario {
             .try_into()
             .unwrap();
         bob.audit_v5_probe = Some(probe());
+        alice.audit_v5_probe = Some(probe_with_ids(0x33, 0x44));
         Self {
             _relay: relay,
             _alice_dir: alice_dir,
@@ -91,9 +96,37 @@ impl Scenario {
     async fn create(&mut self) -> cgka_traits::GroupId {
         let group = self
             .alice
-            .create_group("synthetic private group title", &[&self.bob_id])
+            .create_group_with_initial_source_and_optional_telemetry(
+                "synthetic private group title",
+                &[&self.bob_id],
+                crate::AppCreateGroupOptions::default(),
+                None,
+                None,
+            )
             .await
+            .unwrap()
+            .group_id;
+        // Independent product oracle at the post-canonical, pre-publish seam:
+        // the engine retained the exact outbound artifact, not an app index.
+        let retained = self.alice.runtime.outstanding_welcome_deliveries().unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].0, group);
+        let stored = self
+            .alice
+            .runtime
+            .session()
+            .stored_sent_welcome(&retained[0].1.id)
             .unwrap();
+        assert_eq!(stored, retained[0]);
+        assert_eq!(
+            self.sender_capture()
+                .rows
+                .iter()
+                .filter(|row| matches!(row.fields().event, Event::WelcomePrepared(_)))
+                .count(),
+            1
+        );
+        self.alice.drive_unpublished_welcome_delivery(None).await;
         // Independent sender-side product oracle: enough actual relay ACKs
         // completed the retained delivery obligation. This is not a v5 ACK row.
         assert!(
@@ -110,6 +143,10 @@ impl Scenario {
         self.bob.audit_v5_probe.as_ref().unwrap()
     }
 
+    fn sender_capture(&self) -> &WelcomeProbe {
+        self.alice.audit_v5_probe.as_ref().unwrap()
+    }
+
     fn updates(&self) -> Vec<&AppGroupUpdateFinished> {
         self.capture()
             .rows
@@ -122,11 +159,13 @@ impl Scenario {
     }
 
     fn assert_clean(&self) {
-        assert_eq!(self.capture().invalid, 0);
-        assert_eq!(self.capture().dropped, 0);
-        for (i, row) in self.capture().rows.iter().enumerate() {
-            assert_eq!(row.fields().seq.get(), (i + 1) as u64);
-            assert_eq!(Record::from_json(&row.to_json().unwrap()).unwrap(), *row);
+        for capture in [self.sender_capture(), self.capture()] {
+            assert_eq!(capture.invalid, 0);
+            assert_eq!(capture.dropped, 0);
+            for (i, row) in capture.rows.iter().enumerate() {
+                assert_eq!(row.fields().seq.get(), (i + 1) as u64);
+                assert_eq!(Record::from_json(&row.to_json().unwrap()).unwrap(), *row);
+            }
         }
     }
 }
@@ -178,6 +217,42 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
                 &scenario.key_package_event_id
             ))
         );
+        let prepared = scenario
+            .sender_capture()
+            .rows
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePrepared(event) => Some((row, event)),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(
+            prepared.0.fields().source_ref,
+            scenario.capture().rows[0].fields().source_ref
+        );
+        assert_ne!(
+            prepared.0.fields().session_id,
+            scenario.capture().rows[0].fields().session_id
+        );
+        assert_eq!(
+            prepared.0.fields().group_ref,
+            Some(GroupRef::from_group_id(group.as_slice()).unwrap())
+        );
+        assert_eq!(
+            prepared.1.recipient_ref,
+            MemberRef::from_member_identity(&hex::decode(&scenario.bob_id).unwrap()).unwrap()
+        );
+        assert_eq!(prepared.1.mode, Mode::Founding);
+        assert_eq!(prepared.1.basis, Basis::Founding {});
+        assert_eq!(prepared.1.construction, Construction::Constructed);
+        assert_eq!(prepared.1.retention, Retention::Committed);
+        assert_eq!(prepared.1.failure_stage, None);
+        assert_eq!(prepared.1.reason, None);
+        assert_eq!(prepared.1.outer_event_ref, Some(outer.clone()));
+        assert_eq!(
+            prepared.1.key_package_event_ref,
+            unwrapped.key_package_event_ref
+        );
         assert_eq!(observed.acquisition, Acquisition::Unknown);
         assert_eq!(scenario.updates().len(), 1);
         assert_eq!(scenario.updates()[0].outer_event_ref, outer);
@@ -223,6 +298,15 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
             4,
             "ordinary message work adds no Welcome rows"
         );
+        scenario
+            .alice
+            .drive_unpublished_welcome_delivery(None)
+            .await;
+        assert_eq!(
+            scenario.sender_capture().rows.len(),
+            1,
+            "replaying the delivery driver does not repeat preparation"
+        );
         scenario.assert_clean();
         let mut total = 0;
         let mut largest = 0;
@@ -256,20 +340,288 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
              jsonl_bytes={} largest_body_bytes={largest} by_kind={by_kind:?}",
             total + 4
         );
-        let files = scenario.bob_app.audit_log_files().unwrap();
-        assert!(!files.is_empty());
-        for file in files {
-            for row in std::fs::read_to_string(file.path).unwrap().lines() {
-                let v: serde_json::Value = serde_json::from_str(row).unwrap();
-                assert_eq!(
-                    v["schema_version"],
-                    marmot_forensics::AUDIT_LOG_SCHEMA_VERSION
-                );
+        let sender_rows = &scenario.sender_capture().rows;
+        let sender_body: usize = sender_rows
+            .iter()
+            .map(|row| row.to_json().unwrap().len())
+            .sum();
+        let sender_largest = sender_rows
+            .iter()
+            .map(|row| row.to_json().unwrap().len())
+            .max()
+            .unwrap();
+        let sender_by_kind = sender_rows
+            .iter()
+            .map(|row| {
+                let body = row.to_json().unwrap();
+                let kind = serde_json::to_value(&row.fields().event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let text = std::str::from_utf8(&body).unwrap();
+                for forbidden in [
+                    &group_hex,
+                    &scenario.bob_id,
+                    &hex::encode(scenario.key_package_event_id),
+                    pending.via_welcome_message_id_hex.as_ref().unwrap(),
+                    "synthetic private group title",
+                    "synthetic content must never enter probe",
+                ] {
+                    assert!(!text.contains(forbidden));
+                }
+                (kind, body.len())
+            })
+            .collect::<Vec<_>>();
+        assert!(sender_body < 1600);
+        println!(
+            "v5 sender subset: rows={} body_bytes={sender_body} jsonl_bytes={} \
+             largest_body_bytes={sender_largest} by_kind={sender_by_kind:?}",
+            sender_rows.len(),
+            sender_body + sender_rows.len()
+        );
+        for app in [&scenario.alice.app, &scenario.bob_app] {
+            let files = app.audit_log_files().unwrap();
+            assert!(!files.is_empty());
+            for file in files {
+                for row in std::fs::read_to_string(file.path).unwrap().lines() {
+                    let v: serde_json::Value = serde_json::from_str(row).unwrap();
+                    assert_eq!(
+                        v["schema_version"],
+                        marmot_forensics::AUDIT_LOG_SCHEMA_VERSION
+                    );
+                }
             }
         }
     })
     .await
     .expect("bounded local Welcome scenario");
+}
+
+#[tokio::test]
+async fn founding_preparation_matches_two_recipients_without_order_inference() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let carol_dir = tempfile::tempdir().unwrap();
+        let carol_id = AccountHome::open(carol_dir.path())
+            .create_account("carol")
+            .unwrap()
+            .account_id_hex;
+        let carol_app = app(carol_dir.path(), &scenario._relay.url().await.to_string());
+        let mut carol = carol_app.client("carol").await.unwrap();
+        carol.publish_key_package().await.unwrap();
+        let carol_key_package_event_id: [u8; 32] = carol
+            .runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .unwrap()
+            .authored_event_id
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+
+        let group = scenario
+            .alice
+            .create_group_with_initial_source_and_optional_telemetry(
+                "two recipient preparation",
+                &[&scenario.bob_id, &carol_id],
+                crate::AppCreateGroupOptions::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .group_id;
+        assert_eq!(scenario.alice.members(&group).unwrap().len(), 3);
+        let retained = scenario
+            .alice
+            .runtime
+            .outstanding_welcome_deliveries()
+            .unwrap();
+        assert_eq!(retained.len(), 2);
+        for (retained_group, welcome) in &retained {
+            assert_eq!(*retained_group, group);
+            assert_eq!(
+                scenario
+                    .alice
+                    .runtime
+                    .session()
+                    .stored_sent_welcome(&welcome.id)
+                    .unwrap(),
+                (retained_group.clone(), welcome.clone())
+            );
+        }
+        let sender = scenario.sender_capture();
+        assert_eq!(sender.rows.len(), 2);
+        let expected = [
+            (&scenario.bob_id, scenario.key_package_event_id),
+            (&carol_id, carol_key_package_event_id),
+        ];
+        for (recipient_hex, key_package_event_id) in &expected {
+            let recipient_bytes = hex::decode(recipient_hex).unwrap();
+            let recipient_ref = MemberRef::from_member_identity(&recipient_bytes).unwrap();
+            let row = sender
+                .rows
+                .iter()
+                .find(|row| match &row.fields().event {
+                    Event::WelcomePrepared(prepared) => prepared.recipient_ref == recipient_ref,
+                    _ => false,
+                })
+                .unwrap();
+            let Event::WelcomePrepared(prepared) = &row.fields().event else {
+                unreachable!()
+            };
+            assert_eq!(
+                row.fields().group_ref,
+                Some(GroupRef::from_group_id(group.as_slice()).unwrap())
+            );
+            assert_eq!(
+                prepared.key_package_event_ref,
+                Some(NostrEventRef::from_validated_event_id(key_package_event_id))
+            );
+            let exact = retained
+                .iter()
+                .find(|(_, welcome)| match &welcome.envelope {
+                    cgka_traits::transport::TransportEnvelope::Welcome { recipient } => {
+                        recipient.as_slice() == recipient_bytes
+                    }
+                    _ => false,
+                })
+                .unwrap();
+            let outer_id: [u8; 32] = exact.1.id.as_slice().try_into().unwrap();
+            assert_eq!(
+                prepared.outer_event_ref,
+                Some(NostrEventRef::from_validated_event_id(&outer_id))
+            );
+            assert_eq!(prepared.retention, Retention::Committed);
+        }
+        assert_ne!(
+            match &sender.rows[0].fields().event {
+                Event::WelcomePrepared(e) => &e.outer_event_ref,
+                _ => unreachable!(),
+            },
+            match &sender.rows[1].fields().event {
+                Event::WelcomePrepared(e) => &e.outer_event_ref,
+                _ => unreachable!(),
+            }
+        );
+        scenario.assert_clean();
+
+        // Reorder the same engine-retained artifacts when presenting them to
+        // a separate bounded probe. Recipient identity, not vec index, binds K.
+        let effects = SessionEffects {
+            events: Vec::new(),
+            publish: vec![PublishWork::FoundingGroupCreated {
+                welcomes: retained
+                    .iter()
+                    .rev()
+                    .map(|(_, welcome)| welcome.clone())
+                    .collect(),
+            }],
+            queued: Vec::new(),
+            pending_convergence: Vec::new(),
+        };
+        let selections = vec![
+            FoundingSelection {
+                recipient_hex: scenario.bob_id.clone(),
+                key_package_event_id: Some(MessageId::new(scenario.key_package_event_id.to_vec())),
+            },
+            FoundingSelection {
+                recipient_hex: carol_id.clone(),
+                key_package_event_id: Some(MessageId::new(carol_key_package_event_id.to_vec())),
+            },
+        ];
+        let mut reordered = probe_with_ids(0x55, 0x66);
+        let pending = reordered.begin_founding(selections).unwrap();
+        reordered.founding_prepared(pending, &group, &effects);
+        assert_eq!(reordered.rows.len(), 2);
+        assert_eq!(reordered.invalid, 0);
+        for row in &reordered.rows {
+            let Event::WelcomePrepared(prepared) = &row.fields().event else {
+                unreachable!()
+            };
+            let (_, expected_id) = expected
+                .iter()
+                .find(|(recipient, _)| {
+                    prepared.recipient_ref
+                        == MemberRef::from_member_identity(&hex::decode(recipient).unwrap())
+                            .unwrap()
+                })
+                .unwrap();
+            assert_eq!(
+                prepared.key_package_event_ref,
+                Some(NostrEventRef::from_validated_event_id(expected_id))
+            );
+        }
+
+        let mut mismatched = probe_with_ids(0x77, 0x88);
+        let pending = mismatched
+            .begin_founding(vec![FoundingSelection {
+                recipient_hex: scenario.bob_id.clone(),
+                key_package_event_id: Some(MessageId::new(scenario.key_package_event_id.to_vec())),
+            }])
+            .unwrap();
+        mismatched.founding_prepared(pending, &group, &effects);
+        assert!(mismatched.rows.is_empty());
+        assert_eq!(mismatched.invalid, 1);
+
+        let mut total = 0;
+        let mut largest = 0;
+        for row in &sender.rows {
+            let body = row.to_json().unwrap();
+            total += body.len();
+            largest = largest.max(body.len());
+            let text = std::str::from_utf8(&body).unwrap();
+            for forbidden in [
+                hex::encode(group.as_slice()),
+                scenario.bob_id.clone(),
+                carol_id.clone(),
+                hex::encode(scenario.key_package_event_id),
+                hex::encode(carol_key_package_event_id),
+                "two recipient preparation".to_owned(),
+            ] {
+                assert!(!text.contains(&forbidden));
+            }
+        }
+        assert!(total < 3200);
+        println!(
+            "v5 two-recipient sender: rows=2 body_bytes={total} jsonl_bytes={} \
+             largest_body_bytes={largest} by_kind=[(welcome_prepared,2,{total})]",
+            total + 2
+        );
+    })
+    .await
+    .expect("bounded two-recipient preparation");
+}
+
+#[tokio::test]
+async fn rejected_creator_selection_does_not_claim_retained_preparation() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        scenario.alice.publish_key_package().await.unwrap();
+        let alice_id = AccountHome::open(scenario._alice_dir.path())
+            .account("alice")
+            .unwrap()
+            .account_id_hex;
+        assert!(matches!(
+            scenario
+                .alice
+                .create_group("self invitation", &[&alice_id])
+                .await,
+            Err(crate::AppError::GroupCreateIncludesCreator)
+        ));
+        assert!(
+            scenario
+                .alice
+                .runtime
+                .outstanding_welcome_deliveries()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(scenario.sender_capture().rows.is_empty());
+    })
+    .await
+    .expect("bounded pre-retention rejection");
 }
 
 #[tokio::test]

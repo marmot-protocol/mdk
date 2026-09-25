@@ -1,4 +1,4 @@
-# Controlled v5 recipient Welcome probe
+# Controlled v5 Welcome probe
 
 This is a **partial** real-recording experiment after the v5 contract
 (PR #2040), tracked by #2043. It observes actual `AppClient` execution with two
@@ -21,6 +21,7 @@ its output is checked to remain v4. Probe records stay in bounded memory.
 
 | Record | Actual observation | What it does not establish |
 | --- | --- | --- |
+| `welcome_prepared` | On the sender's current-profile founding path, the runtime preparation call returns after the engine atomically retained the canonical group and exact outbound Welcome as `Sent`. The test-only probe matches the returned artifact to the selected, relay-validated public KeyPackage event by recipient identity and checks the outer event hash. | A relay send, ACK, recipient observation, engine join, or app/UI availability. Failure before the returned artifact has no terminal row in this subset. |
 | `welcome_observed` | The app admits a Welcome envelope to its ingest path, after checking its NIP-01 event hash for reference derivation. | Signature/unwrap validity, engine join, endpoint provenance, live versus history acquisition. Acquisition is explicitly `unknown`. |
 | `welcome_unwrapped` | The same engine-invoked Nostr peeler either validates the authenticated rumor and strict inner `e` KeyPackage event ID, or returns a typed transport error. The row shares the receive ID and outer reference with `welcome_observed`. | MLS KeyPackage secret availability, engine join, app checkpoint, or sender publication. SDK NIP-59 extraction errors are coarsely `failed/unwrap_failed`, not a specific bad-key diagnosis. |
 | `app_group_update_finished`, `welcome_join` | A dirty group projection from an observed engine Welcome event reaches the account checkpoint. | The entire engine transaction history, every projection row, UI rendering or notification delivery. |
@@ -28,6 +29,15 @@ its output is checked to remain v4. Probe records stay in bounded memory.
 
 A committed pending invitation and a committed accepted invitation are distinct
 rows, linked to the same outer event reference with separate local update IDs.
+The sender probe allocates one operation ID per selected founding recipient before
+runtime preparation and emits only after the returned `FoundingGroupCreated`
+artifact. KeyPackage source IDs come from the Commit-purpose relay fetch: the
+directory verifies each event signature, kind and author, and no cached package
+is used as a fallback. The probe matches Welcome recipients to those selected
+identities, rejects duplicate/missing matches, and does not decode an inner
+rumor or repeat MLS construction. It runs after the first post-canonical
+idempotency binding, before repairable app indexing and publication. The
+sender and recipient use distinct synthetic source/session identities.
 The app test installs one bounded per-client peel slot before opening the session.
 It arms that slot after policy prechecks and just before engine ingress, consumes
 the peeler result immediately afterward, and records through the existing probe's
@@ -87,6 +97,15 @@ facts are taken from the running scenario, not converted from v4 records.
    claim app ingress or a real incident cause.
 7. Collector bounds and a generic uncertain checkpoint result are checked
    independently of the successful product scenario.
+8. The sender pauses after canonical creation, before fanout, and compares the
+   emitted preparation row with the exact engine-retained outbound Welcome.
+   A second delivery-driver call emits no second preparation. Two actual
+   selected recipients yield two distinct retained artifacts and sender rows;
+   reordering the artifacts in a probe check preserves recipient-to-KeyPackage
+   links, while a missing selection emits no partial success rows.
+9. A self-invitation rejected before the engine prepares a founding group emits
+   no successful preparation row or retained Welcome. This does not establish
+   emission for every construction/retention failure class.
 
 A local run on 2026-09-25 of the earlier three-row subset measured 2,072 compact
 body bytes, 2,075 JSONL bytes and a 742-byte largest body. With successful unwrap
@@ -97,22 +116,27 @@ largest body. The recorded `elapsed_us` can change the decimal width. In the
 success run, `welcome_observed` contributed 1/592 B,
 `welcome_unwrapped` 1/764 B, and `app_group_update_finished` 2/1,480 B;
 rejection contributed `welcome_observed` 1/590 B and `welcome_unwrapped`
-1/649–650 B. These are compact JSON body bytes by kind.
+1/649–650 B. A sender-side founding preparation added one
+`welcome_prepared` row of 915 body bytes/916 JSONL bytes in the one-recipient
+run. Two recipients produced two such rows, 1,832 body bytes/1,834 JSONL bytes,
+with a 916-byte largest body. These are local compact JSON bytes by kind and
+account-device source; no HTTP request or full-v5 budget is measured.
 
-The successful scenario emits four rows: one receive, one unwrap, one pending
-checkpoint and one accepted checkpoint. Its command prints per-kind counts/body
+The successful scenario emits one sender row and four recipient rows: one
+receive, one unwrap, one pending checkpoint and one accepted checkpoint. Its
+command prints per-kind counts/body
 bytes, total compact JSON body bytes, JSONL bytes (including one newline per
 row), and largest body. The 5.2 KiB aggregate assertion is only a gross
-regression guard for this four-row subset. No v5 HTTP request is
+regression guard for the four-row recipient subset. No v5 HTTP request is
 sent; these are **not upload bytes**, a full Welcome budget, or a device/day
 estimate. Source/session identifiers have fixed encoded width; timing values can
 change the byte count between runs.
 
-Sender preparation/publication, engine disposition records, roster baselines,
+Sender publication, engine disposition records, roster baselines,
 process-reopen capture, broad rejected-input classification, and reader
 missing-source conclusions remain separate slices. In
 particular this does not claim complete W01/W03/W04/W08 acceptance or resolve
-#2043. Do not compare these four rows with the complete measured v4 Welcome
+#2043. Do not compare these five rows with the complete measured v4 Welcome
 lifecycle and claim a bandwidth reduction.
 
 Recovery instrumentation, the Rust investigation API, server acceptance of v5,

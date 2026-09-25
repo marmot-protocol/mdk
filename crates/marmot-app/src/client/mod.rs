@@ -1653,12 +1653,19 @@ impl AppClient {
         // Reject an explicit creator before MLS mutation instead of surfacing
         // OpenMLS's opaque DuplicateSignatureKey error from add_members.
         let creator = self.app.account_home().account(&self.state.label)?;
+        #[cfg(test)]
+        let mut founding_selections = Vec::with_capacity(members.len());
         for member in &members {
             let metadata = cgka_engine::key_package::key_package_metadata(member)
                 .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
             if metadata.credential_identity_hex == creator.account_id_hex {
                 return Err(AppError::GroupCreateIncludesCreator);
             }
+            #[cfg(test)]
+            founding_selections.push(audit_v5_probe::FoundingSelection {
+                recipient_hex: metadata.credential_identity_hex,
+                key_package_event_id: member.source.as_ref().map(|source| source.event_id.clone()),
+            });
         }
         self.refresh_routing()?;
         let constructable = self.runtime.constructable_capabilities(&members)?;
@@ -1770,6 +1777,15 @@ impl AppClient {
         );
 
         request.members = members;
+        #[cfg(test)]
+        let founding_probe = (self.runtime.session().new_protocol_profile()
+            == ProtocolProfile::Current)
+            .then(|| {
+                self.audit_v5_probe
+                    .as_mut()
+                    .and_then(|probe| probe.begin_founding(founding_selections))
+            })
+            .flatten();
         let mls_started_at = Instant::now();
         let prepared = self
             .runtime
@@ -1812,6 +1828,10 @@ impl AppClient {
                 error_kind = error.privacy_safe_kind(),
                 "confirmed group creation outpaced prepared-image consumption; retry will reconcile the engine component"
             );
+        }
+        #[cfg(test)]
+        if let (Some(probe), Some(pending)) = (&mut self.audit_v5_probe, founding_probe) {
+            probe.founding_prepared(pending, &group_id, &prepared.effects);
         }
         // Current-profile founding creation is already canonical before
         // transport delivery: the engine transaction retained the exact
