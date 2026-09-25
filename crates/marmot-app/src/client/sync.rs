@@ -44,6 +44,12 @@ use super::epoch_stall::BackfillDecision;
 use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
 use crate::config::CursorPersistence;
 
+pub(crate) enum PendingRecoverySelection {
+    NotPending,
+    Deferred,
+    Grant(AttemptGrant),
+}
+
 /// Account-wide startup budget for the timestamp-independent correctness pass.
 /// Partial progress is durable, so a slow or non-NIP-77 relay cannot hold the
 /// account worker indefinitely and the next sync can resume from a smaller
@@ -3644,6 +3650,21 @@ impl AppClient {
         &mut self,
         seam: EpochBackfillExecutionSeam,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
+        match self.select_pending_epoch_backfill(seam)? {
+            PendingRecoverySelection::NotPending => Ok(EpochBackfillRunOutcome::NotPending),
+            PendingRecoverySelection::Deferred => Ok(EpochBackfillRunOutcome::Deferred),
+            PendingRecoverySelection::Grant(grant) => {
+                self.execute_pending_epoch_backfill_grant(grant).await
+            }
+        }
+    }
+
+    /// Select once. The worker may hand the exact frozen grant to a bounded
+    /// executor without spending a second retry reservation on fallback.
+    pub(crate) fn select_pending_epoch_backfill(
+        &mut self,
+        seam: EpochBackfillExecutionSeam,
+    ) -> Result<PendingRecoverySelection, AppError> {
         self.drop_terminal_epoch_backfill_intents();
         let storage = self.app.account_storage(&self.state.label)?;
         if storage.pending_recovery_demands()?.is_empty()
@@ -3651,13 +3672,21 @@ impl AppClient {
             && self.pending_recovery_arm_writes.is_empty()
             && self.pending_recovery_capacity_writes.is_empty()
         {
-            return Ok(EpochBackfillRunOutcome::NotPending);
+            return Ok(PendingRecoverySelection::NotPending);
         }
         let mut explicit = ExplicitRecoveryPermit::default();
         let permit = (seam == EpochBackfillExecutionSeam::ExplicitCatchUp).then_some(&mut explicit);
         let Some(grant) = self.authorize_account_recovery(permit, seam)? else {
-            return Ok(EpochBackfillRunOutcome::Deferred);
+            return Ok(PendingRecoverySelection::Deferred);
         };
+        Ok(PendingRecoverySelection::Grant(grant))
+    }
+
+    pub(crate) async fn execute_pending_epoch_backfill_grant(
+        &mut self,
+        grant: AttemptGrant,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
         let selected = grant.fence.obligations.clone();
         let comparison_selected = grant.comparison_revision.is_some();
         match self.execute_recovery_grant(grant, None, None).await {
@@ -3858,6 +3887,51 @@ impl AppClient {
         activation_outcome: &mut EpochBackfillActivationOutcome,
         drain_verdict: &mut Option<DrainVerdict>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        self.activate_recovery_grant_inner(grant, telemetry, activation_outcome)
+            .await?;
+        // Routine below-live-cutoff discovery runs only with a frozen owner
+        // comparison request. The retained-inventory floor still bounds it.
+        let quiet_prerequisites =
+            grant
+                .plan()
+                .expect("validated executor grant")
+                .iter()
+                .all(|obligation| {
+                    matches!(
+                        obligation.cause,
+                        storage_sqlite::RecoveryCause::IncrementalHistory
+                            | storage_sqlite::RecoveryCause::Maintenance
+                    )
+                });
+        let comparison_outcomes = if grant.comparison_revision.is_some() || !quiet_prerequisites {
+            self.reconcile_transport_history(&grant.inventory)
+                .await
+                .map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::Unknown,
+                    )
+                })?
+        } else {
+            Vec::new()
+        };
+        self.complete_recovery_grant_inner(
+            grant,
+            repair,
+            counts,
+            drain_verdict,
+            comparison_outcomes,
+        )
+        .await
+    }
+
+    async fn activate_recovery_grant_inner(
+        &mut self,
+        grant: &AttemptGrant,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        activation_outcome: &mut EpochBackfillActivationOutcome,
+    ) -> Result<(), ClassifiedSyncFailure> {
         let obligations = grant.plan().expect("validated executor grant");
         // A bounded comparison freezes acquisition separately from historical
         // goals. Unchanged broad debt cannot widen an automatic comparison.
@@ -3898,13 +3972,6 @@ impl AppClient {
         // prerequisite must not turn ordinary incremental catch-up into a
         // blocking full-history wait. Neither quiet completion nor installation
         // certifies the still-pending maintenance/history predicate.
-        let quiet_prerequisites = obligations.iter().all(|obligation| {
-            matches!(
-                obligation.cause,
-                storage_sqlite::RecoveryCause::IncrementalHistory
-                    | storage_sqlite::RecoveryCause::Maintenance
-            )
-        });
         self.pending_runtime_group_subscription_refresh = true;
         self.relay_plane
             .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())
@@ -3993,21 +4060,32 @@ impl AppClient {
                     .insert(group, (subscription, route));
             }
         }
-        // Routine below-live-cutoff discovery runs only with a frozen owner
-        // comparison request. The retained-inventory floor still bounds it.
-        let comparison_outcomes = if grant.comparison_revision.is_some() || !quiet_prerequisites {
-            self.reconcile_transport_history(&grant.inventory)
-                .await
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::Unknown,
+        Ok(())
+    }
+
+    async fn complete_recovery_grant_inner(
+        &mut self,
+        grant: &AttemptGrant,
+        repair: Option<&FullHistoryRepairControl<'_>>,
+        counts: &mut DrainCounts,
+        drain_verdict: &mut Option<DrainVerdict>,
+        comparison_outcomes: Vec<(
+            TransportReconciliationRoute,
+            storage_sqlite::RecoveryComparisonOutcome,
+        )>,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let quiet_prerequisites =
+            grant
+                .plan()
+                .expect("validated executor grant")
+                .iter()
+                .all(|obligation| {
+                    matches!(
+                        obligation.cause,
+                        storage_sqlite::RecoveryCause::IncrementalHistory
+                            | storage_sqlite::RecoveryCause::Maintenance
                     )
-                })?
-        } else {
-            Vec::new()
-        };
+                });
         let (mut summary, verdict) = if let Some(control) = repair {
             self.drain_full_history_repair(counts, control).await?
         } else if quiet_prerequisites {
