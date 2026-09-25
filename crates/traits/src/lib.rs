@@ -120,10 +120,11 @@ pub use transport_adapter::{
     FanoutMlsState, FanoutPendingKind, FanoutTargetStatus, OutboundApplicationMessage,
     OutboundFanout, OutboundFanoutOutcome, TransportAccountActivation, TransportAdapter,
     TransportAdapterError, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
-    TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
-    TransportEndpointReceipt, TransportEndpointRejectionCategory, TransportGroupSubscription,
-    TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
-    TransportPublishTarget, TransportWireMetadata, collapse_publish_failure_summaries,
+    TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
+    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
+    TransportGroupSubscription, TransportGroupSync, TransportPublishFailure,
+    TransportPublishReport, TransportPublishRequest, TransportPublishTarget, TransportWireMetadata,
+    collapse_publish_failure_summaries,
 };
 pub use types::{Backend, EpochId, GroupId, MemberId, MessageId};
 pub use welcome::PendingWelcome;

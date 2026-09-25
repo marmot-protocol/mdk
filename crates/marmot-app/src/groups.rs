@@ -2688,6 +2688,7 @@ mod fail_if_publish_failed_tests {
             accepted: vec![TransportEndpointReceipt {
                 endpoint: TransportEndpoint("wss://accepted.example".into()),
                 accepted_at: None,
+                ack_kind: None,
             }],
             failed: Vec::new(),
             required_acks: 1,

@@ -381,6 +381,7 @@ impl NostrPublishOutcome {
                 .map(|endpoint| TransportEndpointReceipt {
                     endpoint,
                     accepted_at: None,
+                    ack_kind: None,
                 })
                 .collect(),
             failed: Vec::new(),

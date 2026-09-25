@@ -4666,6 +4666,8 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
                 accepted.push(TransportEndpointReceipt {
                     endpoint: endpoint.clone(),
                     accepted_at: None,
+                    // Reconstructed state does not retain the original OK detail.
+                    ack_kind: None,
                 });
             }
             cgka_traits::FanoutTargetStatus::Failed => {

@@ -237,6 +237,7 @@ fn receipt(endpoint: &TransportEndpoint) -> TransportEndpointReceipt {
     TransportEndpointReceipt {
         endpoint: endpoint.clone(),
         accepted_at: None,
+        ack_kind: None,
     }
 }
 

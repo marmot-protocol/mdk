@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::{
-    MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointFailure,
-    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
-    TransportPublishFailure, collapse_publish_failure_summaries,
+    MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointAckKind,
+    TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
+    TransportEndpointRejectionCategory, TransportPublishFailure,
+    collapse_publish_failure_summaries,
 };
 use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
@@ -19,6 +20,7 @@ use nostr_sdk::prelude::{
     RelayAcquisition, RelayCapabilities, RelayMessage, RelayStatus, RelayUrl, ReqTarget,
     SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions, Tag, Timestamp as NostrTimestamp,
 };
+use nostr_sdk::relay::EventSendStatus;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
@@ -1308,6 +1310,10 @@ impl NostrSdkRelayClient {
                     return Ok(TransportEndpointReceipt {
                         endpoint: transport_endpoint,
                         accepted_at: None,
+                        // Only a typed SDK ACK can establish this detail. The
+                        // legacy failed-map duplicate path remains accepted
+                        // but has no preserved ACK status to classify.
+                        ack_kind: typed_relay_ack_kind(output.success.get(&endpoint)),
                     });
                 }
                 Ok(Ok(output)) => {
@@ -2528,12 +2534,26 @@ fn merge_registration_log(
     }
 }
 
-/// A relay `OK:false` with the NIP-01 `duplicate:` machine prefix proves the
-/// exact event is already stored and counts as idempotent publication success.
-fn relay_duplicate_acknowledgement(relay_failure: &str) -> bool {
+/// A relay ACK with the NIP-01 `duplicate:` machine prefix reports that the
+/// exact event is already held; an `OK:false` duplicate remains idempotent
+/// publication success under the existing admission policy.
+fn relay_duplicate_acknowledgement(relay_message: &str) -> bool {
     matches!(
-        nostr::message::MachineReadablePrefix::parse(relay_failure),
+        nostr::message::MachineReadablePrefix::parse(relay_message),
         Some(nostr::message::MachineReadablePrefix::Duplicate)
+    )
+}
+
+fn typed_relay_ack_kind(status: Option<&EventSendStatus>) -> Option<TransportEndpointAckKind> {
+    let EventSendStatus::Ack(ack) = status? else {
+        return None;
+    };
+    Some(
+        if ack.message().is_some_and(relay_duplicate_acknowledgement) {
+            TransportEndpointAckKind::Duplicate
+        } else {
+            TransportEndpointAckKind::Affirmative
+        },
     )
 }
 
@@ -3583,6 +3603,7 @@ mod tests {
         let accepted = vec![TransportEndpointReceipt {
             endpoint: TransportEndpoint("wss://good.example".into()),
             accepted_at: None,
+            ack_kind: None,
         }];
         let failed = vec![TransportEndpointFailure {
             endpoint: TransportEndpoint("wss://bad.example".into()),
@@ -3608,7 +3629,15 @@ mod tests {
         ));
         assert!(!relay_duplicate_acknowledgement("blocked: policy"));
         assert!(!relay_duplicate_acknowledgement("relay rejected event"));
+        assert!(!relay_duplicate_acknowledgement(
+            "not-duplicate: already stored"
+        ));
+        assert!(!relay_duplicate_acknowledgement(
+            "Duplicate: already stored"
+        ));
         assert!(!relay_duplicate_acknowledgement(""));
+        assert_eq!(typed_relay_ack_kind(None), None);
+        assert_eq!(typed_relay_ack_kind(Some(&EventSendStatus::Sent)), None);
     }
 
     #[test]
@@ -3673,6 +3702,7 @@ mod tests {
         let accepted = vec![TransportEndpointReceipt {
             endpoint: TransportEndpoint("wss://relay.example".into()),
             accepted_at: None,
+            ack_kind: None,
         }];
         let outcome = NostrSdkRelayClient::finish_publish_outcome(
             message_id,
@@ -4356,13 +4386,18 @@ mod tests {
         .to_event()
         .expect("key package event");
 
-        timeout(
+        let first = timeout(
             Duration::from_secs(2),
             sdk.publish_event(std::slice::from_ref(&endpoint), &dto, 1),
         )
         .await
         .expect("first publish should complete")
         .expect("first publish should succeed");
+        assert_eq!(first.accepted.len(), 1);
+        assert_eq!(
+            first.accepted[0].ack_kind,
+            Some(TransportEndpointAckKind::Affirmative)
+        );
 
         let republish = timeout(
             Duration::from_secs(2),
@@ -4374,6 +4409,71 @@ mod tests {
 
         assert_eq!(republish.accepted.len(), 1);
         assert_eq!(republish.accepted[0].endpoint, endpoint);
+        assert_eq!(
+            republish.accepted[0].ack_kind,
+            Some(TransportEndpointAckKind::Duplicate)
+        );
+        assert_eq!(first.message_id, republish.message_id);
+    }
+
+    #[tokio::test]
+    async fn adapter_report_preserves_real_sdk_duplicate_ack_kind() {
+        let relay = MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let adapter = NostrTransportAdapter::new(Arc::new(signed_sdk(keys)));
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+
+        let message = signed_group_event_dto().to_transport_message().unwrap();
+        let cgka_traits::TransportEnvelope::GroupMessage { transport_group_id } = &message.envelope
+        else {
+            unreachable!()
+        };
+        let request = cgka_traits::TransportPublishRequest {
+            account_id: account_id.clone(),
+            message: message.clone(),
+            target: cgka_traits::TransportPublishTarget::Group {
+                group_id: cgka_traits::GroupId::new(vec![0xAB; 16]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            },
+            required_acks: 1,
+        };
+        let first = timeout(Duration::from_secs(2), adapter.publish(request.clone()))
+            .await
+            .expect("first adapter publish completes")
+            .expect("first adapter publish acknowledged");
+        let duplicate = timeout(Duration::from_secs(2), adapter.publish(request))
+            .await
+            .expect("exact adapter republish completes")
+            .expect("exact adapter republish acknowledged");
+
+        assert_eq!(first.message_id, message.id);
+        assert_eq!(duplicate.message_id, message.id);
+        assert!(first.met_required_acks());
+        assert!(duplicate.met_required_acks());
+        assert_eq!(first.accepted.len(), 1);
+        assert_eq!(duplicate.accepted.len(), 1);
+        assert_eq!(first.accepted[0].endpoint, endpoint);
+        assert_eq!(duplicate.accepted[0].endpoint, endpoint);
+        assert_eq!(
+            first.accepted[0].ack_kind,
+            Some(TransportEndpointAckKind::Affirmative)
+        );
+        assert_eq!(
+            duplicate.accepted[0].ack_kind,
+            Some(TransportEndpointAckKind::Duplicate)
+        );
+        adapter.deactivate_account(&account_id).await.unwrap();
     }
 
     #[tokio::test]

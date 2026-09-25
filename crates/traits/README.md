@@ -34,6 +34,23 @@ between engine, peeler, storage, and caller imports from here.
 `AutoPublish` follows the same publish-before-apply contract as explicit group evolution: callers publish the message,
 then confirm or fail the attached `PendingStateRef`.
 
+`TransportEndpointReceipt` carries optional typed ACK detail. Rust callers that construct a
+receipt must now set `ack_kind`, usually to `None` for an injected or reconstructed receipt:
+
+```rust
+TransportEndpointReceipt {
+    endpoint,
+    accepted_at: None,
+    ack_kind: None,
+}
+```
+
+`Some(Affirmative)` means an affirmative endpoint ACK was observed without a typed duplicate
+marker; `Some(Duplicate)` means the endpoint ACK reported an already-held exact event. `None`
+means the detail was unavailable, not that the event was new. Older serialized receipts without
+`ack_kind` still decode as `None`, and `None` is omitted when serializing. This Rust struct-field
+addition requires the constructor update above; it does not change publish quorum decisions.
+
 ## Run the tests
 
 ```sh
