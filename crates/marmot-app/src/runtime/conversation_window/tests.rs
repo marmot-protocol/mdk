@@ -233,6 +233,14 @@ fn ids(s: &ConversationWindowSnapshot) -> Vec<String> {
         .map(|m| m.message_id_hex.clone())
         .collect()
 }
+async fn next_with_draft(sub: &mut RuntimeConversationWindowSubscription, content: &str) {
+    while next(sub)
+        .await
+        .draft
+        .draft
+        .is_none_or(|draft| draft.content != content)
+    {}
+}
 async fn next(sub: &mut RuntimeConversationWindowSubscription) -> ConversationWindowSnapshot {
     timeout(Duration::from_secs(5), sub.recv())
         .await
@@ -348,6 +356,70 @@ async fn receive_and_commands_are_independent_and_paging_retains_anchor_with_a_r
 }
 
 #[tokio::test]
+async fn commands_quoting_a_revision_replaced_only_by_new_content_apply_to_the_current_viewport() {
+    let f = Fixture::new(20).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    let quoted = sub.snapshot.revision.clone();
+    f.draft("first");
+    next_with_draft(&mut sub, "first").await;
+    let paged = handle
+        .page(&quoted, ConversationPageDirection::Older, 5)
+        .await
+        .unwrap();
+    assert_eq!(ids(&paged), (10..20).map(id).collect::<Vec<_>>());
+    assert_eq!(paged.draft.draft.unwrap().content, "first");
+    f.draft("second");
+    next_with_draft(&mut sub, "second").await;
+    let latest = handle.return_to_latest(&paged.revision).await.unwrap();
+    assert!(matches!(
+        latest.anchor,
+        ConversationOpenAnchorOutcome::Latest { .. }
+    ));
+    assert_eq!(ids(&latest).last(), Some(&id(19)));
+    f.draft("third");
+    next_with_draft(&mut sub, "third").await;
+    let anchored = handle
+        .set_visible_anchor(&latest.revision, &id(17))
+        .await
+        .unwrap();
+    assert_eq!(
+        anchored.anchors[anchor_index(anchored.anchor).unwrap()].message_id_hex(),
+        id(17)
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn a_command_that_leaves_the_viewport_in_place_does_not_supersede_revisions() {
+    let f = Fixture::new(20).await;
+    let sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    let quoted = sub.snapshot.revision.clone();
+    let latest = handle.return_to_latest(&quoted).await.unwrap();
+    assert!(latest.revision.sequence > quoted.sequence);
+    let paged = handle
+        .page(&quoted, ConversationPageDirection::Older, 5)
+        .await
+        .unwrap();
+    assert_eq!(ids(&paged), (10..20).map(id).collect::<Vec<_>>());
+    f.close().await;
+}
+
+#[tokio::test]
+async fn commands_quoting_an_unpublished_sequence_are_stale() {
+    let f = Fixture::new(5).await;
+    let sub = f.open(ConversationOpenTarget::Latest, 3).await;
+    let mut ahead = sub.snapshot.revision.clone();
+    ahead.sequence += 1;
+    assert!(matches!(
+        sub.window_handle().return_to_latest(&ahead).await,
+        Err(ConversationWindowError::StaleWindow)
+    ));
+    f.close().await;
+}
+
+#[tokio::test]
 async fn mutations_during_initial_capture_are_reconciled_after_delivery() {
     let f = Fixture::new(5).await;
     f.mode.store(3, Ordering::SeqCst);
@@ -446,6 +518,101 @@ async fn transient_command_failure_keeps_target_until_quiet_retry() {
         recovered.anchors[anchor_index(recovered.anchor).unwrap()].message_id_hex(),
         id(3)
     );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn viewport_move_kept_through_a_transient_failure_supersedes_revisions_once_published() {
+    let f = Fixture::new(20).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    let before_move = sub.snapshot.revision.clone();
+    f.mode.store(2, Ordering::SeqCst);
+    for _ in 0..2 {
+        // Until the move is published, the installed revision stays current.
+        assert!(matches!(
+            handle
+                .page(&before_move, ConversationPageDirection::Older, 5)
+                .await,
+            Err(ConversationWindowError::App(_))
+        ));
+    }
+    assert!(matches!(
+        sub.recv().await,
+        Err(ConversationWindowError::App(_))
+    ));
+    f.mode.store(0, Ordering::SeqCst);
+    let moved = next(&mut sub).await;
+    assert_eq!(ids(&moved), (5..20).map(id).collect::<Vec<_>>());
+    assert!(matches!(
+        handle.return_to_latest(&before_move).await,
+        Err(ConversationWindowError::StaleWindow)
+    ));
+    let paged = handle
+        .page(&moved.revision, ConversationPageDirection::Older, 5)
+        .await
+        .unwrap();
+    assert_eq!(ids(&paged), (0..20).map(id).collect::<Vec<_>>());
+    f.close().await;
+}
+
+#[tokio::test]
+async fn viewport_moves_undone_before_publication_do_not_supersede_revisions() {
+    let f = Fixture::new(20).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    let quoted = sub.snapshot.revision.clone();
+    f.mode.store(2, Ordering::SeqCst);
+    assert!(matches!(
+        handle.set_visible_anchor(&quoted, &id(17)).await,
+        Err(ConversationWindowError::App(_))
+    ));
+    assert!(matches!(
+        handle.return_to_latest(&quoted).await,
+        Err(ConversationWindowError::App(_))
+    ));
+    assert!(matches!(
+        sub.recv().await,
+        Err(ConversationWindowError::App(_))
+    ));
+    f.draft("saved after returning to the published viewport");
+    f.mode.store(0, Ordering::SeqCst);
+    next_with_draft(&mut sub, "saved after returning to the published viewport").await;
+    let paged = handle
+        .page(&quoted, ConversationPageDirection::Older, 5)
+        .await
+        .unwrap();
+    assert_eq!(ids(&paged), (10..20).map(id).collect::<Vec<_>>());
+    f.close().await;
+}
+
+#[tokio::test]
+async fn viewport_move_abandoned_after_its_target_expires_does_not_supersede_revisions() {
+    let f = Fixture::new(20).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    let before_jump = sub.snapshot.revision.clone();
+    f.mode.store(2, Ordering::SeqCst);
+    assert!(matches!(
+        handle.jump_to_message(&before_jump, &id(3)).await,
+        Err(ConversationWindowError::App(_))
+    ));
+    assert!(sub.recv().await.is_err());
+    f.store
+        .prune_app_events_before(&f.group_hex(), 105, &f.account, &|_, _| false)
+        .unwrap();
+    f.draft("saved while the jump target expired");
+    f.mode.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
+        Err(ConversationWindowError::Query(_))
+    ));
+    next_with_draft(&mut sub, "saved while the jump target expired").await;
+    let paged = handle
+        .page(&before_jump, ConversationPageDirection::Older, 5)
+        .await
+        .unwrap();
+    assert_eq!(ids(&paged), (10..20).map(id).collect::<Vec<_>>());
     f.close().await;
 }
 

@@ -74,7 +74,11 @@ it changes the UniFFI record schema and the C `MarmotConversationReaction` layou
 
 Commands can run while `next()` waits. Supply the revision from the installed
 replacement; install the command result and deduplicate its stream echo by
-`generation`/`sequence`. A stale sequence means refresh/reassess before retrying.
+`generation`/`sequence`. Commands apply to the current retained viewport: a
+revision stays valid across background replacements (new rows, delivery state,
+reactions, header, draft) and goes stale only once a replacement showing a
+command's viewport move is published.
+A stale sequence means refresh/reassess before retrying.
 A foreign generation is a distinct error: discard that revision and use the
 current handle's snapshot.
 
