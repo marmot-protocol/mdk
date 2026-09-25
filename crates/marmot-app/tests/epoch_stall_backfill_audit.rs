@@ -543,7 +543,11 @@ async fn arming_a_backfill_records_one_epoch_stall_backfill_armed_row() {
     );
     assert_eq!(
         row["group_ref"].as_str(),
-        Some(hex::encode(live.group_id.as_slice()).as_str()),
+        Some(
+            marmot_forensics::v5::GroupRef::from_group_id(live.group_id.as_slice())
+                .unwrap()
+                .as_str()
+        ),
         "the row is group-scoped via group_ref, not a duplicated field: {row}"
     );
 }
@@ -752,7 +756,11 @@ async fn repeated_arming_without_recovery_escalates_exactly_once() {
     );
     assert_eq!(
         row["group_ref"].as_str(),
-        Some(hex::encode(live.group_id.as_slice()).as_str()),
+        Some(
+            marmot_forensics::v5::GroupRef::from_group_id(live.group_id.as_slice())
+                .unwrap()
+                .as_str()
+        ),
         "the row is group-scoped via group_ref, not a duplicated field: {row}"
     );
 }
