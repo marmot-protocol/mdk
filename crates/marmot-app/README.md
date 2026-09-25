@@ -80,6 +80,17 @@ crash or relay failure cannot restore legacy join capability or lose the obligat
 Legacy Welcomes are terminally rejected. Already-joined legacy groups remain usable by their existing members,
 including their Media V1 state, but membership additions and re-additions are refused.
 
+Incoming kind:0 strings are sanitized in `directory/records.rs` before they are cached.
+`about` keeps normalized line breaks: adjacent CRLF and a lone CR become LF, U+2028 and
+U+2029 become LF, and interior blank lines stay. Every other known string (`name`,
+`display_name` / `displayName`, `picture`, `banner`, `nip05`, `lud16`) stays single-line.
+Both modes remove tab and every other control, including NUL, ESC, BEL, DEL, and C1
+(U+0085 is removed, not treated as a newline). Ends are trimmed after filtering, then the
+value is capped at 4,096 Unicode scalars and any trailing whitespace exposed by that cap
+is trimmed. A previously cached bio that already lost its line breaks is left in place
+until a newer event is accepted; an equal `created_at` does not replace the cached row.
+Publishing a local profile caches the submitted value directly and does not reparse it.
+
 The user directory is keyed by Nostr pubkey. Account setup and the daemon can refresh a local account's contact-list
 event, pre-cache direct follows, and cache profile metadata for those likely contacts. Runtime startup builds chunked
 directory subscriptions for local accounts and known users so profile, follow-list, relay-list, and KeyPackage updates

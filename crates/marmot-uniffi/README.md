@@ -306,6 +306,15 @@ the shared text-hash seed is preserved. Passing uppercase hex or an undecoded
 replaces client-owned random-roll wordlists; it is cosmetic, may
 collide, and does not create an account.
 
+`userProfile` returns the cached kind:0 projection. `about` from a fetched
+profile keeps normalized LF line breaks; `name`, `displayName`, `picture`,
+`banner`, `nip05`, and `lud16` stay single-line. Tab and other controls are
+removed on ingest. `publishUserProfile` caches the submitted local value
+without reparsing it, so a same-instance publish/read does not show incoming
+sanitization. Read another account through `refreshProfile`, then
+`userProfile` or `cachedIdentityProjections`. A bio already stored without
+line breaks stays until a newer event replaces it.
+
 `accountKeyPackages` lists the current KeyPackage winner per addressable slot
 plus local-only rows. `accountKeyPackageRelayEvents` is the additive observed
 history for that same fetch window: current and superseded kind-30443 events,

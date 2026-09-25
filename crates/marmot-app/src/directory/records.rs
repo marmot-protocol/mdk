@@ -327,7 +327,13 @@ pub(crate) fn upsert_newer_directory_entry(
 /// Parse incoming profile metadata and bound the fields retained on ingestion.
 /// The full event is parsed first; this is not a cap on transient parse memory.
 /// Previously cached rows are not rewritten here: their bounds take effect when
-/// a newer profile is ingested and replaces the cached metadata.
+/// a newer profile is ingested and replaces the cached metadata. Equal
+/// timestamps keep the cached row, so a bio flattened by the older filter is
+/// not repaired until a newer event arrives.
+///
+/// `about` keeps normalized LF line breaks. Other known strings stay
+/// single-line. Both modes drop tab and every other control, including NUL,
+/// ESC, BEL, DEL, and C1. See [`ProfileStringPolicy`].
 pub(crate) fn profile_from_record(
     record: RelayEventRecord,
 ) -> Option<(String, UserProfileMetadata)> {
@@ -336,14 +342,14 @@ pub(crate) fn profile_from_record(
     Some((
         record.event.pubkey.clone(),
         UserProfileMetadata {
-            name: string_field(&content, "name"),
-            display_name: string_field(&content, "display_name")
-                .or_else(|| string_field(&content, "displayName")),
-            about: string_field(&content, "about"),
-            picture: string_field(&content, "picture"),
-            banner: string_field(&content, "banner"),
-            nip05: string_field(&content, "nip05"),
-            lud16: string_field(&content, "lud16"),
+            name: string_field(&content, "name", ProfileStringPolicy::SingleLine),
+            display_name: string_field(&content, "display_name", ProfileStringPolicy::SingleLine)
+                .or_else(|| string_field(&content, "displayName", ProfileStringPolicy::SingleLine)),
+            about: string_field(&content, "about", ProfileStringPolicy::Multiline),
+            picture: string_field(&content, "picture", ProfileStringPolicy::SingleLine),
+            banner: string_field(&content, "banner", ProfileStringPolicy::SingleLine),
+            nip05: string_field(&content, "nip05", ProfileStringPolicy::SingleLine),
+            lud16: string_field(&content, "lud16", ProfileStringPolicy::SingleLine),
             created_at: record.event.created_at,
             source_relays: source_relays_from_record(&record),
             extra: extra_profile_fields(&content),
@@ -448,17 +454,87 @@ fn is_known_profile_field(field: &str) -> bool {
 /// result valid UTF-8.
 const MAX_PROFILE_FIELD_CHARS: usize = 4096;
 
-fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
-    let value = value
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)?;
-    let value = value
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(MAX_PROFILE_FIELD_CHARS)
-        .collect::<String>();
-    (!value.is_empty()).then_some(value)
+/// Incoming kind:0 string policy. Only `about` is multiline. Every other known
+/// profile string stays single-line so a newline cannot open a second rendered
+/// line or a terminal-control surface.
+///
+/// Both modes remove tab (it is not expanded to spaces) and every
+/// `char::is_control()` value, including NUL, ESC, BEL, DEL, and C1 controls.
+/// U+0085 is removed and is not treated as a newline. Multiline maps adjacent
+/// CRLF to one LF, a lone CR to LF, and U+2028/U+2029 to LF, and it keeps LF,
+/// including interior blank lines. Single-line drops LF, CR, U+2028, and
+/// U+2029 instead of turning them into a rendered break. CRLF is recognized
+/// only on adjacent original characters: a removed control between CR and LF
+/// leaves two boundaries.
+///
+/// Ordering is normalize/filter, trim ends with `str::trim` semantics, keep at
+/// most 4,096 Unicode scalars, then trim trailing whitespace exposed by that
+/// cap. The walk retains at most that many scalars; it does not allocate a
+/// full normalized copy first. This does not cap JSON parse memory. A cached
+/// row that was ingested before this policy keeps its flattened text until a
+/// newer event replaces it. Equal timestamps still keep the cached row.
+#[derive(Clone, Copy)]
+enum ProfileStringPolicy {
+    SingleLine,
+    Multiline,
+}
+
+fn string_field(
+    value: &serde_json::Value,
+    field: &str,
+    policy: ProfileStringPolicy,
+) -> Option<String> {
+    let raw = value.get(field).and_then(serde_json::Value::as_str)?;
+    sanitize_profile_string(raw, policy)
+}
+
+fn sanitize_profile_string(raw: &str, policy: ProfileStringPolicy) -> Option<String> {
+    let mut chars = raw.chars().peekable();
+    let mut retained = String::new();
+    let mut retained_chars = 0usize;
+    let mut started = false;
+    while retained_chars < MAX_PROFILE_FIELD_CHARS {
+        let Some(next) = next_profile_char(&mut chars, policy) else {
+            break;
+        };
+        if !started && next.is_whitespace() {
+            continue;
+        }
+        started = true;
+        retained.push(next);
+        retained_chars += 1;
+    }
+    let trimmed = retained.trim_end().len();
+    retained.truncate(trimmed);
+    (!retained.is_empty()).then_some(retained)
+}
+
+fn next_profile_char<I>(
+    chars: &mut std::iter::Peekable<I>,
+    policy: ProfileStringPolicy,
+) -> Option<char>
+where
+    I: Iterator<Item = char>,
+{
+    loop {
+        let character = chars.next()?;
+        match character {
+            '\r' => {
+                let _adjacent_lf = chars.next_if_eq(&'\n').is_some();
+                if matches!(policy, ProfileStringPolicy::Multiline) {
+                    return Some('\n');
+                }
+            }
+            '\n' | '\u{2028}' | '\u{2029}' => {
+                if matches!(policy, ProfileStringPolicy::Multiline) {
+                    return Some('\n');
+                }
+            }
+            '\t' => {}
+            other if other.is_control() => {}
+            other => return Some(other),
+        }
+    }
 }
 
 pub(crate) fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
@@ -775,10 +851,24 @@ mod tests {
         });
 
         assert_eq!(
-            string_field(&content, "name").as_deref(),
+            string_field(&content, "name", ProfileStringPolicy::SingleLine).as_deref(),
             Some("alice[2Jadmin")
         );
-        assert_eq!(string_field(&content, "about"), None);
+        assert_eq!(
+            string_field(&content, "about", ProfileStringPolicy::Multiline),
+            None
+        );
+        assert_eq!(
+            string_field(&content, "about", ProfileStringPolicy::SingleLine),
+            None
+        );
+        let multiline = serde_json::json!({
+            "about": "  first\u{1b}[2J\r\n\nsecond\u{7}  ",
+        });
+        assert_eq!(
+            string_field(&multiline, "about", ProfileStringPolicy::Multiline).as_deref(),
+            Some("first[2J\n\nsecond")
+        );
     }
 
     #[test]
@@ -1240,6 +1330,206 @@ mod tests {
             profile.about.as_deref().map(|value| value.chars().count()),
             Some(MAX_PROFILE_FIELD_CHARS)
         );
+    }
+
+    fn assert_profile_policy(policy: ProfileStringPolicy, input: &str, expected: Option<&str>) {
+        let field = match policy {
+            ProfileStringPolicy::SingleLine => "name",
+            ProfileStringPolicy::Multiline => "about",
+        };
+        let content = serde_json::json!({ field: input });
+        assert_eq!(
+            string_field(&content, field, policy).as_deref(),
+            expected,
+            "policy input {input:?}"
+        );
+        if let Some(expected) = expected {
+            assert!(expected.chars().count() <= MAX_PROFILE_FIELD_CHARS);
+            assert_eq!(
+                sanitize_profile_string(expected, policy).as_deref(),
+                Some(expected),
+                "sanitized output must be idempotent"
+            );
+            match policy {
+                ProfileStringPolicy::Multiline => {
+                    assert!(
+                        expected
+                            .chars()
+                            .all(|character| character == '\n' || !character.is_control())
+                    );
+                }
+                ProfileStringPolicy::SingleLine => {
+                    assert!(expected.chars().all(|character| !character.is_control()));
+                    assert!(!expected.contains(['\u{2028}', '\u{2029}']));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn profile_string_policy_normalizes_newlines_and_drops_other_controls() {
+        let cases = [
+            ("plain", Some("plain")),
+            ("first\nsecond", Some("first\nsecond")),
+            ("first\r\nsecond", Some("first\nsecond")),
+            ("first\rsecond", Some("first\nsecond")),
+            ("a\n\n\nb", Some("a\n\n\nb")),
+            ("a\r\n\r\nb", Some("a\n\nb")),
+            ("a\r\u{0}\nb", Some("a\n\nb")),
+            ("a\r\t\nb", Some("a\n\nb")),
+            ("a\t b", Some("a b")),
+            ("\u{0}a\u{1b}[2J\u{7}b\u{7f}", Some("a[2Jb")),
+            ("line\u{2028}next\u{2029}end", Some("line\nnext\nend")),
+            ("keep\u{85}out", Some("keepout")),
+            ("  \n spaced \n ", Some("spaced")),
+            ("\u{1b}  hello  \u{7}", Some("hello")),
+            ("café ☕ line\nnext", Some("café ☕ line\nnext")),
+            ("\n\n", None),
+            ("\0\t\u{1b}", None),
+            ("   \t  ", None),
+        ];
+        for (input, expected) in cases {
+            assert_profile_policy(ProfileStringPolicy::Multiline, input, expected);
+        }
+
+        for (input, expected) in [
+            ("plain", Some("plain")),
+            ("first\nsecond", Some("firstsecond")),
+            ("first\r\nsecond", Some("firstsecond")),
+            ("first\rsecond", Some("firstsecond")),
+            ("a\r\u{0}\nb", Some("ab")),
+            ("a\t b", Some("a b")),
+            ("\u{0}a\u{1b}[2J\u{7}b\u{7f}", Some("a[2Jb")),
+            ("line\u{2028}next\u{2029}end", Some("linenextend")),
+            ("keep\u{85}out", Some("keepout")),
+            ("  spaced  ", Some("spaced")),
+            ("\u{1b}  hello  \u{7}", Some("hello")),
+            ("café ☕", Some("café ☕")),
+            ("\n\r\u{2028}", None),
+        ] {
+            assert_profile_policy(ProfileStringPolicy::SingleLine, input, expected);
+        }
+
+        for code in (0x00..=0x1Fu32).chain(0x7F..=0x9F) {
+            let character = char::from_u32(code).unwrap();
+            let input = format!("A{character}B");
+            let multiline = sanitize_profile_string(&input, ProfileStringPolicy::Multiline);
+            let single = sanitize_profile_string(&input, ProfileStringPolicy::SingleLine);
+            match character {
+                '\n' | '\r' => {
+                    assert_eq!(multiline.as_deref(), Some("A\nB"));
+                    assert_eq!(single.as_deref(), Some("AB"));
+                }
+                '\t' => {
+                    assert_eq!(multiline.as_deref(), Some("AB"));
+                    assert_eq!(single.as_deref(), Some("AB"));
+                }
+                _ => {
+                    assert_eq!(multiline.as_deref(), Some("AB"));
+                    assert_eq!(single.as_deref(), Some("AB"));
+                    assert!(
+                        multiline
+                            .unwrap()
+                            .chars()
+                            .all(|item| item == '\n' || !item.is_control())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn profile_string_policy_caps_normalized_scalars_and_trims_exposed_whitespace() {
+        let at_limit = "é".repeat(MAX_PROFILE_FIELD_CHARS);
+        let over = format!("{at_limit}é");
+        let under = "é".repeat(MAX_PROFILE_FIELD_CHARS - 1);
+        assert_profile_policy(ProfileStringPolicy::Multiline, &under, Some(under.as_str()));
+        assert_profile_policy(
+            ProfileStringPolicy::Multiline,
+            &at_limit,
+            Some(at_limit.as_str()),
+        );
+        assert_profile_policy(
+            ProfileStringPolicy::Multiline,
+            &over,
+            Some(at_limit.as_str()),
+        );
+
+        let emoji = "🦦".repeat(MAX_PROFILE_FIELD_CHARS);
+        assert_eq!(
+            sanitize_profile_string(&format!("{emoji}x"), ProfileStringPolicy::SingleLine)
+                .as_deref(),
+            Some(emoji.as_str())
+        );
+        assert_eq!(emoji.chars().count(), MAX_PROFILE_FIELD_CHARS);
+
+        let before_break = "a".repeat(MAX_PROFILE_FIELD_CHARS - 1);
+        let crlf_across = format!("{before_break}\r\nmore");
+        assert_eq!(
+            sanitize_profile_string(&crlf_across, ProfileStringPolicy::Multiline).as_deref(),
+            Some(before_break.as_str())
+        );
+
+        let removed_prefix = format!(
+            "{}{}",
+            "\u{0}".repeat(32),
+            "b".repeat(MAX_PROFILE_FIELD_CHARS + 1)
+        );
+        let capped_b = "b".repeat(MAX_PROFILE_FIELD_CHARS);
+        assert_eq!(
+            sanitize_profile_string(&removed_prefix, ProfileStringPolicy::SingleLine).as_deref(),
+            Some(capped_b.as_str())
+        );
+
+        let exposed = format!("{} {}", "a".repeat(MAX_PROFILE_FIELD_CHARS - 1), "tail");
+        assert_eq!(
+            sanitize_profile_string(&exposed, ProfileStringPolicy::SingleLine).as_deref(),
+            Some(before_break.as_str())
+        );
+    }
+
+    #[test]
+    fn profile_from_record_keeps_multiline_about_and_single_line_identity_fields() {
+        let payload = "  first\r\nsecond\u{1b}[2J\n\nthird  ";
+        let profile = profile_from_content(serde_json::json!({
+            "name": payload,
+            "picture": payload,
+            "banner": payload,
+            "nip05": payload,
+            "lud16": payload,
+            "about": payload,
+            "displayName": payload,
+            "website": "https://example.test"
+        }));
+        let single = "firstsecond[2Jthird";
+        assert_eq!(profile.name.as_deref(), Some(single));
+        assert_eq!(profile.display_name.as_deref(), Some(single));
+        assert_eq!(profile.picture.as_deref(), Some(single));
+        assert_eq!(profile.banner.as_deref(), Some(single));
+        assert_eq!(profile.nip05.as_deref(), Some(single));
+        assert_eq!(profile.lud16.as_deref(), Some(single));
+        assert_eq!(profile.about.as_deref(), Some("first\nsecond[2J\n\nthird"));
+        assert_eq!(profile.created_at, 1_700_000_000);
+        assert_eq!(
+            profile.source_relays,
+            vec!["wss://relay.example".to_owned()]
+        );
+
+        let content = profile_content_json(&profile);
+        let reparsed = profile_from_content(content);
+        assert_eq!(reparsed.about, profile.about);
+        assert_eq!(reparsed.name, profile.name);
+        assert!(reparsed.about.as_deref().unwrap().contains('\n'));
+
+        let missing = profile_from_content(serde_json::json!({
+            "name": 7,
+            "about": null,
+            "display_name": "\n\t",
+            "displayName": "Fallback\nName"
+        }));
+        assert_eq!(missing.name, None);
+        assert_eq!(missing.about, None);
+        assert_eq!(missing.display_name.as_deref(), Some("FallbackName"));
     }
 
     #[test]

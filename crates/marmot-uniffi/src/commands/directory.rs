@@ -70,8 +70,14 @@ impl Marmot {
     /// Full cached Nostr kind:0 profile for an account id (name, display
     /// name, about, picture, nip05, lud16), if the runtime has one
     /// projected. The local account's own profile is cached immediately
-    /// after `publish_user_profile`; other accounts' profiles populate via
-    /// `refresh_directory`. Returns `None` when nothing is cached yet.
+    /// after `publish_user_profile` from the submitted value, without
+    /// reparsing it. Other accounts' profiles populate via
+    /// `refresh_profile` / `refresh_directory` and are sanitized on ingest:
+    /// `about` keeps normalized LF line breaks, and every other known
+    /// string stays single-line. Tab and other controls (NUL, ESC, BEL,
+    /// DEL, C1) are removed. A cached bio flattened by an older build stays
+    /// until a newer event replaces it; an equal timestamp does not.
+    /// Returns `None` when nothing is cached yet.
     pub fn user_profile(
         &self,
         account_id_hex: String,
@@ -450,6 +456,131 @@ mod tests {
         assert_eq!(page[1].account_id_hex.as_deref(), Some(unknown.as_str()));
         assert!(page[1].profile.is_none());
         assert_eq!(page[1].resolved_name, None);
+    }
+
+    #[test]
+    fn fetched_profile_preserves_multiline_about_through_bindings() {
+        let test_thread = std::thread::Builder::new()
+            .name("ffi-multiline-profile".to_owned())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let test_runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                test_runtime.block_on(fetched_multiline_profile_body());
+            })
+            .unwrap();
+        test_thread.join().unwrap();
+    }
+
+    async fn fetched_multiline_profile_body() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let publisher_root = tempfile::tempdir().expect("publisher tempdir");
+        let publisher = MarmotApp::with_relays(publisher_root.path(), vec![relay_url.clone()]);
+        let publisher_runtime = publisher.runtime();
+        let publisher_kit = Marmot {
+            app: publisher,
+            runtime: publisher_runtime,
+        };
+        let endpoint = TransportEndpoint(relay_url.clone());
+        let account = publisher_kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: false,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("create publisher identity");
+        let account_id_hex = account.account.account_id_hex;
+        wait_for_network_ready(&publisher_kit.runtime, &account_id_hex).await;
+
+        let payload = "  first\r\nsecond\u{1b}[2J\n\nthird  ";
+        publisher_kit
+            .publish_user_profile(
+                account_id_hex.clone(),
+                UserProfileMetadataFfi {
+                    name: Some(payload.to_owned()),
+                    display_name: Some(payload.to_owned()),
+                    about: Some(payload.to_owned()),
+                    picture: Some(payload.to_owned()),
+                    banner: Some(payload.to_owned()),
+                    nip05: Some(payload.to_owned()),
+                    lud16: Some(payload.to_owned()),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("publish mixed profile");
+
+        let reader_root = tempfile::tempdir().expect("reader tempdir");
+        let reader = MarmotApp::with_relays(reader_root.path(), vec![relay_url.clone()]);
+        let reader_runtime = reader.runtime();
+        let reader_kit = Marmot {
+            app: reader,
+            runtime: reader_runtime,
+        };
+        reader_kit
+            .refresh_profile(account_id_hex.clone(), vec![relay_url])
+            .await
+            .expect("reader fetches published profile");
+
+        let expected_about = "first\nsecond[2J\n\nthird";
+        let expected_single = "firstsecond[2Jthird";
+        let fetched = reader_kit
+            .user_profile(account_id_hex.clone())
+            .expect("cached profile")
+            .expect("profile present");
+        assert_eq!(fetched.about.as_deref(), Some(expected_about));
+        assert_eq!(fetched.name.as_deref(), Some(expected_single));
+        assert_eq!(fetched.display_name.as_deref(), Some(expected_single));
+        assert_eq!(fetched.picture.as_deref(), Some(expected_single));
+        assert_eq!(fetched.banner.as_deref(), Some(expected_single));
+        assert_eq!(fetched.nip05.as_deref(), Some(expected_single));
+        assert_eq!(fetched.lud16.as_deref(), Some(expected_single));
+
+        let page = reader_kit
+            .cached_identity_projections(vec![account_id_hex.clone()])
+            .expect("projection");
+        assert_eq!(
+            page[0]
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.about.as_deref()),
+            Some(expected_about)
+        );
+        assert_eq!(
+            page[0]
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.name.as_deref()),
+            Some(expected_single)
+        );
+
+        let reread = reader_kit
+            .user_profile(account_id_hex.clone())
+            .expect("reread")
+            .expect("still cached");
+        assert_eq!(reread.about.as_deref(), Some(expected_about));
+
+        drop(reader_kit);
+        let reopened = MarmotApp::with_relays(reader_root.path(), Vec::new());
+        let reopened_runtime = reopened.runtime();
+        let reopened_kit = Marmot {
+            app: reopened,
+            runtime: reopened_runtime,
+        };
+        let persisted = reopened_kit
+            .user_profile(account_id_hex)
+            .expect("reopened profile")
+            .expect("persisted");
+        assert_eq!(persisted.about.as_deref(), Some(expected_about));
+        assert_eq!(persisted.name.as_deref(), Some(expected_single));
     }
 
     #[test]

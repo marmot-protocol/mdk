@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Preserve normalized line breaks in ingested kind:0 `about` text while still removing
+  unsafe controls from every known profile string. Previously flattened cached bios stay
+  until a newer event replaces them. (#1973)
+
 - Judge epoch-backfill overflow retry backoff by the durable delay. A loaded runner
   can spend more than a second after that reservation is written, which previously
   failed a test that still required nearly the full cooldown to be remaining.
