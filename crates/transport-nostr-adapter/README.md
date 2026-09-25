@@ -62,6 +62,11 @@ include relay URLs, account ids, group ids, message ids, subscription ids, pubke
 payload-derived values. Tracing uses explicit `target` and `method` fields such as
 `transport_nostr_adapter::adapter` / `publish`.
 
+`NostrTransportAdapter::publish_event_with_client` wraps the complete publication future.
+Direct and account-adapter sends share these counters. Endpoint fanout and authentication retries
+remain one logical attempt; dropping an in-flight publication records one cancellation.
+Account, endpoint-safety, and envelope validation stay outside this accounting boundary.
+
 ## Recovery maintenance sessions
 
 `install_group_maintenance_recovery_subscription` accepts the account recovery owner's durable attempt serial and
