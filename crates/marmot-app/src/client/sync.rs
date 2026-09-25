@@ -3710,6 +3710,15 @@ impl AppClient {
         let Some(grant) = self.authorize_account_recovery(permit, seam)? else {
             return Ok(PendingRecoverySelection::Deferred);
         };
+        #[cfg(test)]
+        if let Some(witness) = &self.test_recovery_selection_witness {
+            witness.lock().unwrap().push(super::TestRecoverySelection {
+                seam,
+                attempt_serial: grant.reservation.attempt_serial,
+                comparison_revision: grant.comparison_revision,
+                obligation_count: grant.fence.obligations.len(),
+            });
+        }
         Ok(PendingRecoverySelection::Grant(Box::new(grant)))
     }
 

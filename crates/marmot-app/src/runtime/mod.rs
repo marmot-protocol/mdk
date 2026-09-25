@@ -341,6 +341,12 @@ pub(crate) struct OrdinaryDeliveryDropTarget {
     pub(crate) event_id: [u8; 32],
 }
 
+#[cfg(test)]
+pub(crate) struct RecoverySelectionWitnessTarget {
+    pub(crate) account_label: String,
+    pub(crate) sink: Arc<StdMutex<Vec<crate::client::TestRecoverySelection>>>,
+}
+
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     /// Off until the production SDK acquisition backend passes its two-relay
@@ -351,6 +357,8 @@ pub struct RuntimeSharedServices {
     recovery_credits: Arc<StdMutex<Arc<account_worker::bounded_recovery::RecoveryCreditPool>>>,
     #[cfg(test)]
     pub(crate) comparison_test_trace: Arc<StdMutex<Vec<&'static str>>>,
+    #[cfg(test)]
+    pub(crate) recovery_selection_witness: Arc<StdMutex<Option<RecoverySelectionWitnessTarget>>>,
     #[cfg(test)]
     pub(crate) bounded_recovery_finished: Arc<Notify>,
     #[cfg(test)]
@@ -471,6 +479,8 @@ impl Default for RuntimeSharedServices {
             #[cfg(test)]
             comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
             #[cfg(test)]
+            recovery_selection_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]
             bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -566,6 +576,8 @@ impl RuntimeSharedServices {
             )),
             #[cfg(test)]
             comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
+            #[cfg(test)]
+            recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]

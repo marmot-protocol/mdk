@@ -334,6 +334,9 @@ pub(crate) struct GroupRouteRefresh {
 
 pub struct AppClient {
     #[cfg(test)]
+    pub(crate) test_recovery_selection_witness:
+        Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
+    #[cfg(test)]
     pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
     #[cfg(test)]
     pub(crate) audit_v5_peel_slot:
@@ -498,6 +501,15 @@ pub struct AppClient {
     /// per-sync `refresh_group_routes` because no delivery or drained effect
     /// could have changed routing since the sync-start pass).
     pub(crate) checkpoint_route_refresh_recomputes: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestRecoverySelection {
+    pub(crate) seam: marmot_forensics::EpochBackfillExecutionSeam,
+    pub(crate) attempt_serial: u64,
+    pub(crate) comparison_revision: Option<u64>,
+    pub(crate) obligation_count: usize,
 }
 
 /// Cross the point-of-no-return for a current-profile group mutation without

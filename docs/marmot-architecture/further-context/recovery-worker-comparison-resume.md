@@ -49,9 +49,11 @@ path. The limits bound selected task shape and SDK result policy, not full
 wire traffic, temporary conversion copies, total process RSS, or the live
 subscription's traffic.
 
-Startup, explicit catch-up and receive-triggered comparison waits remain
-inline. A scheduled post-convergence comparison can use this same job boundary;
-see [post-convergence comparison resume](recovery-post-convergence-comparison-resume.md).
+Startup and explicit catch-up comparison waits remain inline. Eligible
+scheduled post-convergence and ordinary receive comparisons can use this same
+job boundary after their local work; see
+[post-convergence comparison resume](recovery-post-convergence-comparison-resume.md) and
+[receive comparison resume](recovery-receive-comparison-resume.md).
 Activation, group registration, SDK drain and checkpoint can still hold the
 worker. The inactive bounded known-event worker remains gated separately. No
 release version, schema or subscription policy changes in this slice.

@@ -1758,6 +1758,8 @@ impl MarmotApp {
         }
         let mut client = AppClient {
             #[cfg(test)]
+            test_recovery_selection_witness: None,
+            #[cfg(test)]
             audit_v5_probe: None,
             #[cfg(test)]
             audit_v5_peel_slot: self

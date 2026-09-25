@@ -27,8 +27,9 @@ debt stays durable. An ineligible frozen grant uses the existing inline
 executor. Read-only status commands can run during an offloaded SDK wait;
 explicit catch-up and later mutations retain worker FIFO ordering behind the
 active job. Activation, registration, drain and checkpoint can still hold the
-worker. Startup, explicit catch-up and receive-triggered comparison waits stay
-inline. The bounded known-event worker remains separately gated.
+worker. Startup and explicit catch-up remain inline; an eligible ordinary
+receive comparison can now use this same job slot after its local delivery
+commits. The bounded known-event worker remains separately gated.
 
 The relay-backed regression arms a real stored convergence pass, then signs
 out the second account so only the target worker can query the route on

@@ -58,7 +58,13 @@ use transport_nostr_adapter::SubscriptionAttempt;
 
 enum ComparisonRecoveryOrigin {
     PeriodicMaintenance,
-    PostConvergence { audit_tracker_update: bool },
+    PostConvergence {
+        audit_tracker_update: bool,
+    },
+    Receive {
+        audit_tracker_update: bool,
+        retry_push_registration: bool,
+    },
 }
 
 struct ComparisonRecoveryJob {
@@ -67,7 +73,7 @@ struct ComparisonRecoveryJob {
     network: ComparisonNetworkJob,
     observation: Option<crate::product_analytics::ProductObservation>,
     backfill_armed: bool,
-    phase: Observation,
+    phase: Option<Observation>,
     origin: ComparisonRecoveryOrigin,
 }
 
@@ -689,6 +695,17 @@ async fn run_app_runtime_account_worker(
     };
     install_storage_telemetry(&client, &shared.app_performance_telemetry());
     client.runtime_telemetry = Some(shared.app_performance_telemetry());
+    #[cfg(test)]
+    {
+        client.test_recovery_selection_witness = shared
+            .recovery_selection_witness
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|target| {
+                (target.account_label == account_label).then(|| target.sink.clone())
+            });
+    }
     let mut scheduled_convergence = ScheduledConvergence::with_test_delay(
         convergence_settlement_delay(&app),
         scheduled_convergence_test_delay(&app),
@@ -1304,8 +1321,29 @@ async fn run_app_runtime_account_worker(
                             shared.schedule_audit_log_tracker_update("scheduled_convergence");
                         }
                     }
+                    ComparisonRecoveryOrigin::Receive {
+                        audit_tracker_update,
+                        retry_push_registration,
+                    } => {
+                        finish_receive_after_recovery(
+                            &mut client,
+                            ReceiveTailContext {
+                                events: &events,
+                                account_id_hex: &account_id_hex,
+                                account_label: &account_label,
+                                shared: &shared,
+                                scheduled_push_retry: &mut scheduled_push_retry,
+                                command_tx: &command_tx,
+                            },
+                            audit_tracker_update,
+                            retry_push_registration,
+                        )
+                        .await;
+                    }
                 }
-                job.phase.finish(TelemetryOutcome::Success);
+                if let Some(phase) = job.phase {
+                    phase.finish(TelemetryOutcome::Success);
+                }
             }
             completed = async {
                 bounded_recovery.as_mut().expect("bounded task exists").wait().await
@@ -1556,7 +1594,7 @@ async fn run_app_runtime_account_worker(
                                                         network,
                                                         observation,
                                                         backfill_armed,
-                                                        phase: phase.take().expect("scheduled phase exists"),
+                                                        phase: Some(phase.take().expect("scheduled phase exists")),
                                                         origin: ComparisonRecoveryOrigin::PostConvergence {
                                                             audit_tracker_update,
                                                         },
@@ -1774,32 +1812,71 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                             &mut client,
                         );
+                        let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
+                        let retry_push_registration = !summary.joined_groups.is_empty();
                         if !overflow_recovery_incomplete {
-                            let _ = run_pending_epoch_backfill_reporting_arm(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &shared,
-                                EpochBackfillExecutionSeam::Receive,
-                            )
-                            .await;
+                            if delivery_started.is_some() {
+                                let backfill_armed = client.has_pending_epoch_backfill();
+                                let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                                    crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
+                                )).flatten();
+                                // A live job already owns this account's grant.
+                                // Keep this delivered message complete and let
+                                // that job settle the still-durable recovery debt.
+                                let backfill_result = if comparison_recovery.is_some() {
+                                    PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
+                                } else {
+                                    execute_pending_comparison_or_inline(
+                                        &mut client, &shared, EpochBackfillExecutionSeam::Receive,
+                                    ).await
+                                };
+                                match backfill_result {
+                                    PendingComparisonExecution::Offloaded {
+                                        grant, subscription_attempt, network,
+                                    } => {
+                                        comparison_recovery = Some(ComparisonRecoveryJob {
+                                            grant: *grant,
+                                            subscription_attempt,
+                                            network,
+                                            observation,
+                                            backfill_armed,
+                                            phase: None,
+                                            origin: ComparisonRecoveryOrigin::Receive {
+                                                audit_tracker_update,
+                                                retry_push_registration,
+                                            },
+                                        });
+                                        continue 'worker;
+                                    }
+                                    PendingComparisonExecution::Inline(result) => {
+                                        let _ = report_pending_epoch_backfill_result(
+                                            result, backfill_armed, observation,
+                                            &events, &account_id_hex, &account_label, &shared,
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Completed account-wide overflow replay keeps
+                                // its existing inline Receive seam and marker
+                                // contract; it is outside this comparison slice.
+                                let _ = run_pending_epoch_backfill_reporting_arm(
+                                    &mut client, &events, &account_id_hex,
+                                    &account_label, &shared, EpochBackfillExecutionSeam::Receive,
+                                ).await;
+                            }
                         }
-                        if sync_summary_triggers_audit_tracker_update(&summary) {
-                            shared.schedule_audit_log_tracker_update("receive");
-                        }
-                        if !summary.joined_groups.is_empty() {
-                            let pending = client
-                                .retry_pending_push_registration_shares_best_effort()
-                                .await;
-                            scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
-                            publish_client_pending_applied_summary(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                        }
+                        finish_receive_after_recovery(
+                            &mut client,
+                            ReceiveTailContext {
+                                events: &events,
+                                account_id_hex: &account_id_hex,
+                                account_label: &account_label,
+                                shared: &shared,
+                                scheduled_push_retry: &mut scheduled_push_retry,
+                                command_tx: &command_tx,
+                            },
+                            audit_tracker_update, retry_push_registration,
+                        ).await;
                     }
                     Err(err) => {
                         publish_app_runtime_account_error(
@@ -1899,6 +1976,18 @@ async fn run_app_runtime_account_worker(
                                 Ok(mut reopened) => {
                                     install_storage_telemetry(&reopened, &shared.app_performance_telemetry());
                                     reopened.runtime_telemetry = Some(shared.app_performance_telemetry());
+                                    #[cfg(test)]
+                                    {
+                                        reopened.test_recovery_selection_witness = shared
+                                            .recovery_selection_witness
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .and_then(|target| {
+                                                (target.account_label == account_label)
+                                                    .then(|| target.sink.clone())
+                                            });
+                                    }
                                     // A reconnect open is deferred like the
                                     // startup open; drain the hydration
                                     // eagerly here — the steady-state loop
@@ -2210,7 +2299,7 @@ async fn run_app_runtime_account_worker(
                             network,
                             observation,
                             backfill_armed,
-                            phase,
+                            phase: Some(phase),
                             origin: ComparisonRecoveryOrigin::PeriodicMaintenance,
                         });
                         continue 'worker;
@@ -5843,6 +5932,44 @@ fn retry_delay_for_attempt(attempt: u32) -> Duration {
         .min(CONVERGENCE_RETRY_MAX_DELAY)
 }
 
+/// Finish the original Receive arm after its recovery outcome is reported.
+/// The same tail runs immediately for inline/deferred work or when the owned
+/// comparison joins; the push retry always reads the client's current durable
+/// intent rather than storing a delivery-specific snapshot in the network job.
+struct ReceiveTailContext<'a> {
+    events: &'a broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &'a str,
+    account_label: &'a str,
+    shared: &'a RuntimeSharedServices,
+    scheduled_push_retry: &'a mut ScheduledPushRegistrationRetry,
+    command_tx: &'a mpsc::Sender<AccountWorkerCommand>,
+}
+
+async fn finish_receive_after_recovery(
+    client: &mut AppClient,
+    context: ReceiveTailContext<'_>,
+    audit_tracker_update: bool,
+    retry_push_registration: bool,
+) {
+    if audit_tracker_update {
+        context.shared.schedule_audit_log_tracker_update("receive");
+    }
+    if retry_push_registration {
+        let pending = client
+            .retry_pending_push_registration_shares_best_effort()
+            .await;
+        context
+            .scheduled_push_retry
+            .schedule_after_attempt(pending, context.command_tx);
+        publish_client_pending_applied_summary(
+            client,
+            context.events,
+            context.account_id_hex,
+            context.account_label,
+        );
+    }
+}
+
 fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
     !summary.joined_groups.is_empty()
         || !summary.messages.is_empty()
@@ -6280,6 +6407,8 @@ mod tests {
     mod post_convergence_comparison_resume_tests;
     mod real_sdk_bounded_tests;
     mod real_sdk_progress_fairness_tests;
+    #[cfg(feature = "test-policy-overrides")]
+    mod receive_comparison_resume_tests;
     mod resource_bounds_tests;
     mod selective_history_tests;
     mod worker_comparison_resume_tests;
