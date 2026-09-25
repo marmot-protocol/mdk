@@ -99,13 +99,15 @@ facts are taken from the running scenario, not converted from v4 records.
    independently of the successful product scenario.
 8. The sender pauses after canonical creation, before fanout, and compares the
    emitted preparation row with the exact engine-retained outbound Welcome.
-   A second delivery-driver call emits no second preparation. Two actual
-   selected recipients yield two distinct retained artifacts and sender rows;
+   Two actual selected recipients yield two distinct retained artifacts and sender rows;
    reordering the artifacts in a probe check preserves recipient-to-KeyPackage
    links, while a missing selection emits no partial success rows.
-9. A self-invitation rejected before the engine prepares a founding group emits
-   no successful preparation row or retained Welcome. This does not establish
-   emission for every construction/retention failure class.
+
+The probe discards its pending operation token when runtime preparation returns
+an error, but this subset has no real post-selection fault injection and does
+not establish behavior for construction/retention failure classes. It also
+does not exercise a publication retry or reconciliation replay; those paths
+are separate from the creation hook.
 
 A local run on 2026-09-25 of the earlier three-row subset measured 2,072 compact
 body bytes, 2,075 JSONL bytes and a 742-byte largest body. With successful unwrap

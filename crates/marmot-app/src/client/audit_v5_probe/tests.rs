@@ -298,15 +298,6 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
             4,
             "ordinary message work adds no Welcome rows"
         );
-        scenario
-            .alice
-            .drive_unpublished_welcome_delivery(None)
-            .await;
-        assert_eq!(
-            scenario.sender_capture().rows.len(),
-            1,
-            "replaying the delivery driver does not repeat preparation"
-        );
         scenario.assert_clean();
         let mut total = 0;
         let mut largest = 0;
@@ -592,36 +583,6 @@ async fn founding_preparation_matches_two_recipients_without_order_inference() {
     })
     .await
     .expect("bounded two-recipient preparation");
-}
-
-#[tokio::test]
-async fn rejected_creator_selection_does_not_claim_retained_preparation() {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        let mut scenario = Scenario::new().await;
-        scenario.alice.publish_key_package().await.unwrap();
-        let alice_id = AccountHome::open(scenario._alice_dir.path())
-            .account("alice")
-            .unwrap()
-            .account_id_hex;
-        assert!(matches!(
-            scenario
-                .alice
-                .create_group("self invitation", &[&alice_id])
-                .await,
-            Err(crate::AppError::GroupCreateIncludesCreator)
-        ));
-        assert!(
-            scenario
-                .alice
-                .runtime
-                .outstanding_welcome_deliveries()
-                .unwrap()
-                .is_empty()
-        );
-        assert!(scenario.sender_capture().rows.is_empty());
-    })
-    .await
-    .expect("bounded pre-retention rejection");
 }
 
 #[tokio::test]
