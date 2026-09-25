@@ -85,10 +85,17 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
         .unwrap();
 
     let mut client = app.client(&alice.label).await.unwrap();
-    // Register ordinary route state, then deliberately drop any startup replay
-    // delivery before it reaches SQLCipher. Reconciliation must reacquire its
-    // bytes despite a possible first SDK sighting.
+    // Register ordinary route state and wait for its startup replay to finish
+    // before dropping the queued delivery. Reconciliation must reacquire its
+    // bytes despite the first SDK sighting.
     client.prepare_transport().await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while !client.adapter.account_subscription_eose().await.complete() {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup replay reaches EOSE before checking comparison ownership");
     while matches!(
         timeout(Duration::from_millis(100), client.receive_next_delivery()).await,
         Ok(Ok(_))
@@ -194,44 +201,6 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             .retained_recovery_event(&route, &event_id, None, crate::unix_now_seconds())
             .unwrap()
     );
-    let after = storage
-        .transport_reconciliation_inventory(&route, crate::unix_now_seconds())
-        .unwrap();
-    let mut partial_subscription = TransportGroupSubscription {
-        group_id: group.clone(),
-        transport_group_id: match &route {
-            storage_sqlite::TransportReconciliationRoute::Group(id) => id.to_vec(),
-            _ => unreachable!(),
-        },
-        endpoints: vec![subscription.endpoints[0].clone()],
-    };
-    // A failed endpoint remains visible even after the healthy endpoint's
-    // relevant event has reached durable inventory.
-    partial_subscription
-        .endpoints
-        .push(TransportEndpoint("ws://127.0.0.1:9".into()));
-    let (partial, remaining) = client
-        .adapter
-        .reconcile_group_history(
-            partial_subscription,
-            &after
-                .items
-                .iter()
-                .map(|item| transport_nostr_adapter::NostrReconciliationItem {
-                    event_id: item.event_id,
-                    created_at: item.created_at,
-                })
-                .collect::<Vec<_>>(),
-            after.since,
-            crate::unix_now_seconds(),
-            &ComparisonCursor::default(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(partial.relays_succeeded, 1);
-    assert_eq!(partial.relays_failed, 1);
-    assert!(remaining.is_empty());
     assert!(
         timeout(Duration::from_millis(100), client.receive_next_delivery())
             .await

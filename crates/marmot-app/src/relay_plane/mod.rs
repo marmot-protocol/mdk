@@ -2455,8 +2455,8 @@ impl MarmotRelayPlaneAccountAdapter {
         Ok(Some(result?))
     }
 
-    /// Queue an owned comparison result only when the account worker resumes.
-    /// Durable admission still belongs to the worker's subsequent drain.
+    /// Submit an owned comparison event to this account's delivery queue.
+    /// Durable admission happens in the caller's subsequent drain.
     pub(crate) async fn queue_reconciled_event(
         &self,
         event: transport_nostr_adapter::NostrRelayEvent,
