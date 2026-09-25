@@ -5357,6 +5357,85 @@ pub enum PendingResolution {
     RolledBack { pending: PendingStateRef },
 }
 
+fn v5_endpoint_ref(endpoint: &TransportEndpoint) -> Option<audit_v5::EndpointRef> {
+    // TransportEndpoint is supplied by the routing owner after canonical relay
+    // URL normalization; preserve its path/query in the hash input.
+    audit_v5::EndpointRef::from_normalized_url(&endpoint.0).ok()
+}
+
+fn v5_local_id(domain: &[u8], message_id: &[u8], ordinal: u32) -> audit_v5::LocalId {
+    let mut hash = Sha256::new();
+    hash.update(b"marmot-audit-local-id/v5\0");
+    hash.update(domain);
+    hash.update([0]);
+    hash.update(message_id);
+    hash.update(ordinal.to_be_bytes());
+    hex::encode(&hash.finalize()[..16])
+        .try_into()
+        .expect("16-byte hash")
+}
+
+fn v5_failed_endpoint_result(
+    failure: &TransportEndpointFailure,
+) -> Option<audit_v5::EndpointResult> {
+    let endpoint_ref = v5_endpoint_ref(&failure.endpoint)?;
+    let rejection_category = failure.rejection_category.map(|category| match category {
+        TransportEndpointRejectionCategory::Duplicate => audit_v5::RejectionCategory::Duplicate,
+        TransportEndpointRejectionCategory::Pow => audit_v5::RejectionCategory::Pow,
+        TransportEndpointRejectionCategory::Blocked => audit_v5::RejectionCategory::Blocked,
+        TransportEndpointRejectionCategory::RateLimited => audit_v5::RejectionCategory::RateLimited,
+        TransportEndpointRejectionCategory::Invalid => audit_v5::RejectionCategory::Invalid,
+        TransportEndpointRejectionCategory::Error => audit_v5::RejectionCategory::Error,
+        TransportEndpointRejectionCategory::Unsupported => audit_v5::RejectionCategory::Unsupported,
+        TransportEndpointRejectionCategory::AuthRequired => {
+            audit_v5::RejectionCategory::AuthRequired
+        }
+        TransportEndpointRejectionCategory::Restricted => audit_v5::RejectionCategory::Restricted,
+    });
+    let failure_kind = match failure.kind {
+        TransportEndpointFailureKind::TerminalRejected => {
+            audit_v5::EndpointFailureKind::TerminalRejected
+        }
+        TransportEndpointFailureKind::NotExposed => audit_v5::EndpointFailureKind::NotExposed,
+        TransportEndpointFailureKind::PossiblyExposed => {
+            audit_v5::EndpointFailureKind::PossiblyExposed
+        }
+        TransportEndpointFailureKind::RetryableUnavailable => {
+            audit_v5::EndpointFailureKind::RetryableUnavailable
+        }
+    };
+    let admissible = matches!(
+        (failure_kind, rejection_category),
+        (
+            audit_v5::EndpointFailureKind::TerminalRejected,
+            Some(
+                audit_v5::RejectionCategory::Pow
+                    | audit_v5::RejectionCategory::Blocked
+                    | audit_v5::RejectionCategory::Invalid
+                    | audit_v5::RejectionCategory::Unsupported
+                    | audit_v5::RejectionCategory::Restricted,
+            ),
+        ) | (audit_v5::EndpointFailureKind::NotExposed, None)
+            | (
+                audit_v5::EndpointFailureKind::PossiblyExposed,
+                None | Some(audit_v5::RejectionCategory::Error),
+            )
+            | (
+                audit_v5::EndpointFailureKind::RetryableUnavailable,
+                None | Some(
+                    audit_v5::RejectionCategory::RateLimited
+                        | audit_v5::RejectionCategory::AuthRequired,
+                ),
+            )
+    );
+    admissible.then_some(audit_v5::EndpointResult {
+        endpoint_ref,
+        status: audit_v5::EndpointStatus::Failed,
+        failure_kind: Some(failure_kind),
+        rejection_category,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5526,85 +5605,4 @@ mod tests {
             );
         }
     }
-}
-
-fn v5_endpoint_ref(endpoint: &TransportEndpoint) -> Option<audit_v5::EndpointRef> {
-    // TransportEndpoint is supplied by the routing owner after canonical relay
-    // URL normalization; preserve its path/query in the hash input.
-    audit_v5::EndpointRef::from_normalized_url(&endpoint.0).ok()
-}
-
-fn v5_local_id(domain: &[u8], message_id: &[u8], ordinal: u32) -> audit_v5::LocalId {
-    let mut hash = Sha256::new();
-    hash.update(b"marmot-audit-local-id/v5\0");
-    hash.update(domain);
-    hash.update([0]);
-    hash.update(message_id);
-    hash.update(ordinal.to_be_bytes());
-    hex::encode(&hash.finalize()[..16])
-        .try_into()
-        .expect("16-byte hash")
-}
-
-fn v5_failed_endpoint_result(
-    failure: &TransportEndpointFailure,
-) -> Option<audit_v5::EndpointResult> {
-    let endpoint_ref = v5_endpoint_ref(&failure.endpoint)?;
-    let rejection_category = failure.rejection_category.map(|category| match category {
-        TransportEndpointRejectionCategory::Duplicate => audit_v5::RejectionCategory::Duplicate,
-        TransportEndpointRejectionCategory::Pow => audit_v5::RejectionCategory::Pow,
-        TransportEndpointRejectionCategory::Blocked => audit_v5::RejectionCategory::Blocked,
-        TransportEndpointRejectionCategory::RateLimited => audit_v5::RejectionCategory::RateLimited,
-        TransportEndpointRejectionCategory::Invalid => audit_v5::RejectionCategory::Invalid,
-        TransportEndpointRejectionCategory::Error => audit_v5::RejectionCategory::Error,
-        TransportEndpointRejectionCategory::Unsupported => audit_v5::RejectionCategory::Unsupported,
-        TransportEndpointRejectionCategory::AuthRequired => {
-            audit_v5::RejectionCategory::AuthRequired
-        }
-        TransportEndpointRejectionCategory::Restricted => audit_v5::RejectionCategory::Restricted,
-    });
-    let failure_kind = match failure.kind {
-        TransportEndpointFailureKind::TerminalRejected => {
-            audit_v5::EndpointFailureKind::TerminalRejected
-        }
-        TransportEndpointFailureKind::NotExposed => audit_v5::EndpointFailureKind::NotExposed,
-        TransportEndpointFailureKind::PossiblyExposed => {
-            audit_v5::EndpointFailureKind::PossiblyExposed
-        }
-        TransportEndpointFailureKind::RetryableUnavailable => {
-            audit_v5::EndpointFailureKind::RetryableUnavailable
-        }
-    };
-    let admissible = match (failure_kind, rejection_category) {
-        (
-            audit_v5::EndpointFailureKind::TerminalRejected,
-            Some(
-                audit_v5::RejectionCategory::Pow
-                | audit_v5::RejectionCategory::Blocked
-                | audit_v5::RejectionCategory::Invalid
-                | audit_v5::RejectionCategory::Unsupported
-                | audit_v5::RejectionCategory::Restricted,
-            ),
-        ) => true,
-        (audit_v5::EndpointFailureKind::NotExposed, None) => true,
-        (
-            audit_v5::EndpointFailureKind::PossiblyExposed,
-            None | Some(audit_v5::RejectionCategory::Error),
-        ) => true,
-        (
-            audit_v5::EndpointFailureKind::RetryableUnavailable,
-            None
-            | Some(
-                audit_v5::RejectionCategory::RateLimited
-                | audit_v5::RejectionCategory::AuthRequired,
-            ),
-        ) => true,
-        _ => false,
-    };
-    admissible.then_some(audit_v5::EndpointResult {
-        endpoint_ref,
-        status: audit_v5::EndpointStatus::Failed,
-        failure_kind: Some(failure_kind),
-        rejection_category,
-    })
 }
