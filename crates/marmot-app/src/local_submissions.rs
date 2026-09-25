@@ -188,31 +188,8 @@ impl MarmotApp {
         )
     }
 
-    pub(crate) fn admit_local_edit(
-        &self,
-        account_ref: &str,
-        group: &cgka_traits::GroupId,
-        original_client_token: String,
-        content: String,
-        edit_client_token: String,
-    ) -> Result<(LocalSendAcceptance, Option<AppProjectionUpdate>), AppError> {
-        self.admit_local_message_with_edit_at(
-            account_ref,
-            group,
-            edit_client_token,
-            LocalMessageRequest {
-                content,
-                reply_to: None,
-                attachments: vec![],
-            },
-            None,
-            Some(original_client_token),
-            unix_now_seconds(),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    fn admit_local_message_with_edit_at(
+    pub(crate) fn admit_local_message_with_edit_at(
         &self,
         account_ref: &str,
         group: &cgka_traits::GroupId,
@@ -344,7 +321,7 @@ impl MarmotApp {
                     event_created_at = event_created_at.max(previous.edited_at.saturating_add(1));
                     if event_created_at > created_at.saturating_add(30) {
                         return Err(AppError::InvalidAppMessagePayload(
-                            "too many rapid edits; retry shortly".into(),
+                            "pending edit rate limit: retry shortly".into(),
                         ));
                     }
                 }

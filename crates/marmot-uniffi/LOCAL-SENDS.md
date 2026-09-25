@@ -87,8 +87,12 @@ dependency. Repeating the same edit token and content is an identity lookup;
 changed content requires a new token. Multiple queued revisions retain order,
 and MDK assigns strictly increasing edit times when rapid submissions share a
 second, so the latest accepted edit wins. If that would move an edit more than
-30 seconds ahead of the current clock, admission fails and the host should keep
-the revision for a later retry.
+30 seconds ahead of the current clock, admission fails with
+`InvalidAppMessagePayload` and the stable detail
+`pending edit rate limit: retry shortly`. Keep the revision and retry it later
+with a new edit token; it was not admitted. This rate limit is distinct from
+`message identity collision`, which also rejects a new token but does not
+schedule an automatic retry.
 
 The host should continue to show the submitted revision as pending until its
 edit token completes, and keep the text available for retry or copy if it is

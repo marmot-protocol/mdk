@@ -292,17 +292,23 @@ async fn pending_edit_is_durable_while_original_publication_is_blocked() {
 }
 
 #[tokio::test]
-async fn pending_edit_requires_a_local_original_in_the_same_group() {
+async fn pending_edit_requires_an_existing_local_original() {
     let h = History::new(0).await;
     let group_hex = hex::encode(h.group.as_slice());
     let error = h
         .app
-        .admit_local_edit(
+        .admit_local_message_with_edit_at(
             "alice",
             &h.group,
-            "missing-original".into(),
-            "revision".into(),
             "edit-token".into(),
+            LocalMessageRequest {
+                content: "revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("missing-original".into()),
+            crate::unix_now_seconds(),
         )
         .unwrap_err();
     assert!(matches!(error, AppError::InvalidAppMessagePayload(_)));
@@ -318,7 +324,51 @@ async fn pending_edit_requires_a_local_original_in_the_same_group() {
 }
 
 #[tokio::test]
-async fn pending_edit_survives_restart_and_targets_the_original_send() {
+async fn rapid_edit_limit_reports_a_stable_retryable_error() {
+    let h = History::new(0).await;
+    h.app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            LocalMessageRequest {
+                content: "original".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            42,
+        )
+        .unwrap();
+    let edit_time = crate::unix_now_seconds();
+    for revision in 0..32 {
+        let result = h.app.admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            format!("edit-{revision}"),
+            LocalMessageRequest {
+                content: format!("revision {revision}"),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            edit_time,
+        );
+        if revision < 31 {
+            result.unwrap();
+        } else {
+            assert!(
+                matches!(result, Err(AppError::InvalidAppMessagePayload(detail))
+                if detail == "pending edit rate limit: retry shortly")
+            );
+        }
+    }
+    h.app.close_storage().unwrap();
+}
+
+#[tokio::test]
+async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_send() {
     let h = History::new(0).await;
     let group_hex = hex::encode(h.group.as_slice());
     let (original, _) = h
@@ -338,21 +388,33 @@ async fn pending_edit_survives_restart_and_targets_the_original_send() {
         .unwrap();
     let (edit, _) = h
         .app
-        .admit_local_edit(
+        .admit_local_message_with_edit_at(
             "alice",
             &h.group,
-            "original-token".into(),
-            "after revision".into(),
             "edit-token".into(),
+            LocalMessageRequest {
+                content: "after revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            crate::unix_now_seconds(),
         )
         .unwrap();
     h.app
-        .admit_local_edit(
+        .admit_local_message_with_edit_at(
             "alice",
             &h.group,
-            "original-token".into(),
-            "latest revision".into(),
             "latest-edit-token".into(),
+            LocalMessageRequest {
+                content: "latest revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            crate::unix_now_seconds(),
         )
         .unwrap();
     let storage = h.app.account_storage("alice").unwrap();
@@ -474,12 +536,18 @@ async fn rejected_original_cannot_publish_a_retained_pending_edit() {
         )
         .unwrap();
     h.app
-        .admit_local_edit(
+        .admit_local_message_with_edit_at(
             "alice",
             &h.group,
-            "original-token".into(),
-            "must not publish".into(),
             "edit-token".into(),
+            LocalMessageRequest {
+                content: "must not publish".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            crate::unix_now_seconds(),
         )
         .unwrap();
     h.app
