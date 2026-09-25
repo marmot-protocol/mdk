@@ -46,6 +46,8 @@ use crate::config::CursorPersistence;
 
 mod comparison_job;
 pub(crate) use comparison_job::ComparisonNetworkJob;
+#[cfg(test)]
+pub(crate) use comparison_job::TestComparisonActivityWitness;
 
 pub(crate) enum PendingRecoverySelection {
     NotPending,
@@ -1401,55 +1403,8 @@ impl AppClient {
         telemetry: Option<&AppPerformanceTelemetry>,
         explicit: bool,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        // Reconcile epoch-bounded prior routes before issuing the first relay
-        // subscriptions. This makes retirement deterministic even for a quiet
-        // group that has no new inbound events after restart.
-        let refresh = self.refresh_group_routes().map_err(|error| {
-            ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::StatePersist,
-            )
-        })?;
-        // A routing-table delta lives in memory and obligates the subscription
-        // refresh below, not a state write; only route retirement mutates
-        // persisted group state.
-        if refresh.state_pruned {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::StatePersist,
-                    )
-                })?;
-        }
-        if self.app.cursor_persistence() == CursorPersistence::Advance
-            && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
-        {
-            self.request_bounded_comparison().map_err(|error| {
-                ClassifiedSyncFailure::at_stage(
-                    SyncSummary::default(),
-                    error,
-                    SyncFailureStage::StatePersist,
-                )
-            })?;
-            if !explicit {
-                self.comparison_startup_requested = true;
-            }
-        }
-        let mut caller = ExplicitRecoveryPermit::default();
         let grant = self
-            .authorize_account_recovery(
-                explicit.then_some(&mut caller),
-                if explicit {
-                    EpochBackfillExecutionSeam::ExplicitCatchUp
-                } else if telemetry.is_some() {
-                    EpochBackfillExecutionSeam::Startup
-                } else {
-                    EpochBackfillExecutionSeam::Maintenance
-                },
-            )
+            .prepare_sync_grant(telemetry, explicit, false)
             .map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
                     SyncSummary::default(),
@@ -1457,7 +1412,63 @@ impl AppClient {
                     SyncFailureStage::StatePersist,
                 )
             })?;
-        let mut summary = if let Some(grant) = grant {
+        self.execute_prepared_sync(grant, telemetry, explicit).await
+    }
+
+    /// Keep the same startup/explicit reservation path available to the
+    /// account worker before it lends an immutable comparison request to a
+    /// network task. A grant is selected once; an ineligible shape keeps this
+    /// exact reservation when the inline executor takes over.
+    pub(crate) fn prepare_sync_grant(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        explicit: bool,
+        defer_comparison_without_credit: bool,
+    ) -> Result<Option<AttemptGrant>, AppError> {
+        // Reconcile epoch-bounded prior routes before issuing the first relay
+        // subscriptions. This makes retirement deterministic even for a quiet
+        // group that has no new inbound events after restart.
+        let refresh = self.refresh_group_routes()?;
+        // A routing-table delta lives in memory and obligates the subscription
+        // refresh below, not a state write; only route retirement mutates
+        // persisted group state.
+        if refresh.state_pruned {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        if self.app.cursor_persistence() == CursorPersistence::Advance
+            && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
+        {
+            self.request_bounded_comparison()?;
+            if !explicit {
+                self.comparison_startup_requested = true;
+            }
+        }
+        if defer_comparison_without_credit && self.comparison_only_waiting_for_credit()? {
+            // Startup still activates and drains ordinary live interest below.
+            // A saturated process pool cannot spend a durable comparison
+            // reservation merely to fall back to another inline SDK wait.
+            return Ok(None);
+        }
+        let mut caller = ExplicitRecoveryPermit::default();
+        self.authorize_account_recovery(
+            explicit.then_some(&mut caller),
+            if explicit {
+                EpochBackfillExecutionSeam::ExplicitCatchUp
+            } else if telemetry.is_some() {
+                EpochBackfillExecutionSeam::Startup
+            } else {
+                EpochBackfillExecutionSeam::Maintenance
+            },
+        )
+    }
+
+    pub(crate) async fn execute_prepared_sync(
+        &mut self,
+        grant: Option<AttemptGrant>,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        explicit: bool,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let summary = if let Some(grant) = grant {
             self.execute_recovery_grant(grant, None, telemetry).await?
         } else {
             if self.app.cursor_persistence() == CursorPersistence::Frozen
@@ -1489,6 +1500,13 @@ impl AppClient {
             // events. Receiving existing subscriptions is not a new acquisition.
             self.sync_sdk_relay(&mut DrainCounts::default()).await?.0
         };
+        self.finish_prepared_sync_summary(summary).await
+    }
+
+    pub(crate) async fn finish_prepared_sync_summary(
+        &mut self,
+        mut summary: SyncSummary,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
         // `open()` hydration (mdk#426). If no relay delivery arrived
@@ -3643,7 +3661,7 @@ impl AppClient {
     /// A run is still forgotten when a caller discards the client outright; the
     /// [`super::epoch_stall`] module header covers that case and what
     /// re-escalating then costs.
-    fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
+    pub(crate) fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
             .epoch_stall_escalations
             .append(&mut self.pending_epoch_stall_escalations);

@@ -2,6 +2,8 @@
 //! account storage, engine, session, or event-queue authority.
 
 use super::*;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
@@ -10,6 +12,32 @@ use transport_nostr_adapter::{NostrReconciliationProgress, SubscriptionAttempt};
 /// The bounded off-worker shape. A larger route retains the existing inline
 /// executor with its complete endpoint set.
 pub(crate) const MAX_COMPARISON_ENDPOINTS_PER_ROUTE: usize = 4;
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestComparisonActivityWitness {
+    pub(crate) attempt_serial: Arc<AtomicU64>,
+    pub(crate) active_jobs: Arc<AtomicUsize>,
+    pub(crate) active_requests: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+struct ActiveCounter(Arc<AtomicUsize>);
+
+#[cfg(test)]
+impl ActiveCounter {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ActiveCounter {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 struct MemoryProgress {
     cursor: Mutex<Option<[u8; 32]>>,
@@ -97,6 +125,7 @@ impl ComparisonNetworkJob {
         client: &AppClient,
         grant: &AttemptGrant,
         credit: OwnedSemaphorePermit,
+        #[cfg(test)] witness: Option<TestComparisonActivityWitness>,
     ) -> Result<Self, AppError> {
         let storage = client.app.account_storage(&client.state.label)?;
         let routes = grant
@@ -111,7 +140,16 @@ impl ComparisonNetworkJob {
             })
             .collect::<Result<Vec<_>, AppError>>()?;
         let adapter = client.adapter.clone();
+        #[cfg(test)]
+        let attempt_serial = grant.reservation.attempt_serial;
         let handle = tokio::spawn(async move {
+            #[cfg(test)]
+            let _job_active = witness.as_ref().map(|witness| {
+                witness
+                    .attempt_serial
+                    .store(attempt_serial, Ordering::SeqCst);
+                ActiveCounter::new(witness.active_jobs.clone())
+            });
             let deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
             let mut results = Vec::with_capacity(routes.len());
             for frozen in routes {
@@ -132,6 +170,10 @@ impl ComparisonNetworkJob {
                     cursor: Mutex::new(initial_cursor),
                 });
                 let run = async {
+                    #[cfg(test)]
+                    let _request_active = witness
+                        .as_ref()
+                        .map(|witness| ActiveCounter::new(witness.active_requests.clone()));
                     match inventory.work {
                         TransportReconciliationWork::Inbox(endpoints) => {
                             adapter

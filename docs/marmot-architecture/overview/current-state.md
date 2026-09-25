@@ -119,9 +119,11 @@ Full-history repair retains one activation across checkpointed work quanta, with
 budget and safe-boundary cancellation. EOSE alone is not qualified history coverage; the current SDK reports honest
 incomplete outcomes. Loss retirement requires qualified admission and an exact live acknowledgment, with cursor
 safety and durable debt preserved on failure. Snapshot reads can run during the wait; mutations retain account FIFO
-ordering. Eligible owner-selected comparisons from periodic maintenance, scheduled convergence
-and ordinary receive suspend only the SDK request in the shared worker job; startup, explicit
-catch-up, account-wide overflow and other waits retain their separate inline paths. The broader
+ordering. Eligible owner-selected comparisons from startup, periodic maintenance, scheduled
+convergence and ordinary receive suspend only the SDK request in the shared worker job. Startup
+keeps live receive and eligible commands active while that request runs; a saturated comparison
+credit pool leaves its retry reservation unspent. Explicit catch-up, account-wide overflow and
+other waits retain their separate inline paths. The broader
 nonblocking acquisition and scheduling program belongs to #1947.
 See the [owner integration ledger](../further-context/account-recovery-integration.md) for the acceptance matrix,
 same-schema conservative mode, coordinated migration landing and approved unresolved-watermark retention exception.

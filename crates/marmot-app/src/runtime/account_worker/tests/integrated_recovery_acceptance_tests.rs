@@ -9,7 +9,10 @@ use nostr_relay_builder::prelude::{
     QueryPolicy, SaveEventStatus, SingleLetterTag, Timestamp as RelayTimestamp,
 };
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
-use nostr_sdk::prelude::{Client as NostrSdkClient, Filter, Kind, RelayCapabilities, ReqTarget};
+use nostr_sdk::prelude::{
+    Client as NostrSdkClient, EventBuilder, Filter, FinalizeEvent, Keys, Kind, RelayCapabilities,
+    ReqTarget, Tag,
+};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{
@@ -202,6 +205,9 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
+    let healthy_relay = LocalRelay::new(RelayBuilder::default());
+    healthy_relay.run().await.unwrap();
+    let healthy_url = healthy_relay.url().await.to_string();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let alice = home.create_account("alice").unwrap();
@@ -216,7 +222,10 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     runtime.reconcile_accounts().await.unwrap();
     runtime.publish_key_package(&bob.label).await.unwrap();
     let mut groups = Vec::new();
-    for title in ["recovery target", "healthy live route"] {
+    for (title, group_relay) in [
+        ("recovery target", &url),
+        ("healthy live route", &healthy_url),
+    ] {
         groups.push(
             runtime
                 .create_group_with_options(
@@ -224,7 +233,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
                     title,
                     std::slice::from_ref(&bob.account_id_hex),
                     AppCreateGroupOptions {
-                        relays: Some(vec![url.clone()]),
+                        relays: Some(vec![group_relay.clone()]),
                         ..Default::default()
                     },
                 )
@@ -377,6 +386,15 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
 
     let reopened_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
     let reopened = crate::MarmotAppRuntime::new(reopened_app.clone());
+    let pool = reopened
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
+    let activity = crate::client::TestComparisonActivityWitness::default();
+    *reopened
+        .shared_services()
+        .comparison_activity_witness
+        .lock()
+        .unwrap() = Some((alice.label.clone(), activity.clone()));
     let entered = gate.entered.notified();
     tokio::pin!(entered);
     entered.as_mut().enable();
@@ -424,6 +442,18 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         );
     }
     assert!(gate.active.load(Ordering::SeqCst) > 0);
+    assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
+    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
+    assert!(activity.attempt_serial.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        activity.attempt_serial.load(Ordering::SeqCst),
+        reopened_app
+            .account_storage(&alice.label)
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial,
+    );
     let entered_at = Instant::now();
     let commands = reopened
         .accounts()
@@ -444,11 +474,142 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         }
         Err(_) => false,
     };
+    assert!(
+        status_within_300_ms,
+        "startup status serves during the owned SDK request"
+    );
     assert!(gate.active.load(Ordering::SeqCst) > 0);
-    eprintln!(
-        "startup status probe: within_300_ms={status_within_300_ms} elapsed_ms={} active_relay_handlers={}",
-        entered_at.elapsed().as_millis(),
-        gate.active.load(Ordering::SeqCst),
+    assert_eq!(
+        bounded_recovery::available_credits(&pool),
+        bounded_recovery::MAX_CONCURRENT_JOBS - 1,
+        "the worker task still owns its shared credit after answering status"
+    );
+    assert!(entered_at.elapsed() < Duration::from_secs(2));
+    timeout(
+        Duration::from_secs(2),
+        reopened.send_message(&alice.label, &groups[1], b"send while recovering".to_vec()),
+    )
+    .await
+    .expect("healthy-group send finishes before the held recovery request")
+    .expect("healthy-group send succeeds");
+    assert_eq!(gate.active.load(Ordering::SeqCst), 1);
+    assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
+    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        bounded_recovery::available_credits(&pool),
+        bounded_recovery::MAX_CONCURRENT_JOBS - 1,
+    );
+    timeout(
+        Duration::from_millis(300),
+        reopened.group_mls_state(&alice.label, &groups[1]),
+    )
+    .await
+    .expect("startup snapshot group read remains ready during acquisition")
+    .unwrap();
+    let (catch_up_respond, mut catch_up_answer) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::CatchUp {
+            respond: catch_up_respond,
+        })
+        .unwrap();
+    let (ordered_respond, mut ordered_answer) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+            group_id: groups[0].clone(),
+            respond: ordered_respond,
+        })
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), &mut ordered_answer)
+            .await
+            .is_err(),
+        "a status behind a startup CatchUp barrier stays in FIFO"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), &mut catch_up_answer)
+            .await
+            .is_err(),
+        "coalesced CatchUp waits for the initial comparison"
+    );
+    let mut bob_client = reopened_app.client(&bob.label).await.unwrap();
+    bob_client
+        .send_custom_event(
+            &groups[1],
+            22_222,
+            Vec::new(),
+            "live while recovering".into(),
+        )
+        .await
+        .unwrap();
+    drop(bob_client);
+    let live_received = timeout(Duration::from_secs(2), async {
+        loop {
+            if reopened_app
+                .messages(&alice.label)
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message.kind == 22_222 && message.plaintext == "live while recovering"
+                })
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if live_received.is_err() {
+        let healthy_route: [u8; 32] = hex::decode(
+            reopened_app
+                .group(&alice.label, &hex::encode(&groups[1]))
+                .unwrap()
+                .unwrap()
+                .nostr_routing
+                .nostr_group_id_hex,
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        inspector
+            .add_relay(healthy_url.clone())
+            .capabilities(RelayCapabilities::READ)
+            .await
+            .unwrap();
+        inspector.connect().await;
+        let relay_events = group_events(&inspector, &healthy_url, &healthy_route).await;
+        panic!(
+            "healthy live receipt absent: relay_events={} alice_messages={:?} credit={} exact_active={} comparison_pending={} demands={:?}",
+            relay_events.len(),
+            reopened_app
+                .messages(&alice.label)
+                .unwrap()
+                .iter()
+                .map(|m| (m.kind, m.plaintext.clone()))
+                .collect::<Vec<_>>(),
+            bounded_recovery::available_credits(&pool),
+            gate.active.load(Ordering::SeqCst),
+            reopened_app
+                .account_storage(&alice.label)
+                .unwrap()
+                .recovery_comparison()
+                .unwrap()
+                .pending(),
+            reopened_app
+                .account_storage(&alice.label)
+                .unwrap()
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .map(|d| (&d.cause, &d.eligibility))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(gate.active.load(Ordering::SeqCst), 1);
+    assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
+    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        bounded_recovery::available_credits(&pool),
+        bounded_recovery::MAX_CONCURRENT_JOBS - 1,
     );
     let storage = reopened_app.account_storage(&alice.label).unwrap();
     let route_key = storage_sqlite::TransportReconciliationRoute::Group(route);
@@ -485,24 +646,23 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
             .iter()
             .all(|demand| demand.cause != storage_sqlite::RecoveryCause::KnownEvent)
     );
-    // The immediate probe above is measured before any durable-state polling
-    // can consume the request's ten-second SDK quantum.
-    reopened
-        .send_message(&alice.label, &groups[1], b"send while recovering".to_vec())
-        .await
-        .expect("healthy-group send remains serviceable");
     gate.release();
-    if !status_within_300_ms {
-        timeout(Duration::from_secs(15), answer)
-            .await
-            .expect("deferred status eventually responds")
-            .unwrap()
-            .unwrap();
-    }
+    timeout(Duration::from_secs(20), catch_up_answer)
+        .await
+        .expect("coalesced catch-up completes after release")
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(20), ordered_answer)
+        .await
+        .expect("status after catch-up runs in arrival order")
+        .unwrap()
+        .unwrap();
     timeout(Duration::from_secs(15), startup)
         .await
         .expect("startup joins after release")
         .unwrap();
+    assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 0);
+    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 0);
     timeout(Duration::from_secs(45), async {
         loop {
             if reopened
@@ -575,5 +735,188 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
             .unwrap()
     );
     final_runtime.shutdown_and_close().await.unwrap();
+    relay.shutdown();
+    healthy_relay.shutdown();
+}
+
+#[tokio::test]
+async fn startup_comparison_waits_for_credit_before_reserving_retry() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("capacity startup")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let pool = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
+    let held = bounded_recovery::hold_all_credits_for_test(&pool);
+    runtime.reconcile_accounts().await.unwrap();
+    let commands = runtime
+        .accounts()
+        .worker_commands(&account.label)
+        .await
+        .unwrap();
+    let (respond, answer) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::NetworkStartupSettled { respond })
+        .unwrap();
+    timeout(Duration::from_secs(15), answer)
+        .await
+        .expect("startup serves deferred command with a saturated shared pool")
+        .unwrap();
+    let storage = app.account_storage(&account.label).unwrap();
+    assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 0);
+    assert!(storage.recovery_comparison().unwrap().pending());
+    assert_eq!(bounded_recovery::available_credits(&pool), 0);
+    drop(held);
+    runtime.shutdown_and_close().await.unwrap();
+    relay.shutdown();
+}
+
+#[tokio::test]
+async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let gate = HeldCommitRequest::default();
+    let _release_on_drop = ReleaseOnDrop(gate.clone());
+    let database = RetainedHistoryRelay {
+        inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
+            events: true,
+            max_events: Some(64),
+        }),
+        route: Arc::new(Mutex::new(None)),
+        ordinary_cutoff: Arc::new(Mutex::new(None)),
+        broad_queries: Arc::new(AtomicUsize::new(0)),
+    };
+    let relay = LocalRelay::new(
+        RelayBuilder::default()
+            .query_policy(gate.clone())
+            .database(database.clone()),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("cancel startup")
+        .unwrap();
+    let config = crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let initial_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let initial = crate::MarmotAppRuntime::new(initial_app.clone());
+    initial.reconcile_accounts().await.unwrap();
+    let group = initial
+        .create_group_with_options(
+            &account.label,
+            "cancel comparison",
+            &[],
+            AppCreateGroupOptions {
+                relays: Some(vec![url.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let route = initial_app
+        .group(&account.label, &hex::encode(&group))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    *database.route.lock().unwrap() = Some(route.clone());
+    initial.shutdown_and_close().await.unwrap();
+    drop(initial);
+    drop(initial_app);
+
+    let signed = EventBuilder::new(Kind::MlsGroupMessage, "request held at relay")
+        .tags([Tag::custom("h", [route])])
+        .finalize(&Keys::generate())
+        .unwrap();
+    database
+        .inner
+        .save_event(&serde_json::from_value(serde_json::to_value(&signed).unwrap()).unwrap())
+        .await
+        .unwrap();
+    *database.ordinary_cutoff.lock().unwrap() =
+        Some(RelayTimestamp::from_secs(signed.created_at.as_secs() + 1));
+    *gate.target.lock().unwrap() = Some(signed.id.to_hex());
+    gate.hold.store(true, Ordering::SeqCst);
+
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let pool = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
+    let activity = crate::client::TestComparisonActivityWitness::default();
+    *runtime
+        .shared_services()
+        .comparison_activity_witness
+        .lock()
+        .unwrap() = Some((account.label.clone(), activity.clone()));
+    let entered = gate.entered.notified();
+    tokio::pin!(entered);
+    entered.as_mut().enable();
+    runtime
+        .accounts()
+        .sign_in_account(&account.label)
+        .await
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    if timeout(Duration::from_secs(20), &mut entered)
+        .await
+        .is_err()
+    {
+        let storage = app.account_storage(&account.label).unwrap();
+        panic!(
+            "startup cancellation request absent: hits={} active={} jobs={} requests={} retry={:?} comparison_pending={} demands={:?}",
+            gate.hits.load(Ordering::SeqCst),
+            gate.active.load(Ordering::SeqCst),
+            activity.active_jobs.load(Ordering::SeqCst),
+            activity.active_requests.load(Ordering::SeqCst),
+            storage.recovery_retry_state().unwrap(),
+            storage.recovery_comparison().unwrap().pending(),
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .map(|d| (&d.cause, &d.eligibility))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
+    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
+    let retry = app
+        .account_storage(&account.label)
+        .unwrap()
+        .recovery_retry_state()
+        .unwrap()
+        .attempt_serial;
+    assert!(retry > 0);
+    timeout(Duration::from_secs(15), runtime.shutdown_and_close())
+        .await
+        .expect("shutdown reaps the startup comparison without relay release")
+        .unwrap();
+    assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 0);
+    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        bounded_recovery::available_credits(&pool),
+        bounded_recovery::MAX_CONCURRENT_JOBS,
+    );
+    drop(runtime);
+    drop(app);
+    gate.release();
+    let reopened = MarmotApp::with_relay_and_config(dir.path(), url, config);
+    let storage = reopened.account_storage(&account.label).unwrap();
+    assert_eq!(
+        storage.recovery_retry_state().unwrap().attempt_serial,
+        retry
+    );
+    assert!(storage.recovery_comparison().unwrap().pending());
     relay.shutdown();
 }

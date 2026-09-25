@@ -81,6 +81,8 @@ mod sync;
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 #[cfg(test)]
+pub(crate) use sync::TestComparisonActivityWitness;
+#[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
     ComparisonNetworkJob, ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome,

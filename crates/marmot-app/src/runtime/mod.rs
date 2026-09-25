@@ -358,6 +358,9 @@ pub struct RuntimeSharedServices {
     #[cfg(test)]
     pub(crate) comparison_test_trace: Arc<StdMutex<Vec<&'static str>>>,
     #[cfg(test)]
+    pub(crate) comparison_activity_witness:
+        Arc<StdMutex<Option<(String, crate::client::TestComparisonActivityWitness)>>>,
+    #[cfg(test)]
     pub(crate) recovery_selection_witness: Arc<StdMutex<Option<RecoverySelectionWitnessTarget>>>,
     #[cfg(test)]
     pub(crate) bounded_recovery_finished: Arc<Notify>,
@@ -479,6 +482,8 @@ impl Default for RuntimeSharedServices {
             #[cfg(test)]
             comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
             #[cfg(test)]
+            comparison_activity_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
@@ -576,6 +581,8 @@ impl RuntimeSharedServices {
             )),
             #[cfg(test)]
             comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
+            #[cfg(test)]
+            comparison_activity_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]

@@ -77,6 +77,21 @@ struct ComparisonRecoveryJob {
     origin: ComparisonRecoveryOrigin,
 }
 
+/// The initial sync can return the same frozen comparison grant to its worker
+/// while the immutable SDK request runs. The live client stays with the worker
+/// until the bounded result is admitted and the startup summary is finished.
+enum StartupSyncStep {
+    Complete(SyncSummary),
+    Network {
+        grant: Box<AttemptGrant>,
+        subscription_attempt: SubscriptionAttempt,
+        network: ComparisonNetworkJob,
+    },
+}
+
+type StartupSyncContinuation<'a> =
+    Pin<Box<dyn Future<Output = Option<Result<SyncSummary, ClassifiedSyncFailure>>> + Send + 'a>>;
+
 enum PendingComparisonExecution {
     Offloaded {
         grant: Box<AttemptGrant>,
@@ -580,6 +595,102 @@ enum DeferredStartupCommand {
     CatchUp(oneshot::Sender<Result<(), AccountCatchUpFailure>>),
 }
 
+/// The original startup command policy applies during both the initial sync
+/// future and its off-worker comparison wait. Snapshot reads remain available;
+/// mutations and catch-up keep their arrival order in `deferred`.
+fn handle_startup_sync_command(
+    command: AccountWorkerCommand,
+    read_snapshot: Option<&crate::client::GroupReadSnapshot>,
+    deferred: &mut Vec<DeferredStartupCommand>,
+    setup_key_package_result: &mut Option<Result<usize, AppError>>,
+    app: &MarmotApp,
+    account_label: &str,
+) {
+    match command {
+        AccountWorkerCommand::Members { group_id, respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(snapshot.members(&group_id));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::Members { group_id, respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(snapshot.member_ids_page(&group_ids));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::MemberIdsPage { group_ids, respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::CaptureConversation {
+            respond, queued, ..
+        } => {
+            if let Some(queued) = queued {
+                queued.finish(TelemetryOutcome::NotReady);
+            }
+            let _ = respond.send(Err(ConversationWindowError::NotReady));
+        }
+        AccountWorkerCommand::GroupMlsState { group_id, respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(snapshot.group_mls_state(&group_id));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::GroupMlsState { group_id, respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::GroupRoster { group_id, respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(group_roster_from_snapshot(
+                    app,
+                    account_label,
+                    snapshot,
+                    &group_id,
+                ));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::GroupRoster { group_id, respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::QuarantinedGroups { respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(Ok(snapshot.quarantined_groups()));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::QuarantinedGroups { respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
+            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+        }
+        AccountWorkerCommand::DeclineGroupRejoin { respond, .. } => {
+            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+        }
+        AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
+            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+        }
+        AccountWorkerCommand::CatchUp { respond } => {
+            deferred.push(DeferredStartupCommand::CatchUp(respond));
+        }
+        AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
+            match setup_key_package_result.take() {
+                Some(result) => {
+                    let _ = respond.send(result);
+                }
+                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
+                ))),
+            }
+        }
+        other => deferred.push(DeferredStartupCommand::Command(Box::new(other))),
+    }
+}
+
 /// Relay-only startup Welcome work. Dropping the worker aborts the task so no
 /// detached publication can outlive relay-plane/account shutdown; the exact
 /// durable artifact remains retryable on the next open.
@@ -626,9 +737,10 @@ pub(crate) fn spawn_app_runtime_account_worker(
     ready: oneshot::Sender<Result<(), AppError>>,
     shutdown: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
-    tokio::spawn(run_app_runtime_account_worker(
-        runtime, command_tx, commands, ready, shutdown,
-    ))
+    let worker: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(
+        run_app_runtime_account_worker(runtime, command_tx, commands, ready, shutdown),
+    );
+    tokio::spawn(worker)
 }
 
 async fn run_app_runtime_account_worker(
@@ -860,17 +972,18 @@ async fn run_app_runtime_account_worker(
 
     // Start signer installation, transport activation, group-subscription
     // registration, and initial catch-up only after local readiness has been
-    // signalled. The sync future holds `&mut client` for its whole lifetime, so
-    // while it is in flight the command loop must not touch the live session:
-    // read commands are answered from `read_snapshot`, invite acceptance gets
-    // a typed definitely-not-started busy response, and every other command is
-    // deferred and replayed on live state once catch-up lands, in arrival
-    // order. `CatchUp` requests that arrive during the initial sync are
-    // coalesced onto it.
+    // signalled. Until a comparison network job is selected, the sync future
+    // holds `&mut client`: read commands use `read_snapshot`, invite acceptance
+    // gets a typed definitely-not-started busy response, and other commands
+    // join the startup FIFO. During an off-worker comparison the worker can
+    // serve eligible live commands without passing ownership of `client` to
+    // the network job. Deferred commands replay in arrival order after catch-up.
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
     let startup_sync_result = {
-        let mut initial_sync = std::pin::pin!(async {
+        let mut initial_sync: Pin<
+            Box<dyn Future<Output = Result<StartupSyncStep, ClassifiedSyncFailure>> + Send + '_>,
+        > = Box::pin(async {
             #[cfg(any(test, feature = "test-policy-overrides"))]
             if let Some(barrier) = shared.take_next_startup_sync_barrier() {
                 // First acknowledge entry, then hold sync until the test has
@@ -878,12 +991,50 @@ async fn run_app_runtime_account_worker(
                 barrier.wait().await;
                 barrier.wait().await;
             }
+            let credit =
+                bounded_recovery::try_acquire_recovery_credit(&shared.recovery_credit_pool());
+            let mut grant = client
+                .prepare_sync_grant(Some(&startup_stage_telemetry), false, credit.is_none())
+                .map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::StatePersist,
+                    )
+                })?;
+            #[cfg(test)]
+            let activity_witness = shared
+                .comparison_activity_witness
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|(label, witness)| (label == &account_label).then(|| witness.clone()));
+            if let Some(selected) = grant.as_ref()
+                && client
+                    .comparison_offload_eligible(selected)
+                    .unwrap_or(false)
+                && let Some(credit) = credit
+                && let Ok(subscription_attempt) = client.activate_comparison_grant(selected).await
+                && let Ok(network) = ComparisonNetworkJob::start(
+                    &client,
+                    selected,
+                    credit,
+                    #[cfg(test)]
+                    activity_witness,
+                )
+            {
+                return Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Network {
+                    grant: Box::new(grant.take().expect("selected startup grant")),
+                    subscription_attempt,
+                    network,
+                });
+            }
             let summary = client
-                .sync_with_stage_telemetry(&startup_stage_telemetry, false)
+                .execute_prepared_sync(grant, Some(&startup_stage_telemetry), false)
                 .await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
-            Ok::<_, ClassifiedSyncFailure>(summary)
+            Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Complete(summary))
         });
         loop {
             tokio::select! {
@@ -893,106 +1044,219 @@ async fn run_app_runtime_account_worker(
                 command = commands.recv() => {
                     match command {
                         None => return,
-                        Some(AccountWorkerCommand::Members { group_id, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(snapshot.members(&group_id));
-                                }
-                                // Degraded (capture failed): answer from live
-                                // state after catch-up instead of guessing.
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::Members { group_id, respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::MemberIdsPage { group_ids, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(snapshot.member_ids_page(&group_ids));
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::MemberIdsPage { group_ids, respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::CaptureConversation { respond, queued, .. }) => {
-                            // Frozen startup facts cannot be composed with newer account rows.
-                            if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
-                            let _ = respond.send(Err(ConversationWindowError::NotReady));
-                        }
-                        Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(snapshot.group_mls_state(&group_id));
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::GroupMlsState { group_id, respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::GroupRoster { group_id, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let result = group_roster_from_snapshot(
-                                        &app,
-                                        &account_label,
-                                        snapshot,
-                                        &group_id,
-                                    );
-                                    let _ = respond.send(result);
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::GroupRoster { group_id, respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::QuarantinedGroups { respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(Ok(snapshot.quarantined_groups()));
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::QuarantinedGroups { respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::ConfirmGroupRejoin { respond, .. }) => {
-                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
-                        }
-                        Some(AccountWorkerCommand::DeclineGroupRejoin { respond, .. }) => {
-                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
-                        }
-                        Some(AccountWorkerCommand::AcceptGroupInvite { respond, .. }) => {
-                            // `initial_sync` owns `&mut client`, so the command
-                            // cannot start here. Report that fact explicitly
-                            // instead of retaining the oneshot behind an
-                            // unbounded catch-up.
-                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
-                        }
-                        Some(AccountWorkerCommand::CatchUp { respond }) => {
-                            // Coalesce onto the in-flight initial catch-up rather
-                            // than starting a second sync; fulfilled in arrival
-                            // order below when it completes.
-                            deferred.push(DeferredStartupCommand::CatchUp(respond));
-                        }
-                        Some(AccountWorkerCommand::PublishSetupKeyPackage { respond }) => {
-                            match setup_key_package_result.take() {
-                                Some(result) => {
-                                    let _ = respond.send(result);
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
-                                ))),
-                            }
-                        }
-                        Some(other) => {
-                            deferred.push(DeferredStartupCommand::Command(Box::new(other)))
-                        }
+                        Some(command) => handle_startup_sync_command(
+                            command,
+                            read_snapshot.as_ref(),
+                            &mut deferred,
+                            &mut setup_key_package_result,
+                            &app,
+                            &account_label,
+                        ),
                     }
                 }
             }
         }
     };
+    // Keep the large command/receive continuation out of the enclosing
+    // worker's async state while the frozen network request is active.
+    let mut startup_sync_result = {
+        let continuation: StartupSyncContinuation<'_> = Box::pin(async {
+            Some(match startup_sync_result {
+                Ok(StartupSyncStep::Complete(summary)) => Ok(summary),
+                Ok(StartupSyncStep::Network {
+                    grant,
+                    subscription_attempt,
+                    mut network,
+                }) => {
+                    let completed = loop {
+                        tokio::select! {
+                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                                network.abort_and_wait().await;
+                                return None;
+                            }
+                            _ = &mut shutdown => {
+                                network.abort_and_wait().await;
+                                return None;
+                            }
+                            result = network.wait() => match result {
+                                Ok(value) => break Ok(value),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        target: "marmot_app::account_worker",
+                                        method = "startup_comparison",
+                                        error_kind = if error.is_panic() { "panic" } else { "cancelled" },
+                                        "comparison task ended before startup admission"
+                                    );
+                                    break Err(ClassifiedSyncFailure::at_stage(
+                                        SyncSummary::default(),
+                                        AppError::BlockingTask("startup comparison task failed".into()),
+                                        SyncFailureStage::Unknown,
+                                    ));
+                                }
+                            },
+                            received = client.receive_next_delivery() => {
+                                match received {
+                                    Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
+                                        // Once claimed, finish engine ingest and projection
+                                        // without cancellation by the network completion.
+                                        let delivery_started = Instant::now();
+                                        let receive_observation = shared.app_performance_telemetry()
+                                            .observe(RuntimeOp::WorkerReceive);
+                                        match client.ingest_received_delivery(*delivery).await {
+                                            Ok(summary) => {
+                                                receive_observation.finish(TelemetryOutcome::Success);
+                                                shared.app_performance_telemetry().record(
+                                                    AppPerformanceOperation::InboundDeliveryProjection,
+                                                    delivery_started.elapsed(), true,
+                                                );
+                                                publish_app_runtime_summary(
+                                                    &events, &account_id_hex, &account_label, &summary,
+                                                );
+                                                publish_client_pending_projection_updates(
+                                                    &mut client, &events, &account_id_hex, &account_label,
+                                                );
+                                                start_post_join_history_after_visibility(
+                                                    &mut client, &summary, &events,
+                                                    &account_id_hex, &account_label,
+                                                ).await;
+                                                scheduled_runtime_group_subscription_refresh.observe_pending(
+                                                    client.has_pending_runtime_group_subscription_refresh(),
+                                                    &command_tx,
+                                                );
+                                                schedule_pending_convergence_groups(
+                                                    &mut scheduled_convergence, &mut client,
+                                                );
+                                                finish_receive_after_recovery(
+                                                    &mut client,
+                                                    ReceiveTailContext {
+                                                        events: &events,
+                                                        account_id_hex: &account_id_hex,
+                                                        account_label: &account_label,
+                                                        shared: &shared,
+                                                        scheduled_push_retry: &mut scheduled_push_retry,
+                                                        command_tx: &command_tx,
+                                                    },
+                                                    sync_summary_triggers_audit_tracker_update(&summary),
+                                                    !summary.joined_groups.is_empty(),
+                                                ).await;
+                                            }
+                                            Err(error) => {
+                                                receive_observation.finish(TelemetryOutcome::Failure);
+                                                shared.app_performance_telemetry().record(
+                                                    AppPerformanceOperation::InboundDeliveryProjection,
+                                                    delivery_started.elapsed(), false,
+                                                );
+                                                network.abort_and_wait().await;
+                                                break Err(ClassifiedSyncFailure::at_stage(
+                                                    SyncSummary::default(), error, SyncFailureStage::Unknown,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(_)) => {
+                                        // receive_next_delivery persisted the loss marker.
+                                        // This in-flight comparison cannot certify it;
+                                        // the fence check below will retain the debt.
+                                        publish_app_runtime_account_error(
+                                            &events, &account_id_hex, &account_label,
+                                            "account delivery overflow recovery incomplete".to_owned(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        network.abort_and_wait().await;
+                                        break Err(ClassifiedSyncFailure::at_stage(
+                                            SyncSummary::default(), error, SyncFailureStage::Unknown,
+                                        ));
+                                    }
+                                }
+                            }
+                            command = commands.recv() => {
+                                let Some(command) = command else {
+                                    network.abort_and_wait().await;
+                                    return None;
+                                };
+                                // Preserve the startup snapshot-read and busy-response
+                                // policy during the off-worker request. Mutations still
+                                // obey the deferred FIFO; only its head may use the
+                                // live client while the immutable network request runs.
+                                match command {
+                                    AccountWorkerCommand::GroupRecoveryStatus { group_id, respond }
+                                        if deferred.is_empty() => {
+                                        let _ = respond.send(group_recovery_after_hydration(&mut client, &group_id));
+                                    }
+                                    AccountWorkerCommand::SendMessage {
+                                        enqueued_at, queued, group_id, payload, respond,
+                                    } if deferred.is_empty() => {
+                                        send_message_on_worker(
+                                            &mut client, enqueued_at, queued, group_id, payload, respond,
+                                            &events, &account_id_hex, &account_label, &shared,
+                                            shared.product_analytics.permit(),
+                                        ).await;
+                                        publish_client_pending_applied_summary(
+                                            &mut client, &events, &account_id_hex, &account_label,
+                                        );
+                                    }
+                                    other => handle_startup_sync_command(
+                                        other,
+                                        read_snapshot.as_ref(),
+                                        &mut deferred,
+                                        &mut setup_key_package_result,
+                                        &app,
+                                        &account_label,
+                                    ),
+                                }
+                            }
+                        }
+                    };
+                    let result = match completed {
+                        Ok((credit, network_result)) => {
+                            let _credit = credit;
+                            client
+                                .finish_comparison_grant(
+                                    *grant,
+                                    subscription_attempt,
+                                    network_result,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    ClassifiedSyncFailure::at_stage(
+                                        std::mem::take(&mut client.pending_failed_sync_summary),
+                                        error,
+                                        SyncFailureStage::Unknown,
+                                    )
+                                })
+                        }
+                        Err(failure) => Err(failure),
+                    };
+                    let result = match result {
+                        Ok(
+                            EpochBackfillRunOutcome::Completed(summary)
+                            | EpochBackfillRunOutcome::Incomplete(summary),
+                        ) => client.finish_prepared_sync_summary(summary).await,
+                        Ok(
+                            EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending,
+                        ) => {
+                            client
+                                .execute_prepared_sync(None, Some(&startup_stage_telemetry), false)
+                                .await
+                        }
+                        Err(failure) => Err(failure),
+                    };
+                    app.finish_client_open_network_maintenance(&mut client)
+                        .await;
+                    result
+                }
+                Err(failure) => Err(failure),
+            })
+        });
+        let Some(result) = continuation.await else {
+            return;
+        };
+        result
+    };
+    if let Err(failure) = &mut startup_sync_result {
+        client.drain_epoch_stall_escalations(&mut failure.partial_summary);
+    }
     shared.app_performance_telemetry().record_classified_result(
         AppPerformanceOperation::AccountSync,
         sync_started_at.elapsed(),
@@ -2366,6 +2630,15 @@ async fn execute_pending_comparison_or_inline(
                         client,
                         &grant,
                         credit.take().expect("offloaded grant owns credit"),
+                        #[cfg(test)]
+                        shared
+                            .comparison_activity_witness
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|(label, witness)| {
+                                (label == &client.state.label).then(|| witness.clone())
+                            }),
                     ) {
                         Ok(network) => {
                             #[cfg(test)]
@@ -4852,46 +5125,20 @@ fn account_worker_command_future<'a>(
             payload,
             respond,
         } => Box::pin(async move {
-            if let Some(queued) = queued {
-                queued.finish(TelemetryOutcome::Success);
-            }
-            let execution = shared
-                .app_performance_telemetry()
-                .observe(RuntimeOp::SendExecution);
-            let send_started_at = Instant::now();
-            shared.app_performance_telemetry().record(
-                AppPerformanceOperation::OutboundMessageQueueWait,
-                enqueued_at.elapsed(),
-                true,
-            );
-            let mut first_projection = true;
-            client.send_telemetry = Some(shared.app_performance_telemetry());
-            let result = client
-                .send_with_local_projection(&group_id, &payload, |update| {
-                    if first_projection {
-                        shared.app_performance_telemetry().record(
-                            AppPerformanceOperation::OutboundMessageLocalProjection,
-                            enqueued_at.elapsed(),
-                            true,
-                        );
-                        first_projection = false;
-                    }
-                    publish_app_runtime_projection_update(
-                        events,
-                        account_id_hex,
-                        account_label,
-                        update,
-                    );
-                })
-                .await;
-            client.send_telemetry = None;
-            execution.finish_app(&result);
-            shared.app_performance_telemetry().record(
-                AppPerformanceOperation::OutboundMessageSend,
-                send_started_at.elapsed(),
-                result.is_ok(),
-            );
-            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            send_message_on_worker(
+                client,
+                enqueued_at,
+                queued,
+                group_id,
+                payload,
+                respond,
+                events,
+                account_id_hex,
+                account_label,
+                shared,
+                storage_permit,
+            )
+            .await;
             true
         }),
         AccountWorkerCommand::SendAppEvent {
@@ -5342,6 +5589,57 @@ fn group_recovery_after_hydration(
         .session_mut()
         .ensure_group_hydrated(group_id)?;
     client.group_recovery_status(group_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_message_on_worker(
+    client: &mut AppClient,
+    enqueued_at: Instant,
+    queued: Option<Observation>,
+    group_id: GroupId,
+    payload: Vec<u8>,
+    respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+    storage_permit: Option<crate::DiagnosticsPermit>,
+) {
+    if let Some(queued) = queued {
+        queued.finish(TelemetryOutcome::Success);
+    }
+    let execution = shared
+        .app_performance_telemetry()
+        .observe(RuntimeOp::SendExecution);
+    let send_started_at = Instant::now();
+    shared.app_performance_telemetry().record(
+        AppPerformanceOperation::OutboundMessageQueueWait,
+        enqueued_at.elapsed(),
+        true,
+    );
+    let mut first_projection = true;
+    client.send_telemetry = Some(shared.app_performance_telemetry());
+    let result = client
+        .send_with_local_projection(&group_id, &payload, |update| {
+            if first_projection {
+                shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::OutboundMessageLocalProjection,
+                    enqueued_at.elapsed(),
+                    true,
+                );
+                first_projection = false;
+            }
+            publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+        })
+        .await;
+    client.send_telemetry = None;
+    execution.finish_app(&result);
+    shared.app_performance_telemetry().record(
+        AppPerformanceOperation::OutboundMessageSend,
+        send_started_at.elapsed(),
+        result.is_ok(),
+    );
+    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
 }
 
 pub(super) fn group_roster_after_hydration(
@@ -6403,6 +6701,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[cfg(feature = "test-policy-overrides")]
+    mod integrated_recovery_acceptance_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod post_convergence_comparison_resume_tests;
     mod real_sdk_bounded_tests;
