@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-24
+updated: 2026-09-25
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -223,6 +223,9 @@ subscription rebuilds and empty or failed comparisons, and advances before fetch
 of admitted event inventory. Retired routes are counted separately from reconciliation failures.
 The SDK requires a route-scoped progress store instead of evicting cursors from a shared cache;
 see [reconciliation progress ownership](../../../crates/transport-nostr-adapter/README.md#reconciliation-progress-ownership).
+The account worker can resume its command loop while an eligible scheduled post-convergence
+comparison waits on the relay; it joins and settles the same owner grant after the SDK request.
+See [post-convergence comparison resume](../further-context/recovery-post-convergence-comparison-resume.md).
 
 ## Protocol implementations
 

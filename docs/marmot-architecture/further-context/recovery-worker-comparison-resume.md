@@ -49,12 +49,13 @@ path. The limits bound selected task shape and SDK result policy, not full
 wire traffic, temporary conversion copies, total process RSS, or the live
 subscription's traffic.
 
-Startup, explicit catch-up, receive-triggered and convergence-triggered
-comparison waits remain inline. Activation, group registration, SDK drain and
-checkpoint can still hold the worker. The inactive bounded known-event worker
-remains gated separately. No release version, schema or subscription policy
-changes in this slice.
+Startup, explicit catch-up and receive-triggered comparison waits remain
+inline. A scheduled post-convergence comparison can use this same job boundary;
+see [post-convergence comparison resume](recovery-post-convergence-comparison-resume.md).
+Activation, group registration, SDK drain and checkpoint can still hold the
+worker. The inactive bounded known-event worker remains gated separately. No
+release version, schema or subscription policy changes in this slice.
 
-An explicit catch-up arriving while the periodic comparison task is active
+An explicit catch-up arriving while a comparison task is active
 waits in the worker's command FIFO until that task joins. Later mutations stay
 behind it, while read-only status commands can still run during the SDK wait.

@@ -56,13 +56,28 @@ use crate::{
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use transport_nostr_adapter::SubscriptionAttempt;
 
-struct ComparisonMaintenanceJob {
+enum ComparisonRecoveryOrigin {
+    PeriodicMaintenance,
+    PostConvergence { audit_tracker_update: bool },
+}
+
+struct ComparisonRecoveryJob {
     grant: AttemptGrant,
     subscription_attempt: SubscriptionAttempt,
     network: ComparisonNetworkJob,
     observation: Option<crate::product_analytics::ProductObservation>,
     backfill_armed: bool,
     phase: Observation,
+    origin: ComparisonRecoveryOrigin,
+}
+
+enum PendingComparisonExecution {
+    Offloaded {
+        grant: Box<AttemptGrant>,
+        subscription_attempt: SubscriptionAttempt,
+        network: ComparisonNetworkJob,
+    },
+    Inline(Result<EpochBackfillRunOutcome, AppError>),
 }
 
 pub(crate) struct ManagedAccountWorker {
@@ -1173,7 +1188,7 @@ async fn run_app_runtime_account_worker(
 
     let mut yield_to_convergence = false;
     let mut bounded_recovery: Option<bounded_recovery::Job> = None;
-    let mut comparison_maintenance: Option<ComparisonMaintenanceJob> = None;
+    let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let mut yield_to_bounded_admission = false;
     let mut bounded_probe_at = TokioInstant::now();
     let mut bounded_prepare_error_reported = false;
@@ -1228,7 +1243,7 @@ async fn run_app_runtime_account_worker(
             }
         }
         let ready_command =
-            ready_command_index(&pending, &media_http, comparison_maintenance.is_some());
+            ready_command_index(&pending, &media_http, comparison_recovery.is_some());
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -1239,9 +1254,9 @@ async fn run_app_runtime_account_worker(
             }
             _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
             completed = async {
-                comparison_maintenance.as_mut().expect("comparison task exists").network.wait().await
-            }, if comparison_maintenance.is_some() => {
-                let job = comparison_maintenance.take().expect("completed comparison task exists");
+                comparison_recovery.as_mut().expect("comparison task exists").network.wait().await
+            }, if comparison_recovery.is_some() => {
+                let job = comparison_recovery.take().expect("completed comparison task exists");
                 let result = match completed {
                     Ok((credit, network)) => {
                         #[cfg(test)]
@@ -1266,7 +1281,7 @@ async fn run_app_runtime_account_worker(
                             .push("task_join_error");
                         tracing::warn!(
                             target: "marmot_app::account_worker",
-                            method = "comparison_maintenance",
+                            method = "comparison_recovery",
                             error_kind = if error.is_panic() { "panic" } else { "cancelled" },
                             "comparison task ended before worker admission"
                         );
@@ -1277,10 +1292,19 @@ async fn run_app_runtime_account_worker(
                     result, job.backfill_armed, job.observation,
                     &events, &account_id_hex, &account_label, &shared,
                 );
-                finish_periodic_maintenance_after_recovery(
-                    &mut client, &events, &account_id_hex, &account_label,
-                    &shared, &product_backlog, &mut scheduled_convergence,
-                ).await;
+                match job.origin {
+                    ComparisonRecoveryOrigin::PeriodicMaintenance => {
+                        finish_periodic_maintenance_after_recovery(
+                            &mut client, &events, &account_id_hex, &account_label,
+                            &shared, &product_backlog, &mut scheduled_convergence,
+                        ).await;
+                    }
+                    ComparisonRecoveryOrigin::PostConvergence { audit_tracker_update } => {
+                        if audit_tracker_update {
+                            shared.schedule_audit_log_tracker_update("scheduled_convergence");
+                        }
+                    }
+                }
                 job.phase.finish(TelemetryOutcome::Success);
             }
             completed = async {
@@ -1364,7 +1388,7 @@ async fn run_app_runtime_account_worker(
                         // before the CatchUp barrier. Apply this extra gate only
                         // to fresh channel arrivals, or the earlier work would
                         // be requeued behind CatchUp after capacity returns.
-                        if comparison_maintenance.is_some() && !approved_pending
+                        if comparison_recovery.is_some() && !approved_pending
                             && (matches!(command, AccountWorkerCommand::CatchUp { .. })
                                 || (pending.iter().any(|queued| {
                                     matches!(queued, AccountWorkerCommand::CatchUp { .. })
@@ -1446,7 +1470,7 @@ async fn run_app_runtime_account_worker(
                 yield_to_convergence = false;
                 yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
-                let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence);
+                let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
                 // Mutations retain worker FIFO order; reads use the snapshot.
@@ -1506,16 +1530,52 @@ async fn run_app_runtime_account_worker(
                                             &mut scheduled_convergence,
                                             &mut client,
                                         );
-                                        let _ = run_pending_epoch_backfill_reporting_arm(
-                                            &mut client,
+                                        let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
+                                        // An existing comparison owns the one
+                                        // account lease. Keep this local pass
+                                        // complete and let that job settle the
+                                        // still-durable recovery debt.
+                                        let backfill_armed = client.has_pending_epoch_backfill();
+                                        let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                                            crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
+                                        )).flatten();
+                                        let backfill_result = if comparison_recovery.is_some() {
+                                            Ok(EpochBackfillRunOutcome::Deferred)
+                                        } else {
+                                            match execute_pending_comparison_or_inline(
+                                                &mut client,
+                                                &shared,
+                                                EpochBackfillExecutionSeam::Maintenance,
+                                            ).await {
+                                                PendingComparisonExecution::Offloaded {
+                                                    grant, subscription_attempt, network,
+                                                } => {
+                                                    comparison_recovery = Some(ComparisonRecoveryJob {
+                                                        grant: *grant,
+                                                        subscription_attempt,
+                                                        network,
+                                                        observation,
+                                                        backfill_armed,
+                                                        phase: phase.take().expect("scheduled phase exists"),
+                                                        origin: ComparisonRecoveryOrigin::PostConvergence {
+                                                            audit_tracker_update,
+                                                        },
+                                                    });
+                                                    return;
+                                                }
+                                                PendingComparisonExecution::Inline(result) => result,
+                                            }
+                                        };
+                                        let _ = report_pending_epoch_backfill_result(
+                                            backfill_result,
+                                            backfill_armed,
+                                            observation,
                                             &events,
                                             &account_id_hex,
                                             &account_label,
                                             &shared,
-                                            EpochBackfillExecutionSeam::Maintenance,
-                                        )
-                                        .await;
-                                        if sync_summary_triggers_audit_tracker_update(&summary) {
+                                        );
+                                        if audit_tracker_update {
                                             shared.schedule_audit_log_tracker_update("scheduled_convergence");
                                         }
                                     }
@@ -1550,7 +1610,9 @@ async fn run_app_runtime_account_worker(
                 ))
                 .await;
 
-                phase.finish(TelemetryOutcome::Success);
+                if let Some(phase) = phase {
+                    phase.finish(TelemetryOutcome::Success);
+                }
             }
             _ = async {}, if yield_to_bounded_admission
                 && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)
@@ -2029,7 +2091,7 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
-                if comparison_maintenance.is_some() {
+                if comparison_recovery.is_some() {
                     continue 'worker;
                 }
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
@@ -2130,82 +2192,33 @@ async fn run_app_runtime_account_worker(
                 let observation = backfill_armed.then(|| shared.product_analytics.begin(
                     crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                 )).flatten();
-                let mut credit = bounded_recovery::try_acquire_recovery_credit(
-                    &shared.recovery_credit_pool(),
-                );
-                let selection = if credit.is_none() && client.comparison_only_waiting_for_credit().unwrap_or(false) {
-                    Ok(crate::client::PendingRecoverySelection::Deferred)
-                } else {
-                    client.select_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
-                };
-                let backfill_result = match selection {
-                    Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
-                        let grant = *grant;
-                        let eligible = credit.is_some()
-                            && client.comparison_offload_eligible(&grant).unwrap_or(false);
-                        #[cfg(test)]
-                        shared.comparison_test_trace.lock().unwrap().push(
-                            if eligible { "grant_eligible" } else { "grant_inline" },
-                        );
-                        if eligible {
-                            match client.activate_comparison_grant(&grant).await {
-                                Ok(subscription_attempt) => match ComparisonNetworkJob::start(
-                                    &client, &grant, credit.take().expect("offloaded grant owns credit"),
-                                ) {
-                                    Ok(network) => {
-                                        #[cfg(test)]
-                                        shared.comparison_test_trace.lock().unwrap().push("task_started");
-                                        comparison_maintenance = Some(ComparisonMaintenanceJob {
-                                            grant, subscription_attempt, network,
-                                            observation, backfill_armed, phase,
-                                        });
-                                        continue 'worker;
-                                    }
-                                    Err(error) => {
-                                        #[cfg(test)]
-                                        shared.comparison_test_trace.lock().unwrap().push("task_start_error");
-                                        Some(Err(error))
-                                    }
-                                },
-                                Err(error) => {
-                                    #[cfg(test)]
-                                    shared.comparison_test_trace.lock().unwrap().push("activation_error");
-                                    Some(Err(error))
-                                }
-                            }
-                        } else {
-                            drop(credit.take());
-                            Some(client.execute_pending_epoch_backfill_grant(grant).await)
-                        }
-                    }
-                    Ok(crate::client::PendingRecoverySelection::Deferred) => {
-                        #[cfg(test)]
-                        shared.comparison_test_trace.lock().unwrap().push("selection_deferred");
-                        Some(Ok(EpochBackfillRunOutcome::Deferred))
-                    },
-                    Ok(crate::client::PendingRecoverySelection::NotPending) => {
-                        #[cfg(test)]
-                        shared.comparison_test_trace.lock().unwrap().push("selection_empty");
-                        Some(Ok(EpochBackfillRunOutcome::NotPending))
-                    },
-                    Err(error) => {
-                        #[cfg(test)]
-                        shared.comparison_test_trace.lock().unwrap().push(match &error {
-                            AppError::Storage(cgka_traits::storage::StorageError::Serialization(message))
-                                if message == "invalid recovery comparison" => "selection_invalid_comparison",
-                            AppError::Storage(cgka_traits::storage::StorageError::Serialization(_)) => "selection_storage_serialization",
-                            AppError::Storage(cgka_traits::storage::StorageError::Busy(_)) => "selection_storage_busy",
-                            AppError::Storage(_) => "selection_storage_other",
-                            AppError::Transport(_) => "selection_transport_error",
-                            AppError::Sqlite(_) => "selection_sqlite_error",
-                            _ => "selection_other_error",
+                let backfill_result = match execute_pending_comparison_or_inline(
+                    &mut client,
+                    &shared,
+                    EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                {
+                    PendingComparisonExecution::Offloaded {
+                        grant,
+                        subscription_attempt,
+                        network,
+                    } => {
+                        comparison_recovery = Some(ComparisonRecoveryJob {
+                            grant: *grant,
+                            subscription_attempt,
+                            network,
+                            observation,
+                            backfill_armed,
+                            phase,
+                            origin: ComparisonRecoveryOrigin::PeriodicMaintenance,
                         });
-                        Some(Err(error))
-                    },
+                        continue 'worker;
+                    }
+                    PendingComparisonExecution::Inline(result) => result,
                 };
-                drop(credit.take());
                 let _ = report_pending_epoch_backfill_result(
-                    backfill_result.expect("inline maintenance result"), backfill_armed,
+                    backfill_result, backfill_armed,
                     observation, &events, &account_id_hex, &account_label, &shared,
                 );
                 finish_periodic_maintenance_after_recovery(
@@ -2223,8 +2236,131 @@ async fn run_app_runtime_account_worker(
             }
         }
     }
-    if let Some(job) = comparison_maintenance {
+    if let Some(job) = comparison_recovery {
         job.network.abort_and_wait().await;
+    }
+}
+
+/// Select one existing owner grant, then move only an eligible comparison's
+/// immutable SDK request to the shared worker job. Other frozen shapes execute
+/// through the original inline path without reserving a replacement grant.
+async fn execute_pending_comparison_or_inline(
+    client: &mut AppClient,
+    shared: &RuntimeSharedServices,
+    seam: EpochBackfillExecutionSeam,
+) -> PendingComparisonExecution {
+    let mut credit = bounded_recovery::try_acquire_recovery_credit(&shared.recovery_credit_pool());
+    let selection =
+        if credit.is_none() && client.comparison_only_waiting_for_credit().unwrap_or(false) {
+            Ok(crate::client::PendingRecoverySelection::Deferred)
+        } else {
+            client.select_pending_epoch_backfill(seam)
+        };
+    match selection {
+        Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
+            let grant = *grant;
+            let eligible =
+                credit.is_some() && client.comparison_offload_eligible(&grant).unwrap_or(false);
+            #[cfg(test)]
+            shared
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .push(if eligible {
+                    "grant_eligible"
+                } else {
+                    "grant_inline"
+                });
+            if eligible {
+                match client.activate_comparison_grant(&grant).await {
+                    Ok(subscription_attempt) => match ComparisonNetworkJob::start(
+                        client,
+                        &grant,
+                        credit.take().expect("offloaded grant owns credit"),
+                    ) {
+                        Ok(network) => {
+                            #[cfg(test)]
+                            shared
+                                .comparison_test_trace
+                                .lock()
+                                .unwrap()
+                                .push("task_started");
+                            PendingComparisonExecution::Offloaded {
+                                grant: Box::new(grant),
+                                subscription_attempt,
+                                network,
+                            }
+                        }
+                        Err(error) => {
+                            #[cfg(test)]
+                            shared
+                                .comparison_test_trace
+                                .lock()
+                                .unwrap()
+                                .push("task_start_error");
+                            PendingComparisonExecution::Inline(Err(error))
+                        }
+                    },
+                    Err(error) => {
+                        #[cfg(test)]
+                        shared
+                            .comparison_test_trace
+                            .lock()
+                            .unwrap()
+                            .push("activation_error");
+                        PendingComparisonExecution::Inline(Err(error))
+                    }
+                }
+            } else {
+                drop(credit.take());
+                PendingComparisonExecution::Inline(
+                    client.execute_pending_epoch_backfill_grant(grant).await,
+                )
+            }
+        }
+        Ok(crate::client::PendingRecoverySelection::Deferred) => {
+            #[cfg(test)]
+            shared
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .push("selection_deferred");
+            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
+        }
+        Ok(crate::client::PendingRecoverySelection::NotPending) => {
+            #[cfg(test)]
+            shared
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .push("selection_empty");
+            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::NotPending))
+        }
+        Err(error) => {
+            #[cfg(test)]
+            shared
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .push(match &error {
+                    AppError::Storage(cgka_traits::storage::StorageError::Serialization(
+                        message,
+                    )) if message == "invalid recovery comparison" => {
+                        "selection_invalid_comparison"
+                    }
+                    AppError::Storage(cgka_traits::storage::StorageError::Serialization(_)) => {
+                        "selection_storage_serialization"
+                    }
+                    AppError::Storage(cgka_traits::storage::StorageError::Busy(_)) => {
+                        "selection_storage_busy"
+                    }
+                    AppError::Storage(_) => "selection_storage_other",
+                    AppError::Transport(_) => "selection_transport_error",
+                    AppError::Sqlite(_) => "selection_sqlite_error",
+                    _ => "selection_other_error",
+                });
+            PendingComparisonExecution::Inline(Err(error))
+        }
     }
 }
 
@@ -6140,6 +6276,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[cfg(feature = "test-policy-overrides")]
+    mod post_convergence_comparison_resume_tests;
     mod real_sdk_bounded_tests;
     mod real_sdk_progress_fairness_tests;
     mod resource_bounds_tests;
