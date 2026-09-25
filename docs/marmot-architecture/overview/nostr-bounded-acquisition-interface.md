@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-09-24
+updated: 2026-09-25
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
@@ -190,25 +190,42 @@ relay's exact-ID EOSE. During the outstanding SDK request, the acquiring
 worker completes an outbound send and a committed snapshot read, and a live
 encrypted message from another account reaches its projection before the
 same acquisition ends. Both relays return the exact event; only the delayed
-relay's EOSE is withheld. Durable retention can admit either copy and satisfy
-the known-event obligation. This proves progress for that single case, not
-general coverage from partial endpoint evidence or recovery when only one
-endpoint returns the event.
+relay's EOSE is withheld. The earlier relay's EVENT remains outside SQLCipher
+while the SDK result is pending. After the delayed result completes, durable
+retention can admit either copy and satisfy the known-event obligation. This
+proves progress for that single case, not general coverage from partial
+endpoint evidence or recovery when only one endpoint returns the event.
 
-The activation gate remains closed. These tests do not yet qualify the real
-SDK path for SDK-seen but unretained input, both endpoints returning no data,
-saturation/oversized results, cancellation on either side of a durable
-prefix, stale generation/route fences, or restart persistence. Focused
-worker admission and completion fences, with their exact limits, are recorded
-in [recovery admission and interruption qualification](../further-context/recovery-admission-interruption-qualification.md).
-Two real-SDK controls exercise competing recovery demands and a newer delivery
-loss. On a conforming NIP-77 relay, an already-retained known ID and a fresh
-comparison both settle through automatic worker service after the injected
-test clock moves past the current shared retry deadline. The fixture allows
-either owner-selection order and establishes no real-time latency bound. In a
-separate two-relay run, one exact-ID EOSE stays withheld after the event has
-been durably retained from the other relay. A newer queue-loss revision then
-prevents that in-flight exact result from checkpointing its stale scope;
+The activation gate remains closed. The [resource-bounds qualification](../further-context/recovery-resource-bounds-qualification.md)
+covers request-local SDK input, empty and partial endpoints, duplicate and
+oversized results, and an exhausted worker-credit gate. It does not qualify
+cancellation on either side of a durable prefix, stale generation/route
+fences, restart persistence, or resumption after worker-credit saturation.
+Focused worker admission and completion fences, with their exact limits, are
+recorded in [recovery admission and interruption qualification](../further-context/recovery-admission-interruption-qualification.md).
+The [real-SDK receipt-release fence qualification](../further-context/recovery-interruption-redelivery-qualification.md)
+adds positive returned-content evidence while retaining the redelivery limit.
+The [real-SDK attempt/scope replacement qualification](../further-context/recovery-lifecycle-generation-qualification.md)
+checks durable admission from an old result without allowing its completion to clear the newer scope.
+The [progress and fairness qualification](../further-context/recovery-p5-progress-fairness-2026-09-24.md)
+records controlled ready-work and distinct known-ID owner turns; this branch
+also runs those fixtures against the isolated SDK pin. Its broad recovery and
+device limits remain open.
+
+Two further real-SDK controls exercise competing recovery demands and a newer
+delivery loss. The conforming NIP-77 relay fixture expects an already-retained
+known ID and a fresh comparison to settle through automatic worker service
+after the injected test clock moves past the current shared retry deadline.
+It allows either owner-selection order and establishes no real-time latency
+bound. An intermittent failure was traced to this fixture joining an earlier
+frozen route with a newer request second; that test-only window mismatch was
+corrected in #2023. This controlled case does not establish general owner
+fairness.
+
+In a separate two-relay run, one exact-ID EOSE stays withheld after the other
+relay has sent the event. The event remains unadmitted while the SDK request is
+pending. A newer queue-loss revision then prevents that in-flight exact result
+from checkpointing its stale scope;
 the queue-loss demand remains pending. These controls do not qualify all
 competing account recovery demands or every stale loss outcome. Controlled
 backend tests cover several remaining policies, but they do not establish

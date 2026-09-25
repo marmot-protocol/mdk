@@ -46,6 +46,18 @@ nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
 The catalog includes C-only compatibility shims; prefer the v4 audit configuration
 setter and the composable runtime options constructor for new integrations.
 
+`marmot_record_host_performance` accepts 28 shared and nine Linux-specific host
+stages in addition to the existing readiness and visibility milestones. Read these
+37 stages by their `host_*` operation name in
+`MarmotAppPerformanceSnapshot.runtime_operations`. Splash readiness, foreground
+readiness and outbound/inbound message visibility remain in `host_splash_ready`,
+`host_foreground_local_ready`, `host_outbound_message_visible` and
+`host_inbound_message_visible`, respectively. The snapshot layout and existing
+operation values are unchanged. Adopt new operations with matching headers/libraries
+and free snapshots with `marmot_app_performance_snapshot_free`. Stage boundaries
+are defined in the [runtime telemetry catalog](../../docs/marmot-architecture/runtime-latency-telemetry.md#boundaries).
+See the [diagnostics contract](../marmot-uniffi/README.md#localization-privacy-and-diagnostics).
+
 ## What you get
 
 - `libmarmot_c.so` / `libmarmot_c.a` (cdylib + staticlib).

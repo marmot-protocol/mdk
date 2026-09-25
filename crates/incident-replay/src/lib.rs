@@ -64,7 +64,10 @@ pub use convergence::{
 };
 pub use export::{AgentStateExport, ParseError, parse};
 pub use fork::{ForkCommitKind, ForkRecoveryError, RecoveredFork, recover_fork};
-pub use ndjson::{StreamParseError, is_stream, parse_stream};
+pub use ndjson::{
+    MAX_STREAM_LINE_BYTES, MAX_STREAM_LINES, StreamParseError, is_stream, parse_stream,
+    starts_as_stream,
+};
 pub use route::{
     Advisory, CONVERGENCE_NAME, INCIDENT_NAME, MEMBERSHIP_INCIDENT_NAME, Outcome, Routing, route,
 };

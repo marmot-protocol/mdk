@@ -112,6 +112,10 @@ pub(crate) enum AppPerformanceOperation {
 /// This is deliberately a closed enum rather than a caller-supplied metric or
 /// label name. Adding an operation therefore requires an MDK review and cannot
 /// silently create unbounded Prometheus cardinality.
+///
+/// Record only boundaries the host can observe. Nested stages overlap and must
+/// not be summed. Report the actual outcome, including early/error returns.
+/// Shared and Linux-specific stages use the same runtime registry and bindings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostPerformanceOperation {
     SplashReady,
@@ -122,6 +126,80 @@ pub enum HostPerformanceOperation {
     InboundMessageVisible,
     ConversationLocalVisible,
     ConversationComposerReady,
+    /// From host startup entry to entering the vault gate; excludes unlock input and vault work.
+    LinuxStartupBeforeVault,
+    /// From post-unlock runtime setup to the first main-loop presentation return; excludes the vault gate.
+    LinuxStartupAfterVault,
+    /// Initialize the host window or root UI surface.
+    WindowInit,
+    /// Load and prepare the font resources needed by the host.
+    FontsInit,
+    /// Construct and start the MDK runtime from the host.
+    RuntimeInit,
+    /// Load account state into the host model.
+    AccountLoad,
+    /// Switch the active account and initialize its host state.
+    AccountSwitch,
+    /// Process input and update host state for one frame.
+    FrameUpdate,
+    /// Compute the layout for one frame.
+    FrameLayout,
+    /// Generate or submit draw work for one frame.
+    FrameDraw,
+    /// Execute the host presentation call, including any wait it performs.
+    FramePresent,
+    /// Process post-presentation frame work; excludes the presentation call and idle wait.
+    LinuxFramePostPresent,
+    /// From main-loop frame start through presentation return; includes update, layout, draw and present.
+    LinuxFrameUntilPresent,
+    /// Wait for an event or idle-refresh deadline after frame work; excludes waits inside presentation.
+    LinuxFrameIdleWait,
+    /// Read and prepare the active chat list in the host.
+    ChatListLoad,
+    /// Read and prepare the contact list in the host.
+    ContactsLoad,
+    /// Read and prepare the archived chat list in the host.
+    ArchivedChatListLoad,
+    /// Assemble the profile screen model, including auxiliary profile data.
+    ProfileLoad,
+    /// Read one locally cached profile and convert it to host data.
+    ProfileRead,
+    /// Open a timeline subscription and obtain its initial snapshot.
+    TimelineOpen,
+    /// Request and obtain one additional timeline page.
+    TimelinePage,
+    /// Wait from a prepared timeline update until the UI begins consuming it.
+    TimelineHandoff,
+    /// Apply a timeline snapshot or update to the host UI model.
+    TimelineApply,
+    /// Execute a host send task, including attachments; exclude queue wait.
+    MessageSend,
+    /// Execute a search that returns matching messages across conversations.
+    MessageSearch,
+    /// Execute a search that returns conversations containing matching messages.
+    ConversationSearch,
+    /// Wait from media task enqueue until processing begins.
+    MediaQueueWait,
+    /// Load and decode media for display; exclude queue wait and UI application.
+    MediaPrepare,
+    /// Obtain plaintext media bytes from cache or download and decryption.
+    MediaLoad,
+    /// Read usable plaintext media bytes from a successful cache lookup.
+    MediaCacheRead,
+    /// Decode plaintext media bytes into display-ready host resources.
+    MediaDecode,
+    /// Install prepared media in the UI, including GPU resource creation.
+    MediaApply,
+    /// Derive the vault encryption key with Argon2id; excludes vault file I/O.
+    LinuxVaultDeriveKey,
+    /// Open an existing vault through decrypted state installation; includes file I/O and any key derivation.
+    LinuxVaultOpen,
+    /// Create an unlocked vault through initial persistence; includes lock wait, key derivation and writing.
+    LinuxVaultCreate,
+    /// Serialize and encrypt vault state through atomic file replacement and any dev-cache update.
+    LinuxVaultPersist,
+    /// Serialize and persist host preferences.
+    SettingsSave,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1042,6 +1120,9 @@ impl AppPerformanceTelemetry {
         duration: Duration,
         outcome: HostPerformanceOutcome,
     ) {
+        use HostPerformanceOperation as Host;
+        use RuntimePerformanceOperation as Runtime;
+
         let runtime_outcome = match outcome {
             HostPerformanceOutcome::Success => runtime::Outcome::Success,
             HostPerformanceOutcome::Failure => runtime::Outcome::Failure,
@@ -1050,36 +1131,76 @@ impl AppPerformanceTelemetry {
             HostPerformanceOutcome::Unavailable => runtime::Outcome::NotReady,
         };
         let success = matches!(outcome, HostPerformanceOutcome::Success);
-        match operation {
-            HostPerformanceOperation::ConversationLocalVisible => self.record_runtime(
-                RuntimePerformanceOperation::HostConversationLocalVisible,
-                duration,
-                runtime_outcome,
-            ),
-            HostPerformanceOperation::ConversationComposerReady => self.record_runtime(
-                RuntimePerformanceOperation::HostConversationComposerReady,
-                duration,
-                runtime_outcome,
-            ),
-            HostPerformanceOperation::OutboundMessageVisible => self.record(
-                AppPerformanceOperation::HostOutboundMessageVisible,
-                duration,
-                success,
-            ),
-            HostPerformanceOperation::InboundMessageVisible => self.record(
-                AppPerformanceOperation::HostInboundMessageVisible,
-                duration,
-                success,
-            ),
-            HostPerformanceOperation::SplashReady => {
-                self.record(AppPerformanceOperation::HostSplashReady, duration, success)
+        let runtime_operation = match operation {
+            Host::ConversationLocalVisible => Runtime::HostConversationLocalVisible,
+            Host::ConversationComposerReady => Runtime::HostConversationComposerReady,
+            Host::OutboundMessageVisible => {
+                self.record(
+                    AppPerformanceOperation::HostOutboundMessageVisible,
+                    duration,
+                    success,
+                );
+                return;
             }
-            HostPerformanceOperation::ForegroundLocalReady => self.record(
-                AppPerformanceOperation::HostForegroundLocalReady,
-                duration,
-                success,
-            ),
-        }
+            Host::InboundMessageVisible => {
+                self.record(
+                    AppPerformanceOperation::HostInboundMessageVisible,
+                    duration,
+                    success,
+                );
+                return;
+            }
+            Host::SplashReady => {
+                self.record(AppPerformanceOperation::HostSplashReady, duration, success);
+                return;
+            }
+            Host::ForegroundLocalReady => {
+                self.record(
+                    AppPerformanceOperation::HostForegroundLocalReady,
+                    duration,
+                    success,
+                );
+                return;
+            }
+            Host::LinuxStartupBeforeVault => Runtime::HostLinuxStartupBeforeVault,
+            Host::LinuxStartupAfterVault => Runtime::HostLinuxStartupAfterVault,
+            Host::WindowInit => Runtime::HostWindowInit,
+            Host::FontsInit => Runtime::HostFontsInit,
+            Host::RuntimeInit => Runtime::HostRuntimeInit,
+            Host::AccountLoad => Runtime::HostAccountLoad,
+            Host::AccountSwitch => Runtime::HostAccountSwitch,
+            Host::FrameUpdate => Runtime::HostFrameUpdate,
+            Host::FrameLayout => Runtime::HostFrameLayout,
+            Host::FrameDraw => Runtime::HostFrameDraw,
+            Host::FramePresent => Runtime::HostFramePresent,
+            Host::LinuxFramePostPresent => Runtime::HostLinuxFramePostPresent,
+            Host::LinuxFrameUntilPresent => Runtime::HostLinuxFrameUntilPresent,
+            Host::LinuxFrameIdleWait => Runtime::HostLinuxFrameIdleWait,
+            Host::ChatListLoad => Runtime::HostChatListLoad,
+            Host::ContactsLoad => Runtime::HostContactsLoad,
+            Host::ArchivedChatListLoad => Runtime::HostArchivedChatListLoad,
+            Host::ProfileLoad => Runtime::HostProfileLoad,
+            Host::ProfileRead => Runtime::HostProfileRead,
+            Host::TimelineOpen => Runtime::HostTimelineOpen,
+            Host::TimelinePage => Runtime::HostTimelinePage,
+            Host::TimelineHandoff => Runtime::HostTimelineHandoff,
+            Host::TimelineApply => Runtime::HostTimelineApply,
+            Host::MessageSend => Runtime::HostMessageSend,
+            Host::MessageSearch => Runtime::HostMessageSearch,
+            Host::ConversationSearch => Runtime::HostConversationSearch,
+            Host::MediaQueueWait => Runtime::HostMediaQueueWait,
+            Host::MediaPrepare => Runtime::HostMediaPrepare,
+            Host::MediaLoad => Runtime::HostMediaLoad,
+            Host::MediaCacheRead => Runtime::HostMediaCacheRead,
+            Host::MediaDecode => Runtime::HostMediaDecode,
+            Host::MediaApply => Runtime::HostMediaApply,
+            Host::LinuxVaultDeriveKey => Runtime::HostLinuxVaultDeriveKey,
+            Host::LinuxVaultOpen => Runtime::HostLinuxVaultOpen,
+            Host::LinuxVaultCreate => Runtime::HostLinuxVaultCreate,
+            Host::LinuxVaultPersist => Runtime::HostLinuxVaultPersist,
+            Host::SettingsSave => Runtime::HostSettingsSave,
+        };
+        self.record_runtime(runtime_operation, duration, runtime_outcome);
     }
 
     /// Return cumulative process-wide aggregates suitable for the opt-in

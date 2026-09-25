@@ -14,6 +14,7 @@ acquisition credits are process global.
 | Case | Evidence | Limit |
 | --- | --- | --- |
 | Receipt release during a returned batch | A controlled transport result is owned by the real worker while admission is paused. SQLCipher `release_message_for_replay` removes an unrelated seeded retained row, invalidates inventory, and journals receipt release. The worker rejects the result under its stale inventory fence; the known-event demand remains. | The released row is synthetic, and this case does not prove eventual redelivery of that row or a resource-refusal path. The transport result is controlled rather than produced by a real SDK. |
+| Receipt release with a real SDK result | [The two-relay qualification](recovery-interruption-redelivery-qualification.md) binds an actual returned event to the account, attempt, and requested ID before admission. Releasing a distinct seeded receipt advances inventory; the worker leaves target retention, the known-event demand, and the persisted cursor unchanged. The installed scope has no retained-known-event or admission-complete checkpoint. | The released receipt is synthetic. Nonexhaustive endpoint evidence may still be recorded under the compatible installed scope. The case stops after rejection and does not prove a second bounded reacquisition or SDK ordinary seen-state. |
 | Replaced attempt after a returned batch | A fault-injected durable reservation and replacement scope plan retire the old scope token while the worker owns its valid result. The worker can retain valid ciphertext under the unchanged route/inventory fence, but the old token cannot clear the known-event demand at completion. | Reservation and replacement are injected through storage outside normal owner serialization; this proves the conditional fence, not a production scheduling interleaving. A reservation without scope replacement intentionally permits compatible late evidence. |
 
 Existing adjacent tests cover other seams:
@@ -32,7 +33,7 @@ same-request durable-prefix or process-kill durability.
 
 ## Acquisition and ordinary delivery overlap
 
-At the rust-nostr revision `0efbb4ee` pinned by this test tree, an acquisition
+At the prior rust-nostr revision `0efbb4ee`, an acquisition
 REQ's validated first-seen EVENT also emits a global
 `ClientNotification::Event`. MDK's
 `NostrSdkRelayClient::spawn_notification_forwarder` forwards that notification
@@ -43,8 +44,9 @@ result or EOSE. A controlled attempt observed that ordering while the bounded
 result was still pending; relay transmission alone was not used as proof of
 SDK acceptance. The SDK/adapter boundary and its accounting are being
 qualified separately. The merged [fork correction](https://github.com/erskingardner/rust-nostr/pull/2)
-is being adopted in MDK through a separate change. No test here attributes
-ordinary retention to bounded result admission.
+is now pinned at `63384e485d55097cb3d9e57a2146f453a5742570` in MDK. The
+new real-SDK receipt-release case observes request-local result content; it
+does not attribute ordinary retention to bounded result admission.
 
 ## Remaining acceptance work
 

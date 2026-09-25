@@ -325,6 +325,15 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(3),
 ];
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct BoundedResultWitness {
+    pub(crate) account_label: String,
+    pub(crate) attempt_serial: u64,
+    pub(crate) event_id: [u8; 32],
+    pub(crate) matching_items: usize,
+}
+
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     /// Off until the production SDK acquisition backend passes its two-relay
@@ -336,6 +345,8 @@ pub struct RuntimeSharedServices {
     pub(crate) bounded_preparation_probes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     pub(crate) bounded_result_ready: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_result_witness: Arc<StdMutex<Option<BoundedResultWitness>>>,
     #[cfg(test)]
     pub(crate) bounded_prefix_admitted: Arc<Notify>,
     #[cfg(test)]
@@ -442,6 +453,8 @@ impl Default for RuntimeSharedServices {
             #[cfg(test)]
             bounded_result_ready: Arc::new(Notify::new()),
             #[cfg(test)]
+            bounded_result_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             bounded_prefix_admitted: Arc::new(Notify::new()),
             #[cfg(test)]
             bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
@@ -501,6 +514,8 @@ impl RuntimeSharedServices {
             bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             bounded_result_ready: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_result_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             bounded_prefix_admitted: Arc::new(Notify::new()),
             #[cfg(test)]

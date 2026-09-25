@@ -104,8 +104,8 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 # Already in the graph through quinn's platform-verifier feature; direct dep so
 # the broker can build ALPN-carrying rustls client configs with platform trust.
 rustls-platform-verifier = "0.6"
-nostr = { git = "https://github.com/erskingardner/rust-nostr", rev = "0efbb4ee20cd2d48ff9ffc19d307ec5a3658d6b9", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
-nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "0efbb4ee20cd2d48ff9ffc19d307ec5a3658d6b9", features = ["local-relay"] }
+nostr = { git = "https://github.com/erskingardner/rust-nostr", rev = "63384e485d55097cb3d9e57a2146f453a5742570", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
+nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "63384e485d55097cb3d9e57a2146f453a5742570", features = ["local-relay"] }
 nostr-relay-builder = "0.44"
 # OTLP export (behind the marmot-app `otlp-export` feature): map pre-aggregated
 # relay telemetry straight to the OTLP protobuf and POST it over the existing

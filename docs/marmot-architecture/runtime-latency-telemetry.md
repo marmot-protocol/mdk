@@ -1,7 +1,7 @@
 ---
 title: "Conversation readiness and runtime latency telemetry"
 created: 2026-09-18
-updated: 2026-09-23
+updated: 2026-09-24
 status: implementation
 tags: [marmot, runtime, telemetry, performance]
 ---
@@ -90,6 +90,43 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `catch_up_after_mutation` | Command helper's post-mutation catch-up (does not cover every creation/invite background task) |
 | `catch_up_coalesced` | Zero-duration count of requests folded into an existing worker catch-up |
 | `reconnect_command_rejected` | Zero-duration count of ordinary commands dropped while no engine exists during reconnect; preserves existing caller behavior |
+| `host_linux_startup_before_vault` | Host startup entry to entering the vault gate; excludes unlock input and vault work |
+| `host_linux_startup_after_vault` | Post-unlock runtime setup, after tray/window policy, to the first main-loop presentation return; includes runtime boot and initial host state loading, excludes the vault gate |
+| `host_window_init` | Initialize the host window or root UI surface |
+| `host_fonts_init` | Load and prepare font resources needed by the host |
+| `host_runtime_init` | Construct and start the MDK runtime from the host |
+| `host_account_load` | Load account state into the host model |
+| `host_account_switch` | Switch the active account and initialize its host state |
+| `host_frame_update` | Process input and update host state for one frame |
+| `host_frame_layout` | Compute layout for one frame |
+| `host_frame_draw` | Generate or submit draw work for one frame |
+| `host_frame_present` | Execute the host presentation call, including any wait it performs |
+| `host_linux_frame_post_present` | Process post-presentation frame work through the final cursor update; excludes the presentation call and idle wait |
+| `host_linux_frame_until_present` | Main-loop frame start through presentation return; includes update, layout, draw and present, excludes post-presentation work and idle wait |
+| `host_linux_frame_idle_wait` | Wait for an event or idle-refresh deadline after frame work; excludes waits inside presentation |
+| `host_chat_list_load` | Read and prepare the active chat list in the host |
+| `host_contacts_load` | Read and prepare the contact list in the host |
+| `host_archived_chat_list_load` | Read and prepare the archived chat list in the host |
+| `host_profile_load` | Assemble the profile screen model, including auxiliary profile data |
+| `host_profile_read` | Read one locally cached profile and convert it to host data |
+| `host_timeline_open` | Open a timeline subscription and obtain its initial snapshot |
+| `host_timeline_page` | Request and obtain one additional timeline page |
+| `host_timeline_handoff` | Wait from a prepared timeline update until the UI begins consuming it |
+| `host_timeline_apply` | Apply a timeline snapshot or update to the host UI model |
+| `host_message_send` | Execute a host send task, including attachments; excludes queue wait |
+| `host_message_search` | Execute a search returning matching messages across conversations |
+| `host_conversation_search` | Execute a search returning conversations containing matching messages |
+| `host_media_queue_wait` | Wait from media task enqueue until processing begins |
+| `host_media_prepare` | Load and decode media for display; excludes queue wait and UI application |
+| `host_media_load` | Obtain plaintext media bytes from cache or download and decryption |
+| `host_media_cache_read` | Read usable plaintext media bytes from a successful cache lookup |
+| `host_media_decode` | Decode plaintext media bytes into display-ready host resources |
+| `host_media_apply` | Install prepared media in the UI, including GPU resource creation |
+| `host_linux_vault_derive_key` | Derive the vault encryption key with Argon2id; excludes vault file I/O |
+| `host_linux_vault_open` | Open an existing vault through decrypted state installation; includes file I/O and any key derivation, excludes user input |
+| `host_linux_vault_create` | Create an unlocked vault through initial persistence; includes lock wait, key derivation and writing, excludes user input |
+| `host_linux_vault_persist` | Serialize and encrypt vault state through atomic file replacement and any dev-cache update; excludes key derivation |
+| `host_settings_save` | Serialize and persist host preferences |
 
 Storage observers attach to the cached account connection after worker client open and again
 on reconnect. They cover subsequent engine and projection access through that connection, not
@@ -121,6 +158,11 @@ with elapsed time from the same start. `Unavailable` maps to `not_ready`. Do not
 success on receiving a DTO or merely finishing relay sync. After an authoritative disabled
 composer, close that open attempt as unavailable; a later user action can start a new attempt.
 Other legacy host operations still aggregate all non-success outcomes as failures.
+
+The 28 shared host stages and nine `host_linux_*` stages in the Boundaries table use the same
+reporting API and are readable through the Rust, UniFFI and C `runtime_operations` arrays.
+Hosts should report only applicable, observable stages. Every platform exports the fixed
+registry, so unreported stages, including Linux stages on other platforms, remain zero.
 
 The binding surface is provided here; native call-site adoption and device validation are separate
 work. Host milestones have no live start API, so unfinished native rendering itself is not visible
