@@ -48,7 +48,6 @@ pub(crate) struct ComparisonRouteResult {
 }
 
 pub(crate) struct ComparisonNetworkResult {
-    deadline: tokio::time::Instant,
     routes: Vec<ComparisonRouteResult>,
 }
 
@@ -164,13 +163,7 @@ impl ComparisonNetworkJob {
                     result,
                 });
             }
-            (
-                credit,
-                ComparisonNetworkResult {
-                    deadline,
-                    routes: results,
-                },
-            )
+            (credit, ComparisonNetworkResult { routes: results })
         });
         Ok(Self { handle })
     }
@@ -333,48 +326,16 @@ impl AppClient {
             // leaves durable comparison and coverage debt for the next owner.
             return Ok(EpochBackfillRunOutcome::Deferred);
         }
+        // Acquisition may have consumed its entire quantum before the worker
+        // joins. Give delivery of the already owned batch a separate bounded
+        // admission window.
+        let admission_deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
         let mut outcomes = Vec::with_capacity(network.routes.len());
         for route in network.routes {
-            if route.cursor != route.initial_cursor {
-                storage
-                    .advance_transport_reconciliation_replay_cursor(&route.route, route.cursor)?;
-            }
-            let outcome = match route.result {
-                ComparisonRouteWorkResult::Skipped => {
-                    storage_sqlite::RecoveryComparisonOutcome::ServicedPartial
-                }
-                ComparisonRouteWorkResult::TimedOut => {
-                    storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-                }
-                ComparisonRouteWorkResult::Returned(Ok(None)) => {
-                    storage_sqlite::RecoveryComparisonOutcome::Unsupported
-                }
-                ComparisonRouteWorkResult::Returned(Err(_)) => {
-                    storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-                }
-                ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
-                    let mut submitted = true;
-                    for event in events {
-                        if !matches!(
-                            tokio::time::timeout_at(
-                                network.deadline,
-                                self.adapter.queue_reconciled_event(event)
-                            )
-                            .await,
-                            Ok(Ok(_))
-                        ) {
-                            submitted = false;
-                            break;
-                        }
-                    }
-                    if !submitted || summary.relays_failed > 0 {
-                        storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-                    } else {
-                        storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown
-                    }
-                }
-            };
-            outcomes.push((route.route, outcome));
+            outcomes.push(
+                self.admit_comparison_route(&storage, route, admission_deadline)
+                    .await?,
+            );
         }
         let mut counts = DrainCounts::default();
         let mut verdict = None;
@@ -388,6 +349,78 @@ impl AppClient {
             })?;
         Ok(EpochBackfillRunOutcome::Incomplete(summary))
     }
+
+    async fn admit_comparison_route(
+        &self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        route: ComparisonRouteResult,
+        admission_deadline: tokio::time::Instant,
+    ) -> Result<
+        (
+            TransportReconciliationRoute,
+            storage_sqlite::RecoveryComparisonOutcome,
+        ),
+        AppError,
+    > {
+        let mut cursor_safe_to_advance = true;
+        let outcome = match route.result {
+            ComparisonRouteWorkResult::Skipped => {
+                storage_sqlite::RecoveryComparisonOutcome::ServicedPartial
+            }
+            ComparisonRouteWorkResult::TimedOut => {
+                storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+            }
+            ComparisonRouteWorkResult::Returned(Ok(None)) => {
+                storage_sqlite::RecoveryComparisonOutcome::Unsupported
+            }
+            ComparisonRouteWorkResult::Returned(Err(_)) => {
+                storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+            }
+            ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
+                let mut submitted = true;
+                for event in events {
+                    let queue = async {
+                        #[cfg(test)]
+                        if let Ok(Some(action)) = TEST_COMPARISON_QUEUE_ACTIONS
+                            .try_with(|actions| actions.borrow_mut().pop_front())
+                        {
+                            match action {
+                                TestComparisonQueueAction::Fail => {
+                                    return Err(cgka_traits::TransportAdapterError::Subscription(
+                                        "injected comparison queue failure".into(),
+                                    ));
+                                }
+                                TestComparisonQueueAction::Block => {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                        }
+                        self.adapter.queue_reconciled_event(event).await
+                    };
+                    if !matches!(
+                        tokio::time::timeout_at(admission_deadline, queue).await,
+                        Ok(Ok(_))
+                    ) {
+                        submitted = false;
+                        break;
+                    }
+                }
+                if !submitted || summary.relays_failed > 0 {
+                    cursor_safe_to_advance = submitted;
+                    storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+                } else {
+                    storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown
+                }
+            }
+        };
+        // A failed or timed-out queue step leaves an unqueued suffix whose
+        // IDs cannot be mapped back to individual cursor positions. Keep
+        // the entire pre-pass cursor so the next attempt can replay it.
+        if cursor_safe_to_advance && route.cursor != route.initial_cursor {
+            storage.advance_transport_reconciliation_replay_cursor(&route.route, route.cursor)?;
+        }
+        Ok((route.route, outcome))
+    }
 }
 
 #[cfg(test)]
@@ -398,7 +431,27 @@ mod tests {
         scripted_eose_pump,
     };
     use cgka_traits::GroupStorage;
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+    use std::cell::RefCell;
+    use std::future::Future as _;
     use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+
+    fn candidate_for_route(route: [u8; 32]) -> transport_nostr_adapter::NostrRelayEvent {
+        let signed = EventBuilder::new(Kind::MlsGroupMessage, "queue boundary")
+            .tags([Tag::custom("h", [hex::encode(route)])])
+            .finalize(&Keys::generate())
+            .unwrap();
+        transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&signed).unwrap(),
+        }
+    }
+
+    fn candidate() -> transport_nostr_adapter::NostrRelayEvent {
+        candidate_for_route([7; 32])
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn abort_request_keeps_credit_until_network_future_is_dropped() {
@@ -413,13 +466,7 @@ mod tests {
             async move {
                 entered.notify_one();
                 std::future::pending::<()>().await;
-                (
-                    credit,
-                    ComparisonNetworkResult {
-                        deadline: tokio::time::Instant::now(),
-                        routes: Vec::new(),
-                    },
-                )
+                (credit, ComparisonNetworkResult { routes: Vec::new() })
             }
         });
         let job = ComparisonNetworkJob { handle };
@@ -485,7 +532,6 @@ mod tests {
         cursor: Option<[u8; 32]>,
     ) -> ComparisonNetworkResult {
         ComparisonNetworkResult {
-            deadline: tokio::time::Instant::now() + Duration::from_secs(1),
             routes: vec![ComparisonRouteResult {
                 route,
                 initial_cursor: None,
@@ -716,6 +762,240 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn comparison_join_admits_owned_event_after_real_delivery_backpressure() {
+        let mut fixture = fixture().await;
+        let grant = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        let (route, group_route) = grant
+            .inventory
+            .iter()
+            .find_map(|item| match item.route {
+                TransportReconciliationRoute::Group(id) => Some((item.route.clone(), id)),
+                TransportReconciliationRoute::Inbox => None,
+            })
+            .expect("fixture has a selected group route");
+        let attempt = fixture
+            .client
+            .activate_comparison_grant(&grant)
+            .await
+            .unwrap();
+        let event = candidate_for_route(group_route);
+        // Saturate the shared transport queue with another account's route.
+        // Its account queue can hold this prefix; Alice's queue stays empty
+        // until the comparison result is admitted and owner-drained.
+        crate::AccountHome::open(fixture._dir.path())
+            .create_account("bob")
+            .unwrap();
+        let mut bob = client_on_app_relay_plane(&fixture.client.app, "bob").await;
+        let bob_group = bob.create_group("backpressure source", &[]).await.unwrap();
+        let bob_record = fixture
+            .client
+            .app
+            .group("bob", &hex::encode(bob_group))
+            .unwrap()
+            .unwrap();
+        let bob_route: [u8; 32] = hex::decode(bob_record.nostr_routing.nostr_group_id_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let bob_event = candidate_for_route(bob_route);
+        let adapter = bob.adapter.clone();
+        let mut context = Context::from_waker(Waker::noop());
+        tokio::task::unconstrained(async {
+            for _ in 0..1024 {
+                assert_eq!(
+                    adapter
+                        .queue_reconciled_event(bob_event.clone())
+                        .await
+                        .unwrap(),
+                    1
+                );
+            }
+            // Keep Tokio's cooperative yield from running the router during
+            // the fill. The next real adapter send must pend on its buffer.
+            let mut blocked = Box::pin(adapter.queue_reconciled_event(bob_event.clone()));
+            assert!(matches!(blocked.as_mut().poll(&mut context), Poll::Pending));
+        })
+        .await;
+
+        let mut network = network_result(route.clone(), Some([8; 32]));
+        network.routes[0].result = ComparisonRouteWorkResult::Returned(Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            vec![event],
+        ))));
+        let mut finish = Box::pin(
+            fixture
+                .client
+                .finish_comparison_grant(grant, attempt, network),
+        );
+        assert!(matches!(finish.as_mut().poll(&mut context), Poll::Pending));
+        let result = tokio::time::timeout(Duration::from_secs(15), finish)
+            .await
+            .expect("the owner drains after its real queue send pends")
+            .unwrap();
+        assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
+        assert_eq!(
+            fixture
+                .storage
+                .transport_reconciliation_replay_cursor(&route)
+                .unwrap(),
+            Some([8; 32]),
+        );
+        assert!(fixture.client.adapter.pending_delivery_overflow().is_none());
+        assert!(bob.adapter.pending_delivery_overflow().is_none());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                fixture.client.adapter.receive_account_delivery()
+            )
+            .await
+            .is_err(),
+            "owner continuation drained Alice's admitted event"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn comparison_join_timeout_keeps_cursor_and_retry_debt_after_real_queue_block() {
+        let mut fixture = fixture().await;
+        let grant = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        let (route, group_route) = grant
+            .inventory
+            .iter()
+            .find_map(|item| match item.route {
+                TransportReconciliationRoute::Group(id) => Some((item.route.clone(), id)),
+                TransportReconciliationRoute::Inbox => None,
+            })
+            .expect("fixture has a selected group route");
+        fixture
+            .client
+            .activate_comparison_grant(&grant)
+            .await
+            .unwrap();
+        let event = candidate_for_route(group_route);
+        let adapter = fixture.client.adapter.clone();
+        let router_pause = fixture.client.app.relay_plane.pause_router_for_test().await;
+        let mut context = Context::from_waker(Waker::noop());
+        tokio::task::unconstrained(async {
+            for _ in 0..1024 {
+                assert_eq!(
+                    adapter.queue_reconciled_event(event.clone()).await.unwrap(),
+                    1
+                );
+            }
+            let mut blocked = Box::pin(adapter.queue_reconciled_event(event.clone()));
+            assert!(matches!(blocked.as_mut().poll(&mut context), Poll::Pending));
+        })
+        .await;
+        let mut network = network_result(route.clone(), Some([8; 32]));
+        network.routes[0].result = ComparisonRouteWorkResult::Returned(Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            vec![event],
+        ))));
+        let route_result = network.routes.remove(0);
+        let admission = fixture.client.admit_comparison_route(
+            &fixture.storage,
+            route_result,
+            tokio::time::Instant::now() - Duration::from_millis(1),
+        );
+        // The elapsed admission deadline meets the same genuinely pending
+        // production send while the test holds only the router task. Tokio's
+        // real timeout fires before that task is restarted.
+        let (route_key, outcome) = tokio::time::timeout(Duration::from_secs(1), admission)
+            .await
+            .expect("elapsed admission timeout fires on the real queue send")
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+        ));
+        assert_eq!(
+            fixture
+                .storage
+                .transport_reconciliation_replay_cursor(&route)
+                .unwrap(),
+            None
+        );
+        drop(router_pause);
+        let mut counts = DrainCounts::default();
+        let mut verdict = None;
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            fixture.client.complete_recovery_grant_inner(
+                &grant,
+                None,
+                &mut counts,
+                &mut verdict,
+                vec![(route_key, outcome)],
+            ),
+        )
+        .await
+        .expect("owner drains and checkpoints after timed-out admission")
+        .unwrap();
+        let slot = fixture.storage.recovery_comparison().unwrap();
+        assert!(slot.pending());
+        assert!(!slot.plan.unwrap().retry_routes.is_empty());
+        assert!(fixture.client.adapter.pending_delivery_overflow().is_none());
+    }
+
+    #[tokio::test]
+    async fn comparison_failed_queue_keeps_prepass_cursor_for_unqueued_suffix() {
+        let mut fixture = fixture().await;
+        let grant = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        let route = grant.inventory.first().unwrap().route.clone();
+        let attempt = fixture
+            .client
+            .activate_comparison_grant(&grant)
+            .await
+            .unwrap();
+        let mut network = network_result(route.clone(), Some([8; 32]));
+        network.routes[0].result = ComparisonRouteWorkResult::Returned(Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            vec![candidate()],
+        ))));
+        let result = TEST_COMPARISON_QUEUE_ACTIONS
+            .scope(
+                RefCell::new([TestComparisonQueueAction::Fail].into()),
+                async {
+                    fixture
+                        .client
+                        .finish_comparison_grant(grant, attempt, network)
+                        .await
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
+        assert_eq!(
+            fixture
+                .storage
+                .transport_reconciliation_replay_cursor(&route)
+                .unwrap(),
+            None,
+        );
+        assert!(fixture.storage.recovery_comparison().unwrap().pending());
+    }
+
     #[tokio::test]
     async fn comparison_partial_pass_rotates_cursor_and_keeps_retry_debt() {
         let mut fixture = fixture().await;
@@ -753,16 +1033,5 @@ mod tests {
         let slot = fixture.storage.recovery_comparison().unwrap();
         assert!(slot.pending());
         assert!(!slot.plan.unwrap().retry_routes.is_empty());
-    }
-
-    #[test]
-    fn cancelled_memory_progress_does_not_touch_durable_cursor() {
-        let progress = MemoryProgress {
-            cursor: Mutex::new(Some([1; 32])),
-        };
-        progress.save_cursor(Some([2; 32])).unwrap();
-        assert_eq!(progress.load_cursor().unwrap(), Some([2; 32]));
-        // No storage handle exists in MemoryProgress. A cancelled task loses
-        // this proposal and leaves the owner's durable route cursor intact.
     }
 }

@@ -505,6 +505,20 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
+    /// Reads that can cross a deferred explicit catch-up without changing the
+    /// recovery grant or the order of later mutations.
+    fn readable_during_comparison_catch_up(&self) -> bool {
+        matches!(
+            self,
+            Self::Members { .. }
+                | Self::MemberIdsPage { .. }
+                | Self::GroupMlsState { .. }
+                | Self::GroupRoster { .. }
+                | Self::QuarantinedGroups { .. }
+                | Self::GroupRecoveryStatus { .. }
+        )
+    }
+
     fn needs_media_slot(&self) -> bool {
         match self {
             Self::UploadPreparedGroupImage { .. }
@@ -1061,7 +1075,7 @@ async fn run_app_runtime_account_worker(
         })
         .collect::<VecDeque<_>>();
     // Skip only media waiting for capacity; retain FIFO order among the rest.
-    while let Some(index) = ready_command_index(&pending, &media_http) {
+    while let Some(index) = ready_command_index(&pending, &media_http, false) {
         let command = pending
             .remove(index)
             .expect("selected pending command exists");
@@ -1213,7 +1227,8 @@ async fn run_app_runtime_account_worker(
                 }
             }
         }
-        let ready_command = ready_command_index(&pending, &media_http);
+        let ready_command =
+            ready_command_index(&pending, &media_http, comparison_maintenance.is_some());
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -1345,6 +1360,19 @@ async fn run_app_runtime_account_worker(
                 yield_to_bounded_admission = true;
                 match command {
                     Some(command) => {
+                        // An explicit catch-up would revise the selected
+                        // comparison while its grant lease is live. Preserve
+                        // its FIFO barrier for later commands, including Drain,
+                        // while allowing read-only status requests through.
+                        if comparison_maintenance.is_some()
+                            && (matches!(command, AccountWorkerCommand::CatchUp { .. })
+                                || (pending.iter().any(|queued| {
+                                    matches!(queued, AccountWorkerCommand::CatchUp { .. })
+                                }) && !command.readable_during_comparison_catch_up()))
+                        {
+                            pending.push_back(command);
+                            continue;
+                        }
                         let command = match command {
                             AccountWorkerCommand::Drain { respond } => {
                                 if let Some(recovery) = &mut welcome_recovery {
@@ -3105,12 +3133,23 @@ fn spawn_media_http<T>(
 fn ready_command_index(
     pending: &VecDeque<AccountWorkerCommand>,
     media_http: &MediaHttpContext,
+    comparison_waiting: bool,
 ) -> Option<usize> {
     let has_capacity =
         !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
-    pending
-        .iter()
-        .position(|command| has_capacity || !command.needs_media_slot())
+    let deferred_catch_up = comparison_waiting
+        .then(|| {
+            pending
+                .iter()
+                .position(|command| matches!(command, AccountWorkerCommand::CatchUp { .. }))
+        })
+        .flatten();
+    pending.iter().enumerate().position(|(index, command)| {
+        (!comparison_waiting
+            || (deferred_catch_up.is_none_or(|barrier| index < barrier)
+                || command.readable_during_comparison_catch_up()))
+            && (has_capacity || !command.needs_media_slot())
+    })
 }
 
 fn reserve_media_http(media_http: &MediaHttpContext) -> OwnedSemaphorePermit {

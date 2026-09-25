@@ -18,15 +18,21 @@ memory-only advisory replay cursor. It cannot write SQLCipher, submit a relay
 event to the account queue, mutate the MLS engine, or settle the grant. On
 join, the worker checks the selected loss, route, inventory and obligation
 revisions, comparison revision and attempt serial, and account subscription
-attempt. A stale result is discarded in full. A current result has its proposed
-cursor saved before returned events enter the ordinary queue. The worker then
-drains, checkpoints, settles and reports through the existing owner path.
+attempt. A stale result is discarded in full. For a current result, the worker
+submits the returned event batch under one fresh, finite 10-second admission
+window shared by all selected routes. This can add up to 10 seconds after the
+SDK acquisition quantum while the same capacity credit remains held. A route's
+proposed cursor is saved only after its entire owned batch enters the ordinary
+queue. If submission stops, the prior cursor stays durable, the route retains
+retry debt, and an already queued prefix may recur on the next pass. The worker
+then drains, checkpoints, settles and reports through the existing owner path.
 
 The cursor records attempted exact IDs, not admitted events. A completed
 non-single-object byte-limited SDK acquisition that returned no requested ID
 can restore its prior cursor; a deferred large ID can therefore lead the next
 pass. Cancelled tasks lose their memory cursor and retry the still-durable
 comparison debt. A completed partial pass may rotate past a refused prefix,
+including routes that returned no events or handed off their complete batch,
 but an unretained event remains in the comparison difference and recurs when
 rotation wraps. This worker handoff supersedes the earlier recommendation in
 `recovery-worker-resume.md` to durably acknowledge a cursor before SDK fetch:
@@ -48,3 +54,7 @@ comparison waits remain inline. Activation, group registration, SDK drain and
 checkpoint can still hold the worker. The inactive bounded known-event worker
 remains gated separately. No release version, schema or subscription policy
 changes in this slice.
+
+An explicit catch-up arriving while the periodic comparison task is active
+waits in the worker's command FIFO until that task joins. Later mutations stay
+behind it, while read-only status commands can still run during the SDK wait.

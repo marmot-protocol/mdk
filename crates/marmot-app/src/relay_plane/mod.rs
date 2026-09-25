@@ -80,6 +80,18 @@ pub struct MarmotRelayPlane {
     inner: Arc<MarmotRelayPlaneInner>,
 }
 
+#[cfg(test)]
+/// Holds only this plane's router; drop always resumes it, including on a
+/// fixture panic. Production routing has no pause path.
+pub(crate) struct RouterPauseForTest(MarmotRelayPlane);
+
+#[cfg(test)]
+impl Drop for RouterPauseForTest {
+    fn drop(&mut self) {
+        self.0.spawn_router();
+    }
+}
+
 struct MarmotRelayPlaneInner {
     subscription_rebuild_lookback: Option<Duration>,
     relay_safety: RelaySafetyPolicy,
@@ -1420,6 +1432,16 @@ impl MarmotRelayPlane {
             .notification_forwarder_health
             .running_count
             .store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_router_for_test(&self) -> RouterPauseForTest {
+        let handle = self.inner.transport.router.lock().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        RouterPauseForTest(self.clone())
     }
 
     fn spawn_router(&self) {

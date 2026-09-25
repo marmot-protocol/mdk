@@ -3894,6 +3894,8 @@ impl AppClient {
             .await?;
         // Routine below-live-cutoff discovery runs only with a frozen owner
         // comparison request. The retained-inventory floor still bounds it.
+        // Neither a quiet completion nor subscription installation certifies
+        // the still-pending maintenance/history predicate.
         let quiet_prerequisites =
             grant
                 .plan()
@@ -3970,11 +3972,9 @@ impl AppClient {
         };
         // Maintenance has its own scoped unfloored REQ. It cannot widen the
         // broad live activation; only selected history/loss goals may do so.
-        // Maintenance installs a temporary subscription and observes its first
-        // boundary later under the domain's existing deadline. Sharing that
-        // prerequisite must not turn ordinary incremental catch-up into a
-        // blocking full-history wait. Neither quiet completion nor installation
-        // certifies the still-pending maintenance/history predicate.
+        // Its first boundary is observed later under the domain's deadline.
+        // Sharing that prerequisite cannot turn ordinary incremental catch-up
+        // into a blocking full-history wait.
         self.pending_runtime_group_subscription_refresh = true;
         self.relay_plane
             .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())

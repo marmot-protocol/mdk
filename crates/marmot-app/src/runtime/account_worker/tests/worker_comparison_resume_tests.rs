@@ -60,20 +60,29 @@ impl QueryPolicy for HeldComparisonId {
 
 #[tokio::test]
 async fn comparison_worker_held_sdk_request_keeps_status_command_ready() {
-    run_held_comparison(false, false).await;
+    run_held_comparison(false, false, false).await;
+}
+
+#[tokio::test]
+async fn explicit_catch_up_waits_for_held_comparison_before_revising_it() {
+    run_held_comparison(false, false, true).await;
 }
 
 #[tokio::test]
 async fn comparison_shutdown_reaps_task_and_releases_credit() {
-    run_held_comparison(true, false).await;
+    run_held_comparison(true, false, false).await;
 }
 
 #[tokio::test]
 async fn comparison_and_known_worker_share_two_credits_during_shutdown() {
-    run_held_comparison(true, true).await;
+    run_held_comparison(true, true, false).await;
 }
 
-async fn run_held_comparison(shutdown_while_held: bool, known_competes: bool) {
+async fn run_held_comparison(
+    shutdown_while_held: bool,
+    known_competes: bool,
+    catch_up_while_held: bool,
+) {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldComparisonId::default();
     let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
@@ -259,6 +268,58 @@ async fn run_held_comparison(shutdown_while_held: bool, known_competes: bool) {
             .unwrap(),
         None
     );
+    let catch_up = if catch_up_while_held {
+        let revision = storage.recovery_comparison().unwrap().revision;
+        let (respond, waiting) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::CatchUp { respond })
+            .unwrap();
+        let (respond, mut mutation) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
+            .unwrap();
+        let (respond, mut drain) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::Drain { respond })
+            .unwrap();
+        let (respond, status) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_millis(300), status)
+            .await
+            .expect("read after queued catch-up stays serviceable")
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                mutation.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "later mutation stays behind queued catch-up"
+        );
+        assert!(matches!(
+            drain.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            storage.recovery_comparison().unwrap().revision,
+            revision,
+            "explicit catch-up stays queued until the live comparison joins"
+        );
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            before_retry + 1,
+            "waiting explicit work cannot spend another reservation"
+        );
+        Some((waiting, mutation, drain))
+    } else {
+        None
+    };
     if known_competes {
         let fixture = known_fixture.as_ref().unwrap();
         fixture
@@ -343,6 +404,29 @@ async fn run_held_comparison(shutdown_while_held: bool, known_competes: bool) {
         })
         .await
         .expect("worker finishes the result and releases its credit");
+        if let Some((waiting, mutation, drain)) = catch_up {
+            timeout(Duration::from_secs(20), waiting)
+                .await
+                .expect("explicit catch-up follows comparison admission")
+                .unwrap()
+                .unwrap();
+            assert!(
+                storage
+                    .transport_reconciliation_replay_cursor(&recovery_route)
+                    .unwrap()
+                    .is_some(),
+                "the held comparison proposal was admitted before catch-up revised it"
+            );
+            timeout(Duration::from_secs(5), mutation)
+                .await
+                .expect("later mutation follows explicit catch-up")
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("drain follows explicit catch-up")
+                .unwrap();
+        }
         runtime.shutdown_and_close().await.unwrap();
     }
     gate.hold_exact.store(false, Ordering::SeqCst);
