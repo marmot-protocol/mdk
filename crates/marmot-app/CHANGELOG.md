@@ -14,6 +14,18 @@
   mutation path imports that evidence into recovery demand; runtime dispatch consolidation
   remains separate integration work. (#1946)
 
+### Breaking changes
+
+- `HostPerformanceOperation` and `RuntimePerformanceOperation` gain 28 shared and
+  nine Linux-specific host stages. Downstream exhaustive Rust matches must handle
+  the new variants. The snapshot struct layout is unchanged; stages appear in
+  `runtime_operations`.
+
+### Added
+
+- Route reviewed host stages through the existing runtime telemetry registry,
+  including its fixed metric names and all five outcomes in snapshots and OTLP.
+
 ## 0.10.4 - 2026-09-20
 
 ### Fixed

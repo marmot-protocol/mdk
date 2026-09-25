@@ -1203,9 +1203,19 @@ async fn run_app_runtime_account_worker(
             completed = async {
                 bounded_recovery.as_mut().expect("bounded task exists").wait().await
             }, if bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
-                bounded_recovery.as_mut().expect("bounded task exists").accept(completed);
+                let job = bounded_recovery.as_mut().expect("bounded task exists");
+                job.accept(completed);
                 #[cfg(test)]
-                shared.bounded_result_ready.notify_one();
+                {
+                    let (attempt_serial, event_id, matching_items) = job.result_witness_for_test();
+                    *shared.bounded_result_witness.lock().unwrap() = Some(super::BoundedResultWitness {
+                        account_label: account_label.clone(),
+                        attempt_serial,
+                        event_id,
+                        matching_items,
+                    });
+                    shared.bounded_result_ready.notify_one();
+                }
                 yield_to_bounded_admission = true;
             }
             recovered = async {
@@ -1261,7 +1271,7 @@ async fn run_app_runtime_account_worker(
                     Some(command) => Some(command),
                     None => commands.recv().await,
                 }
-            }, if (!yield_to_convergence || !scheduled_convergence.has_ready())
+            }, if (!yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
                 && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
                 yield_to_bounded_admission = true;
@@ -1334,8 +1344,9 @@ async fn run_app_runtime_account_worker(
                     None => return,
                 }
             }
-            _ = scheduled_convergence.timer.as_mut(), if !yield_to_bounded_admission
-                || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
+            _ = scheduled_convergence.timer.as_mut(), if (!yield_to_bounded_admission
+                || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready))
+                && !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
                 yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
@@ -5157,6 +5168,23 @@ const CONVERGENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// never-settling input cannot keep the worker waking every ~1.1s indefinitely.
 const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
 
+#[cfg(test)]
+static HELD_SCHEDULED_CONVERGENCE_ACCOUNTS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+fn scheduled_convergence_held_for_test(account_id_hex: &str) -> bool {
+    HELD_SCHEDULED_CONVERGENCE_ACCOUNTS
+        .lock()
+        .unwrap()
+        .contains(account_id_hex)
+}
+
+#[cfg(not(test))]
+fn scheduled_convergence_held_for_test(_account_id_hex: &str) -> bool {
+    false
+}
+
 struct ScheduledConvergence {
     delay: Duration,
     test_delay: Duration,
@@ -5848,6 +5876,14 @@ fn publish_app_runtime_account_error(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    mod real_sdk_bounded_tests;
+    mod real_sdk_progress_fairness_tests;
+    mod resource_bounds_tests;
+    mod selective_history_tests;
+    mod worker_recovery_resume_tests;
+    #[cfg(feature = "test-policy-overrides")]
+    mod worker_wait_attribution_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

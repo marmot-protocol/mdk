@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-10
+updated: 2026-09-24
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -297,9 +297,17 @@ sum phase percentiles or treat SDK projection and host render timings as a singl
 histograms are process-local, with no per-message correlation identifiers or persisted timing journal.
 
 OTLP host milestones use the closed `HostPerformanceOperation` enum without caller-supplied metric names or labels.
-For app-specific measurements such as inbox layout, image decoding, or navigation, use `record_host_timing` with a
-registered product event name. This consent-gated path sends duration buckets and outcomes to Aptabase; it does not
-add OTLP series or local app-performance snapshot fields. See the [registration example](usage-diagnostics.md#custom-host-timings).
+Reviewed stages such as `FrameLayout`, `MediaDecode` and `TimelineOpen` now also use this path: comparable host
+performance needs fixed-bucket distributions in local snapshots and opt-in OTLP, which `record_host_timing` does not
+provide. The stages are registered in `RuntimePerformanceOperation`, so their metrics and binding exposure follow
+the existing runtime registry. Shared and Linux-specific stages are all readable through `runtime_operations`; no
+per-stage snapshot fields or caller-defined names are added. See the [catalog](#registered-host-stage-metrics).
+
+For app-specific product measurements outside this reviewed list, continue using `record_host_timing` with a
+registered product event name. That separate consent-gated path sends duration buckets and outcomes to Aptabase;
+it does not add OTLP series or app-performance snapshot entries. See the
+[registration example](usage-diagnostics.md#custom-host-timings). Hosts must report the actual outcome in both paths,
+including early/error returns; do not report success merely because a scope exited.
 
 The `app_account_sync_failures` and `app_account_catch_up_failures` counters are the only app-performance metrics with
 metric attributes. Every failed attempt emits exactly one point in a bounded classification bucket:
@@ -660,6 +668,13 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 Current implementation note: publish telemetry is device-wide attempts/successes/failures. It is not currently
 per-relay or per-Nostr-kind, even though the relay observability design doc names those as desired future ranking
 signals.
+
+### Registered host-stage metrics
+
+The 28 shared and nine Linux-specific host stages use the runtime registry. See
+[runtime latency telemetry](runtime-latency-telemetry.md#boundaries) for their measurement boundaries
+and [accounting and export](runtime-latency-telemetry.md#accounting-and-export) for the metric suffixes,
+outcomes, completed-only semantics and binding snapshot representation.
 
 ### OTLP encoding
 

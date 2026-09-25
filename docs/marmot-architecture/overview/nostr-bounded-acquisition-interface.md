@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-09-24
+updated: 2026-09-25
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
@@ -156,3 +156,78 @@ unknown-history recovery; it
 remains worker-held and can still wait for EOSE. This exact-ID slice does not
 establish unknown-history discovery, bandwidth optimality or the original
 phone/NSE outcome.
+
+### P5 real-SDK qualification progress
+
+`bounded_real_sdk_two_relays_retain_one_encrypted_known_event` exercises the
+production multi-account `NostrSdkRelayClient`, endpoint-validated relay plane,
+account worker, MLS receive path, and SQLCipher storage. A real encrypted
+kind-445 event is published to two local WebSocket relays while its recipient
+is signed out. Their ordinary live subscriptions return EOSE without replaying
+history. The exact-ID request retrieves the event from each relay, and the
+worker retains the eligible event before clearing its known-event obligation.
+The regression asserts one exact-ID REQ per endpoint, one returned EVENT per
+endpoint, and per-endpoint byte ceilings in the fixture. The event JSON
+counters measure normalized JSON after parsing; they are included in the text
+counters, not additional bytes. The measurements are WebSocket
+text payloads at the local relay boundary, excluding TCP/TLS framing, SDK
+allocations, and process memory.
+
+One serial run measured these per-relay byte totals (left/right), including
+fixture setup and control traffic:
+
+| Case | Client to relay text | Relay to client text | Client EVENT JSON | Relay EVENT JSON |
+| --- | ---: | ---: | ---: | ---: |
+| Exact-ID retention | 2,863 / 2,920 | 1,464 / 1,464 | 944 / 944 | 944 / 944 |
+| Withheld EOSE and concurrent messages | 4,807 / 4,807 | 7,776 / 7,733 | 2,868 / 2,868 | 6,716 / 6,716 |
+
+These are fixture measurements, not a bandwidth target. The test enforces
+coarse ceilings because SDK control frames can vary between runs; the exact
+recovered event size and duplicate count are asserted separately.
+
+`bounded_real_sdk_missing_eose_keeps_send_and_read_available` withholds one
+relay's exact-ID EOSE. During the outstanding SDK request, the acquiring
+worker completes an outbound send and a committed snapshot read, and a live
+encrypted message from another account reaches its projection before the
+same acquisition ends. Both relays return the exact event; only the delayed
+relay's EOSE is withheld. The earlier relay's EVENT remains outside SQLCipher
+while the SDK result is pending. After the delayed result completes, durable
+retention can admit either copy and satisfy the known-event obligation. This
+proves progress for that single case, not general coverage from partial
+endpoint evidence or recovery when only one endpoint returns the event.
+
+The activation gate remains closed. The [resource-bounds qualification](../further-context/recovery-resource-bounds-qualification.md)
+covers request-local SDK input, empty and partial endpoints, duplicate and
+oversized results, and an exhausted worker-credit gate. It does not qualify
+cancellation on either side of a durable prefix, stale generation/route
+fences, restart persistence, or resumption after worker-credit saturation.
+Focused worker admission and completion fences, with their exact limits, are
+recorded in [recovery admission and interruption qualification](../further-context/recovery-admission-interruption-qualification.md).
+The [real-SDK receipt-release fence qualification](../further-context/recovery-interruption-redelivery-qualification.md)
+adds positive returned-content evidence while retaining the redelivery limit.
+The [real-SDK attempt/scope replacement qualification](../further-context/recovery-lifecycle-generation-qualification.md)
+checks durable admission from an old result without allowing its completion to clear the newer scope.
+The [progress and fairness qualification](../further-context/recovery-p5-progress-fairness-2026-09-24.md)
+records controlled ready-work and distinct known-ID owner turns; this branch
+also runs those fixtures against the isolated SDK pin. Its broad recovery and
+device limits remain open.
+
+Two further real-SDK controls exercise competing recovery demands and a newer
+delivery loss. The conforming NIP-77 relay fixture expects an already-retained
+known ID and a fresh comparison to settle through automatic worker service
+after the injected test clock moves past the current shared retry deadline.
+It allows either owner-selection order and establishes no real-time latency
+bound. An intermittent failure was traced to this fixture joining an earlier
+frozen route with a newer request second; that test-only window mismatch was
+corrected in #2023. This controlled case does not establish general owner
+fairness.
+
+In a separate two-relay run, one exact-ID EOSE stays withheld after the other
+relay has sent the event. The event remains unadmitted while the SDK request is
+pending. A newer queue-loss revision then prevents that in-flight exact result
+from checkpointing its stale scope;
+the queue-loss demand remains pending. These controls do not qualify all
+competing account recovery demands or every stale loss outcome. Controlled
+backend tests cover several remaining policies, but they do not establish
+their behavior against production SDK sessions. No public activation or
+platform bandwidth/peak-memory claim follows from the P5 regressions.

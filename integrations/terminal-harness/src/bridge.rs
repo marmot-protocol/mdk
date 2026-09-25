@@ -1619,6 +1619,14 @@ fn attachment_failure_reply(config: &Config, error: &HarnessError) -> String {
         HarnessError::AttachmentCountLimit => "too many attachments",
         HarnessError::AttachmentBytesLimit => "the attachment batch is too large",
         HarnessError::AttachmentUnsupported => "one or more attachment types are unsupported",
+        HarnessError::ControlTimedOut {
+            method: "download_media",
+        } => "an attachment download timed out",
+        HarnessError::ControlRejected {
+            method: "download_media",
+            ..
+        } => "the attachment download was rejected by the connector",
+        HarnessError::AttachmentInvalid => "a downloaded attachment failed local validation",
         _ => "an attachment could not be downloaded and validated",
     };
     format!(
@@ -2861,6 +2869,33 @@ mod tests {
                 legacy_allowed_senders_env: Some("WN_OPENCODE_ADMIN_HEX"),
             },
         }
+    }
+
+    #[test]
+    fn attachment_failure_reply_distinguishes_download_and_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let timed_out = attachment_failure_reply(
+            &config,
+            &HarnessError::ControlTimedOut {
+                method: "download_media",
+            },
+        );
+        assert!(timed_out.contains("attachment download timed out"));
+        let rejected = attachment_failure_reply(
+            &config,
+            &HarnessError::ControlRejected {
+                method: "download_media",
+                code: "app_error".to_owned(),
+            },
+        );
+        assert!(rejected.contains("download was rejected"));
+        assert!(!rejected.contains("app_error"));
+        let invalid = attachment_failure_reply(&config, &HarnessError::AttachmentInvalid);
+        assert!(invalid.contains("failed local validation"));
+        assert!(timed_out.ends_with("no backend turn was started."));
+        assert!(rejected.ends_with("no backend turn was started."));
+        assert!(invalid.ends_with("no backend turn was started."));
     }
 
     struct NoopBackend;

@@ -15,10 +15,9 @@ use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     AcquisitionEnd as SdkAcquisitionEnd, AcquisitionLimits as SdkAcquisitionLimits, Client,
-    ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder, EventId, Filter,
-    FinalizeEventAsync, Kind, PublicKey, RelayAcquisition, RelayCapabilities, RelayMessage,
-    RelayStatus, RelayUrl, ReqTarget, SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions,
-    Tag, Timestamp as NostrTimestamp,
+    ClientNotification, Event, EventBuilder, EventId, Filter, FinalizeEventAsync, Kind, PublicKey,
+    RelayAcquisition, RelayCapabilities, RelayMessage, RelayStatus, RelayUrl, ReqTarget,
+    SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions, Tag, Timestamp as NostrTimestamp,
 };
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -312,9 +311,6 @@ pub struct NostrSdkRelayClient {
     forwarder_event_entered: Arc<AtomicBool>,
     #[cfg(test)]
     publish_relay_pin_failure_stage: Arc<AtomicU8>,
-    /// Relays that explicitly rejected NIP-77 are skipped for the rest of this
-    /// process. Transient connection failures are never cached here.
-    reconciliation_unsupported_relays: Arc<RwLock<HashSet<RelayUrl>>>,
     /// Per-account, per-relay subscription-registration outcomes accumulated
     /// since that account's last
     /// [`take_subscription_registrations`](Self::take_subscription_registrations)
@@ -427,7 +423,6 @@ impl NostrSdkRelayClient {
             forwarder_event_entered: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
-            reconciliation_unsupported_relays: Arc::new(RwLock::new(HashSet::new())),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -641,23 +636,15 @@ impl NostrSdkRelayClient {
             .since(NostrTimestamp::from_secs(reconcile_since))
             .until(NostrTimestamp::from_secs(reconcile_until))
             .limit(SDK_RECONCILIATION_SET_LIMIT);
-        let unsupported = self.reconciliation_unsupported_relays.read().await;
-        let endpoints = plan
-            .endpoints
-            .iter()
-            .filter(|endpoint| !unsupported.contains(*endpoint))
-            .cloned()
-            .collect::<Vec<_>>();
-        let unsupported_count = plan.endpoints.len().saturating_sub(endpoints.len());
-        drop(unsupported);
+        // Endpoint capability can change after reconnect. Re-probe each
+        // requested endpoint under this call's finite SDK deadline rather
+        // than carrying a stale process-lifetime rejection across sessions.
+        // The app recovery owner paces its calls; direct callers own their rate.
+        let endpoints = plan.endpoints;
         let Some(replay_endpoint) = endpoints.first().cloned() else {
-            return Ok((
-                NostrReconciliationSummary {
-                    relays_failed: unsupported_count,
-                    ..NostrReconciliationSummary::default()
-                },
-                Vec::new(),
-            ));
+            // Preserve the public no-op result for an empty route set. It is
+            // neither relay coverage nor backend-wide incapability evidence.
+            return Ok((NostrReconciliationSummary::default(), Vec::new()));
         };
         let subscription_id = plan.subscription_id.to_string();
         let items = local_items
@@ -695,28 +682,18 @@ impl NostrSdkRelayClient {
             })?;
         let mut remote = HashSet::new();
         let mut relays_succeeded = 0;
-        let mut relays_failed = unsupported_count;
-        let mut newly_unsupported = Vec::new();
-        for (endpoint, result) in outcomes {
+        let mut relays_failed = 0;
+        for (_, result) in outcomes {
             match result {
                 Some(Ok(summary)) => {
                     relays_succeeded += 1;
                     remote.extend(summary.remote);
                 }
-                Some(Err(error)) => {
+                Some(Err(_)) => {
                     relays_failed += 1;
-                    if error.kind() == SdkErrorKind::Unsupported {
-                        newly_unsupported.push(endpoint);
-                    }
                 }
                 None => relays_failed += 1,
             }
-        }
-        if !newly_unsupported.is_empty() {
-            self.reconciliation_unsupported_relays
-                .write()
-                .await
-                .extend(newly_unsupported);
         }
         // Compare without SDK-managed downloads: its download path returns
         // only after every 100-id REQ/EOSE batch, so an outer timeout discards

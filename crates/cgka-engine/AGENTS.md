@@ -539,7 +539,10 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   durable record has gone terminal under it, and `schedule_manual_self_update` refuses a terminal record outright.
   Obligations are minted while the copy is live and disenrollment is event-driven only, so a lost removal event
   otherwise leaves the pass driving a `SelfUpdate` the send gate refuses, uncapped, every tick forever — the field's
-  `UseAfterEviction` self-update loop.
+  `UseAfterEviction` self-update loop. A group with a pending leave (`leave_in_progress`) or disband
+  (`disbanding_in_progress`) refuses the same `SelfUpdate`, but its obligation *waits* untouched rather than fails:
+  the removal landing ends it through the terminal verdict, and a reorg or an acknowledged disband failure that keeps
+  the device a member must find its rotation still owed.
 - **The durable `Group::epoch` is a mirror of the epoch manager, and hydration seeds the epoch manager from it.**
   Because those two stores read each other across a restart, every mirror write belongs to the same durable unit as the
   MLS state change it projects, and every mirror failure propagates — never best-effort. Write the record inside the

@@ -8,6 +8,43 @@ pub enum HostPerformanceOperationFfi {
     InboundMessageVisible,
     ConversationLocalVisible,
     ConversationComposerReady,
+    LinuxStartupBeforeVault,
+    LinuxStartupAfterVault,
+    WindowInit,
+    FontsInit,
+    RuntimeInit,
+    AccountLoad,
+    AccountSwitch,
+    FrameUpdate,
+    FrameLayout,
+    FrameDraw,
+    FramePresent,
+    LinuxFramePostPresent,
+    LinuxFrameUntilPresent,
+    LinuxFrameIdleWait,
+    ChatListLoad,
+    ContactsLoad,
+    ArchivedChatListLoad,
+    ProfileLoad,
+    ProfileRead,
+    TimelineOpen,
+    TimelinePage,
+    TimelineHandoff,
+    TimelineApply,
+    MessageSend,
+    MessageSearch,
+    ConversationSearch,
+    MediaQueueWait,
+    MediaPrepare,
+    MediaLoad,
+    MediaCacheRead,
+    MediaDecode,
+    MediaApply,
+    LinuxVaultDeriveKey,
+    LinuxVaultOpen,
+    LinuxVaultCreate,
+    LinuxVaultPersist,
+    SettingsSave,
 }
 
 /// Bounded runtime diagnostics. Operation names are defined by MDK, never callers.
@@ -422,6 +459,43 @@ impl From<HostPerformanceOperationFfi> for marmot_app::HostPerformanceOperation 
             }
             HostPerformanceOperationFfi::ConversationLocalVisible => Self::ConversationLocalVisible,
             HostPerformanceOperationFfi::ForegroundLocalReady => Self::ForegroundLocalReady,
+            HostPerformanceOperationFfi::LinuxStartupBeforeVault => Self::LinuxStartupBeforeVault,
+            HostPerformanceOperationFfi::LinuxStartupAfterVault => Self::LinuxStartupAfterVault,
+            HostPerformanceOperationFfi::WindowInit => Self::WindowInit,
+            HostPerformanceOperationFfi::FontsInit => Self::FontsInit,
+            HostPerformanceOperationFfi::RuntimeInit => Self::RuntimeInit,
+            HostPerformanceOperationFfi::AccountLoad => Self::AccountLoad,
+            HostPerformanceOperationFfi::AccountSwitch => Self::AccountSwitch,
+            HostPerformanceOperationFfi::FrameUpdate => Self::FrameUpdate,
+            HostPerformanceOperationFfi::FrameLayout => Self::FrameLayout,
+            HostPerformanceOperationFfi::FrameDraw => Self::FrameDraw,
+            HostPerformanceOperationFfi::FramePresent => Self::FramePresent,
+            HostPerformanceOperationFfi::LinuxFramePostPresent => Self::LinuxFramePostPresent,
+            HostPerformanceOperationFfi::LinuxFrameUntilPresent => Self::LinuxFrameUntilPresent,
+            HostPerformanceOperationFfi::LinuxFrameIdleWait => Self::LinuxFrameIdleWait,
+            HostPerformanceOperationFfi::ChatListLoad => Self::ChatListLoad,
+            HostPerformanceOperationFfi::ContactsLoad => Self::ContactsLoad,
+            HostPerformanceOperationFfi::ArchivedChatListLoad => Self::ArchivedChatListLoad,
+            HostPerformanceOperationFfi::ProfileLoad => Self::ProfileLoad,
+            HostPerformanceOperationFfi::ProfileRead => Self::ProfileRead,
+            HostPerformanceOperationFfi::TimelineOpen => Self::TimelineOpen,
+            HostPerformanceOperationFfi::TimelinePage => Self::TimelinePage,
+            HostPerformanceOperationFfi::TimelineHandoff => Self::TimelineHandoff,
+            HostPerformanceOperationFfi::TimelineApply => Self::TimelineApply,
+            HostPerformanceOperationFfi::MessageSend => Self::MessageSend,
+            HostPerformanceOperationFfi::MessageSearch => Self::MessageSearch,
+            HostPerformanceOperationFfi::ConversationSearch => Self::ConversationSearch,
+            HostPerformanceOperationFfi::MediaQueueWait => Self::MediaQueueWait,
+            HostPerformanceOperationFfi::MediaPrepare => Self::MediaPrepare,
+            HostPerformanceOperationFfi::MediaLoad => Self::MediaLoad,
+            HostPerformanceOperationFfi::MediaCacheRead => Self::MediaCacheRead,
+            HostPerformanceOperationFfi::MediaDecode => Self::MediaDecode,
+            HostPerformanceOperationFfi::MediaApply => Self::MediaApply,
+            HostPerformanceOperationFfi::LinuxVaultDeriveKey => Self::LinuxVaultDeriveKey,
+            HostPerformanceOperationFfi::LinuxVaultOpen => Self::LinuxVaultOpen,
+            HostPerformanceOperationFfi::LinuxVaultCreate => Self::LinuxVaultCreate,
+            HostPerformanceOperationFfi::LinuxVaultPersist => Self::LinuxVaultPersist,
+            HostPerformanceOperationFfi::SettingsSave => Self::SettingsSave,
         }
     }
 }
@@ -497,6 +571,35 @@ mod tests {
             (1, 1, 1, 1, 1)
         );
         assert_eq!(s.duration_ms.sum_ms, 500);
+    }
+
+    #[test]
+    fn host_stages_cross_bindings() {
+        let telemetry = marmot_app::AppPerformanceTelemetry::default();
+        let stages = [
+            (HostPerformanceOperationFfi::MediaApply, "host_media_apply"),
+            (
+                HostPerformanceOperationFfi::LinuxVaultOpen,
+                "host_linux_vault_open",
+            ),
+        ];
+        for (index, (operation, _)) in stages.into_iter().enumerate() {
+            telemetry.record_host_performance(
+                operation.into(),
+                Duration::from_millis(index as u64 + 1),
+                marmot_app::HostPerformanceOutcome::Failure,
+            );
+        }
+        let snapshot: AppPerformanceSnapshotFfi = telemetry.snapshot().into();
+        for (index, (_, name)) in stages.into_iter().enumerate() {
+            let stage = snapshot
+                .runtime_operations
+                .iter()
+                .find(|s| s.operation == name)
+                .unwrap();
+            assert_eq!((stage.started, stage.completed, stage.failures), (1, 1, 1));
+            assert_eq!(stage.duration_ms.sum_ms, index as u64 + 1);
+        }
     }
 
     #[test]

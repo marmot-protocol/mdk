@@ -36,6 +36,9 @@ const MEDIA_BLOB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// body bytes within this bound gives the next ordered locator a chance. The
 /// candidate transfer deadline and read-idle timeout govern an active body.
 const BLOSSOM_CANDIDATE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Preserve a bounded tail for another locator without returning to equal
+/// division, which can terminate a healthy progressing large transfer.
+const BLOSSOM_FALLBACK_RESERVE_MAX: Duration = Duration::from_secs(30);
 /// Reusing a pinned client inside this lease amortizes DNS and TLS setup without
 /// turning one resolution result into a process-lifetime routing decision.
 const BLOSSOM_ADDRESS_LEASE: Duration = Duration::from_secs(60);
@@ -205,6 +208,21 @@ impl BlossomHttpTransport {
         )
     }
 
+    #[cfg(feature = "media-benchmarks")]
+    /// Scale production deadlines for repeatable wall-clock regression benchmarks.
+    pub(super) fn for_benchmark(
+        candidate_startup_timeout: Duration,
+        transfer_timeout: Duration,
+    ) -> Self {
+        Self::with_policy(
+            true,
+            BLOSSOM_ADDRESS_LEASE,
+            candidate_startup_timeout,
+            transfer_timeout,
+            system_dns_resolver(),
+        )
+    }
+
     #[cfg(test)]
     /// Inject a resolver so tests can prove that expired origin leases are
     /// resolved and vetted again.
@@ -302,6 +320,15 @@ impl BlossomHttpTransport {
     /// Return the single deadline shared by every locator in one download.
     pub(super) fn transfer_timeout(&self) -> Duration {
         self.transfer_timeout
+    }
+
+    /// Reserve at most one quarter of a short acquisition, capped at 30 seconds.
+    ///
+    /// Startup and body-idle bounds still evict non-progressing candidates much
+    /// earlier. This reserve matters only when a body keeps making progress near
+    /// the global deadline and another authenticated locator remains untried.
+    pub(super) fn fallback_reserve(&self) -> Duration {
+        BLOSSOM_FALLBACK_RESERVE_MAX.min(self.transfer_timeout / 4)
     }
 }
 

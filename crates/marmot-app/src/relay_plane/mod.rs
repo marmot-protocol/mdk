@@ -2342,7 +2342,13 @@ impl MarmotRelayPlaneAccountAdapter {
         reconcile_since: u64,
         reconcile_until: u64,
         progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
-    ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
+    ) -> Result<
+        Option<(
+            NostrReconciliationSummary,
+            Vec<transport_nostr_adapter::NostrRelayEvent>,
+        )>,
+        TransportAdapterError,
+    > {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
             return Ok(None);
         };
@@ -2383,16 +2389,7 @@ impl MarmotRelayPlaneAccountAdapter {
             .adapter
             .record_reconciliation(&metric)
             .await;
-        let (summary, events) = result?;
-        for event in events {
-            self.relay_plane
-                .inner
-                .transport
-                .adapter
-                .handle_reconciled_event(&self.account_id, event)
-                .await?;
-        }
-        Ok(Some(summary))
+        Ok(Some(result?))
     }
 
     pub(crate) async fn reconcile_group_history(
@@ -2402,7 +2399,13 @@ impl MarmotRelayPlaneAccountAdapter {
         reconcile_since: u64,
         reconcile_until: u64,
         progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
-    ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
+    ) -> Result<
+        Option<(
+            NostrReconciliationSummary,
+            Vec<transport_nostr_adapter::NostrRelayEvent>,
+        )>,
+        TransportAdapterError,
+    > {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
             return Ok(None);
         };
@@ -2449,16 +2452,21 @@ impl MarmotRelayPlaneAccountAdapter {
             .adapter
             .record_reconciliation(&metric)
             .await;
-        let (summary, events) = result?;
-        for event in events {
-            self.relay_plane
-                .inner
-                .transport
-                .adapter
-                .handle_reconciled_event(&self.account_id, event)
-                .await?;
-        }
-        Ok(Some(summary))
+        Ok(Some(result?))
+    }
+
+    /// Submit an owned comparison event to this account's delivery queue.
+    /// Durable admission happens in the caller's subsequent drain.
+    pub(crate) async fn queue_reconciled_event(
+        &self,
+        event: transport_nostr_adapter::NostrRelayEvent,
+    ) -> Result<usize, TransportAdapterError> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .handle_reconciled_event(&self.account_id, event)
+            .await
     }
 
     pub(crate) async fn install_group_maintenance_subscription(
