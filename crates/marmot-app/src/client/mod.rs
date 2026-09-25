@@ -3014,7 +3014,7 @@ impl AppClient {
                 tracing::warn!(
                     target: "marmot_app::client",
                     method = "backfill_self_membership_once",
-                    abort_reason = "malformed_group_id",
+                    abort_reason = "malformed_candidate",
                     "aborting self-membership backfill"
                 );
                 return Ok(());
