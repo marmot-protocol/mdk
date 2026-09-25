@@ -1215,14 +1215,16 @@
           "type": "boolean"
         },
         "accepted_this_attempt_count": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295
+          "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            { "type": "null" }
+          ]
         },
         "accepted_total_count": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295
+          "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            { "type": "null" }
+          ]
         },
         "required_acks": {
           "type": "integer",

@@ -86,6 +86,20 @@ fn epoch_backfill_terminal_event_kind(
 }
 
 impl AppClient {
+    pub(crate) fn audit_v5_enabled(&self) -> bool {
+        self.runtime.session().audit_v5_enabled()
+    }
+
+    /// Drain only current-operation events into the installed recorder. The
+    /// session assigns the same source/session/sequence as engine audit rows.
+    pub(crate) fn flush_live_v5_events(&mut self) {
+        let Some(probe) = &mut self.audit_v5_probe else {
+            return;
+        };
+        for (group_ref, event) in probe.take_live_events() {
+            self.runtime.session().record_v5_event(group_ref, event);
+        }
+    }
     pub(crate) fn local_human_action_context(
         action: impl Into<String>,
         fields: Vec<&'static str>,

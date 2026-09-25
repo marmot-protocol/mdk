@@ -145,6 +145,19 @@ fn safe_category(input: &str) -> String {
     }
 }
 
+fn safe_metadata(input: &str, punctuation: &[u8]) -> String {
+    if !input.is_empty()
+        && input.len() <= 64
+        && input
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || punctuation.contains(&b))
+    {
+        input.to_owned()
+    } else {
+        "unclassified".to_owned()
+    }
+}
+
 fn renamed(key: &str) -> &str {
     match key {
         "relay_url" => "endpoint_ref",
@@ -272,12 +285,13 @@ fn protect(value: &mut Value) -> Result<(), ContractError> {
                     | "device_id" => {
                         map_strings(&mut child, |s| Ok(diagnostic_ref(&key, s)))?;
                     }
+                    "hardware_model" => map_strings(&mut child, |s| Ok(safe_metadata(s, b",._-")))?,
+                    "app_version" => map_strings(&mut child, |s| Ok(safe_metadata(s, b"._+-")))?,
                     "reason" | "error_kind" | "action" | "origin" | "phase" | "target_kind"
                     | "intent_kind" | "result_kind" | "change_kind" | "pending_kind" | "stage"
                     | "proposal_kind" | "decision" | "outcome_kind" | "envelope_kind"
                     | "transport_source" | "delivery_plane" | "wire_kind" | "transport"
-                    | "recorder" | "hardware_model" | "app_version" | "upload_trigger"
-                    | "platform" => {
+                    | "recorder" | "upload_trigger" | "platform" => {
                         if matches!(child, Value::String(_) | Value::Array(_)) {
                             map_strings(&mut child, |s| Ok(safe_category(s)))?;
                         }
@@ -430,4 +444,30 @@ fn validate_protected(value: &Value) -> Result<(), ContractError> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::diagnostic_ref;
+
+    #[test]
+    fn operational_branch_and_snapshot_aliases_share_their_semantic_domains() {
+        let branch = "branch-17";
+        assert_eq!(
+            diagnostic_ref("branch_id", branch),
+            diagnostic_ref("selected_branch_id", branch)
+        );
+        assert_eq!(
+            diagnostic_ref("branch_id", branch),
+            diagnostic_ref("losing_branch_ids", branch)
+        );
+        assert_eq!(
+            diagnostic_ref("snapshot_name", "snapshot-1"),
+            diagnostic_ref("fallback_snapshot_name", "snapshot-1")
+        );
+        assert_ne!(
+            diagnostic_ref("branch_id", branch),
+            diagnostic_ref("snapshot_name", branch)
+        );
+    }
 }

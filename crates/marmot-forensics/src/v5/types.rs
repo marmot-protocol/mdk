@@ -368,8 +368,10 @@ pub struct WelcomePublishFinished {
     pub outer_event_ref: NostrEventRef,
     pub results: Vec<EndpointResult>,
     pub results_complete: bool,
-    pub accepted_this_attempt_count: u32,
-    pub accepted_total_count: u32,
+    #[serde(deserialize_with = "nullable")]
+    pub accepted_this_attempt_count: Option<u32>,
+    #[serde(deserialize_with = "nullable")]
+    pub accepted_total_count: Option<u32>,
     pub required_acks: u32,
     pub policy: Policy,
     pub retained_state: RetainedState,

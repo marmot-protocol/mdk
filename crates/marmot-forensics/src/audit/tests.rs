@@ -345,6 +345,7 @@ fn audit_event_round_trips_through_serde() {
             group: None,
             convergence: None,
             source: None,
+            v5_welcome_refs: Vec::new(),
         }),
         kind: AuditEventKind::ForkResolution {
             source_epoch: 4,
@@ -1295,6 +1296,7 @@ fn sample_events_serialize_within_schema_property_names() {
                 local_member_ref: Some("b".repeat(32)),
                 ..Default::default()
             }),
+            v5_welcome_refs: Vec::new(),
         }),
         kind: AuditEventKind::SendEntry {
             intent_kind: "app_message".into(),
@@ -2391,4 +2393,71 @@ fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
     }
     assert_eq!(actual, expected.into_iter().map(str::to_owned).collect());
     assert_eq!(actual.len(), 44);
+}
+
+#[test]
+fn v5_operational_wire_rejects_legacy_aliases_and_preserves_reference_domains() {
+    use crate::v5::{self, BuildProfile, EngineMessageRef, GroupRef, Platform, Producer};
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder = JsonlRecorder::open_v5_with_account_ref(
+        &path,
+        "11".repeat(16),
+        None,
+        Producer {
+            mdk_revision: None,
+            build_profile: BuildProfile::Debug,
+            platform: Platform::Other,
+            host_build: None,
+        },
+    )
+    .unwrap();
+    let raw_message = "ab".repeat(32);
+    let raw_group = "cd".repeat(16);
+    recorder.record(AuditRecord::new(
+        Some(raw_group.clone()),
+        AuditEventKind::PublishAttempt {
+            msg_id: raw_message.clone(),
+            artifact_kind: Some(MessageArtifactKind::Welcome),
+            target_kind: "group".into(),
+            relay_url: Some("wss://relay.example".into()),
+            relay_urls: vec!["wss://relay.example".into()],
+            required_acks: 1,
+            transport: None,
+        },
+    ));
+    let body = std::fs::read_to_string(path).unwrap();
+    let row = body.lines().last().unwrap();
+    let value: serde_json::Value = serde_json::from_str(row).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let expected_message =
+        EngineMessageRef::from_message_id(&hex::decode(&raw_message).unwrap()).unwrap();
+    let expected_group = GroupRef::from_group_id(&hex::decode(&raw_group).unwrap()).unwrap();
+    assert_eq!(value["event"]["message_ref"], expected_message.as_str());
+    assert_eq!(value["group_ref"], expected_group.as_str());
+    assert_ne!(value["event"]["message_ref"], raw_message);
+    assert!(!row.contains("wss://"));
+    assert!(validator.is_valid(&value));
+    v5::Record::from_json(row.as_bytes()).unwrap();
+
+    let mut mutations = Vec::new();
+    let mut legacy_name = value.clone();
+    let event = legacy_name["event"].as_object_mut().unwrap();
+    let raw_field = event.remove("message_ref").unwrap();
+    event.insert("msg_id".into(), raw_field);
+    mutations.push(legacy_name);
+    let mut raw_endpoint = value.clone();
+    raw_endpoint["event"]["endpoint_ref"] = "wss://relay.example".into();
+    mutations.push(raw_endpoint);
+    let mut object_enum = value.clone();
+    object_enum["event"]["artifact_kind"] = serde_json::json!({"welcome": null});
+    mutations.push(object_enum);
+    let mut extra = value.clone();
+    extra["event"]["unexpected"] = "safe".into();
+    mutations.push(extra);
+    for mutated in mutations {
+        assert!(!validator.is_valid(&mutated));
+        assert!(v5::Record::from_json(&serde_json::to_vec(&mutated).unwrap()).is_err());
+    }
 }

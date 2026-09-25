@@ -181,11 +181,15 @@ pub(crate) struct WelcomeProbe {
     next_id: u64,
     bytes: usize,
     pub(super) rows: Vec<Record>,
+    live: bool,
+    pending_live: Vec<(Option<GroupRef>, Event)>,
+    validated_refs: Vec<(String, NostrEventRef, LocalId)>,
     // Only origins observed at an actual projection path are eligible. Absence
     // of a receive row never implies local replay or successful computation.
     projections: BTreeMap<String, UpdateCause>,
     pub(super) dropped: usize,
     pub(super) invalid: usize,
+    #[cfg(test)]
     pub(super) reject_checkpoints: bool,
 }
 
@@ -228,11 +232,38 @@ impl WelcomeProbe {
             next_id: 0,
             bytes: 0,
             rows: Vec::new(),
+            live: false,
+            pending_live: Vec::new(),
+            validated_refs: Vec::new(),
             projections: BTreeMap::new(),
             dropped: 0,
             invalid: 0,
+            #[cfg(test)]
             reject_checkpoints: false,
         }
+    }
+
+    pub(crate) fn live() -> Self {
+        let mut probe = Self::new(
+            "00".repeat(16).try_into().expect("valid placeholder"),
+            "00".repeat(16).try_into().expect("valid placeholder"),
+            Producer {
+                mdk_revision: None,
+                build_profile: BuildProfile::Debug,
+                platform: Platform::Other,
+                host_build: None,
+            },
+        );
+        probe.live = true;
+        probe
+    }
+
+    pub(super) fn take_live_events(&mut self) -> Vec<(Option<GroupRef>, Event)> {
+        std::mem::take(&mut self.pending_live)
+    }
+
+    pub(super) fn take_validated_refs(&mut self) -> Vec<(String, NostrEventRef, LocalId)> {
+        std::mem::take(&mut self.validated_refs)
     }
 
     fn local_id(&mut self) -> LocalId {
@@ -241,6 +272,14 @@ impl WelcomeProbe {
     }
 
     fn record(&mut self, group_ref: Option<GroupRef>, event: Event) {
+        if self.live {
+            if self.pending_live.len() < MAX_ROWS {
+                self.pending_live.push((group_ref, event));
+            } else {
+                self.dropped += 1;
+            }
+            return;
+        }
         self.seq += 1;
         let row = Record::new(RecordFields {
             schema_version: SchemaVersion::V5,
@@ -376,6 +415,11 @@ impl WelcomeProbe {
             return;
         }
         for (op_id, recipient_ref, key_package_event_id, outer_event_id) in rows {
+            self.validated_refs.push((
+                hex::encode(outer_event_id),
+                NostrEventRef::from_validated_event_id(&outer_event_id),
+                op_id.clone(),
+            ));
             self.record(
                 Some(group_ref.clone()),
                 Event::WelcomePrepared(WelcomePrepared {
@@ -421,7 +465,11 @@ impl WelcomeProbe {
         };
         let receive_id = self.local_id();
         let outer = NostrEventRef::from_validated_event_id(&id);
-        let before = self.rows.len();
+        let before = if self.live {
+            self.pending_live.len()
+        } else {
+            self.rows.len()
+        };
         self.record(
             None,
             Event::WelcomeObserved(WelcomeObserved {
@@ -433,7 +481,12 @@ impl WelcomeProbe {
                 fetch_id: None,
             }),
         );
-        (self.rows.len() > before).then_some((receive_id, outer))
+        let after = if self.live {
+            self.pending_live.len()
+        } else {
+            self.rows.len()
+        };
+        (after > before).then_some((receive_id, outer))
     }
 
     pub(super) fn unwrapped(&mut self, completion: PeelCompletion) {
@@ -460,7 +513,7 @@ impl WelcomeProbe {
     /// The matching GroupJoined was durably journaled in the engine's join
     /// transaction. The copy-install epoch is written there too; a buffered
     /// group message can advance `group.epoch` before this call returns.
-    pub(super) fn joined(&mut self, receive: (LocalId, NostrEventRef), group: &Group) {
+    pub(super) fn joined(&mut self, receive: (LocalId, NostrEventRef), group: &Group) -> bool {
         // A replacement Welcome resets join_epoch to zero. Zero is also the
         // stored unknown-bound sentinel; only equal, known first-join and
         // copy-install epochs establish this subset's initial-join scope.
@@ -469,11 +522,11 @@ impl WelcomeProbe {
             || group.join_epoch.0 == 0
             || group.join_epoch != group.local_copy_install_epoch
         {
-            return;
+            return false;
         }
         let Ok(group_ref) = GroupRef::from_group_id(group.id.as_slice()) else {
             self.invalid += 1;
-            return;
+            return false;
         };
         self.record(
             Some(group_ref),
@@ -485,6 +538,70 @@ impl WelcomeProbe {
                 epoch: Some(group.local_copy_install_epoch.0.into()),
                 engine_commit: EngineCommit::Committed,
                 elapsed_us: None,
+            }),
+        );
+        true
+    }
+
+    /// Snapshot the authoritative stored roster once at a canonical create or
+    /// join boundary. Admin policy read failure is explicit partial coverage.
+    pub(super) fn baseline(
+        &mut self,
+        group: &Group,
+        admins: Option<&[[u8; 32]]>,
+        reason: BaselineReason,
+        cause_outer_event_ref: Option<NostrEventRef>,
+    ) {
+        if group.protocol_profile != ProtocolProfile::Current || group.is_terminal() {
+            return;
+        }
+        let Ok(group_ref) = GroupRef::from_group_id(group.id.as_slice()) else {
+            return;
+        };
+        let mut members = group
+            .members
+            .iter()
+            .filter_map(|member| {
+                let member_ref = MemberRef::from_member_identity(member.id.as_slice()).ok()?;
+                let admin = admins.and_then(|admins| {
+                    let id: [u8; 32] = member.id.as_slice().try_into().ok()?;
+                    Some(admins.contains(&id))
+                });
+                Some(BaselineMember { member_ref, admin })
+            })
+            .collect::<Vec<_>>();
+        members.sort_by(|a, b| a.member_ref.cmp(&b.member_ref));
+        members.dedup_by(|a, b| a.member_ref == b.member_ref);
+        let member_count = u32::try_from(group.members.len()).ok();
+        let mut limitations = Vec::new();
+        if members.len() > MAX_MEMBERS {
+            members.truncate(MAX_MEMBERS);
+            limitations.push(Limitation::MemberLimit);
+        }
+        if admins.is_none() || members.iter().any(|member| member.admin.is_none()) {
+            limitations.push(Limitation::AdminPolicyUnavailable);
+        }
+        let members_complete = member_count == Some(members.len() as u32);
+        self.record(
+            Some(group_ref),
+            Event::GroupBaseline(GroupBaseline {
+                reason,
+                cause_outer_event_ref,
+                epoch: Some(group.epoch.0.into()),
+                basis: if reason == BaselineReason::Created {
+                    Basis::Founding {}
+                } else {
+                    Basis::Unavailable {}
+                },
+                members,
+                member_count,
+                members_complete,
+                limitations: limitations.clone(),
+                capture: if limitations.is_empty() && members_complete {
+                    Capture::Complete
+                } else {
+                    Capture::Partial
+                },
             }),
         );
     }

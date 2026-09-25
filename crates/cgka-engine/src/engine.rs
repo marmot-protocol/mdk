@@ -1037,6 +1037,7 @@ impl<S: StorageProvider> Engine<S> {
             group: None,
             convergence: None,
             source: None,
+            v5_welcome_refs: Vec::new(),
         };
         // Record the transport wire evidence before ingest when the transport
         // layer supplied it, so an analyzer sees what arrived on the wire ahead
@@ -2938,6 +2939,20 @@ impl<S: StorageProvider> Engine<S> {
     /// file-backed. `None` for the default [`NoopRecorder`].
     pub fn audit_recorder_path(&self) -> Option<std::path::PathBuf> {
         self.recorder.audit_log_path()
+    }
+
+    /// Native v5 evidence shares the recorder's source, session and sequence
+    /// with engine audit rows. V4 and disabled recorders ignore this call.
+    pub fn audit_v5_event(
+        &self,
+        group_ref: Option<marmot_forensics::v5::GroupRef>,
+        event: marmot_forensics::v5::Event,
+    ) {
+        self.recorder.record_v5_event(group_ref, event);
+    }
+
+    pub fn audit_v5_enabled(&self) -> bool {
+        self.recorder.records_v5()
     }
 
     /// Rotate the installed forensic recorder: discard its current file and

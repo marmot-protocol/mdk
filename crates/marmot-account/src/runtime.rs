@@ -36,15 +36,17 @@ use cgka_traits::{
     EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
     OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, StorageError, Timestamp,
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
-    TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
-    TransportEndpointReceipt, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
-    TransportPublishTarget,
+    TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
+    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
+use marmot_forensics::v5 as audit_v5;
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditTransportWire, MessageArtifactKind, PublishRelayFailure,
 };
+use sha2::{Digest, Sha256};
 
 use crate::error::{AccountError, AccountResult};
 use crate::key_package::{KeyPackagePublication, KeyPackagePublisher, NoopKeyPackagePublisher};
@@ -189,6 +191,12 @@ enum LegacyPublishCompletion {
 struct PreparedLegacyPublishAttempt {
     message_id: cgka_traits::MessageId,
     msg_id_hex: String,
+    v5_welcome: Option<(
+        audit_v5::LocalId,
+        audit_v5::NostrEventRef,
+        audit_v5::LocalId,
+        audit_v5::MemberRef,
+    )>,
     wire: AuditTransportWire,
     artifact_kind: Option<MessageArtifactKind>,
     publish_context: AuditEventContext,
@@ -4231,6 +4239,22 @@ where
         };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
+        let v5_welcome_identity = if self.session.audit_v5_enabled() {
+            match &message.envelope {
+                TransportEnvelope::Welcome { recipient } => publish_context
+                    .v5_welcome_refs
+                    .iter()
+                    .find(|(id, _, _)| id == &msg_id_hex)
+                    .and_then(|(_, outer, op_id)| {
+                        audit_v5::MemberRef::from_member_identity(recipient.as_slice())
+                            .ok()
+                            .map(|recipient_ref| (op_id.clone(), outer.clone(), recipient_ref))
+                    }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let existing_fanout = self.session.transport_fanout(&message_id)?;
         if existing_fanout
             .as_ref()
@@ -4246,6 +4270,20 @@ where
             match self.routing.publish_target(&message) {
                 Ok(target) => target,
                 Err(e) => {
+                    if let Some((op_id, outer_event_ref, recipient_ref)) = &v5_welcome_identity {
+                        self.session.record_v5_event(
+                            None,
+                            audit_v5::Event::WelcomePublishNotStarted(
+                                audit_v5::WelcomePublishNotStarted {
+                                    op_id: op_id.clone(),
+                                    outer_event_ref: outer_event_ref.clone(),
+                                    recipient_ref: recipient_ref.clone(),
+                                    reason: audit_v5::NotStartedReason::RouteResolutionFailed,
+                                    elapsed_us: None,
+                                },
+                            ),
+                        );
+                    }
                     self.session.record_audit_event(
                         None,
                         Some(publish_context),
@@ -4382,10 +4420,57 @@ where
             .max(1)
             .min(retry_endpoints.len());
 
+        let v5_welcome = v5_welcome_identity.map(|(op_id, outer, recipient_ref)| {
+            let ordinal = fanout
+                .targets
+                .iter()
+                .map(|t| t.attempt_count)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let attempt_id =
+                v5_local_id(b"welcome-publish-attempt", message_id.as_slice(), ordinal);
+            (op_id, outer, attempt_id, recipient_ref)
+        });
+        if let Some((op_id, outer, attempt_id, recipient_ref)) = &v5_welcome
+            && let Some(group_ref) = target_group_id.as_ref().and_then(v5_group_ref)
+            && let (Ok(target_count), Ok(required_acks), Ok(accepted_before_count)) = (
+                u32::try_from(retry_endpoints.len()),
+                u32::try_from(required_acks),
+                u32::try_from(accepted_before),
+            )
+        {
+            let mut targets = retry_endpoints
+                .iter()
+                .filter_map(v5_endpoint_ref)
+                .collect::<Vec<_>>();
+            targets.sort();
+            targets.dedup();
+            let targets_complete =
+                targets.len() == retry_endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
+            targets.truncate(audit_v5::MAX_ENDPOINTS);
+            self.session.record_v5_event(
+                Some(group_ref),
+                audit_v5::Event::WelcomePublishStarted(audit_v5::WelcomePublishStarted {
+                    op_id: op_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    outer_event_ref: outer.clone(),
+                    recipient_ref: recipient_ref.clone(),
+                    route_source: audit_v5::RouteSource::Unknown,
+                    targets,
+                    target_count: Some(target_count),
+                    targets_complete,
+                    required_acks,
+                    accepted_before_count,
+                }),
+            );
+        }
+
         Ok(PreparedLegacyPublish::Network(Box::new(
             PreparedLegacyPublishAttempt {
                 message_id,
                 msg_id_hex,
+                v5_welcome,
                 wire,
                 artifact_kind,
                 publish_context,
@@ -4416,6 +4501,7 @@ where
         let PreparedLegacyPublishAttempt {
             message_id,
             msg_id_hex,
+            v5_welcome,
             wire,
             artifact_kind,
             publish_context,
@@ -4451,6 +4537,14 @@ where
                     }
                 }
                 self.session.put_transport_fanout(&fanout)?;
+                self.record_v5_welcome_publish_finished(
+                    &v5_welcome,
+                    target_group_id.as_ref(),
+                    None,
+                    &retry_endpoints,
+                    accepted_before,
+                    required_acks,
+                );
                 self.session.record_audit_event(
                     target_group_id.as_ref(),
                     Some(publish_context),
@@ -4492,6 +4586,14 @@ where
             .iter()
             .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
             .count();
+        self.record_v5_welcome_publish_finished(
+            &v5_welcome,
+            target_group_id.as_ref(),
+            Some(&report),
+            &retry_endpoints,
+            accepted_total,
+            required_acks,
+        );
         let published = accepted_total >= required_acks.max(1);
         let accepted_by_any_endpoint = accepted_total > 0;
         self.session.record_audit_event(
@@ -4553,6 +4655,92 @@ where
             retry_deferred: false,
             terminal_failure: !published && !accepted_by_any_endpoint && !fanout.possible_exposure,
         })
+    }
+
+    fn record_v5_welcome_publish_finished(
+        &self,
+        identity: &Option<(
+            audit_v5::LocalId,
+            audit_v5::NostrEventRef,
+            audit_v5::LocalId,
+            audit_v5::MemberRef,
+        )>,
+        group_id: Option<&GroupId>,
+        report: Option<&TransportPublishReport>,
+        attempted: &[TransportEndpoint],
+        accepted_total: usize,
+        required_acks: usize,
+    ) {
+        let Some((_, outer, attempt_id, _)) = identity else {
+            return;
+        };
+        let Some(group_ref) = group_id.and_then(v5_group_ref) else {
+            return;
+        };
+        let Ok(required_acks) = u32::try_from(required_acks) else {
+            return;
+        };
+        let mut results = Vec::new();
+        let mut source_count = 0usize;
+        if let Some(report) = report {
+            source_count = report.accepted.len() + report.failed.len();
+            for receipt in &report.accepted {
+                if let Some(endpoint_ref) = v5_endpoint_ref(&receipt.endpoint) {
+                    results.push(audit_v5::EndpointResult {
+                        endpoint_ref,
+                        status: audit_v5::EndpointStatus::Acknowledged,
+                        failure_kind: None,
+                        rejection_category: (receipt.ack_kind
+                            == Some(TransportEndpointAckKind::Duplicate))
+                        .then_some(audit_v5::RejectionCategory::Duplicate),
+                    });
+                }
+            }
+            for failure in &report.failed {
+                if let Some(result) = v5_failed_endpoint_result(failure) {
+                    results.push(result);
+                }
+            }
+        }
+        results.sort_by(|a, b| a.endpoint_ref.cmp(&b.endpoint_ref));
+        let unique = results
+            .windows(2)
+            .all(|pair| pair[0].endpoint_ref < pair[1].endpoint_ref);
+        results.dedup_by(|a, b| a.endpoint_ref == b.endpoint_ref);
+        let results_complete = report.is_some()
+            && unique
+            && results.len() == attempted.len()
+            && source_count == attempted.len()
+            && results.len() <= audit_v5::MAX_ENDPOINTS;
+        results.truncate(audit_v5::MAX_ENDPOINTS);
+        let accepted_this_attempt_count = results_complete
+            .then(|| report.and_then(|report| u32::try_from(report.accepted.len()).ok()))
+            .flatten();
+        let accepted_total_count = results_complete
+            .then(|| u32::try_from(accepted_total).ok())
+            .flatten();
+        let policy = if !results_complete {
+            audit_v5::Policy::Unknown
+        } else if accepted_total_count.is_some_and(|count| count >= required_acks) {
+            audit_v5::Policy::Met
+        } else {
+            audit_v5::Policy::Unmet
+        };
+        self.session.record_v5_event(
+            Some(group_ref),
+            audit_v5::Event::WelcomePublishFinished(audit_v5::WelcomePublishFinished {
+                attempt_id: attempt_id.clone(),
+                outer_event_ref: outer.clone(),
+                results,
+                results_complete,
+                accepted_this_attempt_count,
+                accepted_total_count,
+                required_acks,
+                policy,
+                retained_state: audit_v5::RetainedState::Pending,
+                elapsed_us: None,
+            }),
+        );
     }
 }
 
@@ -5334,4 +5522,89 @@ mod tests {
             );
         }
     }
+}
+
+fn v5_group_ref(group_id: &GroupId) -> Option<audit_v5::GroupRef> {
+    audit_v5::GroupRef::from_group_id(group_id.as_slice()).ok()
+}
+
+fn v5_endpoint_ref(endpoint: &TransportEndpoint) -> Option<audit_v5::EndpointRef> {
+    // TransportEndpoint is supplied by the routing owner after canonical relay
+    // URL normalization; preserve its path/query in the hash input.
+    audit_v5::EndpointRef::from_normalized_url(&endpoint.0).ok()
+}
+
+fn v5_local_id(domain: &[u8], message_id: &[u8], ordinal: u32) -> audit_v5::LocalId {
+    let mut hash = Sha256::new();
+    hash.update(b"marmot-audit-local-id/v5\0");
+    hash.update(domain);
+    hash.update([0]);
+    hash.update(message_id);
+    hash.update(ordinal.to_be_bytes());
+    hex::encode(&hash.finalize()[..16])
+        .try_into()
+        .expect("16-byte hash")
+}
+
+fn v5_failed_endpoint_result(
+    failure: &TransportEndpointFailure,
+) -> Option<audit_v5::EndpointResult> {
+    let endpoint_ref = v5_endpoint_ref(&failure.endpoint)?;
+    let rejection_category = failure.rejection_category.map(|category| match category {
+        TransportEndpointRejectionCategory::Duplicate => audit_v5::RejectionCategory::Duplicate,
+        TransportEndpointRejectionCategory::Pow => audit_v5::RejectionCategory::Pow,
+        TransportEndpointRejectionCategory::Blocked => audit_v5::RejectionCategory::Blocked,
+        TransportEndpointRejectionCategory::RateLimited => audit_v5::RejectionCategory::RateLimited,
+        TransportEndpointRejectionCategory::Invalid => audit_v5::RejectionCategory::Invalid,
+        TransportEndpointRejectionCategory::Error => audit_v5::RejectionCategory::Error,
+        TransportEndpointRejectionCategory::Unsupported => audit_v5::RejectionCategory::Unsupported,
+        TransportEndpointRejectionCategory::AuthRequired => {
+            audit_v5::RejectionCategory::AuthRequired
+        }
+        TransportEndpointRejectionCategory::Restricted => audit_v5::RejectionCategory::Restricted,
+    });
+    let failure_kind = match failure.kind {
+        TransportEndpointFailureKind::TerminalRejected => {
+            audit_v5::EndpointFailureKind::TerminalRejected
+        }
+        TransportEndpointFailureKind::NotExposed => audit_v5::EndpointFailureKind::NotExposed,
+        TransportEndpointFailureKind::PossiblyExposed => {
+            audit_v5::EndpointFailureKind::PossiblyExposed
+        }
+        TransportEndpointFailureKind::RetryableUnavailable => {
+            audit_v5::EndpointFailureKind::RetryableUnavailable
+        }
+    };
+    let admissible = match (failure_kind, rejection_category) {
+        (
+            audit_v5::EndpointFailureKind::TerminalRejected,
+            Some(
+                audit_v5::RejectionCategory::Pow
+                | audit_v5::RejectionCategory::Blocked
+                | audit_v5::RejectionCategory::Invalid
+                | audit_v5::RejectionCategory::Unsupported
+                | audit_v5::RejectionCategory::Restricted,
+            ),
+        ) => true,
+        (audit_v5::EndpointFailureKind::NotExposed, None) => true,
+        (
+            audit_v5::EndpointFailureKind::PossiblyExposed,
+            None | Some(audit_v5::RejectionCategory::Error),
+        ) => true,
+        (
+            audit_v5::EndpointFailureKind::RetryableUnavailable,
+            None
+            | Some(
+                audit_v5::RejectionCategory::RateLimited
+                | audit_v5::RejectionCategory::AuthRequired,
+            ),
+        ) => true,
+        _ => false,
+    };
+    admissible.then_some(audit_v5::EndpointResult {
+        endpoint_ref,
+        status: audit_v5::EndpointStatus::Failed,
+        failure_kind: Some(failure_kind),
+        rejection_category,
+    })
 }

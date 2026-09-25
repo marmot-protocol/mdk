@@ -156,6 +156,11 @@ pub struct AuditEventContext {
     pub convergence: Option<AuditConvergenceContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<AuditSourceContext>,
+    /// Ephemeral app-validated Nostr Welcome references for the exact publish
+    /// batch. Never serialized into v4 or operational v5 contexts; account
+    /// publication consumes this only while the operation is in memory.
+    #[serde(skip)]
+    pub v5_welcome_refs: Vec<(MessageRefHex, crate::v5::NostrEventRef, crate::v5::LocalId)>,
 }
 
 /// Identifies the account/device/app that produced an audit log, for upload
@@ -1272,6 +1277,10 @@ pub trait ForensicRecorder: Send + Sync {
     /// evidence; an enabled v5 recorder assigns all envelope fields.
     fn record_v5_event(&self, _group_ref: Option<crate::v5::GroupRef>, _event: crate::v5::Event) {}
 
+    fn records_v5(&self) -> bool {
+        false
+    }
+
     /// Whether this recorder consumes audit events.
     ///
     /// Producers may use this to skip audit-only data loads on hot paths. The
@@ -1587,6 +1596,13 @@ impl ForensicRecorder for JsonlRecorder {
         {
             self.try_roll_segment(&mut inner, Instant::now());
         }
+    }
+
+    fn records_v5(&self) -> bool {
+        matches!(
+            self.inner.lock().unwrap_or_else(|p| p.into_inner()).format,
+            RecorderFormat::V5 { .. }
+        )
     }
 
     fn health_snapshot(&self) -> AuditRecorderHealthSnapshot {

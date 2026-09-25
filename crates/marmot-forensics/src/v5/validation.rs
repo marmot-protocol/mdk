@@ -177,21 +177,30 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                 .filter(|r| r.status == EndpointStatus::Acknowledged)
                 .count() as u32;
             require(
-                e.accepted_this_attempt_count >= captured_acks
-                    && (!e.results_complete || e.accepted_this_attempt_count == captured_acks),
+                e.accepted_this_attempt_count
+                    .is_none_or(|n| n >= captured_acks)
+                    && (!e.results_complete
+                        || e.accepted_this_attempt_count == Some(captured_acks)),
                 "current acknowledgment count inconsistent with results",
             )?;
             require(
-                e.accepted_total_count >= e.accepted_this_attempt_count,
+                e.accepted_total_count.is_none_or(|total| {
+                    e.accepted_this_attempt_count
+                        .is_none_or(|current| total >= current)
+                }),
                 "cumulative acknowledgments smaller than current attempt",
             )?;
             require(
                 match e.policy {
-                    Policy::Met => e.accepted_total_count >= e.required_acks,
-                    Policy::Unmet => e.accepted_total_count < e.required_acks,
+                    Policy::Met => e.accepted_total_count.is_some_and(|n| n >= e.required_acks),
+                    Policy::Unmet => e.accepted_total_count.is_some_and(|n| n < e.required_acks),
                     Policy::Unknown => true,
                 },
                 "policy contradicts acknowledgment counts",
+            )?;
+            require(
+                e.results_complete || e.policy != Policy::Unmet,
+                "incomplete endpoint results cannot establish unmet policy",
             )?;
             require(
                 e.retained_state != RetainedState::Completed || e.policy == Policy::Met,
