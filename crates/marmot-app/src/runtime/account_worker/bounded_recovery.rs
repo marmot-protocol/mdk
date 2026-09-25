@@ -13,7 +13,8 @@ use cgka_traits::{
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::SemaphorePermit;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use transport_nostr_adapter::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionError,
     NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope,
@@ -28,36 +29,65 @@ pub(super) const MAX_CONCURRENT_JOBS: usize = 2;
 pub(super) const ADMISSION_YIELD_DELAY: Duration = Duration::from_millis(1);
 pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_REQUEST_DURATION: Duration = Duration::from_secs(5);
-static ACQUISITION_CREDITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_JOBS);
+static ACQUISITION_CREDITS: LazyLock<Arc<RecoveryCreditPool>> =
+    LazyLock::new(|| Arc::new(RecoveryCreditPool::new()));
+
+/// One process pool in production. A test fixture may explicitly substitute
+/// another two-credit pool while all accounts in that runtime still share it.
+pub(in crate::runtime) struct RecoveryCreditPool {
+    semaphore: Arc<Semaphore>,
+    #[cfg(test)]
+    bounded_refusals: AtomicUsize,
+}
+
+impl RecoveryCreditPool {
+    fn new() -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
+            #[cfg(test)]
+            bounded_refusals: AtomicUsize::new(0),
+        }
+    }
+}
+
+pub(in crate::runtime) fn shared_recovery_credit_pool() -> Arc<RecoveryCreditPool> {
+    ACQUISITION_CREDITS.clone()
+}
+
 #[cfg(test)]
-static CREDIT_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::runtime) fn private_recovery_credit_pool_for_test() -> Arc<RecoveryCreditPool> {
+    Arc::new(RecoveryCreditPool::new())
+}
 
 /// Both owner-authorized history jobs reserve from the same process-wide
 /// capacity before spending a durable attempt, then retain it through worker
 /// admission and checkpoint.
-pub(super) fn try_acquire_recovery_credit() -> Option<SemaphorePermit<'static>> {
-    ACQUISITION_CREDITS.try_acquire().ok()
+pub(super) fn try_acquire_recovery_credit(
+    pool: &Arc<RecoveryCreditPool>,
+) -> Option<OwnedSemaphorePermit> {
+    pool.semaphore.clone().try_acquire_owned().ok()
 }
 
 #[cfg(test)]
-pub(super) fn available_credits() -> usize {
-    ACQUISITION_CREDITS.available_permits()
+pub(super) fn available_credits(pool: &Arc<RecoveryCreditPool>) -> usize {
+    pool.semaphore.available_permits()
 }
 
 #[cfg(test)]
-pub(super) fn credit_refusals_for_test() -> usize {
-    CREDIT_REFUSALS.load(Ordering::SeqCst)
+pub(super) fn credit_refusals_for_test(pool: &Arc<RecoveryCreditPool>) -> usize {
+    pool.bounded_refusals.load(Ordering::SeqCst)
 }
 
 #[cfg(test)]
-pub(super) fn hold_all_credits_for_test() -> SemaphorePermit<'static> {
-    ACQUISITION_CREDITS
-        .try_acquire_many(MAX_CONCURRENT_JOBS as u32)
+pub(super) fn hold_all_credits_for_test(pool: &Arc<RecoveryCreditPool>) -> OwnedSemaphorePermit {
+    pool.semaphore
+        .clone()
+        .try_acquire_many_owned(MAX_CONCURRENT_JOBS as u32)
         .expect("fixture owns all bounded execution credits")
 }
 
 pub(super) struct Plan {
-    credit: Option<SemaphorePermit<'static>>,
+    credit: Option<OwnedSemaphorePermit>,
     grant: AttemptGrant,
     group: GroupId,
     route: [u8; 32],
@@ -70,11 +100,11 @@ pub(super) struct Job {
     cancellation: NostrAcquisitionCancellation,
     handle: Option<
         JoinHandle<(
-            SemaphorePermit<'static>,
+            OwnedSemaphorePermit,
             Result<NostrAcquisitionResult, NostrAcquisitionError>,
         )>,
     >,
-    credit: Option<SemaphorePermit<'static>>,
+    credit: Option<OwnedSemaphorePermit>,
     pending: VecDeque<(TransportEndpoint, NostrTransportEvent)>,
     ends: Vec<(TransportEndpoint, NostrAcquisitionEnd)>,
     unsupported: bool,
@@ -96,6 +126,7 @@ impl Drop for Job {
 pub(super) fn prepare(
     client: &mut AppClient,
     seam: EpochBackfillExecutionSeam,
+    pool: &Arc<RecoveryCreditPool>,
 ) -> Result<Option<Plan>, AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
     let demands = storage.pending_recovery_demands()?;
@@ -153,9 +184,9 @@ pub(super) fn prepare(
     }
     // Reserve process capacity before spending the owner's durable attempt.
     // No waiter or completed result can exist without a credit.
-    let Some(credit) = try_acquire_recovery_credit() else {
+    let Some(credit) = try_acquire_recovery_credit(pool) else {
         #[cfg(test)]
-        CREDIT_REFUSALS.fetch_add(1, Ordering::SeqCst);
+        pool.bounded_refusals.fetch_add(1, Ordering::SeqCst);
         return Ok(None);
     };
     // The owner selects one predicate for this request without changing the
@@ -261,7 +292,7 @@ impl Job {
         &mut self,
     ) -> Result<
         (
-            SemaphorePermit<'static>,
+            OwnedSemaphorePermit,
             Result<NostrAcquisitionResult, NostrAcquisitionError>,
         ),
         tokio::task::JoinError,
@@ -276,7 +307,7 @@ impl Job {
         &mut self,
         completed: Result<
             (
-                SemaphorePermit<'static>,
+                OwnedSemaphorePermit,
                 Result<NostrAcquisitionResult, NostrAcquisitionError>,
             ),
             tokio::task::JoinError,

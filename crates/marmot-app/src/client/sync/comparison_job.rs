@@ -3,6 +3,7 @@
 
 use super::*;
 use std::sync::{Arc, Mutex};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{NostrReconciliationProgress, SubscriptionAttempt};
 
@@ -51,9 +52,33 @@ pub(crate) struct ComparisonNetworkResult {
     routes: Vec<ComparisonRouteResult>,
 }
 
+#[cfg(test)]
+impl ComparisonNetworkResult {
+    pub(crate) fn outcome_kinds_for_test(&self) -> Vec<&'static str> {
+        self.routes
+            .iter()
+            .map(|route| match &route.result {
+                ComparisonRouteWorkResult::Skipped => "route_skipped",
+                ComparisonRouteWorkResult::TimedOut => "route_timed_out",
+                ComparisonRouteWorkResult::Returned(Ok(None)) => "route_unsupported",
+                ComparisonRouteWorkResult::Returned(Err(_)) => "route_error",
+                ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
+                    if summary.relays_failed > 0 {
+                        "route_relay_failed"
+                    } else if events.is_empty() {
+                        "route_no_events"
+                    } else {
+                        "route_events"
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
 /// Dropping the worker's handle cancels I/O and drops all unadmitted events.
 pub(crate) struct ComparisonNetworkJob {
-    handle: JoinHandle<ComparisonNetworkResult>,
+    handle: JoinHandle<(OwnedSemaphorePermit, ComparisonNetworkResult)>,
 }
 
 impl Drop for ComparisonNetworkJob {
@@ -63,7 +88,11 @@ impl Drop for ComparisonNetworkJob {
 }
 
 impl ComparisonNetworkJob {
-    pub(crate) fn start(client: &AppClient, grant: &AttemptGrant) -> Result<Self, AppError> {
+    pub(crate) fn start(
+        client: &AppClient,
+        grant: &AttemptGrant,
+        credit: OwnedSemaphorePermit,
+    ) -> Result<Self, AppError> {
         let storage = client.app.account_storage(&client.state.label)?;
         let routes = grant
             .inventory
@@ -135,15 +164,20 @@ impl ComparisonNetworkJob {
                     result,
                 });
             }
-            ComparisonNetworkResult {
-                deadline,
-                routes: results,
-            }
+            (
+                credit,
+                ComparisonNetworkResult {
+                    deadline,
+                    routes: results,
+                },
+            )
         });
         Ok(Self { handle })
     }
 
-    pub(crate) async fn wait(&mut self) -> Result<ComparisonNetworkResult, tokio::task::JoinError> {
+    pub(crate) async fn wait(
+        &mut self,
+    ) -> Result<(OwnedSemaphorePermit, ComparisonNetworkResult), tokio::task::JoinError> {
         (&mut self.handle).await
     }
 }
@@ -365,6 +399,44 @@ mod tests {
     };
     use cgka_traits::GroupStorage;
     use std::sync::Arc;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_request_keeps_credit_until_network_future_is_dropped() {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let credit = capacity.clone().try_acquire_owned().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let waiting = entered.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        let handle = tokio::spawn({
+            let entered = entered.clone();
+            async move {
+                entered.notify_one();
+                std::future::pending::<()>().await;
+                (
+                    credit,
+                    ComparisonNetworkResult {
+                        deadline: tokio::time::Instant::now(),
+                        routes: Vec::new(),
+                    },
+                )
+            }
+        });
+        let job = ComparisonNetworkJob { handle };
+        waiting.await;
+        drop(job);
+        // abort() has only requested cancellation. The task still owns the
+        // permit until Tokio drops its future on the next scheduler turn.
+        assert_eq!(capacity.available_permits(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while capacity.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled task releases its own permit");
+        assert_eq!(capacity.available_permits(), 1);
+    }
 
     struct Fixture {
         _dir: tempfile::TempDir,

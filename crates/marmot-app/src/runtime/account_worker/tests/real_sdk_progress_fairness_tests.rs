@@ -118,6 +118,9 @@ async fn bounded_real_sdk_retained_epochs_and_other_group_progress_before_exact_
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
     runtime
         .shared_services()
+        .use_private_recovery_credit_pool_for_test();
+    runtime
+        .shared_services()
         .bounded_group_recovery_enabled
         .store(true, Ordering::SeqCst);
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
@@ -608,6 +611,9 @@ async fn bounded_real_sdk_two_missing_known_ids_receive_distinct_owner_turns() {
         crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
+    runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
     runtime
         .shared_services()
         .bounded_group_recovery_enabled

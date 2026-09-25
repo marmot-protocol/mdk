@@ -2,7 +2,7 @@
 //! and the runtime-event publishing helpers the loop drives.
 
 mod attachments;
-mod bounded_recovery;
+pub(super) mod bounded_recovery;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
@@ -54,14 +54,12 @@ use crate::{
     SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
-use tokio::sync::SemaphorePermit;
 use transport_nostr_adapter::SubscriptionAttempt;
 
 struct ComparisonMaintenanceJob {
     grant: AttemptGrant,
     subscription_attempt: SubscriptionAttempt,
     network: ComparisonNetworkJob,
-    _credit: SemaphorePermit<'static>,
     observation: Option<crate::product_analytics::ProductObservation>,
     backfill_armed: bool,
     phase: Observation,
@@ -489,6 +487,12 @@ pub(crate) enum AccountWorkerCommand {
     AdvanceRecoveryClock {
         elapsed: Duration,
         respond: oneshot::Sender<()>,
+    },
+    /// Arm a current comparison through the same serialized owner used by
+    /// production, so a fixture never writes a stale plan beside the worker.
+    #[cfg(test)]
+    RequestBoundedComparisonForTest {
+        respond: oneshot::Sender<Result<(), AppError>>,
     },
     #[cfg(any(test, feature = "test-policy-overrides"))]
     RecoveryRetrySnapshot {
@@ -1184,7 +1188,11 @@ async fn run_app_runtime_account_worker(
                 shared
                     .bounded_preparation_probes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance)
+                bounded_recovery::prepare(
+                    &mut client,
+                    EpochBackfillExecutionSeam::Maintenance,
+                    &shared.recovery_credit_pool(),
+                )
             })();
             match probe {
                 Ok(Some(plan)) => {
@@ -1220,10 +1228,27 @@ async fn run_app_runtime_account_worker(
             }, if comparison_maintenance.is_some() => {
                 let job = comparison_maintenance.take().expect("completed comparison task exists");
                 let result = match completed {
-                    Ok(network) => client.finish_comparison_grant(
-                        job.grant, job.subscription_attempt, network,
-                    ).await,
+                    Ok((credit, network)) => {
+                        #[cfg(test)]
+                        shared
+                            .comparison_test_trace
+                            .lock()
+                            .unwrap()
+                            .extend(network.outcome_kinds_for_test());
+                        // The task owned this permit until its future really
+                        // ended; keep it through owner admission/checkpoint.
+                        let _credit = credit;
+                        client.finish_comparison_grant(
+                            job.grant, job.subscription_attempt, network,
+                        ).await
+                    }
                     Err(error) => {
+                        #[cfg(test)]
+                        shared
+                            .comparison_test_trace
+                            .lock()
+                            .unwrap()
+                            .push("task_join_error");
                         tracing::warn!(
                             target: "marmot_app::account_worker",
                             method = "comparison_maintenance",
@@ -2077,7 +2102,9 @@ async fn run_app_runtime_account_worker(
                 let observation = backfill_armed.then(|| shared.product_analytics.begin(
                     crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                 )).flatten();
-                let mut credit = bounded_recovery::try_acquire_recovery_credit();
+                let mut credit = bounded_recovery::try_acquire_recovery_credit(
+                    &shared.recovery_credit_pool(),
+                );
                 let selection = if credit.is_none() && client.comparison_only_waiting_for_credit().unwrap_or(false) {
                     Ok(crate::client::PendingRecoverySelection::Deferred)
                 } else {
@@ -2086,29 +2113,67 @@ async fn run_app_runtime_account_worker(
                 let backfill_result = match selection {
                     Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
                         let grant = *grant;
-                        if credit.is_some() && client.comparison_offload_eligible(&grant).unwrap_or(false) {
+                        let eligible = credit.is_some()
+                            && client.comparison_offload_eligible(&grant).unwrap_or(false);
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push(
+                            if eligible { "grant_eligible" } else { "grant_inline" },
+                        );
+                        if eligible {
                             match client.activate_comparison_grant(&grant).await {
-                                Ok(subscription_attempt) => match ComparisonNetworkJob::start(&client, &grant) {
+                                Ok(subscription_attempt) => match ComparisonNetworkJob::start(
+                                    &client, &grant, credit.take().expect("offloaded grant owns credit"),
+                                ) {
                                     Ok(network) => {
+                                        #[cfg(test)]
+                                        shared.comparison_test_trace.lock().unwrap().push("task_started");
                                         comparison_maintenance = Some(ComparisonMaintenanceJob {
                                             grant, subscription_attempt, network,
-                                            _credit: credit.take().expect("offloaded grant owns credit"),
                                             observation, backfill_armed, phase,
                                         });
                                         continue 'worker;
                                     }
-                                    Err(error) => Some(Err(error)),
+                                    Err(error) => {
+                                        #[cfg(test)]
+                                        shared.comparison_test_trace.lock().unwrap().push("task_start_error");
+                                        Some(Err(error))
+                                    }
                                 },
-                                Err(error) => Some(Err(error)),
+                                Err(error) => {
+                                    #[cfg(test)]
+                                    shared.comparison_test_trace.lock().unwrap().push("activation_error");
+                                    Some(Err(error))
+                                }
                             }
                         } else {
                             drop(credit.take());
                             Some(client.execute_pending_epoch_backfill_grant(grant).await)
                         }
                     }
-                    Ok(crate::client::PendingRecoverySelection::Deferred) => Some(Ok(EpochBackfillRunOutcome::Deferred)),
-                    Ok(crate::client::PendingRecoverySelection::NotPending) => Some(Ok(EpochBackfillRunOutcome::NotPending)),
-                    Err(error) => Some(Err(error)),
+                    Ok(crate::client::PendingRecoverySelection::Deferred) => {
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push("selection_deferred");
+                        Some(Ok(EpochBackfillRunOutcome::Deferred))
+                    },
+                    Ok(crate::client::PendingRecoverySelection::NotPending) => {
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push("selection_empty");
+                        Some(Ok(EpochBackfillRunOutcome::NotPending))
+                    },
+                    Err(error) => {
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push(match &error {
+                            AppError::Storage(cgka_traits::storage::StorageError::Serialization(message))
+                                if message == "invalid recovery comparison" => "selection_invalid_comparison",
+                            AppError::Storage(cgka_traits::storage::StorageError::Serialization(_)) => "selection_storage_serialization",
+                            AppError::Storage(cgka_traits::storage::StorageError::Busy(_)) => "selection_storage_busy",
+                            AppError::Storage(_) => "selection_storage_other",
+                            AppError::Transport(_) => "selection_transport_error",
+                            AppError::Sqlite(_) => "selection_sqlite_error",
+                            _ => "selection_other_error",
+                        });
+                        Some(Err(error))
+                    },
                 };
                 drop(credit.take());
                 let _ = report_pending_epoch_backfill_result(
@@ -3500,6 +3565,11 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond } => Box::pin(async move {
             client.recovery_owner.test_advance_clock(elapsed);
             let _ = respond.send(());
+            true
+        }),
+        #[cfg(test)]
+        AccountWorkerCommand::RequestBoundedComparisonForTest { respond } => Box::pin(async move {
+            let _ = respond.send(client.request_bounded_comparison());
             true
         }),
         #[cfg(any(test, feature = "test-policy-overrides"))]
@@ -6174,6 +6244,9 @@ mod tests {
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
         runtime
             .shared_services()
+            .use_private_recovery_credit_pool_for_test();
+        runtime
+            .shared_services()
             .bounded_group_recovery_enabled
             .store(true, std::sync::atomic::Ordering::SeqCst);
         runtime.reconcile_accounts().await.unwrap();
@@ -6435,9 +6508,13 @@ mod tests {
         client.recovery_owner.test_advance_to_retry(&storage);
         let before = storage.recovery_retry_state().unwrap();
         assert!(
-            bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance)
-                .unwrap()
-                .is_none()
+            bounded_recovery::prepare(
+                &mut client,
+                EpochBackfillExecutionSeam::Maintenance,
+                &bounded_recovery::shared_recovery_credit_pool(),
+            )
+            .unwrap()
+            .is_none()
         );
         let after = storage.recovery_retry_state().unwrap();
         assert_eq!(after.attempt_serial, before.attempt_serial);
@@ -6480,6 +6557,19 @@ mod tests {
     }
 
     async fn bounded_known_fixture_with_delay(delay_ms: Option<u64>) -> BoundedKnownFixture {
+        bounded_known_fixture_with_delay_and_pool(delay_ms, None).await
+    }
+
+    async fn bounded_known_fixture_with_pool(
+        pool: Arc<bounded_recovery::RecoveryCreditPool>,
+    ) -> BoundedKnownFixture {
+        bounded_known_fixture_with_delay_and_pool(None, Some(pool)).await
+    }
+
+    async fn bounded_known_fixture_with_delay_and_pool(
+        delay_ms: Option<u64>,
+        pool: Option<Arc<bounded_recovery::RecoveryCreditPool>>,
+    ) -> BoundedKnownFixture {
         use storage_sqlite::RecoveryRequest;
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -6496,6 +6586,15 @@ mod tests {
             .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        if let Some(pool) = pool {
+            runtime
+                .shared_services()
+                .set_recovery_credit_pool_for_test(pool);
+        } else {
+            runtime
+                .shared_services()
+                .use_private_recovery_credit_pool_for_test();
+        }
         runtime
             .shared_services()
             .bounded_group_recovery_enabled
@@ -6897,7 +6996,9 @@ mod tests {
         );
         fixture.runtime.shutdown().await;
         assert_eq!(
-            bounded_recovery::available_credits(),
+            bounded_recovery::available_credits(
+                &fixture.runtime.shared_services().recovery_credit_pool(),
+            ),
             bounded_recovery::MAX_CONCURRENT_JOBS
         );
         drop(storage);
@@ -6972,7 +7073,9 @@ mod tests {
         );
         fixture.runtime.shutdown().await;
         assert_eq!(
-            bounded_recovery::available_credits(),
+            bounded_recovery::available_credits(
+                &fixture.runtime.shared_services().recovery_credit_pool(),
+            ),
             bounded_recovery::MAX_CONCURRENT_JOBS
         );
         drop(storage);

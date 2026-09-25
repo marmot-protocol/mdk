@@ -23,6 +23,7 @@ async fn real_sdk_returned_event_rejected_after_receipt_release() {
     );
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let shared = runtime.shared_services();
+    shared.use_private_recovery_credit_pool_for_test();
     shared
         .bounded_group_recovery_enabled
         .store(true, Ordering::SeqCst);

@@ -87,6 +87,7 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
     );
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let shared = runtime.shared_services();
+    let pool = shared.use_private_recovery_credit_pool_for_test();
     shared
         .bounded_group_recovery_enabled
         .store(true, Ordering::SeqCst);
@@ -217,7 +218,7 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
         "ordinary history did not retain the target"
     );
 
-    let credits_before = bounded_recovery::available_credits();
+    let credits_before = bounded_recovery::available_credits(&pool);
     shared
         .bounded_pause_before_admission
         .store(true, Ordering::SeqCst);
@@ -266,7 +267,10 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
     assert_eq!(old_witness.matching_items, 2);
     let old_attempt = storage.recovery_retry_state().unwrap().attempt_serial;
     assert_eq!(old_witness.attempt_serial, old_attempt);
-    assert_eq!(bounded_recovery::available_credits() + 1, credits_before);
+    assert_eq!(
+        bounded_recovery::available_credits(&pool) + 1,
+        credits_before
+    );
     let demand_id = storage
         .pending_recovery_demands()
         .unwrap()
@@ -321,7 +325,7 @@ async fn real_sdk_returned_result_is_dropped_on_account_restart_before_new_sessi
         .restart_account(&alice.account_id_hex)
         .await
         .unwrap();
-    assert_eq!(bounded_recovery::available_credits(), credits_before);
+    assert_eq!(bounded_recovery::available_credits(&pool), credits_before);
     assert!(
         !storage
             .retained_recovery_event(&route, &event_id, None, created_at)

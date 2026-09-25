@@ -21,6 +21,8 @@ struct HeldComparisonId {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
     hits: Arc<AtomicUsize>,
+    all_queries: Arc<AtomicUsize>,
+    id_queries: Arc<AtomicUsize>,
 }
 
 impl QueryPolicy for HeldComparisonId {
@@ -30,6 +32,10 @@ impl QueryPolicy for HeldComparisonId {
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
+            self.all_queries.fetch_add(1, Ordering::SeqCst);
+            if query.ids.is_some() {
+                self.id_queries.fetch_add(1, Ordering::SeqCst);
+            }
             let wanted = self.target.lock().unwrap().clone();
             let matches = wanted.as_ref().is_some_and(|wanted| {
                 query
@@ -54,15 +60,20 @@ impl QueryPolicy for HeldComparisonId {
 
 #[tokio::test]
 async fn comparison_worker_held_sdk_request_keeps_status_command_ready() {
-    run_held_comparison(false).await;
+    run_held_comparison(false, false).await;
 }
 
 #[tokio::test]
 async fn comparison_shutdown_reaps_task_and_releases_credit() {
-    run_held_comparison(true).await;
+    run_held_comparison(true, false).await;
 }
 
-async fn run_held_comparison(shutdown_while_held: bool) {
+#[tokio::test]
+async fn comparison_and_known_worker_share_two_credits_during_shutdown() {
+    run_held_comparison(true, true).await;
+}
+
+async fn run_held_comparison(shutdown_while_held: bool, known_competes: bool) {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldComparisonId::default();
     let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
@@ -87,6 +98,9 @@ async fn run_held_comparison(shutdown_while_held: bool) {
     );
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let pool = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
     runtime.reconcile_accounts().await.unwrap();
     runtime.publish_key_package(&bob.label).await.unwrap();
     let group = runtime
@@ -140,34 +154,36 @@ async fn run_held_comparison(shutdown_while_held: bool) {
         .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
         .await
         .unwrap();
+    let known_fixture = if known_competes {
+        Some(bounded_known_fixture_with_pool(pool.clone()).await)
+    } else {
+        None
+    };
     *gate.target.lock().unwrap() = Some(event.id.to_hex());
     assert!(
         !storage
             .retained_recovery_event(&recovery_route, &event_id, None, crate::unix_now_seconds())
             .unwrap()
     );
-    let now = crate::client::recovery::wall_now_ms().unwrap();
-    let goal = storage_sqlite::RecoveryScopePlan {
-        scope_id: 0,
-        route_kind: 1,
-        route_role: 0,
-        group_id: Some(group.as_slice().to_vec()),
-        transport_group_id: Some(route),
-        since_seconds: Some(now / 1000 - storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS),
-        until_seconds: now / 1000,
-        known_event_id: None,
-        inventory_floor: None,
-        required_endpoints: vec![url.clone()],
-        admitted_endpoints: vec![url.clone()],
-    };
-    storage
-        .join_recovery_comparison(&[5; 16], now, &[goal])
-        .unwrap();
-    let before_retry = storage.recovery_retry_state().unwrap().attempt_serial;
     gate.hold_exact.store(true, Ordering::SeqCst);
     let entered = gate.entered.notified();
     tokio::pin!(entered);
     entered.as_mut().enable();
+    let commands = runtime
+        .accounts()
+        .worker_commands(&alice.label)
+        .await
+        .unwrap();
+    let (respond, armed) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::RequestBoundedComparisonForTest { respond })
+        .unwrap();
+    timeout(Duration::from_secs(5), armed)
+        .await
+        .expect("serialized worker arms current comparison")
+        .unwrap()
+        .unwrap();
+    let before_retry = storage.recovery_retry_state().unwrap().attempt_serial;
     runtime
         .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
         .await;
@@ -177,8 +193,10 @@ async fn run_held_comparison(shutdown_while_held: bool) {
     if timeout(Duration::from_secs(12), entered).await.is_err() {
         let slot = storage.recovery_comparison().unwrap();
         panic!(
-            "maintenance exact-ID wait absent: hits={}, retained={}, pending={}, attempt_delta={}, credits={}, slot_attempt={}, frozen={}, routes={}, retries={}",
+            "maintenance exact-ID wait absent: hits={}, all_queries={}, id_queries={}, retained={}, pending={}, attempt_delta={}, credits={}, slot_attempt={}, frozen={}, routes={}, retries={}, stages={:?}",
             gate.hits.load(Ordering::SeqCst),
+            gate.all_queries.load(Ordering::SeqCst),
+            gate.id_queries.load(Ordering::SeqCst),
             storage
                 .retained_recovery_event(
                     &recovery_route,
@@ -193,15 +211,21 @@ async fn run_held_comparison(shutdown_while_held: bool) {
                 .unwrap()
                 .attempt_serial
                 .saturating_sub(before_retry),
-            bounded_recovery::available_credits(),
+            bounded_recovery::available_credits(&pool),
             slot.attempt_serial,
             slot.frozen_revision,
             slot.plan.as_ref().map_or(0, |plan| plan.routes.len()),
             slot.plan.as_ref().map_or(0, |plan| plan.retry_routes.len()),
+            runtime
+                .shared_services()
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .clone(),
         );
     }
     assert_eq!(
-        bounded_recovery::available_credits(),
+        bounded_recovery::available_credits(&pool),
         bounded_recovery::MAX_CONCURRENT_JOBS - 1
     );
     assert_eq!(
@@ -235,14 +259,83 @@ async fn run_held_comparison(shutdown_while_held: bool) {
             .unwrap(),
         None
     );
+    if known_competes {
+        let fixture = known_fixture.as_ref().unwrap();
+        fixture
+            .relay
+            .acquisition_block
+            .store(true, Ordering::SeqCst);
+        let entered = fixture.relay.acquisition_entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        wake_bounded_fixture(fixture).await;
+        timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("known-event worker holds the second shared credit");
+        assert_eq!(bounded_recovery::available_credits(&pool), 0);
+        assert!(bounded_recovery::try_acquire_recovery_credit(&pool).is_none());
+
+        // A separate ordinary runtime still receives the default process
+        // pool while this fixture owns its private two-credit pool.
+        let ordinary_dir = tempfile::tempdir().unwrap();
+        let ordinary_account = AccountHome::open(ordinary_dir.path())
+            .create_account("ordinary")
+            .unwrap();
+        let ordinary_app = MarmotApp::with_relay_and_config(
+            ordinary_dir.path(),
+            url.clone(),
+            crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        );
+        let ordinary = crate::MarmotAppRuntime::new(ordinary_app);
+        let another_dir = tempfile::tempdir().unwrap();
+        let another = crate::MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+            another_dir.path(),
+            url.clone(),
+            crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        ));
+        let ordinary_pool = ordinary.shared_services().recovery_credit_pool();
+        assert!(Arc::ptr_eq(
+            &ordinary_pool,
+            &another.shared_services().recovery_credit_pool()
+        ));
+        assert!(Arc::ptr_eq(
+            &ordinary_pool,
+            &bounded_recovery::shared_recovery_credit_pool()
+        ));
+        assert!(!Arc::ptr_eq(&ordinary_pool, &pool));
+        ordinary.reconcile_accounts().await.unwrap();
+        let ordinary_commands = ordinary
+            .accounts()
+            .worker_commands(&ordinary_account.label)
+            .await
+            .unwrap();
+        let (respond, status) = oneshot::channel();
+        ordinary_commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: GroupId::new(vec![9; 16]),
+                respond,
+            })
+            .unwrap();
+        let _ = timeout(Duration::from_secs(2), status)
+            .await
+            .expect("ordinary runtime command remains serviceable")
+            .unwrap();
+        ordinary.shutdown_and_close().await.unwrap();
+        another.shutdown_and_close().await.unwrap();
+    }
     if shutdown_while_held {
         runtime.shutdown_and_close().await.unwrap();
+        if let Some(fixture) = known_fixture {
+            fixture.runtime.shutdown_and_close().await.unwrap();
+        }
     } else {
         gate.hold_exact.store(false, Ordering::SeqCst);
         gate.release.notify_waiters();
         timeout(Duration::from_secs(12), async {
             loop {
-                if bounded_recovery::available_credits() == bounded_recovery::MAX_CONCURRENT_JOBS {
+                if bounded_recovery::available_credits(&pool)
+                    == bounded_recovery::MAX_CONCURRENT_JOBS
+                {
                     break;
                 }
                 sleep(Duration::from_millis(20)).await;
@@ -255,7 +348,7 @@ async fn run_held_comparison(shutdown_while_held: bool) {
     gate.hold_exact.store(false, Ordering::SeqCst);
     gate.release.notify_waiters();
     assert_eq!(
-        bounded_recovery::available_credits(),
+        bounded_recovery::available_credits(&pool),
         bounded_recovery::MAX_CONCURRENT_JOBS
     );
 }
@@ -276,27 +369,27 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
         crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let pool = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
     let storage = app.account_storage(&account.label).unwrap();
-    let now = crate::client::recovery::wall_now_ms().unwrap();
-    let goal = storage_sqlite::RecoveryScopePlan {
-        scope_id: 0,
-        route_kind: 0,
-        route_role: 0,
-        group_id: None,
-        transport_group_id: None,
-        since_seconds: Some(now / 1000 - storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS),
-        until_seconds: now / 1000,
-        known_event_id: None,
-        inventory_floor: None,
-        required_endpoints: vec![url.clone()],
-        admitted_endpoints: vec![url],
-    };
-    storage
-        .join_recovery_comparison(&[6; 16], now, &[goal])
+    let credits = bounded_recovery::hold_all_credits_for_test(&pool);
+    let commands = runtime
+        .accounts()
+        .worker_commands(&account.label)
+        .await
         .unwrap();
-    let credits = bounded_recovery::hold_all_credits_for_test();
+    let (respond, armed) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::RequestBoundedComparisonForTest { respond })
+        .unwrap();
+    timeout(Duration::from_secs(5), armed)
+        .await
+        .expect("serialized worker arms current comparison")
+        .unwrap()
+        .unwrap();
     let before = storage.recovery_retry_state().unwrap();
     runtime
         .advance_recovery_clock_for_test(&account.label, Duration::from_secs(600))
@@ -304,11 +397,6 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(16)).await;
     tokio::time::resume();
-    let commands = runtime
-        .accounts()
-        .worker_commands(&account.label)
-        .await
-        .unwrap();
     let (respond, status) = oneshot::channel();
     commands
         .try_send(AccountWorkerCommand::GroupRecoveryStatus {
@@ -344,6 +432,9 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
     );
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let pool = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
     runtime.reconcile_accounts().await.unwrap();
     runtime.publish_key_package(&bob.label).await.unwrap();
     let group = runtime
@@ -419,8 +510,9 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .unwrap();
     assert!(client.comparison_offload_eligible(&grant).unwrap());
     let attempt = client.activate_comparison_grant(&grant).await.unwrap();
-    let mut job = ComparisonNetworkJob::start(&client, &grant).unwrap();
-    let network = timeout(Duration::from_secs(12), job.wait())
+    let credit = bounded_recovery::try_acquire_recovery_credit(&pool).unwrap();
+    let mut job = ComparisonNetworkJob::start(&client, &grant, credit).unwrap();
+    let (credit, network) = timeout(Duration::from_secs(12), job.wait())
         .await
         .unwrap()
         .unwrap();
@@ -441,6 +533,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .finish_comparison_grant(grant, attempt, network)
         .await
         .unwrap();
+    drop(credit);
     assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
     let after = storage
         .transport_reconciliation_inventory(&recovery_route, crate::unix_now_seconds())

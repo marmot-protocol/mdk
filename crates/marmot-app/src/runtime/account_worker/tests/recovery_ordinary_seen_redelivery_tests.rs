@@ -22,6 +22,7 @@ async fn ordinary_sdk_seen_but_unretained_event_is_admitted_by_bounded_worker() 
     );
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let shared = runtime.shared_services();
+    shared.use_private_recovery_credit_pool_for_test();
     shared
         .bounded_group_recovery_enabled
         .store(true, Ordering::SeqCst);

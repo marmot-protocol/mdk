@@ -346,6 +346,11 @@ pub struct RuntimeSharedServices {
     /// Off until the production SDK acquisition backend passes its two-relay
     /// conformance gate. Controlled worker fixtures opt in explicitly.
     pub(crate) bounded_group_recovery_enabled: Arc<AtomicBool>,
+    /// Every production runtime points at the same process capacity. The
+    /// indirection permits explicit isolation of capacity-sensitive fixtures.
+    recovery_credits: Arc<StdMutex<Arc<account_worker::bounded_recovery::RecoveryCreditPool>>>,
+    #[cfg(test)]
+    pub(crate) comparison_test_trace: Arc<StdMutex<Vec<&'static str>>>,
     #[cfg(test)]
     pub(crate) bounded_recovery_finished: Arc<Notify>,
     #[cfg(test)]
@@ -460,6 +465,11 @@ impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
             bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            recovery_credits: Arc::new(StdMutex::new(
+                account_worker::bounded_recovery::shared_recovery_credit_pool(),
+            )),
+            #[cfg(test)]
+            comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]
@@ -509,6 +519,29 @@ impl Default for RuntimeSharedServices {
 }
 
 impl RuntimeSharedServices {
+    pub(in crate::runtime) fn recovery_credit_pool(
+        &self,
+    ) -> Arc<account_worker::bounded_recovery::RecoveryCreditPool> {
+        self.recovery_credits.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn use_private_recovery_credit_pool_for_test(
+        &self,
+    ) -> Arc<account_worker::bounded_recovery::RecoveryCreditPool> {
+        let pool = account_worker::bounded_recovery::private_recovery_credit_pool_for_test();
+        self.set_recovery_credit_pool_for_test(pool.clone());
+        pool
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn set_recovery_credit_pool_for_test(
+        &self,
+        pool: Arc<account_worker::bounded_recovery::RecoveryCreditPool>,
+    ) {
+        *self.recovery_credits.lock().unwrap() = pool;
+    }
+
     fn for_app(app: &MarmotApp) -> Self {
         app.product_analytics.telemetry_origin(
             app.service_endpoints()
@@ -528,6 +561,11 @@ impl RuntimeSharedServices {
         );
         Self {
             bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            recovery_credits: Arc::new(StdMutex::new(
+                account_worker::bounded_recovery::shared_recovery_credit_pool(),
+            )),
+            #[cfg(test)]
+            comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]
