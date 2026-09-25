@@ -5881,6 +5881,7 @@ mod tests {
     mod real_sdk_progress_fairness_tests;
     mod resource_bounds_tests;
     mod selective_history_tests;
+    mod worker_recovery_resume_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod worker_wait_attribution_tests;
 

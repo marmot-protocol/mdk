@@ -1120,7 +1120,8 @@ impl AppClient {
                     }
                     return results
                         .pop_front()
-                        .expect("one scripted result per selected comparison route");
+                        .expect("one scripted result per selected comparison route")
+                        .map(|result| result.map(|summary| (summary, Vec::new())));
                 }
                 match &inventory.work {
                     TransportReconciliationWork::Inbox(endpoints) => {
@@ -1149,11 +1150,18 @@ impl AppClient {
             })
             .await;
             let outcome = match result {
-                Ok(Ok(Some(summary))) => {
+                Ok(Ok(Some((summary, events)))) => {
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
                     remote_items += summary.remote_items;
                     received_items += summary.received_items;
+                    // The relay plane returns request-owned bytes. Only this
+                    // serialized account worker submits them to the existing
+                    // account-scoped delivery queue; the subsequent drain
+                    // remains responsible for durable admission and receipts.
+                    for event in events {
+                        self.adapter.queue_reconciled_event(event).await?;
+                    }
                     if summary.relays_failed > 0 {
                         Outcome::TransientFailure
                     } else {
