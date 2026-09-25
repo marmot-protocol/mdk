@@ -19,6 +19,11 @@ status: overview
 
 # Current State — Implementations & Spec
 
+CLI direct access and daemon startup now respect exclusive Marmot root ownership.
+Ready account workers perform periodic privacy-safe structural integrity probes.
+See [shared-home safety](local-artifact-safety.md#shared-home-access-and-corruption-detection)
+for socket routing, probe limits, and recovery/deployment requirements.
+
 The Nostr relay-client boundary declares owned bounded acquisition and
 receiver-scoped notification-loss evidence. The production SDK client now uses
 the qualified rust-nostr fork for bounded history requests and account-scoped

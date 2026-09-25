@@ -166,20 +166,22 @@ async fn dispatch_hosted_runtime_command(
             Ok(account_home) => account_home,
             Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
         };
-    let app = match crate::app_for(
-        defaults.home.clone(),
-        defaults.relay.clone(),
-        defaults.discovery_relays.clone(),
-        account_home.clone(),
-    ) {
-        Ok(app) => app,
-        Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
-    };
+    let app = runtime.app_handle();
 
     let output = match cli.command.clone() {
+        crate::Command::Logout { pubkey } => {
+            crate::commands::account::logout_command_with_runtime(runtime, pubkey).await
+        }
         crate::Command::UsageDiagnostics { command } => {
             crate::usage_diagnostics_command(runtime, command)
         }
+        crate::Command::Sync => match crate::resolve_account(&account_home, cli.account.clone()) {
+            Ok(account) => match crate::ensure_local_signing(&account) {
+                Ok(()) => crate::commands::sync::sync_command_with_runtime(runtime, account).await,
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        },
         crate::Command::Group { command } => {
             crate::commands::groups::group_command_with_runtime(
                 &account_home,
@@ -303,7 +305,9 @@ async fn dispatch_hosted_runtime_command(
 
 pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
     match &cli.command {
+        crate::Command::Logout { .. } => true,
         crate::Command::UsageDiagnostics { .. } => true,
+        crate::Command::Sync => true,
         crate::Command::Group { .. } | crate::Command::Groups { .. } => true,
         crate::Command::Chats { command } => !matches!(
             command,
@@ -736,15 +740,7 @@ pub(crate) async fn auto_watch_agent_stream_starts(
             Ok(account_home) => account_home,
             Err(_) => return,
         };
-    let app = match crate::app_for(
-        defaults.home.clone(),
-        defaults.relay.clone(),
-        defaults.discovery_relays.clone(),
-        account_home.clone(),
-    ) {
-        Ok(app) => app,
-        Err(_) => return,
-    };
+    let app = runtime.app_handle();
     for message in &summary.messages {
         let Some(start) = marmot_app::StreamStartView::from_event(message.kind, &message.tags)
         else {

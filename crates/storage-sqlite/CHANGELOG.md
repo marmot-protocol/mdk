@@ -4,6 +4,9 @@
 
 ### Added
 
+- Add a bounded SQLCipher structural integrity probe that reports healthy,
+  corrupt, or incomplete without repairing account data. (#1937)
+
 - Add qualified recovery scope checkpoints, independent completion predicates, exact loss
   acknowledgment guards and atomic inventory invalidation. Schema 0093 preserves existing
   demand/retry evidence and bounds serialized explicit-history callers to one row. This

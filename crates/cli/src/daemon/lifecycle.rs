@@ -213,10 +213,6 @@ pub(crate) fn blocked_daemon_execute_command(
             "reset",
             "it deletes the daemon home; run wn reset directly after stopping the daemon",
         )),
-        crate::Command::Logout { .. } => Some((
-            "logout",
-            "it removes a local account; run wn logout directly without --socket",
-        )),
         crate::Command::Stream { command } => crate::client_hosted_stream_command(command),
         _ => None,
     }

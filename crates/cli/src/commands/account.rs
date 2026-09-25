@@ -92,37 +92,7 @@ pub(crate) fn whoami_command(
         });
     }
 
-    let accounts = account_home.accounts()?;
-    let accounts_json = accounts
-        .into_iter()
-        .map(|account| account_summary_json(app, account))
-        .collect::<Result<Vec<_>, _>>()?;
-    let plain = if accounts_json.is_empty() {
-        "no accounts".to_owned()
-    } else {
-        accounts_json
-            .iter()
-            .map(|account| {
-                format!(
-                    "{} {} local-signing={}",
-                    account_display_name_or_npub(account),
-                    account
-                        .get("account_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or(""),
-                    account
-                        .get("local_signing")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    Ok(CommandOutput {
-        plain,
-        json: json!({ "accounts": accounts_json }),
-    })
+    account_list_command(account_home, Some(app))
 }
 
 pub(crate) fn logout_command(
@@ -131,6 +101,19 @@ pub(crate) fn logout_command(
 ) -> Result<CommandOutput, WnError> {
     let account_id = parse_public_key(&pubkey)?;
     account_home.remove_account(&account_id)?;
+    logout_output(account_id)
+}
+
+pub(crate) async fn logout_command_with_runtime(
+    runtime: &marmot_app::MarmotAppRuntime,
+    pubkey: String,
+) -> Result<CommandOutput, WnError> {
+    let account_id = parse_public_key(&pubkey)?;
+    runtime.accounts().remove_account(&account_id).await?;
+    logout_output(account_id)
+}
+
+fn logout_output(account_id: String) -> Result<CommandOutput, WnError> {
     Ok(CommandOutput {
         plain: format!("logged out {}", npub_for_account_id(&account_id)?),
         json: json!({
@@ -288,39 +271,7 @@ pub(crate) async fn account_command(
             )
             .await
         }
-        AccountCommand::List => {
-            let accounts = account_home.accounts()?;
-            let accounts_json = accounts
-                .into_iter()
-                .map(|account| account_summary_json(app, account))
-                .collect::<Result<Vec<_>, _>>()?;
-            let plain = if accounts_json.is_empty() {
-                "no accounts".to_owned()
-            } else {
-                accounts_json
-                    .iter()
-                    .map(|account| {
-                        format!(
-                            "{} {} local-signing={}",
-                            account_display_name_or_npub(account),
-                            account
-                                .get("account_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                            account
-                                .get("local_signing")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            Ok(CommandOutput {
-                plain,
-                json: json!({ "accounts": accounts_json }),
-            })
-        }
+        AccountCommand::List => account_list_command(account_home, Some(app)),
         AccountCommand::Status { account } => {
             let account = resolve_account(account_home, account.or(account_flag))?;
             if !account.local_signing {
@@ -366,6 +317,54 @@ pub(crate) async fn account_command(
             })
         }
     }
+}
+
+/// A direct listing only reads AccountHome metadata. It must not hydrate a
+/// second directory-cache/database handle while another process owns the root.
+pub(crate) fn account_list_command(
+    account_home: &AccountHome,
+    app: Option<&MarmotApp>,
+) -> Result<CommandOutput, WnError> {
+    let accounts_json = account_home
+        .accounts()?
+        .into_iter()
+        .map(|account| match app {
+            Some(app) => account_summary_json(app, account),
+            None => Ok(json!({
+                "account_id": account.account_id_hex,
+                "npub": npub_for_account_id(&account.account_id_hex)?,
+                "display_name": Value::Null,
+                "profile": Value::Null,
+                "local_signing": account.local_signing,
+            })),
+        })
+        .collect::<Result<Vec<_>, WnError>>()?;
+    let plain = if accounts_json.is_empty() {
+        "no accounts".to_owned()
+    } else {
+        accounts_json
+            .iter()
+            .map(|account| {
+                format!(
+                    "{} {} local-signing={}",
+                    account_display_name_or_npub(account),
+                    account
+                        .get("account_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    account
+                        .get("local_signing")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(CommandOutput {
+        plain,
+        json: json!({ "accounts": accounts_json }),
+    })
 }
 
 fn relay_setup_plain(status: &AccountRelayListStatus) -> String {

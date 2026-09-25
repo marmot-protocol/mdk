@@ -1507,6 +1507,13 @@ impl MarmotAppRuntime {
         Self::new(app)
     }
 
+    /// The app handle owned by this runtime. Command adapters that need the
+    /// synchronous app surface must share its storage/cache identity rather
+    /// than constructing a second hydrated app for the same root.
+    pub fn app_handle(&self) -> MarmotApp {
+        self.accounts.app.clone()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<MarmotAppEvent> {
         self.events.subscribe()
     }
@@ -1748,6 +1755,11 @@ impl MarmotAppRuntime {
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
         self.accounts.catch_up_accounts().await.map(|_| ())
+    }
+
+    /// Synchronize one account through its owning worker and return the applied summary.
+    pub async fn sync_account(&self, account_id_hex: &str) -> Result<crate::SyncSummary, AppError> {
+        self.accounts.sync_account(account_id_hex).await
     }
 
     /// Notify every running account worker that the host has observed usable
@@ -5788,7 +5800,7 @@ async fn run_account_catch_up_pass(
     }
     for (command, response) in responses {
         let outcome = match timeout(response_wait, response).await {
-            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Ok(_))) => Ok(()),
             Ok(Ok(Err(failure))) => Err(AppError::AccountCatchUp(failure)),
             Ok(Err(_)) => Err(AppError::TransportClosed),
             Err(_) => Err(AppError::AccountCatchUp(AccountCatchUpFailure::new(
@@ -6716,6 +6728,32 @@ impl AccountManager {
             );
         observation.finish_app(&result);
         result
+    }
+
+    pub async fn sync_account(&self, account_id_hex: &str) -> Result<crate::SyncSummary, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        self.reconcile().await?;
+        let command = self
+            .workers
+            .lock()
+            .await
+            .get(account_id_hex)
+            .filter(|worker| worker.ready && !worker.handle.is_finished())
+            .map(|worker| worker.commands.clone())
+            .ok_or(AppError::TransportClosed)?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CatchUp { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
+            Ok(Ok(Ok(summary))) => Ok(summary),
+            Ok(Ok(Err(failure))) => Err(AppError::AccountCatchUp(failure)),
+            Ok(Err(_)) => Err(AppError::TransportClosed),
+            Err(_) => Err(AppError::BlockingTask(
+                "account worker sync timed out".into(),
+            )),
+        }
     }
 
     pub async fn notify_connectivity_restored(&self) -> Result<(), AppError> {

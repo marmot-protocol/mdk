@@ -3356,7 +3356,7 @@ async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
             let result = if attempts == 1 {
                 Err(transient_transport_catch_up_failure())
             } else {
-                Ok(())
+                Ok(crate::SyncSummary::default())
             };
             let _ = respond.send(result);
             if attempts == 2 {
@@ -3370,7 +3370,7 @@ async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
         let Some(AccountWorkerCommand::CatchUp { respond }) = healthy_rx.recv().await else {
             panic!("expected catch-up command");
         };
-        let _ = respond.send(Ok(()));
+        let _ = respond.send(Ok(crate::SyncSummary::default()));
         1
     });
 

@@ -3,6 +3,7 @@
 
 mod attachments;
 pub(super) mod bounded_recovery;
+mod storage_integrity;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
@@ -158,7 +159,7 @@ pub(crate) struct AccountWorkerRuntime {
 
 pub(crate) enum AccountWorkerCommand {
     CatchUp {
-        respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
+        respond: oneshot::Sender<Result<SyncSummary, AccountCatchUpFailure>>,
     },
     /// The host observed usable connectivity after an outage. Interrupt
     /// transport-failure backoff for already-durable convergence work; this
@@ -169,8 +170,8 @@ pub(crate) enum AccountWorkerCommand {
     /// Startup-coalesced catch-up response held in the same FIFO as deferred
     /// mutations so later live reads cannot bypass those mutations.
     StartupCatchUpResult {
-        result: Result<(), AccountCatchUpFailure>,
-        respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
+        result: Result<SyncSummary, AccountCatchUpFailure>,
+        respond: oneshot::Sender<Result<SyncSummary, AccountCatchUpFailure>>,
     },
     RepairFullHistory {
         respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
@@ -592,7 +593,7 @@ enum DeferredStartupCommand {
     Command(Box<AccountWorkerCommand>),
     /// A `CatchUp` coalesced onto the initial catch-up, fulfilled with its
     /// result at this position in the sequence.
-    CatchUp(oneshot::Sender<Result<(), AccountCatchUpFailure>>),
+    CatchUp(oneshot::Sender<Result<SyncSummary, AccountCatchUpFailure>>),
 }
 
 /// The original startup command policy applies during both the initial sync
@@ -1302,7 +1303,7 @@ async fn run_app_runtime_account_worker(
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
             }
-            Ok(())
+            Ok(summary)
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
@@ -1474,6 +1475,7 @@ async fn run_app_runtime_account_worker(
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
+    let mut storage_integrity = storage_integrity::Schedule::new();
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
     let mut local_submission_wakeups = shared.local_submission_wakeups.subscribe();
@@ -2488,6 +2490,7 @@ async fn run_app_runtime_account_worker(
                 if comparison_recovery.is_some() {
                     continue 'worker;
                 }
+                storage_integrity.tick(&client).await;
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
                 if client.backfill_content_reports().is_err() {
                     tracing::warn!(
@@ -2853,7 +2856,7 @@ struct AccountWorkerCatchUpContext<'a> {
 
 async fn handle_account_worker_catch_up(
     client: &mut AppClient,
-    respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
+    respond: oneshot::Sender<Result<SyncSummary, AccountCatchUpFailure>>,
     commands: &mut mpsc::Receiver<AccountWorkerCommand>,
     pending: &mut VecDeque<AccountWorkerCommand>,
     context: AccountWorkerCatchUpContext<'_>,
@@ -3007,7 +3010,7 @@ async fn handle_account_worker_catch_up(
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 context.shared.schedule_audit_log_tracker_update("catch_up");
             }
-            Ok(())
+            Ok(summary)
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
@@ -4187,7 +4190,7 @@ fn account_worker_command_future<'a>(
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("catch_up");
                     }
-                    Ok(())
+                    Ok(summary)
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
