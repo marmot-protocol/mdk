@@ -18,6 +18,14 @@ use std::sync::{
 
 struct HeldConvergence(String);
 
+struct ActiveNegentropyQuery(Arc<AtomicUsize>);
+
+impl Drop for ActiveNegentropyQuery {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ObservedNegentropyDatabase {
     inner: MemoryDatabase,
@@ -25,6 +33,7 @@ struct ObservedNegentropyDatabase {
     hold: Arc<AtomicBool>,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+    active: Arc<AtomicUsize>,
 }
 
 impl NostrDatabase for ObservedNegentropyDatabase {
@@ -75,6 +84,8 @@ impl NostrDatabase for ObservedNegentropyDatabase {
                 let release = self.release.notified();
                 tokio::pin!(release);
                 release.as_mut().enable();
+                self.active.fetch_add(1, Ordering::SeqCst);
+                let _active = ActiveNegentropyQuery(self.active.clone());
                 self.entered.notify_one();
                 release.await;
             }
@@ -167,6 +178,7 @@ async fn naturally_pending_startup_comparison_resumes_after_scheduled_convergenc
         hold: Arc::new(AtomicBool::new(false)),
         entered: Arc::new(tokio::sync::Notify::new()),
         release: Arc::new(tokio::sync::Notify::new()),
+        active: Arc::new(AtomicUsize::new(0)),
     };
     let relay = LocalRelay::new(
         RelayBuilder::default()
@@ -257,6 +269,15 @@ async fn naturally_pending_startup_comparison_resumes_after_scheduled_convergenc
     })
     .await
     .expect("ordinary delivery durably arms the scheduled pass");
+    // Bob was needed to create the real MLS commit and convergence trigger,
+    // but his own worker shares this route. Persistently sign him out before
+    // reopening so every measured relay query and comparison job is Alice's.
+    runtime
+        .accounts()
+        .deactivate_account(&bob.label)
+        .await
+        .unwrap();
+    assert!(app.account_home().account(&bob.label).unwrap().signed_out);
 
     let route: [u8; 32] = hex::decode(
         app.group(&alice.label, &hex::encode(&group))
@@ -300,6 +321,15 @@ async fn naturally_pending_startup_comparison_resumes_after_scheduled_convergenc
     tokio::pin!(first_request);
     first_request.as_mut().enable();
     reopened.reconcile_accounts().await.unwrap();
+    assert!(
+        !reopened
+            .accounts()
+            .workers
+            .lock()
+            .await
+            .contains_key(&bob.account_id_hex),
+        "Bob's persisted signed-out marker prevents his worker from querying the route"
+    );
     if timeout(Duration::from_secs(20), &mut first_request)
         .await
         .is_err()
@@ -380,25 +410,17 @@ async fn naturally_pending_startup_comparison_resumes_after_scheduled_convergenc
     tokio::pin!(neg_entered);
     neg_entered.as_mut().enable();
     pass_barrier.wait().await;
-    timeout(Duration::from_secs(8), async {
-        while reopened_storage
-            .recovery_comparison()
-            .unwrap()
-            .attempt_serial
-            <= before_attempt
-        {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("scheduled caller reserves the still-pending comparison");
-    let selected = reopened_storage.recovery_comparison().unwrap();
-    assert!(selected.pending());
-    assert_eq!(selected.frozen_revision, selected.revision);
-    assert!(selected.plan.is_some());
+    // The worker is still inside the scheduled arm after this barrier. Its
+    // first periodic comparison has joined and Bob is signed out, so the next
+    // route NEG-OPEN can only come from Alice's scheduled comparison. Observe
+    // network entry before any storage polling can consume the inline quantum.
     timeout(Duration::from_secs(8), &mut neg_entered)
         .await
         .expect("selected scheduled comparison enters the relay NEG-OPEN database query");
+    assert!(
+        negentropy.active.load(Ordering::SeqCst) > 0,
+        "the attributed scheduled NEG-OPEN request is still held"
+    );
     let commands = reopened
         .accounts()
         .worker_commands(&alice.label)
@@ -411,11 +433,25 @@ async fn naturally_pending_startup_comparison_resumes_after_scheduled_convergenc
             respond,
         })
         .unwrap();
-    timeout(Duration::from_secs(2), answer)
+    timeout(Duration::from_millis(300), answer)
         .await
-        .expect("status command completes during the held scheduled comparison")
+        .unwrap_or_else(|_| {
+            panic!(
+                "status command blocked during scheduled comparison; held NEG-OPEN queries={}",
+                negentropy.active.load(Ordering::SeqCst)
+            )
+        })
         .unwrap()
         .unwrap();
+    assert!(
+        negentropy.active.load(Ordering::SeqCst) > 0,
+        "the scheduled relay request remains held after the command responds"
+    );
+    let selected = reopened_storage.recovery_comparison().unwrap();
+    assert!(selected.attempt_serial > before_attempt);
+    assert!(selected.pending());
+    assert_eq!(selected.frozen_revision, selected.revision);
+    assert!(selected.plan.is_some());
     assert_eq!(
         bounded_recovery::available_credits(&pool),
         bounded_recovery::MAX_CONCURRENT_JOBS - 1,

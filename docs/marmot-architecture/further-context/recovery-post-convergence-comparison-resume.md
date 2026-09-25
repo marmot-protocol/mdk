@@ -30,10 +30,13 @@ active job. Activation, registration, drain and checkpoint can still hold the
 worker. Startup, explicit catch-up and receive-triggered comparison waits stay
 inline. The bounded known-event worker remains separately gated.
 
-The relay-backed regression arms a real stored convergence pass, leaves a
-startup comparison pending, then witnesses the scheduled selection enter a
-held relay NEG-OPEN query. It asserts status responsiveness, one owner attempt,
-durable pending debt and credit release after join. It does not measure wire
-bytes, process memory or downstream device delivery. The underlying job's
+The relay-backed regression arms a real stored convergence pass, then signs
+out the second account so only the target worker can query the route on
+restart. It leaves a startup comparison pending and witnesses the scheduled
+selection enter a held relay NEG-OPEN query. A parent-implementation run blocks
+the status command while that query is active; this worker-job path answers it
+while the query remains active. The test also checks one owner attempt, durable
+pending debt and credit release after join. It does not measure wire bytes,
+process memory or downstream device delivery. The underlying job's
 limits and cursor/admission rules are in
 [periodic comparison worker resume](recovery-worker-comparison-resume.md).
