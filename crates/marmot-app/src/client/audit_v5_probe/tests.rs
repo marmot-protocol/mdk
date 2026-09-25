@@ -199,6 +199,7 @@ async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
         assert_eq!(published.outer_event_ref, outer);
         assert_eq!(observed.outer_event_ref, outer);
         assert_eq!(published.policy, Policy::Met);
+        assert_eq!(published.retained_state, RetainedState::Unknown);
         assert_eq!(
             prepared.op_id,
             sender
@@ -614,6 +615,7 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
             scenario.updates()[1].update_id
         );
 
+        let before_message = scenario.capture().rows.len();
         scenario
             .alice
             .send(&group, b"synthetic content must never enter probe")
@@ -627,7 +629,7 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
         );
         assert_eq!(
             scenario.capture().rows.len(),
-            5,
+            before_message,
             "ordinary message work adds no Welcome rows"
         );
         scenario.assert_clean();
@@ -655,13 +657,14 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
                 assert!(!text.contains(forbidden));
             }
         }
-        // A gross-regression bound for this five-row subset, not a bandwidth
+        // A gross-regression bound for this local subset, not a bandwidth
         // target for the complete Welcome lifecycle or an upload measurement.
-        assert!(total < 6500);
+        assert!(total < 7500);
         println!(
-            "v5 recipient subset: rows=5 body_bytes={total} \
+            "v5 recipient subset: rows={} body_bytes={total} \
              jsonl_bytes={} largest_body_bytes={largest} by_kind={by_kind:?}",
-            total + 5
+            scenario.capture().rows.len(),
+            total + scenario.capture().rows.len()
         );
         let sender_rows = &scenario.sender_capture().rows;
         let sender_body: usize = sender_rows
@@ -695,7 +698,17 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
                 (kind, body.len())
             })
             .collect::<Vec<_>>();
-        assert!(sender_body < 1600);
+        assert!(sender_body < 3000);
+        assert!(
+            sender_by_kind
+                .iter()
+                .any(|(kind, _)| kind == "welcome_prepared")
+        );
+        assert!(
+            sender_by_kind
+                .iter()
+                .any(|(kind, _)| kind == "group_baseline")
+        );
         println!(
             "v5 sender subset: rows={} body_bytes={sender_body} jsonl_bytes={} \
              largest_body_bytes={sender_largest} by_kind={sender_by_kind:?}",
@@ -708,10 +721,7 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
             for file in files {
                 for row in std::fs::read_to_string(file.path).unwrap().lines() {
                     let v: serde_json::Value = serde_json::from_str(row).unwrap();
-                    assert_eq!(
-                        v["schema_version"],
-                        marmot_forensics::AUDIT_LOG_SCHEMA_VERSION
-                    );
+                    assert_eq!(v["schema_version"], marmot_forensics::v5::SCHEMA_VERSION);
                 }
             }
         }
@@ -775,7 +785,14 @@ async fn founding_preparation_matches_two_recipients_without_order_inference() {
             );
         }
         let sender = scenario.sender_capture();
-        assert_eq!(sender.rows.len(), 2);
+        assert_eq!(
+            sender
+                .rows
+                .iter()
+                .filter(|row| matches!(row.fields().event, Event::WelcomePrepared(_)))
+                .count(),
+            2
+        );
         let expected = [
             (&scenario.bob_id, scenario.key_package_event_id),
             (&carol_id, carol_key_package_event_id),
@@ -1270,4 +1287,36 @@ fn probe_bounds_and_unknown_checkpoint_do_not_fabricate_success() {
     assert_eq!(capture.dropped, 2);
     assert!(capture.bytes <= MAX_BYTES);
     assert_eq!(capture.invalid, 0);
+}
+
+#[tokio::test]
+async fn baseline_marks_an_invalid_or_duplicate_member_identity_as_partial() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let group_id = scenario.create().await;
+        let group = scenario.alice.runtime.group_record(&group_id).unwrap();
+        let mut capture = probe();
+
+        let mut invalid = group.clone();
+        invalid.members[0].id = cgka_traits::types::MemberId::new(Vec::new());
+        capture.baseline(&invalid, None, BaselineReason::Opened, None);
+        let Event::GroupBaseline(row) = &capture.rows[0].fields().event else {
+            panic!("expected baseline");
+        };
+        assert_eq!(row.capture, Capture::Partial);
+        assert!(!row.members_complete);
+        assert!(row.limitations.contains(&Limitation::MemberIdentityInvalid));
+
+        let mut duplicate = group;
+        duplicate.members[1].id = duplicate.members[0].id.clone();
+        capture.baseline(&duplicate, None, BaselineReason::Opened, None);
+        let Event::GroupBaseline(row) = &capture.rows[1].fields().event else {
+            panic!("expected baseline");
+        };
+        assert_eq!(row.capture, Capture::Partial);
+        assert!(!row.members_complete);
+        assert!(row.limitations.contains(&Limitation::MemberIdentityInvalid));
+    })
+    .await
+    .expect("bounded baseline identity scenario");
 }

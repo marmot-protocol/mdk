@@ -1757,10 +1757,11 @@ impl MarmotApp {
                 client::recovery::wall_now_ms()?,
             )?;
         }
+        let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
         let mut client = AppClient {
             #[cfg(test)]
             test_recovery_selection_witness: None,
-            audit_v5_probe: Some(client::audit_v5_probe::WelcomeProbe::live()),
+            audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
             audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
             #[cfg(test)]
             test_recovery_evidence: None,
@@ -1845,7 +1846,7 @@ impl MarmotApp {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
             client.reconcile_hydrated_account_state()?;
-            client.record_open_v5_baselines();
+            client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
         }
         Ok(client)
     }

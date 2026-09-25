@@ -25,6 +25,10 @@ size-rotated segment siblings. The v5 recorder maps all historical typed event f
 records new Welcome evidence. It keeps the existing best-effort recorder semantics: a record
 failure never interrupts the engine, and the file remains local until the host configures
 delivery. Existing v4 files are preserved and remain enumerable.
+On a hydrated account open or a live audit enable, at most 64 stored groups receive
+`group_baseline` rows. The account-scoped `group_baseline_inventory` row reports how many were
+eligible, selected, omitted by that cap, and unreadable; these are read counts, not durable-write
+claims. A failed group enumeration leaves all four counts unknown.
 
 The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
 `MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
@@ -44,11 +48,17 @@ The v5 sender preserves each original JSONL body inside one OTLP log record, str
 terminal newline. It validates and pins collector addresses before connection and never stores
 the bearer token on disk.
 
+**Host adoption requirement:** enabling audit on this build creates v5 files, not new v4 files.
+Hosts that previously relied only on the Goggles tracker must configure a compatible v5 OTLP
+receiver and destination before relying on remote audit delivery. Until then, new evidence stays
+local and the v5 tracker reports it as pending or unconfigured; explicit v4 whole-file upload of a
+v5 file is rejected. Deploy the compatible receiver before activating v5 delivery in a host.
+
 ## Historical v4 status
 
 | Surface | Current state |
 | --- | --- |
-| Local JSONL recording | Implemented by `marmot-forensics::JsonlRecorder`, installed when app-level `AuditLogSettings.enabled` is true at account-session open or hot-swapped into running account workers by the runtime setter. |
+| Local JSONL recording | Historical v4 files remain readable; new app audit sessions and runtime recorder swaps use v5 when `AuditLogSettings.enabled` is true. |
 | Default behavior | Off. Without an installed recorder, the engine uses `NoopRecorder` and emits no JSONL records. |
 | File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v4`; the line-level JSON Schema is [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json). |
 | Local file location | `<account_dir>/audit-<engine_id>-v4.jsonl` for app-opened account sessions, sealed into `-seg<NNNNNN>` siblings at 1 MiB. Exclusive-root startup deletes recognized v1/v2/v3 files and segments. |

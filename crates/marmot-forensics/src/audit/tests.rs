@@ -2366,9 +2366,10 @@ fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
         let op = v5::Event::Operational(Box::new(v5::OperationalEvent::from_audit(
             AuditRecord::new(None, kind.clone()),
         )));
+        let converted = serde_json::to_value(op);
         assert!(
-            serde_json::to_value(op).is_ok(),
-            "v5 conversion failed for {tag}"
+            converted.is_ok(),
+            "v5 conversion failed for {tag}: {converted:?}"
         );
         recorder.record(AuditRecord::new(None, kind));
     }
@@ -2456,6 +2457,15 @@ fn v5_operational_wire_rejects_legacy_aliases_and_preserves_reference_domains() 
     let mut extra = value.clone();
     extra["event"]["unexpected"] = "safe".into();
     mutations.push(extra);
+    let mut empty_skipped_array = value.clone();
+    empty_skipped_array["event"]["endpoint_refs"] = serde_json::json!([]);
+    mutations.push(empty_skipped_array);
+    let mut unsafe_categorical = value.clone();
+    unsafe_categorical["event"]["target_kind"] = "relay/raw-id".into();
+    mutations.push(unsafe_categorical);
+    let mut non_ascii_categorical = value.clone();
+    non_ascii_categorical["event"]["target_kind"] = "é".into();
+    mutations.push(non_ascii_categorical);
     for mutated in mutations {
         assert!(!validator.is_valid(&mutated));
         assert!(v5::Record::from_json(&serde_json::to_vec(&mutated).unwrap()).is_err());

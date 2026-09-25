@@ -273,6 +273,7 @@ pub enum BaselineReason {
 #[serde(rename_all = "snake_case")]
 pub enum Limitation {
     MemberLimit,
+    MemberIdentityInvalid,
     ByteLimit,
     AdminPolicyUnavailable,
     StateUnavailable,
@@ -465,6 +466,22 @@ pub struct GroupBaseline {
     pub capture: Capture,
 }
 
+/// Account-scoped coverage of the bounded opened-group snapshot. Counts describe
+/// selection and reads, not successful recorder writes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupBaselineInventory {
+    pub reason: BaselineReason,
+    #[serde(deserialize_with = "nullable")]
+    pub eligible_group_count: Option<u32>,
+    #[serde(deserialize_with = "nullable")]
+    pub selected_group_count: Option<u32>,
+    #[serde(deserialize_with = "nullable")]
+    pub omitted_by_limit_count: Option<u32>,
+    #[serde(deserialize_with = "nullable")]
+    pub failed_read_count: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordFields {
@@ -491,6 +508,7 @@ pub enum Event {
     WelcomeJoinFinished(WelcomeJoinFinished),
     AppGroupUpdateFinished(AppGroupUpdateFinished),
     GroupBaseline(GroupBaseline),
+    GroupBaselineInventory(GroupBaselineInventory),
     Operational(Box<OperationalEvent>),
 }
 
@@ -506,6 +524,7 @@ enum WelcomeEvent {
     WelcomeJoinFinished(WelcomeJoinFinished),
     AppGroupUpdateFinished(AppGroupUpdateFinished),
     GroupBaseline(GroupBaseline),
+    GroupBaselineInventory(GroupBaselineInventory),
 }
 
 impl Serialize for Event {
@@ -523,6 +542,7 @@ impl Serialize for Event {
             Event::WelcomeJoinFinished(e) => WelcomeEvent::WelcomeJoinFinished(e.clone()),
             Event::AppGroupUpdateFinished(e) => WelcomeEvent::AppGroupUpdateFinished(e.clone()),
             Event::GroupBaseline(e) => WelcomeEvent::GroupBaseline(e.clone()),
+            Event::GroupBaselineInventory(e) => WelcomeEvent::GroupBaselineInventory(e.clone()),
             Event::Operational(e) => return e.serialize(serializer),
         };
         welcome.serialize(serializer)
@@ -550,6 +570,7 @@ impl<'de> Deserialize<'de> for Event {
                 | "welcome_join_finished"
                 | "app_group_update_finished"
                 | "group_baseline"
+                | "group_baseline_inventory"
         ) {
             let e: WelcomeEvent =
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?;
@@ -563,6 +584,7 @@ impl<'de> Deserialize<'de> for Event {
                 WelcomeEvent::WelcomeJoinFinished(e) => Event::WelcomeJoinFinished(e),
                 WelcomeEvent::AppGroupUpdateFinished(e) => Event::AppGroupUpdateFinished(e),
                 WelcomeEvent::GroupBaseline(e) => Event::GroupBaseline(e),
+                WelcomeEvent::GroupBaselineInventory(e) => Event::GroupBaselineInventory(e),
             })
         } else {
             Ok(Event::Operational(Box::new(

@@ -158,6 +158,18 @@ fn safe_metadata(input: &str, punctuation: &[u8]) -> String {
     }
 }
 
+fn preserve_legacy_hex(input: &str, bytes: usize) -> Result<String, ContractError> {
+    if input.len() == bytes * 2
+        && input
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(input.to_owned())
+    } else {
+        Err(ContractError::rule("invalid legacy diagnostic hash"))
+    }
+}
+
 fn renamed(key: &str) -> &str {
     match key {
         "relay_url" => "endpoint_ref",
@@ -287,29 +299,74 @@ fn protect(value: &mut Value) -> Result<(), ContractError> {
                     }
                     "hardware_model" => map_strings(&mut child, |s| Ok(safe_metadata(s, b",._-")))?,
                     "app_version" => map_strings(&mut child, |s| Ok(safe_metadata(s, b"._+-")))?,
-                    "reason" | "error_kind" | "action" | "origin" | "phase" | "target_kind"
-                    | "intent_kind" | "result_kind" | "change_kind" | "pending_kind" | "stage"
-                    | "proposal_kind" | "decision" | "outcome_kind" | "envelope_kind"
-                    | "transport_source" | "delivery_plane" | "wire_kind" | "transport"
-                    | "recorder" | "upload_trigger" | "platform" => {
+                    // These are already v4 one-way diagnostic hashes, not raw
+                    // member identities or v5 MemberRef values. Keep their
+                    // distinct legacy domain and exact cross-row equality.
+                    "local_member_ref"
+                    | "expected_member_refs"
+                    | "sender_ref"
+                    | "tip_committer_ref"
+                    | "actor_member_ref"
+                    | "subject_member_ref" => {
+                        map_strings(&mut child, |s| preserve_legacy_hex(s, 16))?;
+                    }
+                    "payload_digest" | "group_digest" | "state_digest" | "candidate_digest"
+                    | "incumbent_digest" | "tip_digest" | "digest" => {
+                        map_strings(&mut child, |s| preserve_legacy_hex(s, 32))?;
+                    }
+                    "reason"
+                    | "error_kind"
+                    | "action"
+                    | "origin"
+                    | "phase"
+                    | "target_kind"
+                    | "intent_kind"
+                    | "result_kind"
+                    | "change_kind"
+                    | "pending_kind"
+                    | "stage"
+                    | "proposal_kind"
+                    | "decision"
+                    | "outcome_kind"
+                    | "envelope_kind"
+                    | "transport_source"
+                    | "delivery_plane"
+                    | "wire_kind"
+                    | "transport"
+                    | "recorder"
+                    | "upload_trigger"
+                    | "platform"
+                    | "fields"
+                    | "tip_priority"
+                    | "retained_anchor_status"
+                    | "rejection_reasons"
+                    | "stale_reason"
+                    | "previous_state"
+                    | "new_state"
+                    | "decisive_rule"
+                    | "error_kinds"
+                    | "artifact_kind"
+                    | "recipient_scope"
+                    | "membership_change_source"
+                    | "winner"
+                    | "outcome"
+                    | "trigger"
+                    | "seam"
+                    | "replay_scope"
+                    | "activation_outcome"
+                    | "completion_kind" => {
                         if matches!(child, Value::String(_) | Value::Array(_)) {
                             map_strings(&mut child, |s| Ok(safe_category(s)))?;
                         }
                     }
                     "type" => {}
                     _ => {
-                        if matches!(child, Value::String(_) | Value::Array(_)) {
-                            // Legacy typed payloads include several extension-era
-                            // diagnostic strings. Keep only bounded categories.
-                            if let Value::String(s) = &mut child {
-                                *s = safe_category(s);
-                            } else if let Value::Array(items) = &mut child {
-                                for item in items {
-                                    if let Value::String(s) = item {
-                                        *s = safe_category(s);
-                                    }
-                                }
-                            }
+                        if matches!(child, Value::String(_))
+                            || matches!(&child, Value::Array(items) if items.iter().any(Value::is_string))
+                        {
+                            // A future source field must receive an explicit
+                            // privacy classification before it can be written.
+                            return Err(ContractError::rule("unclassified operation text field"));
                         }
                     }
                 }
@@ -438,7 +495,12 @@ fn validate_protected(value: &Value) -> Result<(), ContractError> {
                 validate_protected(item)?;
             }
         }
-        Value::String(s) if s.contains("://") || s.contains('/') || s.len() > 128 => {
+        Value::String(s)
+            if s.len() > 128
+                || !s
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._,+-".contains(&b)) =>
+        {
             return Err(ContractError::rule("unsafe operation text"));
         }
         _ => {}
@@ -448,7 +510,8 @@ fn validate_protected(value: &Value) -> Result<(), ContractError> {
 
 #[cfg(test)]
 mod tests {
-    use super::diagnostic_ref;
+    use super::{diagnostic_ref, protect};
+    use serde_json::json;
 
     #[test]
     fn operational_branch_and_snapshot_aliases_share_their_semantic_domains() {
@@ -469,5 +532,13 @@ mod tests {
             diagnostic_ref("branch_id", branch),
             diagnostic_ref("snapshot_name", branch)
         );
+    }
+
+    #[test]
+    fn unknown_source_string_cannot_pass_as_a_safe_category() {
+        let mut future = json!({"type":"send_entry", "intent_kind":"application", "future_raw_id":"ab".repeat(32)});
+        assert!(protect(&mut future).is_err());
+        let mut known = json!({"type":"send_entry", "intent_kind":"application"});
+        assert!(protect(&mut known).is_ok());
     }
 }

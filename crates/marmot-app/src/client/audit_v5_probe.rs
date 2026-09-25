@@ -562,11 +562,18 @@ impl WelcomeProbe {
         let Ok(group_ref) = GroupRef::from_group_id(group.id.as_slice()) else {
             return;
         };
+        let mut invalid_member_identity = false;
         let mut members = group
             .members
             .iter()
             .filter_map(|member| {
-                let member_ref = MemberRef::from_member_identity(member.id.as_slice()).ok()?;
+                let member_ref = match MemberRef::from_member_identity(member.id.as_slice()) {
+                    Ok(member_ref) => member_ref,
+                    Err(_) => {
+                        invalid_member_identity = true;
+                        return None;
+                    }
+                };
                 let admin = admins.and_then(|admins| {
                     let id: [u8; 32] = member.id.as_slice().try_into().ok()?;
                     Some(admins.contains(&id))
@@ -575,9 +582,13 @@ impl WelcomeProbe {
             })
             .collect::<Vec<_>>();
         members.sort_by(|a, b| a.member_ref.cmp(&b.member_ref));
+        let before_dedup = members.len();
         members.dedup_by(|a, b| a.member_ref == b.member_ref);
         let member_count = u32::try_from(group.members.len()).ok();
         let mut limitations = Vec::new();
+        if invalid_member_identity || members.len() != before_dedup {
+            limitations.push(Limitation::MemberIdentityInvalid);
+        }
         if members.len() > MAX_MEMBERS {
             members.truncate(MAX_MEMBERS);
             limitations.push(Limitation::MemberLimit);
@@ -606,6 +617,32 @@ impl WelcomeProbe {
                 } else {
                     Capture::Partial
                 },
+            }),
+        );
+    }
+
+    /// Counts the selected stored groups and read failures without claiming
+    /// that a later recorder write was durable.
+    pub(super) fn baseline_inventory(
+        &mut self,
+        reason: BaselineReason,
+        counts: Option<(u32, u32, u32, u32)>,
+    ) {
+        let (eligible_group_count, selected_group_count, omitted_by_limit_count, failed_read_count) =
+            match counts {
+                Some((eligible, selected, omitted, failed)) => {
+                    (Some(eligible), Some(selected), Some(omitted), Some(failed))
+                }
+                None => (None, None, None, None),
+            };
+        self.record(
+            None,
+            Event::GroupBaselineInventory(GroupBaselineInventory {
+                reason,
+                eligible_group_count,
+                selected_group_count,
+                omitted_by_limit_count,
+                failed_read_count,
             }),
         );
     }

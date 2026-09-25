@@ -4730,6 +4730,14 @@ where
         } else {
             audit_v5::Policy::Unmet
         };
+        // This is the durable receipt boundary, before remaining fanout is
+        // finished. A met quorum does not establish that the retained
+        // obligation is terminal; later work may still be owed.
+        let retained_state = if policy == audit_v5::Policy::Met {
+            audit_v5::RetainedState::Unknown
+        } else {
+            audit_v5::RetainedState::Pending
+        };
         self.session.record_v5_event(
             Some(group_ref.clone()),
             audit_v5::Event::WelcomePublishFinished(audit_v5::WelcomePublishFinished {
@@ -4741,7 +4749,7 @@ where
                 accepted_total_count,
                 required_acks,
                 policy,
-                retained_state: audit_v5::RetainedState::Pending,
+                retained_state,
                 elapsed_us: None,
             }),
         );

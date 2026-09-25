@@ -104,27 +104,42 @@ impl AppClient {
     /// Seed an enabled recorder with bounded authoritative state at an ordinary
     /// hydrated account open. The per-group snapshot is observational; an
     /// unreadable group is omitted without changing account-open behavior.
-    pub(crate) fn record_open_v5_baselines(&mut self) {
+    pub(crate) fn record_v5_baselines(&mut self, reason: marmot_forensics::v5::BaselineReason) {
         if !self.audit_v5_enabled() {
             return;
         }
         let Ok(mut group_ids) = self.runtime.live_group_ids() else {
+            if let Some(probe) = &mut self.audit_v5_probe {
+                probe.baseline_inventory(reason, None);
+            }
+            self.flush_live_v5_events();
+            return;
+        };
+        let Ok(eligible) = u32::try_from(group_ids.len()) else {
+            if let Some(probe) = &mut self.audit_v5_probe {
+                probe.baseline_inventory(reason, None);
+            }
+            self.flush_live_v5_events();
             return;
         };
         group_ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-        for group_id in group_ids.into_iter().take(64) {
+        let selected = eligible.min(64);
+        let mut failed_read = 0u32;
+        for group_id in group_ids.into_iter().take(selected as usize) {
             let Ok(group) = self.runtime.group_record(&group_id) else {
+                failed_read += 1;
                 continue;
             };
             let admins = self.runtime.admin_pubkeys(&group_id).ok();
             if let Some(probe) = &mut self.audit_v5_probe {
-                probe.baseline(
-                    &group,
-                    admins.as_deref(),
-                    marmot_forensics::v5::BaselineReason::Opened,
-                    None,
-                );
+                probe.baseline(&group, admins.as_deref(), reason, None);
             }
+        }
+        if let Some(probe) = &mut self.audit_v5_probe {
+            probe.baseline_inventory(
+                reason,
+                Some((eligible, selected, eligible - selected, failed_read)),
+            );
         }
         self.flush_live_v5_events();
     }
@@ -432,6 +447,14 @@ impl AppClient {
     pub(crate) fn set_audit_recording(&mut self, enabled: bool) {
         let recorder = self.app.build_audit_recorder(&self.state.label, enabled);
         self.runtime.session_mut().set_audit_recorder(recorder);
+        if enabled {
+            if self.audit_v5_enabled() && self.audit_v5_probe.is_none() {
+                self.audit_v5_probe = Some(super::audit_v5_probe::WelcomeProbe::live());
+            }
+            self.record_v5_baselines(marmot_forensics::v5::BaselineReason::AuditEnabled);
+        } else {
+            self.audit_v5_probe = None;
+        }
     }
 
     /// Rotate the live forensic recorder iff it is the one appending to

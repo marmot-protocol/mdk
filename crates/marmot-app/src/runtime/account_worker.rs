@@ -3028,6 +3028,7 @@ async fn run_startup_hydration_pipeline(
 }
 
 fn finish_deferred_hydration_reconciliation(client: &mut AppClient) {
+    client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
     if let Err(err) = client.reconcile_hydrated_account_state() {
         tracing::warn!(
             target: "marmot_app::runtime",
@@ -3047,6 +3048,7 @@ pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(
             .session_mut()
             .hydrate_next_groups(&[], STARTUP_HYDRATION_BATCH_SIZE)?;
         if progress.remaining == 0 {
+            client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
             return client.reconcile_hydrated_account_state();
         }
         tokio::task::yield_now().await;

@@ -545,6 +545,115 @@ async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
 }
 
 #[tokio::test]
+async fn deferred_runtime_open_records_the_stored_group_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(tmp.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    let mut client = app.client(&account.label).await.unwrap();
+    let group = client.create_group("stored baseline", &[]).await.unwrap();
+    drop(client);
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group.as_slice())
+        .unwrap()
+        .as_str()
+        .to_owned();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let files = app.audit_log_files().unwrap();
+            let found = files.iter().any(|file| {
+                std::fs::read_to_string(&file.path).is_ok_and(|body| {
+                    body.lines().any(|line| {
+                        let row: Value = serde_json::from_str(line).unwrap();
+                        row["event"]["type"] == "group_baseline"
+                            && row["event"]["reason"] == "opened"
+                            && row["group_ref"] == group_ref
+                    })
+                })
+            });
+            if found {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("deferred runtime hydration should record opened baseline");
+    runtime
+        .set_audit_log_settings(AuditLogSettings { enabled: false })
+        .await
+        .unwrap();
+    runtime
+        .set_audit_log_settings(AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    let files = app.audit_log_files().unwrap();
+    let body = std::fs::read_to_string(&files[0].path).unwrap();
+    let rows = body
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(rows.iter().any(|row| {
+        row["event"]["type"] == "group_baseline"
+            && row["event"]["reason"] == "audit_enabled"
+            && row["group_ref"] == group_ref
+    }));
+    assert!(rows.iter().any(|row| {
+        row["event"]["type"] == "group_baseline_inventory"
+            && row["event"]["reason"] == "audit_enabled"
+            && row["event"]["selected_group_count"] == 1
+    }));
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn opened_baseline_inventory_exposes_the_64_group_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(tmp.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    let mut client = app.client(&account.label).await.unwrap();
+    for index in 0..65 {
+        client
+            .create_group(&format!("baseline group {index}"), &[])
+            .await
+            .unwrap();
+    }
+    drop(client);
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let _reopened = app.client(&account.label).await.unwrap();
+    let files = app.audit_log_files().unwrap();
+    let body = std::fs::read_to_string(&files[0].path).unwrap();
+    let rows = body
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let inventory = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "group_baseline_inventory")
+        .expect("bounded selection must leave an account-scoped inventory row");
+    assert!(inventory["group_ref"].is_null());
+    assert_eq!(inventory["event"]["eligible_group_count"], 65);
+    assert_eq!(inventory["event"]["selected_group_count"], 64);
+    assert_eq!(inventory["event"]["omitted_by_limit_count"], 1);
+    assert_eq!(inventory["event"]["failed_read_count"], 0);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event"]["type"] == "group_baseline"
+                && row["event"]["reason"] == "opened")
+            .count(),
+        64
+    );
+}
+
+#[tokio::test]
 async fn local_group_action_writes_human_action_context() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());

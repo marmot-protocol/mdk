@@ -112,6 +112,17 @@
       "if": {
         "properties": {
           "event": {
+            "properties": { "type": { "const": "group_baseline_inventory" } },
+            "required": ["type"]
+          }
+        }
+      },
+      "then": { "properties": { "group_ref": { "type": "null" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
             "properties": {
               "type": {
                 "const": "welcome_prepared"
@@ -458,6 +469,7 @@
     "Limitation": {
       "enum": [
         "member_limit",
+        "member_identity_invalid",
         "byte_limit",
         "admin_policy_unavailable",
         "state_unavailable"
@@ -1267,6 +1279,24 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": { "policy": { "enum": ["met", "unmet"] } },
+            "required": ["policy"]
+          },
+          "then": {
+            "properties": { "accepted_total_count": { "type": "integer" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "policy": { "const": "unmet" } },
+            "required": ["policy"]
+          },
+          "then": {
+            "properties": { "results_complete": { "const": true } }
+          }
         }
       ]
     },
@@ -1996,7 +2026,7 @@
           "items": {
             "$ref": "#/$defs/Limitation"
           },
-          "maxItems": 4,
+          "maxItems": 5,
           "uniqueItems": true
         },
         "capture": {
@@ -2160,6 +2190,7 @@
                 "contains": {
                   "enum": [
                     "member_limit",
+                    "member_identity_invalid",
                     "byte_limit"
                   ]
                 }
@@ -2217,6 +2248,48 @@
         }
       ]
     },
+    "GroupBaselineInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type", "reason", "eligible_group_count", "selected_group_count",
+        "omitted_by_limit_count", "failed_read_count"
+      ],
+      "properties": {
+        "type": { "const": "group_baseline_inventory" },
+        "reason": { "enum": ["opened", "audit_enabled"] },
+        "eligible_group_count": { "anyOf": [
+          { "type": "integer", "minimum": 0, "maximum": 4294967295 }, { "type": "null" }
+        ] },
+        "selected_group_count": { "anyOf": [
+          { "type": "integer", "minimum": 0, "maximum": 64 }, { "type": "null" }
+        ] },
+        "omitted_by_limit_count": { "anyOf": [
+          { "type": "integer", "minimum": 0, "maximum": 4294967295 }, { "type": "null" }
+        ] },
+        "failed_read_count": { "anyOf": [
+          { "type": "integer", "minimum": 0, "maximum": 64 }, { "type": "null" }
+        ] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "eligible_group_count": { "type": "null" } } },
+          "then": { "properties": {
+            "selected_group_count": { "type": "null" },
+            "omitted_by_limit_count": { "type": "null" },
+            "failed_read_count": { "type": "null" }
+          } }
+        },
+        {
+          "if": { "properties": { "eligible_group_count": { "type": "integer" } } },
+          "then": { "properties": {
+            "selected_group_count": { "type": "integer" },
+            "omitted_by_limit_count": { "type": "integer" },
+            "failed_read_count": { "type": "integer" }
+          } }
+        }
+      ]
+    },
     "Event": {
       "oneOf": [
         {
@@ -2245,6 +2318,9 @@
         },
         {
           "$ref": "#/$defs/GroupBaseline"
+        },
+        {
+          "$ref": "#/$defs/GroupBaselineInventory"
         },
         {
           "$ref": "#/$defs/OperationalEvent_recorder_started"
@@ -2380,6 +2456,11 @@
         }
       ]
     },
+    "Operational_safeText": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._,+-]*$"
+    },
     "Operational_u64": {
       "type": "integer",
       "minimum": 0
@@ -2412,8 +2493,9 @@
     },
     "Operational_stringArray": {
       "type": "array",
+      "minItems": 1,
       "items": {
-        "type": "string"
+        "$ref": "#/$defs/Operational_safeText"
       }
     },
     "Operational_messageRefArray": {
@@ -2458,16 +2540,17 @@
       ],
       "properties": {
         "action": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "origin": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "fields": {
           "$ref": "#/$defs/Operational_stringArray"
         },
         "component_ids": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Operational_u16"
           }
@@ -2485,10 +2568,10 @@
       ],
       "properties": {
         "transport_source": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "delivery_plane": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "endpoint_ref": {
           "$ref": "#/$defs/EndpointRef"
@@ -2569,16 +2652,16 @@
           "$ref": "#/$defs/OperationalDiagnosticRef"
         },
         "hardware_model": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "platform": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "app_version": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "upload_trigger": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "local_member_ref": {
           "$ref": "#/$defs/Operational_refHex16"
@@ -2590,16 +2673,16 @@
       "additionalProperties": false,
       "properties": {
         "transport": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "delivery_plane": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "wire_ref": {
           "$ref": "#/$defs/OperationalDiagnosticRef"
         },
         "wire_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "wire_pubkey_ref": {
           "$ref": "#/$defs/OperationalDiagnosticRef"
@@ -2681,6 +2764,7 @@
         },
         "expected_member_refs": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Operational_refHex16"
           }
@@ -2780,6 +2864,7 @@
         },
         "commit_refs": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/EngineMessageRef"
           }
@@ -2794,13 +2879,13 @@
           "$ref": "#/$defs/Operational_digestHex"
         },
         "tip_priority": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "tip_committer_ref": {
           "$ref": "#/$defs/Operational_refHex16"
         },
         "retained_anchor_status": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "last_input_time_ms": {
           "$ref": "#/$defs/Operational_u64"
@@ -2816,6 +2901,7 @@
         },
         "app_witnesses": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Operational_appWitness"
           }
@@ -2839,7 +2925,7 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "tip_priority": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "tip_committer_ref": {
           "$ref": "#/$defs/Operational_refHex16"
@@ -2876,7 +2962,7 @@
           "$ref": "#/$defs/EndpointRef"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         }
       }
     },
@@ -2961,7 +3047,7 @@
           "const": "recorder_started"
         },
         "recorder": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3019,7 +3105,7 @@
           "const": "group_context"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "context": {
           "$ref": "#/$defs/Operational_auditGroupContext"
@@ -3070,19 +3156,20 @@
           "const": "human_action"
         },
         "action": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "origin": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "phase": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "fields": {
           "$ref": "#/$defs/Operational_stringArray"
         },
         "component_ids": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Operational_u16"
           }
@@ -3092,6 +3179,7 @@
         },
         "message_refs": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/EngineMessageRef"
           }
@@ -3103,7 +3191,7 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "error_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3159,10 +3247,10 @@
           "$ref": "#/$defs/EngineMessageRef"
         },
         "envelope_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "transport_source": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "transport": {
           "$ref": "#/$defs/Operational_transportWireEnvelope"
@@ -3194,10 +3282,10 @@
           "$ref": "#/$defs/EngineMessageRef"
         },
         "outcome_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "stale_reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "epoch": {
           "$ref": "#/$defs/Operational_u64"
@@ -3223,7 +3311,7 @@
           "$ref": "#/$defs/EngineMessageRef"
         },
         "error_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3265,7 +3353,7 @@
           "const": "send_entry"
         },
         "intent_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3285,13 +3373,14 @@
           "const": "send_outcome"
         },
         "intent_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "result_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "outbound_messages": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Operational_outboundMessage"
           }
@@ -3314,10 +3403,10 @@
           "const": "send_error"
         },
         "intent_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "error_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3367,10 +3456,11 @@
           "const": "create_group_outcome"
         },
         "result_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "outbound_messages": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Operational_outboundMessage"
           }
@@ -3392,7 +3482,7 @@
           "const": "create_group_error"
         },
         "error_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3419,7 +3509,7 @@
           "$ref": "#/$defs/Operational_messageArtifactKind"
         },
         "target_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "transport": {
           "$ref": "#/$defs/Operational_transportWireEnvelope"
@@ -3429,6 +3519,7 @@
         },
         "endpoint_refs": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/EndpointRef"
           }
@@ -3462,7 +3553,7 @@
           "$ref": "#/$defs/Operational_messageArtifactKind"
         },
         "target_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "transport": {
           "$ref": "#/$defs/Operational_transportWireEnvelope"
@@ -3472,12 +3563,14 @@
         },
         "accepted_endpoint_refs": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/EndpointRef"
           }
         },
         "failed_relays": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Operational_publishRelayFailure"
           }
@@ -3514,10 +3607,10 @@
           "$ref": "#/$defs/Operational_messageArtifactKind"
         },
         "stage": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "target_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "transport": {
           "$ref": "#/$defs/Operational_transportWireEnvelope"
@@ -3527,6 +3620,7 @@
         },
         "endpoint_refs": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/EndpointRef"
           }
@@ -3535,7 +3629,7 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3562,7 +3656,7 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "pending_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "origin_commit_ref": {
           "$ref": "#/$defs/EngineMessageRef"
@@ -3592,7 +3686,7 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "pending_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3613,22 +3707,22 @@
           "const": "epoch_state_changed"
         },
         "previous_state": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "new_state": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "epoch": {
           "$ref": "#/$defs/Operational_u64"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "pending_ref": {
           "$ref": "#/$defs/Operational_u64"
         },
         "pending_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3670,6 +3764,7 @@
         },
         "component_ids": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Operational_u16"
           }
@@ -3717,7 +3812,7 @@
           "$ref": "#/$defs/Operational_digestHex"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3763,7 +3858,7 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "state_digest": {
           "$ref": "#/$defs/Operational_digestHex"
@@ -3831,10 +3926,10 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "error_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3867,7 +3962,7 @@
           }
         },
         "decisive_rule": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "selected_branch_ref": {
           "$ref": "#/$defs/OperationalDiagnosticRef"
@@ -3880,6 +3975,7 @@
         },
         "losing_branch_refs": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/OperationalDiagnosticRef"
           }
@@ -3927,7 +4023,7 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "error_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3947,13 +4043,13 @@
           "const": "auto_commit_decision"
         },
         "proposal_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "decision": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -3980,16 +4076,16 @@
           "$ref": "#/$defs/Operational_messageArtifactKind"
         },
         "previous_state": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "new_state": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "epoch": {
           "$ref": "#/$defs/Operational_u64"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "retry_count": {
           "$ref": "#/$defs/Operational_u64"
@@ -4018,7 +4114,7 @@
           "$ref": "#/$defs/EngineMessageRef"
         },
         "reason": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -4043,6 +4139,7 @@
         },
         "relay_results": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Operational_relayRegistration"
           }
@@ -4219,7 +4316,7 @@
           "$ref": "#/$defs/Operational_epochBackfillActivationOutcome"
         },
         "error_kind": {
-          "type": "string"
+          "$ref": "#/$defs/Operational_safeText"
         },
         "deliveries": {
           "$ref": "#/$defs/Operational_u64"

@@ -330,8 +330,18 @@ async fn post_audit_log_tracker_update_with_v5(
     let Some(sender) = sender else {
         return legacy;
     };
-    let v5 =
-        post_v5_audit_tracker_update(app, sender, configured_sender, lifecycle, schedule).await?;
+    let v5 = match post_v5_audit_tracker_update(app, sender, configured_sender, lifecycle, schedule)
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            schedule.failed(Duration::ZERO);
+            AuditOtlpTrackerResult {
+                skipped_reason: Some("v5 delivery pass failed".to_owned()),
+                ..Default::default()
+            }
+        }
+    };
     let mut result = match legacy {
         Ok(result) => result,
         Err(_) => {

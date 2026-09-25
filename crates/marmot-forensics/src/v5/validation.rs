@@ -341,7 +341,7 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                 "complete membership requires exact count",
             )?;
             require(
-                e.limitations.len() <= 4
+                e.limitations.len() <= 5
                     && e.limitations
                         .iter()
                         .enumerate()
@@ -390,6 +390,33 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                 e.reason != BaselineReason::Joined || e.cause_outer_event_ref.is_some(),
                 "join baseline requires Welcome cause",
             )?;
+        }
+        Event::GroupBaselineInventory(e) => {
+            require(!has_group, "baseline inventory is account-scoped")?;
+            require(
+                matches!(
+                    e.reason,
+                    BaselineReason::Opened | BaselineReason::AuditEnabled
+                ),
+                "baseline inventory reason must be opened or audit enabled",
+            )?;
+            match (
+                e.eligible_group_count,
+                e.selected_group_count,
+                e.omitted_by_limit_count,
+                e.failed_read_count,
+            ) {
+                (Some(eligible), Some(selected), Some(omitted), Some(failed)) => {
+                    require(
+                        selected == eligible.min(64)
+                            && selected.checked_add(omitted) == Some(eligible)
+                            && failed <= selected,
+                        "invalid baseline inventory counts",
+                    )?;
+                }
+                (None, None, None, None) => {}
+                _ => return Err(ContractError::rule("partial baseline inventory counts")),
+            }
         }
     }
     Ok(())

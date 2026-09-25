@@ -1087,5 +1087,31 @@
         "elapsed_us": "100"
       }
     }
+  },
+  {
+    "name": "baseline_inventory",
+    "record": {
+      "schema_version": "marmot-forensics-audit/v5",
+      "source_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "seq": "10",
+      "wall_time_ms": "0",
+      "mono_us": "0",
+      "producer": {
+        "mdk_revision": null,
+        "build_profile": "debug",
+        "platform": "macos",
+        "host_build": null
+      },
+      "group_ref": null,
+      "event": {
+        "type": "group_baseline_inventory",
+        "reason": "opened",
+        "eligible_group_count": 65,
+        "selected_group_count": 64,
+        "omitted_by_limit_count": 1,
+        "failed_read_count": 0
+      }
+    }
   }
 ]

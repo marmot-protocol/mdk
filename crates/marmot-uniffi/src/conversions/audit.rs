@@ -69,20 +69,10 @@ pub struct AuditLogTrackerUpdateResultFfi {
 
 impl From<AuditLogTrackerUpdateResult> for AuditLogTrackerUpdateResultFfi {
     fn from(value: AuditLogTrackerUpdateResult) -> Self {
-        let skipped_reason = match &value.v5 {
-            Some(v5) if v5.blocked_accounts > 0 => {
-                Some("v5 audit delivery blocked; inspect v5 tracker result".to_owned())
-            }
-            Some(v5) if v5.pending_accounts > 0 => {
-                Some("v5 audit delivery pending; inspect v5 tracker result".to_owned())
-            }
-            Some(v5) if v5.accepted_batches > 0 => None,
-            _ => value.skipped_reason,
-        };
         Self {
             enabled: value.enabled,
             uploaded: value.uploaded.into_iter().map(Into::into).collect(),
-            skipped_reason,
+            skipped_reason: value.skipped_reason,
         }
     }
 }
@@ -317,24 +307,37 @@ mod tests {
     }
 
     #[test]
-    fn legacy_tracker_result_does_not_report_empty_success_when_v5_is_pending() {
-        let result = AuditLogTrackerUpdateResult {
-            enabled: true,
-            uploaded: vec![],
-            skipped_reason: Some("audit log tracker endpoint missing".to_owned()),
-            v5: Some(AuditOtlpTrackerResult {
+    fn legacy_tracker_result_keeps_v4_reason_regardless_of_v5_outcome() {
+        for v5 in [
+            AuditOtlpTrackerResult {
+                accepted_batches: 1,
+                ..Default::default()
+            },
+            AuditOtlpTrackerResult {
                 pending_accounts: 1,
                 ..Default::default()
-            }),
-        };
-        let legacy: AuditLogTrackerUpdateResultFfi = result.clone().into();
-        assert!(
-            legacy
-                .skipped_reason
-                .unwrap()
-                .contains("v5 audit delivery pending")
-        );
-        let versioned: AuditLogTrackerUpdateResultV5Ffi = result.into();
-        assert_eq!(versioned.v5.unwrap().pending_accounts, 1);
+            },
+            AuditOtlpTrackerResult {
+                blocked_accounts: 1,
+                ..Default::default()
+            },
+        ] {
+            let result = AuditLogTrackerUpdateResult {
+                enabled: true,
+                uploaded: vec![],
+                skipped_reason: Some("audit log tracker authorization token missing".to_owned()),
+                v5: Some(v5.clone()),
+            };
+            let legacy: AuditLogTrackerUpdateResultFfi = result.clone().into();
+            assert_eq!(
+                legacy.skipped_reason.as_deref(),
+                Some("audit log tracker authorization token missing")
+            );
+            let versioned: AuditLogTrackerUpdateResultV5Ffi = result.into();
+            let versioned_v5 = versioned.v5.unwrap();
+            assert_eq!(versioned_v5.accepted_batches, v5.accepted_batches);
+            assert_eq!(versioned_v5.pending_accounts, v5.pending_accounts);
+            assert_eq!(versioned_v5.blocked_accounts, v5.blocked_accounts);
+        }
     }
 }

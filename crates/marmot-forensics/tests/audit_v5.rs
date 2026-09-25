@@ -48,10 +48,10 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
         })
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(kinds, catalog);
-    assert_eq!(kinds.len(), 9);
+    assert_eq!(kinds.len(), 10);
     assert_eq!(
         schema["$defs"]["Event"]["oneOf"].as_array().unwrap().len(),
-        53
+        54
     );
 }
 
@@ -370,13 +370,54 @@ fn incomplete_publication_keeps_discarded_ack_counts_unknown() {
     body["event"]["retained_state"] = json!("pending");
     assert!(schema.is_valid(&body));
     assert!(decode(&body).is_ok());
-
     let mut false_success = body.clone();
     false_success["event"]["policy"] = json!("met");
+    assert!(!schema.is_valid(&false_success));
     assert!(decode(&false_success).is_err());
+    let mut false_unmet = body.clone();
+    false_unmet["event"]["policy"] = json!("unmet");
+    assert!(!schema.is_valid(&false_unmet));
+    assert!(decode(&false_unmet).is_err());
     let mut false_complete = body;
     false_complete["event"]["results_complete"] = json!(true);
     assert!(decode(&false_complete).is_err());
+}
+
+#[test]
+fn opened_baseline_inventory_reports_the_actual_64_group_selection() {
+    let schema = validator();
+    let body = fixture("baseline_inventory");
+    assert!(schema.is_valid(&body));
+    assert!(decode(&body).is_ok());
+    let mut enabled = body.clone();
+    enabled["event"]["reason"] = json!("audit_enabled");
+    assert!(schema.is_valid(&enabled));
+    assert!(decode(&enabled).is_ok());
+
+    let mut wrong_reason = body.clone();
+    wrong_reason["event"]["reason"] = json!("created");
+    assert!(!schema.is_valid(&wrong_reason));
+    assert!(decode(&wrong_reason).is_err());
+
+    let mut wrong_scope = body.clone();
+    wrong_scope["group_ref"] = fixture("baseline")["group_ref"].clone();
+    assert!(!schema.is_valid(&wrong_scope));
+    assert!(decode(&wrong_scope).is_err());
+
+    let mut false_selection = body.clone();
+    false_selection["event"]["selected_group_count"] = json!(63);
+    false_selection["event"]["omitted_by_limit_count"] = json!(2);
+    assert!(decode(&false_selection).is_err());
+
+    let mut partial_unknown = body.clone();
+    partial_unknown["event"]["eligible_group_count"] = Value::Null;
+    assert!(!schema.is_valid(&partial_unknown));
+    assert!(decode(&partial_unknown).is_err());
+
+    let mut failed_read_overflow = body;
+    failed_read_overflow["event"]["failed_read_count"] = json!(65);
+    assert!(!schema.is_valid(&failed_read_overflow));
+    assert!(decode(&failed_read_overflow).is_err());
 }
 
 #[test]
