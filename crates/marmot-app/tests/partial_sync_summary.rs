@@ -189,14 +189,18 @@ async fn direct_sync_failure_returns_applied_prefix() {
             std::fs::read_to_string(file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real v5 sync row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     assert!(
         audit_rows
             .iter()
-            .any(|row| { row["kind"]["type"] == "sync_drain" && row["kind"]["deliveries"] == 1 }),
+            .any(|row| { row["event"]["type"] == "sync_drain" && row["event"]["deliveries"] == 1 }),
         "the failed drain must retain forensic span and completed-delivery evidence",
     );
 }
@@ -268,13 +272,17 @@ async fn batch_with_failed_checkpoint_is_excluded_and_replays_exactly_once() {
             std::fs::read_to_string(file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real v5 sync row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
                 .collect::<Vec<_>>()
         })
-        .rfind(|row| row["kind"]["type"] == "sync_drain")
+        .rfind(|row| row["event"]["type"] == "sync_drain")
         .expect("failed drain audit row");
     assert_eq!(
-        failed_drain["kind"]["cursor_after_secs"], failed_drain["kind"]["cursor_before_secs"],
+        failed_drain["event"]["cursor_after_secs"], failed_drain["event"]["cursor_before_secs"],
         "a failed projection checkpoint must not claim an uncommitted cursor",
     );
     drop(bob);
