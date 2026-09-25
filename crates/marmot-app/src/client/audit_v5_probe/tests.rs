@@ -300,17 +300,29 @@ async fn hash_valid_unsigned_gift_wrap_is_observed_then_rejected_without_inner_r
                 wire: None,
             },
         };
-        let _ = scenario.bob.ingest_received_delivery(delivery).await;
+        let summary = scenario
+            .bob
+            .ingest_received_delivery(delivery)
+            .await
+            .expect("terminal invalid-signature rejection is a handled ingest");
+        assert!(summary.joined_groups.is_empty());
+        assert!(summary.events.is_empty());
         assert!(scenario.bob_app.groups("bob").unwrap().is_empty());
         let rows = &scenario.capture().rows;
-        let observed = rows.iter().find_map(|r| match &r.fields().event {
-            Event::WelcomeObserved(e) => Some(e),
-            _ => None,
-        }).unwrap();
-        let rejected = rows.iter().find_map(|r| match &r.fields().event {
-            Event::WelcomeUnwrapped(e) => Some(e),
-            _ => None,
-        }).unwrap();
+        let observed = rows
+            .iter()
+            .find_map(|r| match &r.fields().event {
+                Event::WelcomeObserved(e) => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let rejected = rows
+            .iter()
+            .find_map(|r| match &r.fields().event {
+                Event::WelcomeUnwrapped(e) => Some(e),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(rejected.receive_id, observed.receive_id);
         assert_eq!(rejected.outer_event_ref, observed.outer_event_ref);
         assert_eq!(rejected.result, UnwrapResult::Rejected);
@@ -318,7 +330,10 @@ async fn hash_valid_unsigned_gift_wrap_is_observed_then_rejected_without_inner_r
         assert!(rejected.rumor_event_ref.is_none());
         assert!(rejected.key_package_event_ref.is_none());
         assert!(rows.iter().all(|r| r.fields().group_ref.is_none()));
-        assert!(rows.iter().all(|r| !matches!(r.fields().event, Event::AppGroupUpdateFinished(_))));
+        assert!(
+            rows.iter()
+                .all(|r| !matches!(r.fields().event, Event::AppGroupUpdateFinished(_)))
+        );
         scenario.assert_clean();
         for row in rows {
             let text = String::from_utf8(row.to_json().unwrap()).unwrap();
@@ -327,13 +342,30 @@ async fn hash_valid_unsigned_gift_wrap_is_observed_then_rejected_without_inner_r
             assert!(!text.contains("synthetic invalid gift wrap"));
         }
         let body: usize = rows.iter().map(|r| r.to_json().unwrap().len()).sum();
-        let largest = rows.iter().map(|r| r.to_json().unwrap().len()).max().unwrap();
-        let by_kind = rows.iter().map(|r| {
-            let value = serde_json::to_value(&r.fields().event).unwrap();
-            (value["type"].as_str().unwrap().to_owned(), r.to_json().unwrap().len())
-        }).collect::<Vec<_>>();
-        println!("v5 rejected unwrap: rows={} body_bytes={body} jsonl_bytes={} largest_body_bytes={largest} by_kind={by_kind:?}", rows.len(), body + rows.len());
-    }).await.expect("bounded invalid-signature scenario");
+        let largest = rows
+            .iter()
+            .map(|r| r.to_json().unwrap().len())
+            .max()
+            .unwrap();
+        let by_kind = rows
+            .iter()
+            .map(|r| {
+                let value = serde_json::to_value(&r.fields().event).unwrap();
+                (
+                    value["type"].as_str().unwrap().to_owned(),
+                    r.to_json().unwrap().len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "v5 rejected unwrap: rows={} body_bytes={body} jsonl_bytes={} \
+             largest_body_bytes={largest} by_kind={by_kind:?}",
+            rows.len(),
+            body + rows.len()
+        );
+    })
+    .await
+    .expect("bounded invalid-signature scenario");
 }
 
 #[tokio::test]

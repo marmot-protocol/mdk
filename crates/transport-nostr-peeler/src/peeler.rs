@@ -222,12 +222,17 @@ impl NostrMlsPeeler {
         // author to the seal. It does not verify UnsignedEvent.id; compute the
         // canonical ID from those authenticated rumor fields instead.
         let rumor_event_id = unwrapped.rumor.compute_id().to_bytes();
+        // spec/transports/nostr.md — the kind-444 welcome rumor links to the
+        // KeyPackage event consumed for this welcome and carries the group
+        // relay list the new member should use next. Both tags are
+        // routing-significant, so duplicates are rejected and the relay values
+        // are content-validated before anything downstream sees them (#709).
         let key_package_event_id = rumor_single_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG)?;
         let key_package_event_id: [u8; 32] =
             decode_hex_exact("welcome e tag", key_package_event_id, 32)
                 .map_err(to_peeler_error)?
                 .try_into()
-                .expect("validated 32-byte event ID");
+                .map_err(|_| PeelerError::Malformed("welcome e tag is not 32 bytes".into()))?;
         let relays = rumor_single_tag_values(&unwrapped.rumor, WELCOME_RELAYS_TAG)?;
         validate_welcome_relays(&relays).map_err(PeelerError::Malformed)?;
 

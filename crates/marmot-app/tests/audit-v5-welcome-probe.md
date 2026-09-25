@@ -91,12 +91,13 @@ facts are taken from the running scenario, not converted from v4 records.
 A local run on 2026-09-25 of the earlier three-row subset measured 2,072 compact
 body bytes, 2,075 JSONL bytes and a 742-byte largest body. With successful unwrap
 added, the same success path measured four rows, 2,836 body bytes, 2,840 JSONL
-bytes and a 764-byte largest body. The invalid-signature path measured two rows,
-1,240 body bytes, 1,242 JSONL bytes and a 650-byte largest body. Timings vary.
-For that run, success contributed `welcome_observed` 1/592 B,
+bytes and a 764-byte largest body. Two invalid-signature runs each measured two
+rows: 1,239–1,240 body bytes, 1,241–1,242 JSONL bytes, and a 649–650-byte
+largest body. The recorded `elapsed_us` can change the decimal width. In the
+success run, `welcome_observed` contributed 1/592 B,
 `welcome_unwrapped` 1/764 B, and `app_group_update_finished` 2/1,480 B;
 rejection contributed `welcome_observed` 1/590 B and `welcome_unwrapped`
-1/650 B. These are compact JSON body bytes by kind.
+1/649–650 B. These are compact JSON body bytes by kind.
 
 The successful scenario emits four rows: one receive, one unwrap, one pending
 checkpoint and one accepted checkpoint. Its command prints per-kind counts/body
