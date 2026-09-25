@@ -121,7 +121,10 @@ the same pass budgets; a silent endpoint can still consume most of the two-secon
 byte/item/deadline exit retains partial events but leaves comparison incomplete. These are
 returned-result and SDK-received budgets, not complete wire or memory ceilings.
 
-Replay position is advisory, separate from admitted event inventory. Failed or cancelled fetches
-advance position but acknowledge no delivery. Refused events recur on wrap; only durable app
-ingestion removes an event from the missing set. SDK callers must supply this new progress
+Replay position is advisory, separate from admitted event inventory. A cancelled fetch retains its
+pre-I/O cursor advance. A completed byte-limit rejection of an otherwise eligible network ID
+restores the preceding cursor when earlier results consumed this pass's allowance, so the ID leads
+the next pass even if that earlier result stays unadmitted. Repeated route URLs are counted once
+after parsing, preserving one acquisition obligation per distinct relay. Refused and over-ceiling
+events recur on wrap; only durable app ingestion removes an event from the missing set. SDK callers must supply this new progress
 argument; no FFI signature changes are required.

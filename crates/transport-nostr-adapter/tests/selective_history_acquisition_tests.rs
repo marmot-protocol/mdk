@@ -614,6 +614,72 @@ async fn large_network_id_retries_after_a_smaller_cached_prefix() {
 }
 
 #[tokio::test]
+async fn unadmitted_small_network_id_does_not_hide_deferred_large_id() {
+    // The fixed fixture key puts the small ID first. Keep the caller's durable
+    // inventory empty on every pass: returning A is not admission of A.
+    let (left, right, sdk, route, _, _, items) = cached_fixture(&[160 * 1024, 1024], &[]).await;
+    assert_eq!(items[0].created_at, 1_700_001_001);
+    let cursor = Cursor::default();
+    let (first_summary, first) = sdk
+        .reconcile_subscription(route.clone(), &[], 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(first_summary.relays_failed, 2);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].event.id, hex::encode(items[0].event_id));
+    let (second_summary, second) = sdk
+        .reconcile_subscription(route, &[], 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1, "the deferred ID must lead the next pass");
+    assert_eq!(second[0].event.id, hex::encode(items[1].event_id));
+    assert!(returned_json_bytes(&second) > 128 * 1024);
+    assert_eq!(second_summary.relays_failed, 2, "A remains unadmitted");
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
+async fn duplicate_route_endpoint_preserves_cached_prefix_and_unique_obligations() {
+    let (left, right, sdk, mut route, left_counts, right_counts, items) =
+        cached_fixture(&[1024, 1024], &[0]).await;
+    let NostrSubscription::Group { endpoints, .. } = &mut route else {
+        panic!("group fixture");
+    };
+    endpoints.push(endpoints[0].clone());
+    endpoints.push(TransportEndpoint(format!(
+        "{}/",
+        endpoints[0].as_str().trim_end_matches('/')
+    )));
+    let (summary, events) = sdk
+        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2, "cached prefix and network suffix survive");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event.id == hex::encode(items[0].event_id))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event.id == hex::encode(items[1].event_id))
+    );
+    assert_eq!(summary.relays_failed, 0);
+    assert_eq!(
+        summary.relays_succeeded, 2,
+        "two distinct relay obligations"
+    );
+    assert_eq!(left_counts.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(right_counts.requests.load(Ordering::SeqCst), 1);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
 async fn large_network_result_survives_one_withholding_endpoint() {
     let (left, right, sdk, route, left_counts, right_counts, items) =
         cached_fixture(&[160 * 1024], &[]).await;

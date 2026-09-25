@@ -647,7 +647,15 @@ impl NostrSdkRelayClient {
         // requested endpoint under this call's finite SDK deadline rather
         // than carrying a stale process-lifetime rejection across sessions.
         // The app recovery owner paces its calls; direct callers own their rate.
-        let endpoints = plan.endpoints;
+        // Reconciliation counts physical relay obligations. Parse first, then
+        // keep each canonical endpoint once so a repeated route URL cannot
+        // make the exact-ID request invalid after cached events were gathered.
+        let mut seen_endpoints = HashSet::new();
+        let endpoints = plan
+            .endpoints
+            .into_iter()
+            .filter(|endpoint| seen_endpoints.insert(endpoint.clone()))
+            .collect::<Vec<_>>();
         let Some(replay_endpoint) = endpoints.first().cloned() else {
             // Preserve the public no-op result for an empty route set. It is
             // neither relay coverage nor backend-wide incapability evidence.
@@ -803,6 +811,8 @@ impl NostrSdkRelayClient {
             // Do not advance past an ID merely because this pass ran out of
             // capacity. A dispatched request saves progress before its I/O;
             // only worker admission removes the ID from later comparisons.
+            let prior_cursor = progress.load_cursor()?;
+            let single_object_request = byte_allowance == SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES;
             progress.save_cursor(Some(event_id.to_bytes()))?;
             requests += 1;
             let result = self
@@ -836,10 +846,12 @@ impl NostrSdkRelayClient {
             // except for the one event observed at the rejection boundary.
             let mut request_items = 0usize;
             let mut request_bytes = 0usize;
+            let mut byte_limited = false;
             let wanted_id = event_id.to_hex();
             for (endpoint, outcome) in endpoints.iter().zip(result.endpoints) {
                 request_items = request_items.max(outcome.stats.received_items);
                 request_bytes = request_bytes.max(outcome.stats.serialized_event_bytes);
+                byte_limited |= outcome.end == NostrAcquisitionEnd::ByteLimitReached;
                 let claimed_id_missing = remote_by_endpoint
                     .get(endpoint)
                     .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id))
@@ -865,6 +877,20 @@ impl NostrSdkRelayClient {
             }
             spent_items = spent_items.saturating_add(request_items);
             spent_bytes = spent_bytes.saturating_add(request_bytes);
+            if !single_object_request
+                && byte_limited
+                && !returned_ids.contains(&wanted_id)
+                && request_bytes <= SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
+            {
+                // This ID was dispatched with only the bytes left after an
+                // earlier result. Keep the pre-I/O save for cancellation, but
+                // after a completed bounded rejection let this ID lead the
+                // next pass, even if that earlier result stays unadmitted.
+                // An object beyond the single-event ceiling still rotates.
+                progress.save_cursor(prior_cursor)?;
+                incomplete |= index + 1 < selected_item_count;
+                break;
+            }
             if spent_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
                 // A first oversized result, or expensive duplicate/boundary
                 // traffic, consumes this pass. Failed endpoints remain marked
