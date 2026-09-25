@@ -631,7 +631,10 @@ version 3 reader cannot validate epoch-scoped approvals. Completed recovery
 leaves a version 4 cancellation tombstone even before a new begin, so older
 readers fail closed. Preparing an additive relay proposal upgrades its checkpoint
 to version 5, with or without a recovery epoch. This prevents older readers from
-resuming an approved, unsigned proposal as a destructive replacement.
+resuming an approved, unsigned proposal as a destructive replacement. Preparing
+an exact lossless relay repair upgrades the checkpoint to version 6, preserving
+that version through approval, signing and completion. Version 3/4/5 readers
+reject it rather than discard the typed preview and publish replacement tags.
 Downgrading once either format is used is unsupported; use a build that supports
 the checkpoint version. Do not relabel versions or delete checkpoints to
 force a downgrade. Restore/upgrade to a supporting build, or explicitly recover

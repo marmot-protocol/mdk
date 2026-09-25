@@ -80,9 +80,12 @@ enum OnboardingPersist {
 // v3 forbids older v2 cancellation/restart semantics. Recovered attempts use
 // v4 because a v3 reader cannot enforce epoch-scoped approvals. v5 protects
 // append semantics from v3/v4 readers, with or without a recovery epoch.
+// v6 fences typed lossless relay previews from v3/v4/v5 readers that would
+// silently discard the preview and publish a destructive replacement.
 const ONBOARDING_VERSION: u32 = 3;
 const RECOVERED_ONBOARDING_VERSION: u32 = 4;
 const APPEND_ONBOARDING_VERSION: u32 = 5;
+const LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION: u32 = 6;
 const ONBOARDING_V2: u32 = 2;
 const STEP_COUNT: usize = 6;
 const MAX_RELAYS: usize = 16;
@@ -578,6 +581,7 @@ fn decode_onboarding_checkpoint(
         (ONBOARDING_VERSION, None)
             | (RECOVERED_ONBOARDING_VERSION, Some(_))
             | (APPEND_ONBOARDING_VERSION, _)
+            | (LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION, _)
     ) || checkpoint
         .snapshot
         .recovery_epoch
@@ -1023,7 +1027,15 @@ impl AccountManager {
                 };
             }
         }
-        if checkpoint.append_relays {
+        if checkpoint
+            .snapshot
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.relay_repair.is_some())
+            || checkpoint.version == LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION
+        {
+            checkpoint.version = LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION;
+        } else if checkpoint.append_relays {
             checkpoint.version = APPEND_ONBOARDING_VERSION;
         }
         checkpoint.snapshot.revision = checkpoint

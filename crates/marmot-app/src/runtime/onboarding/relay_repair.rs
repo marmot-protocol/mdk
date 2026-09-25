@@ -128,7 +128,7 @@ impl AccountManager {
             .collect();
         let mut after = Vec::with_capacity(before.len() + 1);
         let mut changes = Vec::with_capacity(before.len() + 1);
-        let mut safe_endpoints = HashSet::new();
+        let mut safe_endpoints = HashMap::new();
         let mut has_read = false;
         let mut has_write = false;
         let mut has_inbox = false;
@@ -145,27 +145,37 @@ impl AccountManager {
                 let Some(endpoint) = tag.endpoint.as_ref() else {
                     return manual();
                 };
-                if policies.get(endpoint) != Some(&RelayEndpointPolicy::Allowed) {
-                    changes.push(tag_change(
-                        tag,
-                        OnboardingRelayTagDisposition::Removed,
-                        Some(index),
-                        None,
-                        OnboardingRelayCapability::None,
-                    ));
-                    removed += 1;
-                    continue;
-                }
-                safe_endpoints.insert(endpoint.trim().to_owned());
-                match tag.role {
-                    OnboardingRelayTagRole::Unmarked => {
-                        has_read = true;
-                        has_write = true;
+                match policies.get(endpoint) {
+                    Some(RelayEndpointPolicy::Retired) => {
+                        changes.push(tag_change(
+                            tag,
+                            OnboardingRelayTagDisposition::Removed,
+                            Some(index),
+                            None,
+                            OnboardingRelayCapability::None,
+                        ));
+                        removed += 1;
+                        continue;
                     }
-                    OnboardingRelayTagRole::Read => has_read = true,
-                    OnboardingRelayTagRole::Write => has_write = true,
-                    OnboardingRelayTagRole::Inbox => has_inbox = true,
-                    OnboardingRelayTagRole::Other => unreachable!(),
+                    // A route the direct dialer cannot use may still be useful
+                    // to a Tor or LAN client. Do not erase its declaration.
+                    Some(RelayEndpointPolicy::Unsafe) => {}
+                    Some(RelayEndpointPolicy::Allowed) => {
+                        safe_endpoints
+                            .entry(relay_key(endpoint))
+                            .or_insert_with(|| endpoint.clone());
+                        match tag.role {
+                            OnboardingRelayTagRole::Unmarked => {
+                                has_read = true;
+                                has_write = true;
+                            }
+                            OnboardingRelayTagRole::Read => has_read = true,
+                            OnboardingRelayTagRole::Write => has_write = true,
+                            OnboardingRelayTagRole::Inbox => has_inbox = true,
+                            OnboardingRelayTagRole::Other => unreachable!(),
+                        }
+                    }
+                    _ => return manual(),
                 }
             }
             changes.push(tag_change(
@@ -196,7 +206,7 @@ impl AccountManager {
                 .collect::<Vec<_>>();
             let candidate = allowed_defaults
                 .iter()
-                .find(|endpoint| safe_endpoints.contains(*endpoint))
+                .find_map(|endpoint| safe_endpoints.get(&relay_key(endpoint)))
                 .or_else(|| {
                     (safe_endpoints.len() < MAX_RELAYS)
                         .then(|| allowed_defaults.first())
