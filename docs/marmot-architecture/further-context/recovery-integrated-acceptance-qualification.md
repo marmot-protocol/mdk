@@ -40,10 +40,12 @@ and exhaustive endpoint coverage are not asserted: the startup comparison
 may be selected before the later traffic arms the gap, and EOSE alone cannot
 certify durable admission.
 
-Two adjacent tests cover the same startup continuation's capacity and
-interruption boundaries. With both shared credits held, a comparison stays
+Adjacent tests cover the startup continuation's capacity and interruption
+boundaries. With both shared credits held, a comparison stays
 pending and the retry serial does not advance while startup still answers a
-deferred command. In the cancellation fixture, the owned job and adapter
+deferred command. With credits available but no comparison grant, a held
+ordinary inline startup query does not retain its speculative credit or spend
+a recovery reservation. In the cancellation fixture, the owned job and adapter
 request are held over a signed Nostr event; `shutdown_and_close` reaps both,
 restores the credit, and a fresh SQLCipher open still has the comparison debt
 and the same retry serial. That cancellation fixture does not use valid MLS
@@ -78,5 +80,6 @@ Focused commands:
 ```sh
 cargo test -p marmot-app --features test-policy-overrides --lib startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen
 cargo test -p marmot-app --features test-policy-overrides --lib startup_comparison_waits_for_credit_before_reserving_retry
+cargo test -p marmot-app --features test-policy-overrides --lib startup_inline_wait_releases_unused_comparison_credit
 cargo test -p marmot-app --features test-policy-overrides --lib startup_comparison_shutdown_reaps_owned_request_and_keeps_debt
 ```

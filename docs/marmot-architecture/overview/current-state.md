@@ -122,7 +122,8 @@ safety and durable debt preserved on failure. Snapshot reads can run during the 
 ordering. Eligible owner-selected comparisons from startup, periodic maintenance, scheduled
 convergence and ordinary receive suspend only the SDK request in the shared worker job. Startup
 keeps live receive and eligible commands active while that request runs; a saturated comparison
-credit pool leaves its retry reservation unspent. Explicit catch-up, account-wide overflow and
+credit pool leaves its retry reservation unspent, and an inline fallback releases a speculative
+credit before waiting. Explicit catch-up, account-wide overflow and
 other waits retain their separate inline paths. The broader
 nonblocking acquisition and scheduling program belongs to #1947.
 See the [owner integration ledger](../further-context/account-recovery-integration.md) for the acceptance matrix,

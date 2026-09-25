@@ -991,7 +991,7 @@ async fn run_app_runtime_account_worker(
                 barrier.wait().await;
                 barrier.wait().await;
             }
-            let credit =
+            let mut credit =
                 bounded_recovery::try_acquire_recovery_credit(&shared.recovery_credit_pool());
             let mut grant = client
                 .prepare_sync_grant(Some(&startup_stage_telemetry), false, credit.is_none())
@@ -1013,7 +1013,7 @@ async fn run_app_runtime_account_worker(
                 && client
                     .comparison_offload_eligible(selected)
                     .unwrap_or(false)
-                && let Some(credit) = credit
+                && let Some(credit) = credit.take()
                 && let Ok(subscription_attempt) = client.activate_comparison_grant(selected).await
                 && let Ok(network) = ComparisonNetworkJob::start(
                     &client,
@@ -1029,6 +1029,9 @@ async fn run_app_runtime_account_worker(
                     network,
                 });
             }
+            // A grant with no off-worker request keeps the same inline path,
+            // but must not hold a speculative process credit across its wait.
+            drop(credit.take());
             let summary = client
                 .execute_prepared_sync(grant, Some(&startup_stage_telemetry), false)
                 .await?;

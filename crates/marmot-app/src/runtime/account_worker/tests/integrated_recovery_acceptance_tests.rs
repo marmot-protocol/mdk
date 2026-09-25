@@ -158,6 +158,50 @@ impl QueryPolicy for HeldCommitRequest {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct HeldBroadQuery {
+    hold: Arc<AtomicBool>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    active: Arc<AtomicUsize>,
+}
+
+impl HeldBroadQuery {
+    fn release(&self) {
+        self.hold.store(false, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+struct ReleaseBroadOnDrop(HeldBroadQuery);
+
+impl Drop for ReleaseBroadOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+impl QueryPolicy for HeldBroadQuery {
+    fn admit_query<'a>(
+        &'a self,
+        query: &'a RelayFilter,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if query.ids.is_none() && self.hold.load(Ordering::SeqCst) {
+                let released = self.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.active.fetch_add(1, Ordering::SeqCst);
+                let _active = ActiveRequest(self.active.clone());
+                self.entered.notify_one();
+                released.await;
+            }
+            PolicyResult::Accept
+        })
+    }
+}
+
 async fn group_events(
     inspector: &NostrSdkClient,
     url: &str,
@@ -778,6 +822,93 @@ async fn startup_comparison_waits_for_credit_before_reserving_retry() {
     assert!(storage.recovery_comparison().unwrap().pending());
     assert_eq!(bounded_recovery::available_credits(&pool), 0);
     drop(held);
+    runtime.shutdown_and_close().await.unwrap();
+    relay.shutdown();
+}
+
+#[tokio::test]
+async fn startup_inline_wait_releases_unused_comparison_credit() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let gate = HeldBroadQuery::default();
+    let _release_on_drop = ReleaseBroadOnDrop(gate.clone());
+    let relay = LocalRelay::new(RelayBuilder::default().query_policy(gate.clone()));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("inline startup")
+        .unwrap();
+    let config = crate::MarmotAppConfig::default()
+        .with_allow_loopback_relay_endpoints(true)
+        .with_cursor_persistence(crate::CursorPersistence::Frozen);
+    let initial_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let initial = crate::MarmotAppRuntime::new(initial_app.clone());
+    initial.reconcile_accounts().await.unwrap();
+    initial
+        .create_group_with_options(
+            &account.label,
+            "inline route",
+            &[],
+            AppCreateGroupOptions {
+                relays: Some(vec![url.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    initial.shutdown_and_close().await.unwrap();
+    drop(initial);
+    drop(initial_app);
+
+    // Frozen policy starts no comparison grant, but its ordinary startup
+    // activation still issues a broad relay query and waits inline.
+    gate.hold.store(true, Ordering::SeqCst);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url, config);
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let pool = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .expect("ordinary startup query entered the held relay policy");
+    assert!(gate.active.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        bounded_recovery::available_credits(&pool),
+        2,
+        "inline startup returned its speculative credit before the held query finishes"
+    );
+    assert_eq!(
+        app.account_storage(&account.label)
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial,
+        0,
+        "the no-grant fallback did not spend a recovery reservation"
+    );
+
+    let commands = runtime
+        .accounts()
+        .worker_commands(&account.label)
+        .await
+        .unwrap();
+    let (respond, mut answer) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::NetworkStartupSettled { respond })
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), &mut answer)
+            .await
+            .is_err(),
+        "the inline startup remains blocked while its credit is already free"
+    );
+    gate.release();
+    timeout(Duration::from_secs(15), answer)
+        .await
+        .expect("inline startup completes after query release")
+        .unwrap();
+    assert_eq!(bounded_recovery::available_credits(&pool), 2);
     runtime.shutdown_and_close().await.unwrap();
     relay.shutdown();
 }
