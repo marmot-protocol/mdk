@@ -1,0 +1,432 @@
+#![cfg(feature = "sdk")]
+
+use cgka_traits::{GroupId, MemberId, TransportAdapterError, TransportEndpoint};
+use futures::{SinkExt, StreamExt};
+use nostr_relay_builder::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
+use nostr_relay_builder::{LocalRelay, RelayBuilder};
+use nostr_sdk::prelude::{Client, EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use tokio::net::TcpListener;
+use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
+use transport_nostr_adapter::{
+    NostrReconciliationItem, NostrReconciliationProgress, NostrSdkRelayClient, NostrSubscription,
+    SubscriptionAttempt,
+};
+
+const ROUTE: [u8; 32] = [0xc3; 32];
+const LARGE_EVENT_BYTES: usize = 40 * 1024;
+
+#[derive(Default)]
+struct Cursor(Mutex<Option<[u8; 32]>>);
+
+impl NostrReconciliationProgress for Cursor {
+    fn load_cursor(&self) -> Result<Option<[u8; 32]>, TransportAdapterError> {
+        Ok(*self.0.lock().unwrap())
+    }
+
+    fn save_cursor(&self, cursor: Option<[u8; 32]>) -> Result<(), TransportAdapterError> {
+        *self.0.lock().unwrap() = cursor;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct WireCounts {
+    sent_text: AtomicUsize,
+    received_text: AtomicUsize,
+    sent_event_json: AtomicUsize,
+    sent_control_text: AtomicUsize,
+    received_control_text: AtomicUsize,
+    requests: AtomicUsize,
+    comparisons: AtomicUsize,
+    drop_requests: AtomicBool,
+    suppress_events: AtomicBool,
+    extra_event_copies: AtomicUsize,
+}
+
+impl WireCounts {
+    fn total_text(&self) -> usize {
+        self.sent_text.load(Ordering::SeqCst) + self.received_text.load(Ordering::SeqCst)
+    }
+}
+
+async fn counted_proxy(backend: String) -> (String, Arc<WireCounts>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let counts = Arc::new(WireCounts::default());
+    let accepted = counts.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let backend = backend.clone();
+            let counts = accepted.clone();
+            tokio::spawn(async move {
+                let Ok(client) = accept_async(stream).await else {
+                    return;
+                };
+                let Ok((upstream, _)) = connect_async(&backend).await else {
+                    return;
+                };
+                let (mut client_write, mut client_read) = client.split();
+                let (mut relay_write, mut relay_read) = upstream.split();
+                let to_relay = async {
+                    while let Some(Ok(message)) = client_read.next().await {
+                        if let Message::Text(text) = &message {
+                            counts.received_text.fetch_add(text.len(), Ordering::SeqCst);
+                            counts
+                                .received_control_text
+                                .fetch_add(text.len(), Ordering::SeqCst);
+                            if text.starts_with("[\"REQ\"") {
+                                counts.requests.fetch_add(1, Ordering::SeqCst);
+                                if counts.drop_requests.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                            }
+                            if text.starts_with("[\"NEG-OPEN\"") {
+                                counts.comparisons.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        if relay_write.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                let to_client = async {
+                    while let Some(Ok(message)) = relay_read.next().await {
+                        if let Message::Text(text) = &message {
+                            counts.sent_text.fetch_add(text.len(), Ordering::SeqCst);
+                            let mut event_frame = false;
+                            if let Ok(frame) = serde_json::from_str::<Vec<Value>>(text)
+                                && frame.first().and_then(Value::as_str) == Some("EVENT")
+                                && let Some(event) = frame.get(2)
+                            {
+                                event_frame = true;
+                                let payload_bytes = event.to_string().len();
+                                counts
+                                    .sent_event_json
+                                    .fetch_add(payload_bytes, Ordering::SeqCst);
+                                if counts.suppress_events.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                for _ in 0..counts.extra_event_copies.load(Ordering::SeqCst) {
+                                    counts.sent_text.fetch_add(text.len(), Ordering::SeqCst);
+                                    counts
+                                        .sent_event_json
+                                        .fetch_add(payload_bytes, Ordering::SeqCst);
+                                    if client_write.send(message.clone()).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            if !event_frame {
+                                counts
+                                    .sent_control_text
+                                    .fetch_add(text.len(), Ordering::SeqCst);
+                            }
+                        }
+                        if client_write.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                tokio::select! { _ = to_relay => {}, _ = to_client => {} }
+            });
+        }
+    });
+    (url, counts)
+}
+
+fn subscription(urls: &[String]) -> NostrSubscription {
+    NostrSubscription::Group {
+        account_id: MemberId::new(vec![0xa1; 32]),
+        group_id: GroupId::new(vec![0xb2; 16]),
+        transport_group_id: ROUTE.to_vec(),
+        endpoints: urls.iter().cloned().map(TransportEndpoint).collect(),
+        since: None,
+        attempt: SubscriptionAttempt::INITIAL,
+    }
+}
+
+#[tokio::test]
+async fn large_retained_history_and_sparse_gap_use_finite_bounded_acquisition() {
+    let keys = Keys::generate();
+    let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(2_048),
+    });
+    let mut retained = Vec::new();
+    let mut missing = Vec::new();
+    for index in 0..1_108 {
+        let content = if index >= 1_100 {
+            format!("missing-{index}-{}", "x".repeat(LARGE_EVENT_BYTES))
+        } else {
+            format!("retained-{index}")
+        };
+        let event = EventBuilder::new(Kind::MlsGroupMessage, content)
+            .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                1_700_000_000 + index as u64,
+            ))
+            .finalize(&keys)
+            .unwrap();
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+        let item = NostrReconciliationItem {
+            event_id: event.id.to_bytes(),
+            created_at: event.created_at.as_secs(),
+        };
+        if index >= 1_100 {
+            missing.push(item)
+        } else {
+            retained.push(item)
+        }
+    }
+    let left = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    let right = LocalRelay::new(RelayBuilder::default().database(database));
+    left.run().await.unwrap();
+    right.run().await.unwrap();
+    let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
+    let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
+    let urls = vec![left_url, right_url];
+    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    for url in &urls {
+        sdk.client().add_relay(url.as_str()).await.unwrap();
+    }
+    sdk.client().connect().await;
+    let cursor = Cursor::default();
+    let route = subscription(&urls);
+    let all_retained = retained.iter().chain(&missing).cloned().collect::<Vec<_>>();
+    let (caught_up, events) = sdk
+        .reconcile_subscription(route.clone(), &all_retained, 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(caught_up.relays_succeeded, 2);
+    assert_eq!(caught_up.relays_failed, 0);
+    assert!(events.is_empty());
+    assert_eq!(left_counts.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(right_counts.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(left_counts.sent_event_json.load(Ordering::SeqCst), 0);
+    assert_eq!(right_counts.sent_event_json.load(Ordering::SeqCst), 0);
+    let caught_up_bytes = left_counts.total_text() + right_counts.total_text();
+    assert!(
+        caught_up_bytes <= 160 * 1024,
+        "zero-new-event comparison used {caught_up_bytes} text bytes"
+    );
+    assert_eq!(
+        caught_up_bytes,
+        left_counts.sent_control_text.load(Ordering::SeqCst)
+            + right_counts.sent_control_text.load(Ordering::SeqCst)
+            + left_counts.received_control_text.load(Ordering::SeqCst)
+            + right_counts.received_control_text.load(Ordering::SeqCst),
+        "zero-new-data traffic is all reconciliation/control text"
+    );
+
+    let mut admitted = retained;
+    let wanted: HashSet<_> = missing.iter().map(|item| item.event_id).collect();
+    let mut seen = HashSet::new();
+    for _attempt in 0..4 {
+        let before_left = left_counts.sent_event_json.load(Ordering::SeqCst);
+        let before_right = right_counts.sent_event_json.load(Ordering::SeqCst);
+        let (summary, events) = sdk
+            .reconcile_subscription(route.clone(), &admitted, 0, u64::MAX, &cursor)
+            .await
+            .unwrap();
+        assert_eq!(summary.relays_succeeded + summary.relays_failed, 2);
+        assert!(
+            !events.is_empty(),
+            "a bounded partial pass must keep useful events"
+        );
+        if seen.is_empty() {
+            assert_eq!(summary.relays_failed, 2, "byte exhaustion is incomplete");
+            assert!(
+                events.len() < missing.len(),
+                "one pass may not retain the whole gap"
+            );
+        }
+        assert!(left_counts.comparisons.load(Ordering::SeqCst) <= 5);
+        assert!(right_counts.comparisons.load(Ordering::SeqCst) <= 5);
+        assert!(left_counts.requests.load(Ordering::SeqCst) <= 4 * 16);
+        assert!(right_counts.requests.load(Ordering::SeqCst) <= 4 * 16);
+        let left_payload = left_counts.sent_event_json.load(Ordering::SeqCst) - before_left;
+        let right_payload = right_counts.sent_event_json.load(Ordering::SeqCst) - before_right;
+        assert!(
+            left_payload <= 180 * 1024,
+            "left sent {left_payload} prefilter EVENT bytes"
+        );
+        assert!(
+            right_payload <= 180 * 1024,
+            "right sent {right_payload} prefilter EVENT bytes"
+        );
+        for event in events {
+            let id = hex::decode(event.event.id).unwrap().try_into().unwrap();
+            assert!(wanted.contains(&id));
+            if seen.insert(id) {
+                admitted.push(
+                    missing
+                        .iter()
+                        .find(|item| item.event_id == id)
+                        .unwrap()
+                        .clone(),
+                );
+            }
+        }
+        if seen.len() == wanted.len() {
+            break;
+        }
+    }
+    assert_eq!(
+        seen, wanted,
+        "all missing IDs resume under finite acquisition attempts"
+    );
+    let requests_before_settled = (
+        left_counts.requests.load(Ordering::SeqCst),
+        right_counts.requests.load(Ordering::SeqCst),
+    );
+    let (settled, events) = sdk
+        .reconcile_subscription(route, &admitted, 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(settled.relays_failed, 0);
+    assert!(events.is_empty());
+    assert_eq!(
+        (
+            left_counts.requests.load(Ordering::SeqCst),
+            right_counts.requests.load(Ordering::SeqCst),
+        ),
+        requests_before_settled,
+        "admitted history must not trigger another exact-ID REQ"
+    );
+    let control_bytes = [left_counts.as_ref(), right_counts.as_ref()]
+        .iter()
+        .map(|counts| {
+            counts.sent_control_text.load(Ordering::SeqCst)
+                + counts.received_control_text.load(Ordering::SeqCst)
+        })
+        .sum::<usize>();
+    let prefilter_payload_bytes = left_counts.sent_event_json.load(Ordering::SeqCst)
+        + right_counts.sent_event_json.load(Ordering::SeqCst);
+    assert!(
+        control_bytes <= 160 * 1024,
+        "control text used {control_bytes} bytes"
+    );
+    eprintln!(
+        "selective acquisition: caught_up_text={caught_up_bytes}, control_text={control_bytes}, prefilter_event_json={prefilter_payload_bytes}, requests=({}, {})",
+        left_counts.requests.load(Ordering::SeqCst),
+        right_counts.requests.load(Ordering::SeqCst),
+    );
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+async fn one_missing_event_fixture() -> (
+    LocalRelay,
+    LocalRelay,
+    NostrSdkRelayClient,
+    NostrSubscription,
+    Arc<WireCounts>,
+    Arc<WireCounts>,
+    String,
+) {
+    let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(8),
+    });
+    let event = EventBuilder::new(Kind::MlsGroupMessage, "missing encrypted event")
+        .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+        .finalize(&Keys::generate())
+        .unwrap();
+    database
+        .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+        .await
+        .unwrap();
+    let left = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    let right = LocalRelay::new(RelayBuilder::default().database(database));
+    left.run().await.unwrap();
+    right.run().await.unwrap();
+    let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
+    let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
+    let urls = vec![left_url, right_url];
+    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    for url in &urls {
+        sdk.client().add_relay(url.as_str()).await.unwrap();
+    }
+    sdk.client().connect().await;
+    let subscription = subscription(&urls);
+    (
+        left,
+        right,
+        sdk,
+        subscription,
+        left_counts,
+        right_counts,
+        event.id.to_hex(),
+    )
+}
+
+#[tokio::test]
+async fn duplicated_endpoint_item_limit_keeps_partial_event_and_incomplete_summary() {
+    let (left, right, sdk, route, left_counts, right_counts, event_id) =
+        one_missing_event_fixture().await;
+    right_counts.extra_event_copies.store(20, Ordering::SeqCst);
+    let (summary, events) = sdk
+        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_succeeded, 1);
+    assert_eq!(summary.relays_failed, 1);
+    assert_eq!(events.len(), 1, "cross-relay copies stay one owned event");
+    assert_eq!(events[0].event.id, event_id);
+    assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > 0);
+    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) > 0);
+    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) < 16 * 1024);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
+async fn silent_endpoint_deadline_keeps_healthy_partial_event_and_incomplete_summary() {
+    let (left, right, sdk, route, left_counts, right_counts, event_id) =
+        one_missing_event_fixture().await;
+    right_counts.drop_requests.store(true, Ordering::SeqCst);
+    let (summary, events) = sdk
+        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_succeeded, 1);
+    assert_eq!(summary.relays_failed, 1);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.id, event_id);
+    assert!(left_counts.requests.load(Ordering::SeqCst) >= 1);
+    assert!(right_counts.requests.load(Ordering::SeqCst) >= 1);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
+async fn comparison_claim_without_exact_id_bytes_remains_incomplete() {
+    let (left, right, sdk, route, left_counts, right_counts, event_id) =
+        one_missing_event_fixture().await;
+    right_counts.suppress_events.store(true, Ordering::SeqCst);
+    let (summary, events) = sdk
+        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_succeeded, 1);
+    assert_eq!(summary.relays_failed, 1);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.id, event_id);
+    assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > 0);
+    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) > 0);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
