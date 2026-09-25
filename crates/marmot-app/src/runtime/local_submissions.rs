@@ -218,15 +218,19 @@ impl MarmotAppRuntime {
         // projection publication belong inside the same owned task.
         blocking_app_task(move || {
             shared.lifecycle().ensure_running()?;
-            let (accepted, update) = app.admit_local_message_with_edit_at(
-                &account.label,
-                &group,
-                token,
-                request,
-                draft,
-                edit_of_client_token,
-                crate::unix_now_seconds(),
-            )?;
+            let (accepted, update) = if let Some(original) = edit_of_client_token {
+                app.admit_local_message_with_edit_at(
+                    &account.label,
+                    &group,
+                    token,
+                    request,
+                    draft,
+                    Some(original),
+                    crate::unix_now_seconds(),
+                )?
+            } else {
+                app.admit_local_message(&account.label, &group, token, request, draft)?
+            };
             if let Some(update) = update {
                 account_worker::publish_app_runtime_projection_update(
                     &events,
