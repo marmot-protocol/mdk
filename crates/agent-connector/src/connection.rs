@@ -7,6 +7,7 @@ use serde::Serialize;
 use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::UnixStream;
 
+use crate::account::ProfileUpdateFields;
 use crate::error::ConnectorError;
 use crate::socket::current_effective_uid;
 use crate::validation::{auth_token_matches, unsupported_request_message};
@@ -528,9 +529,23 @@ impl AgentConnector {
                 account_id_hex,
                 name,
                 display_name,
+                about,
+                picture,
+                nip05,
+                lud16,
             } => {
-                self.publish_profile_response(&account_id_hex, name, display_name)
-                    .await
+                self.publish_profile_response(
+                    &account_id_hex,
+                    name,
+                    display_name,
+                    ProfileUpdateFields {
+                        about,
+                        picture,
+                        nip05,
+                        lud16,
+                    },
+                )
+                .await
             }
             AgentControlRequest::AccountProfileLookup { account_id_hex } => {
                 self.profile_lookup_response(&account_id_hex).await

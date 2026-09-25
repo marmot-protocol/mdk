@@ -32,6 +32,7 @@ use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep, timeout};
 
+use crate::account::ProfileUpdateFields;
 use crate::allowlist::{AllowlistRecord, AllowlistStore};
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
@@ -3091,6 +3092,10 @@ async fn connector_socket_publishes_profile_metadata() {
             account_id_hex: account.account_id_hex.clone(),
             name: "  Hermes Agent  ".to_owned(),
             display_name: None,
+            about: None,
+            picture: None,
+            nip05: None,
+            lud16: None,
         },
     );
     write_frame(&mut client_write, &request).await.unwrap();
@@ -3131,6 +3136,72 @@ async fn connector_socket_publishes_profile_metadata() {
 }
 
 #[tokio::test]
+async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Hermes Agent".to_owned(),
+            Some("Hermes Agent".to_owned()),
+            ProfileUpdateFields {
+                about: Some("Day family assistant.".to_owned()),
+                picture: Some("https://example.com/avatar.png".to_owned()),
+                nip05: Some("holly@example.com".to_owned()),
+                lud16: Some("holly@example.com".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    // kind:0 is replaceable, so a publish that names only the display name must
+    // leave every other published field alone.
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Holly Day".to_owned(),
+            Some("Holly Day".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    app.refresh_profile_for_account_id(
+        &account.account_id_hex,
+        vec![crate::validation::endpoint(&relay_url)],
+    )
+    .await
+    .unwrap();
+    let profile = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("published profile");
+    assert_eq!(profile.name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.display_name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        profile.picture.as_deref(),
+        Some("https://example.com/avatar.png")
+    );
+    assert_eq!(profile.nip05.as_deref(), Some("holly@example.com"));
+    assert_eq!(profile.lud16.as_deref(), Some("holly@example.com"));
+}
+
+#[tokio::test]
 async fn connector_profile_lookup_distinguishes_existing_and_absent_profiles() {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -3164,6 +3235,7 @@ async fn connector_profile_lookup_distinguishes_existing_and_absent_profiles() {
             &account.account_id_hex,
             "Existing Agent".to_owned(),
             Some("Existing Agent".to_owned()),
+            ProfileUpdateFields::default(),
         )
         .await
         .unwrap();

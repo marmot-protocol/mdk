@@ -208,15 +208,28 @@ class MarmotAgentControlClient:
         account_id_hex: str,
         name: str,
         display_name: Optional[str] = None,
+        about: Optional[str] = None,
+        picture: Optional[str] = None,
+        nip05: Optional[str] = None,
+        lud16: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return await self.request(
-            {
-                "type": "account_publish_profile",
-                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
-                "name": str(name or ""),
-                "display_name": str(display_name) if display_name is not None else None,
-            }
-        )
+        payload: Dict[str, Any] = {
+            "type": "account_publish_profile",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "name": str(name or ""),
+            "display_name": str(display_name) if display_name is not None else None,
+        }
+        # An omitted field keeps its published value; never send an empty string
+        # in its place, which would clear it.
+        for key, value in (
+            ("about", about),
+            ("picture", picture),
+            ("nip05", nip05),
+            ("lud16", lud16),
+        ):
+            if value is not None:
+                payload[key] = str(value)
+        return await self.request(payload)
 
     async def send_final(
         self,

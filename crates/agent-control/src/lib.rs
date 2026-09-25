@@ -279,6 +279,17 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         name: String,
         display_name: Option<String>,
+        /// Optional kind-0 fields, mirroring `wn profile update`. An absent field
+        /// keeps the account's currently published value: the connector reads the
+        /// published profile and overlays these instead of replacing it.
+        #[serde(default)]
+        about: Option<String>,
+        #[serde(default)]
+        picture: Option<String>,
+        #[serde(default)]
+        nip05: Option<String>,
+        #[serde(default)]
+        lud16: Option<String>,
     },
     /// Resolve whether the selected account already has a valid published
     /// Nostr kind-0 profile. The connector returns a typed outcome so relay
@@ -1005,6 +1016,57 @@ mod tests {
     };
 
     #[test]
+    fn account_publish_profile_frames_round_trip_with_optional_fields() {
+        for optional in [false, true] {
+            let request = AgentControlEnvelope::request(
+                Some("profile-1".into()),
+                AgentControlRequest::AccountPublishProfile {
+                    account_id_hex: "11".repeat(32),
+                    name: "Holly Day".into(),
+                    display_name: None,
+                    about: optional.then(|| "Day family assistant.".into()),
+                    picture: optional.then(|| "https://example.com/avatar.png".into()),
+                    nip05: optional.then(|| "holly@example.com".into()),
+                    lud16: optional.then(|| "holly@example.com".into()),
+                },
+            );
+            let encoded = encode_frame(&request).unwrap();
+            let json: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "account_publish_profile");
+            assert_eq!(json["about"].is_null(), !optional);
+            assert_eq!(json["picture"].is_null(), !optional);
+            assert_eq!(json["nip05"].is_null(), !optional);
+            assert_eq!(json["lud16"].is_null(), !optional);
+            assert_eq!(
+                decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+
+        // A client that predates the optional fields sends none of them.
+        let legacy: Value = serde_json::json!({
+            "marmot_agent_control": crate::AGENT_CONTROL_PROTOCOL_V2,
+            "id": "profile-legacy",
+            "type": "account_publish_profile",
+            "account_id_hex": "11".repeat(32),
+            "name": "Holly Day",
+            "display_name": null,
+        });
+        let decoded: AgentControlRequest =
+            serde_json::from_value(legacy).expect("legacy account_publish_profile payload");
+        assert!(matches!(
+            decoded,
+            AgentControlRequest::AccountPublishProfile {
+                about: None,
+                picture: None,
+                nip05: None,
+                lud16: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn group_create_frames_round_trip_with_optional_fields() {
         for optional in [false, true] {
             let request = AgentControlEnvelope::request(
@@ -1717,6 +1779,10 @@ mod tests {
                     account_id_hex: account(),
                     name: "agent".to_owned(),
                     display_name: Some("Agent".to_owned()),
+                    about: None,
+                    picture: None,
+                    nip05: None,
+                    lud16: None,
                 },
                 "account_publish_profile",
             ),

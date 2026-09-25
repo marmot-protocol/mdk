@@ -8,6 +8,16 @@ use crate::AgentConnector;
 use crate::error::ConnectorError;
 use crate::validation::{unix_now_seconds, validate_profile_name};
 
+/// Optional kind-0 fields one publish may set. Every field left as `None` keeps
+/// the value already published for the account.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProfileUpdateFields {
+    pub(crate) about: Option<String>,
+    pub(crate) picture: Option<String>,
+    pub(crate) nip05: Option<String>,
+    pub(crate) lud16: Option<String>,
+}
+
 impl AgentConnector {
     pub(crate) fn account_list_response(&self) -> Result<AgentControlResponse, ConnectorError> {
         let accounts = self
@@ -141,6 +151,7 @@ impl AgentConnector {
         account_id_hex: &str,
         name: String,
         display_name: Option<String>,
+        fields: ProfileUpdateFields,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let name = validate_profile_name(name)?;
@@ -149,12 +160,41 @@ impl AgentConnector {
             .transpose()?
             .unwrap_or_else(|| name.clone());
         let bootstrap_relays = self.configured_relay_endpoints();
-        let profile = UserProfileMetadata {
-            name: Some(name.clone()),
-            display_name: Some(display_name.clone()),
-            created_at: unix_now_seconds(),
-            ..UserProfileMetadata::default()
+        // kind:0 is a *replaceable* event, so publishing a struct built only from
+        // this request would erase every field the caller did not name - `about`,
+        // `picture`, `banner`, `nip05`, `lud16` and any unknown key another client
+        // wrote. Read the currently published profile first and overlay only the
+        // provided fields, exactly as `wn profile update` does. A relay failure
+        // stays an error: an unconfirmed read must never become a partial
+        // replacement. No configured relay means nothing to read, and no profile
+        // to preserve.
+        let mut profile = if bootstrap_relays.is_empty() {
+            UserProfileMetadata::default()
+        } else {
+            self.runtime
+                .fetch_current_user_profile_for_account_id(
+                    &account.account_id_hex,
+                    bootstrap_relays.clone(),
+                )
+                .await?
+                .unwrap_or_default()
         };
+        profile.name = Some(name.clone());
+        profile.display_name = Some(display_name.clone());
+        if let Some(about) = fields.about {
+            profile.about = Some(about);
+        }
+        if let Some(picture) = fields.picture {
+            profile.picture = Some(picture);
+        }
+        if let Some(nip05) = fields.nip05 {
+            profile.nip05 = Some(nip05);
+        }
+        if let Some(lud16) = fields.lud16 {
+            profile.lud16 = Some(lud16);
+        }
+        profile.created_at = unix_now_seconds();
+        profile.source_relays = Vec::new();
         self.runtime
             .publish_user_profile(
                 &account.label,
