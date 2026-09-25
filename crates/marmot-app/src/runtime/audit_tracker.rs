@@ -8,11 +8,17 @@ use tokio::time::{Instant, sleep_until};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use super::{AuditOtlpAttemptOutcome, send_audit_otlp_once_for_app};
 use super::{RuntimeLifecycle, runtime_shutdown_requested, wait_for_runtime_shutdown};
-use crate::audit_log::{AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadAttempt, AuditUploadOutcome};
+use crate::audit_log::{
+    AUDIT_LOG_UPLOAD_MAX_BYTES, AuditOtlpTrackerResult, AuditUploadAttempt, AuditUploadOutcome,
+};
+use crate::audit_otlp_sender::AuditOtlpSendResult;
+use crate::audit_otlp_sender::AuditOtlpSender;
 use crate::{
     AppError, AuditLogFile, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, MarmotApp,
 };
+use marmot_forensics::local_delivery::DeliveryStep;
 
 /// Only one follow-up batch is queued while a pass is in flight.
 const APP_RUNTIME_AUDIT_TRACKER_QUEUE: usize = 1;
@@ -51,6 +57,7 @@ impl AuditBatchWindow {
 pub(crate) struct AuditLogTrackerUploader {
     app: MarmotApp,
     config: Arc<StdMutex<AuditLogTrackerConfig>>,
+    otlp_sender: Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
     lifecycle: RuntimeLifecycle,
     batch_window: AuditBatchWindow,
     worker: Arc<StdMutex<Option<AuditLogTrackerWorker>>>,
@@ -65,11 +72,13 @@ impl AuditLogTrackerUploader {
     pub(crate) fn new(
         app: MarmotApp,
         config: Arc<StdMutex<AuditLogTrackerConfig>>,
+        otlp_sender: Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
         lifecycle: RuntimeLifecycle,
     ) -> Self {
         Self {
             app,
             config,
+            otlp_sender,
             lifecycle,
             batch_window: AuditBatchWindow::default(),
             worker: Arc::new(StdMutex::new(None)),
@@ -95,6 +104,8 @@ impl AuditLogTrackerUploader {
             let handle = tokio::spawn(run_audit_log_tracker_uploader(
                 self.app.clone(),
                 self.config.clone(),
+                self.otlp_sender.clone(),
+                self.lifecycle.clone(),
                 receiver,
                 stopping,
                 self.batch_window.clone(),
@@ -149,6 +160,8 @@ impl AuditLogTrackerUploader {
 async fn run_audit_log_tracker_uploader(
     app: MarmotApp,
     config: Arc<StdMutex<AuditLogTrackerConfig>>,
+    otlp_sender: Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
+    lifecycle: RuntimeLifecycle,
     commands: mpsc::Receiver<&'static str>,
     stopping: watch::Receiver<bool>,
     window: AuditBatchWindow,
@@ -159,9 +172,25 @@ async fn run_audit_log_tracker_uploader(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let otlp_sender_config = otlp_sender.clone();
+        let otlp_sender = otlp_sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let lifecycle = lifecycle.clone();
         async move {
             let mut schedule = AuditPassSchedule::default();
-            match post_audit_log_tracker_update(app, config, true, &mut schedule).await {
+            match post_audit_log_tracker_update_with_v5(
+                app,
+                config,
+                otlp_sender.as_deref(),
+                Some(&otlp_sender_config),
+                &lifecycle,
+                true,
+                &mut schedule,
+            )
+            .await
+            {
                 Ok(result) => {
                     tracing::debug!(
                         target: "marmot_app::audit_log",
@@ -261,11 +290,141 @@ fn audit_upload_stops_batch(attempt: &Result<AuditUploadAttempt, AppError>) -> b
     )
 }
 
+#[cfg(test)]
 pub(crate) async fn post_audit_log_tracker_update_for_app(
     app: &MarmotApp,
     config: AuditLogTrackerConfig,
 ) -> Result<AuditLogTrackerUpdateResult, AppError> {
     post_audit_log_tracker_update(app, config, false, &mut AuditPassSchedule::default()).await
+}
+
+pub(crate) async fn post_audit_log_tracker_update_for_runtime(
+    app: &MarmotApp,
+    config: AuditLogTrackerConfig,
+    sender: Option<&AuditOtlpSender>,
+    configured_sender: &Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>,
+    lifecycle: &RuntimeLifecycle,
+) -> Result<AuditLogTrackerUpdateResult, AppError> {
+    post_audit_log_tracker_update_with_v5(
+        app,
+        config,
+        sender,
+        Some(configured_sender),
+        lifecycle,
+        false,
+        &mut AuditPassSchedule::default(),
+    )
+    .await
+}
+
+async fn post_audit_log_tracker_update_with_v5(
+    app: &MarmotApp,
+    config: AuditLogTrackerConfig,
+    sender: Option<&AuditOtlpSender>,
+    configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
+    lifecycle: &RuntimeLifecycle,
+    automatic: bool,
+    schedule: &mut AuditPassSchedule,
+) -> Result<AuditLogTrackerUpdateResult, AppError> {
+    let legacy = post_audit_log_tracker_update(app, config, automatic, schedule).await;
+    let Some(sender) = sender else {
+        return legacy;
+    };
+    let v5 =
+        post_v5_audit_tracker_update(app, sender, configured_sender, lifecycle, schedule).await?;
+    let mut result = match legacy {
+        Ok(result) => result,
+        Err(_) => {
+            schedule.failed(Duration::ZERO);
+            AuditLogTrackerUpdateResult {
+                enabled: app.audit_log_settings()?.enabled,
+                uploaded: Vec::new(),
+                skipped_reason: Some("v4 whole-file upload failed".to_owned()),
+                v5: None,
+            }
+        }
+    };
+    result.v5 = Some(v5);
+    Ok(result)
+}
+
+async fn post_v5_audit_tracker_update(
+    app: &MarmotApp,
+    sender: &AuditOtlpSender,
+    configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
+    lifecycle: &RuntimeLifecycle,
+    schedule: &mut AuditPassSchedule,
+) -> Result<AuditOtlpTrackerResult, AppError> {
+    let mut summary = AuditOtlpTrackerResult::default();
+    if !app.audit_log_settings()?.enabled {
+        summary.skipped_reason = Some("audit logging disabled".to_owned());
+        return Ok(summary);
+    }
+    // A pass drains bounded batches so a quiet account with several sealed
+    // segments is not stranded waiting for another activity trigger.
+    const MAX_BATCHES_PER_ACCOUNT_PASS: usize = 256;
+    for account in app.account_home().accounts()? {
+        let mut reached_limit = true;
+        for _ in 0..MAX_BATCHES_PER_ACCOUNT_PASS {
+            let outcome = match send_audit_otlp_once_for_app(
+                app,
+                lifecycle,
+                &account.label,
+                sender,
+                configured_sender,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    summary.blocked_accounts += 1;
+                    schedule.failed(Duration::ZERO);
+                    reached_limit = false;
+                    break;
+                }
+            };
+            match outcome {
+                AuditOtlpAttemptOutcome::Sent {
+                    receiver: AuditOtlpSendResult::Complete,
+                    local: Some(DeliveryStep::Accepted),
+                } => summary.accepted_batches += 1,
+                AuditOtlpAttemptOutcome::Local(DeliveryStep::Idle) => {
+                    summary.idle_accounts += 1;
+                    reached_limit = false;
+                    break;
+                }
+                AuditOtlpAttemptOutcome::Sent {
+                    receiver: AuditOtlpSendResult::Blocked,
+                    ..
+                }
+                | AuditOtlpAttemptOutcome::Sent {
+                    local: Some(DeliveryStep::Blocked | DeliveryStep::Gap),
+                    ..
+                }
+                | AuditOtlpAttemptOutcome::Local(DeliveryStep::Blocked | DeliveryStep::Gap) => {
+                    summary.blocked_accounts += 1;
+                    reached_limit = false;
+                    break;
+                }
+                AuditOtlpAttemptOutcome::Cancelled => {
+                    summary.pending_accounts += 1;
+                    reached_limit = false;
+                    break;
+                }
+                _ => {
+                    summary.pending_accounts += 1;
+                    schedule.failed(Duration::ZERO);
+                    reached_limit = false;
+                    break;
+                }
+            }
+        }
+        if reached_limit {
+            summary.pending_accounts += 1;
+            schedule.failed(Duration::ZERO);
+        }
+    }
+    Ok(summary)
 }
 
 async fn post_audit_log_tracker_update(
@@ -279,6 +438,7 @@ async fn post_audit_log_tracker_update(
             enabled: false,
             uploaded: Vec::new(),
             skipped_reason: Some("audit logging disabled".to_owned()),
+            v5: None,
         });
     }
 
@@ -287,6 +447,7 @@ async fn post_audit_log_tracker_update(
             enabled: true,
             uploaded: Vec::new(),
             skipped_reason: Some("audit log tracker endpoint missing".to_owned()),
+            v5: None,
         });
     }
     if config.authorization_bearer_token.is_none() {
@@ -294,6 +455,7 @@ async fn post_audit_log_tracker_update(
             enabled: true,
             uploaded: Vec::new(),
             skipped_reason: Some("audit log tracker authorization token missing".to_owned()),
+            v5: None,
         });
     }
     if !config.upload_allowed_with_endpoints(app.service_endpoints()) {
@@ -301,15 +463,23 @@ async fn post_audit_log_tracker_update(
             enabled: true,
             uploaded: Vec::new(),
             skipped_reason: Some("audit log tracker not configured".to_owned()),
+            v5: None,
         });
     }
 
-    let files = app.audit_log_files()?;
+    // v5 segments use the byte-range OTLP cursor. Never hand them to the
+    // historical whole-file endpoint or classify them as v4-ineligible.
+    let files: Vec<_> = app
+        .audit_log_files()?
+        .into_iter()
+        .filter(|file| !is_v5_recorder_file(&file.file_name))
+        .collect();
     if files.is_empty() {
         return Ok(AuditLogTrackerUpdateResult {
             enabled: true,
             uploaded: Vec::new(),
             skipped_reason: Some("audit log files missing".to_owned()),
+            v5: None,
         });
     }
 
@@ -542,7 +712,21 @@ async fn post_audit_log_tracker_update(
         enabled: true,
         uploaded,
         skipped_reason: None,
+        v5: None,
     })
+}
+
+fn is_v5_recorder_file(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("audit-")
+        .and_then(|s| s.strip_suffix(".jsonl"))
+    else {
+        return false;
+    };
+    stem.ends_with("-v5")
+        || stem.rsplit_once("-v5-seg").is_some_and(|(_, index)| {
+            index.len() >= 6 && index.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 /// Split the account-sorted enumeration into one non-empty run per account.

@@ -135,11 +135,11 @@ pub use runtime::{
     AccountAttentionUnavailable, AccountManager, AccountSetupReadiness, AccountSetupRequest,
     AccountSetupResult, AgentPublisher, AgentPublisherOptions, AgentPublisherRecord,
     AgentPublisherRouting, AgentStreamWatchOptions, AgentTextStreamCryptoContext,
-    CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
-    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction, OnboardingDeviceDiscovery,
-    OnboardingDevicePackage, OnboardingFinding, OnboardingIssue, OnboardingOptions,
-    OnboardingRepairProposal, OnboardingSingleDeviceNotice, OnboardingSnapshot, OnboardingStatus,
-    OnboardingStep, OnboardingStepState, OnboardingSubscription, RelayFailure,
+    AuditOtlpAttemptOutcome, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
+    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
+    OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding, OnboardingIssue,
+    OnboardingOptions, OnboardingRepairProposal, OnboardingSingleDeviceNotice, OnboardingSnapshot,
+    OnboardingStatus, OnboardingStep, OnboardingStepState, OnboardingSubscription, RelayFailure,
     RuntimeAccountAttentionSubscription, RuntimeAccountError, RuntimeAgentStreamMessage,
     RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch, RuntimeChatListSubscription,
     RuntimeChatListUpdate, RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
@@ -182,7 +182,7 @@ pub use app_telemetry::{
 };
 pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
-    AuditLogUploadResult,
+    AuditLogUploadResult, AuditOtlpTrackerResult,
 };
 pub use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,

@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-09-23
+updated: 2026-09-25
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -12,12 +12,39 @@ This is a source-grounded inventory of the append-only JSONL audit logging used 
 It is intentionally separate from the privacy-safe telemetry/tracing surface described in
 [`telemetry.md`](./telemetry.md).
 
-Audit logs are opt-in forensic artifacts and should not be treated like telemetry. The current v4 model has one
+Audit logs are opt-in forensic artifacts and should not be treated like telemetry. The historical v4 model has one
 content-restricted shape: it cannot represent decrypted application content, cleartext group-state values, full account or
 member public keys, account/device display names, or arbitrary convergence-rule input/result JSON. There is no sensitive/full-data mode.
 The retained deterministic hashes, raw group/message/transport identifiers, timestamps and relationships remain sensitive and linkable. The fixed hash prefixes are public domain separators, not secret salts.
 
-## Current status
+## v5 recording and delivery
+
+When `AuditLogSettings.enabled` is true, new account sessions and live recorder swaps write
+strict `marmot-forensics-audit/v5` rows to `<account_dir>/audit-<engine_id>-v5.jsonl` and
+size-rotated segment siblings. The v5 recorder maps all historical typed event families and
+records new Welcome evidence. It keeps the existing best-effort recorder semantics: a record
+failure never interrupts the engine, and the file remains local until the host configures
+delivery. Existing v4 files are preserved and remain enumerable.
+
+The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
+`MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
+`set_audit_otlp_config_v5` binding method. Recording consent is separate from this destination.
+The manual `post_audit_log_tracker_update_v5` binding method reports v5 accepted, pending,
+blocked, and idle account counts separately from v4 whole-file uploads. Existing tracker
+activity triggers use the same 30-second coalescing window, retry delay, and shutdown
+cancellation; they drain bounded v5 batches per account. V5 cursor state lives in
+`audit-otlp-delivery-v5`, so historical v4 cursor state and files are untouched. A complete
+receiver acceptance advances the v5 cursor; retryable, partial, unknown, and blocked outcomes
+retain or block the prepared range according to the local delivery contract. Deleting or
+disabling a live audit file fences in-flight acknowledgments.
+
+The old Goggles whole-file endpoint remains a v4-only route. Direct whole-file upload validates
+the exact v4 schema version and rejects v5; the tracker excludes v5 filenames from its v4 pass.
+The v5 sender preserves each original JSONL body inside one OTLP log record, stripping only its
+terminal newline. It validates and pins collector addresses before connection and never stores
+the bearer token on disk.
+
+## Historical v4 status
 
 | Surface | Current state |
 | --- | --- |
@@ -26,7 +53,7 @@ The retained deterministic hashes, raw group/message/transport identifiers, time
 | File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v4`; the line-level JSON Schema is [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json). |
 | Local file location | `<account_dir>/audit-<engine_id>-v4.jsonl` for app-opened account sessions, sealed into `-seg<NNNNNN>` siblings at 1 MiB. Exclusive-root startup deletes recognized v1/v2/v3 files and segments. |
 | Upload/listing | App and bindings list remaining local `audit-*.jsonl` files for inspection/deletion. Both explicit and tracker uploads accept only valid v4 snapshots; any legacy files left after cleanup and the separate key-reveal log are never sent. |
-| Audit OTLP delivery | An internal, explicit one-account attempt now composes the local prepared cursor and dedicated OTLP sender under runtime consent and lifecycle admission. No scheduler, production destination, or native binding activates it. |
+| Audit OTLP delivery | The dedicated v5 sender is configured in memory by the host, with additive UniFFI and C APIs. Manual tracker requests and configured activity triggers use the existing runtime scheduler. |
 | Static bundle analyzer | Not present in the current repo path. The current artifact model is raw append-only JSONL audit logs. |
 
 ## Source map

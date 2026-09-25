@@ -449,6 +449,31 @@ async fn post_audit_log_file_posts_jsonl_body() {
 }
 
 #[tokio::test]
+async fn v5_recorder_file_cannot_be_sent_to_legacy_whole_file_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let _client = app.client("alice").await.unwrap();
+    let path = std::path::PathBuf::from(&app.audit_log_files().unwrap()[0].path);
+    assert!(
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-v5.jsonl")
+    );
+    let result = app
+        .post_audit_log_file(path.to_str().unwrap(), "http://127.0.0.1:9/ingest")
+        .await;
+    assert!(matches!(
+        result,
+        Err(marmot_app::AppError::InvalidAuditLogFile(_))
+    ));
+}
+
+#[tokio::test]
 async fn post_audit_log_file_rejects_remote_endpoint_without_token() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -542,20 +567,20 @@ async fn local_group_action_writes_human_action_context() {
     let human_action = events
         .iter()
         .find(|event| {
-            event["kind"]["type"] == "human_action"
-                && event["kind"]["action"] == "create_group"
-                && event["kind"]["phase"] == "succeeded"
+            event["event"]["type"] == "human_action"
+                && event["event"]["action"] == "create_group"
+                && event["event"]["phase"] == "succeeded"
         })
         .expect("create_group should write a human_action audit row");
-    assert_eq!(human_action["kind"]["origin"], "local_user");
+    assert_eq!(human_action["event"]["origin"], "local_user");
     assert!(
-        human_action["kind"]["fields"]
+        human_action["event"]["fields"]
             .as_array()
             .unwrap()
             .contains(&Value::String("name".into()))
     );
     assert!(
-        human_action["kind"]["fields"]
+        human_action["event"]["fields"]
             .as_array()
             .unwrap()
             .contains(&Value::String("members".into()))
@@ -563,14 +588,14 @@ async fn local_group_action_writes_human_action_context() {
 
     let create_entry = events
         .iter()
-        .find(|event| event["kind"]["type"] == "create_group_entry")
+        .find(|event| event["event"]["type"] == "create_group_entry")
         .expect("create_group should write a create_group_entry audit row");
     assert_eq!(
-        create_entry["context"]["human_action"]["action"],
+        create_entry["event"]["record_context"]["human_action"]["action"],
         "create_group"
     );
     assert_eq!(
-        create_entry["context"]["human_action"]["origin"],
+        create_entry["event"]["record_context"]["human_action"]["origin"],
         "local_user"
     );
 }
@@ -608,14 +633,14 @@ async fn local_message_send_tags_engine_rows_with_human_action() {
     // engine's `send_entry` row carries it (previously context-free for sends).
     let send_entry = events
         .iter()
-        .find(|event| event["kind"]["type"] == "send_entry")
+        .find(|event| event["event"]["type"] == "send_entry")
         .expect("send should write a send_entry audit row");
     assert_eq!(
-        send_entry["context"]["human_action"]["action"],
+        send_entry["event"]["record_context"]["human_action"]["action"],
         "send_message"
     );
     assert_eq!(
-        send_entry["context"]["human_action"]["origin"],
+        send_entry["event"]["record_context"]["human_action"]["origin"],
         "local_user"
     );
 
@@ -624,12 +649,12 @@ async fn local_message_send_tags_engine_rows_with_human_action() {
     let state_changed = events
         .iter()
         .find(|event| {
-            event["kind"]["type"] == "message_state_changed"
-                && event["context"]["human_action"]["action"] == "send_message"
+            event["event"]["type"] == "message_state_changed"
+                && event["event"]["record_context"]["human_action"]["action"] == "send_message"
         })
         .expect("send's message_state_changed row should inherit the human action");
     assert_eq!(
-        state_changed["context"]["human_action"]["origin"],
+        state_changed["event"]["record_context"]["human_action"]["origin"],
         "local_user"
     );
 }
@@ -1727,7 +1752,7 @@ fn source_events(path: &str) -> Vec<Value> {
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|event| event["kind"]["type"] == "source_context")
+        .filter(|event| event["event"]["type"] == "source_context")
         .collect()
 }
 
@@ -1765,8 +1790,8 @@ async fn enabled_recorder_emits_local_member_ref_before_any_group_mutation() {
     assert_eq!(events.len(), 1, "startup should write one source row");
     let expected =
         marmot_forensics::member_ref_hex(&decode_account_id_hex(&account.account_id_hex));
-    assert_eq!(events[0]["kind"]["source"]["local_member_ref"], expected);
-    assert_ne!(events[0]["account_ref"], expected);
+    assert_eq!(events[0]["event"]["source"]["local_member_ref"], expected);
+    assert!(events[0].get("account_ref").is_none());
     let body = std::fs::read_to_string(&files[0].path).unwrap();
     assert!(!body.contains(&account.account_id_hex));
     assert!(!body.contains("\"account_label\""));
@@ -1774,11 +1799,10 @@ async fn enabled_recorder_emits_local_member_ref_before_any_group_mutation() {
 
 fn assert_source_linkage(actual: &Value, expected: &Value) {
     assert_eq!(
-        actual["kind"]["source"]["local_member_ref"],
-        expected["kind"]["source"]["local_member_ref"]
+        actual["event"]["source"]["local_member_ref"],
+        expected["event"]["source"]["local_member_ref"]
     );
-    assert_eq!(actual["account_ref"], expected["account_ref"]);
-    assert_eq!(actual["engine_id"], expected["engine_id"]);
+    assert_eq!(actual["source_ref"], expected["source_ref"]);
 }
 
 #[tokio::test]
@@ -1804,8 +1828,8 @@ async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
     );
     assert_source_linkage(reopened.last().unwrap(), &first[0]);
     assert_ne!(
-        reopened.last().unwrap()["recorder_session_id"],
-        first[0]["recorder_session_id"]
+        reopened.last().unwrap()["session_id"],
+        first[0]["session_id"]
     );
     drop(client);
 
@@ -1870,10 +1894,7 @@ async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
     );
     let latest = restored.last().unwrap();
     assert_source_linkage(latest, &before_toggle_row);
-    assert_ne!(
-        latest["recorder_session_id"],
-        before_toggle_row["recorder_session_id"]
-    );
+    assert_ne!(latest["session_id"], before_toggle_row["session_id"]);
     runtime.shutdown().await;
 }
 
@@ -1903,15 +1924,11 @@ async fn live_delete_rotates_and_replays_source_context() {
     let after = source_events(&path);
     assert_eq!(after.len(), 1);
     assert_eq!(
-        after[0]["kind"]["source"]["local_member_ref"],
-        before[0]["kind"]["source"]["local_member_ref"]
+        after[0]["event"]["source"]["local_member_ref"],
+        before[0]["event"]["source"]["local_member_ref"]
     );
-    assert_eq!(after[0]["account_ref"], before[0]["account_ref"]);
-    assert_eq!(after[0]["engine_id"], before[0]["engine_id"]);
-    assert_ne!(
-        after[0]["recorder_session_id"],
-        before[0]["recorder_session_id"]
-    );
+    assert_eq!(after[0]["source_ref"], before[0]["source_ref"]);
+    assert_ne!(after[0]["session_id"], before[0]["session_id"]);
     runtime.shutdown().await;
 }
 
