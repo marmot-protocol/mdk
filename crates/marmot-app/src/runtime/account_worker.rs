@@ -2036,64 +2036,88 @@ async fn run_app_runtime_account_worker(
                     EpochBackfillExecutionSeam::Maintenance,
                 )
                 .await;
-                if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
-                    publish_app_runtime_account_error(
-                        &events,
-                        &account_id_hex,
-                        &account_label,
-                        account_error_message("post-join maintenance subscription failed", &err),
-                    );
-                }
-                let backlog_permit = shared.product_analytics.permit();
-                match client.run_due_maintenance().await {
-                    Ok(summary) => {
-                        if let Some(permit) = &backlog_permit {
-                            product_backlog.sample(
-                                permit, crate::ProductFamily::Maintenance, "pending",
-                                u64::from(summary.deferred),
-                            );
-                            product_backlog.sample(
-                                permit, crate::ProductFamily::Maintenance, "ambiguous",
-                                u64::from(summary.ambiguous_exposure),
-                            );
-                            product_backlog.sample(
-                                permit, crate::ProductFamily::Maintenance, "failed",
-                                u64::from(client.maintenance_failed_backlog),
-                            );
-                            product_backlog.sample(
-                                permit, crate::ProductFamily::Recovery, "quarantine",
-                                client.runtime.quarantined_group_count() as u64,
-                            );
-                        }
-                        publish_client_pending_projection_updates(
-                            &mut client,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                        );
-                        publish_client_pending_applied_summary(
-                            &mut client,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                        );
-                        schedule_pending_convergence_groups(
-                            &mut scheduled_convergence,
-                            &mut client,
-                        );
-                    }
-                    Err(err) => {
-                        publish_app_runtime_account_error(
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            account_error_message("scheduled maintenance failed", &err),
-                        );
-                    }
-                }
+                finish_periodic_maintenance_after_recovery(
+                    &mut client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &shared,
+                    &product_backlog,
+                    &mut scheduled_convergence,
+                )
+                .await;
 
                 phase.finish(TelemetryOutcome::Success);
             }
+        }
+    }
+}
+
+/// Keep the domain maintenance continuation after the recovery outcome. A
+/// suspended network comparison resumes this same tail when its worker-owned
+/// admission and checkpoint finish.
+async fn finish_periodic_maintenance_after_recovery(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+    product_backlog: &crate::product_analytics::ProductBacklogSource,
+    scheduled_convergence: &mut ScheduledConvergence,
+) {
+    if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
+        publish_app_runtime_account_error(
+            events,
+            account_id_hex,
+            account_label,
+            account_error_message("post-join maintenance subscription failed", &err),
+        );
+    }
+    let backlog_permit = shared.product_analytics.permit();
+    match client.run_due_maintenance().await {
+        Ok(summary) => {
+            if let Some(permit) = &backlog_permit {
+                product_backlog.sample(
+                    permit,
+                    crate::ProductFamily::Maintenance,
+                    "pending",
+                    u64::from(summary.deferred),
+                );
+                product_backlog.sample(
+                    permit,
+                    crate::ProductFamily::Maintenance,
+                    "ambiguous",
+                    u64::from(summary.ambiguous_exposure),
+                );
+                product_backlog.sample(
+                    permit,
+                    crate::ProductFamily::Maintenance,
+                    "failed",
+                    u64::from(client.maintenance_failed_backlog),
+                );
+                product_backlog.sample(
+                    permit,
+                    crate::ProductFamily::Recovery,
+                    "quarantine",
+                    client.runtime.quarantined_group_count() as u64,
+                );
+            }
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+            schedule_pending_convergence_groups(scheduled_convergence, client);
+        }
+        Err(err) => {
+            publish_app_runtime_account_error(
+                events,
+                account_id_hex,
+                account_label,
+                account_error_message("scheduled maintenance failed", &err),
+            );
         }
     }
 }
