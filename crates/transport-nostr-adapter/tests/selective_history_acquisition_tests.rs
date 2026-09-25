@@ -2,6 +2,7 @@
 
 use cgka_traits::{GroupId, MemberId, TransportAdapterError, TransportEndpoint};
 use futures::{SinkExt, StreamExt};
+use nostr_memory::MemoryDatabase as SdkMemoryDatabase;
 use nostr_relay_builder::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{Client, EventBuilder, FinalizeEvent, Keys, Kind, Tag};
@@ -368,6 +369,211 @@ async fn one_missing_event_fixture() -> (
         right_counts,
         event.id.to_hex(),
     )
+}
+
+async fn cached_fixture(
+    sizes: &[usize],
+    cached_sorted_indices: &[usize],
+) -> (
+    LocalRelay,
+    LocalRelay,
+    NostrSdkRelayClient,
+    NostrSubscription,
+    Arc<WireCounts>,
+    Arc<WireCounts>,
+    Vec<NostrReconciliationItem>,
+) {
+    let relay_database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(64),
+    });
+    let sdk_database = Arc::new(SdkMemoryDatabase::unbounded());
+    let keys = Keys::generate();
+    let mut events = sizes
+        .iter()
+        .enumerate()
+        .map(|(index, size)| {
+            EventBuilder::new(
+                Kind::MlsGroupMessage,
+                format!("{index}-{}", "x".repeat(*size)),
+            )
+            .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                1_700_001_000 + index as u64,
+            ))
+            .finalize(&keys)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    events.sort_unstable_by_key(|event| event.id);
+    for (index, event) in events.iter().enumerate() {
+        relay_database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+        if cached_sorted_indices.contains(&index) {
+            nostr_sdk::prelude::NostrDatabase::save_event(sdk_database.as_ref(), event)
+                .await
+                .unwrap();
+        }
+    }
+    let items = events
+        .iter()
+        .map(|event| NostrReconciliationItem {
+            event_id: event.id.to_bytes(),
+            created_at: event.created_at.as_secs(),
+        })
+        .collect();
+    let left = LocalRelay::new(RelayBuilder::default().database(relay_database.clone()));
+    let right = LocalRelay::new(RelayBuilder::default().database(relay_database));
+    left.run().await.unwrap();
+    right.run().await.unwrap();
+    let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
+    let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
+    let urls = vec![left_url, right_url];
+    let sdk = NostrSdkRelayClient::new(Client::builder().database(sdk_database).build());
+    for url in &urls {
+        sdk.client().add_relay(url.as_str()).await.unwrap();
+    }
+    sdk.client().connect().await;
+    let route = subscription(&urls);
+    (left, right, sdk, route, left_counts, right_counts, items)
+}
+
+fn returned_json_bytes(events: &[transport_nostr_adapter::NostrRelayEvent]) -> usize {
+    events
+        .iter()
+        .map(|event| {
+            event
+                .event
+                .to_verified_nostr_event()
+                .unwrap()
+                .as_json()
+                .len()
+        })
+        .sum()
+}
+
+#[tokio::test]
+async fn warm_full_event_cache_resumes_under_combined_result_budget() {
+    let (left, right, sdk, route, left_counts, right_counts, items) =
+        cached_fixture(&[LARGE_EVENT_BYTES; 8], &(0..8).collect::<Vec<_>>()).await;
+    let expected = items
+        .iter()
+        .map(|item| item.event_id)
+        .collect::<HashSet<_>>();
+    let mut admitted = Vec::new();
+    let mut seen = HashSet::new();
+    let cursor = Cursor::default();
+    for _ in 0..4 {
+        let (summary, events) = sdk
+            .reconcile_subscription(route.clone(), &admitted, 0, u64::MAX, &cursor)
+            .await
+            .unwrap();
+        assert!(returned_json_bytes(&events) <= 128 * 1024);
+        assert!(events.len() <= 3);
+        if seen.len() + events.len() < expected.len() {
+            assert_eq!(summary.relays_failed, 2);
+        }
+        for event in events {
+            let id = hex::decode(event.event.id).unwrap().try_into().unwrap();
+            assert!(
+                seen.insert(id),
+                "cached ID should not return after admission"
+            );
+            admitted.push(
+                items
+                    .iter()
+                    .find(|item| item.event_id == id)
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        if seen == expected {
+            break;
+        }
+    }
+    assert_eq!(seen, expected);
+    assert_eq!(left_counts.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(right_counts.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(left_counts.sent_event_json.load(Ordering::SeqCst), 0);
+    assert_eq!(right_counts.sent_event_json.load(Ordering::SeqCst), 0);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
+async fn oversized_cached_id_keeps_later_cached_id_reachable() {
+    let (left, right, sdk, route, left_counts, right_counts, items) =
+        cached_fixture(&[140 * 1024, 1024], &[0, 1]).await;
+    let (summary, events) = sdk
+        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .await
+        .unwrap();
+    let small = items
+        .iter()
+        .find(|item| {
+            events
+                .iter()
+                .any(|event| event.event.id == hex::encode(item.event_id))
+        })
+        .expect("a later affordable cached candidate remains reachable");
+    assert!(items.iter().any(|item| item.event_id != small.event_id));
+    assert_eq!(events.len(), 1);
+    assert!(returned_json_bytes(&events) < 128 * 1024);
+    assert_eq!(summary.relays_failed, 2);
+    assert_eq!(left_counts.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(right_counts.requests.load(Ordering::SeqCst), 0);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
+async fn mixed_cache_and_network_share_one_return_budget() {
+    let (left, right, sdk, route, left_counts, right_counts, items) =
+        cached_fixture(&[LARGE_EVENT_BYTES; 4], &[0]).await;
+    let cursor = Cursor::default();
+    let (summary, first) = sdk
+        .reconcile_subscription(route.clone(), &[], 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_failed, 2);
+    assert_eq!(first.len(), 3);
+    assert!(returned_json_bytes(&first) <= 128 * 1024);
+    assert!(
+        first
+            .iter()
+            .any(|event| event.event.id == hex::encode(items[0].event_id))
+    );
+    assert!(left_counts.requests.load(Ordering::SeqCst) >= 1);
+    assert!(right_counts.requests.load(Ordering::SeqCst) >= 1);
+    let admitted = first
+        .iter()
+        .map(|event| {
+            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+            items
+                .iter()
+                .find(|item| item.event_id == id)
+                .unwrap()
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    let (next, remaining) = sdk
+        .reconcile_subscription(route, &admitted, 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(next.relays_failed, 0);
+    assert_eq!(remaining.len(), 1);
+    assert!(
+        !admitted
+            .iter()
+            .any(|item| remaining[0].event.id == hex::encode(item.event_id))
+    );
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
 }
 
 #[tokio::test]

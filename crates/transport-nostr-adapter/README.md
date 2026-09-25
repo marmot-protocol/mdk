@@ -110,9 +110,11 @@ state. The SDK no longer has a shared 256-entry replay cursor cache, so activity
 cannot evict an active route's progress. State adds at most one 32-byte cursor to each existing
 route row. The NIP-77 remote-only selection still holds at most 128 IDs from a 16,384-ID
 reconciliation set. Each pass now sends at most 16 request-local one-ID acquisitions within the
-existing two-second comparison deadline and aggregate 16-received-item / 128-KiB-serialized-event
-allowance per endpoint. A byte/item/deadline exit retains partial events but leaves comparison
-incomplete. These are SDK received-result bounds, not complete wire or memory ceilings.
+existing two-second comparison deadline and aggregate 16-item / 128-KiB-serialized-event
+allowance. Full-event SDK cache hits spend the same returned-result allowance as fetched events;
+the largest endpoint's received count/bytes conservatively charges each network request. A
+byte/item/deadline exit retains partial events but leaves comparison incomplete. These are
+returned-result and SDK-received budgets, not complete wire or memory ceilings.
 
 Replay position is advisory, separate from admitted event inventory. Failed or cancelled fetches
 advance position but acknowledge no delivery. Refused events recur on wrap; only durable app

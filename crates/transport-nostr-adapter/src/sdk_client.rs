@@ -715,14 +715,13 @@ impl NostrSdkRelayClient {
         let mut sdk_events = Vec::new();
         let mut spent_items = 0usize;
         let mut spent_bytes = 0usize;
+        let mut returned_items = 0usize;
+        let mut returned_bytes = 0usize;
+        let mut returned_ids = HashSet::new();
         let mut requests = 0usize;
         let mut incomplete = remote_item_count > remote_ids.len();
         for (index, event_id) in remote_ids.into_iter().enumerate() {
             if tokio::time::Instant::now() >= deadline {
-                incomplete = true;
-                break;
-            }
-            if requests >= SDK_RECONCILIATION_MAX_ID_REQUESTS {
                 incomplete = true;
                 break;
             }
@@ -737,7 +736,36 @@ impl NostrSdkRelayClient {
                     )
                 })?
             {
+                let event_bytes = event.as_json().len();
+                let remaining_items =
+                    SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
+                let remaining_bytes =
+                    SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT.saturating_sub(spent_bytes);
+                let return_room =
+                    SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT.saturating_sub(returned_bytes);
+                if remaining_items == 0
+                    || returned_items >= SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
+                    || event_bytes > remaining_bytes
+                    || event_bytes > return_room
+                {
+                    incomplete = true;
+                    if event_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
+                        // This object can never fit the pass allowance. Rotate
+                        // past it so smaller missing IDs remain reachable;
+                        // durable inventory still keeps it eligible on wrap.
+                        progress.save_cursor(Some(event_id.to_bytes()))?;
+                        continue;
+                    }
+                    // A fitting object deferred by earlier results must be
+                    // the first candidate on the next pass.
+                    break;
+                }
                 progress.save_cursor(Some(event_id.to_bytes()))?;
+                spent_items += 1;
+                spent_bytes += event_bytes;
+                returned_items += 1;
+                returned_bytes += event_bytes;
+                returned_ids.insert(event_id.to_hex());
                 sdk_events.push((
                     replay_endpoint.clone(),
                     NostrTransportEvent::from_nostr_event(&event).map_err(|_| {
@@ -747,6 +775,10 @@ impl NostrSdkRelayClient {
                     })?,
                 ));
                 continue;
+            }
+            if requests >= SDK_RECONCILIATION_MAX_ID_REQUESTS {
+                incomplete = true;
+                break;
             }
             let remaining_items =
                 SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
@@ -794,27 +826,51 @@ impl NostrSdkRelayClient {
             let mut request_items = 0usize;
             let mut request_bytes = 0usize;
             let mut request_incomplete = false;
+            let wanted_id = event_id.to_hex();
             for (endpoint, outcome) in endpoints.iter().zip(result.endpoints) {
                 request_items = request_items.max(outcome.stats.received_items);
                 request_bytes = request_bytes.max(outcome.stats.serialized_event_bytes);
                 let claimed_id_missing = remote_by_endpoint
                     .get(endpoint)
                     .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id))
-                    && !outcome
-                        .events
-                        .iter()
-                        .any(|event| event.id == event_id.to_hex());
+                    && !outcome.events.iter().any(|event| event.id == wanted_id);
                 if outcome.end != NostrAcquisitionEnd::RequestPolicySatisfied || claimed_id_missing
                 {
                     failed_endpoints.insert(endpoint.clone());
                     request_incomplete = true;
                 }
-                sdk_events.extend(
-                    outcome
-                        .events
-                        .into_iter()
-                        .map(|event| (endpoint.clone(), event)),
-                );
+                for event in outcome.events {
+                    if event.id != wanted_id {
+                        failed_endpoints.insert(endpoint.clone());
+                        request_incomplete = true;
+                        continue;
+                    }
+                    if returned_ids.contains(&event.id) {
+                        continue;
+                    }
+                    let event_bytes = event
+                        .to_verified_nostr_event()
+                        .map_err(|_| {
+                            TransportAdapterError::Subscription(
+                                "decode acquired reconciled SDK event failed".to_owned(),
+                            )
+                        })?
+                        .as_json()
+                        .len();
+                    if returned_items >= SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
+                        || event_bytes
+                            > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
+                                .saturating_sub(returned_bytes)
+                    {
+                        failed_endpoints.insert(endpoint.clone());
+                        request_incomplete = true;
+                        continue;
+                    }
+                    returned_items += 1;
+                    returned_bytes += event_bytes;
+                    returned_ids.insert(event.id.clone());
+                    sdk_events.push((endpoint.clone(), event));
+                }
             }
             spent_items = spent_items.saturating_add(request_items);
             spent_bytes = spent_bytes.saturating_add(request_bytes);
