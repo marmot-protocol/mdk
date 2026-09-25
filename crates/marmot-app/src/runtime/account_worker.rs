@@ -5627,6 +5627,28 @@ async fn run_pending_epoch_backfill_reporting_arm(
         })
         .flatten();
     let backfill_result = client.run_pending_epoch_backfill(seam).await;
+    report_pending_epoch_backfill_result(
+        backfill_result,
+        backfill_armed,
+        observation,
+        events,
+        account_id_hex,
+        account_label,
+        shared,
+    )
+}
+
+/// A suspended comparison reports through the same product/runtime boundary
+/// after the worker has admitted its owned result and checkpointed the grant.
+fn report_pending_epoch_backfill_result(
+    backfill_result: Result<EpochBackfillRunOutcome, AppError>,
+    backfill_armed: bool,
+    observation: Option<crate::product_analytics::ProductObservation>,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+) -> Result<(), AccountCatchUpFailure> {
     if let Some(observation) = observation {
         observation.finish(match &backfill_result {
             Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
