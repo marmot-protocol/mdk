@@ -35,7 +35,11 @@ saves changed group rows before acknowledging its engine outbox events; this
 probe does not confuse those two commits.
 
 The projection path supplies the cause explicitly. The no-delivery drain uses
-`retained_event_replay`; missing receive evidence never selects that cause.
+`retained_event_replay` only when the group projection actually changes; a no-op
+replay leaves no origin for a later unrelated save. Missing receive evidence
+never selects that cause. Acceptance uses the same checkpoint hook, temporarily
+replacing any pending Welcome cause. Failed acceptance restores the prior origin
+alongside the app candidate rollback, so a single save emits one result.
 The current real failure scenario covers retry in the same client, not a
 process crash/reopen. App-open capture and durable probe identities are absent.
 An aborted or failed projection before checkpoint selection can leave no
@@ -60,11 +64,13 @@ facts are taken from the running scenario, not converted from v4 records.
    its first write. The MLS roster exists while the persisted app invitation
    does not. Evidence records failure/unknown invitation, followed by a distinct
    successful pending checkpoint after retry.
-3. Sender publication completes its retained delivery obligation, but the
-   recipient app is not drained. It has neither an engine group nor a persisted
-   invitation, and emits no recipient records. This withholds app admission,
-   **not** relay delivery into the transport queue; it does not prove network loss.
-4. Collector bounds and a generic uncertain checkpoint result are checked
+3. Replay an actual joined event after acceptance, then archive the group. The
+   replay changes no group row and must not label that unrelated checkpoint.
+4. Seed a pending probe origin alongside the real persisted invitation to model
+   an uncertain earlier save, then fail and retry actual acceptance. Each attempt
+   emits exactly one result with the acceptance cause; failure restores the prior
+   origin, success clears it. This seeds probe state, not a real crash scenario.
+5. Collector bounds and a generic uncertain checkpoint result are checked
    independently of the successful product scenario.
 
 A local run on 2026-09-25 measured 2,072 compact body bytes, 2,075 JSONL bytes

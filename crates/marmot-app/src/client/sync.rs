@@ -1659,7 +1659,9 @@ impl AppClient {
                 &source_message_id_hex,
             );
             #[cfg(test)]
-            if let Some(probe) = &mut self.audit_v5_probe {
+            if previous_group != updated_group
+                && let Some(probe) = &mut self.audit_v5_probe
+            {
                 probe.projected(
                     event,
                     marmot_forensics::v5::UpdateCause::RetainedEventReplay,
@@ -5085,7 +5087,9 @@ impl AppClient {
                 &event_source,
             );
             #[cfg(test)]
-            if let Some(probe) = &mut self.audit_v5_probe {
+            if previous_group != updated_group
+                && let Some(probe) = &mut self.audit_v5_probe
+            {
                 probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
             }
             routes_dirty |=

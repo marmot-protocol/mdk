@@ -3153,11 +3153,16 @@ impl AppClient {
         *group = authoritative;
         let archived = group.archived;
         #[cfg(test)]
-        let audit_update = audit_v5_probe::PendingUpdate::confirmation(group);
+        let audit_origin = self
+            .audit_v5_probe
+            .as_mut()
+            .and_then(|probe| probe.begin_confirmation(group));
         let result = self.set_group_invite_confirmation(group_id, false, archived);
         #[cfg(test)]
-        if let (Some(probe), Some(update)) = (&mut self.audit_v5_probe, audit_update) {
-            probe.finish_checkpoint(vec![update], result.is_ok(), false);
+        if result.is_err()
+            && let (Some(probe), Some(origin)) = (&mut self.audit_v5_probe, audit_origin)
+        {
+            probe.rollback_confirmation(origin);
         }
         result
     }

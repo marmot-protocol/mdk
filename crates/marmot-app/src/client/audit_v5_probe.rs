@@ -43,12 +43,6 @@ pub(super) struct PendingUpdate {
 }
 
 impl PendingUpdate {
-    pub(super) fn confirmation(group: &AppGroupRecord) -> Option<Self> {
-        let mut update = Self::for_group(group, UpdateCause::InviteConfirmation)?;
-        update.invite = InviteState::Accepted;
-        Some(update)
-    }
-
     fn for_group(group: &AppGroupRecord, cause: UpdateCause) -> Option<Self> {
         // This is persisted engine-derived Welcome provenance, never a group
         // routing id or a caller-supplied substitute for the outer event id.
@@ -169,6 +163,32 @@ impl WelcomeProbe {
         }
     }
 
+    // Attribute acceptance at the same checkpoint as Welcome projection work.
+    // If the operation rolls its candidate back, restore the prior origin too.
+    pub(super) fn begin_confirmation(
+        &mut self,
+        group: &AppGroupRecord,
+    ) -> Option<(String, Option<UpdateCause>)> {
+        let key = group.via_welcome_message_id_hex.clone()?;
+        if self.projections.len() == MAX_PENDING && !self.projections.contains_key(&key) {
+            self.dropped += 1;
+            return None;
+        }
+        let previous = self
+            .projections
+            .insert(key.clone(), UpdateCause::InviteConfirmation);
+        Some((key, previous))
+    }
+
+    pub(super) fn rollback_confirmation(&mut self, origin: (String, Option<UpdateCause>)) {
+        let (key, previous) = origin;
+        if let Some(cause) = previous {
+            self.projections.insert(key, cause);
+        } else {
+            self.projections.remove(&key);
+        }
+    }
+
     pub(super) fn pending_updates(
         &self,
         groups: &[AppGroupRecord],
@@ -186,7 +206,6 @@ impl WelcomeProbe {
                 update.projection_key = Some(key.clone());
                 Some(update)
             })
-            .take(MAX_PENDING)
             .collect()
     }
 

@@ -127,58 +127,104 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
         let pending = scenario.bob_app.group("bob", &group_hex).unwrap().unwrap();
         assert!(pending.pending_confirmation);
         assert_eq!(scenario.bob.members(&group).unwrap().len(), 2);
-        assert_eq!(scenario.alice.group_mls_state(&group).unwrap().epoch,
-                   scenario.bob.group_mls_state(&group).unwrap().epoch);
-        let observed = scenario.capture().rows.iter().find_map(|r| match &r.fields().event {
-            Event::WelcomeObserved(e) => Some(e), _ => None,
-        }).unwrap();
+        assert_eq!(
+            scenario.alice.group_mls_state(&group).unwrap().epoch,
+            scenario.bob.group_mls_state(&group).unwrap().epoch
+        );
+        let observed = scenario
+            .capture()
+            .rows
+            .iter()
+            .find_map(|r| match &r.fields().event {
+                Event::WelcomeObserved(e) => Some(e),
+                _ => None,
+            })
+            .unwrap();
         let outer = observed.outer_event_ref.clone();
         assert_eq!(observed.acquisition, Acquisition::Unknown);
         assert_eq!(scenario.updates().len(), 1);
         assert_eq!(scenario.updates()[0].outer_event_ref, outer);
         assert_eq!(scenario.updates()[0].cause, UpdateCause::WelcomeJoin);
         assert_eq!(scenario.updates()[0].checkpoint, Checkpoint::Committed);
-        assert_eq!(scenario.updates()[0].invite_state, InviteState::PendingConfirmation);
+        assert_eq!(
+            scenario.updates()[0].invite_state,
+            InviteState::PendingConfirmation
+        );
 
         scenario.bob.accept_group_invite(&group).unwrap();
-        assert!(!scenario.bob_app.group("bob", &group_hex).unwrap().unwrap().pending_confirmation);
+        assert!(
+            !scenario
+                .bob_app
+                .group("bob", &group_hex)
+                .unwrap()
+                .unwrap()
+                .pending_confirmation
+        );
         assert_eq!(scenario.updates().len(), 2);
         assert_eq!(scenario.updates()[1].outer_event_ref, outer);
         assert_eq!(scenario.updates()[1].cause, UpdateCause::InviteConfirmation);
         assert_eq!(scenario.updates()[1].checkpoint, Checkpoint::Committed);
         assert_eq!(scenario.updates()[1].invite_state, InviteState::Accepted);
-        assert_ne!(scenario.updates()[0].update_id, scenario.updates()[1].update_id);
+        assert_ne!(
+            scenario.updates()[0].update_id,
+            scenario.updates()[1].update_id
+        );
 
-        scenario.alice.send(&group, b"synthetic content must never enter probe").await.unwrap();
+        scenario
+            .alice
+            .send(&group, b"synthetic content must never enter probe")
+            .await
+            .unwrap();
         let received = scenario.bob.sync().await.unwrap();
         assert_eq!(received.messages.len(), 1);
-        assert_eq!(received.messages[0].plaintext, "synthetic content must never enter probe");
-        assert_eq!(scenario.capture().rows.len(), 3, "ordinary message work adds no Welcome rows");
+        assert_eq!(
+            received.messages[0].plaintext,
+            "synthetic content must never enter probe"
+        );
+        assert_eq!(
+            scenario.capture().rows.len(),
+            3,
+            "ordinary message work adds no Welcome rows"
+        );
         scenario.assert_clean();
         let mut total = 0;
         let mut largest = 0;
         for row in &scenario.capture().rows {
             let body = row.to_json().unwrap();
-            total += body.len(); largest = largest.max(body.len());
+            total += body.len();
+            largest = largest.max(body.len());
             let text = std::str::from_utf8(&body).unwrap();
-            for forbidden in [&group_hex, &scenario.bob_id,
-                "synthetic private group title", "synthetic content must never enter probe"] {
+            for forbidden in [
+                &group_hex,
+                &scenario.bob_id,
+                "synthetic private group title",
+                "synthetic content must never enter probe",
+            ] {
                 assert!(!text.contains(forbidden));
             }
         }
         // A gross-regression bound for this THREE-ROW subset, not a bandwidth
         // target for the complete Welcome lifecycle or an upload measurement.
         assert!(total < 4096);
-        println!("v5 recipient subset: rows=3 body_bytes={total} jsonl_bytes={} largest_body_bytes={largest}", total + 3);
+        println!(
+            "v5 recipient subset: rows=3 body_bytes={total} \
+             jsonl_bytes={} largest_body_bytes={largest}",
+            total + 3
+        );
         let files = scenario.bob_app.audit_log_files().unwrap();
         assert!(!files.is_empty());
         for file in files {
             for row in std::fs::read_to_string(file.path).unwrap().lines() {
                 let v: serde_json::Value = serde_json::from_str(row).unwrap();
-                assert_eq!(v["schema_version"], marmot_forensics::AUDIT_LOG_SCHEMA_VERSION);
+                assert_eq!(
+                    v["schema_version"],
+                    marmot_forensics::AUDIT_LOG_SCHEMA_VERSION
+                );
             }
         }
-    }).await.expect("bounded local Welcome scenario");
+    })
+    .await
+    .expect("bounded local Welcome scenario");
 }
 
 #[tokio::test]
@@ -248,25 +294,100 @@ async fn engine_join_survives_app_checkpoint_failure_without_false_success() {
 }
 
 #[tokio::test]
-async fn relay_ack_without_app_drain_is_not_recipient_success() {
+async fn no_op_welcome_replay_does_not_label_unrelated_checkpoint() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
         let group = scenario.create().await;
-        // The relay may have delivered into a queue, but the app has not consumed
-        // it. ACK alone cannot support a join or app-visible invitation claim.
-        assert!(scenario.bob.runtime.group_record(&group).is_err());
+        let joined = scenario.bob.sync().await.unwrap();
+        scenario.bob.accept_group_invite(&group).unwrap();
+        let event = joined
+            .events
+            .into_iter()
+            .find(|event| matches!(event, GroupEvent::GroupJoined { .. }))
+            .expect("actual retained Welcome event");
+        let before = scenario.capture().rows.len();
+        scenario
+            .bob
+            .observe_drained_session_events(&marmot_account::AccountDeviceEffects {
+                events: vec![event],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(scenario.capture().projections.is_empty());
+        scenario.bob.set_group_archived(&group, true).unwrap();
         assert!(
             scenario
                 .bob_app
                 .group("bob", &hex::encode(group.as_slice()))
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .archived
         );
-        assert!(scenario.capture().rows.is_empty());
+        assert_eq!(scenario.capture().rows.len(), before);
         scenario.assert_clean();
     })
     .await
-    .expect("bounded withheld-app-drain scenario");
+    .expect("bounded no-op replay scenario");
+}
+
+#[tokio::test]
+async fn failed_acceptance_has_one_checkpoint_result_and_restores_origin() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let group = scenario.create().await;
+        let joined = scenario.bob.sync().await.unwrap();
+        let event = joined
+            .events
+            .iter()
+            .find(|event| matches!(event, GroupEvent::GroupJoined { .. }))
+            .unwrap();
+        // Exercise an outstanding origin alongside a persisted pending row,
+        // as may occur after an uncertain checkpoint result.
+        let capture = scenario.bob.audit_v5_probe.as_mut().unwrap();
+        capture.projected(event, UpdateCause::WelcomeJoin);
+        capture.reject_checkpoints = true;
+        let before = scenario.updates().len();
+        assert!(scenario.bob.accept_group_invite(&group).is_err());
+        assert!(
+            scenario
+                .bob_app
+                .group("bob", &hex::encode(group.as_slice()))
+                .unwrap()
+                .unwrap()
+                .pending_confirmation
+        );
+        assert_eq!(scenario.updates().len(), before + 1);
+        let failed = scenario.updates()[before];
+        assert_eq!(failed.cause, UpdateCause::InviteConfirmation);
+        assert_eq!(failed.checkpoint, Checkpoint::FailedBeforeCommit);
+        assert_eq!(failed.invite_state, InviteState::Unknown);
+        assert_eq!(
+            scenario
+                .capture()
+                .projections
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![UpdateCause::WelcomeJoin]
+        );
+        scenario
+            .bob
+            .audit_v5_probe
+            .as_mut()
+            .unwrap()
+            .reject_checkpoints = false;
+        scenario.bob.accept_group_invite(&group).unwrap();
+        assert_eq!(scenario.updates().len(), before + 2);
+        let accepted = scenario.updates()[before + 1];
+        assert_eq!(accepted.cause, UpdateCause::InviteConfirmation);
+        assert_eq!(accepted.checkpoint, Checkpoint::Committed);
+        assert_eq!(accepted.invite_state, InviteState::Accepted);
+        assert!(scenario.capture().projections.is_empty());
+        scenario.assert_clean();
+    })
+    .await
+    .expect("bounded acceptance retry scenario");
 }
 
 #[test]
