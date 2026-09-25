@@ -59,11 +59,28 @@ const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
 // until delivery and EOSE can share an ordered receive lane.
 const EOSE_QUIET_WAIT: Duration = Duration::from_millis(100);
 
-#[cfg(test)]
-pub(super) type TestComparisonResult = Result<
-    Option<transport_nostr_adapter::NostrReconciliationSummary>,
+type OwnedComparisonResult = Result<
+    Option<(
+        transport_nostr_adapter::NostrReconciliationSummary,
+        Vec<transport_nostr_adapter::NostrRelayEvent>,
+    )>,
     cgka_traits::TransportAdapterError,
 >;
+
+#[cfg(test)]
+pub(super) type TestComparisonResult = OwnedComparisonResult;
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_COMPARISON_QUEUE_ACTIONS: std::cell::RefCell<std::collections::VecDeque<TestComparisonQueueAction>>;
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestComparisonQueueAction {
+    Fail,
+    Block,
+}
 
 /// Overall explicit repair budget, distinct from each checkpointed drain quantum.
 /// Checked at safe boundaries; an admitted ingest/checkpoint is always finished.
@@ -1114,54 +1131,83 @@ impl AppClient {
             let progress = StoredReconciliationProgress::new(&storage, &inventory.route);
             let result = tokio::time::timeout_at(deadline, async {
                 #[cfg(test)]
-                if let Some(results) = &mut self.test_comparison_results {
+                let scripted = if let Some(results) = &mut self.test_comparison_results {
                     if let Some(delay) = self.test_comparison_delay {
                         tokio::time::sleep(delay).await;
                     }
-                    return results
-                        .pop_front()
-                        .expect("one scripted result per selected comparison route")
-                        .map(|result| result.map(|summary| (summary, Vec::new())));
-                }
-                match &inventory.work {
-                    TransportReconciliationWork::Inbox(endpoints) => {
-                        self.adapter
-                            .reconcile_inbox_history(
-                                endpoints.clone(),
-                                &inventory.items,
-                                inventory.since,
-                                inventory.until,
-                                &progress,
-                            )
-                            .await
+                    Some(
+                        results
+                            .pop_front()
+                            .expect("one scripted result per selected comparison route"),
+                    )
+                } else {
+                    None
+                };
+                #[cfg(not(test))]
+                let scripted: Option<OwnedComparisonResult> = None;
+                let owned = if let Some(result) = scripted {
+                    result
+                } else {
+                    match &inventory.work {
+                        TransportReconciliationWork::Inbox(endpoints) => {
+                            self.adapter
+                                .reconcile_inbox_history(
+                                    endpoints.clone(),
+                                    &inventory.items,
+                                    inventory.since,
+                                    inventory.until,
+                                    &progress,
+                                )
+                                .await
+                        }
+                        TransportReconciliationWork::Group(group) => {
+                            self.adapter
+                                .reconcile_group_history(
+                                    group.clone(),
+                                    &inventory.items,
+                                    inventory.since,
+                                    inventory.until,
+                                    &progress,
+                                )
+                                .await
+                        }
                     }
-                    TransportReconciliationWork::Group(group) => {
-                        self.adapter
-                            .reconcile_group_history(
-                                group.clone(),
-                                &inventory.items,
-                                inventory.since,
-                                inventory.until,
-                                &progress,
-                            )
-                            .await
+                }?;
+                let Some((summary, events)) = owned else {
+                    return Ok::<_, cgka_traits::TransportAdapterError>(None);
+                };
+                // This is still an inline worker phase. Keep queue submission
+                // inside the original per-route deadline and error boundary:
+                // a full queue or closed adapter remains a transient route
+                // result, while any earlier submitted prefix stays available
+                // for the ordinary drain.
+                for event in events {
+                    #[cfg(test)]
+                    if let Ok(Some(action)) = TEST_COMPARISON_QUEUE_ACTIONS
+                        .try_with(|actions| actions.borrow_mut().pop_front())
+                    {
+                        match action {
+                            TestComparisonQueueAction::Fail => {
+                                return Err(cgka_traits::TransportAdapterError::Subscription(
+                                    "injected comparison queue failure".into(),
+                                ));
+                            }
+                            TestComparisonQueueAction::Block => {
+                                std::future::pending::<()>().await;
+                            }
+                        }
                     }
+                    self.adapter.queue_reconciled_event(event).await?;
                 }
+                Ok(Some(summary))
             })
             .await;
             let outcome = match result {
-                Ok(Ok(Some((summary, events)))) => {
+                Ok(Ok(Some(summary))) => {
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
                     remote_items += summary.remote_items;
                     received_items += summary.received_items;
-                    // The relay plane returns request-owned bytes. Only this
-                    // serialized account worker submits them to the existing
-                    // account-scoped delivery queue; the subsequent drain
-                    // remains responsible for durable admission and receipts.
-                    for event in events {
-                        self.adapter.queue_reconciled_event(event).await?;
-                    }
                     if summary.relays_failed > 0 {
                         Outcome::TransientFailure
                     } else {
@@ -5604,6 +5650,10 @@ fn backfill_drain_verdict(eose: AccountSubscriptionEose) -> DrainVerdict {
 pub(crate) fn epoch_stall_now_ms() -> u64 {
     crate::notifications::unix_now_ms().max(0) as u64
 }
+
+#[cfg(test)]
+#[path = "sync/worker_resume_boundary_tests.rs"]
+mod worker_resume_boundary_tests;
 
 #[cfg(test)]
 mod tests {

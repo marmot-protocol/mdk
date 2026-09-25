@@ -31,6 +31,11 @@ submits each returned event through the same account-scoped adapter routing
 path before its existing drain. This removes the implicit relay-plane delivery
 side effect and makes the network result an owned value. It does not bypass the
 existing account queue or change durable admission, cursor, or completion rules.
+Explicit queue submission remains inside the existing per-route comparison
+deadline and error classification. A blocked queue consumes that route's
+remaining quantum; a submission error marks that route transient while later
+routes retain their normal opportunity. Already submitted events remain queued
+for the normal drain.
 An unsupported backend still returns `None`; an empty supported result remains
 empty; route errors retain their existing transient classification. The SDK
 continues to limit each reconciliation's selected candidates, and partial
