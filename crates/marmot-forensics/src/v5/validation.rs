@@ -113,7 +113,7 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
             )?;
             // A zero-target result belongs in not_started; omitted targets must be explicit.
             require(
-                e.target_count != Some(0) && (!e.targets_complete || !e.targets.is_empty()),
+                e.target_count != Some(0),
                 "started publication needs a target",
             )?;
         }
@@ -133,9 +133,39 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                 require(
                     match result.status {
                         EndpointStatus::Acknowledged => {
-                            result.failure_kind.is_none() && result.rejection_category.is_none()
+                            result.failure_kind.is_none()
+                                && matches!(
+                                    result.rejection_category,
+                                    None | Some(RejectionCategory::Duplicate)
+                                )
                         }
-                        EndpointStatus::Failed => result.failure_kind.is_some(),
+                        EndpointStatus::Failed => match result.failure_kind {
+                            Some(EndpointFailureKind::NotExposed) => {
+                                result.rejection_category.is_none()
+                            }
+                            Some(EndpointFailureKind::PossiblyExposed) => matches!(
+                                result.rejection_category,
+                                None | Some(RejectionCategory::Error)
+                            ),
+                            Some(EndpointFailureKind::RetryableUnavailable) => matches!(
+                                result.rejection_category,
+                                None | Some(
+                                    RejectionCategory::RateLimited
+                                        | RejectionCategory::AuthRequired
+                                )
+                            ),
+                            Some(EndpointFailureKind::TerminalRejected) => matches!(
+                                result.rejection_category,
+                                Some(
+                                    RejectionCategory::Pow
+                                        | RejectionCategory::Blocked
+                                        | RejectionCategory::Invalid
+                                        | RejectionCategory::Unsupported
+                                        | RejectionCategory::Restricted
+                                )
+                            ),
+                            None => false,
+                        },
                     },
                     "invalid endpoint result",
                 )?;

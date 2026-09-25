@@ -48,6 +48,14 @@ cannot prove that a producer used a real clock, a validated event or consent.
 - `group_baseline`: local epoch and bounded membership/admin status, with explicit
   partial/failed capture. No keys, MLS state, payloads or invented global state.
 
+Publication endpoint classifications follow the Nostr publish boundary: an
+acknowledged result has no failure kind and may carry only the `duplicate`
+category (already stored). Failed `not_exposed` has no category;
+`possibly_exposed` allows null or `error`; `retryable_unavailable` allows null,
+`rate-limited` or `auth-required`; `terminal_rejected` requires `pow`, `blocked`,
+`invalid`, `unsupported` or `restricted`. A duplicate acknowledgment is not a
+failed publication. These are observed outcomes, not a new retry policy.
+
 Per-record comparisons cannot check a finished attempt against a missing start
 row. The future reader must preserve independent facts, expose missing evidence
 and conflicts, and never infer delivery failure merely from absent recipient rows.
@@ -73,6 +81,12 @@ be correlated across sources. Group input is the variable-length MLS group ID;
 it is not a 32-byte transport route ID. KeyPackage references are public event
 references, never hashes of key material. Never use plaintext or ciphertext as
 reference input.
+
+V5 is intended for a coordinated new-pipeline cutover, not mixed-version member
+correlation. Its member references intentionally differ from v4; do not join the
+two by equality or infer an identity from unrelated records. Historical v4
+evidence stays with existing tooling. This foundation does not implement that
+cutover, convert old records or discard queued v4 data.
 
 The forensic crate deliberately does not depend on a URL parser or transport SDK.
 `EndpointRef::from_normalized_url` requires owner-normalized input. For Nostr this

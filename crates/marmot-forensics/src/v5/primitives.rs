@@ -26,7 +26,7 @@ macro_rules! text_type {
                 if ($valid)(&value) {
                     Ok(Self(value))
                 } else {
-                    Err(ContractError::new("invalid ", stringify!($name)))
+                    Err(ContractError::rule(concat!("invalid ", stringify!($name))))
                 }
             }
         }

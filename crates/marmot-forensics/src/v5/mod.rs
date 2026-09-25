@@ -15,18 +15,15 @@ pub const JSON_SCHEMA: &str = include_str!("../../schema/audit-log-event.v5.sche
 
 /// Safe categorical error: never includes supplied JSON, identifiers or free-form values.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContractError(String);
+pub struct ContractError(&'static str);
 impl ContractError {
     pub(crate) fn rule(message: &'static str) -> Self {
-        Self(message.into())
-    }
-    pub(crate) fn new(prefix: &'static str, kind: &'static str) -> Self {
-        Self(format!("{prefix}{kind}"))
+        Self(message)
     }
 }
 impl std::fmt::Display for ContractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.0)
     }
 }
 impl std::error::Error for ContractError {}

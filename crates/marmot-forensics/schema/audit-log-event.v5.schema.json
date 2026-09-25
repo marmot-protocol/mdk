@@ -584,45 +584,91 @@
       },
       "allOf": [
         {
-          "if": {
-            "properties": {
-              "status": {
-                "const": "acknowledged"
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "acknowledged"
+                },
+                "failure_kind": {
+                  "const": null
+                },
+                "rejection_category": {
+                  "enum": [
+                    null,
+                    "duplicate"
+                  ]
+                }
               }
             },
-            "required": [
-              "status"
-            ]
-          },
-          "then": {
-            "properties": {
-              "failure_kind": {
-                "type": "null"
-              },
-              "rejection_category": {
-                "type": "null"
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "status": {
-                "const": "failed"
+            {
+              "properties": {
+                "status": {
+                  "const": "failed"
+                },
+                "failure_kind": {
+                  "const": "not_exposed"
+                },
+                "rejection_category": {
+                  "enum": [
+                    null
+                  ]
+                }
               }
             },
-            "required": [
-              "status"
-            ]
-          },
-          "then": {
-            "properties": {
-              "failure_kind": {
-                "$ref": "#/$defs/EndpointFailureKind"
+            {
+              "properties": {
+                "status": {
+                  "const": "failed"
+                },
+                "failure_kind": {
+                  "const": "possibly_exposed"
+                },
+                "rejection_category": {
+                  "enum": [
+                    null,
+                    "error"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "failed"
+                },
+                "failure_kind": {
+                  "const": "retryable_unavailable"
+                },
+                "rejection_category": {
+                  "enum": [
+                    null,
+                    "rate-limited",
+                    "auth-required"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "failed"
+                },
+                "failure_kind": {
+                  "const": "terminal_rejected"
+                },
+                "rejection_category": {
+                  "enum": [
+                    "pow",
+                    "blocked",
+                    "invalid",
+                    "unsupported",
+                    "restricted"
+                  ]
+                }
               }
             }
-          }
+          ]
         }
       ]
     },

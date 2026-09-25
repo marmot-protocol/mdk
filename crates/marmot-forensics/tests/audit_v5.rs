@@ -414,3 +414,69 @@ fn scalar_encodings_and_count_ranges_agree_with_schema() {
     assert!(schema.is_valid(&body));
     assert!(decode(&body).is_ok());
 }
+
+#[test]
+fn publication_endpoint_classifications_match_nostr_owner_contract() {
+    let schema = validator();
+    let kinds = [
+        None,
+        Some("not_exposed"),
+        Some("possibly_exposed"),
+        Some("retryable_unavailable"),
+        Some("terminal_rejected"),
+    ];
+    let categories = [
+        None,
+        Some("duplicate"),
+        Some("pow"),
+        Some("blocked"),
+        Some("rate-limited"),
+        Some("invalid"),
+        Some("error"),
+        Some("unsupported"),
+        Some("auth-required"),
+        Some("restricted"),
+    ];
+    for status in ["acknowledged", "failed"] {
+        for kind in kinds {
+            for category in categories {
+                // The source owner accepts duplicate replies before classifying failures.
+                // Enumerate every status/kind/category combination, including forbidden pairs.
+                let expected = matches!(
+                    (status, kind, category),
+                    ("acknowledged", None, None | Some("duplicate"))
+                        | ("failed", Some("not_exposed"), None)
+                        | ("failed", Some("possibly_exposed"), None | Some("error"))
+                        | (
+                            "failed",
+                            Some("retryable_unavailable"),
+                            None | Some("rate-limited" | "auth-required"),
+                        )
+                        | (
+                            "failed",
+                            Some("terminal_rejected"),
+                            Some("pow" | "blocked" | "invalid" | "unsupported" | "restricted"),
+                        )
+                );
+                let mut body = fixture(if status == "acknowledged" {
+                    "publish_finished"
+                } else {
+                    "publish_rejected"
+                });
+                body["event"]["results"][0]["status"] = json!(status);
+                body["event"]["results"][0]["failure_kind"] = json!(kind);
+                body["event"]["results"][0]["rejection_category"] = json!(category);
+                assert_eq!(
+                    schema.is_valid(&body),
+                    expected,
+                    "schema: {status}/{kind:?}/{category:?}"
+                );
+                assert_eq!(
+                    decode(&body).is_ok(),
+                    expected,
+                    "Rust: {status}/{kind:?}/{category:?}"
+                );
+            }
+        }
+    }
+}
