@@ -12,7 +12,7 @@ fn probe_with_ids(source: u8, session: u8) -> WelcomeProbe {
         format!("{source:02x}").repeat(16).try_into().unwrap(),
         format!("{session:02x}").repeat(16).try_into().unwrap(),
         Producer {
-            mdk_revision: "00".repeat(20).try_into().unwrap(),
+            mdk_revision: Some("00".repeat(20).try_into().unwrap()),
             build_profile: BuildProfile::Debug,
             platform: Platform::Other,
             host_build: Some("unit-test-probe".to_owned().try_into().unwrap()),

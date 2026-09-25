@@ -2336,3 +2336,59 @@ fn size_rotation_without_source_context_does_not_invent_metadata() {
         ));
     }
 }
+
+#[test]
+fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
+    use crate::v5::{self, BuildProfile, Platform, Producer};
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder = JsonlRecorder::open_v5_with_account_ref(
+        &path,
+        "11".repeat(16),
+        Some("22".repeat(16)),
+        Producer {
+            mdk_revision: None,
+            build_profile: BuildProfile::Debug,
+            platform: Platform::Other,
+            host_build: None,
+        },
+    )
+    .unwrap();
+    let source_kinds = sample_audit_event_kinds();
+    let expected = source_kinds
+        .iter()
+        .map(AuditEventKind::type_tag)
+        .collect::<std::collections::BTreeSet<_>>();
+    for kind in source_kinds {
+        let tag = kind.type_tag();
+        let op = v5::Event::Operational(Box::new(v5::OperationalEvent::from_audit(
+            AuditRecord::new(None, kind.clone()),
+        )));
+        assert!(
+            serde_json::to_value(op).is_ok(),
+            "v5 conversion failed for {tag}"
+        );
+        recorder.record(AuditRecord::new(None, kind));
+    }
+    let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    let mut actual = std::collections::BTreeSet::new();
+    for line in body.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            validator.is_valid(&value),
+            "v5 schema rejected {}: {:?}",
+            value["event"]["type"],
+            validator.iter_errors(&value).collect::<Vec<_>>()
+        );
+        v5::Record::from_json(line.as_bytes()).unwrap();
+        actual.insert(value["event"]["type"].as_str().unwrap().to_owned());
+        assert_eq!(value["producer"]["mdk_revision"], serde_json::Value::Null);
+        assert!(value["seq"].as_str().unwrap().parse::<u64>().unwrap() > 0);
+        assert!(!line.contains("wss://"));
+        assert!(!line.contains("unknown group"));
+    }
+    assert_eq!(actual, expected.into_iter().map(str::to_owned).collect());
+    assert_eq!(actual.len(), 44);
+}

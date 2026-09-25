@@ -15,6 +15,7 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
     require(record.seq.get() > 0, "sequence must be positive")?;
     let has_group = record.group_ref.is_some();
     match &record.event {
+        Event::Operational(_) => {}
         Event::WelcomePrepared(e) => {
             require(
                 match e.mode {

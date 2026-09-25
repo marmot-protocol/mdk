@@ -38,6 +38,7 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
         .as_array()
         .unwrap()
         .iter()
+        .filter(|r| !r["$ref"].as_str().unwrap().contains("OperationalEvent_"))
         .map(|r| {
             let name = r["$ref"].as_str().unwrap().rsplit('/').next().unwrap();
             schema["$defs"][name]["properties"]["type"]["const"]
@@ -48,6 +49,10 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(kinds, catalog);
     assert_eq!(kinds.len(), 9);
+    assert_eq!(
+        schema["$defs"]["Event"]["oneOf"].as_array().unwrap().len(),
+        53
+    );
 }
 
 #[test]

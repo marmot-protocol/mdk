@@ -1,7 +1,8 @@
 //! Data-only candidate types. Use `Record::new` / `Record::from_json` to enforce
 //! cross-field constraints and bounds; deserializing candidates alone is not validation.
+use super::operational::OperationalEvent;
 use super::primitives::*;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // deserialize_with deliberately makes nullable fields required on the wire.
 fn nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -296,7 +297,8 @@ pub enum Basis {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Producer {
-    pub mdk_revision: Revision,
+    #[serde(deserialize_with = "nullable")]
+    pub mdk_revision: Option<Revision>,
     pub build_profile: BuildProfile,
     pub platform: Platform,
     #[serde(deserialize_with = "nullable")]
@@ -476,8 +478,7 @@ pub struct RecordFields {
     pub event: Event,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     WelcomePrepared(WelcomePrepared),
     WelcomePublishStarted(WelcomePublishStarted),
@@ -488,4 +489,83 @@ pub enum Event {
     WelcomeJoinFinished(WelcomeJoinFinished),
     AppGroupUpdateFinished(AppGroupUpdateFinished),
     GroupBaseline(GroupBaseline),
+    Operational(Box<OperationalEvent>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WelcomeEvent {
+    WelcomePrepared(WelcomePrepared),
+    WelcomePublishStarted(WelcomePublishStarted),
+    WelcomePublishFinished(WelcomePublishFinished),
+    WelcomePublishNotStarted(WelcomePublishNotStarted),
+    WelcomeObserved(WelcomeObserved),
+    WelcomeUnwrapped(WelcomeUnwrapped),
+    WelcomeJoinFinished(WelcomeJoinFinished),
+    AppGroupUpdateFinished(AppGroupUpdateFinished),
+    GroupBaseline(GroupBaseline),
+}
+
+impl Serialize for Event {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let welcome = match self {
+            Event::WelcomePrepared(e) => WelcomeEvent::WelcomePrepared(e.clone()),
+            Event::WelcomePublishStarted(e) => WelcomeEvent::WelcomePublishStarted(e.clone()),
+            Event::WelcomePublishFinished(e) => WelcomeEvent::WelcomePublishFinished(e.clone()),
+            Event::WelcomePublishNotStarted(e) => WelcomeEvent::WelcomePublishNotStarted(e.clone()),
+            Event::WelcomeObserved(e) => WelcomeEvent::WelcomeObserved(e.clone()),
+            Event::WelcomeUnwrapped(e) => WelcomeEvent::WelcomeUnwrapped(e.clone()),
+            Event::WelcomeJoinFinished(e) => WelcomeEvent::WelcomeJoinFinished(e.clone()),
+            Event::AppGroupUpdateFinished(e) => WelcomeEvent::AppGroupUpdateFinished(e.clone()),
+            Event::GroupBaseline(e) => WelcomeEvent::GroupBaseline(e.clone()),
+            Event::Operational(e) => return e.serialize(serializer),
+        };
+        welcome.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let tag = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("missing event type"))?;
+        if matches!(
+            tag,
+            "welcome_prepared"
+                | "welcome_publish_started"
+                | "welcome_publish_finished"
+                | "welcome_publish_not_started"
+                | "welcome_observed"
+                | "welcome_unwrapped"
+                | "welcome_join_finished"
+                | "app_group_update_finished"
+                | "group_baseline"
+        ) {
+            let e: WelcomeEvent =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(match e {
+                WelcomeEvent::WelcomePrepared(e) => Event::WelcomePrepared(e),
+                WelcomeEvent::WelcomePublishStarted(e) => Event::WelcomePublishStarted(e),
+                WelcomeEvent::WelcomePublishFinished(e) => Event::WelcomePublishFinished(e),
+                WelcomeEvent::WelcomePublishNotStarted(e) => Event::WelcomePublishNotStarted(e),
+                WelcomeEvent::WelcomeObserved(e) => Event::WelcomeObserved(e),
+                WelcomeEvent::WelcomeUnwrapped(e) => Event::WelcomeUnwrapped(e),
+                WelcomeEvent::WelcomeJoinFinished(e) => Event::WelcomeJoinFinished(e),
+                WelcomeEvent::AppGroupUpdateFinished(e) => Event::AppGroupUpdateFinished(e),
+                WelcomeEvent::GroupBaseline(e) => Event::GroupBaseline(e),
+            })
+        } else {
+            Ok(Event::Operational(Box::new(
+                OperationalEvent::from_wire(value).map_err(serde::de::Error::custom)?,
+            )))
+        }
+    }
 }
