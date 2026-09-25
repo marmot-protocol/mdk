@@ -187,11 +187,70 @@ int main(int argc, char **argv) {
         MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY, 125,
         MARMOT_HOST_PERFORMANCE_OUTCOME_CANCELLED);
     check(st == MARMOT_STATUS_OK, "conversation host timing accepted");
+    const struct {
+        MarmotHostPerformanceOperation operation;
+        const char *name;
+    } host_stages[] = {
+        {MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_STARTUP_BEFORE_VAULT, "host_linux_startup_before_vault"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_STARTUP_AFTER_VAULT, "host_linux_startup_after_vault"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_WINDOW_INIT, "host_window_init"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_FONTS_INIT, "host_fonts_init"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_RUNTIME_INIT, "host_runtime_init"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_ACCOUNT_LOAD, "host_account_load"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_ACCOUNT_SWITCH, "host_account_switch"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_FRAME_UPDATE, "host_frame_update"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_FRAME_LAYOUT, "host_frame_layout"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_FRAME_DRAW, "host_frame_draw"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_FRAME_PRESENT, "host_frame_present"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_FRAME_POST_PRESENT, "host_linux_frame_post_present"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_FRAME_UNTIL_PRESENT, "host_linux_frame_until_present"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_FRAME_IDLE_WAIT, "host_linux_frame_idle_wait"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_CHAT_LIST_LOAD, "host_chat_list_load"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_CONTACTS_LOAD, "host_contacts_load"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_ARCHIVED_CHAT_LIST_LOAD, "host_archived_chat_list_load"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_PROFILE_LOAD, "host_profile_load"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_PROFILE_READ, "host_profile_read"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_OPEN, "host_timeline_open"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_PAGE, "host_timeline_page"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_HANDOFF, "host_timeline_handoff"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_TIMELINE_APPLY, "host_timeline_apply"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_MESSAGE_SEND, "host_message_send"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_MESSAGE_SEARCH, "host_message_search"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_SEARCH, "host_conversation_search"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_QUEUE_WAIT, "host_media_queue_wait"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_PREPARE, "host_media_prepare"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_LOAD, "host_media_load"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_CACHE_READ, "host_media_cache_read"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_DECODE, "host_media_decode"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_MEDIA_APPLY, "host_media_apply"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_VAULT_DERIVE_KEY, "host_linux_vault_derive_key"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_VAULT_OPEN, "host_linux_vault_open"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_VAULT_CREATE, "host_linux_vault_create"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_LINUX_VAULT_PERSIST, "host_linux_vault_persist"},
+        {MARMOT_HOST_PERFORMANCE_OPERATION_SETTINGS_SAVE, "host_settings_save"},
+    };
+    for (uintptr_t i = 0; i < sizeof(host_stages) / sizeof(host_stages[0]); i++) {
+        st = marmot_record_host_performance(client, host_stages[i].operation, i + 1,
+            MARMOT_HOST_PERFORMANCE_OUTCOME_FAILURE);
+        check(st == MARMOT_STATUS_OK, "host stage accepted");
+    }
     MarmotAppPerformanceSnapshot *performance = NULL;
     st = marmot_app_performance_snapshot(client, &performance);
     check(st == MARMOT_STATUS_OK && performance != NULL, "runtime performance snapshot");
     bool found_timing = false;
     if (performance != NULL) {
+        for (uintptr_t i = 0; i < sizeof(host_stages) / sizeof(host_stages[0]); i++) {
+            const MarmotRuntimePerformanceSnapshot *stage = NULL;
+            for (uintptr_t j = 0; j < performance->runtime_operations_len; j++) {
+                if (strcmp(performance->runtime_operations[j].operation, host_stages[i].name) == 0) {
+                    stage = &performance->runtime_operations[j];
+                    break;
+                }
+            }
+            check(stage != NULL && stage->started == 1 && stage->completed == 1 &&
+                stage->failures == 1 && stage->duration_ms.sum_ms == i + 1 &&
+                stage->duration_ms.buckets_len > 0, "host stage snapshot");
+        }
         for (uintptr_t i = 0; i < performance->runtime_operations_len; i++) {
             const MarmotRuntimePerformanceSnapshot *timing = &performance->runtime_operations[i];
             if (strcmp(timing->operation, "host_conversation_composer_ready") == 0) {

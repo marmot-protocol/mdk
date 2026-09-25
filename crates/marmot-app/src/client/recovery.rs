@@ -191,6 +191,9 @@ pub(crate) struct AttemptGrant {
     pub(super) rotation_claim: Option<storage_sqlite::TransportReconciliationRoute>,
     pub(super) inventory: Vec<FrozenRecoveryInventory>,
     loss: Vec<GrantedLoss>,
+    /// Exact-ID side-channel acquisition does not replace installed live
+    /// maintenance subscriptions or their session-bound observations.
+    preserve_maintenance_observations: bool,
     _live: Arc<()>,
     admission: Option<Arc<RecoveryAdmissionSnapshot>>,
 }
@@ -307,15 +310,22 @@ impl AccountRecoveryOwner {
 
     /// Wall clock is sampled only on open. Later wall-clock corrections cannot
     /// repeatedly reopen the authorization gate within this process.
+    pub(crate) fn retry_remaining(
+        &self,
+        storage: &SqliteAccountStorage,
+        now: Instant,
+    ) -> StorageResult<Duration> {
+        Ok(Duration::from_millis(
+            storage
+                .recovery_retry_state()?
+                .not_before_ms
+                .saturating_sub(self.logical_now_ms(now)?),
+        ))
+    }
+
     #[cfg(any(test, feature = "test-policy-overrides"))]
     pub(crate) fn test_retry_remaining(&self, storage: &SqliteAccountStorage) -> Duration {
-        Duration::from_millis(
-            storage
-                .recovery_retry_state()
-                .unwrap()
-                .not_before_ms
-                .saturating_sub(self.logical_now_ms(Instant::now()).unwrap()),
-        )
+        self.retry_remaining(storage, Instant::now()).unwrap()
     }
 
     #[cfg(test)]
@@ -348,6 +358,20 @@ impl AccountRecoveryOwner {
         readiness: RecoveryReadiness,
         now: Instant,
         explicit: Option<&mut ExplicitRecoveryPermit>,
+    ) -> StorageResult<Option<AttemptGrant>> {
+        self.select_authorized_attempt_for(storage, readiness, now, explicit, None)
+    }
+
+    /// A bounded executor may accept only its exact selected obligation. The
+    /// owner still applies its normal ordering and pacing; a different winner
+    /// returns before a retry reservation is spent.
+    pub(crate) fn select_authorized_attempt_for(
+        &mut self,
+        storage: &SqliteAccountStorage,
+        readiness: RecoveryReadiness,
+        now: Instant,
+        explicit: Option<&mut ExplicitRecoveryPermit>,
+        required: Option<[u8; 16]>,
     ) -> StorageResult<Option<AttemptGrant>> {
         if self.active.upgrade().is_some() {
             return Ok(None);
@@ -388,7 +412,7 @@ impl AccountRecoveryOwner {
             {
                 return Ok::<_, StorageError>(None);
             }
-            if self.mode == RecoveryExecutorMode::Normal {
+            if self.mode == RecoveryExecutorMode::Normal && required.is_none() {
                 let maintenance = self
                     .maintenance_observations
                     .values()
@@ -411,7 +435,9 @@ impl AccountRecoveryOwner {
                     .filter(|observation| demands.iter().any(|d| d.ticket.id == observation.id))
                     .map(|observation| observation.id)
                     .collect::<Vec<_>>();
-                storage.rearm_recovery_maintenance_for_activation(&displaced)?;
+                if required.is_none() {
+                    storage.rearm_recovery_maintenance_for_activation(&displaced)?;
+                }
                 let mut ordered = fence
                     .obligations
                     .iter()
@@ -446,6 +472,13 @@ impl AccountRecoveryOwner {
                     .map(|(_, _, id, revision)| (id, revision))
                     .collect();
             }
+            if required.is_some_and(|id| {
+                comparison_revision.is_some()
+                    || fence.obligations.len() != 1
+                    || fence.obligations[0].0 != id
+            }) {
+                return Ok(None);
+            }
             let reservation = storage.reserve_recovery_work(
                 &fence,
                 comparison_revision,
@@ -471,6 +504,7 @@ impl AccountRecoveryOwner {
             rotation_claim: None,
             inventory: Vec::new(),
             loss: Vec::new(),
+            preserve_maintenance_observations: required.is_some(),
             _live: live,
             admission: None,
         }))
@@ -579,7 +613,9 @@ impl AccountRecoveryOwner {
         grant.admission = Some(admission);
         // Reservation is durable retry cost, not permission to disturb an
         // installed session. Commit transient effects only after plan freeze.
-        self.maintenance_observations.clear();
+        if !grant.preserve_maintenance_observations {
+            self.maintenance_observations.clear();
+        }
         if let Some(permit) = explicit {
             permit.spent = true;
         }
@@ -1109,8 +1145,17 @@ impl AppClient {
     /// consumer before selecting a revision-fenced immutable history plan.
     pub(crate) fn authorize_account_recovery(
         &mut self,
+        explicit: Option<&mut ExplicitRecoveryPermit>,
+        seam: marmot_forensics::EpochBackfillExecutionSeam,
+    ) -> Result<Option<AttemptGrant>, AppError> {
+        self.authorize_account_recovery_for(explicit, seam, None)
+    }
+
+    pub(crate) fn authorize_account_recovery_for(
+        &mut self,
         mut explicit: Option<&mut ExplicitRecoveryPermit>,
         seam: marmot_forensics::EpochBackfillExecutionSeam,
+        required: Option<[u8; 16]>,
     ) -> Result<Option<AttemptGrant>, AppError> {
         // Wake collection retains the loaded live floor and leaves recovery
         // debt/pacing to an Advance runtime. Only the separate full-history
@@ -1163,12 +1208,22 @@ impl AppClient {
         } else {
             RecoveryReadiness::Waiting
         };
-        let selected = self.recovery_owner.select_authorized_attempt(
-            &storage,
-            readiness,
-            Instant::now(),
-            explicit.as_deref_mut(),
-        )?;
+        let selected = if required.is_some() {
+            self.recovery_owner.select_authorized_attempt_for(
+                &storage,
+                readiness,
+                Instant::now(),
+                explicit.as_deref_mut(),
+                required,
+            )?
+        } else {
+            self.recovery_owner.select_authorized_attempt(
+                &storage,
+                readiness,
+                Instant::now(),
+                explicit.as_deref_mut(),
+            )?
+        };
         self.record_unavailable_epoch_observation(&storage)?;
         let Some(mut grant) = selected else {
             return Ok(None);
@@ -1476,6 +1531,60 @@ impl AppClient {
 mod tests {
     use super::*;
 
+    /// Compile-checked handoff shape only. The #1947 executor will submit the
+    /// owned events to the worker and return endpoint evidence to this owner.
+    #[test]
+    fn owned_acquisition_result_can_travel_with_an_existing_grant() {
+        use transport_nostr_adapter::{
+            NostrAcquisitionEnd, NostrAcquisitionEndpoint, NostrAcquisitionResult,
+            NostrAcquisitionStats,
+        };
+
+        fn stage_for_worker(
+            grant: AttemptGrant,
+            result: NostrAcquisitionResult,
+        ) -> (
+            AttemptGrant,
+            Vec<transport_nostr_peeler::NostrTransportEvent>,
+            Vec<NostrAcquisitionEndpoint>,
+        ) {
+            let mut endpoints = result.endpoints;
+            let events = endpoints
+                .iter_mut()
+                .flat_map(|endpoint| std::mem::take(&mut endpoint.events))
+                .collect();
+            (grant, events, endpoints)
+        }
+
+        let (storage, mut owner, now) = fixture();
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+            .unwrap()
+            .unwrap();
+        let attempt = grant.reservation.attempt_serial;
+        let result = NostrAcquisitionResult {
+            endpoints: vec![NostrAcquisitionEndpoint {
+                endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+                session_generation: Some(12),
+                events: vec![transport_nostr_peeler::NostrTransportEvent {
+                    id: "03".repeat(32),
+                    pubkey: "04".repeat(32),
+                    created_at: 1,
+                    kind: 445,
+                    tags: Vec::new(),
+                    content: "owned bytes".into(),
+                    sig: None,
+                }],
+                end: NostrAcquisitionEnd::ByteLimitReached,
+                stats: NostrAcquisitionStats::default(),
+            }],
+        };
+        let (grant, worker_input, endpoints) = stage_for_worker(grant, result);
+        assert_eq!(grant.reservation.attempt_serial, attempt);
+        assert_eq!(worker_input.len(), 1);
+        assert_eq!(endpoints[0].end, NostrAcquisitionEnd::ByteLimitReached);
+    }
+
     fn fixture() -> (SqliteAccountStorage, AccountRecoveryOwner, Instant) {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         storage.ensure_account_projection("alice").unwrap();
@@ -1485,6 +1594,236 @@ mod tests {
         let now = Instant::now();
         let owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
         (storage, owner, now)
+    }
+
+    #[test]
+    fn bounded_executor_does_not_spend_an_unrelated_owner_selection() {
+        let (storage, mut owner, now) = fixture();
+        assert_eq!(owner.mode, RecoveryExecutorMode::Normal);
+        assert!(
+            owner
+                .select_authorized_attempt_for(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    now,
+                    None,
+                    Some([99; 16]),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 0);
+        assert_eq!(owner.mode, RecoveryExecutorMode::Normal);
+        assert!(
+            owner
+                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn bounded_grant_freeze_preserves_live_maintenance_observation() {
+        let (storage, mut owner, now) = fixture();
+        let selected = storage.pending_recovery_demands().unwrap()[0].ticket.id;
+        let grant = owner
+            .select_authorized_attempt_for(
+                &storage,
+                RecoveryReadiness::Ready,
+                now,
+                None,
+                Some(selected),
+            )
+            .unwrap()
+            .unwrap();
+        let group = cgka_traits::GroupId::new(vec![7; 16]);
+        owner.maintenance_observations.insert(
+            group.clone(),
+            MaintenanceRecoveryObservation {
+                fence: grant.fence.clone(),
+                attempt_serial: grant.reservation.attempt_serial,
+                id: [8; 16],
+                scopes: Vec::new(),
+            },
+        );
+        let goal = RecoveryScopePlan {
+            scope_id: 0,
+            route_kind: 0,
+            route_role: 0,
+            group_id: None,
+            transport_group_id: None,
+            since_seconds: None,
+            until_seconds: 1,
+            known_event_id: None,
+            inventory_floor: None,
+            required_endpoints: vec!["relay".into()],
+            admitted_endpoints: vec!["relay".into()],
+        };
+        assert!(
+            owner
+                .freeze_plan(&storage, grant, vec![(selected, vec![goal])], None)
+                .unwrap()
+                .is_some()
+        );
+        assert!(owner.maintenance_observations.contains_key(&group));
+    }
+
+    #[tokio::test]
+    async fn bounded_grant_keeps_installed_maintenance_boundary_checkpointable() {
+        use storage_sqlite::{
+            RecoveryEndpointCheckpoint, RecoveryRequest, RecoveryScopeCheckpoint,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+        let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+        let group = client.create_group("maintenance", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let maintenance = storage
+            .request_recovery(
+                RecoveryRequest::MaintenanceBoundary {
+                    job_id: &[1],
+                    group_id: group.as_slice(),
+                },
+                1_000_000,
+            )
+            .unwrap();
+        let now = Instant::now();
+        let mut owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+            .unwrap()
+            .unwrap();
+        let goal = RecoveryScopePlan {
+            scope_id: 0,
+            route_kind: 1,
+            route_role: 0,
+            group_id: Some(group.as_slice().to_vec()),
+            transport_group_id: Some([9; 32]),
+            since_seconds: None,
+            until_seconds: 1_000,
+            known_event_id: None,
+            inventory_floor: None,
+            required_endpoints: vec!["relay".into()],
+            admitted_endpoints: vec!["relay".into()],
+        };
+        let goals = grant
+            .fence
+            .obligations
+            .iter()
+            .map(|(id, _)| (*id, vec![goal.clone()]))
+            .collect();
+        let grant = owner
+            .freeze_plan(&storage, grant, goals, None)
+            .unwrap()
+            .unwrap();
+        let prior_scope = grant
+            .plan()
+            .unwrap()
+            .iter()
+            .find(|obligation| obligation.id == maintenance.id)
+            .unwrap()
+            .scopes[0]
+            .clone();
+        assert!(
+            !storage
+                .checkpoint_recovery_obligation(
+                    &grant.fence,
+                    grant.reservation.attempt_serial,
+                    maintenance.id,
+                    &[RecoveryScopeCheckpoint {
+                        token: prior_scope.token.clone(),
+                        endpoints: Vec::new(),
+                        retained_known_event: false,
+                    }],
+                    storage_sqlite::RecoveryEligibility::WaitingCapability,
+                )
+                .unwrap()
+        );
+        owner.maintenance_observations.insert(
+            group.clone(),
+            MaintenanceRecoveryObservation {
+                fence: grant.fence.clone(),
+                attempt_serial: grant.reservation.attempt_serial,
+                id: maintenance.id,
+                scopes: vec![prior_scope.clone()],
+            },
+        );
+        let installed = owner.maintenance_observations[&group].clone();
+        drop(grant);
+        let known_id = [3; 32];
+        let known = storage
+            .request_recovery(
+                RecoveryRequest::KnownEvent {
+                    group_id: group.as_slice(),
+                    event_id: &known_id,
+                },
+                1_000_001,
+            )
+            .unwrap();
+        let bounded = owner
+            .select_authorized_attempt_for(
+                &storage,
+                RecoveryReadiness::Ready,
+                now + Duration::from_secs(15),
+                None,
+                Some(known.id),
+            )
+            .unwrap()
+            .unwrap();
+        let bounded_goal = RecoveryScopePlan {
+            known_event_id: Some(known_id),
+            ..goal
+        };
+        let bounded = owner
+            .freeze_plan(
+                &storage,
+                bounded,
+                vec![(known.id, vec![bounded_goal])],
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(bounded.plan().unwrap()[0].id, known.id);
+        assert_eq!(
+            owner.maintenance_observations[&group].attempt_serial,
+            installed.attempt_serial
+        );
+        assert_eq!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.ticket.id == maintenance.id)
+                .unwrap()
+                .ticket
+                .revision,
+            maintenance.revision
+        );
+        assert!(
+            storage
+                .checkpoint_recovery_obligation(
+                    &installed.fence,
+                    installed.attempt_serial,
+                    installed.id,
+                    &[RecoveryScopeCheckpoint {
+                        token: prior_scope.token,
+                        endpoints: vec![RecoveryEndpointCheckpoint {
+                            endpoint: "relay".into(),
+                            outcome: storage_sqlite::RecoveryScopeOutcome::Partial,
+                            exhaustive: false,
+                            admission_complete: false,
+                            first_boundary: true,
+                        }],
+                        retained_known_event: false,
+                    }],
+                    storage_sqlite::RecoveryEligibility::Retry,
+                )
+                .unwrap()
+        );
     }
 
     fn policy() -> RecoveryRetryPolicy {
@@ -1824,6 +2163,42 @@ mod tests {
         );
         drop(grant);
         let old = owner.maintenance_observations[&group].clone();
+        let maintenance_before = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.ticket.id == ticket.id)
+            .unwrap()
+            .ticket
+            .revision;
+        assert!(
+            owner
+                .select_authorized_attempt_for(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    now + Duration::from_secs(15),
+                    None,
+                    Some([99; 16]),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.ticket.id == ticket.id)
+                .unwrap()
+                .ticket
+                .revision,
+            maintenance_before,
+            "a declined exact-ID selection must not rearm a live maintenance session"
+        );
+        assert_eq!(
+            owner.maintenance_observations[&group].attempt_serial,
+            old.attempt_serial
+        );
         let mut permit = ExplicitRecoveryPermit::default();
         let rejected = owner
             .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, Some(&mut permit))

@@ -1,40 +1,34 @@
 //! Device-wide logical publish counters for one relay-plane adapter.
 //!
 //! One attempt is one validated publish that has entered its relay client.
-//! Endpoint fanout and SDK retries stay inside that call. The mutex is
-//! synchronous and is never held across `.await` or inside a user callback, so
-//! dropping an in-flight publish can record its failure without an async
-//! runtime.
+//! Endpoint fanout and SDK retries stay inside that call. Every attempt ends as
+//! exactly one success, failure, or cancellation. The mutex is synchronous and
+//! is never held across `.await` or inside a user callback, so dropping an
+//! in-flight publish can record its cancellation without an async runtime.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Coherent view of the three aggregate publish counters.
+/// Coherent view of the aggregate publish counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PublishCounterSnapshot {
     pub attempts: usize,
     pub successes: usize,
     pub failures: usize,
-}
-
-#[derive(Default)]
-struct PublishCounters {
-    attempts: usize,
-    successes: usize,
-    failures: usize,
+    pub cancellations: usize,
 }
 
 pub(crate) struct PublishAccounting {
-    inner: Mutex<PublishCounters>,
+    inner: Mutex<PublishCounterSnapshot>,
 }
 
 impl PublishAccounting {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(PublishCounters::default()),
+            inner: Mutex::new(PublishCounterSnapshot::default()),
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, PublishCounters> {
+    fn lock(&self) -> MutexGuard<'_, PublishCounterSnapshot> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -53,12 +47,7 @@ impl PublishAccounting {
     }
 
     pub(crate) fn snapshot(&self) -> PublishCounterSnapshot {
-        let counters = self.lock();
-        PublishCounterSnapshot {
-            attempts: counters.attempts,
-            successes: counters.successes,
-            failures: counters.failures,
-        }
+        *self.lock()
     }
 }
 
@@ -69,37 +58,30 @@ pub(crate) struct PublishAttemptGuard {
 
 impl PublishAttemptGuard {
     pub(crate) fn succeed(&mut self) {
-        self.finish(true);
+        self.finish(|counters| &mut counters.successes);
     }
 
     pub(crate) fn fail(&mut self) {
-        self.finish(false);
+        self.finish(|counters| &mut counters.failures);
     }
 
-    fn finish(&mut self, success: bool) {
+    fn finish(&mut self, counter: fn(&mut PublishCounterSnapshot) -> &mut usize) {
         if !self.open {
             return;
         }
         // Disarm before the increment so a panic in this section cannot also
-        // count a failure from `Drop`.
+        // count a cancellation from `Drop`.
         self.open = false;
         let mut counters = self.accounting.lock();
-        if success {
-            counters.successes = counters.successes.saturating_add(1);
-        } else {
-            counters.failures = counters.failures.saturating_add(1);
-        }
+        let value = counter(&mut counters);
+        *value = value.saturating_add(1);
     }
 }
 
 impl Drop for PublishAttemptGuard {
+    /// The caller dropped a started publish before the client returned.
     fn drop(&mut self) {
-        if !self.open {
-            return;
-        }
-        self.open = false;
-        let mut counters = self.accounting.lock();
-        counters.failures = counters.failures.saturating_add(1);
+        self.finish(|counters| &mut counters.cancellations);
     }
 }
 

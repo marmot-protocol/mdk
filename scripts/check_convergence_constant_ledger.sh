@@ -10,7 +10,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 inventory_path="docs/marmot-architecture/convergence-constant-inventory.txt"
 plan_path="docs/marmot-architecture/convergence-reliability-plan.md"
 # A10 includes #1946 qualified local observations; no new numeric policy or ledger id.
-expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10)
+expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11)
 inventory_pairs=("__inventory_sentinel__")
 inventory_ids=()
 fail=0
@@ -123,6 +123,9 @@ discover_constants \
 discover_constants \
     "crates/marmot-app/src/runtime/account_worker.rs" \
     "(CONVERGENCE_[A-Z0-9_]+|MIN_CONVERGENCE_[A-Z0-9_]+|IDLE_CONVERGENCE_[A-Z0-9_]+)"
+discover_constants \
+    "crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs" \
+    "(MAX_[A-Z0-9_]+|ADMISSION_YIELD_DELAY|PROBE_INTERVAL)"
 discover_constants "crates/marmot-app/src/client/epoch_stall.rs" "EPOCH_STALL_[A-Z0-9_]+"
 discover_constants \
     "crates/marmot-app/src/lib.rs" \

@@ -49,6 +49,7 @@ tokio = { workspace = true, features = ["time"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 futures.workspace = true
+getrandom = { version = "0.2", features = ["js"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 openmls = { workspace = true, features = ["js"] }
 

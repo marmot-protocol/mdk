@@ -322,7 +322,7 @@ mod tests {
         let app = MarmotApp::with_relay(root.path(), relay_url.clone());
         let runtime = app.runtime();
         let kit = Marmot { app, runtime };
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let id = keys.public_key().to_hex();
         let snapshot = kit
             .begin_onboarding(
@@ -339,12 +339,19 @@ mod tests {
             .propose_onboarding_recommended_relays(id.clone(), OnboardingStepFfi::Relays)
             .await
             .expect("propose");
-        drop(relay);
+        // This binding test owns cancellation mapping. Capture the approved
+        // checkpoint directly so whether the relay becomes unavailable during
+        // inspection or publication cannot change the state under test.
+        patch_onboarding_checkpoint(root.path(), &id, |value| {
+            value["approved"] = serde_json::json!(true);
+        });
         let approved = kit
-            .approve_onboarding_repair(id.clone(), proposal.revision)
-            .await
-            .expect("approve after the relay is gone");
+            .onboarding_snapshot(id.clone())
+            .expect("approved snapshot")
+            .expect("approved attempt exists");
+        assert_eq!(approved.revision, proposal.revision);
         assert!(approved.proposal.is_some());
+        relay.shutdown();
         let subscription = kit
             .subscribe_onboarding(id.clone())
             .expect("subscribe approved");
@@ -391,7 +398,7 @@ mod tests {
             runtime: app.runtime(),
             app,
         };
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let id = keys.public_key().to_hex();
         kit.begin_onboarding(
             keys.secret_key().to_bech32().unwrap(),
@@ -427,6 +434,7 @@ mod tests {
                 .await
                 .is_err()
         );
+        relay.shutdown();
         drop(relay);
         let approved = kit
             .approve_onboarding_repair_in_epoch(id.clone(), proposal.revision, epoch.clone())

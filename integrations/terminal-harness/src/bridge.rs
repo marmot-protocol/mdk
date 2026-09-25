@@ -1619,6 +1619,14 @@ fn attachment_failure_reply(config: &Config, error: &HarnessError) -> String {
         HarnessError::AttachmentCountLimit => "too many attachments",
         HarnessError::AttachmentBytesLimit => "the attachment batch is too large",
         HarnessError::AttachmentUnsupported => "one or more attachment types are unsupported",
+        HarnessError::ControlTimedOut {
+            method: "download_media",
+        } => "an attachment download timed out",
+        HarnessError::ControlRejected {
+            method: "download_media",
+            ..
+        } => "the attachment download was rejected by the connector",
+        HarnessError::AttachmentInvalid => "a downloaded attachment failed local validation",
         _ => "an attachment could not be downloaded and validated",
     };
     format!(
@@ -2118,9 +2126,27 @@ async fn handle_backend_run_failure(
                 config.spec.reply_prefix, config.spec.display_name, config.spec.bin_env_name
             )
         }
+        HarnessError::AttachmentInvalid => format!(
+            "[{}] the staged attachment changed or is invalid; retry the upload. No backend turn was started.",
+            config.spec.reply_prefix
+        ),
         HarnessError::AttachmentUnsupported => format!(
             "[{}] {} does not support this attachment batch; no backend turn was started.",
             config.spec.reply_prefix, config.spec.display_name
+        ),
+        HarnessError::AttachmentBackendCapabilityUnsupported { capability } => format!(
+            "[{}] {} does not expose the required {} attachment capability; upgrade {} and retry. No backend turn was started.",
+            config.spec.reply_prefix,
+            config.spec.display_name,
+            capability,
+            config.spec.display_name
+        ),
+        HarnessError::AttachmentBackendCapabilityProbeFailed { capability } => format!(
+            "[{}] could not verify {}'s required {} attachment capability; check {} and retry. No backend turn was started.",
+            config.spec.reply_prefix,
+            config.spec.display_name,
+            capability,
+            config.spec.bin_env_name
         ),
         _ => {
             if let Some(session_id) = resumable_session {
@@ -2845,6 +2871,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn attachment_failure_reply_distinguishes_download_and_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let timed_out = attachment_failure_reply(
+            &config,
+            &HarnessError::ControlTimedOut {
+                method: "download_media",
+            },
+        );
+        assert!(timed_out.contains("attachment download timed out"));
+        let rejected = attachment_failure_reply(
+            &config,
+            &HarnessError::ControlRejected {
+                method: "download_media",
+                code: "app_error".to_owned(),
+            },
+        );
+        assert!(rejected.contains("download was rejected"));
+        assert!(!rejected.contains("app_error"));
+        let invalid = attachment_failure_reply(&config, &HarnessError::AttachmentInvalid);
+        assert!(invalid.contains("failed local validation"));
+        assert!(timed_out.ends_with("no backend turn was started."));
+        assert!(rejected.ends_with("no backend turn was started."));
+        assert!(invalid.ends_with("no backend turn was started."));
+    }
+
     struct NoopBackend;
 
     struct ScriptedArtifactBackend {
@@ -2983,6 +3036,33 @@ mod tests {
         batches: Mutex<Vec<Vec<AttachmentSnapshot>>>,
     }
 
+    struct CapabilityProbeFailingAttachmentBackend;
+
+    #[async_trait]
+    impl Backend for CapabilityProbeFailingAttachmentBackend {
+        async fn run(
+            &self,
+            _invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            unreachable!("attachment test must use run_with_attachments")
+        }
+
+        async fn run_with_attachments(
+            &self,
+            invocation: Invocation,
+            _attachments: Vec<Attachment>,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            Err(RunFailure {
+                error: HarnessError::AttachmentBackendCapabilityProbeFailed {
+                    capability: "native image input",
+                },
+                observed_session: invocation.session_id,
+            })
+        }
+    }
+
     #[async_trait]
     impl Backend for RecordingAttachmentBackend {
         async fn run(
@@ -3000,6 +3080,23 @@ mod tests {
             _tx: mpsc::Sender<RunnerEvent>,
         ) -> std::result::Result<Outcome, RunFailure> {
             use std::os::unix::fs::PermissionsExt as _;
+
+            let mut reader = tokio::process::Command::new("/bin/sh");
+            reader
+                .arg("-c")
+                .arg("for path in \"$@\"; do cat -- \"$path\" >/dev/null || exit; done")
+                .arg("attachment-reader");
+            for attachment in &attachments {
+                reader.arg(&attachment.path);
+            }
+            let status = reader
+                .status()
+                .await
+                .expect("fake backend process must start");
+            assert!(
+                status.success(),
+                "fake backend process must read every file"
+            );
 
             let snapshots = attachments
                 .into_iter()
@@ -3522,7 +3619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_attachment_turn_preserves_order_privacy_and_cleanup() {
+    async fn successful_attachment_process_turn_preserves_order_privacy_and_cleanup() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = tempfile::tempdir().unwrap();
@@ -3665,6 +3762,63 @@ mod tests {
         );
         assert!(backend.invocations.lock().await.is_empty());
         assert!(ctx.recovery.get("group").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attachment_capability_probe_failure_cleans_staging_without_persisting_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let source = root.path().join("source.png");
+        fs_private::write_private(&source, b"image").unwrap();
+        let config = test_config(root.path());
+        let server = spawn_attachment_server(
+            &config.socket,
+            vec![DownloadedMedia {
+                path: source,
+                media_type: "image/png".to_owned(),
+                file_name: "image.png".to_owned(),
+                size_bytes: 5,
+            }],
+        );
+        let backend = Arc::new(CapabilityProbeFailingAttachmentBackend);
+        let ctx = test_context_with_backend(root.path(), &home, config, backend);
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        ctx.sessions
+            .record_session("group", "session".to_owned(), repo)
+            .await
+            .unwrap();
+
+        assert!(
+            dispatch_test_message_with_media(
+                ctx.clone(),
+                "message",
+                "inspect image",
+                vec![test_media_ref("image")],
+            )
+            .await
+        );
+        let requests = server.await.unwrap();
+        let reply = requests
+            .iter()
+            .find_map(|request| match request {
+                AgentControlRequest::SendFinal { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("capability rejection must send a final reply");
+        assert_eq!(
+            reply,
+            "[wn-opencode] could not verify opencode's required native image input attachment capability; check WN_OPENCODE_BIN and retry. No backend turn was started."
+        );
+        assert!(ctx.recovery.get("group").await.is_none());
+        assert!(
+            fs::read_dir(&ctx.cfg.attachment_staging_root)
+                .unwrap()
+                .next()
+                .is_none(),
+            "pre-spawn capability failure must drop the staged batch"
+        );
     }
 
     #[tokio::test]
@@ -4644,6 +4798,39 @@ mod tests {
             recovery.get("invalid").await.unwrap().status,
             RecoveryStatus::Pending
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_attachment_before_spawn_does_not_persist_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let sessions = SessionStore::load(home.join("sessions.json"), &home).unwrap();
+        let recovery = RecoveryStore::load(home.join("recovery.json")).unwrap();
+        let config = test_config(&home);
+        sessions
+            .record_session("group1", "existing-session".to_owned(), home.clone())
+            .await
+            .unwrap();
+        let known_session = sessions.get("group1").await.unwrap();
+        let reply = handle_backend_run_failure(
+            FailureRecoveryContext {
+                config: &config,
+                sessions: &sessions,
+                recovery: &recovery,
+            },
+            "group1",
+            Some(&known_session),
+            home,
+            "prompt".to_owned(),
+            Vec::new(),
+            &RunFailure {
+                error: HarnessError::AttachmentInvalid,
+                observed_session: None,
+            },
+        )
+        .await;
+        assert!(reply.contains("No backend turn was started."));
+        assert!(recovery.get("group1").await.is_none());
     }
 
     #[tokio::test]

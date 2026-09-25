@@ -76,6 +76,8 @@ pub mod metric_names {
     pub const PUBLISH_SUCCESSES: &str = "relay_publish_successes";
     /// Device-wide failed publishes (monotonic).
     pub const PUBLISH_FAILURES: &str = "relay_publish_failures";
+    /// Device-wide publishes dropped by their caller in flight (monotonic).
+    pub const PUBLISH_CANCELLATIONS: &str = "relay_publish_cancellations";
     /// Engine settle episodes (monotonic).
     pub const SETTLES: &str = "relay_settles";
     /// Engine post-settle reorgs (monotonic).
@@ -974,6 +976,10 @@ pub fn build_export_batch(
         (metric_names::PUBLISH_ATTEMPTS, rollup.publish_attempts),
         (metric_names::PUBLISH_SUCCESSES, rollup.publish_successes),
         (metric_names::PUBLISH_FAILURES, rollup.publish_failures),
+        (
+            metric_names::PUBLISH_CANCELLATIONS,
+            rollup.publish_cancellations,
+        ),
         (metric_names::MESSAGE_OBSERVED, rollup.messages_observed),
         (
             metric_names::MESSAGE_CORROBORATED,
@@ -2478,6 +2484,7 @@ mod otlp {
             assert_eq!(primed_value(metric_names::PUBLISH_ATTEMPTS), 0);
             assert_eq!(primed_value(metric_names::PUBLISH_SUCCESSES), 0);
             assert_eq!(primed_value(metric_names::PUBLISH_FAILURES), 0);
+            assert_eq!(primed_value(metric_names::PUBLISH_CANCELLATIONS), 0);
 
             fixture
                 .publish(PublishScript::Accept, 1)
@@ -2487,6 +2494,7 @@ mod otlp {
                 .publish(PublishScript::Error, 1)
                 .await
                 .expect_err("failure");
+            fixture.cancel_in_flight().await;
             let (delta, started) = exporter.since_baseline(exporter.build_batch(None).await);
             let start_ns = started
                 .duration_since(UNIX_EPOCH)
@@ -2525,9 +2533,10 @@ mod otlp {
                     ref other => panic!("{name} value {other:?}"),
                 }
             };
-            assert_eq!(sum(metric_names::PUBLISH_ATTEMPTS), 2);
+            assert_eq!(sum(metric_names::PUBLISH_ATTEMPTS), 3);
             assert_eq!(sum(metric_names::PUBLISH_SUCCESSES), 1);
             assert_eq!(sum(metric_names::PUBLISH_FAILURES), 1);
+            assert_eq!(sum(metric_names::PUBLISH_CANCELLATIONS), 1);
         }
     }
 }

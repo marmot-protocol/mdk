@@ -12,6 +12,8 @@ use cgka_traits::{
     TransportGroupSubscription, TransportPublishReport, TransportPublishRequest,
     TransportPublishTarget,
 };
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient};
@@ -32,6 +34,7 @@ pub(crate) enum PublishScript {
 
 pub(crate) struct CountingClient {
     pub calls: AtomicUsize,
+    accounts: StdMutex<Vec<MemberId>>,
     script: StdMutex<PublishScript>,
     entered: StdMutex<Option<oneshot::Sender<()>>>,
     release: StdMutex<Option<oneshot::Receiver<()>>>,
@@ -41,6 +44,7 @@ impl CountingClient {
     pub(crate) fn new(script: PublishScript) -> Arc<Self> {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
+            accounts: StdMutex::new(Vec::new()),
             script: StdMutex::new(script),
             entered: StdMutex::new(None),
             release: StdMutex::new(None),
@@ -82,6 +86,20 @@ impl NostrRelayClient for CountingClient {
         _account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
         Ok(())
+    }
+
+    async fn publish_event_for_account(
+        &self,
+        account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.accounts
+            .lock()
+            .expect("accounts lock")
+            .push(account_id.clone());
+        self.publish_event(endpoints, event, required_acks).await
     }
 
     async fn publish_event(
@@ -190,14 +208,28 @@ impl AccountPublishFixture {
         self.client.set_script(script);
         self.adapter.publish(self.request(required_acks)).await
     }
+
+    /// Start one account publish, wait until it is inside the relay client,
+    /// then drop it.
+    pub(crate) async fn cancel_in_flight(&self) {
+        let (entered, _release) = self.client.arm_wait();
+        let adapter = self.adapter.clone();
+        let request = self.request(1);
+        let task = tokio::spawn(async move { adapter.publish(request).await });
+        entered.await.expect("account client entered");
+        task.abort();
+        let _ = task.await;
+    }
 }
 
-async fn counts(plane: &MarmotRelayPlane) -> (usize, usize, usize) {
+/// `(attempts, successes, failures, cancellations)`.
+async fn counts(plane: &MarmotRelayPlane) -> (usize, usize, usize, usize) {
     let metrics = plane.relay_telemetry().await.metrics;
     (
         metrics.publish_attempts,
         metrics.publish_successes,
         metrics.publish_failures,
+        metrics.publish_cancellations,
     )
 }
 
@@ -225,15 +257,16 @@ async fn account_publish_classifies_against_met_required_acks() {
         .await
         .expect("admitted publish");
     assert!(admitted.met_required_acks());
-    assert_eq!(counts(&fixture.plane).await, (1, 1, 0));
+    assert_eq!(counts(&fixture.plane).await, (1, 1, 0, 0));
     let rollup = fixture.plane.telemetry_rollup(None).await;
     assert_eq!(
         (
             rollup.publish_attempts,
             rollup.publish_successes,
-            rollup.publish_failures
+            rollup.publish_failures,
+            rollup.publish_cancellations,
         ),
-        (1, 1, 0)
+        (1, 1, 0, 0)
     );
 
     let rejected = fixture
@@ -284,7 +317,15 @@ async fn account_publish_classifies_against_met_required_acks() {
         .await
         .expect_err("client error is unchanged");
     assert!(matches!(error, TransportAdapterError::Publish(message) if message == "scripted"));
-    assert_eq!(counts(&fixture.plane).await, (7, 3, 4));
+    assert_eq!(counts(&fixture.plane).await, (7, 3, 4, 0));
+    let accounts = fixture.client.accounts.lock().expect("accounts lock");
+    assert_eq!(accounts.len(), 7);
+    assert!(
+        accounts
+            .iter()
+            .all(|account| *account == fixture.account_id),
+        "the account adapter publishes under its own authentication context"
+    );
 }
 
 #[tokio::test]
@@ -368,7 +409,7 @@ async fn account_admission_and_unpolled_future_do_not_publish() {
     let pending = fixture.adapter.publish(fixture.request(1));
     drop(pending);
     assert_eq!(fixture.client.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(counts(&fixture.plane).await, (0, 0, 0));
+    assert_eq!(counts(&fixture.plane).await, (0, 0, 0, 0));
 }
 
 #[tokio::test]
@@ -379,21 +420,47 @@ async fn account_and_direct_cancellation_finalize_without_double_counting() {
     let request = fixture.request(1);
     let task = tokio::spawn(async move { adapter.publish(request).await });
     entered.await.expect("account client entered");
-    assert_eq!(counts(&fixture.plane).await, (1, 0, 0));
+    assert_eq!(counts(&fixture.plane).await, (1, 0, 0, 0));
     task.abort();
     let _ = task.await;
-    assert_eq!(counts(&fixture.plane).await, (1, 0, 1));
+    assert_eq!(counts(&fixture.plane).await, (1, 0, 0, 1));
 
     let (entered, _release) = fixture.client.arm_wait();
     let direct = fixture.plane.inner.transport.adapter.clone();
     let request = fixture.request(1);
     let task = tokio::spawn(async move { direct.publish(request).await });
     entered.await.expect("direct client entered");
-    assert_eq!(counts(&fixture.plane).await, (2, 0, 1));
+    assert_eq!(counts(&fixture.plane).await, (2, 0, 0, 1));
     task.abort();
     let _ = task.await;
-    assert_eq!(counts(&fixture.plane).await, (2, 0, 2));
+    assert_eq!(counts(&fixture.plane).await, (2, 0, 0, 2));
     assert_eq!(fixture.client.calls.load(Ordering::SeqCst), 2);
+}
+
+/// The account runtime publishes one single-endpoint request per relay and
+/// drops the unfinished ones once the acknowledgement goal is met (see
+/// `drive_outbound_fanout` in `marmot-account`). Those abandoned calls are
+/// cancellations, not relay failures, so a healthy multi-relay send does not
+/// inflate `publish_failures`.
+#[tokio::test]
+async fn quorum_early_release_counts_cancellations_not_failures() {
+    let fixture = AccountPublishFixture::activate().await;
+    let (mut entered, _release) = fixture.client.arm_wait();
+    let mut attempts = (0..2)
+        .map(|_| fixture.adapter.publish(fixture.request(1)))
+        .collect::<FuturesUnordered<_>>();
+    let first = attempts
+        .next()
+        .await
+        .expect("one attempt")
+        .expect("unblocked endpoint accepts");
+    assert!(first.met_required_acks());
+    entered
+        .try_recv()
+        .expect("the other endpoint entered its relay client");
+    assert_eq!(counts(&fixture.plane).await, (2, 1, 0, 0));
+    drop(attempts);
+    assert_eq!(counts(&fixture.plane).await, (2, 1, 0, 1));
 }
 
 #[tokio::test]
@@ -424,8 +491,9 @@ async fn cancellation_during_local_fanout_keeps_the_success() {
     let task = tokio::spawn(async move { adapter.publish(request).await });
     timeout(Duration::from_secs(2), async {
         loop {
-            let (attempts, successes, failures) = counts(&fixture.plane).await;
-            if attempts == 1 && successes == 1 && failures == 0 && !task.is_finished() {
+            let (attempts, successes, failures, cancellations) = counts(&fixture.plane).await;
+            if (attempts, successes, failures, cancellations) == (1, 1, 0, 0) && !task.is_finished()
+            {
                 break;
             }
             tokio::task::yield_now().await;
@@ -435,7 +503,7 @@ async fn cancellation_during_local_fanout_keeps_the_success() {
     .expect("network accounting completed while local fanout is blocked");
     task.abort();
     let _ = task.await;
-    assert_eq!(counts(&fixture.plane).await, (1, 1, 0));
+    assert_eq!(counts(&fixture.plane).await, (1, 1, 0, 0));
 }
 
 #[tokio::test]
@@ -490,7 +558,7 @@ async fn successful_fanout_delivers_once_per_route_and_keeps_the_message_id() {
         .expect("overlapping publish");
     assert_eq!(report.message_id, canonical);
     assert_eq!(client.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(counts(&plane).await, (1, 1, 0));
+    assert_eq!(counts(&plane).await, (1, 1, 0, 0));
 
     for (adapter, account_id) in [(alice, alice_id), (bob, bob_id)] {
         let delivery = timeout(Duration::from_secs(1), adapter.receive())
@@ -548,7 +616,7 @@ async fn rejected_and_failed_publishes_do_not_invent_local_delivery() {
         .await
         .expect_err("publish error");
     assert!(matches!(error, TransportAdapterError::Publish(message) if message == "scripted"));
-    assert_eq!(counts(&fixture.plane).await, (2, 0, 2));
+    assert_eq!(counts(&fixture.plane).await, (2, 0, 2, 0));
     assert!(
         timeout(Duration::from_millis(50), bob.receive())
             .await
@@ -596,15 +664,15 @@ async fn account_and_direct_clones_share_one_counter() {
     c.expect("direct a");
     d.expect("direct b");
     assert_eq!(fixture.client.calls.load(Ordering::SeqCst), 4);
-    assert_eq!(counts(&fixture.plane).await, (4, 4, 0));
+    assert_eq!(counts(&fixture.plane).await, (4, 4, 0, 0));
 
     let (entered, release) = fixture.client.arm_wait();
     let pending_adapter = fixture.adapter.clone();
     let pending_request = fixture.request(1);
     let task = tokio::spawn(async move { pending_adapter.publish(pending_request).await });
     entered.await.expect("pending publish entered");
-    assert_eq!(counts(&fixture.plane).await, (5, 4, 0));
+    assert_eq!(counts(&fixture.plane).await, (5, 4, 0, 0));
     release.send(()).expect("release pending publish");
     task.await.expect("join").expect("pending publish");
-    assert_eq!(counts(&fixture.plane).await, (5, 5, 0));
+    assert_eq!(counts(&fixture.plane).await, (5, 5, 0, 0));
 }

@@ -207,13 +207,24 @@ The archive has a `marmotkit-android-<identifier>` root containing:
 - `kotlin/dev/ipf/marmotkit/MarmotAndroid.kt`
 - `kotlin/io/crates/keyring/Keyring.kt`
 - `jniLibs/<abi>/libmarmot_uniffi.so` for each supported ABI
+- `android-elf.json`
 - `manifest.json`
+
+`arm64-v8a` and `x86_64` libraries are linked so every ELF `PT_LOAD` segment is aligned to at least 16 KB.
+The linker flags are extra arguments on the final library build, so configured Cargo rustflags remain in effect.
+`armeabi-v7a` and `x86` stay on the NDK default page size. The four ABIs and the Kotlin API are unchanged.
+`android-elf.json` is a schema-1 report of the packaged bytes: each `jniLibs/<abi>/libmarmot_uniffi.so` entry has
+the library's lowercase SHA-256, ELF class, machine, and ordered `PT_LOAD` alignments. Compare those hashes with
+the files you stage. ZIP alignment of an app bundle does not repair a library whose load segments are still 4 KB.
 
 Verify the archive against its sibling `.sha256` before extracting it. Update the generated Kotlin helpers and all
 JNI ABI libraries together; mixing identifiers can cross an incompatible UniFFI ABI. The manifest records both the
 exact packaged source SHA and the workflow builder SHA. Its ordered `contents` contract lists the generated UniFFI
 Kotlin source and JNI libraries; the two required hand-written initialization helpers remain validated archive
-payloads but do not change that existing consumer-facing API contract.
+payloads but do not change that existing consumer-facing API contract. `elf_validation` names `android-elf.json`
+without adding that report to `contents`. Exact-head candidate packages from the release-profile workflow include
+the same report beside `manifest.txt` and the build provenance. Publishing a new formal or snapshot artifact, and
+adopting it in an Android app, remains a separate release step.
 
 ## Publishing
 

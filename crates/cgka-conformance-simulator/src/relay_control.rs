@@ -398,15 +398,21 @@ mod tests {
             publication_log: Arc::clone(&control.publication_log),
             hidden_event_ids: Arc::clone(&control.hidden_event_ids),
         };
-        let keys = nostr::Keys::generate();
-        let first = nostr::EventBuilder::new(Kind::MlsGroupMessage, "first admitted")
-            .custom_created_at(nostr::Timestamp::from_secs(200))
-            .sign_with_keys(&keys)
-            .unwrap();
-        let second = nostr::EventBuilder::new(Kind::MlsGroupMessage, "second admitted")
-            .custom_created_at(nostr::Timestamp::from_secs(100))
-            .sign_with_keys(&keys)
-            .unwrap();
+        let keys = nostr_relay_builder::prelude::Keys::generate();
+        let first = nostr_relay_builder::prelude::EventBuilder::new(
+            Kind::MlsGroupMessage,
+            "first admitted",
+        )
+        .custom_created_at(nostr_relay_builder::prelude::Timestamp::from_secs(200))
+        .sign_with_keys(&keys)
+        .unwrap();
+        let second = nostr_relay_builder::prelude::EventBuilder::new(
+            Kind::MlsGroupMessage,
+            "second admitted",
+        )
+        .custom_created_at(nostr_relay_builder::prelude::Timestamp::from_secs(100))
+        .sign_with_keys(&keys)
+        .unwrap();
 
         assert!(database.save_event(&first).await.unwrap().is_success());
         assert!(database.save_event(&second).await.unwrap().is_success());
@@ -461,11 +467,12 @@ mod tests {
             publication_log: Arc::clone(&control.publication_log),
             hidden_event_ids: Arc::clone(&control.hidden_event_ids),
         };
-        let keys = nostr::Keys::generate();
-        let group_message = nostr::EventBuilder::new(Kind::MlsGroupMessage, "commit")
-            .sign_with_keys(&keys)
-            .unwrap();
-        let welcome = nostr::EventBuilder::new(Kind::GiftWrap, "welcome")
+        let keys = nostr_relay_builder::prelude::Keys::generate();
+        let group_message =
+            nostr_relay_builder::prelude::EventBuilder::new(Kind::MlsGroupMessage, "commit")
+                .sign_with_keys(&keys)
+                .unwrap();
+        let welcome = nostr_relay_builder::prelude::EventBuilder::new(Kind::GiftWrap, "welcome")
             .sign_with_keys(&keys)
             .unwrap();
         assert!(
@@ -547,13 +554,19 @@ mod tests {
             publication_log: Arc::clone(&control.publication_log),
             hidden_event_ids: Arc::clone(&control.hidden_event_ids),
         };
-        let keys = nostr::Keys::generate();
-        let maintenance = nostr::EventBuilder::new(Kind::MlsGroupMessage, "queued maintenance")
-            .sign_with_keys(&keys)
-            .unwrap();
-        let current = nostr::EventBuilder::new(Kind::MlsGroupMessage, "current action")
-            .sign_with_keys(&keys)
-            .unwrap();
+        let keys = nostr_relay_builder::prelude::Keys::generate();
+        let maintenance = nostr_relay_builder::prelude::EventBuilder::new(
+            Kind::MlsGroupMessage,
+            "queued maintenance",
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
+        let current = nostr_relay_builder::prelude::EventBuilder::new(
+            Kind::MlsGroupMessage,
+            "current action",
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
         database.save_event(&maintenance).await.unwrap();
         let expected_ids = [current.id.to_hex()];
         let expectation = || RelayActionExpectation {
@@ -627,13 +640,17 @@ mod tests {
             publication_log: Arc::clone(&control.publication_log),
             hidden_event_ids: Arc::clone(&control.hidden_event_ids),
         };
-        let keys = nostr::Keys::generate();
-        let delayed_prior = nostr::EventBuilder::new(Kind::MlsGroupMessage, "prior action")
-            .sign_with_keys(&keys)
-            .unwrap();
-        let current = nostr::EventBuilder::new(Kind::MlsGroupMessage, "current action")
-            .sign_with_keys(&keys)
-            .unwrap();
+        let keys = nostr_relay_builder::prelude::Keys::generate();
+        let delayed_prior =
+            nostr_relay_builder::prelude::EventBuilder::new(Kind::MlsGroupMessage, "prior action")
+                .sign_with_keys(&keys)
+                .unwrap();
+        let current = nostr_relay_builder::prelude::EventBuilder::new(
+            Kind::MlsGroupMessage,
+            "current action",
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
         assert!(
             database
                 .save_event(&delayed_prior)
@@ -671,16 +688,23 @@ mod tests {
             publication_log: Arc::clone(&control.publication_log),
             hidden_event_ids: Arc::clone(&control.hidden_event_ids),
         };
-        let keys = nostr::Keys::generate();
-        let accepted = nostr::EventBuilder::new(Kind::MlsGroupMessage, "accepted commit")
-            .sign_with_keys(&keys)
-            .unwrap();
-        let recovery = nostr::EventBuilder::new(Kind::MlsGroupMessage, "convergence recovery")
-            .sign_with_keys(&keys)
-            .unwrap();
-        let welcome = nostr::EventBuilder::new(Kind::GiftWrap, "early welcome")
-            .sign_with_keys(&keys)
-            .unwrap();
+        let keys = nostr_relay_builder::prelude::Keys::generate();
+        let accepted = nostr_relay_builder::prelude::EventBuilder::new(
+            Kind::MlsGroupMessage,
+            "accepted commit",
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
+        let recovery = nostr_relay_builder::prelude::EventBuilder::new(
+            Kind::MlsGroupMessage,
+            "convergence recovery",
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
+        let welcome =
+            nostr_relay_builder::prelude::EventBuilder::new(Kind::GiftWrap, "early welcome")
+                .sign_with_keys(&keys)
+                .unwrap();
         for event in [&recovery, &welcome] {
             assert!(database.save_event(event).await.unwrap().is_success());
         }

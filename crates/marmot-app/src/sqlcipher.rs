@@ -208,7 +208,7 @@ impl MarmotApp {
     pub(crate) fn sqlcipher_key_locked(
         &self,
         label: &str,
-        keys: &nostr::Keys,
+        keys: &nostr::prelude::Keys,
         database: &DatabaseOpenGuard<'_>,
         kind: SqlcipherDatabaseKind,
     ) -> Result<SqlCipherKey, AppError> {
@@ -242,7 +242,7 @@ impl MarmotApp {
     pub(crate) fn sqlcipher_key(
         &self,
         label: &str,
-        keys: &nostr::Keys,
+        keys: &nostr::prelude::Keys,
         path: &Path,
         kind: SqlcipherDatabaseKind,
     ) -> Result<SqlCipherKey, AppError> {
@@ -294,7 +294,7 @@ impl MarmotApp {
     fn sqlcipher_salt(
         &self,
         label: &str,
-        keys: &nostr::Keys,
+        keys: &nostr::prelude::Keys,
         db_path: &Path,
         kind: SqlcipherDatabaseKind,
     ) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError> {
@@ -537,7 +537,7 @@ fn write_sqlcipher_migration_marker(path: &Path) -> Result<(), AppError> {
 /// repeatedly.
 fn finish_interrupted_sqlcipher_migration(
     label: &str,
-    keys: &nostr::Keys,
+    keys: &nostr::prelude::Keys,
     db_path: &Path,
     kind: SqlcipherDatabaseKind,
     salt: &[u8; SQLCIPHER_SALT_LEN],
@@ -571,7 +571,7 @@ fn finish_interrupted_sqlcipher_migration(
 
 fn derive_sqlcipher_key_material(
     label: &str,
-    keys: &nostr::Keys,
+    keys: &nostr::prelude::Keys,
     salt: &[u8; SQLCIPHER_SALT_LEN],
     kind: SqlcipherDatabaseKind,
 ) -> Result<String, AppError> {
@@ -613,7 +613,7 @@ fn derive_external_sqlcipher_key_material(
 
 fn legacy_sqlcipher_key_material(
     label: &str,
-    keys: &nostr::Keys,
+    keys: &nostr::prelude::Keys,
     kind: SqlcipherDatabaseKind,
 ) -> String {
     // Wipe the account-secret copy and the raw digest (the legacy DB key) on
@@ -1074,7 +1074,7 @@ mod tests {
     /// database has been migrated or created fresh.
     fn create_healthy_v2_database(
         label: &str,
-        keys: &nostr::Keys,
+        keys: &nostr::prelude::Keys,
         db_path: &Path,
         kind: SqlcipherDatabaseKind,
     ) {

@@ -686,7 +686,7 @@ async fn closing_storage_directly_terminates_an_idle_window() {
 #[tokio::test]
 async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision() {
     let f = Fixture::new(20);
-    let sender = nostr::Keys::generate().public_key().to_hex();
+    let sender = nostr::prelude::Keys::generate().public_key().to_hex();
     f.store
         .record_app_event(&storage_sqlite::StoredAppEvent {
             group_id_hex: "0000".into(),

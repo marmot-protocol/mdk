@@ -121,9 +121,11 @@ def install_fake_hermes_modules(*, media_kinds: bool = False):
         # never a trigger itself. Mirrors gateway.platforms.base.MessageEvent.
         channel_context: str | None = None
 
-    class Platform:
-        def __init__(self, value):
-            self.value = value
+    class Platform(enum.Enum):
+        # Hermes ships a Platform *enum*, and str() on a member is
+        # "Platform.MARMOT" rather than its value. A plain wrapper here is what
+        # let that difference go untested.
+        MARMOT = "marmot"
 
     @dataclass
     class PlatformConfig:
@@ -5165,6 +5167,45 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 other._observations.loaded_fingerprint,
             )
 
+    def test_home_channel_platform_enum_resolves_like_the_yaml_form(self):
+        # A core HomeChannel carries a Platform *enum*, and str() on a member is
+        # "Platform.MARMOT" - not the "marmot" the shared home resolver accepts.
+        # Feeding that through made a /sethome-configured home read as
+        # wrong_platform, so home_configured stayed False and the doctor reported
+        # restart.required + home.live_agreement mismatch against a config-side
+        # route that resolved fine.
+
+        Platform = sys.modules["gateway.config"].Platform
+
+        extra = {
+            "account_id_hex": "11" * 32,
+            "socket_path": "/tmp/home-enum.sock",
+            "group_id_hex": "dd" * 16,
+        }
+        home = type("Home", (), {"platform": Platform("marmot"), "chat_id": "cc" * 16})()
+
+        class FakeClient:
+            pass
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra=extra, home_channel=home), client=FakeClient()
+        )
+        self.assertTrue(adapter._observations.home_configured)
+        self.assertEqual(
+            adapter._observations.loaded_home_digest,
+            self.adapter_module.marmot_diagnostics.identity_digest("cc" * 16),
+        )
+
+        # The plain-string form (doctor projection, plugin settings) keeps working.
+        as_string = type("Home", (), {"platform": "marmot", "chat_id": "cc" * 16})()
+        string_adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra=extra, home_channel=as_string), client=FakeClient()
+        )
+        self.assertEqual(
+            string_adapter._observations.loaded_home_digest,
+            adapter._observations.loaded_home_digest,
+        )
+
     def test_media_path_resolvers_match_diagnostics(self):
         diag = self.adapter_module.marmot_diagnostics
         extra = {
@@ -7392,6 +7433,37 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
                 status = json.loads(await module._marmot_status_tool({}))
                 self.assertFalse(status["ok"])
                 self.assertEqual(status["state"], expected)
+
+    async def test_marmot_status_resolves_a_platform_enum_home_channel(self):
+        module = self.adapter_module
+        config_cls = sys.modules["gateway.config"].PlatformConfig
+
+        Platform = sys.modules["gateway.config"].Platform
+
+        class ReadyClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        live = type("FakeAdapter", (), {})()
+        live.config = config_cls(
+            enabled=True,
+            extra={"socket_path": "/tmp/passive-probe.sock"},
+            home_channel=type(
+                "Home", (), {"platform": Platform("marmot"), "chat_id": "cc" * 16}
+            )(),
+        )
+        live.client = ReadyClient()
+        module._remember_live_adapter(live)
+        status = json.loads(await module._marmot_status_tool({}))
+        self.assertTrue(status["ok"], status)
+        self.assertEqual(status["state"], "ready")
 
     async def test_marmot_history_fetches_one_exact_materialized_message(self):
         calls = []

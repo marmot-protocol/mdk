@@ -24,6 +24,24 @@ Tracking issue: marmot-protocol/mdk#381.
 
 ## Inventory
 
+### `marmot-app` audit export admission (`src/audit_export_lifecycle.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Process-local account attempt map | At most one active export attempt per account plus entries for account mutations in progress. Each entry holds an account key, attempt id, immutable destination profile, cancellation bit, and one local-work gate; no payload or file handle. | Attempt and mutation RAII drops remove entries as soon as neither is active. Runtime stopping and storage close reject late local admissions without waiting for network futures. The global id counter is process-lifetime and checked for overflow. |
+
+
+### `marmot-app` account-worker startup (`src/runtime/worker_startup.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| In-memory startup failures | At most one entry per eligible account, with a saturating failure count and monotonic deadline; no history or error text | Successful readiness, explicit lifecycle reset, ineligibility, account removal/deactivation, or shutdown clears entries. Reconcile prunes absent and ineligible accounts. |
+| Pending worker reapers | At most one cleanup task per removed managed worker | Global reconcile joins already-finished workers immediately and checks still-running cleanup without waiting. Targeted worker acquisition and explicit lifecycle operations wait at most twice the worker shutdown grace period for their own account. A timeout during targeted worker acquisition enters per-account retry backoff. An unfinished handle retains only its account's replacement fence. Cancelled callers leave handles tracked for the next transaction or terminal shutdown. |
+
+The retry delay starts at one second, doubles after each actual failure, and caps at 60 seconds.
+Suppressed calls do not advance the count or deadline. Expiry permits an attempt on the next
+existing trigger; no timer retains an account or holds the transaction through a cooldown.
+
 ### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)
 
 | Structure | Bound | Reclamation |

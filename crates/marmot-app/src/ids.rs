@@ -1,16 +1,25 @@
 use cgka_traits::MemberId;
-use nostr::FromBech32;
-use nostr::ToBech32;
+use nostr::nips::nip19::FromBech32;
 use nostr::nips::nip19::Nip19Profile;
+use nostr::nips::nip19::ToBech32;
 use nostr::prelude::RelayUrl;
 use nostr_sdk::prelude::PublicKey;
 
 use crate::AppError;
 
 pub(crate) fn parse_account_id_hex(value: &str) -> Result<String, AppError> {
-    PublicKey::parse(value)
+    parse_account_key(value)
         .map(|pubkey| pubkey.to_hex())
         .map_err(|_| AppError::InvalidPublicKey)
+}
+
+fn parse_account_key(value: &str) -> Result<PublicKey, AppError> {
+    // The 0.45 parser also accepts nprofile. Preserve this narrower account-id
+    // contract; only account_id_hex_from_ref intentionally accepts profiles.
+    if value.starts_with("nprofile1") || value.starts_with("nostr:nprofile1") {
+        return Err(AppError::InvalidPublicKey);
+    }
+    PublicKey::parse(value).map_err(|_| AppError::InvalidPublicKey)
 }
 
 pub(crate) fn normalize_group_id_hex_app(value: &str) -> Result<String, AppError> {
@@ -47,8 +56,7 @@ pub(crate) fn normalize_account_ids(values: Vec<String>) -> Result<Vec<String>, 
 /// Convert a hex Nostr public key (account id) into its `npub...` bech32 form.
 /// Public so embedders (FFI/UI) can render npubs instead of raw hex.
 pub fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
-    PublicKey::parse(account_id_hex)
-        .map_err(|_| AppError::InvalidPublicKey)?
+    parse_account_key(account_id_hex)?
         .to_bech32()
         .map_err(|_| AppError::InvalidPublicKey)
 }
@@ -72,7 +80,7 @@ pub fn nprofile_for_account_id(
     account_id_hex: &str,
     relays: &[String],
 ) -> Result<String, AppError> {
-    let public_key = PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+    let public_key = parse_account_key(account_id_hex)?;
     let relay_urls = parse_relay_urls(relays)?;
     Nip19Profile::new(public_key, relay_urls)
         .to_bech32()
@@ -86,18 +94,18 @@ const MAX_NPROFILE_REFERENCE_BYTES: usize = 1023;
 /// Normalize a public identity reference into a canonical hex account id.
 ///
 /// Accepts hex, `npub`, `nostr:npub`, `nprofile`, and `nostr:nprofile`.
-/// Existing hex/npub/NIP-21 behavior stays on [`PublicKey::parse`]; the
+/// Existing hex/npub/NIP-21 behavior stays on the narrow account-key parser; the
 /// nprofile fallback discards relay hints and keeps the first type-0 key.
 ///
 /// After one lowercase `nostr:` prefix, the fallback limits the complete
 /// encoded token to 1023 UTF-8 bytes, matching the locked Bech32 ceiling.
 /// A valid 1023-byte token therefore still decodes with that prefix. This
-/// local fallback budget does not bound the earlier `PublicKey::parse`.
+/// local fallback budget does not bound the earlier account-key parse.
 ///
 /// Whitespace and `marmot://profile/...` normalization belong to FFI.
 /// Failures return [`AppError::InvalidPublicKey`] without echoing the input.
 pub fn account_id_hex_from_ref(reference: &str) -> Result<String, AppError> {
-    if let Ok(pubkey) = PublicKey::parse(reference) {
+    if let Ok(pubkey) = parse_account_key(reference) {
         return Ok(pubkey.to_hex());
     }
     let profile_ref = nprofile_fallback_token(reference)?;

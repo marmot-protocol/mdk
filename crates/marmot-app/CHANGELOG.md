@@ -2,15 +2,34 @@
 
 ## Unreleased
 
+### Fixed
+
+- Count account-scoped relay publishes on the shared device-wide publish counters.
+  `relay_publish_attempts` was previously always zero in production. Success now
+  requires the acknowledgement threshold, and publishes dropped in flight (such as
+  endpoints abandoned after quorum) count under the new `publish_cancellations` /
+  `relay_publish_cancellations` series rather than as failures. (#1950)
+- Judge epoch-backfill overflow retry backoff by the durable delay. A loaded runner
+  can spend more than a second after that reservation is written, which previously
+  failed a test that still required nearly the full cooldown to be remaining.
+
 ### Changed
 
 - Restrict the account-local overflow marker writer to durable loss evidence. The account
   mutation path imports that evidence into recovery demand; runtime dispatch consolidation
   remains separate integration work. (#1946)
 
-### Fixed
+### Breaking changes
 
-- Count account-scoped relay publishes on the shared device-wide publish counters, including partial acceptance and publishes dropped in flight. (#1950)
+- `HostPerformanceOperation` and `RuntimePerformanceOperation` gain 28 shared and
+  nine Linux-specific host stages. Downstream exhaustive Rust matches must handle
+  the new variants. The snapshot struct layout is unchanged; stages appear in
+  `runtime_operations`.
+
+### Added
+
+- Route reviewed host stages through the existing runtime telemetry registry,
+  including its fixed metric names and all five outcomes in snapshots and OTLP.
 
 ## 0.10.4 - 2026-09-20
 

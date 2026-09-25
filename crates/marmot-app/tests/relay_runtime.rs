@@ -4,6 +4,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID;
@@ -24,13 +26,13 @@ use marmot_app::{
     RuntimeNotificationsSubscription, SelfMembership, SignOutOptions, TimelineMessageQuery,
     TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, QueryPolicy, WritePolicy};
+use nostr_relay_builder::prelude::{
+    BoxedFuture, Kind as OldKind, PolicyResult, QueryPolicy, WritePolicy,
+};
 use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Alphabet, Client as NostrSdkClient, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag,
-    TagKind, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
+    Timestamp as NostrTimestamp,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -284,11 +286,11 @@ struct RejectGroupMessagesWhileArmed(Arc<AtomicBool>);
 impl WritePolicy for RejectGroupMessagesWhileArmed {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            if self.0.load(Ordering::Relaxed) && event.kind == Kind::MlsGroupMessage {
+            if self.0.load(Ordering::Relaxed) && event.kind == OldKind::MlsGroupMessage {
                 PolicyResult::Reject("injected group-message rejection".into())
             } else {
                 PolicyResult::Accept
@@ -303,11 +305,11 @@ struct RejectDeletionEvents;
 impl WritePolicy for RejectDeletionEvents {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            if event.kind == Kind::EventDeletion {
+            if event.kind == OldKind::EventDeletion {
                 PolicyResult::Reject("injected deletion rejection".into())
             } else {
                 PolicyResult::Accept
@@ -322,12 +324,12 @@ struct RejectKeyPackagesWhileArmed(Arc<AtomicBool>);
 impl WritePolicy for RejectKeyPackagesWhileArmed {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
             if self.0.load(Ordering::Relaxed)
-                && event.kind == Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16)
+                && event.kind == OldKind::Custom(KIND_MARMOT_KEY_PACKAGE as u16)
             {
                 PolicyResult::Reject("injected key package rejection".into())
             } else {
@@ -346,7 +348,7 @@ struct RejectMultiAuthorQueries {
 impl QueryPolicy for RejectMultiAuthorQueries {
     fn admit_query<'a>(
         &'a self,
-        query: &'a Filter,
+        query: &'a nostr_relay_builder::prelude::Filter,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
@@ -409,11 +411,11 @@ impl BlockNextGroupMessages {
 impl WritePolicy for BlockNextGroupMessages {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            let should_block = event.kind == Kind::MlsGroupMessage
+            let should_block = event.kind == OldKind::MlsGroupMessage
                 && self
                     .remaining
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -471,11 +473,11 @@ impl BlockNextGiftWraps {
 impl WritePolicy for BlockNextGiftWraps {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            let should_block = event.kind == Kind::GiftWrap
+            let should_block = event.kind == OldKind::GiftWrap
                 && self
                     .remaining
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -525,11 +527,11 @@ struct RejectGiftWrapsWhileArmed(Arc<AtomicBool>);
 impl WritePolicy for RejectGiftWrapsWhileArmed {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            if self.0.load(Ordering::Relaxed) && event.kind == Kind::GiftWrap {
+            if self.0.load(Ordering::Relaxed) && event.kind == OldKind::GiftWrap {
                 PolicyResult::Reject("injected gift-wrap rejection".into())
             } else {
                 PolicyResult::Accept
@@ -558,11 +560,11 @@ impl CountGiftWraps {
 impl WritePolicy for CountGiftWraps {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            if event.kind == Kind::GiftWrap {
+            if event.kind == OldKind::GiftWrap {
                 self.count.fetch_add(1, Ordering::SeqCst);
             }
             PolicyResult::Accept
@@ -624,11 +626,11 @@ impl RejectThenBlockGiftWraps {
 impl WritePolicy for RejectThenBlockGiftWraps {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            if event.kind != Kind::GiftWrap {
+            if event.kind != OldKind::GiftWrap {
                 return PolicyResult::Accept;
             }
             if self.rejecting.load(Ordering::SeqCst) {
@@ -646,12 +648,12 @@ impl WritePolicy for RejectThenBlockGiftWraps {
 impl WritePolicy for BlockKeyPackagesWhileArmed {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
             if self.armed.load(Ordering::Relaxed)
-                && event.kind == Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16)
+                && event.kind == OldKind::Custom(KIND_MARMOT_KEY_PACKAGE as u16)
             {
                 self.entered.notify_one();
                 self.release.notified().await;
@@ -947,6 +949,16 @@ async fn write_http_response(
     stream.write_all(body).await.unwrap();
 }
 
+fn signed_sdk_client(keys: Keys) -> NostrSdkRelayClient {
+    let account_id = cgka_traits::MemberId::new(keys.public_key().to_bytes().to_vec());
+    let client = NostrSdkClient::builder()
+        .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+            transport_nostr_peeler::SdkSigner(Arc::new(keys.clone())),
+        ))
+        .build();
+    NostrSdkRelayClient::with_account_signer(client, account_id, Arc::new(keys))
+}
+
 fn endpoint(url: &str) -> TransportEndpoint {
     TransportEndpoint(url.to_owned())
 }
@@ -955,57 +967,66 @@ fn endpoint(url: &str) -> TransportEndpoint {
 // Mirrors `src/tests.rs::TestExternalAccountSigner`; keep both shims aligned
 // when the `NostrSigner` or account-identity-proof signer traits change.
 struct TestExternalAccountSigner {
-    keys: nostr::Keys,
+    keys: nostr::prelude::Keys,
 }
 
-impl nostr::NostrSigner for TestExternalAccountSigner {
-    fn backend(&self) -> nostr::signer::SignerBackend<'_> {
-        self.keys.backend()
-    }
-
+impl transport_nostr_peeler::MarmotNostrSigner for TestExternalAccountSigner {
     fn get_public_key(
         &self,
-    ) -> nostr::util::BoxedFuture<'_, Result<nostr::PublicKey, nostr::SignerError>> {
-        self.keys.get_public_key()
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::get_public_key(&self.keys)
     }
-
     fn sign_event(
         &self,
-        unsigned: nostr::UnsignedEvent,
-    ) -> nostr::util::BoxedFuture<'_, Result<nostr::Event, nostr::SignerError>> {
-        self.keys.sign_event(unsigned)
+        unsigned: nostr::prelude::UnsignedEvent,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::sign_event(&self.keys, unsigned)
     }
-
     fn nip04_encrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip04_encrypt(public_key, content)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_encrypt(&self.keys, public_key, content)
     }
-
     fn nip04_decrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
-        encrypted_content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip04_decrypt(public_key, encrypted_content)
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_decrypt(&self.keys, public_key, payload)
     }
-
     fn nip44_encrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip44_encrypt(public_key, content)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_encrypt(&self.keys, public_key, content)
     }
-
     fn nip44_decrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         payload: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip44_decrypt(public_key, payload)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_decrypt(&self.keys, public_key, payload)
     }
 }
 
@@ -1017,11 +1038,9 @@ impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for TestExt
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match test signer".into());
         }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
     }
 }
@@ -1039,7 +1058,7 @@ async fn publish_nostr_event_at(
     let mut event =
         NostrTransportEvent::new_unsigned(keys.public_key().to_hex(), kind, tags, content);
     event.created_at = created_at;
-    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys).build());
+    let relay_client = signed_sdk_client(keys);
     relay_client
         .publish_event(&[endpoint(relay_url)], &event, 1)
         .await
@@ -1064,12 +1083,9 @@ async fn publish_garbage_group_message(
     assert!(envelope.len() >= NOSTR_GROUP_CONTENT_MIN_LEN);
     let ephemeral = Keys::generate();
     let signed = EventBuilder::new(Kind::MlsGroupMessage, BASE64_STANDARD.encode(envelope))
-        .tags([Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-            [nostr_group_id_hex.to_owned()],
-        )])
+        .tags([Tag::custom("h", [nostr_group_id_hex.to_owned()])])
         .custom_created_at(NostrTimestamp::from_secs(created_at))
-        .sign_with_keys(&ephemeral)
+        .finalize(&ephemeral)
         .expect("sign ephemeral kind-445 test event");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event");
@@ -1229,10 +1245,9 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     });
 
     use nostr::prelude::ToBech32;
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let secret = keys.secret_key().to_bech32().unwrap();
-    let relay_client =
-        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+    let relay_client = signed_sdk_client(keys.clone());
     for (kind, tag) in [
         (10002, vec!["r".to_owned(), url.clone(), "write".to_owned()]),
         (10050, vec!["relay".to_owned(), url.clone()]),
@@ -2142,7 +2157,7 @@ async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser
     });
     let signed = EventBuilder::new(Kind::Metadata, content.to_string())
         .custom_created_at(NostrTimestamp::from_secs(1_700_000_867))
-        .sign_with_keys(&publisher)
+        .finalize(&publisher)
         .expect("sign hostile kind:0");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed kind:0");
@@ -2182,7 +2197,7 @@ async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser
     content["bot"] = serde_json::json!(true);
     let newer = EventBuilder::new(Kind::Metadata, content.to_string())
         .custom_created_at(NostrTimestamp::from_secs(1_700_000_868))
-        .sign_with_keys(&publisher)
+        .finalize(&publisher)
         .unwrap();
     relay_client
         .publish_event(
@@ -3353,6 +3368,10 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             .is_none(),
         "restart reconciliation must preserve every deleted group"
     );
+    runtime
+        .publish_key_package(&alice_id)
+        .await
+        .expect("retiring Bob's signer must not disrupt Alice's transport");
 
     // A full routing rebuild for unrelated account activity must preserve the
     // hidden live routes that can receive a future resurrection message.
@@ -4287,7 +4306,7 @@ async fn push_registration_settings_accept_apns_fcm_and_redact_tokens() {
     )
     .await
     .account;
-    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
     let settings = app
         .set_local_notifications_enabled(&account.account_id_hex, true)
@@ -4352,7 +4371,7 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         )
         .await
         .unwrap();
-    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -4483,7 +4502,7 @@ async fn removed_member_triggers_local_push_token_cleanup() {
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
     wait_for_chat_update(&mut carol_chats, |chat| chat.group_id_hex == group_id_hex).await;
-    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
     for member in [&bob, &carol] {
         app.set_native_push_enabled(&member.account.account_id_hex, true)
@@ -4731,7 +4750,7 @@ async fn remove_members_sends_context_free_wake_from_snapshotted_tokens() {
         )
         .await
         .unwrap();
-    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     app.upsert_push_registration(
@@ -4799,7 +4818,7 @@ async fn remove_members_succeeds_when_wake_publish_fails() {
         )
         .await
         .unwrap();
-    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     app.upsert_push_registration(
@@ -4871,7 +4890,7 @@ async fn unauthorized_remove_and_self_demotion_send_no_wake() {
         "unauthorized removal must not publish a wake"
     );
 
-    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     app.upsert_push_registration(
@@ -5033,7 +5052,7 @@ async fn message_send_succeeds_when_notification_trigger_publish_fails() {
         )
         .await
         .unwrap();
-    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -5164,7 +5183,7 @@ async fn successful_invite_delivers_while_overlapping_invite_fails() {
     };
     let alice = create_network_ready_identity(&runtime, setup().relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup()).await;
-    let missing_key_package_member = nostr::Keys::generate().public_key().to_hex();
+    let missing_key_package_member = nostr::prelude::Keys::generate().public_key().to_hex();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let alice_group = runtime
@@ -12416,11 +12435,11 @@ struct CountUncertainSetupRelayListPublications(Arc<AtomicUsize>);
 impl WritePolicy for CountUncertainSetupRelayListPublications {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr::Event,
+        event: &'a nostr_relay_builder::prelude::Event,
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            if event.kind == Kind::from(10002) || event.kind == Kind::from(10050) {
+            if event.kind == OldKind::from(10002) || event.kind == OldKind::from(10050) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
             PolicyResult::Accept
@@ -12537,8 +12556,7 @@ async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool)
         }
     });
     let keys = Keys::generate();
-    let publisher =
-        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+    let publisher = signed_sdk_client(keys.clone());
     publisher
         .publish_event(
             &[endpoint(&discovery_url)],
@@ -12741,8 +12759,7 @@ async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer
         relay.run().await.unwrap();
         let url = relay.url().await.to_string();
         let keys = Keys::generate();
-        let publisher =
-            NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+        let publisher = signed_sdk_client(keys.clone());
         for kind in [10002, 10050] {
             let tags = if kind == 10002 && read_only {
                 vec![vec!["r".into(), url.clone(), "read".into()]]
@@ -12865,7 +12882,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
             .expect("member setup must publish relay metadata and a KeyPackage");
         runtime.shutdown().await;
 
-        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build())
+        signed_sdk_client(keys.clone())
             .publish_event(
                 &[endpoint(&discovery_url)],
                 &NostrTransportEvent::new_unsigned(
@@ -13099,13 +13116,15 @@ async fn onboarding_relay_repair_requires_approval_and_preserves_unrelated_tags(
     client.add_relay(&url).await.unwrap();
     client.connect().await;
     let events = client
-        .fetch_events_from(
-            [url],
-            nostr::Filter::new()
-                .author(nostr::PublicKey::parse(&id).unwrap())
-                .kind(Kind::RelayList),
-            Duration::from_secs(3),
-        )
+        .fetch_events(nostr_sdk::prelude::ReqTarget::manual(vec![(
+            nostr_sdk::prelude::RelayUrl::parse(&url).unwrap(),
+            vec![
+                nostr::prelude::Filter::new()
+                    .author(nostr::prelude::PublicKey::parse(&id).unwrap())
+                    .kind(Kind::RelayList),
+            ],
+        )]))
+        .timeout(Duration::from_secs(3))
         .await
         .unwrap();
     let event = events.first().unwrap();
@@ -13283,7 +13302,7 @@ struct OnboardingPaymentRequired;
 impl nostr_relay_builder::prelude::QueryPolicy for OnboardingPaymentRequired {
     fn admit_query<'a>(
         &'a self,
-        _: &'a nostr::Filter,
+        _: &'a nostr_relay_builder::prelude::Filter,
         _: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async { PolicyResult::Reject("payment-required: subscription needed".into()) })
@@ -13440,13 +13459,15 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
     client.add_relay(&url).await.unwrap();
     client.connect().await;
     let events = client
-        .fetch_events_from(
-            [url.clone()],
-            nostr::Filter::new()
-                .author(keys.public_key())
-                .kind(Kind::from(30443)),
-            Duration::from_secs(3),
-        )
+        .fetch_events(nostr_sdk::prelude::ReqTarget::manual(vec![(
+            nostr_sdk::prelude::RelayUrl::parse(&url).unwrap(),
+            vec![
+                nostr::prelude::Filter::new()
+                    .author(keys.public_key())
+                    .kind(Kind::from(30443)),
+            ],
+        )]))
+        .timeout(Duration::from_secs(3))
         .await
         .unwrap();
     let event = events.first().unwrap();
@@ -13639,14 +13660,14 @@ struct OnboardingKeyPackageQueriesRestricted;
 impl nostr_relay_builder::prelude::QueryPolicy for OnboardingKeyPackageQueriesRestricted {
     fn admit_query<'a>(
         &'a self,
-        filter: &'a nostr::Filter,
+        filter: &'a nostr_relay_builder::prelude::Filter,
         _: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
             if filter
                 .kinds
                 .as_ref()
-                .is_some_and(|kinds| kinds.contains(&Kind::from(30443)))
+                .is_some_and(|kinds| kinds.contains(&OldKind::from(30443)))
             {
                 PolicyResult::Reject("restricted".into())
             } else {

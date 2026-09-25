@@ -1220,7 +1220,7 @@ pub(crate) fn ensure_local_signing(
 }
 
 pub(crate) fn parse_public_key(value: &str) -> Result<String, WnError> {
-    nostr::PublicKey::parse(value)
+    nostr::prelude::PublicKey::parse(value)
         .map(|pubkey| pubkey.to_hex())
         .map_err(|_| WnError::InvalidPublicKey)
 }

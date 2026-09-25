@@ -1,6 +1,6 @@
 pub(crate) mod attachment_resume;
 pub(crate) mod avatar;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use cgka_traits::app_components::{
@@ -10,11 +10,11 @@ use cgka_traits::app_components::{
 };
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
-use nostr::NostrSigner;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use transport_nostr_peeler::MarmotNostrSigner;
 
 use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
 use crate::{AppError, ChatListAttachmentKind, SendSummary};
@@ -51,6 +51,7 @@ pub(crate) use host_safety::is_loopback_http_endpoint;
 /// This surface is excluded from normal app artifacts and deliberately exposes
 /// only the same fetch path used by encrypted-media downloads.
 #[cfg(feature = "media-benchmarks")]
+#[derive(Clone)]
 pub struct MediaDownloadBenchmarkTransport(BlossomHttpTransport);
 
 #[cfg(feature = "media-benchmarks")]
@@ -58,6 +59,21 @@ impl MediaDownloadBenchmarkTransport {
     /// Create one transport whose vetted exact-origin clients can be reused.
     pub fn new() -> Self {
         Self(BlossomHttpTransport::new(true))
+    }
+
+    /// Create a loopback transport with scaled production deadlines.
+    ///
+    /// This is benchmark-only so wall-clock regression scenarios can exercise
+    /// the real locator policy without waiting for minute-scale production
+    /// bounds. App artifacts cannot construct a custom transport policy.
+    pub fn with_timeouts(
+        startup_timeout: std::time::Duration,
+        transfer_timeout: std::time::Duration,
+    ) -> Self {
+        Self(BlossomHttpTransport::for_benchmark(
+            startup_timeout,
+            transfer_timeout,
+        ))
     }
 
     /// Fetch one bounded blob through the production download transport.
@@ -73,6 +89,42 @@ impl MediaDownloadBenchmarkTransport {
         telemetry: &AppPerformanceTelemetry,
     ) -> Result<Vec<u8>, AppError> {
         blossom::fetch_blossom_blob_with_observer(url, &self.0, Some(telemetry)).await
+    }
+
+    /// Fetch one integrity-bound blob through the ordered production locator path.
+    pub async fn fetch_candidates(
+        &self,
+        locators: Vec<String>,
+        ciphertext_sha256: String,
+        telemetry: &AppPerformanceTelemetry,
+    ) -> Result<Vec<u8>, AppError> {
+        let reference = MediaAttachmentReference {
+            locators: locators
+                .into_iter()
+                .map(|value| MediaLocator {
+                    kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                    value,
+                })
+                .collect(),
+            ciphertext_sha256,
+            plaintext_sha256: "00".repeat(32),
+            nonce_hex: "00".repeat(12),
+            file_name: "benchmark.bin".to_owned(),
+            media_type: "application/octet-stream".to_owned(),
+            version: ENCRYPTED_MEDIA_FORMAT_V1.to_owned(),
+            dim: None,
+            thumbhash: None,
+            source_epoch: 0,
+        };
+        fetch_encrypted_media_blob_classified(
+            &reference,
+            &[],
+            &[BLOSSOM_LOCATOR_KIND_V1.to_owned()],
+            &self.0,
+            Some(telemetry),
+        )
+        .await
+        .map_err(AttachmentDownloadFailure::into_error)
     }
 }
 
@@ -191,7 +243,7 @@ pub(crate) async fn upload_profile_image(
     image: &[u8],
     media_type: &str,
     server: Option<&str>,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
 ) -> Result<String, AppError> {
     upload_profile_image_with_policy(image, media_type, server, signer, false).await
 }
@@ -200,7 +252,7 @@ pub(crate) async fn upload_profile_image_with_policy(
     image: &[u8],
     media_type: &str,
     server: Option<&str>,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     allow_loopback_http: bool,
 ) -> Result<String, AppError> {
     if image.is_empty() {
@@ -683,7 +735,7 @@ pub(crate) async fn upload_encrypted_media(
     request: MediaUploadRequest,
     source_epoch: u64,
     media_secret: &[u8],
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     policy: MediaOperationPolicy<'_>,
     transport: &BlossomHttpTransport,
 ) -> Result<MediaUploadResult, AppError> {
@@ -754,7 +806,7 @@ async fn upload_encrypted_media_attachment(
     request: MediaUploadAttachmentRequest,
     source_epoch: u64,
     media_secret: &[u8],
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     upload_servers: &[String],
     policy: MediaOperationPolicy<'_>,
     transport: &BlossomHttpTransport,
@@ -846,7 +898,7 @@ async fn upload_blossom_blob_with_fallback(
     servers: &[String],
     encrypted: Bytes,
     encrypted_hash_hex: &str,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     transport: &BlossomHttpTransport,
 ) -> Result<String, AppError> {
     let mut failures = Vec::new();
@@ -1223,15 +1275,17 @@ async fn fetch_encrypted_media_blob_classified(
             return Err(AppError::MediaDownloadFailed("media download timed out".into()).into());
         }
         let now = tokio::time::Instant::now();
-        // ponytail: split the remaining budget evenly; size-based budgets need
-        // a trusted expected ciphertext length that references do not carry.
-        let candidate_budget =
-            download_deadline.saturating_duration_since(now) / (candidate_count - index) as u32;
+        let candidate_deadline = progressing_candidate_deadline(
+            now,
+            download_deadline,
+            index + 1 < candidate_count,
+            transport.fallback_reserve(),
+        );
         let fetched = blossom::fetch_blossom_blob_classified_until(
             &candidate,
             transport,
             telemetry,
-            now + candidate_budget,
+            candidate_deadline,
         )
         .await;
         match fetched {
@@ -1290,6 +1344,27 @@ async fn fetch_encrypted_media_blob_classified(
     } else {
         Err(AttachmentDownloadFailure::Retry(error))
     }
+}
+
+/// Let a body that keeps producing bytes borrow the old equal locator shares.
+///
+/// Connection/header/first-byte stalls still yield under the transport's
+/// startup bound, and body stalls under its idle bound. A progressing non-final
+/// candidate may use the acquisition until a fixed fallback tail remains. Each
+/// later candidate receives at least half of the then-remaining time, while the
+/// final candidate receives the complete global remainder.
+fn progressing_candidate_deadline(
+    now: tokio::time::Instant,
+    global_deadline: tokio::time::Instant,
+    has_untried_fallback: bool,
+    fallback_reserve: Duration,
+) -> tokio::time::Instant {
+    if !has_untried_fallback {
+        return global_deadline;
+    }
+    let remaining = global_deadline.saturating_duration_since(now);
+    let reserve = fallback_reserve.min(remaining / 2);
+    global_deadline - reserve
 }
 
 /// Record one candidate's failure as the attachment's provisional outcome.

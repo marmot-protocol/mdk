@@ -7,6 +7,12 @@ any raw-FFI consumer (Zig, Nim, Go, Odin, Lua, PHP, …).
 
 Start with the [shared binding integration guide](../marmot-uniffi/README.md#integration-guide-and-api-reference)
 for runtime lifecycle, screen contracts, API selection, localization and upgrade policy.
+`marmot_verify_public_nostr_event_json`
+are stateless public-event checks: they require no client, return `uint8_t`
+results through required out-pointers, and return `MARMOT_STATUS_OK` with zero
+for malformed or invalid cryptographic input. Null/invalid UTF-8 pointers are
+argument errors. Callers still enforce their author, kind, tag, and JSON-size
+policy. These additive functions require a matching regenerated header/library.
 Use the [complete C symbol reference](API-REFERENCE.md) for every function declaration,
 including ownership helpers, and the [shared method reference](../marmot-uniffi/API-REFERENCE.md)
 for runtime purposes and recommended alternatives to older screen paths.
@@ -36,6 +42,18 @@ exit. Run final free off the UI thread. Calls from a Tokio runtime context retai
 nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
 The catalog includes C-only compatibility shims; prefer the v4 audit configuration
 setter and the composable runtime options constructor for new integrations.
+
+`marmot_record_host_performance` accepts 28 shared and nine Linux-specific host
+stages in addition to the existing readiness and visibility milestones. Read these
+37 stages by their `host_*` operation name in
+`MarmotAppPerformanceSnapshot.runtime_operations`. Splash readiness, foreground
+readiness and outbound/inbound message visibility remain in `host_splash_ready`,
+`host_foreground_local_ready`, `host_outbound_message_visible` and
+`host_inbound_message_visible`, respectively. The snapshot layout and existing
+operation values are unchanged. Adopt new operations with matching headers/libraries
+and free snapshots with `marmot_app_performance_snapshot_free`. Stage boundaries
+are defined in the [runtime telemetry catalog](../../docs/marmot-architecture/runtime-latency-telemetry.md#boundaries).
+See the [diagnostics contract](../marmot-uniffi/README.md#localization-privacy-and-diagnostics).
 
 ## What you get
 

@@ -3,7 +3,7 @@
 //! bytes are checkpointed before they can reach a relay.
 use super::*;
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord, RelayEndpointPolicy};
-use nostr::{EventBuilder, Kind, PublicKey, Tag, Timestamp};
+use nostr::prelude::{EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp};
 use std::future::Future;
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -1181,7 +1181,10 @@ impl AccountManager {
             }
             Err(error) => return Err(error.into()),
         };
-        self.reconcile_locked().await?;
+        self.clear_startup_retry(&snapshot.account_id_hex);
+        self.reconcile_locked_report_for(Some(&snapshot.account_id_hex))
+            .await?
+            .for_account(&snapshot.account_id_hex)?;
         Ok(snapshot)
     }
     pub async fn begin_external_signer_onboarding<S: crate::ExternalAccountSigner + 'static>(
@@ -1239,7 +1242,10 @@ impl AccountManager {
             }
             Err(error) => return Err(error.into()),
         };
-        self.reconcile_locked().await?;
+        self.clear_startup_retry(&snapshot.account_id_hex);
+        self.reconcile_locked_report_for(Some(&snapshot.account_id_hex))
+            .await?
+            .for_account(&snapshot.account_id_hex)?;
         drop(_workers);
         self.app.register_external_signer(&id, signer).await?;
         Ok(snapshot)
@@ -1421,7 +1427,8 @@ impl AccountManager {
             }
             self.save_onboarding(c)?;
             if c.snapshot.steps[index].status != OnboardingStatus::Passed {
-                self.reconcile().await?;
+                self.reconcile_for_account(&c.snapshot.account_id_hex)
+                    .await?;
                 return Ok(());
             }
         }
@@ -1452,6 +1459,7 @@ impl AccountManager {
             return Err(onboarding_error());
         }
         if c.approved {
+            self.reset_startup_retry(&account_id).await;
             self.run_onboarding_locked(&mut c).await?;
         } else {
             c.snapshot.proposal = None;
@@ -1464,7 +1472,7 @@ impl AccountManager {
                 c.reset_step(c.snapshot.steps[index].step);
             }
             self.save_onboarding(&mut c)?;
-            self.reconcile().await?;
+            self.retry_and_reconcile_for_account(&account_id).await?;
             self.run_onboarding_locked(&mut c).await?;
         }
         Ok(c.snapshot)
@@ -1500,7 +1508,7 @@ impl AccountManager {
             }
         }
         self.save_onboarding(&mut c)?;
-        self.reconcile().await?;
+        self.retry_and_reconcile_for_account(&account_id).await?;
         self.run_onboarding_locked(&mut c).await?;
         Ok(c.snapshot)
     }
@@ -1526,6 +1534,7 @@ impl AccountManager {
         }
         c.set(step, OnboardingStatus::Skipped, Vec::new());
         self.save_onboarding(&mut c)?;
+        self.reset_startup_retry(&account_id).await;
         self.run_onboarding_locked(&mut c).await?;
         Ok(c.snapshot)
     }
@@ -1588,7 +1597,7 @@ impl AccountManager {
                 continue;
             }
             let endpoint = c.normalized_endpoint.unwrap_or(c.endpoint);
-            let Ok(url) = nostr::RelayUrl::parse(&endpoint) else {
+            let Ok(url) = nostr::prelude::RelayUrl::parse(&endpoint) else {
                 failures.push(OnboardingFinding {
                     issue: OnboardingIssue::InvalidRelay,
                     endpoint: Some(endpoint),
@@ -1916,7 +1925,7 @@ impl AccountManager {
             && (all.iter().collect::<HashSet<_>>().len() > MAX_RELAYS
                 || all
                     .iter()
-                    .any(|relay| nostr::RelayUrl::parse(relay).is_err())
+                    .any(|relay| nostr::prelude::RelayUrl::parse(relay).is_err())
                 || self
                     .app
                     .relay_plane
@@ -2169,13 +2178,14 @@ impl AccountManager {
                 .map(Tag::parse)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| onboarding_error())?;
-            let unsigned = EventBuilder::new(Kind::from(proposal.step.kind() as u16), content)
+            let mut unsigned = EventBuilder::new(Kind::from(proposal.step.kind() as u16), content)
                 .tags(tags)
                 .custom_created_at(Timestamp::from(created_at))
-                .build(
+                .finalize_unsigned(
                     PublicKey::parse(&account.account_id_hex)
                         .map_err(|_| AppError::InvalidPublicKey)?,
                 );
+            unsigned.ensure_id();
             let signed = match self
                 .await_while_onboarding_live(
                     &c.snapshot.account_id_hex,

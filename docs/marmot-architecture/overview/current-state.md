@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-23
+updated: 2026-09-24
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,16 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+The Nostr relay-client boundary declares owned bounded acquisition and
+receiver-scoped notification-loss evidence. The production SDK client now uses
+the qualified rust-nostr fork for bounded history requests and account-scoped
+loss watches; the recovery owner and account worker still use their existing
+production execution path. A controlled exact-ID group-recovery path now
+acquires history outside the account worker and admits it through that worker,
+but its private activation switch defaults off pending integrated SDK-session
+qualification.
+See [the interface contract](nostr-bounded-acquisition-interface.md).
 
 C6a resolves accepted kind-1009 edits in the durable timeline once, sharing effective text with reply and chat-list
 previews. Compact metadata is part of native conversation rows; accepted edit history is a separate paged query.
@@ -145,6 +155,11 @@ Generated identities remain unavailable to background attention and managed work
 until local readiness. Failed pre-readiness setup preserves its files and keys
 without preventing healthy accounts from starting; it does not automatically erase
 or repair an unreadable database. See [local artifact safety](local-artifact-safety.md#initializing-encrypted-account-databases).
+Managed worker startup now settles each account independently: an account that reached
+local readiness remains usable when another fails. Actual failures get an in-memory
+per-account retry delay capped at 60 seconds; ordinary worker acquisition and reconcile
+triggers during that delay do not reopen the failed account. Explicit restart and committed
+setup/onboarding changes can retry it. Aggregate reconciliation still reports partial failure.
 
 MDK now exposes opt-in durable onboarding for imported identities, with per-step
 validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.

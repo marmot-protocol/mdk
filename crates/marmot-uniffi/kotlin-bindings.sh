@@ -263,12 +263,37 @@ for abi in $ANDROID_ABIS; do
   target="$(abi_to_target "$abi")"
   echo "==> Building Android target $target ($abi)"
   configure_android_toolchain "$NDK_DIR" "$HOST_TAG" "$target"
-  CARGO_PROFILE_RELEASE_STRIP=symbols \
-    cargo build --locked --release --timings -p "$CRATE_NAME" --target "$target" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+  # 16 KB alignment belongs on the final JNI link. `cargo rustc --lib` appends
+  # these flags after Cargo's selected rustflags source and does not replace
+  # build.rustflags or target rustflags. 32-bit ABIs keep `cargo build`.
+  (
+    cargo_cmd=()
+    case "$abi" in
+      arm64-v8a|x86_64)
+        cargo_cmd=(cargo rustc --locked --release --timings -p "$CRATE_NAME" --target "$target" --lib)
+        ;;
+      *)
+        cargo_cmd=(cargo build --locked --release --timings -p "$CRATE_NAME" --target "$target")
+        ;;
+    esac
+    if ((${#FEATURE_ARGS[@]})); then
+      cargo_cmd+=("${FEATURE_ARGS[@]}")
+    fi
+    if [[ "$abi" == "arm64-v8a" || "$abi" == "x86_64" ]]; then
+      cargo_cmd+=(
+        --
+        -C link-arg=-Wl,-z,max-page-size=16384
+        -C link-arg=-Wl,-z,common-page-size=16384
+      )
+    fi
+    CARGO_PROFILE_RELEASE_STRIP=symbols "${cargo_cmd[@]}"
+  )
   rm -rf "${JNI_OUT_DIR:?}/$abi"
   mkdir -p "$JNI_OUT_DIR/$abi"
   cp "$TARGET_DIR/$target/release/lib${LIB_BASENAME}.so" "$JNI_OUT_DIR/$abi/"
-  validate_stripped_android_library "$JNI_OUT_DIR/$abi/lib${LIB_BASENAME}.so"
+  copied="$JNI_OUT_DIR/$abi/lib${LIB_BASENAME}.so"
+  validate_stripped_android_library "$copied"
+  python3 "$TOOL_DIR/validate-android-artifact.py" library --abi "$abi" "$copied"
 done
 
 echo ""

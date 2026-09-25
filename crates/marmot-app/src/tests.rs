@@ -8,6 +8,8 @@ mod user_blocks;
 
 use super::*;
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_traits::Timestamp;
 use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
@@ -21,10 +23,8 @@ use cgka_traits::app_event::{
 };
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
 use marmot_account::AccountHomeError;
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr_sdk::prelude::{
-    Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag, TagKind, Timestamp as NostrTimestamp,
+    EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp as NostrTimestamp,
 };
 use storage_sqlite::StoredRelayTelemetrySettings;
 use transport_nostr_adapter::{
@@ -492,6 +492,12 @@ fn legacy_inline_group_image_create_rejects_oversized_input_before_canonical_cre
 
 #[derive(Default)]
 pub(crate) struct ScriptedPushRelayClient {
+    pub(crate) acquisition_result:
+        std::sync::Mutex<Option<transport_nostr_adapter::NostrAcquisitionResult>>,
+    pub(crate) acquisition_calls: std::sync::atomic::AtomicUsize,
+    pub(crate) acquisition_block: std::sync::atomic::AtomicBool,
+    pub(crate) acquisition_entered: tokio::sync::Notify,
+    pub(crate) acquisition_release: tokio::sync::Notify,
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
@@ -695,6 +701,15 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
 }
 
 impl ScriptedPushRelayClient {
+    pub(crate) fn last_published_group_event(&self) -> Option<NostrTransportEvent> {
+        self.published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .cloned()
+    }
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
@@ -957,6 +972,43 @@ impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
+    async fn acquire_history(
+        &self,
+        request: transport_nostr_adapter::NostrAcquisitionRequest,
+        cancellation: transport_nostr_adapter::NostrAcquisitionCancellation,
+    ) -> Result<
+        transport_nostr_adapter::NostrAcquisitionResult,
+        transport_nostr_adapter::NostrAcquisitionError,
+    > {
+        request.validate()?;
+        self.acquisition_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.acquisition_entered.notify_one();
+        if self
+            .acquisition_block
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tokio::select! {
+                _ = self.acquisition_release.notified() => {},
+                _ = cancellation.cancelled() => {
+                    return Ok(transport_nostr_adapter::NostrAcquisitionResult {
+                        endpoints: request.endpoints.into_iter().map(|endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {
+                            endpoint,
+                            session_generation: None,
+                            events: Vec::new(),
+                            end: transport_nostr_adapter::NostrAcquisitionEnd::Cancelled,
+                            stats: Default::default(),
+                        }).collect(),
+                    });
+                }
+            }
+        }
+        self.acquisition_result
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)
+    }
     fn supports_scoped_subscriptions(&self) -> bool {
         true
     }
@@ -1180,6 +1232,16 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         }
     }
 
+    async fn publish_event_for_account(
+        &self,
+        _account_id: &cgka_traits::MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        self.publish_event(endpoints, event, required_acks).await
+    }
+
     async fn publish_events(
         &self,
         requests: &[NostrEventPublishRequest],
@@ -1194,6 +1256,14 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             );
         }
         outcomes
+    }
+
+    async fn publish_events_for_account(
+        &self,
+        _account_id: &cgka_traits::MemberId,
+        requests: &[NostrEventPublishRequest],
+    ) -> Vec<Result<NostrPublishOutcome, cgka_traits::TransportAdapterError>> {
+        self.publish_events(requests).await
     }
 }
 
@@ -1213,6 +1283,11 @@ fn expire_epoch_backfill_retry_cooldown(client: &mut crate::AppClient) {
     let storage = client.app.account_storage(&client.state.label).unwrap();
     assert!(storage.recovery_retry_state().unwrap().attempt_serial > 0);
     client.recovery_owner.test_advance_to_retry(&storage);
+    // The helper advances by whole milliseconds from a monotonic remainder.
+    // Cross the boundary even when that remainder was truncated below 1 ms.
+    client
+        .recovery_owner
+        .test_advance_clock(Duration::from_millis(1));
 }
 
 /// Open a client on the app's *own* relay plane.
@@ -1364,12 +1439,9 @@ fn epoch_gap_probe(nostr_group_id_hex: &str, created_at: u64, marker: &str) -> N
     envelope.extend_from_slice(format!("explicit-catch-up-probe:{marker}").as_bytes());
     assert!(envelope.len() >= NOSTR_GROUP_CONTENT_MIN_LEN);
     let event = EventBuilder::new(Kind::MlsGroupMessage, BASE64_STANDARD.encode(envelope))
-        .tags([Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-            [nostr_group_id_hex.to_owned()],
-        )])
+        .tags([Tag::custom("h", [nostr_group_id_hex.to_owned()])])
         .custom_created_at(NostrTimestamp::from_secs(created_at))
-        .sign_with_keys(&Keys::generate())
+        .finalize(&Keys::generate())
         .expect("sign epoch-gap probe");
     NostrTransportEvent::from_nostr_event(&event).expect("convert epoch-gap probe")
 }
@@ -6361,7 +6433,7 @@ async fn disable_native_push_removal_body() {
             "alice",
             PushPlatform::Fcm,
             "retired-token",
-            &nostr::Keys::generate().public_key().to_hex(),
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
             None,
         )
         .await
@@ -6421,7 +6493,7 @@ async fn push_registration_update_retry_survives_failure_partial_success_and_res
     client.create_group("alpha", &[]).await.unwrap();
     client.create_group("beta", &[]).await.unwrap();
     app.set_native_push_enabled("alice", true).unwrap();
-    let server_pubkey_hex = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey_hex = nostr::prelude::Keys::generate().public_key().to_hex();
     app.upsert_push_registration(
         "alice",
         PushPlatform::Fcm,
@@ -6488,7 +6560,7 @@ async fn foreground_push_registration_preserves_completed_gossip_after_reopen() 
     client.create_group("alpha", &[]).await.unwrap();
     client.create_group("beta", &[]).await.unwrap();
     app.set_native_push_enabled("alice", true).unwrap();
-    let server = nostr::Keys::generate().public_key().to_hex();
+    let server = nostr::prelude::Keys::generate().public_key().to_hex();
     let first = client
         .upsert_and_share_push_registration(PushPlatform::Fcm, "opaque-token", &server, None)
         .await
@@ -6602,7 +6674,7 @@ async fn push_registration_idle_retry_body() {
             "alice",
             PushPlatform::Fcm,
             "opaque-token",
-            &nostr::Keys::generate().public_key().to_hex(),
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
             None,
         )
         .await
@@ -6660,7 +6732,7 @@ async fn push_registration_local_projection_body() {
 
     relay.block_next_publish();
     let runtime_for_upsert = runtime.clone();
-    let server_pubkey_hex = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey_hex = nostr::prelude::Keys::generate().public_key().to_hex();
     let upsert = tokio::spawn(async move {
         runtime_for_upsert
             .upsert_push_registration(
@@ -6725,7 +6797,7 @@ async fn local_group_wipe_push_removal_body() {
             "alice",
             PushPlatform::Fcm,
             "opaque-token",
-            &nostr::Keys::generate().public_key().to_hex(),
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
             None,
         )
         .await
@@ -6801,7 +6873,7 @@ async fn failed_leave_push_compensation_body() {
             "alice",
             PushPlatform::Fcm,
             "opaque-token",
-            &nostr::Keys::generate().public_key().to_hex(),
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
             None,
         )
         .await
@@ -6916,7 +6988,7 @@ async fn push_registration_removal_retry_body() {
         .set_native_push_enabled("alice", true)
         .await
         .unwrap();
-    let server_pubkey_hex = nostr::Keys::generate().public_key().to_hex();
+    let server_pubkey_hex = nostr::prelude::Keys::generate().public_key().to_hex();
     let registered = runtime
         .upsert_push_registration(
             "alice",
@@ -8246,7 +8318,7 @@ fn durable_incomplete_setup_can_provision_slot_after_database_creation() {
 async fn legacy_ambiguous_setup_requires_consent_before_reset() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let secret = keys.secret_key().to_secret_hex();
     let account = home.import_nostr_account(&secret).unwrap();
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
@@ -8325,7 +8397,7 @@ async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
             &session_path,
             session_key,
             account_id.as_slice().to_vec(),
-            Box::new(NostrMlsPeeler::new().with_welcome_signer(nostr_signer)),
+            Box::new(NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer)),
         )
         .legacy_compatibility_profile()
         .account_identity_proof_signer(signer.as_proof_signer())
@@ -8388,7 +8460,7 @@ async fn fresh_key_package_with_components(
         session_path.to_path_buf(),
         session_key,
         account_id.as_slice().to_vec(),
-        Box::new(NostrMlsPeeler::new().with_welcome_signer(signer.as_nostr_signer())),
+        Box::new(NostrMlsPeeler::new().with_welcome_signer_arc(signer.as_nostr_signer())),
     )
     .account_identity_proof_signer(signer.as_proof_signer())
     .feature_registry(app_feature_registry())
@@ -10310,57 +10382,66 @@ fn nip65_setter_round_trip_preserves_existing_roles() {
 
 #[derive(Clone, Debug)]
 struct TestExternalAccountSigner {
-    keys: nostr::Keys,
+    keys: nostr::prelude::Keys,
 }
 
-impl nostr::NostrSigner for TestExternalAccountSigner {
-    fn backend(&self) -> nostr::signer::SignerBackend<'_> {
-        self.keys.backend()
-    }
-
+impl transport_nostr_peeler::MarmotNostrSigner for TestExternalAccountSigner {
     fn get_public_key(
         &self,
-    ) -> nostr::util::BoxedFuture<'_, Result<nostr::PublicKey, nostr::SignerError>> {
-        self.keys.get_public_key()
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::get_public_key(&self.keys)
     }
-
     fn sign_event(
         &self,
-        unsigned: nostr::UnsignedEvent,
-    ) -> nostr::util::BoxedFuture<'_, Result<nostr::Event, nostr::SignerError>> {
-        self.keys.sign_event(unsigned)
+        unsigned: nostr::prelude::UnsignedEvent,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::sign_event(&self.keys, unsigned)
     }
-
     fn nip04_encrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip04_encrypt(public_key, content)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_encrypt(&self.keys, public_key, content)
     }
-
     fn nip04_decrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
-        encrypted_content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip04_decrypt(public_key, encrypted_content)
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_decrypt(&self.keys, public_key, payload)
     }
-
     fn nip44_encrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip44_encrypt(public_key, content)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_encrypt(&self.keys, public_key, content)
     }
-
     fn nip44_decrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         payload: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip44_decrypt(public_key, payload)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_decrypt(&self.keys, public_key, payload)
     }
 }
 
@@ -10372,11 +10453,9 @@ impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for TestExt
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match test signer".into());
         }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
     }
 }
@@ -11181,7 +11260,7 @@ fn warm_directory_storage_opens_shared_and_local_directory_handles() {
     let home = AccountHome::open(dir.path());
     let alice = home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
-    let public_key = nostr::Keys::generate().public_key().to_hex();
+    let public_key = nostr::prelude::Keys::generate().public_key().to_hex();
     let public_account = home.add_public_account(&public_key).unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
@@ -11215,14 +11294,14 @@ fn warm_directory_storage_opens_shared_and_local_directory_handles() {
 async fn register_external_signer_requires_matching_external_account() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let keys = nostr::Keys::generate();
-    let wrong_keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
+    let wrong_keys = nostr::prelude::Keys::generate();
     let account = home
         .add_external_signer_account(&keys.public_key().to_hex())
         .unwrap();
     let local_account = home.create_nostr_account().unwrap();
     let public_account = home
-        .add_public_account(&nostr::Keys::generate().public_key().to_hex())
+        .add_public_account(&nostr::prelude::Keys::generate().public_key().to_hex())
         .unwrap();
     let app = MarmotApp::with_relays_and_account_home(
         dir.path(),
@@ -12298,27 +12377,89 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
         })
         .await
         .expect("the undrained history must overflow the account queue");
+        // The drop metric advances before the account-local marker writer has
+        // persisted its count. Wait for that evidence so the first recovery
+        // reservation cannot race its asynchronous loss import.
+        let storage = app.account_storage("alice").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let watermarks = storage
+                    .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
+                    .unwrap();
+                if watermarks.len() == 1
+                    && watermarks[0].observed_count
+                        == (HISTORY - crate::relay_plane::ACCOUNT_DELIVERY_BUFFER) as u64
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the complete queue loss count must be durable before recovery");
 
         for ordinal in 0..2 {
             if ordinal > 0 {
                 expire_epoch_backfill_retry_cooldown(&mut client);
             }
-            assert!(matches!(
-                client
-                    .run_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                    )
-                    .await
-                    .unwrap(),
-                crate::EpochBackfillRunOutcome::Incomplete(_)
-            ));
-            let remaining = client
-                .recovery_owner
-                .test_retry_remaining(&client.app.account_storage(&client.state.label).unwrap());
+            let outcome = client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                .unwrap();
+            if !matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)) {
+                let storage = client.app.account_storage(&client.state.label).unwrap();
+                let routing = client.routing.snapshot();
+                let group_endpoints = routing
+                    .group_routes
+                    .iter()
+                    .map(|route| route.endpoints.len())
+                    .sum::<usize>();
+                let admitted_inbox = client
+                    .adapter
+                    .recovery_admitted_endpoints(&routing.local_inbox_endpoints)
+                    .len();
+                let admitted_groups = routing
+                    .group_routes
+                    .iter()
+                    .map(|route| {
+                        client
+                            .adapter
+                            .recovery_admitted_endpoints(&route.endpoints)
+                            .len()
+                    })
+                    .sum::<usize>();
+                panic!(
+                    "overflow attempt {ordinal} returned {outcome:?}; retry state: {:?}; pending demands: {}; eligible obligations: {}; inbox endpoints: {}; group endpoints: {group_endpoints}; admitted inbox: {admitted_inbox}; admitted groups: {admitted_groups}; cursor frozen: {}",
+                    storage.recovery_retry_state().unwrap(),
+                    storage.pending_recovery_demands().unwrap().len(),
+                    storage
+                        .recovery_eligible_revision_fence(false)
+                        .unwrap()
+                        .obligations
+                        .len(),
+                    routing.local_inbox_endpoints.len(),
+                    client.app.cursor_persistence() == crate::CursorPersistence::Frozen,
+                );
+            }
+            let storage = client.app.account_storage(&client.state.label).unwrap();
+            let retry = storage.recovery_retry_state().unwrap();
             let expected = Duration::from_secs(15 * (1 << ordinal));
+            assert_eq!(
+                retry.delay_ms,
+                expected.as_millis() as u64,
+                "overflow attempt {ordinal} must reserve the full backoff"
+            );
+            assert_eq!(
+                retry.not_before_ms.saturating_sub(retry.recorded_at_ms),
+                expected.as_millis() as u64,
+                "overflow attempt {ordinal} deadline must match the earned delay"
+            );
+            let remaining = client.recovery_owner.test_retry_remaining(&storage);
             assert!(
-                remaining > expected - Duration::from_secs(1) && remaining <= expected,
-                "overflow attempt {ordinal} must earn {expected:?}, got {remaining:?}"
+                remaining > Duration::ZERO && remaining <= expected,
+                "overflow attempt {ordinal} must stay in backoff after reserving {expected:?}, got {remaining:?}"
             );
             let subscriptions = relay.accepted_subscriptions().len();
             assert!(matches!(
@@ -12685,8 +12826,8 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
 
 #[test]
 fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
-    use nostr::base64::Engine as _;
-    use nostr::base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
 
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -12697,47 +12838,48 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
     let group_id_hex = hex::encode(group_id.as_slice());
 
-    let owner = nostr::Keys::generate();
+    let owner = nostr::prelude::Keys::generate();
     let owner_id = owner.public_key().to_hex();
-    let relayer = nostr::Keys::generate().public_key().to_hex();
+    let relayer = nostr::prelude::Keys::generate().public_key().to_hex();
 
     // Build a token gossip `content` whose record is signed by `signer` but
     // claims `claimed_owner`. For an honest record the two match; for a spoof the
     // attacker signs while naming the victim.
-    let gossip_content = |signer: &nostr::Keys, claimed_owner: &str, owner_ts: i64| -> String {
-        let mut record = GroupPushTokenRecord {
-            group_id_hex: group_id_hex.clone(),
-            member_id_hex: signer.public_key().to_hex(),
-            leaf_index: 1,
-            platform: PushPlatform::Apns,
-            token_fingerprint: crate::notifications::push_token_fingerprint(
-                PushPlatform::Apns,
-                &owner_ts.to_be_bytes(),
-            ),
-            server_pubkey_hex: "dd".repeat(32),
-            relay_hint: Some("wss://relay.example".to_owned()),
-            encrypted_token: vec![0_u8; crate::notifications::PUSH_ENCRYPTED_TOKEN_LEN],
-            owner_ts,
-            owner_sig: String::new(),
-            updated_at_ms: owner_ts,
+    let gossip_content =
+        |signer: &nostr::prelude::Keys, claimed_owner: &str, owner_ts: i64| -> String {
+            let mut record = GroupPushTokenRecord {
+                group_id_hex: group_id_hex.clone(),
+                member_id_hex: signer.public_key().to_hex(),
+                leaf_index: 1,
+                platform: PushPlatform::Apns,
+                token_fingerprint: crate::notifications::push_token_fingerprint(
+                    PushPlatform::Apns,
+                    &owner_ts.to_be_bytes(),
+                ),
+                server_pubkey_hex: "dd".repeat(32),
+                relay_hint: Some("wss://relay.example".to_owned()),
+                encrypted_token: vec![0_u8; crate::notifications::PUSH_ENCRYPTED_TOKEN_LEN],
+                owner_ts,
+                owner_sig: String::new(),
+                updated_at_ms: owner_ts,
+            };
+            record.sign_owner(signer).unwrap();
+            serde_json::json!({
+                "v": "marmot-push-v1",
+                "tokens": [{
+                    "member_id_hex": claimed_owner,
+                    "leaf_index": record.leaf_index,
+                    "platform": "apns",
+                    "token_fingerprint": record.token_fingerprint,
+                    "server_pubkey_hex": record.server_pubkey_hex,
+                    "relay_hint": record.relay_hint,
+                    "encrypted_token": B64.encode(&record.encrypted_token),
+                    "owner_ts": record.owner_ts,
+                    "owner_sig": record.owner_sig,
+                }]
+            })
+            .to_string()
         };
-        record.sign_owner(signer).unwrap();
-        serde_json::json!({
-            "v": "marmot-push-v1",
-            "tokens": [{
-                "member_id_hex": claimed_owner,
-                "leaf_index": record.leaf_index,
-                "platform": "apns",
-                "token_fingerprint": record.token_fingerprint,
-                "server_pubkey_hex": record.server_pubkey_hex,
-                "relay_hint": record.relay_hint,
-                "encrypted_token": B64.encode(&record.encrypted_token),
-                "owner_ts": record.owner_ts,
-                "owner_sig": record.owner_sig,
-            }]
-        })
-        .to_string()
-    };
 
     let message = |content: String, sender: &str| ReceivedMessage {
         authority: None,
@@ -12772,7 +12914,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     // Spoof: an attacker (a current member) signs a record but names the victim
     // as owner, with a strictly-newer stamp. Only the signature check can stop it
     // — and does, so the victim's record is untouched.
-    let attacker = nostr::Keys::generate();
+    let attacker = nostr::prelude::Keys::generate();
     let spoof = gossip_content(&attacker, &owner_id, 2000);
     app.ingest_push_gossip_message(
         "alice",
@@ -13947,7 +14089,7 @@ fn received_event_with_wrong_sender_is_rejected() {
 
 #[test]
 fn inner_event_id_matches_nostr_sdk_event_id() {
-    use nostr::{EventId, Keys, Kind, Tag, Tags, Timestamp};
+    use nostr::prelude::{EventId, Keys, Kind, Tag, Tags, Timestamp};
 
     let keys = Keys::generate();
     let pubkey = keys.public_key();
@@ -13970,7 +14112,7 @@ fn inner_event_id_matches_nostr_sdk_event_id() {
             .map(|tag| Tag::parse(tag.clone()).unwrap())
             .collect(),
     );
-    let theirs = EventId::new(
+    let theirs = EventId::compute(
         &pubkey,
         &Timestamp::from(created_at),
         &Kind::from(kind as u16),
@@ -14884,8 +15026,8 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
     let group_id = client.create_group("drained departure", &[]).await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
 
-    let departing = nostr::Keys::generate().public_key().to_hex();
-    let staying = nostr::Keys::generate().public_key().to_hex();
+    let departing = nostr::prelude::Keys::generate().public_key().to_hex();
+    let staying = nostr::prelude::Keys::generate().public_key().to_hex();
     app.upsert_group_push_token(
         "alice",
         &drained_seam_push_token(&group_id_hex, &departing, 1),
@@ -15150,7 +15292,7 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
         .observe_drained_session_events(&state_change(
             cgka_traits::engine::GroupStateChange::MemberAdded {
                 member: MemberId::new(
-                    hex::decode(nostr::Keys::generate().public_key().to_hex()).unwrap(),
+                    hex::decode(nostr::prelude::Keys::generate().public_key().to_hex()).unwrap(),
                 ),
             },
         ))
@@ -15191,7 +15333,7 @@ async fn a_self_departure_marks_transport_routes_dirty() {
         origin_commit_id: None,
     };
     let member = |account_id_hex: &str| MemberId::new(hex::decode(account_id_hex).unwrap());
-    let peer = nostr::Keys::generate().public_key().to_hex();
+    let peer = nostr::prelude::Keys::generate().public_key().to_hex();
     let local = account.account_id_hex.as_str();
     let mut summary = SyncSummary::default();
 
@@ -15256,11 +15398,11 @@ async fn a_drained_disband_performs_the_terminal_push_sweep() {
         "alice",
         PushPlatform::Fcm,
         "device-token",
-        &nostr::Keys::generate().public_key().to_hex(),
+        &nostr::prelude::Keys::generate().public_key().to_hex(),
         None,
     )
     .unwrap();
-    let peer = nostr::Keys::generate().public_key().to_hex();
+    let peer = nostr::prelude::Keys::generate().public_key().to_hex();
     app.upsert_group_push_token("alice", &drained_seam_push_token(&group_id_hex, &peer, 1))
         .unwrap();
 
@@ -15400,11 +15542,11 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
         "alice",
         PushPlatform::Fcm,
         "device-token",
-        &nostr::Keys::generate().public_key().to_hex(),
+        &nostr::prelude::Keys::generate().public_key().to_hex(),
         None,
     )
     .unwrap();
-    let peer = nostr::Keys::generate().public_key().to_hex();
+    let peer = nostr::prelude::Keys::generate().public_key().to_hex();
     app.upsert_group_push_token("alice", &drained_seam_push_token(&group_id_hex, &peer, 1))
         .unwrap();
 
@@ -22026,15 +22168,14 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
                 .to_verified_nostr_event()
                 .unwrap();
             let inner = nostr::nips::nip59::extract_rumor(&bob_keys, &event)
-                .await
                 .unwrap()
                 .rumor;
             let rumor = EventBuilder::new(inner.kind, inner.content)
                 .tags(inner.tags)
                 .custom_created_at(NostrTimestamp::from_secs(cutoff.0))
-                .build(alice_keys.public_key());
-            let wrapper = EventBuilder::gift_wrap(&alice_keys, &bob_keys.public_key(), rumor, [])
-                .await
+                .finalize_unsigned(alice_keys.public_key());
+            let wrapper = nostr::nips::nip59::GiftWrapBuilder::new(bob_keys.public_key(), rumor)
+                .finalize(&alice_keys)
                 .unwrap();
             delivery.message = NostrTransportEvent::from_nostr_event(&wrapper)
                 .unwrap()
@@ -22227,7 +22368,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         let skewed = EventBuilder::new(event.kind, event.content.clone())
             .tags(event.tags.clone())
             .custom_created_at(NostrTimestamp::from_secs(0))
-            .sign_with_keys(&Keys::generate())
+            .finalize(&Keys::generate())
             .unwrap();
         let reply = reopened
             .ingest_received_delivery(cgka_traits::TransportDelivery {

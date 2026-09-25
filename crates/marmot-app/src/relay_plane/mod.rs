@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::{
     Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -12,9 +13,11 @@ use cgka_traits::{
     TransportDelivery, TransportEndpoint, TransportGroupSubscription, TransportGroupSync,
     TransportPublishReport, TransportPublishRequest,
 };
+use futures::{Stream, StreamExt};
+use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification,
-    RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, ClientNotification, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
+    SubscriptionId, Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -22,7 +25,8 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
-    AccountSubscriptionEose, NostrPublishOutcome, NostrReconciliationItem,
+    AccountSubscriptionEose, NostrAcquisitionCancellation, NostrAcquisitionError,
+    NostrAcquisitionRequest, NostrAcquisitionResult, NostrPublishOutcome, NostrReconciliationItem,
     NostrReconciliationSummary, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
     NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
     RelayRegistrationOutcome, SubscriptionAttempt,
@@ -87,11 +91,14 @@ struct MarmotRelayPlaneInner {
 struct RelayPlaneTransport {
     adapter: NostrTransportAdapter,
     sdk_relay_client: Option<NostrSdkRelayClient>,
+    directory_client: Option<NostrSdkClient>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     account_deliveries: RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
     account_delivery_metrics: Arc<AccountDeliveryMetrics>,
     router: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder: Mutex<Option<JoinHandle<()>>>,
+    account_notification_forwarders: Mutex<HashMap<MemberId, JoinHandle<()>>>,
+    directory_notification_forwarder: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder_health: Arc<RelayNotificationForwarderHealth>,
     shutting_down: AtomicBool,
 }
@@ -104,7 +111,7 @@ pub(crate) enum DirectoryRelayPlaneEvent {
 
 #[derive(Default)]
 struct RelayNotificationForwarderHealth {
-    running: AtomicBool,
+    running_count: AtomicU64,
     restarts: AtomicU64,
     lag_incidents: AtomicU64,
     lagged_notifications: AtomicU64,
@@ -636,6 +643,8 @@ pub struct RelayPlaneHealth {
     pub account_delivery_recovery_elapsed_ms: u64,
     pub directory_inflight_fetches: usize,
     pub directory_active_subscriptions: usize,
+    #[serde(default)]
+    pub directory_auth_required_routes: usize,
     pub directory_completed_fetches: usize,
     pub directory_coalesced_waiters: usize,
     pub directory_failed_fetches: usize,
@@ -715,15 +724,15 @@ impl MarmotRelayPlane {
     }
 
     fn from_sdk(subscription_rebuild_lookback: Option<Duration>, allow_loopback: bool) -> Self {
-        let client = NostrSdkClient::builder().build();
-        let relay_client = NostrSdkRelayClient::new(client.clone());
+        let directory_client = directory::anonymous_directory_client();
+        let relay_client = NostrSdkRelayClient::multi_account();
         let adapter = NostrTransportAdapter::new(Arc::new(relay_client.clone()));
         Self::from_adapter(
             subscription_rebuild_lookback,
             adapter,
             Some(relay_client),
-            None,
-            Arc::new(NostrSdkDirectoryRelayFetcher::new(client)),
+            Some(directory_client.clone()),
+            Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
             allow_loopback,
         )
     }
@@ -732,18 +741,21 @@ impl MarmotRelayPlane {
         subscription_rebuild_lookback: Option<Duration>,
         adapter: NostrTransportAdapter,
         sdk_relay_client: Option<NostrSdkRelayClient>,
-        notification_forwarder: Option<JoinHandle<()>>,
+        directory_client: Option<NostrSdkClient>,
         directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
         allow_loopback: bool,
     ) -> Self {
         let transport = Arc::new(RelayPlaneTransport {
             adapter,
             sdk_relay_client,
+            directory_client,
             directory_events: broadcast::channel(DIRECTORY_EVENT_BUFFER).0,
             account_deliveries: RwLock::new(HashMap::new()),
             account_delivery_metrics: Arc::new(AccountDeliveryMetrics::default()),
             router: Mutex::new(None),
-            notification_forwarder: Mutex::new(notification_forwarder),
+            notification_forwarder: Mutex::new(None),
+            account_notification_forwarders: Mutex::new(HashMap::new()),
+            directory_notification_forwarder: Mutex::new(None),
             notification_forwarder_health: Arc::new(RelayNotificationForwarderHealth::default()),
             shutting_down: AtomicBool::new(false),
         });
@@ -838,6 +850,29 @@ impl MarmotRelayPlane {
             .sanitize_endpoints(endpoints, context)
     }
 
+    /// Check the production relay dial policy before a history request may
+    /// register an endpoint absent from this account's current SDK pool.
+    pub async fn acquire_history(
+        &self,
+        request: NostrAcquisitionRequest,
+        cancellation: NostrAcquisitionCancellation,
+    ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
+        request.validate()?;
+        let checked = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(request.endpoints.clone(), "history acquisition")
+            .map_err(|_| NostrAcquisitionError::InvalidRequest)?;
+        if checked.len() != request.endpoints.len() {
+            return Err(NostrAcquisitionError::InvalidRequest);
+        }
+        self.inner
+            .transport
+            .adapter
+            .acquire_history(request, cancellation)
+            .await
+    }
+
     /// Classify caller-owned relay URLs under the exact policy used at every
     /// relay-plane dial boundary. Results preserve input order and cardinality.
     pub fn classify_relay_endpoints(
@@ -915,19 +950,74 @@ impl MarmotRelayPlane {
         Vec::new()
     }
 
-    /// Attach an account's signing keys to the shared transport client so it
-    /// can answer NIP-42 AUTH challenges. Auth-gated relays withhold
-    /// gift-wrapped welcomes from unauthenticated subscribers without
-    /// surfacing an error — the events are simply absent — so an inbox
-    /// subscription issued before a signer is set never sees the invites
-    /// those relays hold. The SDK client (and the directory fetcher sharing
-    /// it) is one per plane: with multiple accounts the most recently opened
-    /// account's keys win, which matches the one-account-per-process apps.
-    /// No-op for planes built on a custom relay client.
-    pub async fn set_transport_signer(&self, signer: Arc<dyn nostr::NostrSigner>) {
+    /// Register the immutable NIP-42 context before any account subscription.
+    /// A custom injected relay client owns its own authentication behavior.
+    pub async fn set_transport_signer(
+        &self,
+        account_id: &MemberId,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+    ) -> Result<(), TransportAdapterError> {
         if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
-            sdk_relay_client.client().set_signer(signer).await;
+            let account_client = sdk_relay_client
+                .register_account(account_id.clone(), signer)
+                .await?;
+            let mut forwarders = self
+                .inner
+                .transport
+                .account_notification_forwarders
+                .lock()
+                .await;
+            if forwarders
+                .get(account_id)
+                .is_none_or(JoinHandle::is_finished)
+                && !self.inner.transport.shutting_down.load(Ordering::SeqCst)
+            {
+                if forwarders.remove(account_id).is_some() {
+                    recover_relay_notification_forwarder_scoped(
+                        &self.inner.transport,
+                        RelayNotificationConsumerExit::Closed,
+                        Some(account_id),
+                    );
+                }
+                forwarders.insert(
+                    account_id.clone(),
+                    spawn_relay_notification_forwarder_scoped(
+                        account_client,
+                        self.inner.transport.clone(),
+                        Some(account_id.clone()),
+                    ),
+                );
+            }
         }
+        Ok(())
+    }
+
+    /// Retire a stopped account worker's subscriptions and immutable SDK
+    /// authenticator before a replacement worker can register a fresh signer.
+    pub(crate) async fn deactivate_account_context(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<(), TransportAdapterError> {
+        account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
+        self.inner
+            .transport
+            .adapter
+            .deactivate_account(account_id)
+            .await?;
+        if let Some(sdk) = &self.inner.transport.sdk_relay_client {
+            sdk.remove_account(account_id).await;
+        }
+        if let Some(handle) = self
+            .inner
+            .transport
+            .account_notification_forwarders
+            .lock()
+            .await
+            .remove(account_id)
+        {
+            handle.abort();
+        }
+        Ok(())
     }
 
     pub async fn relay_health(&self) -> RelayPlaneHealth {
@@ -1052,7 +1142,7 @@ impl MarmotRelayPlane {
         &self,
         endpoint: TransportEndpoint,
         query: DirectoryEventQuery,
-        signer: Option<Arc<dyn nostr::NostrSigner>>,
+        signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, directory::DirectoryInspectionError> {
         let endpoints = self
             .inner
@@ -1103,16 +1193,29 @@ impl MarmotRelayPlane {
             .relay_safety
             .sanitize_endpoints(plan.endpoints, "directory subscription")?;
         if plan.batches.is_empty() || endpoints.is_empty() {
+            if let Some(client) = &self.inner.transport.directory_client {
+                let (_, stale) = self
+                    .inner
+                    .directory
+                    .subscription_diff(&HashSet::new())
+                    .await;
+                for subscription_id in stale {
+                    client
+                        .unsubscribe(&SubscriptionId::new(subscription_id))
+                        .await
+                        .map_err(|_| "directory unsubscribe failed".to_owned())?;
+                }
+            }
             return self
                 .inner
                 .directory
                 .replace_subscriptions(HashMap::new())
                 .await;
         }
-        let sdk_relay_client = self
+        let directory_client = self
             .inner
             .transport
-            .sdk_relay_client
+            .directory_client
             .as_ref()
             .ok_or_else(|| "directory subscription requires SDK relay plane".to_owned())?;
         let relay_urls = endpoints
@@ -1123,19 +1226,23 @@ impl MarmotRelayPlane {
             })
             .collect::<Result<Vec<_>, _>>()?;
         for relay_url in &relay_urls {
-            sdk_relay_client
-                .client()
+            directory_client
                 .add_relay(relay_url.clone())
                 .await
                 .map_err(|_| "directory subscription add relay failed".to_owned())?;
             timeout(
                 DIRECTORY_RELAY_CONNECT_WAIT,
-                sdk_relay_client.client().connect_relay(relay_url.clone()),
+                directory_client.connect_relay(relay_url.clone()),
             )
             .await
             .map_err(|_| "directory subscription connect relay timed out".to_owned())?
             .map_err(|_| "directory subscription connect relay failed".to_owned())?;
         }
+        let endpoints_changed = self
+            .inner
+            .directory
+            .set_subscription_endpoints(&relay_urls)
+            .await;
 
         let desired_ids = plan
             .batches
@@ -1143,14 +1250,23 @@ impl MarmotRelayPlane {
             .map(|batch| batch.subscription_id.clone())
             .collect::<HashSet<_>>();
         let (mut to_add, to_remove) = self.inner.directory.subscription_diff(&desired_ids).await;
-        if force_rebuild {
+        if force_rebuild || endpoints_changed {
             to_add = desired_ids;
+            self.inner.directory.mark_rebuild_pending(&to_add).await;
         }
         for subscription_id in &to_remove {
-            sdk_relay_client
-                .client()
+            directory_client
                 .unsubscribe(&SubscriptionId::new(subscription_id.clone()))
-                .await;
+                .await
+                .map_err(|_| "directory unsubscribe failed".to_owned())?;
+        }
+        if force_rebuild || endpoints_changed {
+            for subscription_id in &to_add {
+                directory_client
+                    .unsubscribe(&SubscriptionId::new(subscription_id.clone()))
+                    .await
+                    .map_err(|_| "directory unsubscribe failed".to_owned())?;
+            }
         }
         // The validation filter persisted for every batch (added or already
         // active) is keyed on the same canonical-hex authors and kinds the SDK
@@ -1183,6 +1299,10 @@ impl MarmotRelayPlane {
             if !to_add.contains(&batch.subscription_id) {
                 continue;
             }
+            self.inner
+                .directory
+                .clear_auth_required(&batch.subscription_id)
+                .await;
             let mut filter = Filter::new()
                 .authors(authors)
                 .kinds(kinds)
@@ -1190,22 +1310,32 @@ impl MarmotRelayPlane {
             if let Some(since) = batch.since {
                 filter = filter.since(NostrTimestamp::from_secs(since));
             }
-            sdk_relay_client
-                .client()
-                .subscribe_with_id_to(
-                    relay_urls.clone(),
-                    SubscriptionId::new(batch.subscription_id.clone()),
-                    filter,
-                    None,
-                )
-                .await
-                .map_err(|err| format!("directory subscription subscribe: {err}"))?;
-            subscriptions_created += usize::from(
+            let previous = self
+                .inner
+                .directory
+                .record_subscription_filter(batch.subscription_id.clone(), validation_filter)
+                .await;
+            let subscription = directory_client
+                .subscribe(nostr_sdk::prelude::ReqTarget::manual(
+                    relay_urls
+                        .iter()
+                        .cloned()
+                        .map(|url| (url, vec![filter.clone()])),
+                ))
+                .with_id(SubscriptionId::new(batch.subscription_id.clone()))
+                .await;
+            if !subscription.is_ok_and(|output| !output.success.is_empty()) {
                 self.inner
                     .directory
-                    .record_subscription_filter(batch.subscription_id.clone(), validation_filter)
-                    .await,
-            );
+                    .restore_failed_subscription_filter(&batch.subscription_id, previous)
+                    .await;
+                return Err("directory subscription registered on no relays".to_owned());
+            }
+            subscriptions_created += usize::from(previous.is_none());
+            self.inner
+                .directory
+                .mark_subscription_installed(&batch.subscription_id)
+                .await;
         }
 
         self.inner
@@ -1220,6 +1350,11 @@ impl MarmotRelayPlane {
             .shutting_down
             .store(true, Ordering::SeqCst);
         if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
+            let _ = timeout(
+                RELAY_PLANE_SHUTDOWN_WAIT,
+                sdk_relay_client.shutdown_accounts(),
+            )
+            .await;
             let timed_out = timeout(
                 RELAY_PLANE_SHUTDOWN_WAIT,
                 sdk_relay_client.client().shutdown(),
@@ -1233,6 +1368,9 @@ impl MarmotRelayPlane {
                     "SDK relay pool shutdown timed out",
                 );
             }
+        }
+        if let Some(directory_client) = &self.inner.transport.directory_client {
+            let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, directory_client.shutdown()).await;
         }
         account_deliveries_write(&self.inner.transport.account_deliveries).clear();
         if let Some(handle) = self.inner.transport.router.lock().await.take() {
@@ -1252,11 +1390,36 @@ impl MarmotRelayPlane {
             handle.abort();
             let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
         }
+        let account_forwarders = self
+            .inner
+            .transport
+            .account_notification_forwarders
+            .lock()
+            .await
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect::<Vec<_>>();
+        for mut handle in account_forwarders {
+            handle.abort();
+            let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
+        }
+        if let Some(handle) = self
+            .inner
+            .transport
+            .directory_notification_forwarder
+            .lock()
+            .await
+            .take()
+        {
+            let mut handle = handle;
+            handle.abort();
+            let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
+        }
         self.inner
             .transport
             .notification_forwarder_health
-            .running
-            .store(false, Ordering::SeqCst);
+            .running_count
+            .store(0, Ordering::SeqCst);
     }
 
     fn spawn_router(&self) {
@@ -1275,8 +1438,9 @@ impl MarmotRelayPlane {
             };
             if needs_forwarder
                 && let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client
+                && !sdk_relay_client.is_multi_account()
             {
-                if sdk_relay_client.client().pool().is_shutdown() {
+                if sdk_relay_client.client().is_shutdown() {
                     notification_forwarder.take();
                 } else {
                     if notification_forwarder.take().is_some() {
@@ -1288,10 +1452,34 @@ impl MarmotRelayPlane {
                     *notification_forwarder = Some(spawn_relay_notification_forwarder(
                         sdk_relay_client.clone(),
                         self.inner.transport.clone(),
-                        self.inner.directory.clone(),
                     ));
                 }
             }
+        }
+        if let Ok(mut forwarder) = self
+            .inner
+            .transport
+            .directory_notification_forwarder
+            .try_lock()
+            && forwarder.as_ref().is_none_or(JoinHandle::is_finished)
+            && let Some(client) = &self.inner.transport.directory_client
+            && !client.is_shutdown()
+        {
+            if forwarder.take().is_some() {
+                let _ = self
+                    .inner
+                    .transport
+                    .directory_events
+                    .send(DirectoryRelayPlaneEvent::RecoveryRequired);
+            }
+            *forwarder = Some(spawn_directory_notification_forwarder(
+                Arc::new(SdkRelayNotificationSource {
+                    client: client.clone(),
+                    loss: None,
+                }),
+                self.inner.transport.directory_events.clone(),
+                self.inner.directory.clone(),
+            ));
         }
         let Ok(mut router) = self.inner.transport.router.try_lock() else {
             return;
@@ -1456,6 +1644,7 @@ impl RelayPlaneHealth {
             account_delivery_recovery_elapsed_ms: account_delivery.recovery_elapsed_ms,
             directory_inflight_fetches: directory.inflight_fetches,
             directory_active_subscriptions: directory.active_subscriptions,
+            directory_auth_required_routes: directory.auth_required_routes,
             directory_completed_fetches: directory.completed_fetches,
             directory_coalesced_waiters: directory.coalesced_waiters,
             directory_failed_fetches: directory.failed_fetches,
@@ -1479,6 +1668,7 @@ impl RelayPlaneHealth {
             account_delivery_recovery_elapsed_ms: account_delivery.recovery_elapsed_ms,
             directory_inflight_fetches: directory.inflight_fetches,
             directory_active_subscriptions: directory.active_subscriptions,
+            directory_auth_required_routes: directory.auth_required_routes,
             directory_completed_fetches: directory.completed_fetches,
             directory_coalesced_waiters: directory.coalesced_waiters,
             directory_failed_fetches: directory.failed_fetches,
@@ -1493,7 +1683,7 @@ impl RelayPlaneHealth {
 impl RelayNotificationForwarderHealth {
     fn snapshot(&self) -> RelayNotificationForwarderHealthSnapshot {
         RelayNotificationForwarderHealthSnapshot {
-            running: self.running.load(Ordering::Relaxed),
+            running: self.running_count.load(Ordering::Relaxed) > 0,
             restarts: self.restarts.load(Ordering::Relaxed),
             lag_incidents: self.lag_incidents.load(Ordering::Relaxed),
             lagged_notifications: self.lagged_notifications.load(Ordering::Relaxed),
@@ -1516,8 +1706,11 @@ enum RelayNotificationConsumerExit {
     Closed,
 }
 
+type RelayNotificationStream =
+    Pin<Box<dyn Stream<Item = NotificationUpdate<ClientNotification>> + Send>>;
+
 struct RelayNotificationConsumerOutcome {
-    receiver: broadcast::Receiver<RelayPoolNotification>,
+    receiver: RelayNotificationStream,
     exit: RelayNotificationConsumerExit,
 }
 
@@ -1549,58 +1742,182 @@ impl RelayNotificationRestartBackoff {
 }
 
 trait RelayNotificationSource: Send + Sync {
-    fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification>;
+    fn notifications(&self) -> RelayNotificationStream;
     fn is_shutdown(&self) -> bool;
+    fn record_loss(&self, _skipped: u64) {}
+    fn receiver_replaced(&self) {}
+    #[cfg(test)]
+    fn worker_failure_hook(&self) -> Option<Arc<NotificationWorkerFailureHook>> {
+        None
+    }
+    #[cfg(test)]
+    fn notification_queued(&self) {}
+}
+
+#[cfg(test)]
+struct NotificationWorkerFailureHook {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    fail_once: AtomicBool,
 }
 
 struct SdkRelayNotificationSource {
     client: NostrSdkClient,
+    loss: Option<NostrSdkRelayClient>,
 }
 
 impl RelayNotificationSource for SdkRelayNotificationSource {
-    fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification> {
-        self.client.notifications()
+    fn notifications(&self) -> RelayNotificationStream {
+        self.client.notifications_with_gaps()
     }
 
     fn is_shutdown(&self) -> bool {
-        self.client.pool().is_shutdown()
+        self.client.is_shutdown()
+    }
+
+    fn record_loss(&self, skipped: u64) {
+        if let Some(loss) = &self.loss {
+            loss.record_notification_gap(skipped);
+        }
+    }
+
+    fn receiver_replaced(&self) {
+        if let Some(loss) = &self.loss {
+            loss.notification_receiver_replaced();
+        }
     }
 }
 
 fn spawn_relay_notification_forwarder(
     sdk_relay_client: NostrSdkRelayClient,
     transport: Arc<RelayPlaneTransport>,
-    directory: DirectoryRelayPlane,
+) -> JoinHandle<()> {
+    spawn_relay_notification_forwarder_scoped(sdk_relay_client, transport, None)
+}
+
+fn spawn_relay_notification_forwarder_scoped(
+    sdk_relay_client: NostrSdkRelayClient,
+    transport: Arc<RelayPlaneTransport>,
+    account_id: Option<MemberId>,
 ) -> JoinHandle<()> {
     let source: Arc<dyn RelayNotificationSource> = Arc::new(SdkRelayNotificationSource {
         client: sdk_relay_client.client().clone(),
+        loss: Some(sdk_relay_client),
     });
-    spawn_relay_notification_supervisor(source, transport, directory)
+    spawn_relay_notification_supervisor_scoped(source, transport, account_id)
 }
 
-fn spawn_relay_notification_supervisor(
+/// Public directory interests have their own unauthenticated SDK client and
+/// receiver. A gap here invalidates directory coverage without interrupting
+/// an account's live delivery or attributing the loss to an account.
+fn spawn_directory_notification_forwarder(
     source: Arc<dyn RelayNotificationSource>,
-    transport: Arc<RelayPlaneTransport>,
+    events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     directory: DirectoryRelayPlane,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        transport
-            .notification_forwarder_health
-            .running
-            .store(true, Ordering::SeqCst);
+        let mut receiver = source.notifications();
+        loop {
+            match receiver.next().await {
+                Some(NotificationUpdate::Notification(ClientNotification::Event {
+                    relay_url,
+                    subscription_id,
+                    event,
+                })) => {
+                    let subscription_id = subscription_id.to_string();
+                    if let Ok(event) = NostrTransportEvent::from_nostr_event(&event)
+                        && directory
+                            .accepts_live_event_from(
+                                &subscription_id,
+                                relay_url.as_str(),
+                                &event.pubkey,
+                                event.kind,
+                            )
+                            .await
+                    {
+                        let _ = events.send(DirectoryRelayPlaneEvent::Record(
+                            DirectoryRelayEventRecord {
+                                endpoints: vec![TransportEndpoint(relay_url.to_string())],
+                                event,
+                            },
+                        ));
+                    }
+                }
+                Some(NotificationUpdate::Notification(ClientNotification::Message {
+                    relay_url,
+                    message,
+                })) => {
+                    if let RelayMessage::Closed {
+                        subscription_id,
+                        message,
+                    } = *message
+                        && message.starts_with("auth-required:")
+                        && directory
+                            .mark_auth_required(subscription_id.as_str(), relay_url.as_str())
+                            .await
+                    {
+                        let count = directory.stats().await.auth_required_routes;
+                        tracing::warn!(
+                            target: "marmot_app::relay_plane",
+                            method = "spawn_directory_notification_forwarder",
+                            auth_required_routes = count,
+                            "anonymous directory request requires authentication",
+                        );
+                    }
+                }
+                Some(NotificationUpdate::Notification(ClientNotification::Shutdown)) => break,
+                Some(NotificationUpdate::Lagged { skipped }) => {
+                    tracing::warn!(
+                        target: "marmot_app::relay_plane",
+                        method = "spawn_directory_notification_forwarder",
+                        skipped_notifications = skipped,
+                        "directory SDK receiver lost notifications",
+                    );
+                    let _ = events.send(DirectoryRelayPlaneEvent::RecoveryRequired);
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+fn spawn_relay_notification_supervisor(
+    source: Arc<dyn RelayNotificationSource>,
+    transport: Arc<RelayPlaneTransport>,
+) -> JoinHandle<()> {
+    spawn_relay_notification_supervisor_scoped(source, transport, None)
+}
+
+fn spawn_relay_notification_supervisor_scoped(
+    source: Arc<dyn RelayNotificationSource>,
+    transport: Arc<RelayPlaneTransport>,
+    account_id: Option<MemberId>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _running = RunningSupervisorGuard::new(transport.notification_forwarder_health.clone());
         let mut receiver = None;
         let mut restart_backoff = RelayNotificationRestartBackoff::default();
         loop {
             let adapter = transport.adapter.clone();
-            let directory_events = transport.directory_events.clone();
-            let directory = directory.clone();
             let source_for_consumer = source.clone();
             let next_receiver = receiver.take();
             let consumer_started_at = Instant::now();
+            if next_receiver.is_none() {
+                source.receiver_replaced();
+            }
+            let consumer_account_id = account_id.clone();
             let mut consumer = tokio::spawn(async move {
                 let receiver = next_receiver.unwrap_or_else(|| source_for_consumer.notifications());
-                run_relay_notification_consumer(receiver, adapter, directory_events, directory)
-                    .await
+                run_relay_notification_consumer_scoped(
+                    receiver,
+                    adapter,
+                    consumer_account_id,
+                    source_for_consumer,
+                )
+                .await
             });
             let abort_on_drop = AbortTaskOnDrop(consumer.abort_handle());
             match (&mut consumer).await {
@@ -1611,9 +1928,20 @@ fn spawn_relay_notification_supervisor(
                         || transport.shutting_down.load(Ordering::SeqCst)
                         || source.is_shutdown()
                     {
+                        if matches!(outcome.exit, RelayNotificationConsumerExit::Lagged(_)) {
+                            recover_relay_notification_forwarder_scoped(
+                                &transport,
+                                outcome.exit,
+                                account_id.as_ref(),
+                            );
+                        }
                         break;
                     }
-                    recover_relay_notification_forwarder(&transport, outcome.exit);
+                    recover_relay_notification_forwarder_scoped(
+                        &transport,
+                        outcome.exit,
+                        account_id.as_ref(),
+                    );
                     if outcome.exit == RelayNotificationConsumerExit::Closed {
                         receiver = None;
                         tokio::time::sleep(
@@ -1632,9 +1960,10 @@ fn spawn_relay_notification_supervisor(
                         u64::from(join_error.is_panic()),
                     );
                     receiver = None;
-                    recover_relay_notification_forwarder(
+                    recover_relay_notification_forwarder_scoped(
                         &transport,
                         RelayNotificationConsumerExit::Closed,
+                        account_id.as_ref(),
                     );
                     tokio::time::sleep(
                         restart_backoff.delay_after_failure(consumer_started_at.elapsed()),
@@ -1643,11 +1972,28 @@ fn spawn_relay_notification_supervisor(
                 }
             }
         }
-        transport
-            .notification_forwarder_health
-            .running
-            .store(false, Ordering::SeqCst);
     })
+}
+
+struct RunningSupervisorGuard(Arc<RelayNotificationForwarderHealth>);
+
+impl RunningSupervisorGuard {
+    fn new(health: Arc<RelayNotificationForwarderHealth>) -> Self {
+        health.running_count.fetch_add(1, Ordering::SeqCst);
+        Self(health)
+    }
+}
+
+impl Drop for RunningSupervisorGuard {
+    fn drop(&mut self) {
+        // Terminal shutdown may already have reset the aggregate to zero.
+        let _ = self
+            .0
+            .running_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                Some(count.saturating_sub(1))
+            });
+    }
 }
 
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
@@ -1658,22 +2004,15 @@ impl Drop for AbortTaskOnDrop {
     }
 }
 
+#[cfg(test)]
 async fn run_relay_notification_consumer(
-    mut receiver: broadcast::Receiver<RelayPoolNotification>,
+    mut receiver: RelayNotificationStream,
     adapter: NostrTransportAdapter,
-    directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
-    directory: DirectoryRelayPlane,
 ) -> RelayNotificationConsumerOutcome {
     loop {
-        match receiver.recv().await {
-            Ok(notification) => {
-                let should_shutdown = handle_relay_notification(
-                    notification,
-                    &adapter,
-                    &directory_events,
-                    &directory,
-                )
-                .await;
+        match receiver.next().await {
+            Some(NotificationUpdate::Notification(notification)) => {
+                let should_shutdown = handle_relay_notification(notification, &adapter, None).await;
                 if should_shutdown {
                     return RelayNotificationConsumerOutcome {
                         receiver,
@@ -1681,13 +2020,13 @@ async fn run_relay_notification_consumer(
                     };
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            Some(NotificationUpdate::Lagged { skipped }) => {
                 return RelayNotificationConsumerOutcome {
                     receiver,
                     exit: RelayNotificationConsumerExit::Lagged(skipped),
                 };
             }
-            Err(broadcast::error::RecvError::Closed) => {
+            None => {
                 return RelayNotificationConsumerOutcome {
                     receiver,
                     exit: RelayNotificationConsumerExit::Closed,
@@ -1697,14 +2036,139 @@ async fn run_relay_notification_consumer(
     }
 }
 
+/// Keep reading the SDK receiver while account delivery or telemetry awaits.
+/// The bounded queue is an event lane; a full queue becomes a typed gap before
+/// the reader can block, and the watch control lane advances independently.
+fn abandoned_notification_lane(
+    pending: &AtomicU64,
+    source: &dyn RelayNotificationSource,
+) -> RelayNotificationConsumerExit {
+    let abandoned = pending.load(Ordering::SeqCst);
+    if abandoned > 0 {
+        source.record_loss(abandoned);
+        RelayNotificationConsumerExit::Lagged(abandoned)
+    } else {
+        RelayNotificationConsumerExit::Closed
+    }
+}
+
+async fn run_relay_notification_consumer_scoped(
+    mut receiver: RelayNotificationStream,
+    adapter: NostrTransportAdapter,
+    account_id: Option<MemberId>,
+    source: Arc<dyn RelayNotificationSource>,
+) -> RelayNotificationConsumerOutcome {
+    const EVENT_QUEUE_CAPACITY: usize = 256;
+    let (sender, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    // Channel capacity returns to its maximum when a panicked worker drops
+    // the receiver, even though queued work was discarded. Count admitted
+    // items independently until each worker operation actually finishes.
+    let pending = Arc::new(AtomicU64::new(0));
+    let worker_pending = pending.clone();
+    #[cfg(test)]
+    let worker_failure_hook = source.worker_failure_hook();
+    let mut worker = tokio::spawn(async move {
+        while let Some(notification) = event_rx.recv().await {
+            #[cfg(test)]
+            if let Some(hook) = &worker_failure_hook
+                && hook.fail_once.swap(false, Ordering::SeqCst)
+            {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+                panic!("injected relay notification worker failure");
+            }
+            if handle_relay_notification(notification, &adapter, account_id.as_ref()).await {
+                worker_pending.fetch_sub(1, Ordering::SeqCst);
+                return true;
+            }
+            worker_pending.fetch_sub(1, Ordering::SeqCst);
+        }
+        false
+    });
+    let abort_on_drop = AbortTaskOnDrop(worker.abort_handle());
+    loop {
+        tokio::select! {
+            worker_result = &mut worker => {
+                drop(abort_on_drop);
+                let exit = abandoned_notification_lane(&pending, source.as_ref());
+                return RelayNotificationConsumerOutcome {
+                    receiver,
+                    exit: if exit == RelayNotificationConsumerExit::Closed && matches!(worker_result, Ok(true)) {
+                        RelayNotificationConsumerExit::Shutdown
+                    } else {
+                        exit
+                    },
+                };
+            }
+            update = receiver.next() => match update {
+                Some(NotificationUpdate::Notification(notification)) => {
+                    if matches!(notification, ClientNotification::Shutdown) {
+                        let abandoned = pending.load(Ordering::SeqCst);
+                        if abandoned > 0 {
+                            source.record_loss(abandoned);
+                        }
+                        return RelayNotificationConsumerOutcome {
+                            receiver,
+                            exit: if abandoned > 0 {
+                                RelayNotificationConsumerExit::Lagged(abandoned)
+                            } else {
+                                RelayNotificationConsumerExit::Shutdown
+                            },
+                        };
+                    }
+                    pending.fetch_add(1, Ordering::SeqCst);
+                    if let Err(error) = sender.try_send(notification) {
+                        pending.fetch_sub(1, Ordering::SeqCst);
+                        let skipped = match error {
+                            mpsc::error::TrySendError::Full(_) => {
+                                1 + pending.load(Ordering::SeqCst)
+                            }
+                            mpsc::error::TrySendError::Closed(_) => 1,
+                        };
+                        source.record_loss(skipped);
+                        return RelayNotificationConsumerOutcome {
+                            receiver,
+                            exit: RelayNotificationConsumerExit::Lagged(skipped),
+                        };
+                    }
+                    #[cfg(test)]
+                    source.notification_queued();
+                }
+                Some(NotificationUpdate::Lagged { skipped }) => {
+                    let abandoned = skipped
+                        .saturating_add(pending.load(Ordering::SeqCst));
+                    source.record_loss(abandoned);
+                    return RelayNotificationConsumerOutcome {
+                        receiver,
+                        exit: RelayNotificationConsumerExit::Lagged(abandoned),
+                    };
+                }
+                None => {
+                    let abandoned = pending.load(Ordering::SeqCst);
+                    if abandoned > 0 {
+                        source.record_loss(abandoned);
+                    }
+                    return RelayNotificationConsumerOutcome {
+                        receiver,
+                        exit: if abandoned > 0 {
+                            RelayNotificationConsumerExit::Lagged(abandoned)
+                        } else {
+                            RelayNotificationConsumerExit::Closed
+                        },
+                    };
+                }
+            }
+        }
+    }
+}
+
 async fn handle_relay_notification(
-    notification: RelayPoolNotification,
+    notification: ClientNotification,
     adapter: &NostrTransportAdapter,
-    directory_events: &broadcast::Sender<DirectoryRelayPlaneEvent>,
-    directory: &DirectoryRelayPlane,
+    account_id: Option<&MemberId>,
 ) -> bool {
     match notification {
-        RelayPoolNotification::Event {
+        ClientNotification::Event {
             relay_url,
             subscription_id,
             event,
@@ -1718,88 +2182,53 @@ async fn handle_relay_notification(
                 let endpoint = TransportEndpoint(relay_url.to_string());
                 let subscription_id = subscription_id.to_string();
                 let relay_event = transport_nostr_adapter::NostrRelayEvent {
-                    endpoint: endpoint.clone(),
-                    subscription_id: Some(subscription_id.clone()),
-                    event: event.clone(),
+                    endpoint,
+                    subscription_id: Some(subscription_id),
+                    event,
                 };
-                // The transport adapter path is unchanged: every
-                // SDK event still feeds account/group delivery
-                // and telemetry. Only the directory cache path is
-                // gated, so an unsolicited or filter-mismatched
-                // event from a malicious or buggy relay cannot
-                // create persistent directory search-graph writes
-                // (mdk#709).
-                let _ = adapter.handle_relay_event(relay_event).await;
-                if directory
-                    .accepts_live_event(&subscription_id, &event.pubkey, event.kind)
-                    .await
-                {
-                    let _ = directory_events.send(DirectoryRelayPlaneEvent::Record(
-                        DirectoryRelayEventRecord {
-                            endpoints: vec![endpoint],
-                            event,
-                        },
-                    ));
+                // Account notifications feed only account/group delivery.
+                // Public directory interests use the anonymous receiver.
+                let _ = if let Some(account_id) = account_id {
+                    adapter
+                        .handle_reconciled_event(account_id, relay_event)
+                        .await
                 } else {
-                    tracing::trace!(
-                        target: "marmot_app::relay_plane",
-                        method = "handle_relay_notification",
-                        "dropping directory relay event: no matching active directory subscription"
-                    );
-                }
+                    adapter.handle_relay_event(relay_event).await
+                };
             }
             false
         }
-        RelayPoolNotification::Message {
-            relay_url,
-            message:
+        ClientNotification::Message { relay_url, message } => {
+            match *message {
                 RelayMessage::Event {
                     subscription_id,
                     event,
-                },
-        } => {
-            // Raw per-relay copy (not deduplicated): telemetry
-            // only, so cross-relay arrival spread and per-relay
-            // first-event timing see every relay's copy. Delivery
-            // happens on the deduplicated `Event` arm above. Keep
-            // this in sync with the relay plane's own tap; the
-            // SDK client's standalone forwarder is unused here.
-            if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                tracing::trace!(
-                    target: "marmot_app::relay_plane",
-                    method = "handle_relay_notification",
-                    "observing per-relay event copy"
-                );
-                adapter
-                    .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {
-                        endpoint: TransportEndpoint(relay_url.to_string()),
-                        subscription_id: Some(subscription_id.to_string()),
-                        event,
-                    })
-                    .await;
+                } => {
+                    // Raw per-relay copy is telemetry only. Delivery uses the
+                    // deduplicated Event notification above.
+                    if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
+                        adapter
+                            .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {
+                                endpoint: TransportEndpoint(relay_url.to_string()),
+                                subscription_id: Some(subscription_id.to_string()),
+                                event,
+                            })
+                            .await;
+                    }
+                }
+                RelayMessage::EndOfStoredEvents(subscription_id) => {
+                    adapter
+                        .handle_relay_eose(
+                            TransportEndpoint(relay_url.to_string()),
+                            subscription_id.to_string(),
+                        )
+                        .await;
+                }
+                _ => {}
             }
             false
         }
-        RelayPoolNotification::Message {
-            relay_url,
-            message: RelayMessage::EndOfStoredEvents(subscription_id),
-        } => {
-            // EOSE tap: advances the per-relay initial-sync gate
-            // and records EOSE latency. No delivery.
-            tracing::trace!(
-                target: "marmot_app::relay_plane",
-                method = "handle_relay_notification",
-                "forwarding SDK relay end-of-stored-events"
-            );
-            adapter
-                .handle_relay_eose(
-                    TransportEndpoint(relay_url.to_string()),
-                    subscription_id.to_string(),
-                )
-                .await;
-            false
-        }
-        RelayPoolNotification::Shutdown => {
+        ClientNotification::Shutdown => {
             tracing::debug!(
                 target: "marmot_app::relay_plane",
                 method = "handle_relay_notification",
@@ -1807,7 +2236,6 @@ async fn handle_relay_notification(
             );
             true
         }
-        _ => false,
     }
 }
 
@@ -1815,13 +2243,29 @@ fn recover_relay_notification_forwarder(
     transport: &RelayPlaneTransport,
     exit: RelayNotificationConsumerExit,
 ) {
-    let account_count = account_deliveries_read(&transport.account_deliveries).len();
+    recover_relay_notification_forwarder_scoped(transport, exit, None);
+}
+
+fn recover_relay_notification_forwarder_scoped(
+    transport: &RelayPlaneTransport,
+    exit: RelayNotificationConsumerExit,
+    account_id: Option<&MemberId>,
+) {
+    let account_count = match account_id {
+        Some(account_id) => usize::from(
+            account_deliveries_read(&transport.account_deliveries).contains_key(account_id),
+        ),
+        None => account_deliveries_read(&transport.account_deliveries).len(),
+    };
     // Latch account-local evidence before closing receivers. Keep each loss
     // handle in the existing account registry so replacement adapters inherit
     // the fence; the shared router never awaits account database I/O.
     if !matches!(exit, RelayNotificationConsumerExit::Shutdown) {
         let mut routes = account_deliveries_write(&transport.account_deliveries);
-        for route in routes.values_mut() {
+        for (route_account_id, route) in routes.iter_mut() {
+            if account_id.is_some_and(|account_id| account_id != route_account_id) {
+                continue;
+            }
             if matches!(exit, RelayNotificationConsumerExit::Lagged(_)) {
                 route.overflow.record_notification_loss();
             }
@@ -1839,9 +2283,6 @@ fn recover_relay_notification_forwarder(
             route.sender = closed_sender;
         }
     }
-    let _ = transport
-        .directory_events
-        .send(DirectoryRelayPlaneEvent::RecoveryRequired);
     RelayNotificationForwarderHealth::increment(
         &transport.notification_forwarder_health.restarts,
         1,
@@ -2073,30 +2514,6 @@ impl MarmotRelayPlaneAccountAdapter {
         }
     }
 
-    pub(crate) fn recovery_admitted_endpoints(
-        &self,
-        endpoints: &[TransportEndpoint],
-    ) -> Vec<String> {
-        if self
-            .relay_plane
-            .inner
-            .relay_safety
-            .sanitize_endpoints(endpoints.to_vec(), "recovery scope")
-            .is_err()
-        {
-            return Vec::new();
-        }
-        // Preserve signed spelling in the frozen goal. Membership queries use
-        // the adapter's forward canonical identity lookup, never URL rewrites.
-        let mut result = endpoints
-            .iter()
-            .map(|endpoint| endpoint.0.clone())
-            .collect::<Vec<_>>();
-        result.sort();
-        result.dedup();
-        result
-    }
-
     pub(crate) async fn group_maintenance_endpoint_eose(
         &self,
         subscription_id: &str,
@@ -2286,13 +2703,8 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         }
         let mut activation = self.incremental_activation.lock().await;
         *activation = None;
-        account_deliveries_write(&self.relay_plane.inner.transport.account_deliveries)
-            .remove(account_id);
         self.relay_plane
-            .inner
-            .transport
-            .adapter
-            .deactivate_account(account_id)
+            .deactivate_account_context(account_id)
             .await
     }
 
@@ -2319,6 +2731,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .adapter
             .publish_event_with_client(
                 self.publish_client.as_ref(),
+                &request.account_id,
                 request.target.endpoints(),
                 &event,
                 request.required_acks,

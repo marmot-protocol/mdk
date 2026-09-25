@@ -18,6 +18,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use nostr::prelude::FinalizeEvent;
 use std::io::Write;
 use std::sync::Arc;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -25,7 +26,7 @@ use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 const SESSION_PROMOTION_FIXTURE: &[u8] = include_bytes!("../fixtures/session-promotion-v1.bin");
 const SESSION_PROMOTION_GROUP_ID_HEX: &str = "1d3ce58153822ac936ba83eba9cb87db";
 
-fn deterministic_nostr_keys(name: &[u8]) -> nostr::Keys {
+fn deterministic_nostr_keys(name: &[u8]) -> nostr::prelude::Keys {
     use sha2::{Digest, Sha256};
     let mut counter = 0u64;
     loop {
@@ -34,7 +35,7 @@ fn deterministic_nostr_keys(name: &[u8]) -> nostr::Keys {
         hasher.update(name);
         hasher.update(counter.to_be_bytes());
         let secret = hasher.finalize();
-        if let Ok(keys) = nostr::Keys::parse(&hex::encode(secret)) {
+        if let Ok(keys) = nostr::prelude::Keys::parse(&hex::encode(secret)) {
             return keys;
         }
         counter += 1;
@@ -43,7 +44,7 @@ fn deterministic_nostr_keys(name: &[u8]) -> nostr::Keys {
 
 #[derive(Clone)]
 struct NostrAccountIdentityProofSigner {
-    keys: nostr::Keys,
+    keys: nostr::prelude::Keys,
 }
 
 impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
@@ -54,11 +55,9 @@ impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match session test key".into());
         }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
     }
 }

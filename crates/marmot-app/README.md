@@ -145,6 +145,16 @@ catch-up continue asynchronously. Hosts should render local chat projections at 
 separately, and allow subsequent relay events to refresh or reorder the rendered rows. Mutating worker commands received
 during initial catch-up are deferred and replayed in order once the live client is ready.
 
+Worker startup is isolated per account. A failed open does not discard a sibling that reached
+local readiness. Failed accounts have an in-memory, per-account retry delay starting at one second,
+doubling to a 60-second cap; the next reconcile or worker request after expiry admits one attempt.
+There is no background retry timer. `restart_account` explicitly retries an eligible account, while
+successful sign-in, signer registration, and committed setup/onboarding transitions reset that
+account's delay. Reconcile and start still report an error if any eligible account failed or is
+cooling down; a healthy worker remains usable through account-scoped commands. Successful startup
+clears its failure record. Account removal, deactivation, and runtime shutdown discard the record.
+Signed-out, missing-signer, and onboarding-gated accounts remain ineligible even after a reset.
+
 The crate root now keeps app construction, shared state, storage/projector wiring, directory bootstrap, account relay
 list helpers, and public re-exports. Runtime orchestration lives in the `src/runtime/` module, app-client commands and queries
 live in the `src/client/` module, group DTOs/component projection helpers live in `src/groups.rs`, and encrypted-media

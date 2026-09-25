@@ -1,0 +1,20 @@
+[package]
+name = "relay-backend-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately isolated: this experiment does not upgrade MDK's SDK dependency.
+[workspace]
+
+[dependencies]
+nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "0efbb4ee20cd2d48ff9ffc19d307ec5a3658d6b9", features = ["local-relay"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+futures-util = "0.3"
+tokio-tungstenite = "0.26"
+serde_json = "1"
+cgka-traits = { path = "../../crates/traits" }
+transport-nostr-adapter = { path = "../../crates/transport-nostr-adapter" }
+transport-nostr-peeler = { path = "../../crates/transport-nostr-peeler" }
+async-trait = "0.1"
+hex = "0.4"

@@ -2,7 +2,7 @@ use super::*;
 use crate::relay_plane::{DirectoryFetchRequest, DirectoryRelayFetcher};
 use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportAdapterError};
-use nostr::prelude::ToBech32;
+use nostr::prelude::{FinalizeEvent, ToBech32};
 use std::sync::atomic::{AtomicBool, Ordering};
 use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
 
@@ -73,7 +73,7 @@ impl DirectoryRelayFetcher for Network {
     async fn inspect_directory_events(
         &self,
         request: DirectoryFetchRequest,
-        _signer: Option<Arc<dyn nostr::NostrSigner>>,
+        _signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, crate::relay_plane::DirectoryInspectionError> {
         self.fetch_directory_events(request)
             .await
@@ -193,7 +193,7 @@ async fn onboarding_legacy_setup_admission_does_not_mutate_account() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(directory.path(), network);
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let secret = keys.secret_key().to_bech32().unwrap();
     let account = runtime
         .accounts()
@@ -256,6 +256,12 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
     let (_directory, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
     let pending = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    let now = tokio::time::Instant::now();
+    manager
+        .startup_retries
+        .lock()
+        .unwrap()
+        .fail(id.clone(), now);
     assert!(
         manager
             .retry_onboarding_step(&id, OnboardingStep::Follows)
@@ -263,6 +269,7 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
             .is_err()
     );
     assert_eq!(manager.onboarding_snapshot(&id).unwrap().unwrap(), pending);
+    assert!(!manager.startup_retries.lock().unwrap().allows(&id, now));
     let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
     c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
     c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
@@ -283,6 +290,7 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
         .retry_onboarding_step(&id, OnboardingStep::Profile)
         .await
         .unwrap();
+    assert!(manager.startup_retries.lock().unwrap().allows(&id, now));
     assert_eq!(
         retried.steps[OnboardingStep::Follows.index()].status,
         OnboardingStatus::Skipped
@@ -301,10 +309,16 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
     );
     // Changing sources invalidates even an already acknowledged notice.
     manager.save_onboarding(&mut c).unwrap();
+    manager
+        .startup_retries
+        .lock()
+        .unwrap()
+        .fail(id.clone(), now);
     let changed = manager
         .set_onboarding_discovery_relays(&id, vec!["wss://alternate.example".into()])
         .await
         .unwrap();
+    assert!(manager.startup_retries.lock().unwrap().allows(&id, now));
     assert!(changed.single_device_notice.is_none());
     assert_eq!(
         changed.steps[OnboardingStep::Follows.index()].status,
@@ -339,7 +353,7 @@ async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results
     network.fail_index_only.store(false, Ordering::SeqCst);
     network.events.lock().unwrap().clear();
     network.events.lock().unwrap().push(signed(
-        &nostr::Keys::generate(),
+        &nostr::prelude::Keys::generate(),
         30443,
         vec![vec!["d".into(), "foreign-author".into()]],
         "noise",
@@ -495,6 +509,16 @@ impl NostrRelayClient for Network {
         self.events.lock().unwrap().push(event.clone());
         Ok(NostrPublishOutcome::accepted(endpoints.iter().cloned()))
     }
+
+    async fn publish_event_for_account(
+        &self,
+        _account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.publish_event(endpoints, event, required_acks).await
+    }
 }
 fn options() -> OnboardingOptions {
     OnboardingOptions {
@@ -517,13 +541,13 @@ async fn fixture() -> (
     tempfile::TempDir,
     MarmotAppRuntime,
     Arc<Network>,
-    nostr::Keys,
+    nostr::prelude::Keys,
     String,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(dir.path(), network.clone());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let id = keys.public_key().to_hex();
     runtime
         .accounts()
@@ -536,7 +560,7 @@ async fn fixture() -> (
     (dir, runtime, network, keys, id)
 }
 fn signed(
-    keys: &nostr::Keys,
+    keys: &nostr::prelude::Keys,
     kind: u16,
     tags: Vec<Vec<String>>,
     content: &str,
@@ -545,7 +569,7 @@ fn signed(
     let event = EventBuilder::new(Kind::from(kind), content)
         .tags(tags.into_iter().map(|t| Tag::parse(t).unwrap()))
         .custom_created_at(Timestamp::from(at))
-        .sign_with_keys(keys)
+        .finalize(keys)
         .unwrap();
     NostrTransportEvent::from_nostr_event(&event).unwrap()
 }
@@ -1250,7 +1274,7 @@ async fn optional_repairs_preserve_unknown_profile_fields_and_follow_tag_metadat
     assert_eq!(json["name"], "fixed");
     assert_eq!(json["website"], "https://example.com");
     assert_eq!(tags[0][1], "keep");
-    let retained = nostr::Keys::generate().public_key().to_hex();
+    let retained = nostr::prelude::Keys::generate().public_key().to_hex();
     c.records[1] = Some(signed(
         &keys,
         3,
@@ -1298,7 +1322,7 @@ async fn interactive_import_without_detailed_checkpoint_remains_gated() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(directory.path(), network.clone());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let secret = keys.secret_key().to_bech32().unwrap();
     let id = keys.public_key().to_hex();
     let manager = runtime.accounts();
@@ -1764,7 +1788,10 @@ async fn approve_blocked_repair(
                 .await
                 .unwrap();
             manager
-                .propose_onboarding_follows(id, vec![nostr::Keys::generate().public_key().to_hex()])
+                .propose_onboarding_follows(
+                    id,
+                    vec![nostr::prelude::Keys::generate().public_key().to_hex()],
+                )
                 .await
                 .unwrap()
         }
@@ -1806,7 +1833,7 @@ async fn approve_blocked_repair(
 async fn assert_cancelled_and_fresh(
     runtime: &MarmotAppRuntime,
     network: &Network,
-    keys: &nostr::Keys,
+    keys: &nostr::prelude::Keys,
     id: &str,
     previous_sends: usize,
 ) {
@@ -1930,7 +1957,7 @@ async fn cancel_during_blocked_publish_releases_begin_without_aborting_caller() 
 
 #[derive(Clone)]
 struct BlockingSigner {
-    keys: nostr::Keys,
+    keys: nostr::prelude::Keys,
     block: Arc<AtomicBool>,
     started: Arc<Notify>,
 }
@@ -1941,19 +1968,22 @@ impl std::fmt::Debug for BlockingSigner {
     }
 }
 
-impl nostr::NostrSigner for BlockingSigner {
-    fn backend(&self) -> nostr::signer::SignerBackend<'_> {
-        self.keys.backend()
-    }
+impl transport_nostr_peeler::MarmotNostrSigner for BlockingSigner {
     fn get_public_key(
         &self,
-    ) -> nostr::util::BoxedFuture<'_, Result<nostr::PublicKey, nostr::SignerError>> {
-        self.keys.get_public_key()
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::get_public_key(&self.keys)
     }
     fn sign_event(
         &self,
-        unsigned: nostr::UnsignedEvent,
-    ) -> nostr::util::BoxedFuture<'_, Result<nostr::Event, nostr::SignerError>> {
+        unsigned: nostr::prelude::UnsignedEvent,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
+    > {
         let keys = self.keys.clone();
         let block = self.block.clone();
         let started = self.started.clone();
@@ -1962,36 +1992,48 @@ impl nostr::NostrSigner for BlockingSigner {
             if block.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
-            keys.sign_event(unsigned).await
+            transport_nostr_peeler::MarmotNostrSigner::sign_event(&keys, unsigned).await
         })
     }
     fn nip04_encrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip04_encrypt(public_key, content)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_encrypt(&self.keys, public_key, content)
     }
     fn nip04_decrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
-        encrypted_content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip04_decrypt(public_key, encrypted_content)
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_decrypt(&self.keys, public_key, payload)
     }
     fn nip44_encrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         content: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip44_encrypt(public_key, content)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_encrypt(&self.keys, public_key, content)
     }
     fn nip44_decrypt<'a>(
         &'a self,
-        public_key: &'a nostr::PublicKey,
+        public_key: &'a nostr::prelude::PublicKey,
         payload: &'a str,
-    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
-        self.keys.nip44_decrypt(public_key, payload)
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_decrypt(&self.keys, public_key, payload)
     }
 }
 
@@ -2003,11 +2045,9 @@ impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for Blockin
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match test signer".into());
         }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
     }
 }
@@ -2017,7 +2057,7 @@ async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(directory.path(), network.clone());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let id = keys.public_key().to_hex();
     let block = Arc::new(AtomicBool::new(false));
     let started = Arc::new(Notify::new());
@@ -3280,7 +3320,7 @@ async fn recovery_retires_blocked_external_signer_and_survives_dropped_caller() 
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(directory.path(), network.clone());
-    let keys = nostr::Keys::generate();
+    let keys = nostr::prelude::Keys::generate();
     let id = keys.public_key().to_hex();
     let signer = BlockingSigner {
         keys,

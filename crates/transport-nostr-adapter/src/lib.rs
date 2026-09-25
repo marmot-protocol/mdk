@@ -23,7 +23,7 @@ use cgka_traits::{
     TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSubscription,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportWireMetadata,
 };
-use nostr::RelayUrl;
+use nostr::prelude::RelayUrl;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -66,6 +66,7 @@ fn inbound_wire_metadata(
     }
 }
 
+mod acquisition;
 mod key_package;
 mod publish_accounting;
 mod relay_list;
@@ -73,6 +74,12 @@ mod relay_list;
 mod sdk_client;
 mod telemetry;
 
+pub use acquisition::{
+    NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
+    NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
+    NostrAcquisitionScope, NostrAcquisitionStats, NostrNotificationLoss,
+    NostrNotificationLossScope,
+};
 pub use key_package::{
     CLIENT_TAG, KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication, NostrKeyPackagePublisher,
 };
@@ -327,15 +334,21 @@ pub struct NostrAdapterMetrics {
     pub inbound_events_seen: usize,
     pub inbound_events_delivered: usize,
     pub inbound_events_dropped: usize,
-    /// Logical publishes that entered a relay client. Endpoint fanout is not a
-    /// separate attempt. In flight, this can exceed successes + failures.
+    /// `TransportAdapter` publish calls that entered a relay client. One call
+    /// is one attempt however many endpoints it targets. Once every started
+    /// call has resolved or been dropped, attempts equal successes + failures
+    /// + cancellations.
     pub publish_attempts: usize,
-    /// Terminal publishes whose accepted-endpoint count meets
-    /// `required_acks.max(1)`.
+    /// Calls whose accepted-endpoint count met `required_acks.max(1)`.
     pub publish_successes: usize,
-    /// Terminal errors, below-threshold outcomes (including empty acceptance),
-    /// and started publishes dropped before a terminal outcome.
+    /// Client errors and outcomes below that threshold, including empty
+    /// acceptance.
     pub publish_failures: usize,
+    /// Started calls whose caller dropped them before the client returned,
+    /// such as outstanding endpoints abandoned once a fanout reaches quorum.
+    /// These are not relay failures and may still have reached a relay.
+    #[serde(default)]
+    pub publish_cancellations: usize,
     /// Route-level NIP-77 passes attempted after ordinary subscription rebuilds.
     #[serde(default)]
     pub reconciliation_attempts: usize,
@@ -454,6 +467,40 @@ impl AccountSubscriptionEose {
 /// Boundary between this adapter and the actual Nostr relay implementation.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
+    /// Optional bounded, request-scoped history operation. Implementations must
+    /// validate the complete owned request before issuing any network work and
+    /// return one terminal outcome for every requested endpoint. Cancellation
+    /// closes only this request's subscriptions, never live interests.
+    async fn acquire_history(
+        &self,
+        _request: NostrAcquisitionRequest,
+        _cancellation: NostrAcquisitionCancellation,
+    ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
+        Err(NostrAcquisitionError::Unsupported)
+    }
+
+    /// Independent, cumulative control signal for notification-channel loss.
+    /// A watch receiver coalesces updates, so skipped counts must be cumulative
+    /// within the reported receiver scope. The current SDK backend explicitly
+    /// lacks this capability until its production migration.
+    fn notification_loss(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        Err(NostrAcquisitionError::Unsupported)
+    }
+
+    /// Select one account receiver when a client owns several immutable
+    /// authentication contexts. A single coalescing watch cannot carry
+    /// independent cumulative watermarks for multiple accounts.
+    async fn notification_loss_for_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        self.notification_loss()
+    }
+
     async fn subscribe(&self, subscription: NostrSubscription)
     -> Result<(), TransportAdapterError>;
 
@@ -507,6 +554,58 @@ pub trait NostrRelayClient: Send + Sync {
         event: &NostrTransportEvent,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError>;
+
+    /// Publish using the immutable authentication context selected by the
+    /// operation's account identity. An implementation without account
+    /// contexts must reject this call explicitly; it must never infer the
+    /// context from the event's author (kind-445 authors are ephemeral).
+    async fn publish_event_for_account(
+        &self,
+        _account_id: &MemberId,
+        _endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        Err(TransportAdapterError::Publish(
+            "account-scoped publication unsupported".to_owned(),
+        ))
+    }
+
+    /// Ordered account-scoped batch; the default remains fail-closed for
+    /// clients that do not implement the account-aware single-event method.
+    async fn publish_events_for_account(
+        &self,
+        account_id: &MemberId,
+        requests: &[NostrEventPublishRequest],
+    ) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(
+                self.publish_event_for_account(
+                    account_id,
+                    &request.endpoints,
+                    &request.event,
+                    request.required_acks,
+                )
+                .await,
+            );
+        }
+        outcomes
+    }
+
+    async fn publish_events_for_account_with_timings(
+        &self,
+        account_id: &MemberId,
+        requests: &[NostrEventPublishRequest],
+    ) -> NostrPublishBatch {
+        let started_at = Instant::now();
+        let outcomes = self.publish_events_for_account(account_id, requests).await;
+        let elapsed = started_at.elapsed();
+        NostrPublishBatch {
+            request_durations: vec![elapsed; outcomes.len()],
+            outcomes,
+        }
+    }
 
     /// Publish an ordered batch through one client lifecycle.
     ///
@@ -579,6 +678,38 @@ impl NostrTransportAdapter {
         }
     }
 
+    /// Request owned, bounded transport evidence without borrowing adapter
+    /// routing state across the network wait. Admission and completion remain
+    /// with the account worker and recovery owner.
+    pub async fn acquire_history(
+        &self,
+        request: NostrAcquisitionRequest,
+        cancellation: NostrAcquisitionCancellation,
+    ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
+        request.validate()?;
+        self.relay_client
+            .acquire_history(request, cancellation)
+            .await
+    }
+
+    /// Observe receiver-scoped loss independently of the event-delivery queue.
+    pub fn notification_loss(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        self.relay_client.notification_loss()
+    }
+
+    pub async fn notification_loss_for_account(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        self.relay_client
+            .notification_loss_for_account(account_id)
+            .await
+    }
+
     pub async fn metrics(&self) -> NostrAdapterMetrics {
         tracing::trace!(
             target: "transport_nostr_adapter::adapter",
@@ -602,27 +733,32 @@ impl NostrTransportAdapter {
         metrics.publish_attempts = publish.attempts;
         metrics.publish_successes = publish.successes;
         metrics.publish_failures = publish.failures;
+        metrics.publish_cancellations = publish.cancellations;
         metrics
     }
 
-    /// Publish one already-validated event through `client` and record it.
+    /// Publish one already-validated event through `client` for `account_id`
+    /// and record it on this adapter's shared publish counters.
     ///
     /// Callers keep account, endpoint-safety, and envelope checks. This method
     /// does not revalidate, build a request, or fan out locally. Success
     /// follows [`cgka_traits::TransportPublishReport::met_required_acks`]:
-    /// `accepted >= required_acks.max(1)`. Any other `Ok` outcome, any `Err`,
-    /// and dropping this future after it has started count as one failure.
-    /// Cancellation before the future is polled counts nothing. The client's
-    /// outcome or error is returned unchanged.
+    /// `accepted >= required_acks.max(1)`. Any other `Ok` outcome and any
+    /// `Err` count as one failure. Dropping this future after it has started
+    /// counts as one cancellation; dropping it before it is polled counts
+    /// nothing. The client's outcome or error is returned unchanged.
     pub async fn publish_event_with_client(
         &self,
         client: &dyn NostrRelayClient,
+        account_id: &MemberId,
         endpoints: &[TransportEndpoint],
         event: &NostrTransportEvent,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
         let mut attempt = self.publish_accounting.begin();
-        let outcome = client.publish_event(endpoints, event, required_acks).await;
+        let outcome = client
+            .publish_event_for_account(account_id, endpoints, event, required_acks)
+            .await;
         match &outcome {
             Ok(result)
                 if publish_accounting::outcome_met_required_acks(
@@ -1461,6 +1597,7 @@ impl TransportAdapter for NostrTransportAdapter {
         let outcome = self
             .publish_event_with_client(
                 self.relay_client.as_ref(),
+                &request.account_id,
                 request.target.endpoints(),
                 &event,
                 request.required_acks,

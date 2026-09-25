@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-23
+updated: 2026-09-25
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -58,11 +58,16 @@ runtime. It complements the policy docs:
 | `inbound_events_seen` | Deduplicated relay events passed into the delivery path. | Aggregate count. |
 | `inbound_events_delivered` | Account-scoped deliveries successfully enqueued. A single event may deliver to more than one account route. | Aggregate count. |
 | `inbound_events_dropped` | Deduplicated relay events with no matching active route. | Aggregate count. |
-| `publish_attempts` | Logical `TransportAdapter` publishes that entered a relay client after admission checks. One invocation is one attempt; endpoint fanout and internal relay retries are not extra attempts. While a call is in flight, attempts can exceed successes + failures. | Aggregate count. |
-| `publish_successes` | Completed calls whose accepted-endpoint count is at least `max(required_acks, 1)`, the same rule as `TransportPublishReport::met_required_acks`. Partial acceptance at or above that threshold succeeds. | Aggregate count. |
-| `publish_failures` | Client errors, `Ok` outcomes below that threshold (including empty acceptance when `required_acks == 0`), and started calls dropped before a terminal outcome. | Aggregate count. |
+| `publish_attempts` | `TransportAdapter::publish` calls that entered a relay client after admission checks. One call is one attempt however many endpoints it targets; internal relay retries are not extra attempts. | Aggregate count. |
+| `publish_successes` | Calls whose accepted-endpoint count is at least `max(required_acks, 1)`, the same rule as `TransportPublishReport::met_required_acks`. Partial acceptance at or above that threshold succeeds. | Aggregate count. |
+| `publish_failures` | Client errors and `Ok` outcomes below that threshold, including empty acceptance when `required_acks == 0`. | Aggregate count. |
+| `publish_cancellations` | Started calls whose caller dropped them before the relay client returned. Not a relay failure; the event may still have reached a relay. | Aggregate count. |
 
-Account-scoped publishes and the shared adapter's own `publish` share these three counters. They are device-wide and unlabeled. A future that is never polled, or a request rejected before the client call (wrong account, unsafe endpoint, envelope mismatch, malformed payload), changes nothing. Local fanout runs only after the terminal count and cannot reclassify it or add another failure. These series are relay-publish diagnostics. They are separate from application outbound counters such as `app_outbound_message_publish_*`.
+Account-scoped publishes and the shared adapter's own `publish` share these counters. They are device-wide and unlabeled. Once every started call has resolved or been dropped, attempts equal successes + failures + cancellations; while calls are in flight, attempts is larger. A future that is never polled, or a request rejected before the client call (wrong account, unsafe endpoint, envelope mismatch, malformed payload), changes nothing. Local fanout runs only after the terminal count and cannot reclassify it.
+
+The account runtime drives group fanout as one single-endpoint call per relay with `required_acks: 1`, so in production an attempt is roughly one relay publish. Once a fanout meets its acknowledgement goal, the runtime drops the endpoints still waiting and retries them later from the durable fanout record. Those abandoned calls are cancellations, and each retry is a new attempt. Read relay health from `publish_failures / (publish_successes + publish_failures)`, not from `attempts - successes`.
+
+These series are relay-publish diagnostics. They are separate from application outbound counters such as `app_outbound_message_publish_*`. Raw relay-client batch publishers outside `TransportAdapter::publish` (account relay lists, KeyPackages, directory records, push tokens, user blocks) do not update them.
 
 These counters are diagnostic only. They must not feed convergence or branch selection.
 
@@ -299,9 +304,17 @@ sum phase percentiles or treat SDK projection and host render timings as a singl
 histograms are process-local, with no per-message correlation identifiers or persisted timing journal.
 
 OTLP host milestones use the closed `HostPerformanceOperation` enum without caller-supplied metric names or labels.
-For app-specific measurements such as inbox layout, image decoding, or navigation, use `record_host_timing` with a
-registered product event name. This consent-gated path sends duration buckets and outcomes to Aptabase; it does not
-add OTLP series or local app-performance snapshot fields. See the [registration example](usage-diagnostics.md#custom-host-timings).
+Reviewed stages such as `FrameLayout`, `MediaDecode` and `TimelineOpen` now also use this path: comparable host
+performance needs fixed-bucket distributions in local snapshots and opt-in OTLP, which `record_host_timing` does not
+provide. The stages are registered in `RuntimePerformanceOperation`, so their metrics and binding exposure follow
+the existing runtime registry. Shared and Linux-specific stages are all readable through `runtime_operations`; no
+per-stage snapshot fields or caller-defined names are added. See the [catalog](#registered-host-stage-metrics).
+
+For app-specific product measurements outside this reviewed list, continue using `record_host_timing` with a
+registered product event name. That separate consent-gated path sends duration buckets and outcomes to Aptabase;
+it does not add OTLP series or app-performance snapshot entries. See the
+[registration example](usage-diagnostics.md#custom-host-timings). Hosts must report the actual outcome in both paths,
+including early/error returns; do not report success merely because a scope exited.
 
 The `app_account_sync_failures` and `app_account_catch_up_failures` counters are the only app-performance metrics with
 metric attributes. Every failed attempt emits exactly one point in a bounded classification bucket:
@@ -486,9 +499,10 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `cross_relay_spread_ms` | none | Histogram | Population-level `RelayTelemetryRollup.cross_relay_spread` |
 | `relay_connection_attempts` | none | Counter | `RelayPlaneHealth.connection_attempts` |
 | `relay_connection_successes` | none | Counter | `RelayPlaneHealth.connection_successes` |
-| `relay_publish_attempts` | none | Counter | Adapter `publish_attempts` (admitted logical publishes) |
+| `relay_publish_attempts` | none | Counter | Adapter `publish_attempts` (admitted `TransportAdapter` publishes) |
 | `relay_publish_successes` | none | Counter | Adapter `publish_successes` (acceptance threshold met) |
-| `relay_publish_failures` | none | Counter | Adapter `publish_failures` (error, below threshold, or dropped in flight) |
+| `relay_publish_failures` | none | Counter | Adapter `publish_failures` (error or below threshold) |
+| `relay_publish_cancellations` | none | Counter | Adapter `publish_cancellations` (caller dropped the call in flight) |
 | `message_observed` | none | Counter | `RelayDeliverySpread.observed` |
 | `message_corroborated` | none | Counter | `RelayDeliverySpread.corroborated` |
 | `message_single_source` | none | Counter | `RelayDeliverySpread.single_source` |
@@ -659,9 +673,16 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_sqlcipher_migration_probe_runs` | none | Counter | `AppPerformanceSnapshot.sqlcipher_migration_probe_runs`; each run is one full keyed SQLCipher open paying the passphrase KDF (mdk#1439) |
 | `app_sqlcipher_migration_probe_skips` | none | Counter | `AppPerformanceSnapshot.sqlcipher_migration_probe_skips`; each skip is one passphrase KDF derivation avoided via the cached v2-open verdict (mdk#1439) |
 
-Current implementation note: publish telemetry is device-wide attempts/successes/failures. It is not currently
+Current implementation note: publish telemetry is device-wide attempts/successes/failures/cancellations. It is not currently
 per-relay or per-Nostr-kind, even though the relay observability design doc names those as desired future ranking
 signals.
+
+### Registered host-stage metrics
+
+The 28 shared and nine Linux-specific host stages use the runtime registry. See
+[runtime latency telemetry](runtime-latency-telemetry.md#boundaries) for their measurement boundaries
+and [accounting and export](runtime-latency-telemetry.md#accounting-and-export) for the metric suffixes,
+outcomes, completed-only semantics and binding snapshot representation.
 
 ### OTLP encoding
 

@@ -1663,6 +1663,15 @@ where
                 self.maintenance_quiet_monotonic.remove(&obligation.id);
                 continue;
             }
+            // A pending departure refuses every send but its own. It waits
+            // rather than fails: the removal landing ends it through the
+            // terminal verdict above, and a reorg that restores the membership
+            // must find its rotation still owed.
+            if self.session.leave_in_progress(&obligation.group_id)?
+                || self.session.disbanding_in_progress(&obligation.group_id)?
+            {
+                continue;
+            }
             let original_obligation = obligation.clone();
             if obligation
                 .operational_target_at

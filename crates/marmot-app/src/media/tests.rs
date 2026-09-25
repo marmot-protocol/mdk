@@ -437,6 +437,60 @@ async fn spawn_stalled_http_server() -> (String, tokio::task::JoinHandle<()>) {
     (url, server)
 }
 
+/// Stream a complete response in bounded intervals and count every accepted request.
+async fn spawn_progressing_http_server(
+    body: Arc<Vec<u8>>,
+    transfer_time: Duration,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let accepted = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                const CHUNKS: usize = 15;
+                let delay = transfer_time / CHUNKS as u32;
+                for chunk in body.chunks(body.len().div_ceil(CHUNKS)) {
+                    tokio::time::sleep(delay).await;
+                    if stream.write_all(chunk).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (url, requests, server)
+}
+
 fn spawn_roundtrip_blob_server() -> (String, mpsc::Receiver<(u64, String)>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test server");
     let addr = listener.local_addr().expect("upload test server addr");
@@ -668,8 +722,8 @@ fn media_upload_request(blossom_server: Option<String>) -> MediaUploadRequest {
     }
 }
 
-fn signing_keys() -> nostr::Keys {
-    nostr::Keys::generate()
+fn signing_keys() -> nostr::prelude::Keys {
+    nostr::prelude::Keys::generate()
 }
 
 fn media_secret() -> [u8; 32] {
@@ -1995,6 +2049,54 @@ async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
         elapsed < Duration::from_secs(2),
         "two stalled candidates must share the configured end-to-end deadline"
     );
+}
+
+#[tokio::test]
+async fn slow_progressing_locator_is_not_cut_off_by_equal_fallback_share() {
+    const GLOBAL_DEADLINE: Duration = Duration::from_millis(600);
+    const FORMER_EQUAL_SHARE: Duration = Duration::from_millis(200);
+
+    let body = Arc::new(vec![0x5a; 192 * 1024]);
+    let (primary_url, primary_requests, primary) =
+        spawn_progressing_http_server(body.clone(), Duration::from_millis(300)).await;
+    let (fallback_a_url, fallback_a_requests, fallback_a) =
+        spawn_progressing_http_server(body.clone(), Duration::from_millis(20)).await;
+    let (fallback_b_url, fallback_b_requests, fallback_b) =
+        spawn_progressing_http_server(body.clone(), Duration::from_millis(20)).await;
+    let reference = blob_reference_for_servers(
+        body.as_slice(),
+        &[primary_url, fallback_a_url, fallback_b_url],
+    );
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(80),
+        GLOBAL_DEADLINE,
+    );
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let started = Instant::now();
+
+    let downloaded =
+        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect("continuous valid progress must outlive the former equal share");
+    let elapsed = started.elapsed();
+    primary.abort();
+    fallback_a.abort();
+    fallback_b.abort();
+
+    assert_eq!(downloaded.as_slice(), body.as_slice());
+    assert!(
+        elapsed > FORMER_EQUAL_SHARE,
+        "fixture must cross the old cutoff"
+    );
+    assert!(
+        elapsed < GLOBAL_DEADLINE,
+        "the acquisition stays globally bounded"
+    );
+    assert_eq!(primary_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback_a_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(fallback_b_requests.load(Ordering::SeqCst), 0);
 }
 
 /// Expiring the shared deadline while a later locator is active must leave a

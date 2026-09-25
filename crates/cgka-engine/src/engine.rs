@@ -2391,9 +2391,13 @@ impl<S: StorageProvider> Engine<S> {
         Ok(Some(request))
     }
 
-    pub(crate) fn has_leave_send_gate(&mut self, group_id: &GroupId) -> Result<bool, StorageError> {
-        Ok(self.load_leave_request_state(group_id)?.is_some()
-            || self.leaving_groups.contains(group_id))
+    /// Whether outbound group work is gated while this account's leave awaits
+    /// the Commit that removes it. The request stays durable until the removal
+    /// lands or a reorg restores the membership.
+    pub fn leave_in_progress(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        Ok(self.leaving_groups.contains(group_id)
+            || self.leave_requests.contains_key(group_id)
+            || self.storage.leave_request(group_id)?.is_some())
     }
 
     pub(crate) fn clear_leave_request_state(

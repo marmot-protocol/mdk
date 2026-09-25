@@ -245,6 +245,7 @@ pub struct EngineMetrics {
     deferred_peel_candidate_cache_hits: u64,
     deferred_peel_candidate_cache_misses: u64,
     deferred_peel_candidate_cache_invalidations: u64,
+    past_peel_context_derivations: u64,
     deferred_peel_candidate_enumeration_ms: BucketHistogram,
     deferred_peel_row_capacity_refusals: u64,
     deferred_peel_group_byte_capacity_refusals: u64,
@@ -293,6 +294,7 @@ impl Default for EngineMetrics {
             deferred_peel_candidate_cache_hits: 0,
             deferred_peel_candidate_cache_misses: 0,
             deferred_peel_candidate_cache_invalidations: 0,
+            past_peel_context_derivations: 0,
             deferred_peel_candidate_enumeration_ms: BucketHistogram::new(
                 &LATENESS_BUCKET_BOUNDS_MS,
             ),
@@ -487,6 +489,12 @@ impl EngineMetrics {
             .saturating_add(1);
     }
 
+    pub(crate) fn note_past_peel_context_derivations(&mut self, derivations: u64) {
+        self.past_peel_context_derivations = self
+            .past_peel_context_derivations
+            .saturating_add(derivations);
+    }
+
     pub(crate) fn note_deferred_peel_capacity_refusal(
         &mut self,
         resource: DeferredPeelCapacityResource,
@@ -583,6 +591,7 @@ impl EngineMetrics {
             deferred_peel_candidate_cache_misses: self.deferred_peel_candidate_cache_misses,
             deferred_peel_candidate_cache_invalidations: self
                 .deferred_peel_candidate_cache_invalidations,
+            past_peel_context_derivations: self.past_peel_context_derivations,
             deferred_peel_candidate_enumeration_ms: self
                 .deferred_peel_candidate_enumeration_ms
                 .snapshot(),
@@ -671,7 +680,8 @@ pub struct EngineMetricsSnapshot {
     /// Deferred-peel retry sweeps invoked, including empty or gated sweeps.
     pub deferred_peel_sweeps: u64,
     /// Group graph classifications requested by live transport deferrals.
-    /// Retry sweeps consume no lineage report and must not increment this count.
+    /// Retry sweeps and publish-cycle replays consume no lineage report and
+    /// must not increment this count.
     pub deferred_lineage_classifications: u64,
     /// Candidate-branch enumerations actually performed (cache misses).
     pub deferred_peel_candidate_enumerations: u64,
@@ -687,6 +697,11 @@ pub struct EngineMetricsSnapshot {
     pub deferred_peel_candidate_cache_misses: u64,
     /// Cached generations discarded because their work became stale or ended.
     pub deferred_peel_candidate_cache_invalidations: u64,
+    /// Retained-anchor peel contexts derived by rewinding live group state.
+    /// A context served from cache is not a derivation. Recorded when the
+    /// recovery attempt returns; one that fails on a peeler error is not
+    /// recorded.
+    pub past_peel_context_derivations: u64,
     /// Candidate enumeration elapsed time in local monotonic milliseconds.
     pub deferred_peel_candidate_enumeration_ms: HistogramSnapshot,
     /// New rows refused because one group reached its row limit.

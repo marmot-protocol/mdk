@@ -84,7 +84,7 @@ impl AccountSecretStore for ForeignSecretStore {
     fn write_secret(
         &self,
         account: &AccountSummary,
-        keys: &nostr::Keys,
+        keys: &nostr::prelude::Keys,
     ) -> marmot_account::AccountHomeResult<()> {
         let secret_key_hex = Zeroizing::new(keys.secret_key().to_secret_hex());
         self.store
@@ -99,13 +99,13 @@ impl AccountSecretStore for ForeignSecretStore {
     fn load_secret(
         &self,
         account: &AccountSummary,
-    ) -> marmot_account::AccountHomeResult<nostr::Keys> {
+    ) -> marmot_account::AccountHomeResult<nostr::prelude::Keys> {
         let secret_key_hex = Zeroizing::new(
             self.store
                 .load_secret(account.label.clone(), account.account_id_hex.clone())
                 .map_err(account_home_error)?,
         );
-        nostr::Keys::parse(secret_key_hex.as_str())
+        nostr::prelude::Keys::parse(secret_key_hex.as_str())
             .map_err(|_| marmot_account::AccountHomeError::InvalidSecretKey)
     }
 
@@ -195,7 +195,7 @@ mod tests {
         }
     }
 
-    fn summary(keys: &nostr::Keys) -> AccountSummary {
+    fn summary(keys: &nostr::prelude::Keys) -> AccountSummary {
         AccountSummary {
             label: "vault-account".to_owned(),
             account_id_hex: keys.public_key().to_hex(),
@@ -210,7 +210,7 @@ mod tests {
         let store = ForeignSecretStore::new(Arc::new(MapStore {
             entries: Mutex::new(Vec::new()),
         }));
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let account = summary(&keys);
 
         assert!(!store.has_secret_for_label(&account.label).unwrap());

@@ -8,7 +8,7 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
 - Own build/packaging scripts: `xcframework.sh` (Swift + iOS XCFramework), `xcframework-macos.sh` (Swift + macOS
   XCFramework), `kotlin-bindings.sh` (Android JNI libs + generated Kotlin), `package-ios-artifacts.sh`,
   `package-macos-artifacts.sh`, `validate-ios-artifact.sh`, `validate-macos-artifact.sh`, `validate-swift-package.sh`,
-  and `validate-swift-package-macos.sh`.
+  `validate-swift-package-macos.sh`, and `validate-android-artifact.py`.
 - Own `apple-privacy.py`, `apple-privacy/`, `validate-apple-privacy.py`, `validate-apple-archive.py`,
   and `test-apple-privacy.py` for SDK declarations and resource delivery into Apple app archives.
 - Own `marmotkit-release-profile.env`, the canonical Rust release profile for distributable MarmotKit artifacts.
@@ -32,6 +32,11 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
 - The Rust API in `src/` is the source of truth for both Swift and Kotlin — scripts package, they do not fork types.
 - Android consumers must call `MarmotAndroid.initialize(context)` before constructing `Marmot` (Keystore JNI via
   `ndk-context`).
+- Android `arm64-v8a` and `x86_64` JNI libraries are linked with 16 KB ELF load alignment
+  (`-Wl,-z,max-page-size=16384` and `-Wl,-z,common-page-size=16384`) through extra flags on the final
+  library `cargo rustc` invocation, so configured Cargo rustflags are left in place. 32-bit ABIs keep the
+  NDK default page size.
+  `validate-android-artifact.py` checks the packaged bytes; ZIP alignment does not repair a 4 KB `PT_LOAD`.
 - Endpoint env vars set route URLs only; bearer tokens and runtime secrets stay with the host app.
 - Build and validate an Apple artifact against the same deployment target. Objects compiled under
   `MACOSX_DEPLOYMENT_TARGET` / `IPHONEOS_DEPLOYMENT_TARGET` report exactly that minimum, and the validators fail on a

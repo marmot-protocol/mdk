@@ -6,7 +6,7 @@
 //! upstream `nostr` implementation so this crate does not carry a second
 //! hand-rolled copy of sensitive encryption code.
 
-use nostr::ToBech32;
+use nostr::nips::nip19::ToBech32;
 use nostr::nips::nip49::{EncryptedSecretKey, KeySecurity};
 
 use crate::error::{AccountHomeError, AccountHomeResult};
@@ -14,7 +14,7 @@ use crate::error::{AccountHomeError, AccountHomeResult};
 pub(crate) const NIP49_DEFAULT_LOG_N: u8 = 18;
 
 pub(crate) fn export_ncryptsec(
-    secret_key: &nostr::SecretKey,
+    secret_key: &nostr::prelude::SecretKey,
     passphrase: &str,
     key_security_byte: u8,
 ) -> AccountHomeResult<String> {
@@ -27,7 +27,7 @@ pub(crate) fn export_ncryptsec(
 }
 
 fn export_ncryptsec_with_log_n(
-    secret_key: &nostr::SecretKey,
+    secret_key: &nostr::prelude::SecretKey,
     passphrase: &str,
     log_n: u8,
     key_security_byte: u8,
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn exported_material_decrypts_with_nostr_nip49_reference() {
-        let secret_key = nostr::SecretKey::from_hex(
+        let secret_key = nostr::prelude::SecretKey::from_hex(
             "3501454135014541350145413501453fefb02227e449e57cf4d3a3ce05378683",
         )
         .unwrap();
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn export_normalizes_passphrase_nfkc() {
-        let secret_key = nostr::SecretKey::from_hex(
+        let secret_key = nostr::prelude::SecretKey::from_hex(
             "3501454135014541350145413501453fefb02227e449e57cf4d3a3ce05378683",
         )
         .unwrap();
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn export_rejects_empty_passphrase() {
-        let secret_key = nostr::SecretKey::from_hex(
+        let secret_key = nostr::prelude::SecretKey::from_hex(
             "3501454135014541350145413501453fefb02227e449e57cf4d3a3ce05378683",
         )
         .unwrap();
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn export_reports_corrupt_key_security_byte() {
-        let secret_key = nostr::SecretKey::from_hex(
+        let secret_key = nostr::prelude::SecretKey::from_hex(
             "3501454135014541350145413501453fefb02227e449e57cf4d3a3ce05378683",
         )
         .unwrap();

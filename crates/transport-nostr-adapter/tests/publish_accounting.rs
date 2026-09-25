@@ -23,6 +23,7 @@ enum Mode {
 
 struct CountingClient {
     calls: AtomicUsize,
+    accounts: Mutex<Vec<MemberId>>,
     mode: Mutex<Mode>,
     entered: Mutex<Option<oneshot::Sender<()>>>,
     release: Mutex<Option<oneshot::Receiver<()>>>,
@@ -32,6 +33,7 @@ impl CountingClient {
     fn new(mode: Mode) -> Arc<Self> {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
+            accounts: Mutex::new(Vec::new()),
             mode: Mutex::new(mode),
             entered: Mutex::new(None),
             release: Mutex::new(None),
@@ -69,6 +71,20 @@ impl NostrRelayClient for CountingClient {
         _account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
         Ok(())
+    }
+
+    async fn publish_event_for_account(
+        &self,
+        account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.accounts
+            .lock()
+            .expect("accounts lock")
+            .push(account_id.clone());
+        self.publish_event(endpoints, event, required_acks).await
     }
 
     async fn publish_event(
@@ -151,12 +167,14 @@ async fn activated(
     (adapter, account_id, transport_group_id, endpoint)
 }
 
-async fn counts(adapter: &NostrTransportAdapter) -> (usize, usize, usize) {
+/// `(attempts, successes, failures, cancellations)`.
+async fn counts(adapter: &NostrTransportAdapter) -> (usize, usize, usize, usize) {
     let metrics = adapter.metrics().await;
     (
         metrics.publish_attempts,
         metrics.publish_successes,
         metrics.publish_failures,
+        metrics.publish_cancellations,
     )
 }
 
@@ -178,7 +196,7 @@ async fn direct_publish_classifies_success_threshold_and_errors() {
         .await
         .expect("accepted publish");
     assert!(report.met_required_acks());
-    assert_eq!(counts(&adapter).await, (1, 1, 0));
+    assert_eq!(counts(&adapter).await, (1, 1, 0, 0));
 
     *client.mode.lock().expect("mode") = Mode::Empty;
     let empty = adapter
@@ -192,7 +210,7 @@ async fn direct_publish_classifies_success_threshold_and_errors() {
         .await
         .expect("empty outcome still returns Ok");
     assert!(!empty.met_required_acks());
-    assert_eq!(counts(&adapter).await, (2, 1, 1));
+    assert_eq!(counts(&adapter).await, (2, 1, 1, 0));
 
     *client.mode.lock().expect("mode") = Mode::Accept;
     let below = adapter
@@ -207,12 +225,12 @@ async fn direct_publish_classifies_success_threshold_and_errors() {
         .expect("one acceptance is still Ok");
     assert_eq!(below.accepted.len(), 1);
     assert!(!below.met_required_acks());
-    assert_eq!(counts(&adapter).await, (3, 1, 2));
+    assert_eq!(counts(&adapter).await, (3, 1, 2, 0));
 
     *client.mode.lock().expect("mode") = Mode::Error;
     let error = adapter
         .publish(request(
-            account_id,
+            account_id.clone(),
             message,
             transport_group_id,
             endpoint,
@@ -221,8 +239,11 @@ async fn direct_publish_classifies_success_threshold_and_errors() {
         .await
         .expect_err("client error is preserved");
     assert!(matches!(error, TransportAdapterError::Publish(message) if message == "scripted"));
-    assert_eq!(counts(&adapter).await, (4, 1, 3));
+    assert_eq!(counts(&adapter).await, (4, 1, 3, 0));
     assert_eq!(client.calls.load(Ordering::SeqCst), 4);
+    let accounts = client.accounts.lock().expect("accounts lock");
+    assert_eq!(accounts.len(), 4, "every publish is account scoped");
+    assert!(accounts.iter().all(|account| *account == account_id));
 }
 
 #[tokio::test]
@@ -303,11 +324,11 @@ async fn direct_publish_admission_and_unpolled_future_do_not_count() {
     ));
     drop(pending);
     assert_eq!(client.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(counts(&adapter).await, (0, 0, 0));
+    assert_eq!(counts(&adapter).await, (0, 0, 0, 0));
 }
 
 #[tokio::test]
-async fn direct_publish_drop_after_client_entry_counts_one_failure() {
+async fn direct_publish_drop_after_client_entry_counts_one_cancellation() {
     let client = CountingClient::new(Mode::Wait);
     let (adapter, account_id, transport_group_id, endpoint) = activated(client.clone()).await;
     let (entered, _release) = client.arm_wait();
@@ -327,10 +348,10 @@ async fn direct_publish_drop_after_client_entry_counts_one_failure() {
             .await
     });
     entered.await.expect("client entered");
-    assert_eq!(counts(&adapter).await, (1, 0, 0));
+    assert_eq!(counts(&adapter).await, (1, 0, 0, 0));
     task.abort();
     let _ = task.await;
-    assert_eq!(counts(&adapter).await, (1, 0, 1));
+    assert_eq!(counts(&adapter).await, (1, 0, 0, 1));
     assert_eq!(client.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -359,5 +380,5 @@ async fn cloned_adapters_share_publish_counters() {
     let (left, right) = tokio::join!(first, second);
     left.expect("first publish");
     right.expect("second publish");
-    assert_eq!(counts(&adapter).await, (2, 2, 0));
+    assert_eq!(counts(&adapter).await, (2, 2, 0, 0));
 }

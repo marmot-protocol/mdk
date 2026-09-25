@@ -4,7 +4,9 @@
 //! vector. The format is recognised from the content: any first line carrying
 //! the stream's `t` discriminator is parsed under the fail-closed
 //! `goggles-group-export/v1` contract; anything else is parsed as
-//! `agent-state.json`.
+//! `agent-state.json`. A document is read whole, so it is capped at
+//! [`MAX_DOCUMENT_EXPORT_BYTES`]; a stream is parsed line by line under the
+//! parser's per-line and line-count bounds, so its total size is not capped.
 //!
 //! Reading, format detection, and printing live here; everything about *which*
 //! route an export takes is [`incident_replay::route`].
@@ -20,24 +22,26 @@
 //! are all valid outcomes). Exits 2 on usage, I/O, parse, or write failure, and
 //! on a simulator infrastructure failure that left the export unclassified.
 
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use incident_replay::{
-    IncidentReplayFidelityV1, IncidentReproductionStatusV1, IncidentScenarioArtifactV1,
-    IncidentSourceFormatV1, Outcome, is_stream, parse, parse_stream, route,
+    AgentStateExport, IncidentReplayFidelityV1, IncidentReproductionStatusV1,
+    IncidentScenarioArtifactV1, IncidentSourceFormatV1, Outcome, ParseError, StreamParseError,
+    parse, parse_stream, route, starts_as_stream,
 };
 
-/// Bound the in-memory `String` and the parsed event `Vec` for this
-/// operator-run CLI, and reject an oversized export before parsing can
-/// allocate from attacker-controlled JSON/NDJSON.
+/// Bound the in-memory `String` an `agent-state.json` document is read into,
+/// and reject an oversized document before parsing can allocate from
+/// attacker-controlled JSON. Streams are not held to it: they are never read
+/// whole, and the stream parser bounds each line and the line count instead.
 ///
 /// Sized from observed fleet exports — the largest was 72.9 MB as of
 /// 2026-09-03 — with room left for groups to age. Deliberately not tied to the
 /// audit upload ceiling: a Goggles group export is a server-side concatenation
 /// of many uploads, so nothing bounds it by what one upload may be.
-const MAX_INCIDENT_EXPORT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_DOCUMENT_EXPORT_BYTES: u64 = 256 * 1024 * 1024;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -47,34 +51,23 @@ fn main() -> ExitCode {
     };
     let out_dir = args.next().map(PathBuf::from);
 
-    let json = match read_incident_export(Path::new(&path)) {
-        Ok(json) => json,
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(err) => {
             eprintln!("error: cannot read {}: {err}", path.to_string_lossy());
             return ExitCode::from(2);
         }
     };
-    let stream = is_stream(&json);
-    let source_format = if stream {
-        IncidentSourceFormatV1::GogglesGroupExportStream
-    } else {
-        IncidentSourceFormatV1::AgentStateDocument
-    };
-    let export = if stream {
-        match parse_stream(&json) {
-            Ok(export) => export,
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::from(2);
-            }
+    let (source_format, export) = match load_export(BufReader::new(file), MAX_DOCUMENT_EXPORT_BYTES)
+    {
+        Ok(loaded) => loaded,
+        Err(LoadError::Read(err)) => {
+            eprintln!("error: cannot read {}: {err}", path.to_string_lossy());
+            return ExitCode::from(2);
         }
-    } else {
-        match parse(&json) {
-            Ok(export) => export,
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::from(2);
-            }
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::from(2);
         }
     };
 
@@ -112,8 +105,36 @@ fn main() -> ExitCode {
     code
 }
 
-fn read_incident_export(path: &Path) -> io::Result<String> {
-    read_utf8_limited(std::fs::File::open(path)?, MAX_INCIDENT_EXPORT_BYTES)
+/// Parse an export in the format its first non-empty line declares. A stream
+/// is parsed line by line under its own bounds; only a document is read whole,
+/// so only a document is held to `max_document_bytes`.
+fn load_export(
+    mut reader: impl BufRead + Seek,
+    max_document_bytes: u64,
+) -> Result<(IncidentSourceFormatV1, AgentStateExport), LoadError> {
+    let stream = starts_as_stream(&mut reader).map_err(LoadError::Read)?;
+    reader.rewind().map_err(LoadError::Read)?;
+    if stream {
+        Ok((
+            IncidentSourceFormatV1::GogglesGroupExportStream,
+            parse_stream(reader)?,
+        ))
+    } else {
+        let json = read_utf8_limited(reader, max_document_bytes).map_err(LoadError::Read)?;
+        Ok((IncidentSourceFormatV1::AgentStateDocument, parse(&json)?))
+    }
+}
+
+/// Why an export could not be loaded. `Read` is reported against the path by
+/// the caller; the parse failures carry their own context.
+#[derive(Debug, thiserror::Error)]
+enum LoadError {
+    #[error("{0}")]
+    Read(io::Error),
+    #[error(transparent)]
+    Stream(#[from] StreamParseError),
+    #[error(transparent)]
+    Document(#[from] ParseError),
 }
 
 fn read_utf8_limited(reader: impl Read, max_bytes: u64) -> io::Result<String> {
@@ -217,6 +238,7 @@ fn artifact_stem(scenario_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use incident_replay::MAX_STREAM_LINE_BYTES;
 
     #[test]
     fn bounded_reader_rejects_input_past_the_limit() {
@@ -233,17 +255,66 @@ mod tests {
         );
     }
 
-    /// A group export is a server-side concatenation of many uploads, so it
-    /// legitimately exceeds any single upload's ceiling. Sparse: `set_len`
-    /// reserves the size without writing, and the NUL bytes it reads back are
-    /// valid UTF-8.
+    const STREAM: &str = concat!(
+        r#"{"t":"manifest","schema_version":"goggles-group-export/v1"}"#,
+        "\n",
+        r#"{"t":"event","kind":{"type":"epoch_state_changed","epoch":2,"new_state":"stable"}}"#,
+        "\n",
+        r#"{"t":"eof","complete":true,"counts":{"event":1}}"#,
+        "\n",
+    );
+
+    /// The document cap bounds only the document shape: a stream is bounded
+    /// line by line while it is read, so its total size is not capped.
     #[test]
-    fn an_export_larger_than_one_upload_is_read() {
+    fn a_stream_larger_than_the_document_cap_is_parsed() {
+        let (format, export) =
+            load_export(io::Cursor::new(STREAM), 16).expect("the stream is parsed");
+
+        assert_eq!(format, IncidentSourceFormatV1::GogglesGroupExportStream);
+        assert_eq!(export.events.len(), 1);
+    }
+
+    #[test]
+    fn a_document_larger_than_the_document_cap_is_rejected() {
+        let document = r#"{"events":[]}"#;
+
+        let error = load_export(io::Cursor::new(document), 8).unwrap_err();
+
+        let LoadError::Read(error) = error else {
+            panic!("expected the document cap to reject the read, got {error:?}");
+        };
+        assert!(error.to_string().contains("exceeds 8 bytes"));
+    }
+
+    /// A first line too long to be a stream line is read as a document, and the
+    /// document parser still refuses it for carrying the stream discriminator.
+    #[test]
+    fn a_first_line_over_the_stream_line_bound_is_read_as_a_document() {
+        let mut line = br#"{"t":"manifest","pad":""#.to_vec();
+        line.resize(line.len() + MAX_STREAM_LINE_BYTES as usize, b'x');
+        line.extend_from_slice(b"\"}");
+
+        let error = load_export(io::Cursor::new(line), MAX_DOCUMENT_EXPORT_BYTES).unwrap_err();
+
+        assert!(
+            matches!(error, LoadError::Document(ParseError::StreamDiscriminator)),
+            "got {error:?}"
+        );
+    }
+
+    /// A group export is a server-side concatenation of many uploads, so a
+    /// document legitimately exceeds any single upload's ceiling. Sparse:
+    /// `set_len` reserves the size without writing, and the NUL bytes it reads
+    /// back are valid UTF-8.
+    #[test]
+    fn a_document_larger_than_one_upload_is_read() {
         let over_one_upload = 64 * 1024 * 1024 + 1;
         let file = tempfile::NamedTempFile::new().expect("temp file");
         file.as_file().set_len(over_one_upload).expect("sparse len");
 
-        let export = read_incident_export(file.path()).expect("export is read");
+        let export = read_utf8_limited(file.reopen().expect("reopen"), MAX_DOCUMENT_EXPORT_BYTES)
+            .expect("export is read");
 
         assert_eq!(export.len() as u64, over_one_upload);
     }

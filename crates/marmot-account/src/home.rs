@@ -222,12 +222,12 @@ impl AccountHome {
     }
 
     pub fn create_account(&self, label: &str) -> AccountHomeResult<AccountSummary> {
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         self.write_signing_account_for_label(label, &keys)
     }
 
     pub fn create_nostr_account(&self) -> AccountHomeResult<AccountSummary> {
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         self.write_signing_account(&keys)
     }
 
@@ -235,7 +235,7 @@ impl AccountHome {
     /// account becomes visible. A restart can therefore resume the same
     /// identity instead of minting another one.
     pub fn create_nostr_account_for_setup(&self) -> AccountHomeResult<AccountSummary> {
-        let keys = nostr::Keys::generate();
+        let keys = nostr::prelude::Keys::generate();
         let account = AccountSummary {
             label: keys.public_key().to_hex(),
             account_id_hex: keys.public_key().to_hex(),
@@ -327,8 +327,8 @@ impl AccountHome {
         label: &str,
         secret_key: &str,
     ) -> AccountHomeResult<AccountSummary> {
-        let keys =
-            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        let keys = nostr::prelude::Keys::parse(secret_key)
+            .map_err(|_| AccountHomeError::InvalidSecretKey)?;
         self.write_signing_account_for_label(label, &keys)
     }
 
@@ -343,8 +343,8 @@ impl AccountHome {
         label: &str,
         secret_key: &str,
     ) -> AccountHomeResult<AccountSummary> {
-        let keys =
-            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        let keys = nostr::prelude::Keys::parse(secret_key)
+            .map_err(|_| AccountHomeError::InvalidSecretKey)?;
         let _guard = self
             .mutation_lock
             .lock()
@@ -397,8 +397,8 @@ impl AccountHome {
     }
 
     pub fn import_nostr_account(&self, secret_key: &str) -> AccountHomeResult<AccountSummary> {
-        let keys =
-            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        let keys = nostr::prelude::Keys::parse(secret_key)
+            .map_err(|_| AccountHomeError::InvalidSecretKey)?;
         self.write_signing_account(&keys)
     }
 
@@ -431,8 +431,8 @@ impl AccountHome {
         secret_key: &str,
         kind: AccountSetupKind,
     ) -> AccountHomeResult<NostrAccountImport> {
-        let keys =
-            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        let keys = nostr::prelude::Keys::parse(secret_key)
+            .map_err(|_| AccountHomeError::InvalidSecretKey)?;
         let account_id_hex = keys.public_key().to_hex();
         let _guard = self
             .mutation_lock
@@ -833,13 +833,13 @@ impl AccountHome {
     }
 
     pub fn account_id_for_secret(secret_key: &str) -> AccountHomeResult<String> {
-        let keys =
-            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        let keys = nostr::prelude::Keys::parse(secret_key)
+            .map_err(|_| AccountHomeError::InvalidSecretKey)?;
         Ok(keys.public_key().to_hex())
     }
 
     pub fn account_id_for_public_key(public_key: &str) -> AccountHomeResult<String> {
-        nostr::PublicKey::parse(public_key)
+        nostr::prelude::PublicKey::parse(public_key)
             .map(|pubkey| pubkey.to_hex())
             .map_err(|_| AccountHomeError::InvalidPublicKey)
     }
@@ -1135,7 +1135,7 @@ impl AccountHome {
         }))
     }
 
-    pub fn load_signing_keys(&self, account_ref: &str) -> AccountHomeResult<nostr::Keys> {
+    pub fn load_signing_keys(&self, account_ref: &str) -> AccountHomeResult<nostr::prelude::Keys> {
         let account = self.account(account_ref)?;
         if !account.local_signing {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex));
@@ -1187,7 +1187,7 @@ impl AccountHome {
     /// at the UniFFI boundary; unwrap it only there and keep the host-side string
     /// transient.
     pub fn reveal_nsec(&self, account_ref: &str) -> AccountHomeResult<Zeroizing<String>> {
-        use nostr::ToBech32;
+        use nostr::nips::nip19::ToBech32;
         let keys = self.load_signing_keys(account_ref)?;
         let nsec = Zeroizing::new(
             keys.secret_key()
@@ -1222,7 +1222,10 @@ impl AccountHome {
         crate::nip49_export::export_ncryptsec(keys.secret_key(), passphrase, key_security_byte)
     }
 
-    fn write_signing_account(&self, keys: &nostr::Keys) -> AccountHomeResult<AccountSummary> {
+    fn write_signing_account(
+        &self,
+        keys: &nostr::prelude::Keys,
+    ) -> AccountHomeResult<AccountSummary> {
         let label = keys.public_key().to_hex();
         self.write_signing_account_for_label(&label, keys)
     }
@@ -1230,7 +1233,7 @@ impl AccountHome {
     fn write_signing_account_for_label(
         &self,
         label: &str,
-        keys: &nostr::Keys,
+        keys: &nostr::prelude::Keys,
     ) -> AccountHomeResult<AccountSummary> {
         let label = label.to_owned();
         validate_account_label(&label)?;
@@ -1263,7 +1266,7 @@ impl AccountHome {
     fn reuse_or_repair_signing_account(
         &self,
         mut account: AccountSummary,
-        keys: &nostr::Keys,
+        keys: &nostr::prelude::Keys,
     ) -> AccountHomeResult<AccountSummary> {
         match self.secret_store.load_secret(&account) {
             Ok(stored_keys) => {
@@ -1289,7 +1292,7 @@ impl AccountHome {
     fn write_new_signing_account(
         &self,
         account: &AccountSummary,
-        keys: &nostr::Keys,
+        keys: &nostr::prelude::Keys,
     ) -> AccountHomeResult<AccountSummary> {
         // Record first so a crash cannot leave an invisible keychain credential
         // that permanently blocks re-import. A record without a secret is

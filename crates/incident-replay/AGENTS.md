@@ -27,9 +27,14 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     `complete: true`, per-section counts matching what arrived, and no in-band
     `error` line — the server's only failure surface once the HTTP status is
     committed), which replaces the `has_more` truncation signal of the document
-    shape. `is_stream` detects any first-line `t` discriminator and routes it
+    shape. `is_stream` (and `starts_as_stream`, its bounded reader form the CLI
+    uses) detects any first-line `t` discriminator and routes it
     through that fail-closed contract, so a malformed or manifest-less stream
     cannot fall back to the document parser and the CLI needs no format flag.
+    The stream is read line by line from a `BufRead`, so its total size is not
+    capped; hostile input is bounded fail-closed by `MAX_STREAM_LINE_BYTES`
+    (16 MiB per line, enforced before the line is fully buffered) and
+    `MAX_STREAM_LINES` (16 Mi lines).
 - **Module:** `src/classify.rs`
   - **Role:** The `classify` gate → `Verdict`: `Healthy | ForkRecovery |
     ConvergenceSelected | Quarantine { reason }`. Everything downstream is gated
@@ -372,7 +377,10 @@ Gate designs evaluated against real exports and deliberately **rejected**:
   enter VCS.
 - Real exports are the manual pre-PR verification set:
   `cargo run -p incident-replay -- <export.json | export.ndjson>`.
-  The CLI rejects inputs larger than 256 MiB before JSON/NDJSON parsing.
+  The CLI sniffs the format from the first non-empty line (read under the
+  per-line and line-count bounds). An `agent-state.json` document is read whole and rejected
+  over 256 MiB before parsing; a stream is parsed line by line under the
+  per-line and line-count bounds, with no total-size cap.
 - Keep real inputs under ignored `incident-exports/` and generated local output under `target/` or ignored
   `incident-replay-output/`. Producer-attested artifacts may contain unredacted Scenario IR labels and payloads;
   treat them as confidential unless separately redacted and reviewed. Never add sensitive local replay capsules or

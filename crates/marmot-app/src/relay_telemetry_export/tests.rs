@@ -818,6 +818,11 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
         )
     };
     exporter.since_baseline(batch());
+    telemetry.record_runtime(
+        Op::AccountStartupRetrySuppressed,
+        std::time::Duration::ZERO,
+        Outcome::NotReady,
+    );
     let observation = telemetry.observe(Op::ConversationOpen);
     let (active, _) = exporter.since_baseline(batch());
     let points: Vec<_> = active
@@ -840,6 +845,13 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
             .value
             .clone()
     };
+    assert_eq!(
+        metric(
+            &active,
+            "app_runtime_account_startup_retry_suppressed_not_ready"
+        ),
+        ExportMetricValue::Counter(1)
+    );
     assert_eq!(
         metric(&active, "app_runtime_conversation_open_started"),
         ExportMetricValue::Counter(1)
@@ -884,6 +896,7 @@ async fn account_publish_counters_are_unlabeled_population_points() {
         .publish(PublishScript::Error, 1)
         .await
         .expect_err("failure");
+    fixture.cancel_in_flight().await;
     let batch = exporter.build_batch(None).await;
     let counter = |name: &str| {
         let point = batch
@@ -901,7 +914,119 @@ async fn account_publish_counters_are_unlabeled_population_points() {
             ref other => panic!("{name} should be a counter, got {other:?}"),
         }
     };
-    assert_eq!(counter(metric_names::PUBLISH_ATTEMPTS), 2);
+    assert_eq!(counter(metric_names::PUBLISH_ATTEMPTS), 3);
     assert_eq!(counter(metric_names::PUBLISH_SUCCESSES), 1);
     assert_eq!(counter(metric_names::PUBLISH_FAILURES), 1);
+    assert_eq!(counter(metric_names::PUBLISH_CANCELLATIONS), 1);
+}
+
+#[test]
+fn host_stages_use_registry() {
+    use crate::app_telemetry::{
+        AppPerformanceTelemetry, HostPerformanceOperation as Host,
+        HostPerformanceOutcome as Outcome, RuntimePerformanceOperation as Op,
+    };
+    let telemetry = AppPerformanceTelemetry::default();
+    let stages = [
+        (
+            Host::LinuxStartupBeforeVault,
+            Op::HostLinuxStartupBeforeVault,
+        ),
+        (Host::LinuxStartupAfterVault, Op::HostLinuxStartupAfterVault),
+        (Host::WindowInit, Op::HostWindowInit),
+        (Host::FontsInit, Op::HostFontsInit),
+        (Host::RuntimeInit, Op::HostRuntimeInit),
+        (Host::AccountLoad, Op::HostAccountLoad),
+        (Host::AccountSwitch, Op::HostAccountSwitch),
+        (Host::FrameUpdate, Op::HostFrameUpdate),
+        (Host::FrameLayout, Op::HostFrameLayout),
+        (Host::FrameDraw, Op::HostFrameDraw),
+        (Host::FramePresent, Op::HostFramePresent),
+        (Host::LinuxFramePostPresent, Op::HostLinuxFramePostPresent),
+        (Host::LinuxFrameUntilPresent, Op::HostLinuxFrameUntilPresent),
+        (Host::LinuxFrameIdleWait, Op::HostLinuxFrameIdleWait),
+        (Host::ChatListLoad, Op::HostChatListLoad),
+        (Host::ContactsLoad, Op::HostContactsLoad),
+        (Host::ArchivedChatListLoad, Op::HostArchivedChatListLoad),
+        (Host::ProfileLoad, Op::HostProfileLoad),
+        (Host::ProfileRead, Op::HostProfileRead),
+        (Host::TimelineOpen, Op::HostTimelineOpen),
+        (Host::TimelinePage, Op::HostTimelinePage),
+        (Host::TimelineHandoff, Op::HostTimelineHandoff),
+        (Host::TimelineApply, Op::HostTimelineApply),
+        (Host::MessageSend, Op::HostMessageSend),
+        (Host::MessageSearch, Op::HostMessageSearch),
+        (Host::ConversationSearch, Op::HostConversationSearch),
+        (Host::MediaQueueWait, Op::HostMediaQueueWait),
+        (Host::MediaPrepare, Op::HostMediaPrepare),
+        (Host::MediaLoad, Op::HostMediaLoad),
+        (Host::MediaCacheRead, Op::HostMediaCacheRead),
+        (Host::MediaDecode, Op::HostMediaDecode),
+        (Host::MediaApply, Op::HostMediaApply),
+        (Host::LinuxVaultDeriveKey, Op::HostLinuxVaultDeriveKey),
+        (Host::LinuxVaultOpen, Op::HostLinuxVaultOpen),
+        (Host::LinuxVaultCreate, Op::HostLinuxVaultCreate),
+        (Host::LinuxVaultPersist, Op::HostLinuxVaultPersist),
+        (Host::SettingsSave, Op::HostSettingsSave),
+    ];
+    for (index, (operation, _)) in stages.into_iter().enumerate() {
+        for outcome in [
+            Outcome::Success,
+            Outcome::Failure,
+            Outcome::Cancelled,
+            Outcome::Timeout,
+            Outcome::Unavailable,
+        ] {
+            telemetry.record_host_performance(
+                operation,
+                std::time::Duration::from_millis(index as u64 + 1),
+                outcome,
+            );
+        }
+    }
+    let snapshot = telemetry.snapshot();
+    let batch = build_export_batch_with_app_performance(
+        &RelayTelemetryRollup::default(),
+        &RelayLabelResolution::default(),
+        Some(&snapshot),
+    );
+    for (index, (_, operation)) in stages.into_iter().enumerate() {
+        let stage = snapshot
+            .runtime_operations
+            .iter()
+            .find(|s| s.operation == operation)
+            .unwrap();
+        assert_eq!((stage.started, stage.completed, stage.in_flight), (5, 5, 0));
+        assert_eq!(
+            [
+                stage.successes,
+                stage.failures,
+                stage.cancelled,
+                stage.timeouts,
+                stage.not_ready
+            ],
+            [1; 5]
+        );
+        let names = operation.metric_names();
+        for (name, expected) in names[..7].iter().zip([5, 5, 1, 1, 1, 1, 1]) {
+            let points: Vec<_> = batch.points.iter().filter(|p| p.name == *name).collect();
+            assert_eq!(points.len(), 1);
+            assert!(points[0].relay.is_none() && points[0].failure.is_none());
+            assert_eq!(points[0].value, ExportMetricValue::Counter(expected));
+        }
+        let histogram = batch.points.iter().find(|p| p.name == names[7]).unwrap();
+        assert!(histogram.relay.is_none() && histogram.failure.is_none());
+        let ExportMetricValue::Histogram(histogram) = &histogram.value else {
+            panic!("expected histogram")
+        };
+        assert_eq!(histogram.sum_ms, (index as u64 + 1) * 5);
+        assert_eq!(
+            histogram.bucket_counts.iter().sum::<u64>() + histogram.overflow_count,
+            5
+        );
+        for name in &names[8..] {
+            let point = batch.points.iter().find(|p| p.name == *name).unwrap();
+            assert_eq!(point.value, ExportMetricValue::Gauge(0.0));
+        }
+    }
 }

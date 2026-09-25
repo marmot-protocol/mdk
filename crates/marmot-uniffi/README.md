@@ -7,6 +7,12 @@ Host-controlled automatic downloads use the [host-managed attachment contract](A
 ## Integration guide and API reference
 
 This is the current integration entry point for Swift/iOS, Swift/macOS and Kotlin/Android.
+The stateless `verifyPublicNostrEventJson` helper verifies public events through
+MDK's Nostr/libsecp256k1 stack without constructing an account or supplying a
+secret key. It checks both the canonical event ID and signature. A host must
+still enforce its own allowed authors, kinds, tags, and input-size limits.
+Malformed input and invalid signatures return `false`; it does not authenticate
+an MLS group message or replace MDK's relay ingestion checks.
 The [C guide](../marmot-c/README.md) adds ABI ownership and blocking-call rules for C and raw FFI hosts.
 Read the documentation at the tag matching your binaries; `master` can describe unreleased APIs.
 
@@ -93,6 +99,10 @@ All methods, including less common management/diagnostic operations, are listed 
 3. Use local reads for initial UI where their contracts allow it. Start the runtime for live
    account workers, relay synchronization and acquisition. Local data and send readiness are
    distinct: render a conversation's available history while honoring its composer capabilities.
+   If one account worker fails to start, another ready account remains usable. A failed account
+   is retried on a later trigger after bounded in-memory backoff; repeated commands during the
+   delay report unavailability without reopening it. The runtime's aggregate start/reconcile
+   result still reports the partial failure.
 4. Keep synchronous storage reads off the UI thread. Async Swift/Kotlin calls may suspend;
    C methods are blocking unless documented otherwise. Host signer/secret-store callbacks may
    run concurrently on worker threads and must be thread-safe.
@@ -126,6 +136,25 @@ never free handles during concurrent use. Returned plaintext and copies made by 
 remain the host's responsibility, including removal of downstream copies after local deletion.
 
 ### Localization, privacy and diagnostics
+
+`record_host_performance` accepts 28 shared host stages for runtime/UI initialization,
+accounts, lists, profiles, timelines, sending/search, media and preferences, plus
+nine Linux-specific vault/startup and event-loop stages. `MessageSend` covers host
+send task execution, including attachment work. `ConversationSearch` finds
+conversations containing matching messages. `MediaApply` installs prepared media
+in the UI; this is UI resource application, not network publication.
+
+All stages are readable by their `host_*` operation name in the existing
+`AppPerformanceSnapshotFfi.runtime_operations` array, including the Linux stages.
+They use the runtime registry's `app_runtime_host_*` OTLP series with the same
+started/completed counters, five outcomes, histogram and live gauges. Hosts report
+the actual outcome; merely leaving a scope does not establish success. These
+completed-duration reports have no live observation, so their live gauges are zero.
+Record only stages your client can observe. Nested stages overlap and must not be
+summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
+[metric catalog](../../docs/marmot-architecture/telemetry.md#registered-host-stage-metrics).
+Regenerate Swift/Kotlin bindings with the matching library to adopt the new enum
+cases; the snapshot record fields and constructors are unchanged.
 
 Use typed presentation, capability, deletion and group-system fields rather than parsing English
 strings or guessing from membership counts. Clients localize fallback labels and system wording.
@@ -412,6 +441,19 @@ Build all Android ABIs:
 
 The script keeps the host library's UniFFI metadata intact while stripping
 debug and static symbol sections from each packaged Android JNI library.
+The two 64-bit Android links pass `-Wl,-z,max-page-size=16384` and
+`-Wl,-z,common-page-size=16384` as extra flags on the final library `cargo rustc`
+invocation. That appends the policy after Cargo's selected rustflags instead of
+replacing `build.rustflags` or target rustflags. The 32-bit ABIs stay on the NDK's default
+page size, and the supported ABI set is unchanged. Google Play's 16 KB check
+reads ELF `PT_LOAD` alignment; aligning the app bundle ZIP does not change
+those segments. Each published Android archive includes `android-elf.json`
+with the SHA-256, ELF class, machine, and observed load alignments of all
+four `libmarmot_uniffi.so` files. `manifest.json` keeps its existing ordered
+`contents` list and records `elf_validation: android-elf.json`. Exact-head
+candidate packages carry the same report next to their provenance manifest.
+A later release publishes the new artifact; this check does not by itself
+select a version or prove an app's Play Console result.
 
 Standard MarmotKit release builds use the workspace `[profile.release]` together with
 `marmotkit-release-profile.env`: `lto=thin`, `codegen-units=1`, `opt-level=3`,

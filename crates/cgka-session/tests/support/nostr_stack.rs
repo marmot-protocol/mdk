@@ -4,6 +4,7 @@
 //! Each integration test binary compiles this module independently, so some
 //! public helpers are intentionally used by only one sibling test file.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ use cgka_traits::{
     TransportEndpointReceipt, TransportGroupSubscription, TransportGroupSync, TransportMessage,
     TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
+use nostr::prelude::FinalizeEvent;
 use sha2::{Digest, Sha256};
 use storage_sqlite::SqlCipherKey;
 use tempfile::TempDir;
@@ -60,6 +62,7 @@ pub struct PublishedEvent {
 
 #[derive(Default)]
 pub struct FakeRelayClient {
+    active_accounts: Mutex<HashSet<MemberId>>,
     published: Mutex<Vec<PublishedEvent>>,
     accepted_limit: Mutex<Option<usize>>,
     fail_next_publish: Mutex<Option<String>>,
@@ -69,8 +72,12 @@ pub struct FakeRelayClient {
 impl NostrRelayClient for FakeRelayClient {
     async fn subscribe(
         &self,
-        _subscription: transport_nostr_adapter::NostrSubscription,
+        subscription: transport_nostr_adapter::NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
+        self.active_accounts
+            .lock()
+            .unwrap()
+            .insert(subscription.account_id().clone());
         Ok(())
     }
 
@@ -83,9 +90,23 @@ impl NostrRelayClient for FakeRelayClient {
 
     async fn unsubscribe_account(
         &self,
-        _account_id: &MemberId,
+        account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
+        self.active_accounts.lock().unwrap().remove(account_id);
         Ok(())
+    }
+
+    async fn publish_event_for_account(
+        &self,
+        account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        if !self.active_accounts.lock().unwrap().contains(account_id) {
+            return Err(TransportAdapterError::AccountNotActive(account_id.clone()));
+        }
+        self.publish_event(endpoints, event, required_acks).await
     }
 
     async fn publish_event(
@@ -402,11 +423,11 @@ impl FakeRelayClient {
     }
 }
 
-fn member_id(keys: &nostr::Keys) -> MemberId {
+fn member_id(keys: &nostr::prelude::Keys) -> MemberId {
     MemberId::new(keys.public_key().to_bytes().to_vec())
 }
 
-fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
+fn deterministic_nostr_keys(seed: &[u8]) -> nostr::prelude::Keys {
     let mut counter = 0_u64;
     loop {
         let mut hasher = Sha256::new();
@@ -414,7 +435,7 @@ fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
         hasher.update(seed);
         hasher.update(counter.to_be_bytes());
         let secret = hasher.finalize();
-        if let Ok(keys) = nostr::Keys::parse(&hex::encode(secret)) {
+        if let Ok(keys) = nostr::prelude::Keys::parse(&hex::encode(secret)) {
             return keys;
         }
         counter = counter
@@ -425,7 +446,7 @@ fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
 
 #[derive(Clone)]
 struct NostrAccountIdentityProofSigner {
-    keys: nostr::Keys,
+    keys: nostr::prelude::Keys,
 }
 
 impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
@@ -436,11 +457,9 @@ impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match Nostr stack key".into());
         }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
     }
 }

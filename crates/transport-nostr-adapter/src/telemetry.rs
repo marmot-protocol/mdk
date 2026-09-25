@@ -29,7 +29,7 @@ use std::collections::HashSet;
 
 use cgka_traits::MessageId;
 use cgka_traits::TransportEndpoint;
-use nostr::{RelayUrl, Url};
+use nostr::prelude::{RelayUrl, Url};
 use serde::{Deserialize, Serialize};
 
 /// Upper bounds, in milliseconds, of the duration histogram buckets shared by

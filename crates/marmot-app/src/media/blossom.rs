@@ -3,12 +3,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
-use nostr::{EventBuilder, JsonUtil, Kind, NostrSigner, Tag, Timestamp as NostrTimestamp};
+use nostr::prelude::{EventBuilder, FinalizeUnsignedEvent, Kind, Tag, Timestamp as NostrTimestamp};
 use serde::Deserialize;
+use transport_nostr_peeler::MarmotNostrSigner;
 use url::{Host, Url};
 
 use super::AttachmentDownloadFailure;
@@ -35,6 +36,9 @@ const MEDIA_BLOB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// body bytes within this bound gives the next ordered locator a chance. The
 /// candidate transfer deadline and read-idle timeout govern an active body.
 const BLOSSOM_CANDIDATE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Preserve a bounded tail for another locator without returning to equal
+/// division, which can terminate a healthy progressing large transfer.
+const BLOSSOM_FALLBACK_RESERVE_MAX: Duration = Duration::from_secs(30);
 /// Reusing a pinned client inside this lease amortizes DNS and TLS setup without
 /// turning one resolution result into a process-lifetime routing decision.
 const BLOSSOM_ADDRESS_LEASE: Duration = Duration::from_secs(60);
@@ -204,6 +208,21 @@ impl BlossomHttpTransport {
         )
     }
 
+    #[cfg(feature = "media-benchmarks")]
+    /// Scale production deadlines for repeatable wall-clock regression benchmarks.
+    pub(super) fn for_benchmark(
+        candidate_startup_timeout: Duration,
+        transfer_timeout: Duration,
+    ) -> Self {
+        Self::with_policy(
+            true,
+            BLOSSOM_ADDRESS_LEASE,
+            candidate_startup_timeout,
+            transfer_timeout,
+            system_dns_resolver(),
+        )
+    }
+
     #[cfg(test)]
     /// Inject a resolver so tests can prove that expired origin leases are
     /// resolved and vetted again.
@@ -302,6 +321,15 @@ impl BlossomHttpTransport {
     pub(super) fn transfer_timeout(&self) -> Duration {
         self.transfer_timeout
     }
+
+    /// Reserve at most one quarter of a short acquisition, capped at 30 seconds.
+    ///
+    /// Startup and body-idle bounds still evict non-progressing candidates much
+    /// earlier. This reserve matters only when a body keeps making progress near
+    /// the global deadline and another authenticated locator remains untried.
+    pub(super) fn fallback_reserve(&self) -> Duration {
+        BLOSSOM_FALLBACK_RESERVE_MAX.min(self.transfer_timeout / 4)
+    }
 }
 
 /// Resolve the full address set so every answer can be vetted before a client
@@ -327,7 +355,7 @@ pub(crate) async fn upload_blossom_blob(
     server: &str,
     blob: Bytes,
     blob_hash_hex: &str,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     transport: &BlossomHttpTransport,
 ) -> Result<String, AppError> {
     upload_blossom_blob_with_content_type(
@@ -346,7 +374,7 @@ pub(crate) async fn upload_blossom_blob_with_content_type(
     server: &str,
     blob: Bytes,
     blob_hash_hex: &str,
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     transport: &BlossomHttpTransport,
     content_type: &str,
     fallback_extension: Option<&str>,
@@ -1450,7 +1478,7 @@ pub(crate) fn blossom_content_hash_from_url(url: &str) -> Option<String> {
 }
 
 async fn blossom_authorization_header(
-    signer: &dyn NostrSigner,
+    signer: &dyn MarmotNostrSigner,
     server_host: &str,
     encrypted_hash_hex: &str,
 ) -> Result<String, AppError> {
@@ -1469,10 +1497,11 @@ async fn blossom_authorization_header(
         .get_public_key()
         .await
         .map_err(|err| crate::external_signer_error(err, "Blossom auth public key"))?;
-    let unsigned = EventBuilder::new(Kind::Custom(24242), "Upload Blob")
+    let mut unsigned = EventBuilder::new(Kind::Custom(24242), "Upload Blob")
         .tags(tags)
         .custom_created_at(NostrTimestamp::from(now))
-        .build(public_key);
+        .finalize_unsigned(public_key);
+    unsigned.ensure_id();
     let event = signer
         .sign_event(unsigned)
         .await

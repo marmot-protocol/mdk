@@ -206,7 +206,7 @@ pub(crate) fn prepare_group_image_upload(
         )
         .map_err(|_| AppError::InvalidEncryptedMedia("group image encryption failed".into()))?;
     let encrypted_hash_hex = hex::encode(Sha256::digest(&encrypted));
-    let upload_keys = nostr::Keys::generate();
+    let upload_keys = nostr::prelude::Keys::generate();
     let upload_secret = Zeroizing::new(upload_keys.secret_key().to_secret_bytes().to_vec());
     let image_upload_key_hex = hex::encode(&upload_secret);
     Ok(PreparedGroupImageUpload {
@@ -237,9 +237,9 @@ pub(crate) async fn upload_prepared_group_image(
     } else {
         transport.with_loopback_disabled()
     };
-    let secret = nostr::SecretKey::from_slice(&upload_secret)
+    let secret = nostr::prelude::SecretKey::from_slice(&upload_secret)
         .map_err(|_| AppError::InvalidEncryptedMedia("invalid group image upload key".into()))?;
-    let upload_keys = nostr::Keys::new(secret);
+    let upload_keys = nostr::prelude::Keys::new(secret);
     let server = server.unwrap_or(DEFAULT_BLOSSOM_SERVER_URL);
     upload_blossom_blob(
         server,
