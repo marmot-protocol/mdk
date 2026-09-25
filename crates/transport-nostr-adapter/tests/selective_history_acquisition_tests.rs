@@ -388,7 +388,8 @@ async fn cached_fixture(
         max_events: Some(64),
     });
     let sdk_database = Arc::new(SdkMemoryDatabase::unbounded());
-    let keys = Keys::generate();
+    let keys =
+        Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e").unwrap();
     let mut events = sizes
         .iter()
         .enumerate()
@@ -504,9 +505,9 @@ async fn warm_full_event_cache_resumes_under_combined_result_budget() {
 }
 
 #[tokio::test]
-async fn oversized_cached_id_keeps_later_cached_id_reachable() {
+async fn cached_id_over_single_object_ceiling_keeps_smaller_id_reachable() {
     let (left, right, sdk, route, left_counts, right_counts, items) =
-        cached_fixture(&[140 * 1024, 1024], &[0, 1]).await;
+        cached_fixture(&[5 * 1024 * 1024 + 1024, 1024], &[0, 1]).await;
     let (summary, events) = sdk
         .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
         .await
@@ -525,6 +526,109 @@ async fn oversized_cached_id_keeps_later_cached_id_reachable() {
     assert_eq!(summary.relays_failed, 2);
     assert_eq!(left_counts.requests.load(Ordering::SeqCst), 0);
     assert_eq!(right_counts.requests.load(Ordering::SeqCst), 0);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
+async fn one_large_network_event_is_recovered_within_single_object_ceiling() {
+    let (left, right, sdk, route, left_counts, right_counts, items) =
+        cached_fixture(&[160 * 1024], &[]).await;
+    let (summary, events) = sdk
+        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_failed, 0);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.id, hex::encode(items[0].event_id));
+    assert!(returned_json_bytes(&events) > 128 * 1024);
+    assert!(returned_json_bytes(&events) <= 5 * 1024 * 1024);
+    assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > 128 * 1024);
+    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) > 128 * 1024);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
+async fn warm_large_event_waits_for_empty_next_pass_after_smaller_event() {
+    // With the fixed signing key, ID order puts index 1 before index 0.
+    let (left, right, sdk, route, left_counts, right_counts, items) =
+        cached_fixture(&[160 * 1024, 1024], &[0, 1]).await;
+    assert_eq!(items[0].created_at, 1_700_001_001);
+    assert_eq!(items[1].created_at, 1_700_001_000);
+    let cursor = Cursor::default();
+    let (first, small) = sdk
+        .reconcile_subscription(route.clone(), &[], 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(first.relays_failed, 2);
+    assert_eq!(small.len(), 1);
+    assert_eq!(small[0].event.id, hex::encode(items[0].event_id));
+    assert!(returned_json_bytes(&small) < 128 * 1024);
+    let (next, large) = sdk
+        .reconcile_subscription(route, &items[..1], 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(next.relays_failed, 0);
+    assert_eq!(large.len(), 1);
+    assert_eq!(large[0].event.id, hex::encode(items[1].event_id));
+    assert!(returned_json_bytes(&large) > 128 * 1024);
+    assert!(returned_json_bytes(&large) <= 5 * 1024 * 1024);
+    assert_eq!(left_counts.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(right_counts.requests.load(Ordering::SeqCst), 0);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
+async fn large_network_id_retries_after_a_smaller_cached_prefix() {
+    let (left, right, sdk, route, left_counts, right_counts, items) =
+        cached_fixture(&[160 * 1024, 1024], &[0]).await;
+    assert_eq!(items[0].created_at, 1_700_001_001);
+    let cursor = Cursor::default();
+    let (first, small) = sdk
+        .reconcile_subscription(route.clone(), &[], 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(first.relays_failed, 2);
+    assert_eq!(small.len(), 1);
+    assert_eq!(small[0].event.id, hex::encode(items[0].event_id));
+    assert!(returned_json_bytes(&small) < 128 * 1024);
+    let (next, large) = sdk
+        .reconcile_subscription(route, &items[..1], 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(next.relays_failed, 0);
+    assert_eq!(large.len(), 1);
+    assert_eq!(large[0].event.id, hex::encode(items[1].event_id));
+    assert!(returned_json_bytes(&large) > 128 * 1024);
+    assert!(returned_json_bytes(&large) <= 5 * 1024 * 1024);
+    assert!(left_counts.requests.load(Ordering::SeqCst) >= 2);
+    assert!(right_counts.requests.load(Ordering::SeqCst) >= 2);
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+#[tokio::test]
+async fn large_network_result_survives_one_withholding_endpoint() {
+    let (left, right, sdk, route, left_counts, right_counts, items) =
+        cached_fixture(&[160 * 1024], &[]).await;
+    right_counts.suppress_events.store(true, Ordering::SeqCst);
+    let (summary, events) = sdk
+        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_succeeded, 1);
+    assert_eq!(summary.relays_failed, 1);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.id, hex::encode(items[0].event_id));
+    assert!(returned_json_bytes(&events) > 128 * 1024);
+    assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > 128 * 1024);
+    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) > 128 * 1024);
     sdk.client().shutdown().await;
     left.shutdown();
     right.shutdown();
@@ -615,6 +719,67 @@ async fn silent_endpoint_deadline_keeps_healthy_partial_event_and_incomplete_sum
     sdk.client().shutdown().await;
     left.shutdown();
     right.shutdown();
+}
+
+#[tokio::test]
+async fn silent_and_fast_withholding_endpoint_resume_two_ids_across_paced_passes() {
+    for silent in [true, false] {
+        let (left, right, sdk, route, left_counts, right_counts, items) =
+            cached_fixture(&[1024, 1024], &[]).await;
+        if silent {
+            right_counts.drop_requests.store(true, Ordering::SeqCst);
+        } else {
+            right_counts.suppress_events.store(true, Ordering::SeqCst);
+        }
+        let cursor = Cursor::default();
+        let mut admitted = Vec::new();
+        let mut seen = HashSet::new();
+        for pass in 0..if silent { 2 } else { 1 } {
+            let (summary, events) = sdk
+                .reconcile_subscription(route.clone(), &admitted, 0, u64::MAX, &cursor)
+                .await
+                .unwrap();
+            if silent {
+                // A silent relay can consume almost the entire deadline. If
+                // the healthy endpoint finishes another exact request in the
+                // remaining interval, both IDs can arrive this pass; otherwise
+                // cursor rotation reaches the second ID on the next pass.
+                assert!(summary.relays_failed >= 1);
+                assert!(!events.is_empty());
+                if seen.len() + events.len() < 2 {
+                    assert_eq!(summary.relays_failed, 2);
+                }
+            } else {
+                assert_eq!(summary.relays_succeeded, 1);
+                assert_eq!(summary.relays_failed, 1);
+                assert_eq!(
+                    events.len(),
+                    2,
+                    "fast failure cannot block a healthy suffix"
+                );
+            }
+            for event in events {
+                let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+                assert!(seen.insert(id), "pass {pass} must reach a later ID");
+                admitted.push(
+                    items
+                        .iter()
+                        .find(|item| item.event_id == id)
+                        .unwrap()
+                        .clone(),
+                );
+            }
+            if seen.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 2, "both IDs remain reachable");
+        assert!(left_counts.requests.load(Ordering::SeqCst) >= 2);
+        assert!(right_counts.requests.load(Ordering::SeqCst) >= 2);
+        sdk.client().shutdown().await;
+        left.shutdown();
+        right.shutdown();
+    }
 }
 
 #[tokio::test]

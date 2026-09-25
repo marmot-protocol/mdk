@@ -7264,3 +7264,6 @@ mod tests {
 
 #[cfg(test)]
 mod full_history_tests;
+
+#[cfg(test)]
+mod selective_history_acquisition_tests;

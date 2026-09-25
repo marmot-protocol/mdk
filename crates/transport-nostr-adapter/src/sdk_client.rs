@@ -78,6 +78,11 @@ const SDK_RECONCILIATION_REPLAY_BATCH: usize = 128;
 const SDK_RECONCILIATION_MAX_ID_REQUESTS: usize = 16;
 const SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT: usize = 16;
 const SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT: usize = 128 * 1024;
+// A single supported event can exceed the ordinary pass allowance. The pinned
+// SDK's default normalized-message ceiling is 5 MiB; one otherwise-empty pass
+// may return one such object, then stops. This is an MDK acquisition ceiling,
+// not a Nostr protocol maximum or a bound for custom SDK clients.
+const SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES: usize = 5 * 1024 * 1024;
 /// Must match the storage inventory ceiling. The relay applies the same limit,
 /// bounding the dry-run result even on first boot with an empty inventory.
 const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384;
@@ -715,8 +720,6 @@ impl NostrSdkRelayClient {
         let mut sdk_events = Vec::new();
         let mut spent_items = 0usize;
         let mut spent_bytes = 0usize;
-        let mut returned_items = 0usize;
-        let mut returned_bytes = 0usize;
         let mut returned_ids = HashSet::new();
         let mut requests = 0usize;
         let mut incomplete = remote_item_count > remote_ids.len();
@@ -739,17 +742,15 @@ impl NostrSdkRelayClient {
                 let event_bytes = event.as_json().len();
                 let remaining_items =
                     SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
-                let remaining_bytes =
-                    SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT.saturating_sub(spent_bytes);
-                let return_room =
-                    SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT.saturating_sub(returned_bytes);
-                if remaining_items == 0
-                    || returned_items >= SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
-                    || event_bytes > remaining_bytes
-                    || event_bytes > return_room
-                {
+                let byte_allowance = if sdk_events.is_empty() && spent_bytes == 0 {
+                    SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
+                } else {
+                    SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
+                };
+                let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
+                if remaining_items == 0 || event_bytes > remaining_bytes {
                     incomplete = true;
-                    if event_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
+                    if event_bytes > SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES {
                         // This object can never fit the pass allowance. Rotate
                         // past it so smaller missing IDs remain reachable;
                         // durable inventory still keeps it eligible on wrap.
@@ -763,8 +764,6 @@ impl NostrSdkRelayClient {
                 progress.save_cursor(Some(event_id.to_bytes()))?;
                 spent_items += 1;
                 spent_bytes += event_bytes;
-                returned_items += 1;
-                returned_bytes += event_bytes;
                 returned_ids.insert(event_id.to_hex());
                 sdk_events.push((
                     replay_endpoint.clone(),
@@ -774,6 +773,11 @@ impl NostrSdkRelayClient {
                         )
                     })?,
                 ));
+                if event_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
+                    // One large cached object is the entire returned batch.
+                    incomplete |= index + 1 < selected_item_count;
+                    break;
+                }
                 continue;
             }
             if requests >= SDK_RECONCILIATION_MAX_ID_REQUESTS {
@@ -782,8 +786,15 @@ impl NostrSdkRelayClient {
             }
             let remaining_items =
                 SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
-            let remaining_bytes =
-                SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT.saturating_sub(spent_bytes);
+            // The first request must offer enough room to discover the size of
+            // a single event before the SDK can accept or reject it. All later
+            // requests share the ordinary aggregate allowance.
+            let byte_allowance = if sdk_events.is_empty() && spent_bytes == 0 {
+                SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
+            } else {
+                SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
+            };
+            let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
             let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining_items == 0 || remaining_bytes == 0 || remaining_time.is_zero() {
                 incomplete = true;
@@ -825,7 +836,6 @@ impl NostrSdkRelayClient {
             // except for the one event observed at the rejection boundary.
             let mut request_items = 0usize;
             let mut request_bytes = 0usize;
-            let mut request_incomplete = false;
             let wanted_id = event_id.to_hex();
             for (endpoint, outcome) in endpoints.iter().zip(result.endpoints) {
                 request_items = request_items.max(outcome.stats.received_items);
@@ -837,44 +847,28 @@ impl NostrSdkRelayClient {
                 if outcome.end != NostrAcquisitionEnd::RequestPolicySatisfied || claimed_id_missing
                 {
                     failed_endpoints.insert(endpoint.clone());
-                    request_incomplete = true;
                 }
                 for event in outcome.events {
                     if event.id != wanted_id {
                         failed_endpoints.insert(endpoint.clone());
-                        request_incomplete = true;
                         continue;
                     }
                     if returned_ids.contains(&event.id) {
                         continue;
                     }
-                    let event_bytes = event
-                        .to_verified_nostr_event()
-                        .map_err(|_| {
-                            TransportAdapterError::Subscription(
-                                "decode acquired reconciled SDK event failed".to_owned(),
-                            )
-                        })?
-                        .as_json()
-                        .len();
-                    if returned_items >= SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
-                        || event_bytes
-                            > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
-                                .saturating_sub(returned_bytes)
-                    {
-                        failed_endpoints.insert(endpoint.clone());
-                        request_incomplete = true;
-                        continue;
-                    }
-                    returned_items += 1;
-                    returned_bytes += event_bytes;
+                    // SDK stats charge every received EVENT before accepting
+                    // it, using the same event JSON length. The maximum
+                    // endpoint cost therefore dominates this deduped batch.
                     returned_ids.insert(event.id.clone());
                     sdk_events.push((endpoint.clone(), event));
                 }
             }
             spent_items = spent_items.saturating_add(request_items);
             spent_bytes = spent_bytes.saturating_add(request_bytes);
-            if request_incomplete {
+            if spent_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
+                // A first oversized result, or expensive duplicate/boundary
+                // traffic, consumes this pass. Failed endpoints remain marked
+                // while the unattempted suffix stays retryable.
                 incomplete |= index + 1 < selected_item_count;
                 break;
             }
