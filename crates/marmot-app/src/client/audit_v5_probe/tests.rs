@@ -949,6 +949,80 @@ async fn engine_join_survives_app_checkpoint_failure_without_false_success() {
 }
 
 #[tokio::test]
+async fn offworker_startup_receive_retains_join_after_checkpoint_failure() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let group = scenario.create().await;
+        let delivery = cgka_traits::TransportDelivery {
+            account_id: cgka_traits::MemberId::new(hex::decode(&scenario.bob_id).unwrap()),
+            group_id_hint: None,
+            message: scenario.retained_welcome.clone().unwrap(),
+            received_at: cgka_traits::transport::Timestamp(1_700_000_002),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".into()),
+                plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        };
+        scenario
+            .bob
+            .audit_v5_probe
+            .as_mut()
+            .unwrap()
+            .reject_checkpoints = true;
+        let failure = scenario
+            .bob
+            .ingest_received_delivery_with_partial(delivery)
+            .await
+            .expect_err("the post-ingest app checkpoint must fail");
+        assert!(failure.partial_summary.joined_groups.is_empty());
+        assert_eq!(scenario.bob.members(&group).unwrap().len(), 2);
+        assert!(
+            scenario
+                .bob
+                .pending_failed_sync_summary
+                .joined_groups
+                .contains(&group),
+            "the applied join must wait for a successful checkpoint"
+        );
+
+        scenario
+            .bob
+            .audit_v5_probe
+            .as_mut()
+            .unwrap()
+            .reject_checkpoints = false;
+        let replay = scenario
+            .bob
+            .finish_deferred_comparison_sync()
+            .await
+            .unwrap();
+        assert_eq!(replay.joined_groups, vec![group]);
+        assert!(
+            scenario
+                .bob
+                .pending_failed_sync_summary
+                .joined_groups
+                .is_empty()
+        );
+        let next = scenario
+            .bob
+            .finish_deferred_comparison_sync()
+            .await
+            .unwrap();
+        assert!(
+            next.joined_groups.is_empty(),
+            "the join summary replays once"
+        );
+        scenario.assert_clean();
+    })
+    .await
+    .expect("bounded startup receive checkpoint scenario");
+}
+
+#[tokio::test]
 async fn no_op_welcome_replay_does_not_label_unrelated_checkpoint() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;

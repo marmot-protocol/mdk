@@ -597,7 +597,9 @@ enum DeferredStartupCommand {
 
 /// The original startup command policy applies during both the initial sync
 /// future and its off-worker comparison wait. Snapshot reads remain available;
-/// mutations and catch-up keep their arrival order in `deferred`.
+/// mutations and catch-up keep their arrival order in `deferred`. If snapshot
+/// capture failed after readiness, reads join that FIFO and use live state
+/// after catch-up rather than guessing from an incomplete snapshot.
 fn handle_startup_sync_command(
     command: AccountWorkerCommand,
     read_snapshot: Option<&crate::client::GroupReadSnapshot>,
@@ -672,9 +674,13 @@ fn handle_startup_sync_command(
             let _ = respond.send(Err(AppError::AccountWorkerBusy));
         }
         AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
+            // Invite acceptance needs live group state and cannot run from a
+            // frozen snapshot while initial sync is still pending.
             let _ = respond.send(Err(AppError::AccountWorkerBusy));
         }
         AccountWorkerCommand::CatchUp { respond } => {
+            // Join the initial catch-up at this FIFO position; do not start a
+            // second acquisition while the startup grant is still owned.
             deferred.push(DeferredStartupCommand::CatchUp(respond));
         }
         AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
@@ -737,10 +743,9 @@ pub(crate) fn spawn_app_runtime_account_worker(
     ready: oneshot::Sender<Result<(), AppError>>,
     shutdown: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
-    let worker: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(
-        run_app_runtime_account_worker(runtime, command_tx, commands, ready, shutdown),
-    );
-    tokio::spawn(worker)
+    tokio::spawn(run_app_runtime_account_worker(
+        runtime, command_tx, commands, ready, shutdown,
+    ))
 }
 
 async fn run_app_runtime_account_worker(
@@ -1014,15 +1019,35 @@ async fn run_app_runtime_account_worker(
                     .comparison_offload_eligible(selected)
                     .unwrap_or(false)
                 && let Some(credit) = credit.take()
-                && let Ok(subscription_attempt) = client.activate_comparison_grant(selected).await
-                && let Ok(network) = ComparisonNetworkJob::start(
+            {
+                // An attempted activation has side effects even when it fails.
+                // Surface that first failure as the old inline startup did;
+                // falling through would issue a second subscription attempt
+                // and could publish local-ready sends before recovery.
+                let subscription_attempt = client
+                    .activate_comparison_grant(selected, Some(&startup_stage_telemetry))
+                    .await
+                    .map_err(|error| {
+                        ClassifiedSyncFailure::at_stage(
+                            SyncSummary::default(),
+                            error,
+                            SyncFailureStage::TransportActivation,
+                        )
+                    })?;
+                let network = ComparisonNetworkJob::start(
                     &client,
                     selected,
                     credit,
                     #[cfg(test)]
                     activity_witness,
                 )
-            {
+                .map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::Unknown,
+                    )
+                })?;
                 return Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Network {
                     grant: Box::new(grant.take().expect("selected startup grant")),
                     subscription_attempt,
@@ -1105,7 +1130,7 @@ async fn run_app_runtime_account_worker(
                                         let delivery_started = Instant::now();
                                         let receive_observation = shared.app_performance_telemetry()
                                             .observe(RuntimeOp::WorkerReceive);
-                                        match client.ingest_received_delivery(*delivery).await {
+                                        match client.ingest_received_delivery_with_partial(*delivery).await {
                                             Ok(summary) => {
                                                 receive_observation.finish(TelemetryOutcome::Success);
                                                 shared.app_performance_telemetry().record(
@@ -1143,16 +1168,14 @@ async fn run_app_runtime_account_worker(
                                                     !summary.joined_groups.is_empty(),
                                                 ).await;
                                             }
-                                            Err(error) => {
+                                            Err(failure) => {
                                                 receive_observation.finish(TelemetryOutcome::Failure);
                                                 shared.app_performance_telemetry().record(
                                                     AppPerformanceOperation::InboundDeliveryProjection,
                                                     delivery_started.elapsed(), false,
                                                 );
                                                 network.abort_and_wait().await;
-                                                break Err(ClassifiedSyncFailure::at_stage(
-                                                    SyncSummary::default(), error, SyncFailureStage::Unknown,
-                                                ));
+                                                break Err(failure);
                                             }
                                         }
                                     }
@@ -1238,11 +1261,7 @@ async fn run_app_runtime_account_worker(
                         ) => client.finish_prepared_sync_summary(summary).await,
                         Ok(
                             EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending,
-                        ) => {
-                            client
-                                .execute_prepared_sync(None, Some(&startup_stage_telemetry), false)
-                                .await
-                        }
+                        ) => client.finish_deferred_comparison_sync().await,
                         Err(failure) => Err(failure),
                     };
                     app.finish_client_open_network_maintenance(&mut client)
@@ -1394,6 +1413,18 @@ async fn run_app_runtime_account_worker(
                     },
                 )
                 .await;
+            }
+            AccountWorkerCommand::PublishSetupKeyPackage { respond }
+                if setup_key_package_result.is_some() =>
+            {
+                // The durable setup lane may publish before background setup
+                // sends its worker command. Return that exact result even if
+                // the initial catch-up has already finished.
+                let _ = respond.send(
+                    setup_key_package_result
+                        .take()
+                        .expect("cached setup result"),
+                );
             }
             command => {
                 handle_account_worker_command(
@@ -1731,6 +1762,13 @@ async fn run_app_runtime_account_worker(
                                     },
                                 )
                                 .await;
+                            }
+                            AccountWorkerCommand::PublishSetupKeyPackage { respond }
+                                if setup_key_package_result.is_some() =>
+                            {
+                                let _ = respond.send(
+                                    setup_key_package_result.take().expect("cached setup result"),
+                                );
                             }
                             command => {
                                 handle_account_worker_command(
@@ -2628,7 +2666,7 @@ async fn execute_pending_comparison_or_inline(
                     "grant_inline"
                 });
             if eligible {
-                match client.activate_comparison_grant(&grant).await {
+                match client.activate_comparison_grant(&grant, None).await {
                     Ok(subscription_attempt) => match ComparisonNetworkJob::start(
                         client,
                         &grant,

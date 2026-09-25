@@ -327,9 +327,10 @@ impl AppClient {
     pub(crate) async fn activate_comparison_grant(
         &mut self,
         grant: &AttemptGrant,
+        telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SubscriptionAttempt, AppError> {
         let mut activation = EpochBackfillActivationOutcome::Failed;
-        self.activate_recovery_grant_inner(grant, None, &mut activation)
+        self.activate_recovery_grant_inner(grant, telemetry, &mut activation)
             .await
             .map_err(|failure| failure.source)?;
         self.adapter
@@ -663,9 +664,10 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
+        let activated_subscription = fixture.client.adapter.account_subscription_attempt().await;
         let new_goals = fixture
             .client
             .comparison_route_goals(unix_now_seconds())
@@ -692,6 +694,16 @@ mod tests {
             None
         );
         assert!(fixture.storage.recovery_comparison().unwrap().pending());
+        fixture
+            .client
+            .finish_deferred_comparison_sync()
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.client.adapter.account_subscription_attempt().await,
+            activated_subscription,
+            "a stale startup comparison drains its live activation without rebuilding subscriptions"
+        );
     }
 
     #[tokio::test]
@@ -712,7 +724,7 @@ mod tests {
             .unwrap();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let before = fixture
@@ -773,7 +785,7 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         fixture.client.adapter.require_fresh_activation().await;
@@ -815,7 +827,7 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let result = fixture
@@ -851,7 +863,7 @@ mod tests {
             .expect("fixture has a selected group route");
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let event = candidate_for_route(group_route);
@@ -950,7 +962,7 @@ mod tests {
             .expect("fixture has a selected group route");
         fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let event = candidate_for_route(group_route);
@@ -1033,7 +1045,7 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let mut network = network_result(route.clone(), Some([8; 32]));
@@ -1078,7 +1090,7 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let mut network = network_result(route.clone(), Some([8; 32]));

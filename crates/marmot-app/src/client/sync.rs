@@ -1503,6 +1503,16 @@ impl AppClient {
         self.finish_prepared_sync_summary(summary).await
     }
 
+    /// A startup comparison already activated the live account subscriptions.
+    /// If its fenced result is stale, drain that activation without rebuilding
+    /// every subscription or replaying the account backlog a second time.
+    pub(crate) async fn finish_deferred_comparison_sync(
+        &mut self,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let summary = self.sync_sdk_relay(&mut DrainCounts::default()).await?.0;
+        self.finish_prepared_sync_summary(summary).await
+    }
+
     pub(crate) async fn finish_prepared_sync_summary(
         &mut self,
         mut summary: SyncSummary,
@@ -1927,11 +1937,70 @@ impl AppClient {
         &mut self,
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, AppError> {
+        self.ingest_received_delivery_inner(delivery)
+            .await
+            .map_err(|(_, _, _, error, _)| error)
+    }
+
+    /// Startup's off-worker comparison may receive a delivery before its
+    /// immutable network request completes. Keep the applied prefix visible
+    /// on a later checkpoint failure, just as the inline startup drain did.
+    pub(crate) async fn ingest_received_delivery_with_partial(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let drain_started = std::time::Instant::now();
+        let cursor_before_secs = self.state.last_transport_timestamp;
+        match self.ingest_received_delivery_inner(delivery).await {
+            Ok(summary) => Ok(summary),
+            Err((summary, ingested, routes_dirty, error, stage)) => {
+                let counts = DrainCounts {
+                    deliveries: u64::from(ingested),
+                    ..DrainCounts::default()
+                };
+                Err(self
+                    .finish_failed_sync_drain(
+                        summary,
+                        routes_dirty,
+                        counts,
+                        StagedSyncError::new(error, stage),
+                        drain_started,
+                        cursor_before_secs,
+                    )
+                    .await)
+            }
+        }
+    }
+
+    async fn ingest_received_delivery_inner(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
-        let ingested =
-            Self::ingest_delivery(self.transport_receipts()?, delivery, &mut summary).await?;
+        let receipts = self.transport_receipts().map_err(|error| {
+            (
+                SyncSummary::default(),
+                false,
+                false,
+                error,
+                SyncFailureStage::StatePersist,
+            )
+        })?;
+        let ingested = Self::ingest_delivery(receipts, delivery, &mut summary)
+            .await
+            .map_err(|error| {
+                // The inline drain did not merge this delivery's staged
+                // projection when ingest itself failed.
+                (
+                    SyncSummary::default(),
+                    false,
+                    false,
+                    error,
+                    SyncFailureStage::CgkaIngest,
+                )
+            })?;
         if self.delivery_loss_blocks_cursor() {
             // `record_drop` publishes this process-local fence at the exact
             // omission, before marker I/O or the reserved control record can
@@ -1952,17 +2021,44 @@ impl AppClient {
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
-        if routes_dirty {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if routes_dirty
+            && let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
+        {
+            return Err((
+                summary,
+                true,
+                routes_dirty,
+                error,
+                SyncFailureStage::StatePersist,
+            ));
         }
-        let refresh = self.refresh_group_routes()?;
+        let refresh = match self.refresh_group_routes() {
+            Ok(refresh) => refresh,
+            Err(error) => {
+                return Err((
+                    summary,
+                    true,
+                    routes_dirty,
+                    error,
+                    SyncFailureStage::StatePersist,
+                ));
+            }
+        };
         // The routes-dirty save above already persisted this delivery's app
         // projection; save again only when that first save did not run, or
         // when route retirement just mutated persisted group state. The
         // routing-table delta lives in memory and obligates a subscription
         // refresh, not a second identical state write.
-        if !routes_dirty || refresh.state_pruned {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if (!routes_dirty || refresh.state_pruned)
+            && let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
+        {
+            return Err((
+                summary,
+                true,
+                routes_dirty,
+                error,
+                SyncFailureStage::StatePersist,
+            ));
         }
         self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
         self.drain_epoch_stall_escalations(&mut summary);

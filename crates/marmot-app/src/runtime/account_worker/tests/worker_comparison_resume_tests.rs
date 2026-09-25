@@ -680,7 +680,10 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .unwrap()
         .unwrap();
     assert!(client.comparison_offload_eligible(&grant).unwrap());
-    let attempt = client.activate_comparison_grant(&grant).await.unwrap();
+    let attempt = client
+        .activate_comparison_grant(&grant, None)
+        .await
+        .unwrap();
     let credit = bounded_recovery::try_acquire_recovery_credit(&pool).unwrap();
     let mut job = ComparisonNetworkJob::start(&client, &grant, credit, None).unwrap();
     let (credit, network) = timeout(Duration::from_secs(12), job.wait())

@@ -50,6 +50,10 @@ request are held over a signed Nostr event; `shutdown_and_close` reaps both,
 restores the credit, and a fresh SQLCipher open still has the comparison debt
 and the same retry serial. That cancellation fixture does not use valid MLS
 payloads; valid MLS recovery is established by the main test.
+A separate stale-fence client test keeps the already activated subscription
+attempt while the deferred startup tail drains, without a second rebuild.
+A post-ingest checkpoint-failure fixture retains the applied Welcome summary
+until a successful later checkpoint, without reporting an uncommitted join.
 
 ## Baseline and limits
 
@@ -74,6 +78,9 @@ RSS, device traffic, or incomplete/floored relay histories. It uses the
 `test-policy-overrides` feature to shorten retry and settlement intervals to
 100 ms. Separate selective-history and resource-bound qualifications retain
 their own request-local accounting boundaries.
+An ingest or transport error during the offloaded startup wait aborts its
+comparison job and reports startup catch-up failure; these fixtures do not
+qualify reconnect behavior for that failure path.
 
 Focused commands:
 
