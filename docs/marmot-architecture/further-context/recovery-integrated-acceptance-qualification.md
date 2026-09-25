@@ -54,6 +54,17 @@ cancellation assertion expected the server handler to stop immediately and
 observed it still active; cancellation and durable debt preservation need a
 separate composed test.
 
+A follow-up run moved startup into a spawned task and sent
+`GroupRecoveryStatus` immediately after the held exact query entered, before
+polling storage or demands. The status did **not** return within 300 ms;
+the probe elapsed 302 ms with one relay query handler active. Recovery still
+passed in 10.59 seconds. This directly shows the current startup path does
+not provide prompt status while the SDK request is held. The result does not
+by itself identify the owner grant because the relay-side query can outlive
+the SDK caller. Once the worker-owned continuation is integrated, this probe
+should become a strict prompt-response assertion with an active request and
+credit witness.
+
 The fixture does not count wire bytes, retained-history bandwidth, SDK queue
 allocation, whole-process RSS, device traffic, or incomplete/floored relay
 histories. Its `since` cutoff hides all earlier target-route events from broad
