@@ -21,9 +21,9 @@ default-disabled, exact-account-and-event test hook claims that one worker
 delivery and drops it immediately before `ingest_received_delivery`. The hook
 records its actual subscription ID, which the fixture matches against the
 relay's ordinary live REQ. It leaves every other delivery and overflow path
-unchanged. The raw wrapper ID has no engine row, the group's engine-row set is
-unchanged, and SQLCipher's reconciliation inventory and Alice's plaintext
-projection remain empty for the target at this point.
+unchanged. The group's engine-row set is unchanged, and SQLCipher's
+reconciliation inventory and Alice's plaintext projection remain empty for
+the target at this point.
 
 This is a source-backed ordinary SDK seen witness rather than a direct SDK
 registry read. In the pinned SDK, the ordinary `handle_event_msg` path validates

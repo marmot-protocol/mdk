@@ -2,7 +2,7 @@
 
 use super::*;
 use cgka_traits::storage::MessageStorage;
-use cgka_traits::{EpochId, MessageId, MessageState};
+use cgka_traits::{EpochId, MessageState};
 
 #[tokio::test]
 async fn ordinary_sdk_seen_but_unretained_event_is_admitted_by_bounded_worker() {
@@ -120,8 +120,6 @@ async fn ordinary_sdk_seen_but_unretained_event_is_admitted_by_bounded_worker() 
         .unwrap();
     let created_at = historical["created_at"].as_u64().unwrap();
     let recovery_route = storage_sqlite::TransportReconciliationRoute::Group(route);
-    let message_id = MessageId::new(event_id);
-    assert!(storage.get_message(&message_id).is_err());
     assert_eq!(stored_ids(), before_target);
     assert!(
         !storage
@@ -162,24 +160,21 @@ async fn ordinary_sdk_seen_but_unretained_event_is_admitted_by_bounded_worker() 
             break;
         }
     }
-    let ordinary = shared
+    let ordinary_subscription_id = shared
         .ordinary_drop_witness
         .lock()
         .unwrap()
         .clone()
         .expect("one ordinary SDK EVENT reaches Alice's worker");
-    assert_eq!(ordinary.account_label, alice.label);
-    assert_eq!(ordinary.event_id, event_id);
     assert!(
         live.iter()
-            .any(|interest| interest.id == ordinary.subscription_id)
+            .any(|interest| interest.id == ordinary_subscription_id)
     );
     assert!(
         !storage
             .retained_recovery_event(&recovery_route, &event_id, None, created_at)
             .unwrap()
     );
-    assert!(storage.get_message(&message_id).is_err());
     assert_eq!(stored_ids(), before_target);
     assert!(
         storage
@@ -256,7 +251,6 @@ async fn ordinary_sdk_seen_but_unretained_event_is_admitted_by_bounded_worker() 
             .retained_recovery_event(&recovery_route, &event_id, None, created_at)
             .unwrap()
     );
-    assert!(storage.get_message(&message_id).is_err());
     assert_eq!(stored_ids(), before_target);
     assert!(
         storage

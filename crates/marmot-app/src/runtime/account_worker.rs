@@ -1515,23 +1515,17 @@ async fn run_app_runtime_account_worker(
                         delivery.source.subscription_id.as_ref(),
                     )
                 {
-                    let drop_this = {
-                        let mut requested = shared.ordinary_drop_once.lock().unwrap();
-                        if requested.as_ref().is_some_and(|target| {
+                    let drop_this = shared
+                        .ordinary_drop_once
+                        .lock()
+                        .unwrap()
+                        .take_if(|target| {
                             target.account_label == account_label && target.event_id == event_id
-                        }) {
-                            requested.take();
-                            true
-                        } else {
-                            false
-                        }
-                    };
+                        })
+                        .is_some();
                     if drop_this {
-                        *shared.ordinary_drop_witness.lock().unwrap() = Some(super::OrdinaryDeliveryDropWitness {
-                            account_label: account_label.clone(),
-                            event_id,
-                            subscription_id: subscription_id.clone(),
-                        });
+                        *shared.ordinary_drop_witness.lock().unwrap() =
+                            Some(subscription_id.clone());
                         shared.ordinary_delivery_dropped.notify_one();
                         continue 'worker;
                     }

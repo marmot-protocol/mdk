@@ -341,14 +341,6 @@ pub(crate) struct OrdinaryDeliveryDropTarget {
     pub(crate) event_id: [u8; 32],
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct OrdinaryDeliveryDropWitness {
-    pub(crate) account_label: String,
-    pub(crate) event_id: [u8; 32],
-    pub(crate) subscription_id: String,
-}
-
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     /// Off until the production SDK acquisition backend passes its two-relay
@@ -372,7 +364,7 @@ pub struct RuntimeSharedServices {
     #[cfg(test)]
     pub(crate) ordinary_drop_once: Arc<StdMutex<Option<OrdinaryDeliveryDropTarget>>>,
     #[cfg(test)]
-    pub(crate) ordinary_drop_witness: Arc<StdMutex<Option<OrdinaryDeliveryDropWitness>>>,
+    pub(crate) ordinary_drop_witness: Arc<StdMutex<Option<String>>>,
     #[cfg(test)]
     pub(crate) ordinary_delivery_dropped: Arc<Notify>,
     local_submission_wakeups: watch::Sender<()>,
