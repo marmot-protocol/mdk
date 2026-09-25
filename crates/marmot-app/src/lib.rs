@@ -527,6 +527,8 @@ pub struct MarmotApp {
     inventory_snapshot_between_reads: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
     #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
+    #[cfg(test)]
+    audit_v5_peel_slot: Option<(String, Arc<Mutex<client::audit_v5_probe::PeelSlot>>)>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
@@ -1467,6 +1469,8 @@ impl MarmotApp {
             inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
+            #[cfg(test)]
+            audit_v5_peel_slot: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
@@ -1553,6 +1557,8 @@ impl MarmotApp {
             inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
+            #[cfg(test)]
+            audit_v5_peel_slot: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
@@ -1753,6 +1759,12 @@ impl MarmotApp {
         let mut client = AppClient {
             #[cfg(test)]
             audit_v5_probe: None,
+            #[cfg(test)]
+            audit_v5_peel_slot: self
+                .audit_v5_peel_slot
+                .as_ref()
+                .filter(|(label, _)| label == &open.state.label)
+                .map(|(_, slot)| slot.clone()),
             #[cfg(test)]
             test_recovery_evidence: None,
             #[cfg(test)]
@@ -3729,6 +3741,21 @@ impl MarmotApp {
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
         let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer.clone());
+        #[cfg(test)]
+        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> = if let Some((_, slot)) = self
+            .audit_v5_peel_slot
+            .as_ref()
+            .filter(|(selected, _)| selected == label)
+        {
+            Box::new(client::audit_v5_probe::ProbePeeler {
+                inner: peeler,
+                slot: slot.clone(),
+            })
+        } else {
+            Box::new(peeler)
+        };
+        #[cfg(not(test))]
+        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> = Box::new(peeler);
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // load_state/account_storage above completed the first database open.
         // Serialize any remaining key-migration probe with other openers.
@@ -3755,7 +3782,7 @@ impl MarmotApp {
             session_path,
             session_key,
             account_id.as_slice().to_vec(),
-            Box::new(peeler),
+            peeler,
         )
         .account_identity_proof_signer(signer.as_proof_signer())
         .feature_registry(app_feature_registry())

@@ -2643,9 +2643,14 @@ impl AppClient {
             TransportEnvelope::Welcome { .. }
         );
         #[cfg(test)]
-        if welcome && let Some(probe) = &mut client.audit_v5_probe {
-            probe.observe(&delivery.message);
-        }
+        let probe_receive = if welcome {
+            client
+                .audit_v5_probe
+                .as_mut()
+                .and_then(|probe| probe.observe(&delivery.message))
+        } else {
+            None
+        };
         // Hold the same account policy lock through admission and projection, so a
         // block cannot commit between authenticating the inviter and creating state.
         let policy_lock = client.app.block_update_lock(&client.state.label).await;
@@ -2706,6 +2711,10 @@ impl AppClient {
         );
         let telemetry = client.runtime_telemetry.clone();
         let ingest_observation = telemetry.as_ref().map(|t| t.observe(RuntimeOp::Ingest));
+        #[cfg(test)]
+        if let (Some(slot), Some(receive)) = (&client.audit_v5_peel_slot, probe_receive) {
+            slot.lock().unwrap().arm(&delivery.message, receive);
+        }
         let ingest = client
             .runtime
             .ingest_delivery_with_observer(delivery, |phase, duration, success| {
@@ -2728,6 +2737,12 @@ impl AppClient {
                 }
             })
             .await;
+        #[cfg(test)]
+        if let (Some(probe), Some(slot)) = (&mut client.audit_v5_probe, &client.audit_v5_peel_slot)
+            && let Some(completion) = slot.lock().unwrap().take()
+        {
+            probe.unwrapped(completion);
+        }
         if let Some(observation) = ingest_observation {
             observation.finish(if ingest.is_ok() {
                 TelemetryOutcome::Success

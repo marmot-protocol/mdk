@@ -1,6 +1,6 @@
 # Controlled v5 recipient Welcome probe
 
-This is the first **partial** real-recording experiment after the v5 contract
+This is a **partial** real-recording experiment after the v5 contract
 (PR #2040), tracked by #2043. It observes actual `AppClient` execution with two
 synthetic accounts, real NIP-59/MLS Welcomes, SQLCipher storage, and a localhost
 Nostr `MockRelay`. It does not replace v4 recording.
@@ -11,7 +11,7 @@ Run the bounded scenarios (also included in ordinary library tests):
 cargo test -p marmot-app --lib audit_v5_probe -- --nocapture --test-threads=1
 ```
 
-The entire probe, its selection field and fault injection are `#[cfg(test)]`.
+The app probe, its selection field, delegating peeler and fault injection are `#[cfg(test)]`.
 Only these unit tests select it. There is no feature flag, public API, recorder
 setting, file destination, uploader, worker, binding or production activation.
 The existing v4 recorder runs alongside the selected probe in the scenarios;
@@ -22,11 +22,20 @@ its output is checked to remain v4. Probe records stay in bounded memory.
 | Record | Actual observation | What it does not establish |
 | --- | --- | --- |
 | `welcome_observed` | The app admits a Welcome envelope to its ingest path, after checking its NIP-01 event hash for reference derivation. | Signature/unwrap validity, engine join, endpoint provenance, live versus history acquisition. Acquisition is explicitly `unknown`. |
+| `welcome_unwrapped` | The same engine-invoked Nostr peeler either validates the authenticated rumor and strict inner `e` KeyPackage event ID, or returns a typed transport error. The row shares the receive ID and outer reference with `welcome_observed`. | MLS KeyPackage secret availability, engine join, app checkpoint, or sender publication. SDK NIP-59 extraction errors are coarsely `failed/unwrap_failed`, not a specific bad-key diagnosis. |
 | `app_group_update_finished`, `welcome_join` | A dirty group projection from an observed engine Welcome event reaches the account checkpoint. | The entire engine transaction history, every projection row, UI rendering or notification delivery. |
 | `app_group_update_finished`, `invite_confirmation` | Explicit acceptance prepares a changed app row and returns from its checkpoint. | Recipient notification or screen visibility. |
 
 A committed pending invitation and a committed accepted invitation are distinct
 rows, linked to the same outer event reference with separate local update IDs.
+The app test installs one bounded per-client peel slot before opening the session.
+It arms that slot after policy prechecks and just before engine ingress, consumes
+the peeler result immediately afterward, and records through the existing probe's
+source, session and sequence. The production trait method returns the same peeled
+message and errors as before; the concrete peeler also has a narrow provenance
+return for the test wrapper. The SDK verifies the signed gift wrap and seal but
+does not verify an optional ID on its unsigned rumor, so the probe references the
+rumor's computed NIP-01 ID from authenticated fields, never that optional claim.
 Generic checkpoint errors use `checkpoint: unknown` and `invite_state: unknown`:
 an error alone is insufficient to assert that no commit occurred. Only the
 explicit fault placed before all checkpoint writes produces
@@ -70,25 +79,39 @@ facts are taken from the running scenario, not converted from v4 records.
    an uncertain earlier save, then fail and retry actual acceptance. Each attempt
    emits exactly one result with the acceptance cause; failure restores the prior
    origin, success clears it. This seeds probe state, not a real crash scenario.
-5. Collector bounds and a generic uncertain checkpoint result are checked
+5. A hash-valid unsigned gift wrap reaches the app ingress and is explicitly
+   rejected at the peeler, with no inner references, group join or app checkpoint.
+   This is a controlled malformed input, not a diagnosis of real incidents.
+6. A separate peeler-wrapper test uses a wrong local NIP-59 key to check the
+   coarse `failed/unwrap_failed` mapping and null inner references. It does not
+   claim app ingress or a real incident cause.
+7. Collector bounds and a generic uncertain checkpoint result are checked
    independently of the successful product scenario.
 
-A local run on 2026-09-25 measured 2,072 compact body bytes, 2,075 JSONL bytes
-and a 742-byte largest body for this subset (timing values vary between runs).
+A local run on 2026-09-25 of the earlier three-row subset measured 2,072 compact
+body bytes, 2,075 JSONL bytes and a 742-byte largest body. With successful unwrap
+added, the same success path measured four rows, 2,836 body bytes, 2,840 JSONL
+bytes and a 764-byte largest body. The invalid-signature path measured two rows,
+1,240 body bytes, 1,242 JSONL bytes and a 650-byte largest body. Timings vary.
+For that run, success contributed `welcome_observed` 1/592 B,
+`welcome_unwrapped` 1/764 B, and `app_group_update_finished` 2/1,480 B;
+rejection contributed `welcome_observed` 1/590 B and `welcome_unwrapped`
+1/650 B. These are compact JSON body bytes by kind.
 
-The successful scenario emits three rows: one receive, one pending checkpoint,
-one accepted checkpoint. Its command prints compact JSON body bytes, JSONL bytes
-(including one newline per row), and largest body. The 4 KiB aggregate assertion
-is only a gross-regression guard for this three-row subset. No v5 HTTP request is
+The successful scenario emits four rows: one receive, one unwrap, one pending
+checkpoint and one accepted checkpoint. Its command prints per-kind counts/body
+bytes, total compact JSON body bytes, JSONL bytes (including one newline per
+row), and largest body. The 5.2 KiB aggregate assertion is only a gross
+regression guard for this four-row subset. No v5 HTTP request is
 sent; these are **not upload bytes**, a full Welcome budget, or a device/day
 estimate. Source/session identifiers have fixed encoded width; timing values can
 change the byte count between runs.
 
-Sender preparation/publication, validated unwrap/inner KeyPackage references,
-engine disposition records, roster baselines, process-reopen capture, rejected
-inputs, and reader missing-source conclusions remain separate slices. In
+Sender preparation/publication, engine disposition records, roster baselines,
+process-reopen capture, broad rejected-input classification, and reader
+missing-source conclusions remain separate slices. In
 particular this does not claim complete W01/W03/W04/W08 acceptance or resolve
-#2043. Do not compare these three rows with the complete measured v4 Welcome
+#2043. Do not compare these four rows with the complete measured v4 Welcome
 lifecycle and claim a bandwidth reduction.
 
 Recovery instrumentation, the Rust investigation API, server acceptance of v5,

@@ -1490,6 +1490,40 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "rejected"
+              }
+            },
+            "required": ["result"]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": ["wrong_recipient", "invalid_signature", "invalid_encoding"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "failed"
+              }
+            },
+            "required": ["result"]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": ["unwrap_failed", "internal_failed", "unclassified"]
+              }
+            }
+          }
         }
       ]
     },

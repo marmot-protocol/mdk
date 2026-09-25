@@ -40,6 +40,7 @@ struct Scenario {
     bob: AppClient,
     bob_app: MarmotApp,
     bob_id: String,
+    key_package_event_id: [u8; 32],
 }
 
 impl Scenario {
@@ -56,10 +57,24 @@ impl Scenario {
             .unwrap()
             .account_id_hex;
         let alice_app = app(alice_dir.path(), &url);
-        let bob_app = app(bob_dir.path(), &url);
+        let mut bob_app = app(bob_dir.path(), &url);
+        bob_app.audit_v5_peel_slot = Some((
+            "bob".into(),
+            std::sync::Arc::new(std::sync::Mutex::new(PeelSlot::default())),
+        ));
         let alice = alice_app.client("alice").await.unwrap();
         let mut bob = bob_app.client("bob").await.unwrap();
         bob.publish_key_package().await.unwrap();
+        let key_package_event_id: [u8; 32] = bob
+            .runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .unwrap()
+            .authored_event_id
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
         bob.audit_v5_probe = Some(probe());
         Self {
             _relay: relay,
@@ -69,6 +84,7 @@ impl Scenario {
             bob,
             bob_app,
             bob_id,
+            key_package_event_id,
         }
     }
 
@@ -141,6 +157,27 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
             })
             .unwrap();
         let outer = observed.outer_event_ref.clone();
+        let unwrapped = scenario
+            .capture()
+            .rows
+            .iter()
+            .find_map(|r| match &r.fields().event {
+                Event::WelcomeUnwrapped(e) => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(unwrapped.receive_id, observed.receive_id);
+        assert_eq!(unwrapped.outer_event_ref, outer);
+        assert_eq!(unwrapped.result, UnwrapResult::Validated);
+        assert_eq!(unwrapped.reason, None);
+        assert!(unwrapped.rumor_event_ref.is_some());
+        assert_ne!(unwrapped.rumor_event_ref.as_ref(), Some(&outer));
+        assert_eq!(
+            unwrapped.key_package_event_ref,
+            Some(NostrEventRef::from_validated_event_id(
+                &scenario.key_package_event_id
+            ))
+        );
         assert_eq!(observed.acquisition, Acquisition::Unknown);
         assert_eq!(scenario.updates().len(), 1);
         assert_eq!(scenario.updates()[0].outer_event_ref, outer);
@@ -183,33 +220,41 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
         );
         assert_eq!(
             scenario.capture().rows.len(),
-            3,
+            4,
             "ordinary message work adds no Welcome rows"
         );
         scenario.assert_clean();
         let mut total = 0;
         let mut largest = 0;
+        let mut by_kind = std::collections::BTreeMap::<String, (usize, usize)>::new();
         for row in &scenario.capture().rows {
             let body = row.to_json().unwrap();
             total += body.len();
             largest = largest.max(body.len());
+            let value = serde_json::to_value(&row.fields().event).unwrap();
+            let kind = value["type"].as_str().unwrap().to_owned();
+            let entry = by_kind.entry(kind).or_default();
+            entry.0 += 1;
+            entry.1 += body.len();
             let text = std::str::from_utf8(&body).unwrap();
             for forbidden in [
                 &group_hex,
                 &scenario.bob_id,
+                &hex::encode(scenario.key_package_event_id),
+                pending.via_welcome_message_id_hex.as_ref().unwrap(),
                 "synthetic private group title",
                 "synthetic content must never enter probe",
             ] {
                 assert!(!text.contains(forbidden));
             }
         }
-        // A gross-regression bound for this THREE-ROW subset, not a bandwidth
+        // A gross-regression bound for this four-row subset, not a bandwidth
         // target for the complete Welcome lifecycle or an upload measurement.
-        assert!(total < 4096);
+        assert!(total < 5200);
         println!(
-            "v5 recipient subset: rows=3 body_bytes={total} \
-             jsonl_bytes={} largest_body_bytes={largest}",
-            total + 3
+            "v5 recipient subset: rows=4 body_bytes={total} \
+             jsonl_bytes={} largest_body_bytes={largest} by_kind={by_kind:?}",
+            total + 4
         );
         let files = scenario.bob_app.audit_log_files().unwrap();
         assert!(!files.is_empty());
@@ -225,6 +270,121 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
     })
     .await
     .expect("bounded local Welcome scenario");
+}
+
+#[tokio::test]
+async fn hash_valid_unsigned_gift_wrap_is_observed_then_rejected_without_inner_refs() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let mut event = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "44".repeat(32),
+            created_at: 1_700_000_001,
+            kind: transport_nostr_peeler::KIND_NIP59_GIFT_WRAP,
+            tags: vec![vec!["p".into(), scenario.bob_id.clone()]],
+            content: "synthetic invalid gift wrap".into(),
+            sig: None,
+        };
+        event.id = event.computed_id();
+        let message = event.to_transport_message().unwrap();
+        let delivery = cgka_traits::TransportDelivery {
+            account_id: cgka_traits::MemberId::new(hex::decode(&scenario.bob_id).unwrap()),
+            group_id_hint: None,
+            message,
+            received_at: cgka_traits::transport::Timestamp(1_700_000_002),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".into()),
+                plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        };
+        let _ = scenario.bob.ingest_received_delivery(delivery).await;
+        assert!(scenario.bob_app.groups("bob").unwrap().is_empty());
+        let rows = &scenario.capture().rows;
+        let observed = rows.iter().find_map(|r| match &r.fields().event {
+            Event::WelcomeObserved(e) => Some(e),
+            _ => None,
+        }).unwrap();
+        let rejected = rows.iter().find_map(|r| match &r.fields().event {
+            Event::WelcomeUnwrapped(e) => Some(e),
+            _ => None,
+        }).unwrap();
+        assert_eq!(rejected.receive_id, observed.receive_id);
+        assert_eq!(rejected.outer_event_ref, observed.outer_event_ref);
+        assert_eq!(rejected.result, UnwrapResult::Rejected);
+        assert_eq!(rejected.reason, Some(UnwrapReason::InvalidSignature));
+        assert!(rejected.rumor_event_ref.is_none());
+        assert!(rejected.key_package_event_ref.is_none());
+        assert!(rows.iter().all(|r| r.fields().group_ref.is_none()));
+        assert!(rows.iter().all(|r| !matches!(r.fields().event, Event::AppGroupUpdateFinished(_))));
+        scenario.assert_clean();
+        for row in rows {
+            let text = String::from_utf8(row.to_json().unwrap()).unwrap();
+            assert!(!text.contains(&scenario.bob_id));
+            assert!(!text.contains(&event.id));
+            assert!(!text.contains("synthetic invalid gift wrap"));
+        }
+        let body: usize = rows.iter().map(|r| r.to_json().unwrap().len()).sum();
+        let largest = rows.iter().map(|r| r.to_json().unwrap().len()).max().unwrap();
+        let by_kind = rows.iter().map(|r| {
+            let value = serde_json::to_value(&r.fields().event).unwrap();
+            (value["type"].as_str().unwrap().to_owned(), r.to_json().unwrap().len())
+        }).collect::<Vec<_>>();
+        println!("v5 rejected unwrap: rows={} body_bytes={body} jsonl_bytes={} largest_body_bytes={largest} by_kind={by_kind:?}", rows.len(), body + rows.len());
+    }).await.expect("bounded invalid-signature scenario");
+}
+
+#[tokio::test]
+async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
+    let sender = nostr::prelude::Keys::generate();
+    let recipient = nostr::prelude::Keys::generate();
+    let wrong_key = nostr::prelude::Keys::generate();
+    let message = NostrMlsPeeler::new()
+        .with_welcome_signer(sender)
+        .wrap_welcome_with_metadata(
+            &EncryptedPayload {
+                ciphertext: b"synthetic MLS bytes".to_vec(),
+                aad: Vec::new(),
+            },
+            &MemberId::new(recipient.public_key().to_bytes().to_vec()),
+            &WelcomeMetadata {
+                key_package_event_id: cgka_traits::MessageId::new(vec![0x44; 32]),
+                relays: vec![cgka_traits::TransportEndpoint("wss://group.example".into())],
+            },
+        )
+        .await
+        .unwrap();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(PeelSlot::default()));
+    let id: [u8; 32] = message.id.as_slice().try_into().unwrap();
+    slot.lock().unwrap().arm(
+        &message,
+        (
+            "33".repeat(16).try_into().unwrap(),
+            NostrEventRef::from_validated_event_id(&id),
+        ),
+    );
+    let peeler = ProbePeeler {
+        inner: NostrMlsPeeler::new().with_welcome_signer(wrong_key),
+        slot: slot.clone(),
+    };
+    assert!(matches!(
+        peeler.peel_welcome(&message).await,
+        Err(PeelerError::DecryptFailed)
+    ));
+    let completion = slot.lock().unwrap().take().unwrap();
+    assert_eq!(completion.result, UnwrapResult::Failed);
+    assert_eq!(completion.reason, Some(UnwrapReason::UnwrapFailed));
+    assert!(completion.provenance.is_none());
+    let mut capture = probe();
+    capture.unwrapped(completion);
+    assert_eq!(capture.invalid, 0);
+    let Event::WelcomeUnwrapped(row) = &capture.rows[0].fields().event else {
+        panic!("expected unwrap row")
+    };
+    assert!(row.rumor_event_ref.is_none());
+    assert!(row.key_package_event_ref.is_none());
 }
 
 #[tokio::test]

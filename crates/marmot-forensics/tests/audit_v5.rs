@@ -151,6 +151,8 @@ fn forbidden_success_combinations_are_rejected_by_both_layers() {
         ),
         ("local_replay", "/event/endpoint_ref", json!("e".repeat(64))),
         ("unwrapped", "/event/rumor_event_ref", Value::Null),
+        ("unwrap_rejected", "/event/reason", json!("unwrap_failed")),
+        ("unwrap_failed", "/event/reason", json!("invalid_signature")),
         (
             "unwrap_failed",
             "/event/rumor_event_ref",
@@ -183,6 +185,34 @@ fn forbidden_success_combinations_are_rejected_by_both_layers() {
         *body.pointer_mut(path).unwrap() = value;
         assert!(!schema.is_valid(&body), "schema accepted {name} {path}");
         assert!(decode(&body).is_err(), "Rust accepted {name} {path}");
+    }
+}
+
+#[test]
+fn unwrap_result_reason_sets_are_closed_in_rust_and_schema() {
+    let schema = validator();
+    for (fixture_name, reasons) in [
+        (
+            "unwrap_rejected",
+            ["wrong_recipient", "invalid_signature", "invalid_encoding"].as_slice(),
+        ),
+        (
+            "unwrap_failed",
+            ["unwrap_failed", "internal_failed", "unclassified"].as_slice(),
+        ),
+    ] {
+        for reason in reasons {
+            let mut body = fixture(fixture_name);
+            body["event"]["reason"] = json!(reason);
+            assert!(
+                schema.is_valid(&body),
+                "schema rejected {fixture_name}/{reason}"
+            );
+            assert!(
+                decode(&body).is_ok(),
+                "Rust rejected {fixture_name}/{reason}"
+            );
+        }
     }
 }
 

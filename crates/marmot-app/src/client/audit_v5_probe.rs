@@ -1,21 +1,162 @@
 //! Unit-test-only observations of the real recipient app path. Not a v5 recorder
 //! option, upload source, or native API. Production does not compile this module.
 //!
-//! These two event families deliberately say nothing about successful unwrap,
-//! engine commit, baseline capture, relay ACKs, or sender construction. A received
-//! envelope and a committed app checkpoint are distinct evidence boundaries.
+//! A received envelope, its actual transport peel, and a committed app
+//! checkpoint are distinct evidence boundaries. This does not record engine
+//! commit, baseline capture, relay ACKs, or sender construction.
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
+use cgka_traits::engine::WelcomeMetadata;
+use cgka_traits::error::PeelerError;
+use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::ingest::PeeledMessage;
+use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
+use cgka_traits::transport::EncryptedPayload;
+use cgka_traits::types::MemberId;
 use cgka_traits::{GroupEvent, TransportMessage};
 use marmot_forensics::v5::*;
-use transport_nostr_peeler::NostrTransportEvent;
+use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent, WelcomePeelProvenance};
 
 use crate::AppGroupRecord;
 
 const MAX_ROWS: usize = 128;
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_PENDING: usize = 64;
+
+/// One selected AppClient delivery episode. The app arms it before engine
+/// ingress and drains it immediately after. No source/session lives here.
+#[derive(Default)]
+pub(crate) struct PeelSlot {
+    armed: Option<(Vec<u8>, LocalId, NostrEventRef)>,
+    completed: Option<PeelCompletion>,
+}
+
+pub(crate) struct PeelCompletion {
+    pub receive_id: LocalId,
+    pub outer: NostrEventRef,
+    pub result: UnwrapResult,
+    pub reason: Option<UnwrapReason>,
+    pub provenance: Option<WelcomePeelProvenance>,
+    pub elapsed_us: u64,
+}
+
+impl PeelSlot {
+    pub(crate) fn arm(&mut self, message: &TransportMessage, receive: (LocalId, NostrEventRef)) {
+        self.armed = Some((message.id.as_slice().to_vec(), receive.0, receive.1));
+        self.completed = None;
+    }
+
+    pub(crate) fn take(&mut self) -> Option<PeelCompletion> {
+        self.armed = None;
+        self.completed.take()
+    }
+}
+
+/// The only selected test peeler. It delegates product behavior, and observes
+/// the same concrete Welcome peel the engine uses without a second decode.
+pub(crate) struct ProbePeeler {
+    pub inner: NostrMlsPeeler,
+    pub slot: Arc<Mutex<PeelSlot>>,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl TransportPeeler for ProbePeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        self.inner.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        let started = Instant::now();
+        let result = self.inner.peel_welcome_with_provenance(msg).await;
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let mut slot = self.slot.lock().unwrap();
+        if let Some((id, receive_id, outer)) = slot.armed.take()
+            && id == msg.id.as_slice()
+        {
+            let (outcome, reason, provenance) = match &result {
+                Ok((_, provenance)) => (UnwrapResult::Validated, None, Some(provenance.clone())),
+                Err(error) => {
+                    let (outcome, reason) = match error {
+                        PeelerError::WrongRecipient => {
+                            (UnwrapResult::Rejected, UnwrapReason::WrongRecipient)
+                        }
+                        PeelerError::InvalidSignature => {
+                            (UnwrapResult::Rejected, UnwrapReason::InvalidSignature)
+                        }
+                        PeelerError::Malformed(_) => {
+                            (UnwrapResult::Rejected, UnwrapReason::InvalidEncoding)
+                        }
+                        PeelerError::DecryptFailed => {
+                            (UnwrapResult::Failed, UnwrapReason::UnwrapFailed)
+                        }
+                        PeelerError::MissingContext { .. } | PeelerError::Backend(_) => {
+                            (UnwrapResult::Failed, UnwrapReason::InternalFailed)
+                        }
+                        PeelerError::StaleEpoch { .. } | PeelerError::WrapFailed(_) => {
+                            (UnwrapResult::Failed, UnwrapReason::Unclassified)
+                        }
+                    };
+                    (outcome, Some(reason), None)
+                }
+            };
+            slot.completed = Some(PeelCompletion {
+                receive_id,
+                outer,
+                result: outcome,
+                reason,
+                provenance,
+                elapsed_us,
+            });
+        }
+        result.map(|(peeled, _)| peeled)
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_group_message_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+        metadata: &GroupMessageMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner
+            .wrap_group_message_with_metadata(payload, ctx, metadata)
+            .await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_welcome(payload, recipient).await
+    }
+
+    async fn wrap_welcome_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+        metadata: &WelcomeMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner
+            .wrap_welcome_with_metadata(payload, recipient, metadata)
+            .await
+    }
+}
 
 pub(crate) struct WelcomeProbe {
     source: SourceRef,
@@ -120,7 +261,10 @@ impl WelcomeProbe {
         self.rows.push(row);
     }
 
-    pub(super) fn observe(&mut self, message: &TransportMessage) {
+    pub(super) fn observe(
+        &mut self,
+        message: &TransportMessage,
+    ) -> Option<(LocalId, NostrEventRef)> {
         // Validate the NIP-01 hash and envelope before deriving a Nostr reference.
         // This is not signature/decryption evidence. The normal peeler still
         // owns those decisions, and probe failure never changes admission.
@@ -128,26 +272,50 @@ impl WelcomeProbe {
             .and_then(|event| event.to_transport_message());
         let Ok(validated) = validated else {
             self.invalid += 1;
-            return;
+            return None;
         };
         if validated.id != message.id {
             self.invalid += 1;
-            return;
+            return None;
         }
         let Ok(id) = <[u8; 32]>::try_from(validated.id.as_slice()) else {
             self.invalid += 1;
-            return;
+            return None;
         };
         let receive_id = self.local_id();
+        let outer = NostrEventRef::from_validated_event_id(&id);
+        let before = self.rows.len();
         self.record(
             None,
             Event::WelcomeObserved(WelcomeObserved {
-                receive_id,
-                outer_event_ref: NostrEventRef::from_validated_event_id(&id),
+                receive_id: receive_id.clone(),
+                outer_event_ref: outer.clone(),
                 // The app drain does not expose a reliable live/history distinction.
                 acquisition: Acquisition::Unknown,
                 endpoint_ref: None,
                 fetch_id: None,
+            }),
+        );
+        (self.rows.len() > before).then_some((receive_id, outer))
+    }
+
+    pub(super) fn unwrapped(&mut self, completion: PeelCompletion) {
+        self.record(
+            None,
+            Event::WelcomeUnwrapped(WelcomeUnwrapped {
+                receive_id: completion.receive_id,
+                outer_event_ref: completion.outer,
+                result: completion.result,
+                rumor_event_ref: completion
+                    .provenance
+                    .as_ref()
+                    .map(|p| NostrEventRef::from_validated_event_id(&p.rumor_event_id)),
+                key_package_event_ref: completion
+                    .provenance
+                    .as_ref()
+                    .map(|p| NostrEventRef::from_validated_event_id(&p.key_package_event_id)),
+                reason: completion.reason,
+                elapsed_us: Some(completion.elapsed_us.into()),
             }),
         );
     }

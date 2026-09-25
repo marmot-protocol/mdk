@@ -334,6 +334,9 @@ pub(crate) struct GroupRouteRefresh {
 pub struct AppClient {
     #[cfg(test)]
     pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
+    #[cfg(test)]
+    pub(crate) audit_v5_peel_slot:
+        Option<std::sync::Arc<std::sync::Mutex<audit_v5_probe::PeelSlot>>>,
     /// Synthetic endpoint certificates for executor/completion contract tests.
     /// Never enabled by EOSE or by the production SDK adapter.
     #[cfg(test)]

@@ -3,8 +3,9 @@
 `marmot_forensics::v5` is a data-only foundation for a new investigation format.
 It does not change `AUDIT_LOG_SCHEMA_VERSION`, `AuditEvent`, `JsonlRecorder`, local
 cursor handling, the OTLP sender, receiver acceptance or current Goggles uploads.
-Those remain v4. There is no v5 recorder, source-ID persistence, emitter, analyzer,
-network call, runtime timer, migration or activation in this change.
+Those remain v4. The app's unit-test-only Welcome probe does not provide a v5
+recorder, source-ID persistence, analyzer, network call, runtime timer, migration
+or activation.
 
 ## Validated boundary
 
@@ -47,6 +48,18 @@ cannot prove that a producer used a real clock, a validated event or consent.
   accepted invitation. No projection-field history or UI visibility claim.
 - `group_baseline`: local epoch and bounded membership/admin status, with explicit
   partial/failed capture. No keys, MLS state, payloads or invented global state.
+
+For `welcome_unwrapped`, `validated` requires both inner references and no
+reason. `rejected` establishes a classified wrong-target or invalid transport
+input and permits only `wrong_recipient`, `invalid_signature`, or
+`invalid_encoding`. `failed` means validation did not complete and the source
+is not established as invalid input; it permits only `unwrap_failed`,
+`internal_failed`, or `unclassified`. Failed/rejected records have no inner
+references. The current NIP-59 extraction boundary coalesces its SDK errors to
+`unwrap_failed`; that category cannot diagnose bad keys, missing local MLS
+KeyPackage material, malformed encrypted data or a local defect. The unsigned
+rumor's optional claimed ID is not authenticated by the pinned SDK; producers
+derive its reference from the canonical ID computed over authenticated fields.
 
 Publication endpoint classifications follow the Nostr publish boundary: an
 acknowledged result has no failure kind and may carry only the `duplicate`

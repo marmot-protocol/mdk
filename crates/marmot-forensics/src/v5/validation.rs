@@ -213,10 +213,29 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                             && e.key_package_event_ref.is_some()
                             && e.reason.is_none()
                     }
-                    UnwrapResult::Rejected | UnwrapResult::Failed => {
+                    UnwrapResult::Rejected => {
                         e.rumor_event_ref.is_none()
                             && e.key_package_event_ref.is_none()
-                            && e.reason.is_some()
+                            && matches!(
+                                e.reason,
+                                Some(
+                                    UnwrapReason::WrongRecipient
+                                        | UnwrapReason::InvalidSignature
+                                        | UnwrapReason::InvalidEncoding
+                                )
+                            )
+                    }
+                    UnwrapResult::Failed => {
+                        e.rumor_event_ref.is_none()
+                            && e.key_package_event_ref.is_none()
+                            && matches!(
+                                e.reason,
+                                Some(
+                                    UnwrapReason::UnwrapFailed
+                                        | UnwrapReason::InternalFailed
+                                        | UnwrapReason::Unclassified
+                                )
+                            )
                     }
                 },
                 "unwrap result contradicts validated provenance",

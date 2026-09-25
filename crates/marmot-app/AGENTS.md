@@ -66,8 +66,8 @@ App runtime bridge for the first real Marmot app surfaces.
   `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and
   HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
 - Keep the controlled v5 recipient Welcome probe in `src/client/audit_v5_probe.rs`, compiled only with
-  `cfg(test)` and selected only by its unit scenarios. It observes app receipt/checkpoint boundaries; it does not
-  replace v4 recording or prove unwrap, engine commit, UI rendering or complete Welcome evidence. See
+  `cfg(test)` and selected only by its unit scenarios. It observes app receipt, actual Nostr peel and checkpoint
+  boundaries; it does not replace v4 recording or prove engine commit, UI rendering or complete Welcome evidence. See
   `tests/audit-v5-welcome-probe.md` for the measured subset and exclusions.
 - Keep the inactive audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v4 JSON body inside the restricted OTLP JSON envelope,
