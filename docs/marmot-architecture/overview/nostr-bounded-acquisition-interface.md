@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-09-24
+updated: 2026-09-25
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
@@ -205,6 +205,8 @@ Focused worker admission and completion fences, with their exact limits, are
 recorded in [recovery admission and interruption qualification](../further-context/recovery-admission-interruption-qualification.md).
 The [real-SDK receipt-release fence qualification](../further-context/recovery-interruption-redelivery-qualification.md)
 adds positive returned-content evidence while retaining the redelivery limit.
+The [real-SDK attempt/scope replacement qualification](../further-context/recovery-lifecycle-generation-qualification.md)
+checks durable admission from an old result without allowing its completion to clear the newer scope.
 The [progress and fairness qualification](../further-context/recovery-p5-progress-fairness-2026-09-24.md)
 records controlled ready-work and distinct known-ID owner turns; this branch
 also runs those fixtures against the isolated SDK pin. Its broad recovery and

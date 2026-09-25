@@ -32,7 +32,9 @@ The fixture then reserves a newer attempt for the same durable obligation and
 installs a new scope token under the unchanged loss, route and inventory
 revision fence. This is controlled owner-generation fault injection, not a
 second network request or a production scheduling change. Both endpoints
-return copies of the same eligible ID. The test releases the old job only
+return copies of the same eligible ID. The injected newer reservation is kept
+ineligible under the fixture's advanced owner clock, so a third attempt cannot
+replace its scope before the final snapshot. The test releases the old job only
 until its first successful bounded ingest, then pauses it before the remaining
 copy. At that boundary, SQLCipher retains the ID while the newer scope still
 has no checkpoints. The successful-ingest signal is emitted by the exact
@@ -41,7 +43,9 @@ the legacy executor. Empty ordinary history also prevents a live/history read
 from supplying the target. Finally, the old attempt's conditional checkpoint
 cannot clear the new owner's demand or write into its scope. The test checks
 the retained ID, pending demand and current scope token, attempt serial and
-empty checkpoint list before and after old completion.
+empty checkpoint list before and after old completion. The runtime error stream
+also confirms that the worker did not take its admission-error or
+checkpoint-error exit instead of successful conditional completion.
 
 ## Ownership and limits
 

@@ -185,7 +185,10 @@ async fn real_sdk_result_after_attempt_replacement_retains_bytes_without_old_com
         .reserve_recovery_attempt(
             &fence,
             crate::client::recovery::wall_now_ms().unwrap(),
-            15_000,
+            // The fixture advanced this worker's logical clock by 600 s.
+            // Keep the injected replacement ineligible until after we inspect
+            // the old job's completion, even on a slow debug-build runner.
+            3_600_000,
             true,
         )
         .unwrap()
@@ -198,6 +201,15 @@ async fn real_sdk_result_after_attempt_replacement_retains_bytes_without_old_com
         .expect("the newer attempt replaces the frozen scope")
         .remove(0);
     assert!(new_token.revision > old_scope.token.revision);
+    let retry = storage.recovery_retry_state().unwrap();
+    assert_eq!(retry.attempt_serial, newer.attempt_serial);
+    assert!(
+        retry
+            .not_before_ms
+            .saturating_sub(crate::client::recovery::wall_now_ms().unwrap())
+            > 3_000_000,
+        "the replacement stays beyond the worker's 600-second clock advance"
+    );
 
     // Two endpoint copies leave one item pending after the first successful
     // bounded ingest. This hook gates that exact Job after its admitted count
@@ -209,6 +221,7 @@ async fn real_sdk_result_after_attempt_replacement_retains_bytes_without_old_com
     first_admitted.as_mut().enable();
     let mut finished = Box::pin(shared.bounded_recovery_finished.notified());
     finished.as_mut().enable();
+    let mut errors = runtime.subscribe();
     shared
         .bounded_pause_before_admission
         .store(false, Ordering::SeqCst);
@@ -267,6 +280,24 @@ async fn real_sdk_result_after_attempt_replacement_retains_bytes_without_old_com
         expected_endpoints
     );
     assert!(current_scopes[0].checkpoints.is_empty());
+    loop {
+        match errors.try_recv() {
+            Ok(MarmotAppEvent::AccountError(error))
+                if error.account_label == alice.label
+                    && (error
+                        .message
+                        .starts_with("bounded recovery admission failed")
+                        || error
+                            .message
+                            .starts_with("bounded recovery checkpoint failed")) =>
+            {
+                panic!("old bounded job failed instead of reaching conditional completion")
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("bounded completion error observation unavailable: {error:?}"),
+        }
+    }
     let cursor_after = storage
         .load_account_projection_state(&alice.label, 0)
         .unwrap()
