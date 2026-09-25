@@ -1116,6 +1116,7 @@ async fn run(
                 continue;
             }
         };
+        let moves_viewport = next != position;
         sources.drain(); // only the queued prefix; mutations during capture remain queued
         // Following the tail may use the send's coherent pre-publication capture.
         // capture_live sets the requested query first, invalidating any capture
@@ -1156,7 +1157,7 @@ async fn run(
                 reader.send_capture.set_query(&position);
                 last_good_position = position.clone();
                 current = replacement;
-                if changed && (viewport_moved || command.is_some()) {
+                if changed && (viewport_moved || moves_viewport) {
                     viewport_sequence = current.revision.sequence;
                 }
                 viewport_moved = false;
@@ -1191,7 +1192,6 @@ async fn run(
                 retry_delayed = false;
             }
             Err(error) => {
-                let commanded = command.is_some();
                 let terminal = error.terminal();
                 let terminal_outcome = if matches!(error, ConversationWindowError::Closed) {
                     TelemetryOutcome::Cancelled
@@ -1230,7 +1230,7 @@ async fn run(
                 if !query_error {
                     // Preserve accepted viewport commands through a quiet failure.
                     position = next;
-                    viewport_moved |= commanded;
+                    viewport_moved |= moves_viewport;
                     dirty = true;
                     // Quiet NotReady retries must not suppress a later real
                     // storage error that the receiver has not yet seen.

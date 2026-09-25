@@ -391,6 +391,22 @@ async fn commands_quoting_a_revision_replaced_only_by_new_content_apply_to_the_c
 }
 
 #[tokio::test]
+async fn a_command_that_leaves_the_viewport_in_place_does_not_supersede_revisions() {
+    let f = Fixture::new(20).await;
+    let sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    let quoted = sub.snapshot.revision.clone();
+    let latest = handle.return_to_latest(&quoted).await.unwrap();
+    assert!(latest.revision.sequence > quoted.sequence);
+    let paged = handle
+        .page(&quoted, ConversationPageDirection::Older, 5)
+        .await
+        .unwrap();
+    assert_eq!(ids(&paged), (10..20).map(id).collect::<Vec<_>>());
+    f.close().await;
+}
+
+#[tokio::test]
 async fn commands_quoting_an_unpublished_sequence_are_stale() {
     let f = Fixture::new(5).await;
     let sub = f.open(ConversationOpenTarget::Latest, 3).await;
