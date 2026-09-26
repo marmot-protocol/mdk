@@ -6592,6 +6592,23 @@ MarmotStatus marmot_send_text_with_client_token(const struct MarmotClient *clien
                                                 struct MarmotLocalSendAcceptance **out);
 
 /**
+ * Durably queue a revision of a token-aware local send. Free with `marmot_local_send_acceptance_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_edit_local_message_with_client_token(const struct MarmotClient *client,
+                                                         const char *account_ref,
+                                                         const char *group_id_hex,
+                                                         const char *original_client_token,
+                                                         const char *content,
+                                                         const char *edit_client_token,
+                                                         struct MarmotLocalSendAcceptance **out);
+
+/**
  * Return durable local reply acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
  *
  * # Safety

@@ -53,6 +53,30 @@ impl Marmot {
             .into())
     }
 
+    /// Durably queue an edit for a text or reply submitted with a client token.
+    /// The edit survives restart, targets the original's authoritative ID, and
+    /// is rejected if that original never reaches the engine's durable queue.
+    pub async fn edit_local_message_with_client_token(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        original_client_token: String,
+        content: String,
+        edit_client_token: String,
+    ) -> Result<LocalSendAcceptanceFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .submit_edit_for_local_send(
+                &account_ref,
+                &group_id_from_hex(&group_id_hex)?,
+                original_client_token,
+                content,
+                edit_client_token,
+            )
+            .await?
+            .into())
+    }
+
     /// Durably admit a reply, retaining exact token correlation across restart.
     pub async fn reply_to_message_with_client_token(
         &self,

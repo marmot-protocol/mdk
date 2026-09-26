@@ -32,6 +32,9 @@ acceptance), rather than relay completion. Free their results with
 `marmot_local_send_status_free`. The nullable timeline `client_token` is owned by
 its row and released by the row's existing deep-free. Rebuild against the matching
 header/library because this changes the timeline record layout.
+Unreleased source also provides `marmot_edit_local_message_with_client_token` for
+durable revisions of pending text or replies. Each revision needs a new edit token;
+the C call returns local acceptance and uses the same status and free functions.
 
 Before OS suspension/root handoff, use `marmot_client_shutdown_and_close` and observe
 its status; `marmot_client_shutdown` alone does not close shared database handles.

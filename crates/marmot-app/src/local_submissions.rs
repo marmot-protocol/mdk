@@ -70,10 +70,12 @@ pub(crate) struct LocalMessageRequest {
 struct RetainedLocalRequest {
     version: u8,
     request: LocalMessageRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edit_of_client_token: Option<String>,
 }
 
 impl LocalMessageRequest {
-    pub(crate) fn decode_retained(json: &str) -> Result<Self, AppError> {
+    pub(crate) fn decode_retained(json: &str) -> Result<(Self, Option<String>), AppError> {
         let retained: RetainedLocalRequest = serde_json::from_str(json).map_err(|_| {
             AppError::InvalidAppMessagePayload("invalid local submission request".into())
         })?;
@@ -82,13 +84,14 @@ impl LocalMessageRequest {
                 "unsupported local submission request version".into(),
             ));
         }
-        Ok(retained.request)
+        Ok((retained.request, retained.edit_of_client_token))
     }
 
-    fn encode_retained(&self) -> Result<String, AppError> {
+    fn encode_retained(&self, edit_of_client_token: Option<&str>) -> Result<String, AppError> {
         serde_json::to_string(&RetainedLocalRequest {
             version: 1,
             request: self.clone(),
+            edit_of_client_token: edit_of_client_token.map(str::to_owned),
         })
         .map_err(|_| AppError::InvalidAppMessagePayload("invalid local submission request".into()))
     }
@@ -170,13 +173,42 @@ impl MarmotApp {
         account_ref: &str,
         group: &cgka_traits::GroupId,
         token: String,
+        request: LocalMessageRequest,
+        draft: Option<MessageDraftRevision>,
+        created_at: u64,
+    ) -> Result<(LocalSendAcceptance, Option<AppProjectionUpdate>), AppError> {
+        self.admit_local_message_with_edit_at(
+            account_ref,
+            group,
+            token,
+            request,
+            draft,
+            None,
+            created_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_local_message_with_edit_at(
+        &self,
+        account_ref: &str,
+        group: &cgka_traits::GroupId,
+        token: String,
         mut request: LocalMessageRequest,
         draft: Option<MessageDraftRevision>,
+        edit_of_client_token: Option<String>,
         created_at: u64,
     ) -> Result<(LocalSendAcceptance, Option<AppProjectionUpdate>), AppError> {
         if token.is_empty() || token.len() > 128 {
             return Err(AppError::InvalidAppMessagePayload(
                 "client token must contain 1 to 128 UTF-8 bytes".into(),
+            ));
+        }
+        if let Some(original) = &edit_of_client_token
+            && (original.is_empty() || original.len() > 128 || original == &token)
+        {
+            return Err(AppError::InvalidAppMessagePayload(
+                "invalid original client token for pending edit".into(),
             ));
         }
         let account = self.account_home().account(account_ref)?;
@@ -186,6 +218,11 @@ impl MarmotApp {
         // now selected (the accepted draft may already have been consumed).
         let mut request_hash = Sha256::new();
         request_hash.update(b"mdk-local-submission-v1");
+        if let Some(original) = &edit_of_client_token {
+            request_hash.update(b"pending-edit-of-token-v1");
+            request_hash.update((original.len() as u64).to_le_bytes());
+            request_hash.update(original.as_bytes());
+        }
         if let Some(revision) = &draft {
             if revision.group_id_hex() != group_hex {
                 return Err(AppError::MessageDraftRevisionConflict);
@@ -251,14 +288,57 @@ impl MarmotApp {
                 request.content = selected.content;
                 request.reply_to = selected.reply_to_message_id_hex;
             }
-            let intent = request.intent();
+            let mut event_created_at = created_at;
+            let intent = if let Some(original_token) = &edit_of_client_token {
+                let original = storage
+                    .local_submission(&group_hex, original_token)?
+                    .ok_or_else(|| {
+                        AppError::InvalidAppMessagePayload(
+                            "original local send was not found".into(),
+                        )
+                    })?;
+                if original.state == 3 {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "original local send was rejected".into(),
+                    ));
+                }
+                let original_row = storage
+                    .timeline_message(&group_hex, &original.message_id_hex)?
+                    .ok_or_else(|| {
+                        AppError::InvalidAppMessagePayload(
+                            "original local message is unavailable".into(),
+                        )
+                    })?;
+                if original_row.kind != 9 || original_row.direction != "sent" {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "pending edit requires an outgoing text message".into(),
+                    ));
+                }
+                // Edit resolution uses (second, event id), not queue order.
+                // Give rapid local revisions strictly increasing seconds so
+                // the last submitted text remains the effective version.
+                if let Some(previous) = original_row.edit {
+                    event_created_at = event_created_at.max(previous.edited_at.saturating_add(1));
+                    if event_created_at > created_at.saturating_add(30) {
+                        return Err(AppError::InvalidAppMessagePayload(
+                            "pending edit rate limit: retry shortly".into(),
+                        ));
+                    }
+                }
+                AppMessageIntent::Edit {
+                    target_message_id: original.message_id_hex,
+                    content: request.content.clone(),
+                }
+            } else {
+                request.intent()
+            };
             let media_reply = (!request.attachments.is_empty())
                 .then_some(request.reply_to.as_deref())
                 .flatten();
             let event = build_inner_event_with_media_reply(
                 &intent,
                 &account.account_id_hex,
-                created_at,
+                event_created_at,
                 media_reply,
             )?;
             // Keep the existing wire identity. A new token must not overwrite
@@ -286,7 +366,7 @@ impl MarmotApp {
                 request_hash: request_hash.clone(),
                 payload_hash: Sha256::digest(&payload).to_vec(),
                 payload: Some(payload),
-                request_json: Some(request.encode_retained()?),
+                request_json: Some(request.encode_retained(edit_of_client_token.as_deref())?),
                 state: 0,
                 outcome_json: None,
             };

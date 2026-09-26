@@ -1,6 +1,17 @@
 use super::*;
 use crate::local_submissions::LocalMessageRequest;
 
+#[test]
+fn pending_edit_request_decoder_preserves_legacy_local_sends() {
+    let legacy = serde_json::json!({
+        "version": 1,
+        "request": { "content": "legacy", "reply_to": null, "attachments": [] }
+    });
+    let (request, dependency) = LocalMessageRequest::decode_retained(&legacy.to_string()).unwrap();
+    assert_eq!(request.content, "legacy");
+    assert!(dependency.is_none());
+}
+
 #[tokio::test]
 async fn retained_submission_preserves_noncanonical_json_bytes_for_engine_handoff() {
     use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent};
@@ -214,6 +225,375 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
         )
         .contains("host-secret-token")
     );
+}
+
+#[tokio::test]
+async fn pending_edit_is_durable_while_original_publication_is_blocked() {
+    let h = History::new(0).await;
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    h.relay.block_next_publish();
+    let original = runtime
+        .submit_text(
+            "alice",
+            &h.group,
+            "before revision".into(),
+            "original-token".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), h.relay.wait_for_blocked_publish())
+        .await
+        .unwrap();
+    let edit = tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.submit_edit_for_local_send(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            "after revision".into(),
+            "edit-token".into(),
+        ),
+    )
+    .await
+    .expect("edit admission waited for relay publication")
+    .unwrap();
+    assert_ne!(original.message_id_hex, edit.message_id_hex);
+    assert!(matches!(
+        runtime
+            .local_send_status("alice", &h.group, "edit-token")
+            .unwrap(),
+        Some(crate::LocalSendStatus::Queued)
+    ));
+    h.relay.release_publish();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                runtime
+                    .local_send_status("alice", &h.group, "edit-token")
+                    .unwrap(),
+                Some(crate::LocalSendStatus::Completed(_))
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let row = h
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .timeline_message(&hex::encode(h.group.as_slice()), &original.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.plaintext, "after revision");
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_edit_requires_an_existing_local_original() {
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let error = h
+        .app
+        .admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            "edit-token".into(),
+            LocalMessageRequest {
+                content: "revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("missing-original".into()),
+            crate::unix_now_seconds(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::InvalidAppMessagePayload(_)));
+    assert!(
+        h.app
+            .account_storage("alice")
+            .unwrap()
+            .local_submission(&group_hex, "edit-token")
+            .unwrap()
+            .is_none()
+    );
+    h.app.close_storage().unwrap();
+}
+
+#[tokio::test]
+async fn rapid_edit_limit_reports_a_stable_retryable_error() {
+    let h = History::new(0).await;
+    h.app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            LocalMessageRequest {
+                content: "original".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            42,
+        )
+        .unwrap();
+    let edit_time = crate::unix_now_seconds();
+    for revision in 0..32 {
+        let result = h.app.admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            format!("edit-{revision}"),
+            LocalMessageRequest {
+                content: format!("revision {revision}"),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            edit_time,
+        );
+        if revision < 31 {
+            result.unwrap();
+        } else {
+            assert!(
+                matches!(result, Err(AppError::InvalidAppMessagePayload(detail))
+                if detail == "pending edit rate limit: retry shortly")
+            );
+        }
+    }
+    h.app.close_storage().unwrap();
+}
+
+#[tokio::test]
+async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_send() {
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let (original, _) = h
+        .app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            LocalMessageRequest {
+                content: "before revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            42,
+        )
+        .unwrap();
+    let (edit, _) = h
+        .app
+        .admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            "edit-token".into(),
+            LocalMessageRequest {
+                content: "after revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            crate::unix_now_seconds(),
+        )
+        .unwrap();
+    h.app
+        .admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            "latest-edit-token".into(),
+            LocalMessageRequest {
+                content: "latest revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            crate::unix_now_seconds(),
+        )
+        .unwrap();
+    let storage = h.app.account_storage("alice").unwrap();
+    let retained = storage
+        .local_submission(&group_hex, "edit-token")
+        .unwrap()
+        .unwrap();
+    let (event, _) = crate::local_submissions::retained_event(&retained).unwrap();
+    let latest_retained = storage
+        .local_submission(&group_hex, "latest-edit-token")
+        .unwrap()
+        .unwrap();
+    let (latest_event, _) = crate::local_submissions::retained_event(&latest_retained).unwrap();
+    assert_eq!(event.kind, 1009);
+    assert_eq!(event.content, "after revision");
+    assert!(latest_event.created_at > event.created_at);
+    assert!(event.tags.iter().any(|tag| {
+        tag.first().is_some_and(|value| value == "e")
+            && tag.get(1) == Some(&original.message_id_hex)
+    }));
+    assert!(
+        !event
+            .tags
+            .iter()
+            .flatten()
+            .any(|value| value == "original-token")
+    );
+    h.app.close_storage().unwrap();
+
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    let replay = runtime
+        .submit_edit_for_local_send(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            "after revision".into(),
+            "edit-token".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, edit);
+    let changed = runtime
+        .submit_edit_for_local_send(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            "a different revision".into(),
+            "edit-token".into(),
+        )
+        .await;
+    assert!(
+        changed.is_err(),
+        "one edit token must never retarget another revision"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                runtime
+                    .local_send_status("alice", &h.group, "edit-token")
+                    .unwrap(),
+                Some(crate::LocalSendStatus::Completed(_))
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        runtime
+            .local_send_status("alice", &h.group, "original-token")
+            .unwrap(),
+        Some(crate::LocalSendStatus::Completed(_))
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                runtime
+                    .local_send_status("alice", &h.group, "latest-edit-token")
+                    .unwrap(),
+                Some(crate::LocalSendStatus::Completed(_))
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let row = reopened
+        .account_storage("alice")
+        .unwrap()
+        .timeline_message(&group_hex, &original.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.plaintext, "latest revision");
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_original_cannot_publish_a_retained_pending_edit() {
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    h.app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            LocalMessageRequest {
+                content: "not accepted".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            42,
+        )
+        .unwrap();
+    h.app
+        .admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            "edit-token".into(),
+            LocalMessageRequest {
+                content: "must not publish".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            crate::unix_now_seconds(),
+        )
+        .unwrap();
+    h.app
+        .account_storage("alice")
+        .unwrap()
+        .finish_local_submission(&group_hex, "original-token", None)
+        .unwrap();
+    h.app.close_storage().unwrap();
+
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    runtime
+        .submit_edit_for_local_send(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            "must not publish".into(),
+            "edit-token".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                runtime
+                    .local_send_status("alice", &h.group, "edit-token")
+                    .unwrap(),
+                Some(crate::LocalSendStatus::Rejected)
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        reopened
+            .account_storage("alice")
+            .unwrap()
+            .next_local_submission()
+            .unwrap()
+            .is_none()
+    );
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test]
