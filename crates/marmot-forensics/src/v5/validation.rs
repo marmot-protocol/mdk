@@ -22,8 +22,15 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                 "app update failure stage and reason must be paired",
             )?;
         }
-        Event::RuntimePublicationOutcome(_) => {
+        Event::RuntimePublicationOutcome(e) => {
             require(!has_group, "runtime publication must be account-scoped")?;
+            require(
+                e.accepted_by_broadcast
+                    .get()
+                    .checked_add(e.no_subscribers.get())
+                    == Some(e.attempted.get()),
+                "broadcast attempt counts must partition actual sends",
+            )?;
         }
         Event::RecordingSessionStarted(e) => {
             require(!has_group, "recording lifecycle must be account-scoped")?;

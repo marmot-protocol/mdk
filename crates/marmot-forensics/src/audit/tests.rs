@@ -2478,3 +2478,160 @@ fn v5_operational_wire_rejects_legacy_aliases_and_preserves_reference_domains() 
         assert!(v5::Record::from_json(&serde_json::to_vec(&mutated).unwrap()).is_err());
     }
 }
+
+fn v5_test_producer() -> crate::v5::Producer {
+    crate::v5::Producer {
+        mdk_revision: None,
+        build_profile: crate::v5::BuildProfile::Debug,
+        platform: crate::v5::Platform::Other,
+        host_build: None,
+    }
+}
+
+fn v5_rows(path: &Path) -> Vec<serde_json::Value> {
+    let schema: serde_json::Value = serde_json::from_str(crate::v5::JSON_SCHEMA).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(validator.is_valid(&value));
+            crate::v5::Record::from_json(line.as_bytes()).unwrap();
+            value
+        })
+        .collect()
+}
+
+#[test]
+fn v5_recording_start_explicit_stop_and_reopen_do_not_infer_drop() {
+    use crate::v5::RecordingStopReason;
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    let rows = v5_rows(&path);
+    assert_eq!(rows[0]["event"]["type"], "recording_session_started");
+    assert_eq!(rows[0]["event"]["mode"], "opt_in_local_jsonl");
+    let first_session = rows[0]["session_id"].clone();
+    recorder.finish_v5_recording(RecordingStopReason::CleanRuntimeShutdown);
+    recorder.finish_v5_recording(RecordingStopReason::CleanRuntimeShutdown);
+    assert_eq!(
+        v5_rows(&path)
+            .iter()
+            .filter(|row| row["event"]["type"] == "recording_session_stopped")
+            .count(),
+        1
+    );
+    drop(recorder);
+
+    let reopened =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    let rows = v5_rows(&path);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event"]["type"] == "recording_session_started")
+            .count(),
+        2
+    );
+    assert_ne!(rows.last().unwrap()["session_id"], first_session);
+    let reopened_session = rows.last().unwrap()["session_id"].clone();
+    reopened.rotate().unwrap();
+    let rotated = v5_rows(&path);
+    assert_eq!(rotated[0]["event"]["type"], "recording_session_started");
+    assert_ne!(rotated[0]["session_id"], reopened_session);
+    let count_before_drop = rotated.len();
+    drop(reopened);
+    assert_eq!(v5_rows(&path).len(), count_before_drop);
+}
+
+#[test]
+fn v5_partial_write_preserves_prepared_delivery_bytes_and_reports_observed_loss() {
+    use crate::local_delivery::{LocalAuditDelivery, Preparation};
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    let mut delivery =
+        LocalAuditDelivery::open(&path, dir.path().join("delivery"), "local-v5").unwrap();
+    let Preparation::Batch(prepared) = delivery.prepare_once().unwrap() else {
+        panic!("opening rows must be deliverable");
+    };
+    let prepared_bytes = prepared
+        .bodies
+        .iter()
+        .flat_map(|body| body.iter().copied())
+        .collect::<Vec<_>>();
+    recorder.fail_next_write_after_partial_bytes();
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+
+    let segments = segment_paths(&path);
+    assert_eq!(segments.len(), 1);
+    let sealed = fs::read(&segments[0]).unwrap();
+    assert!(sealed.starts_with(&prepared_bytes));
+    assert!(sealed.len() > prepared_bytes.len());
+    assert_ne!(sealed.last(), Some(&b'\n'));
+    let Preparation::Batch(replayed) = delivery.prepare_once().unwrap() else {
+        panic!("prepared original range must replay after inode rename");
+    };
+    assert_eq!(replayed.token, prepared.token);
+    assert_eq!(replayed.bodies, prepared.bodies);
+    assert_eq!(
+        delivery
+            .finish(
+                &prepared.token,
+                crate::local_delivery::ReceiverResult::Complete,
+            )
+            .unwrap(),
+        crate::local_delivery::DeliveryStep::Accepted
+    );
+    assert_eq!(
+        delivery.prepare_once().unwrap(),
+        Preparation::Step(crate::local_delivery::DeliveryStep::Gap)
+    );
+    assert!(
+        delivery
+            .gaps()
+            .iter()
+            .any(|gap| gap.reason == crate::local_delivery::GapReason::TornTail)
+    );
+    let rows = v5_rows(&path);
+    let loss = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "recording_capture_loss")
+        .expect("later safe writer reports the observed failed attempt");
+    assert_eq!(loss["event"]["write_failed_attempts"], "1");
+    assert_eq!(loss["event"]["extent"], "unknown");
+    assert_eq!(recorder.health_snapshot().write_failures, 1);
+}
+
+#[test]
+fn v5_loss_report_retries_in_memory_without_counting_its_own_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    recorder.fail_next_write();
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    recorder.fail_next_v5_write();
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert!(
+        !v5_rows(&path)
+            .iter()
+            .any(|row| row["event"]["type"] == "recording_capture_loss")
+    );
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    let rows = v5_rows(&path);
+    let losses = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "recording_capture_loss")
+        .collect::<Vec<_>>();
+    assert_eq!(losses.len(), 1);
+    assert_eq!(losses[0]["event"]["write_failed_attempts"], "1");
+    assert_eq!(recorder.health_snapshot().write_failures, 2);
+}

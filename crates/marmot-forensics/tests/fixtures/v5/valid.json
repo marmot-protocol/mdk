@@ -1158,7 +1158,7 @@
       "group_ref": null,
       "event": {
         "type": "recording_session_stopped",
-        "reason": "recording_disabled"
+        "reason": "clean_runtime_shutdown"
       }
     }
   },

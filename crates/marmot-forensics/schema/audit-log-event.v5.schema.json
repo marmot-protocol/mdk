@@ -2326,7 +2326,7 @@
       "required": ["type", "reason"],
       "properties": {
         "type": { "const": "recording_session_stopped" },
-        "reason": { "enum": ["recording_disabled", "clean_runtime_shutdown"] }
+        "reason": { "const": "clean_runtime_shutdown" }
       }
     },
     "RecordingCaptureLoss": {
@@ -2362,7 +2362,7 @@
         "failure_stage": { "anyOf": [{ "enum": ["projection", "transaction", "unknown"] }, { "type": "null" }] },
         "failure_reason": { "anyOf": [{ "enum": ["storage", "projection", "unavailable", "unknown"] }, { "type": "null" }] },
         "elapsed_ms": { "$ref": "#/$defs/U64String" },
-        "affected_group_count": { "$ref": "#/$defs/U64String" }
+        "affected_group_count": { "anyOf": [{ "$ref": "#/$defs/U64String" }, { "type": "null" }] }
       },
       "allOf": [
         { "if": { "properties": { "failure_stage": { "type": "null" } } }, "then": { "properties": { "failure_reason": { "type": "null" } } } },

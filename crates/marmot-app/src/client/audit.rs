@@ -457,11 +457,6 @@ impl AppClient {
     /// recorder when off. Dropping the prior recorder flushes and closes any
     /// file it held, so no session reopen is required.
     pub(crate) fn set_audit_recording(&mut self, enabled: bool) {
-        if !enabled {
-            self.runtime.session().finish_audit_v5_recording(
-                marmot_forensics::v5::RecordingStopReason::RecordingDisabled,
-            );
-        }
         let recorder = self.app.build_audit_recorder(&self.state.label, enabled);
         self.runtime.session_mut().set_audit_recorder(recorder);
         if enabled {

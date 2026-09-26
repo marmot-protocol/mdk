@@ -677,3 +677,50 @@ fn publication_endpoint_classifications_match_nostr_owner_contract() {
         }
     }
 }
+
+#[test]
+fn lifecycle_and_app_outcome_shapes_reject_false_scope_and_counts() {
+    let schema = validator();
+    let mut unknown_partial_count = fixture("app_update_outcome");
+    unknown_partial_count["event"]["compute"] = json!("failed");
+    unknown_partial_count["event"]["transaction"] = json!("unknown");
+    unknown_partial_count["event"]["failure_stage"] = json!("projection");
+    unknown_partial_count["event"]["failure_reason"] = json!("projection");
+    unknown_partial_count["event"]["affected_group_count"] = Value::Null;
+    assert!(schema.is_valid(&unknown_partial_count));
+    assert!(decode(&unknown_partial_count).is_ok());
+    let mut cases = Vec::new();
+    let mut group_scoped_start = fixture("recording_started");
+    group_scoped_start["group_ref"] =
+        json!("1e50a718a6a13c6bac32359e1bdadfacb0a3e41845081b0dfdeb197bfb648b10");
+    cases.push(group_scoped_start);
+    let mut missing_limitation = fixture("recording_started");
+    missing_limitation["event"]["limitations"] = json!(["best_effort_local_writes"]);
+    cases.push(missing_limitation);
+    let mut zero_loss = fixture("capture_loss");
+    zero_loss["event"]["write_failed_attempts"] = json!("0");
+    cases.push(zero_loss);
+    let mut app_failure_pair = fixture("app_update_outcome");
+    app_failure_pair["event"]["failure_stage"] = json!("projection");
+    cases.push(app_failure_pair);
+    let mut invented_broadcast = fixture("runtime_publication_outcome");
+    invented_broadcast["event"]["accepted_by_broadcast"] = json!("2");
+    cases.push(invented_broadcast);
+    let mut group_scoped_publication = fixture("runtime_publication_outcome");
+    group_scoped_publication["group_ref"] =
+        json!("1e50a718a6a13c6bac32359e1bdadfacb0a3e41845081b0dfdeb197bfb648b10");
+    cases.push(group_scoped_publication);
+    let mut raw_identifier = fixture("app_update_outcome");
+    raw_identifier["event"]["message_ref"] = json!("wss://private.example");
+    cases.push(raw_identifier);
+    for body in cases {
+        assert!(decode(&body).is_err(), "Rust accepted invalid {body}");
+        // JSON Schema cannot express addition of independent decimal-string
+        // counts; the Rust and receiver semantic parsers enforce that case.
+        if body["event"]["type"] != "runtime_publication_outcome"
+            || body["event"]["accepted_by_broadcast"] != "2"
+        {
+            assert!(!schema.is_valid(&body), "schema accepted invalid {body}");
+        }
+    }
+}

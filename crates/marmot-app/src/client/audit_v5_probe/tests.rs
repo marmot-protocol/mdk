@@ -1198,6 +1198,15 @@ async fn engine_join_survives_app_checkpoint_failure_without_false_success() {
         assert_eq!(failed.checkpoint, Checkpoint::FailedBeforeCommit);
         assert_eq!(failed.invite_state, InviteState::Unknown);
         assert!(failed.reason.is_some());
+        assert!(actual_v5_rows(&scenario.bob_app, "bob").iter().any(|row| {
+            matches!(
+                &row.fields().event,
+                Event::AppUpdateOutcome(outcome)
+                    if outcome.transaction == marmot_forensics::v5::AppUpdateTransaction::NotCommitted
+                        && outcome.failure_stage
+                            == Some(marmot_forensics::v5::AppUpdateFailureStage::Transaction)
+            )
+        }));
         let first_update = failed.update_id.clone();
         let outer = failed.outer_event_ref.clone();
 

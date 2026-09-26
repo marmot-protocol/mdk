@@ -303,7 +303,6 @@ pub enum RecordingLimitation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingStopReason {
-    RecordingDisabled,
     CleanRuntimeShutdown,
 }
 
@@ -611,7 +610,8 @@ pub struct AppUpdateOutcome {
     #[serde(deserialize_with = "nullable")]
     pub failure_reason: Option<AppUpdateFailureReason>,
     pub elapsed_ms: U64String,
-    pub affected_group_count: U64String,
+    #[serde(deserialize_with = "nullable")]
+    pub affected_group_count: Option<U64String>,
 }
 
 /// Broadcast submission in this process, never a host receipt/display claim.
