@@ -295,6 +295,35 @@ typedef enum MarmotOnboardingAction {
   MARMOT_ONBOARDING_ACTION_CANCEL_ONBOARDING,
 } MarmotOnboardingAction;
 
+typedef enum MarmotOnboardingRelayRepairMode {
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_MANUAL_REVIEW,
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_REMOVAL_ONLY,
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_ADDITIVE,
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_REMOVAL_AND_ADDITIVE,
+} MarmotOnboardingRelayRepairMode;
+
+typedef enum MarmotOnboardingRelayTagRole {
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_OTHER,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_UNMARKED,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_READ,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_WRITE,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_INBOX,
+} MarmotOnboardingRelayTagRole;
+
+typedef enum MarmotOnboardingRelayTagDisposition {
+  MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_RETAINED,
+  MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_REMOVED,
+  MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_ADDED,
+} MarmotOnboardingRelayTagDisposition;
+
+typedef enum MarmotOnboardingRelayCapability {
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_NONE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ_AND_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_INBOX,
+} MarmotOnboardingRelayCapability;
+
 typedef enum MarmotOnboardingDeviceDiscovery {
   MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND,
   MARMOT_ONBOARDING_DEVICE_DISCOVERY_OTHER_INSTALLATION_POSSIBLE,
@@ -1633,6 +1662,45 @@ typedef struct MarmotStringList {
   uintptr_t len;
 } MarmotStringList;
 
+typedef struct MarmotOnboardingRelayTag {
+  char **fields;
+  uintptr_t fields_len;
+  char *endpoint;
+  enum MarmotOnboardingRelayTagRole role;
+} MarmotOnboardingRelayTag;
+
+typedef struct MarmotOnboardingRelayTagChange {
+  enum MarmotOnboardingRelayTagDisposition disposition;
+  bool has_before_index;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t before_index;
+  bool has_after_index;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t after_index;
+  char **fields;
+  uintptr_t fields_len;
+  char *endpoint;
+  enum MarmotOnboardingRelayTagRole role;
+  enum MarmotOnboardingRelayCapability restores;
+} MarmotOnboardingRelayTagChange;
+
+typedef struct MarmotOnboardingRelayRepair {
+  enum MarmotOnboardingRelayRepairMode mode;
+  char *original_event_id;
+  char *original_content;
+  char *proposed_content;
+  struct MarmotOnboardingRelayTag *before_tags;
+  uintptr_t before_tags_len;
+  struct MarmotOnboardingRelayTag *after_tags;
+  uintptr_t after_tags_len;
+  struct MarmotOnboardingRelayTagChange *changes;
+  uintptr_t changes_len;
+} MarmotOnboardingRelayRepair;
+
 typedef struct MarmotOnboardingRepairProposal {
   enum MarmotOnboardingStep step;
   uint64_t revision;
@@ -1643,6 +1711,7 @@ typedef struct MarmotOnboardingRepairProposal {
   uintptr_t write_relays_len;
   struct MarmotUserProfileMetadata *profile;
   struct MarmotStringList *follows;
+  struct MarmotOnboardingRelayRepair *relay_repair;
 } MarmotOnboardingRepairProposal;
 
 typedef struct MarmotOnboardingDevicePackage {
@@ -8622,6 +8691,20 @@ MarmotStatus marmot_propose_onboarding_relays(const struct MarmotClient *client,
                                               const char *const *write_relays,
                                               uintptr_t write_relays_len,
                                               struct MarmotOnboardingSnapshot **out);
+
+/**
+ * Preview an exact minimal relay repair without signing or publishing. Manual-review
+ * previews cannot be approved. `step` is a MarmotOnboardingStep discriminant;
+ * out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+ * Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ *
+ * # Safety
+ * The client must be live, input pointers valid and borrowed, and out writable.
+ */
+MarmotStatus marmot_propose_onboarding_relay_repair(const struct MarmotClient *client,
+                                                    const char *account_ref,
+                                                    uint32_t step,
+                                                    struct MarmotOnboardingSnapshot **out);
 
 /**
  * Prepare profile edits without publishing; NULL fields preserve existing values and empty strings clear them. Free the returned snapshot with `marmot_onboarding_snapshot_free`.

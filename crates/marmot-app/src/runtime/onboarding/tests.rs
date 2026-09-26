@@ -573,6 +573,635 @@ fn signed(
         .unwrap();
     NostrTransportEvent::from_nostr_event(&event).unwrap()
 }
+
+#[tokio::test]
+async fn minimal_relay_repair_preserves_exact_custom_tags_and_removes_only_policy_rejected() {
+    let (_dir, runtime, _network, keys, _id) = fixture().await;
+    let before = vec![
+        vec!["client".into(), "keep".into()],
+        vec!["r".into(), "wss://read.example".into(), "read".into()],
+        vec!["r".into(), "wss://read.example".into(), "read".into()],
+        vec!["r".into(), "wss://write.example".into(), "write".into()],
+        vec!["r".into(), "wss://relay.damus.io".into()],
+        vec!["x".into(), "opaque".into()],
+    ];
+    let event = signed(
+        &keys,
+        10002,
+        before.clone(),
+        "opaque content",
+        unix_now_seconds() - 1,
+    );
+    let (repair, read, write) = runtime.accounts().minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&event),
+        &["wss://default.example".into()],
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalOnly);
+    assert_eq!(repair.original_event_id.as_deref(), Some(event.id.as_str()));
+    assert_eq!(repair.original_content, "opaque content");
+    assert_eq!(repair.proposed_content, "opaque content");
+    assert_eq!(
+        repair
+            .before_tags
+            .iter()
+            .map(|tag| tag.fields.clone())
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert_eq!(repair.after_tags.len(), before.len() - 1);
+    assert_eq!(repair.after_tags[0].fields, before[0]);
+    assert_eq!(repair.after_tags[1].fields, before[1]);
+    assert_eq!(repair.after_tags[2].fields, before[2]);
+    assert_eq!(repair.after_tags[3].fields, before[3]);
+    assert_eq!(repair.after_tags[4].fields, before[5]);
+    assert_eq!(
+        repair.changes[4].disposition,
+        OnboardingRelayTagDisposition::Removed
+    );
+    assert_eq!(repair.changes[4].before_index, Some(4));
+    assert_eq!(repair.changes[4].after_index, None);
+    assert_eq!(read, vec!["wss://read.example"]);
+    assert_eq!(write, vec!["wss://write.example"]);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn minimal_relay_repair_retains_unsafe_routes_while_removing_retired_route() {
+    let (_dir, runtime, _network, keys, _id) = fixture().await;
+    let tags = vec![
+        vec!["r".into(), "wss://hidden.onion".into(), "read".into()],
+        vec!["r".into(), "ws://192.168.1.10".into(), "write".into()],
+        vec!["r".into(), "wss://relay.damus.io".into()],
+    ];
+    let event = signed(&keys, 10002, tags.clone(), "opaque", unix_now_seconds() - 1);
+    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&event),
+        &["wss://public.example".into()],
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalAndAdditive);
+    assert_eq!(repair.after_tags[0].fields, tags[0]);
+    assert_eq!(repair.after_tags[1].fields, tags[1]);
+    assert_eq!(
+        repair.changes[0].disposition,
+        OnboardingRelayTagDisposition::Retained
+    );
+    assert_eq!(
+        repair.changes[1].disposition,
+        OnboardingRelayTagDisposition::Retained
+    );
+    assert_eq!(
+        repair.changes[2].disposition,
+        OnboardingRelayTagDisposition::Removed
+    );
+    assert_eq!(
+        repair.after_tags[2].fields,
+        vec!["r", "wss://public.example"]
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn minimal_relay_repair_matches_default_by_normalized_relay_key() {
+    let (_dir, runtime, _network, keys, _id) = fixture().await;
+    let event = signed(
+        &keys,
+        10002,
+        vec![vec![
+            "r".into(),
+            "wss://custom.example/".into(),
+            "read".into(),
+        ]],
+        "",
+        unix_now_seconds() - 1,
+    );
+    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&event),
+        &["wss://other.example".into(), "wss://custom.example".into()],
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::Additive);
+    assert_eq!(
+        repair.after_tags[1].fields,
+        vec!["r", "wss://custom.example/", "write"]
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn minimal_relay_repair_adds_only_missing_role_and_preserves_unmarked_duplicates() {
+    let (_dir, runtime, _network, keys, _id) = fixture().await;
+    let read_only = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://custom.example".into(), "read".into()],
+            vec!["client".into(), "v1".into()],
+        ],
+        "",
+        unix_now_seconds() - 1,
+    );
+    let (repair, read, write) = runtime.accounts().minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&read_only),
+        &["wss://custom.example".into()],
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::Additive);
+    assert_eq!(repair.after_tags[0].fields, read_only.tags[0]);
+    assert_eq!(repair.after_tags[1].fields, read_only.tags[1]);
+    assert_eq!(
+        repair.after_tags[2].fields,
+        vec!["r", "wss://custom.example", "write"]
+    );
+    assert_eq!(repair.changes[2].restores, OnboardingRelayCapability::Write);
+    assert_eq!(read, vec!["wss://custom.example"]);
+    assert_eq!(write, vec!["wss://custom.example"]);
+    let unmarked = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://custom.example".into()],
+            vec!["r".into(), "wss://custom.example".into()],
+        ],
+        "preserve",
+        unix_now_seconds() - 1,
+    );
+    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&unmarked),
+        &["wss://default.example".into()],
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::ManualReview);
+    assert_eq!(repair.before_tags, repair.after_tags);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    let malformed = signed(
+        &keys,
+        10002,
+        vec![vec![
+            "r".into(),
+            "wss://custom.example".into(),
+            "unsupported".into(),
+        ]],
+        "opaque",
+        unix_now_seconds() - 1,
+    );
+    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&malformed),
+        &["wss://default.example".into()],
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::ManualReview);
+    assert_eq!(repair.before_tags, repair.after_tags);
+    assert!(
+        repair
+            .changes
+            .iter()
+            .all(|change| change.disposition == OnboardingRelayTagDisposition::Retained)
+    );
+    let mut checkpoint = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(malformed);
+    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+    let snapshot = runtime
+        .accounts()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .proposal
+            .as_ref()
+            .unwrap()
+            .relay_repair
+            .as_ref()
+            .unwrap()
+            .mode,
+        OnboardingRelayRepairMode::ManualReview
+    );
+    assert!(
+        !snapshot.steps[OnboardingStep::Relays.index()]
+            .actions
+            .contains(&OnboardingAction::ApproveRepair)
+    );
+    assert!(
+        runtime
+            .accounts()
+            .approve_onboarding_repair(&id, snapshot.revision)
+            .await
+            .is_err()
+    );
+    assert!(
+        !runtime
+            .accounts()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap()
+            .approved
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn inspection_failures_never_select_allowed_endpoints_for_removal() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://custom.example".into()]],
+        "",
+        unix_now_seconds() - 1,
+    );
+    let mut checkpoint = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.set(
+        OnboardingStep::Relays,
+        OnboardingStatus::NeedsInput,
+        vec![
+            finding(OnboardingIssue::TimedOut),
+            finding(OnboardingIssue::AuthenticationRequired),
+            finding(OnboardingIssue::PaymentRequired),
+            finding(OnboardingIssue::AccessRestricted),
+            finding(OnboardingIssue::Unreachable),
+        ],
+    );
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(source.clone());
+    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+    let snapshot = runtime
+        .accounts()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let repair = snapshot.proposal.unwrap().relay_repair.unwrap();
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::ManualReview);
+    assert_eq!(repair.before_tags, repair.after_tags);
+    assert_eq!(repair.after_tags[0].fields, source.tags[0]);
+    assert!(
+        repair
+            .changes
+            .iter()
+            .all(|change| change.disposition != OnboardingRelayTagDisposition::Removed)
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://custom.example".into()],
+            vec!["r".into(), "wss://relay.damus.io".into()],
+        ],
+        "",
+        unix_now_seconds() - 1,
+    );
+    let mut checkpoint = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.set(
+        OnboardingStep::Relays,
+        OnboardingStatus::NeedsInput,
+        vec![
+            finding(OnboardingIssue::TimedOut),
+            finding(OnboardingIssue::NoUsableRoute),
+        ],
+    );
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(source.clone());
+    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+
+    let snapshot = runtime
+        .accounts()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let revision = snapshot.revision;
+    let repair = snapshot.proposal.unwrap().relay_repair.unwrap();
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::ManualReview);
+    assert_eq!(repair.before_tags, repair.after_tags);
+    assert_eq!(repair.after_tags[0].fields, source.tags[0]);
+    assert_eq!(repair.after_tags[1].fields, source.tags[1]);
+    assert_eq!(
+        snapshot.steps[OnboardingStep::Relays.index()].actions,
+        vec![
+            OnboardingAction::EditRelays,
+            OnboardingAction::CancelRepair,
+            OnboardingAction::CancelOnboarding,
+        ]
+    );
+    assert!(
+        runtime
+            .accounts()
+            .approve_onboarding_repair(&id, revision)
+            .await
+            .is_err()
+    );
+    // A removal-only preview saved by an older build must not bypass the
+    // no-usable-route gate when the account resumes on this build.
+    let (old_repair, read_relays, write_relays) = runtime.accounts().minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&source),
+        &checkpoint.options.default_relays,
+    );
+    assert_eq!(old_repair.mode, OnboardingRelayRepairMode::RemovalOnly);
+    let mut stale = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    let proposal = stale.snapshot.proposal.as_mut().unwrap();
+    proposal.relay_repair = Some(old_repair);
+    proposal.read_relays = read_relays;
+    proposal.write_relays = write_relays;
+    proposal.revision = stale.snapshot.revision + 1;
+    runtime.accounts().save_onboarding(&mut stale).unwrap();
+    assert!(
+        runtime
+            .accounts()
+            .approve_onboarding_repair(&id, stale.snapshot.revision)
+            .await
+            .is_err()
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn typed_relay_repair_checkpoint_fences_pre_preview_readers() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://relay.damus.io".into()]],
+        "",
+        unix_now_seconds() - 1,
+    ));
+    checkpoint.set(
+        OnboardingStep::Relays,
+        OnboardingStatus::NeedsInput,
+        Vec::new(),
+    );
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let bytes = manager
+        .app
+        .account_home()
+        .account_onboarding(&id)
+        .unwrap()
+        .unwrap();
+    let saved: OnboardingCheckpoint = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(saved.version, 6);
+    assert!(saved.snapshot.proposal.unwrap().relay_repair.is_some());
+    assert_eq!(
+        decode_onboarding_checkpoint(&bytes, &id).unwrap().version,
+        6
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[test]
+fn older_repair_proposal_without_typed_preview_remains_readable() {
+    let proposal = OnboardingRepairProposal {
+        step: OnboardingStep::Relays,
+        revision: 4,
+        previous_event_id: None,
+        read_relays: vec!["wss://example.com".into()],
+        write_relays: vec!["wss://example.com".into()],
+        profile: None,
+        follows: None,
+        relay_repair: None,
+    };
+    let mut serialized = serde_json::to_value(&proposal).unwrap();
+    serialized.as_object_mut().unwrap().remove("relay_repair");
+    let restored: OnboardingRepairProposal = serde_json::from_value(serialized).unwrap();
+    assert_eq!(restored, proposal);
+}
+
+#[tokio::test]
+async fn minimal_relay_repair_restart_preserves_preview_and_retries_exact_signed_event() {
+    let (directory, first, network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["client".into(), "keep".into()],
+            vec!["r".into(), "wss://custom.example".into()],
+            vec!["r".into(), "wss://relay.damus.io".into()],
+        ],
+        "opaque content",
+        unix_now_seconds() - 1,
+    );
+    *network.events.lock().unwrap() = vec![source.clone()];
+    let mut checkpoint = first
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(source.clone());
+    first.accounts().save_onboarding(&mut checkpoint).unwrap();
+    let preview = first
+        .accounts()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let repair = preview
+        .proposal
+        .as_ref()
+        .unwrap()
+        .relay_repair
+        .as_ref()
+        .unwrap();
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalOnly);
+    assert!(network.attempts.lock().unwrap().is_empty());
+    first.shutdown_and_close().await.unwrap();
+
+    let second = runtime(directory.path(), network.clone());
+    let restored = second.accounts().onboarding_snapshot(&id).unwrap().unwrap();
+    assert_eq!(restored.proposal, preview.proposal);
+    assert!(
+        second
+            .accounts()
+            .approve_onboarding_repair(&id, preview.revision - 1)
+            .await
+            .is_err()
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    network.zero_acks.store(true, Ordering::SeqCst);
+    second
+        .accounts()
+        .approve_onboarding_repair(&id, preview.revision)
+        .await
+        .unwrap();
+    let published = network.attempts.lock().unwrap()[0].clone();
+    assert_eq!(published.content, source.content);
+    assert_eq!(
+        published.tags,
+        vec![source.tags[0].clone(), source.tags[1].clone()]
+    );
+    second.shutdown_and_close().await.unwrap();
+
+    let third = runtime(directory.path(), network.clone());
+    third
+        .accounts()
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    {
+        let attempts = network.attempts.lock().unwrap();
+        assert!(attempts.len() >= 2 && attempts.iter().all(|event| event == &published));
+    }
+    third.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn minimal_relay_repair_rejects_modified_preview_without_publication() {
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://custom.example".into()],
+            vec!["r".into(), "wss://relay.damus.io".into()],
+        ],
+        "opaque content",
+        unix_now_seconds() - 1,
+    );
+    *network.events.lock().unwrap() = vec![source.clone()];
+    let mut checkpoint = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(source);
+    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+    let preview = runtime
+        .accounts()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let original = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+
+    for variant in 0..3 {
+        let mut changed = original.clone();
+        let proposal = changed.snapshot.proposal.as_mut().unwrap();
+        match variant {
+            0 => proposal
+                .relay_repair
+                .as_mut()
+                .unwrap()
+                .proposed_content
+                .push_str(" modified"),
+            1 => proposal.relay_repair.as_mut().unwrap().after_tags[0].fields[1]
+                .push_str(".attacker"),
+            _ => proposal.read_relays.push("wss://attacker.example".into()),
+        }
+        runtime
+            .accounts()
+            .app
+            .account_home()
+            .set_account_onboarding(&id, &serde_json::to_vec(&changed).unwrap())
+            .unwrap();
+        assert!(
+            runtime
+                .accounts()
+                .approve_onboarding_repair(&id, preview.revision)
+                .await
+                .is_err()
+        );
+        assert!(network.attempts.lock().unwrap().is_empty());
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn minimal_relay_repair_rejects_changed_source_without_publication() {
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://relay.damus.io".into()]],
+        "",
+        unix_now_seconds() - 2,
+    );
+    let newer = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://other.example".into()]],
+        "",
+        unix_now_seconds() - 1,
+    );
+    *network.events.lock().unwrap() = vec![source.clone()];
+    let mut checkpoint = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.set(
+        OnboardingStep::InboxRelays,
+        OnboardingStatus::NeedsInput,
+        vec![],
+    );
+    checkpoint.records[OnboardingStep::InboxRelays.index()] = Some(source);
+    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+    let preview = runtime
+        .accounts()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview
+            .proposal
+            .as_ref()
+            .unwrap()
+            .relay_repair
+            .as_ref()
+            .unwrap()
+            .mode,
+        OnboardingRelayRepairMode::RemovalAndAdditive
+    );
+    *network.events.lock().unwrap() = vec![newer];
+    let result = runtime
+        .accounts()
+        .approve_onboarding_repair(&id, preview.revision)
+        .await
+        .unwrap();
+    assert!(result.proposal.is_none());
+    assert!(
+        result.steps[OnboardingStep::InboxRelays.index()]
+            .findings
+            .iter()
+            .any(|finding| finding.issue == OnboardingIssue::RecordChanged)
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
 async fn missing_relays(runtime: &MarmotAppRuntime, id: &str) {
     let manager = runtime.accounts();
     manager.run_onboarding(id).await.unwrap();
@@ -1267,6 +1896,7 @@ async fn optional_repairs_preserve_unknown_profile_fields_and_follow_tag_metadat
             ..Default::default()
         }),
         follows: None,
+        relay_repair: None,
     };
     let (tags, content, _) = relay_repair_event(&c, &proposal);
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -1424,6 +2054,7 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
             ..Default::default()
         }),
         follows: None,
+        relay_repair: None,
     };
     let (_, content, _) = relay_repair_event(&c, &proposal);
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();

@@ -603,7 +603,13 @@ Imported identities can use the durable preflight API instead of `login`:
 3. Localize the typed status, findings, and actions. A healthy account advances
    automatically until the single-device acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
    explicit `continue_onboarding_without`. Empty follow lists are valid.
-4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
+4. `propose_onboarding_relay_repair` previews the smallest safe change to a
+   general or inbox relay declaration, preserving the original ordered tags,
+   duplicate/custom entries, direction markers, and content. Show its typed
+   before/after diff and repair mode. `ManualReview` cannot be approved; prefill
+   a manual editor from the original tags or offer a separately labeled reset.
+   No proposal signs or publishes until explicit approval. The older
+   `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
    a proposal. Recommended relays append missing defaults to the observed list,
    preserving every original relay tag, including private-network, `ws://` and `wss://` onion,
@@ -668,7 +674,10 @@ version 3 reader cannot validate epoch-scoped approvals. Completed recovery
 leaves a version 4 cancellation tombstone even before a new begin, so older
 readers fail closed. Preparing an additive relay proposal upgrades its checkpoint
 to version 5, with or without a recovery epoch. This prevents older readers from
-resuming an approved, unsigned proposal as a destructive replacement.
+resuming an approved, unsigned proposal as a destructive replacement. Preparing
+an exact lossless relay repair upgrades the checkpoint to version 6, preserving
+that version through approval, signing and completion. Version 3/4/5 readers
+reject it rather than discard the typed preview and publish replacement tags.
 Downgrading once either format is used is unsupported; use a build that supports
 the checkpoint version. Do not relabel versions or delete checkpoints to
 force a downgrade. Restore/upgrade to a supporting build, or explicitly recover

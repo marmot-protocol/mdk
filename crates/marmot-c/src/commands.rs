@@ -2741,6 +2741,37 @@ pub unsafe extern "C" fn marmot_propose_onboarding_relays(
         }
     })
 }
+/// Preview an exact minimal relay repair without signing or publishing. Manual-review
+/// previews cannot be approved. `step` is a MarmotOnboardingStep discriminant;
+/// out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_propose_onboarding_relay_repair(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    step: u32,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let step = try_arg!(MarmotOnboardingStep::from_c(step)).to_ffi();
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .propose_onboarding_relay_repair(account_ref, step),
+                ),
+                out,
+            )
+        }
+    })
+}
 /// Prepare profile edits without publishing; NULL fields preserve existing values and empty strings clear them. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety

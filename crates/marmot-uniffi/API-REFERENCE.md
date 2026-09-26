@@ -2470,6 +2470,18 @@ Preserve opaque evidence, sign out, and retire the old attempt. Hosts invalidate
 
 [Source](src/commands/onboarding.rs#L41)
 
+### `Marmot::propose_onboarding_relay_repair`
+
+**Current.**
+
+```rust
+pub async fn propose_onboarding_relay_repair( &self, account_ref: String, step: OnboardingStepFfi, ) -> Result<OnboardingSnapshotFfi, MarmotKitError>
+```
+
+Preview an exact, minimal general or inbox relay-list repair. The returned `proposal.relay_repair` carries the source event ID, ordered before/after tags, unchanged content, typed occurrence diff, and repair mode. This method only persists a revision-bound proposal; it never signs or publishes. Show the diff and use `approve_onboarding_repair` (or its epoch-aware variant) only when `ApproveRepair` is offered. `ManualReview` deliberately has no approval action; prefill an editor from `before_tags` or offer a separately labeled full reset. Preserve the account, attempt, recovery epoch, source event, and snapshot revision until approval.
+
+[Source](src/commands/onboarding.rs#L271)
+
 ### `Marmot::approve_onboarding_repair_in_epoch`
 
 **Current.**
@@ -2687,7 +2699,7 @@ pub async fn cancel_onboarding_repair( &self, account_ref: String, ) -> Result<O
 
 Dismiss an unapproved repair proposal; this cannot undo already-approved publication intent.
 
-[Source](src/commands/onboarding.rs#L269)
+[Source](src/commands/onboarding.rs#L283)
 
 </details>
 
@@ -3330,7 +3342,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L242)
+[Source](src/lib.rs#L244)
 
 ### `Marmot::new_with_options`
 
@@ -3342,7 +3354,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L258)
+[Source](src/lib.rs#L260)
 
 ### `Marmot::new`
 
@@ -3354,7 +3366,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L286)
+[Source](src/lib.rs#L288)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3366,7 +3378,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L304)
+[Source](src/lib.rs#L306)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3378,7 +3390,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L334)
+[Source](src/lib.rs#L336)
 
 ### `Marmot::new_with_client_name`
 
@@ -3390,7 +3402,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L353)
+[Source](src/lib.rs#L355)
 
 ### `Marmot::start`
 
@@ -3402,7 +3414,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L390)
+[Source](src/lib.rs#L392)
 
 ### `Marmot::shutdown`
 
@@ -3414,7 +3426,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L402)
+[Source](src/lib.rs#L404)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3426,7 +3438,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L437)
+[Source](src/lib.rs#L439)
 
 ### `Marmot::storage_is_closed`
 
@@ -3438,7 +3450,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L445)
+[Source](src/lib.rs#L447)
 
 ### `Marmot::is_stopping`
 
@@ -3450,7 +3462,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L452)
+[Source](src/lib.rs#L454)
 
 </details>
 

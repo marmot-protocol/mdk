@@ -9,6 +9,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
+  preview records. `MarmotOnboardingRepairProposal` gains an optional
+  `relay_repair` pointer; regenerate and recompile with the matching header
+  and library. The preview is non-publishing, and `ManualReview` has no
+  approvable action.
 - Stateless `marmot_verify_public_nostr_event_json` C API backed by the same
   Nostr/libsecp256k1 verifier as the UniFFI bindings. It checks canonical event
   IDs and signatures without client state, and requires the matching regenerated

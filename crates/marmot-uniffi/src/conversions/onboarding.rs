@@ -233,6 +233,137 @@ impl From<marmot_app::OnboardingStepState> for OnboardingStepStateFfi {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingRelayTagRoleFfi {
+    Other,
+    Unmarked,
+    Read,
+    Write,
+    Inbox,
+}
+impl From<marmot_app::OnboardingRelayTagRole> for OnboardingRelayTagRoleFfi {
+    fn from(value: marmot_app::OnboardingRelayTagRole) -> Self {
+        match value {
+            marmot_app::OnboardingRelayTagRole::Other => Self::Other,
+            marmot_app::OnboardingRelayTagRole::Unmarked => Self::Unmarked,
+            marmot_app::OnboardingRelayTagRole::Read => Self::Read,
+            marmot_app::OnboardingRelayTagRole::Write => Self::Write,
+            marmot_app::OnboardingRelayTagRole::Inbox => Self::Inbox,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingRelayTagDispositionFfi {
+    Retained,
+    Removed,
+    Added,
+}
+impl From<marmot_app::OnboardingRelayTagDisposition> for OnboardingRelayTagDispositionFfi {
+    fn from(value: marmot_app::OnboardingRelayTagDisposition) -> Self {
+        match value {
+            marmot_app::OnboardingRelayTagDisposition::Retained => Self::Retained,
+            marmot_app::OnboardingRelayTagDisposition::Removed => Self::Removed,
+            marmot_app::OnboardingRelayTagDisposition::Added => Self::Added,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingRelayCapabilityFfi {
+    None,
+    Read,
+    Write,
+    ReadAndWrite,
+    Inbox,
+}
+impl From<marmot_app::OnboardingRelayCapability> for OnboardingRelayCapabilityFfi {
+    fn from(value: marmot_app::OnboardingRelayCapability) -> Self {
+        match value {
+            marmot_app::OnboardingRelayCapability::None => Self::None,
+            marmot_app::OnboardingRelayCapability::Read => Self::Read,
+            marmot_app::OnboardingRelayCapability::Write => Self::Write,
+            marmot_app::OnboardingRelayCapability::ReadAndWrite => Self::ReadAndWrite,
+            marmot_app::OnboardingRelayCapability::Inbox => Self::Inbox,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingRelayRepairModeFfi {
+    ManualReview,
+    RemovalOnly,
+    Additive,
+    RemovalAndAdditive,
+}
+impl From<marmot_app::OnboardingRelayRepairMode> for OnboardingRelayRepairModeFfi {
+    fn from(value: marmot_app::OnboardingRelayRepairMode) -> Self {
+        match value {
+            marmot_app::OnboardingRelayRepairMode::ManualReview => Self::ManualReview,
+            marmot_app::OnboardingRelayRepairMode::RemovalOnly => Self::RemovalOnly,
+            marmot_app::OnboardingRelayRepairMode::Additive => Self::Additive,
+            marmot_app::OnboardingRelayRepairMode::RemovalAndAdditive => Self::RemovalAndAdditive,
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingRelayTagFfi {
+    pub fields: Vec<String>,
+    pub endpoint: Option<String>,
+    pub role: OnboardingRelayTagRoleFfi,
+}
+impl From<marmot_app::OnboardingRelayTag> for OnboardingRelayTagFfi {
+    fn from(value: marmot_app::OnboardingRelayTag) -> Self {
+        Self {
+            fields: value.fields,
+            endpoint: value.endpoint,
+            role: value.role.into(),
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingRelayTagChangeFfi {
+    pub disposition: OnboardingRelayTagDispositionFfi,
+    pub before_index: Option<u64>,
+    pub after_index: Option<u64>,
+    pub fields: Vec<String>,
+    pub endpoint: Option<String>,
+    pub role: OnboardingRelayTagRoleFfi,
+    pub restores: OnboardingRelayCapabilityFfi,
+}
+impl From<marmot_app::OnboardingRelayTagChange> for OnboardingRelayTagChangeFfi {
+    fn from(value: marmot_app::OnboardingRelayTagChange) -> Self {
+        Self {
+            disposition: value.disposition.into(),
+            before_index: value.before_index,
+            after_index: value.after_index,
+            fields: value.fields,
+            endpoint: value.endpoint,
+            role: value.role.into(),
+            restores: value.restores.into(),
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingRelayRepairFfi {
+    pub mode: OnboardingRelayRepairModeFfi,
+    pub original_event_id: Option<String>,
+    pub original_content: String,
+    pub proposed_content: String,
+    pub before_tags: Vec<OnboardingRelayTagFfi>,
+    pub after_tags: Vec<OnboardingRelayTagFfi>,
+    pub changes: Vec<OnboardingRelayTagChangeFfi>,
+}
+impl From<marmot_app::OnboardingRelayRepair> for OnboardingRelayRepairFfi {
+    fn from(value: marmot_app::OnboardingRelayRepair) -> Self {
+        Self {
+            mode: value.mode.into(),
+            original_event_id: value.original_event_id,
+            original_content: value.original_content,
+            proposed_content: value.proposed_content,
+            before_tags: value.before_tags.into_iter().map(Into::into).collect(),
+            after_tags: value.after_tags.into_iter().map(Into::into).collect(),
+            changes: value.changes.into_iter().map(Into::into).collect(),
+        }
+    }
+}
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct OnboardingRepairProposalFfi {
     pub step: OnboardingStepFfi,
@@ -242,6 +373,7 @@ pub struct OnboardingRepairProposalFfi {
     pub write_relays: Vec<String>,
     pub profile: Option<UserProfileMetadataFfi>,
     pub follows: Option<Vec<String>>,
+    pub relay_repair: Option<OnboardingRelayRepairFfi>,
 }
 impl From<marmot_app::OnboardingRepairProposal> for OnboardingRepairProposalFfi {
     fn from(value: marmot_app::OnboardingRepairProposal) -> Self {
@@ -253,6 +385,7 @@ impl From<marmot_app::OnboardingRepairProposal> for OnboardingRepairProposalFfi 
             write_relays: value.write_relays,
             profile: value.profile.map(Into::into),
             follows: value.follows,
+            relay_repair: value.relay_repair.map(Into::into),
         }
     }
 }
@@ -356,5 +489,68 @@ impl From<marmot_app::OnboardingSingleDeviceNotice> for OnboardingSingleDeviceNo
             discovery_complete: value.discovery_complete,
             acknowledged_at: value.acknowledged_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod relay_repair_tests {
+    use super::*;
+
+    #[test]
+    fn typed_relay_repair_projects_exact_source_diff_and_manual_mode() {
+        let before = marmot_app::OnboardingRelayTag {
+            fields: vec!["r".into(), "wss://retired.example".into(), "read".into()],
+            endpoint: Some("wss://retired.example".into()),
+            role: marmot_app::OnboardingRelayTagRole::Read,
+        };
+        let after = marmot_app::OnboardingRelayTag {
+            fields: vec!["r".into(), "wss://safe.example".into(), "read".into()],
+            endpoint: Some("wss://safe.example".into()),
+            role: marmot_app::OnboardingRelayTagRole::Read,
+        };
+        let input = marmot_app::OnboardingRelayRepair {
+            mode: marmot_app::OnboardingRelayRepairMode::RemovalAndAdditive,
+            original_event_id: Some("source-id".into()),
+            original_content: "opaque".into(),
+            proposed_content: "opaque".into(),
+            before_tags: vec![before.clone()],
+            after_tags: vec![after.clone()],
+            changes: vec![marmot_app::OnboardingRelayTagChange {
+                disposition: marmot_app::OnboardingRelayTagDisposition::Added,
+                before_index: None,
+                after_index: Some(0),
+                fields: after.fields.clone(),
+                endpoint: after.endpoint.clone(),
+                role: after.role,
+                restores: marmot_app::OnboardingRelayCapability::Read,
+            }],
+        };
+        let projected: OnboardingRelayRepairFfi = input.into();
+        assert_eq!(
+            projected.mode,
+            OnboardingRelayRepairModeFfi::RemovalAndAdditive
+        );
+        assert_eq!(projected.original_event_id.as_deref(), Some("source-id"));
+        assert_eq!(projected.original_content, "opaque");
+        assert_eq!(projected.proposed_content, "opaque");
+        assert_eq!(projected.before_tags[0].fields, before.fields);
+        assert_eq!(
+            projected.before_tags[0].role,
+            OnboardingRelayTagRoleFfi::Read
+        );
+        assert_eq!(projected.after_tags[0].fields, after.fields);
+        assert_eq!(
+            projected.changes[0].disposition,
+            OnboardingRelayTagDispositionFfi::Added
+        );
+        assert_eq!(projected.changes[0].after_index, Some(0));
+        assert_eq!(
+            projected.changes[0].restores,
+            OnboardingRelayCapabilityFfi::Read
+        );
+        assert_eq!(
+            OnboardingRelayRepairModeFfi::from(marmot_app::OnboardingRelayRepairMode::ManualReview),
+            OnboardingRelayRepairModeFfi::ManualReview
+        );
     }
 }
