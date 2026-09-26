@@ -2635,3 +2635,27 @@ fn v5_loss_report_retries_in_memory_without_counting_its_own_failure() {
     assert_eq!(losses[0]["event"]["write_failed_attempts"], "1");
     assert_eq!(recorder.health_snapshot().write_failures, 2);
 }
+
+#[test]
+fn v5_rejected_record_conversion_reports_a_known_drop_without_echoing_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    recorder.record(AuditRecord::new(
+        Some("secret-group-id".into()),
+        recorder_started_kind(),
+    ));
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    let body = fs::read_to_string(&path).unwrap();
+    assert!(!body.contains("secret-group-id"));
+    let rows = v5_rows(&path);
+    let loss = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "recording_capture_loss")
+        .unwrap();
+    assert_eq!(loss["event"]["serialization_failed_attempts"], "1");
+    assert_eq!(loss["event"]["write_failed_attempts"], "0");
+    assert_eq!(loss["event"]["extent"], "unknown");
+}
