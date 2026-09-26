@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.marmot.dev/forensics/audit-log-event.v5.schema.json",
-  "title": "Marmot audit v5 typed Welcome and operational events",
-  "$comment": "Strict JSONL record shape. The 44 operational event types retain typed v4 diagnostic facts with v5 source/session sequence, hashed group/message/endpoint and distinct legacy member reference domains. Record::new enforces Welcome cross-field semantics. Input framing, duplicates, and <=65535 bytes are checked before typed validation.",
+  "title": "Marmot audit v5 typed lifecycle, app, Welcome and operational events",
+  "$comment": "Strict JSONL record shape. The 44 operational event types retain typed v4 diagnostic facts with v5 source/session sequence, hashed group/message/endpoint and distinct legacy member reference domains. Record::new enforces typed cross-field semantics. Input framing, duplicates, and <=65535 bytes are checked before typed validation.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -2366,7 +2366,12 @@
       },
       "allOf": [
         { "if": { "properties": { "failure_stage": { "type": "null" } } }, "then": { "properties": { "failure_reason": { "type": "null" } } } },
-        { "if": { "properties": { "failure_reason": { "type": "null" } } }, "then": { "properties": { "failure_stage": { "type": "null" } } } }
+        { "if": { "properties": { "failure_reason": { "type": "null" } } }, "then": { "properties": { "failure_stage": { "type": "null" } } } },
+        { "if": { "properties": { "transaction": { "const": "committed" } } }, "then": { "properties": {
+          "compute": { "enum": ["updated", "unchanged", "deferred"] },
+          "failure_stage": { "type": "null" },
+          "failure_reason": { "type": "null" }
+        } } }
       ]
     },
     "RuntimePublicationOutcome": {

@@ -689,6 +689,12 @@ fn lifecycle_and_app_outcome_shapes_reject_false_scope_and_counts() {
     unknown_partial_count["event"]["affected_group_count"] = Value::Null;
     assert!(schema.is_valid(&unknown_partial_count));
     assert!(decode(&unknown_partial_count).is_ok());
+    let mut computed_but_not_committed = fixture("app_update_outcome");
+    computed_but_not_committed["event"]["transaction"] = json!("not_committed");
+    computed_but_not_committed["event"]["failure_stage"] = json!("transaction");
+    computed_but_not_committed["event"]["failure_reason"] = json!("storage");
+    assert!(schema.is_valid(&computed_but_not_committed));
+    assert!(decode(&computed_but_not_committed).is_ok());
     let mut cases = Vec::new();
     let mut group_scoped_start = fixture("recording_started");
     group_scoped_start["group_ref"] =
@@ -703,6 +709,11 @@ fn lifecycle_and_app_outcome_shapes_reject_false_scope_and_counts() {
     let mut app_failure_pair = fixture("app_update_outcome");
     app_failure_pair["event"]["failure_stage"] = json!("projection");
     cases.push(app_failure_pair);
+    let mut committed_failure = fixture("app_update_outcome");
+    committed_failure["event"]["compute"] = json!("failed");
+    committed_failure["event"]["failure_stage"] = json!("transaction");
+    committed_failure["event"]["failure_reason"] = json!("storage");
+    cases.push(committed_failure);
     let mut invented_broadcast = fixture("runtime_publication_outcome");
     invented_broadcast["event"]["accepted_by_broadcast"] = json!("2");
     cases.push(invented_broadcast);

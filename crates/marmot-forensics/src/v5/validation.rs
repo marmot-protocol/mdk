@@ -21,6 +21,11 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                 e.failure_stage.is_some() == e.failure_reason.is_some(),
                 "app update failure stage and reason must be paired",
             )?;
+            require(
+                e.transaction != AppUpdateTransaction::Committed
+                    || (e.compute != AppUpdateCompute::Failed && e.failure_stage.is_none()),
+                "committed app update cannot carry a failure",
+            )?;
         }
         Event::RuntimePublicationOutcome(e) => {
             require(!has_group, "runtime publication must be account-scoped")?;

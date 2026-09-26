@@ -609,6 +609,16 @@ async fn deferred_runtime_open_records_the_stored_group_baseline() {
             && row["event"]["selected_group_count"] == 1
     }));
     runtime.shutdown_and_close().await.unwrap();
+    let final_rows = std::fs::read_to_string(&files[0].path)
+        .unwrap()
+        .lines()
+        .map(|line| marmot_forensics::v5::Record::from_json(line.as_bytes()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        &final_rows.last().unwrap().fields().event,
+        marmot_forensics::v5::Event::RecordingSessionStopped(stop)
+            if stop.reason == marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown
+    ));
 }
 
 #[tokio::test]
