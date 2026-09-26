@@ -59,3 +59,4 @@ A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_ITEM
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
 A13|crates/marmot-app/src/client/sync/comparison_job.rs|MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+A13|crates/marmot-app/src/client/sync.rs|ONLINE_EPOCH_GAP_DRAIN_SLICE
