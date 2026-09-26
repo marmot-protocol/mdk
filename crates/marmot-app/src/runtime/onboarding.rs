@@ -438,6 +438,33 @@ fn finding(issue: OnboardingIssue) -> OnboardingFinding {
         endpoint: None,
     }
 }
+
+fn evaluated_onboarding_status(
+    findings: &[OnboardingFinding],
+    relay_status: Option<OnboardingStatus>,
+) -> OnboardingStatus {
+    // Endpoint health and the local inspection cap are advisory once a safe,
+    // directionally complete route has answered. A malformed declaration still
+    // blocks, and an internal interruption is not evidence of a usable route.
+    if findings
+        .iter()
+        .any(|finding| finding.issue == OnboardingIssue::Malformed)
+    {
+        OnboardingStatus::NeedsInput
+    } else if relay_status.is_some()
+        && findings
+            .iter()
+            .any(|finding| finding.issue == OnboardingIssue::Interrupted)
+    {
+        OnboardingStatus::RetryableFailure
+    } else if let Some(status) = relay_status {
+        status
+    } else if findings.is_empty() {
+        OnboardingStatus::Passed
+    } else {
+        OnboardingStatus::NeedsInput
+    }
+}
 fn onboarding_error() -> AppError {
     AppError::OnboardingActionUnavailable
 }
@@ -1769,9 +1796,8 @@ impl AccountManager {
             );
         }
         let mut findings = validate_onboarding_record(&event);
-        let mut passed = findings.is_empty();
+        let mut relay_status = None;
         if step.relay() {
-            passed = false;
             let name = if step == OnboardingStep::Relays {
                 "r"
             } else {
@@ -1783,7 +1809,23 @@ impl AccountManager {
                 .filter(|t| t.first().is_some_and(|v| v == name))
                 .filter_map(|t| t.get(1).cloned())
                 .collect();
-            for classified in self.app.relay_plane.classify_relay_endpoints(raw) {
+            let classifications = self.app.relay_plane.classify_relay_endpoints(raw);
+            let allowed: HashSet<String> = classifications
+                .iter()
+                .filter(|classified| {
+                    classified.policy == RelayEndpointPolicy::Allowed
+                        && !is_onion_relay(&classified.endpoint)
+                })
+                .map(|classified| {
+                    relay_key(
+                        classified
+                            .normalized_endpoint
+                            .as_deref()
+                            .unwrap_or(&classified.endpoint),
+                    )
+                })
+                .collect();
+            for classified in classifications {
                 if is_onion_relay(&classified.endpoint) {
                     continue;
                 }
@@ -1800,21 +1842,42 @@ impl AccountManager {
             }
             let state = crate::relay_list_state_from_event(&event);
             if let Some(state) = state {
-                // NIP-65 requires a usable outbox; read-only routes cannot satisfy it.
-                let mut endpoints = state.relays;
-                let defaults = c
-                    .options
-                    .default_relays
+                let has_read_route = step == OnboardingStep::InboxRelays
+                    || state
+                        .read_relays
+                        .iter()
+                        .any(|endpoint| allowed.contains(&relay_key(endpoint)));
+                // NIP-65 needs an allowed outbox; a read-only route cannot satisfy it.
+                let has_write_or_inbox_route = state
+                    .relays
                     .iter()
-                    .map(|relay| relay_key(relay))
-                    .collect::<HashSet<_>>();
-                // Keep the dial cap from hiding appended defaults behind an old long list.
-                endpoints.sort_by_cached_key(|relay| !defaults.contains(&relay_key(relay)));
-                if endpoints.is_empty() {
+                    .any(|endpoint| allowed.contains(&relay_key(endpoint)));
+                if !has_read_route || !has_write_or_inbox_route {
                     findings.push(finding(OnboardingIssue::NoUsableRoute));
+                    relay_status = Some(OnboardingStatus::NeedsInput);
                 } else {
+                    let mut endpoints = state.relays;
+                    if step == OnboardingStep::Relays {
+                        // A declared read route can complete the bounded check
+                        // when an allowed write route is temporarily unreachable.
+                        for endpoint in state.read_relays {
+                            if !endpoints.contains(&endpoint) {
+                                endpoints.push(endpoint);
+                            }
+                        }
+                    }
+                    let defaults = c
+                        .options
+                        .default_relays
+                        .iter()
+                        .map(|relay| relay_key(relay))
+                        .collect::<HashSet<_>>();
+                    // Keep the dial cap from hiding appended defaults behind an old long list.
+                    endpoints.sort_by_cached_key(|relay| !defaults.contains(&relay_key(relay)));
                     // EOSE proves an actual query completed, not merely a TCP
-                    // connection. Publication is independently confirmed below.
+                    // connection. The declaration supplies read/write roles;
+                    // one completed check on an allowed declared route proves
+                    // the minimum local-use capability without editing it.
                     let (_, failures, completed) = self
                         .inspect_onboarding_relays(
                             &c.snapshot.account_id_hex,
@@ -1827,22 +1890,20 @@ impl AccountManager {
                         )
                         .await;
                     findings.extend(failures);
-                    passed = !completed.is_empty();
-                    if !passed {
+                    // Inspection only dials allowed routes from this declaration.
+                    if completed.is_empty() {
                         findings.push(finding(OnboardingIssue::NoUsableRoute));
+                        relay_status = Some(OnboardingStatus::RetryableFailure);
+                    } else {
+                        relay_status = Some(OnboardingStatus::Passed);
                     }
                 }
             } else {
                 findings.push(finding(OnboardingIssue::Malformed));
+                relay_status = Some(OnboardingStatus::NeedsInput);
             }
         }
-        // Other clients may use routes this runtime cannot. Their failures are
-        // advisory once a usable route exists, not grounds to rewrite the list.
-        let status = if passed {
-            OnboardingStatus::Passed
-        } else {
-            OnboardingStatus::NeedsInput
-        };
+        let status = evaluated_onboarding_status(&findings, relay_status);
         if !failures.is_empty() {
             findings.push(finding(OnboardingIssue::DiscoveryIncomplete));
             findings.extend(failures);

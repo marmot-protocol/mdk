@@ -14,6 +14,8 @@ struct Network {
     fail_reads: AtomicBool,
     return_off_filter_events: AtomicBool,
     fail_index_only: AtomicBool,
+    inspection_errors: StdMutex<HashMap<String, crate::relay_plane::DirectoryInspectionError>>,
+    inspected_endpoints: StdMutex<Vec<String>>,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
     publishing: Notify,
@@ -75,6 +77,19 @@ impl DirectoryRelayFetcher for Network {
         request: DirectoryFetchRequest,
         _signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, crate::relay_plane::DirectoryInspectionError> {
+        self.inspected_endpoints
+            .lock()
+            .unwrap()
+            .extend(request.endpoints.iter().map(|endpoint| endpoint.0.clone()));
+        if let Some(error) = request.endpoints.iter().find_map(|endpoint| {
+            self.inspection_errors
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|(needle, error)| endpoint.0.contains(needle).then_some(*error))
+        }) {
+            return Err(error);
+        }
         self.fetch_directory_events(request)
             .await
             .map_err(|_| crate::relay_plane::DirectoryInspectionError::TimedOut)
@@ -371,6 +386,351 @@ async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results
         OnboardingDeviceDiscovery::NoneFound
     );
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata() {
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    for (step, kind, tags, expected_issue) in [
+        (
+            OnboardingStep::Relays,
+            10002,
+            vec![
+                vec!["r".into(), "wss://healthy.example".into()],
+                vec!["r".into(), "wss://relay.damus.io".into()],
+            ],
+            OnboardingIssue::RetiredRelay,
+        ),
+        (
+            OnboardingStep::InboxRelays,
+            10050,
+            vec![
+                vec!["relay".into(), "wss://healthy.example".into()],
+                vec!["relay".into(), "wss://relay.damus.io".into()],
+            ],
+            OnboardingIssue::RetiredRelay,
+        ),
+        (
+            OnboardingStep::Relays,
+            10002,
+            vec![
+                vec!["r".into(), "wss://healthy.example".into()],
+                vec!["r".into(), "wss://127.0.0.1".into()],
+            ],
+            OnboardingIssue::UnsafeRelay,
+        ),
+    ] {
+        let declaration = signed(&keys, kind, tags, "unchanged", unix_now_seconds());
+        *network.events.lock().unwrap() = vec![declaration.clone()];
+        let (status, findings, observed) = manager.check_onboarding_step(&c, step).await;
+        assert_eq!(status, OnboardingStatus::Passed, "step {step:?}");
+        assert!(findings.iter().any(|f| f.issue == expected_issue));
+        assert_eq!(observed, Some(declaration));
+        assert!(network.attempts.lock().unwrap().is_empty());
+        assert!(
+            network
+                .inspected_endpoints
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|endpoint| !endpoint.contains("relay.damus.io")
+                    && !endpoint.contains("127.0.0.1"))
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
+    c.set(OnboardingStep::Follows, OnboardingStatus::Passed, vec![]);
+    manager.save_onboarding(&mut c).unwrap();
+    *network.events.lock().unwrap() = vec![
+        signed(
+            &keys,
+            10002,
+            vec![
+                vec!["r".into(), "wss://healthy.example".into()],
+                vec!["r".into(), "wss://relay.damus.io".into()],
+            ],
+            "",
+            unix_now_seconds(),
+        ),
+        signed(
+            &keys,
+            10050,
+            vec![
+                vec!["relay".into(), "wss://healthy.example".into()],
+                vec!["relay".into(), "wss://relay.damus.io".into()],
+            ],
+            "",
+            unix_now_seconds(),
+        ),
+    ];
+    let snapshot = manager.run_onboarding(&id).await.unwrap();
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        let state = &snapshot.steps[step.index()];
+        assert_eq!(state.status, OnboardingStatus::Passed);
+        assert!(
+            state
+                .findings
+                .iter()
+                .any(|finding| finding.issue == OnboardingIssue::RetiredRelay)
+        );
+    }
+    assert_eq!(
+        snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    assert!(
+        network
+            .inspected_endpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|endpoint| !endpoint.contains("relay.damus.io"))
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transient_endpoint_failures_are_warnings_when_another_declared_route_completes() {
+    use crate::relay_plane::DirectoryInspectionError;
+
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    *network.events.lock().unwrap() = vec![signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://healthy.example".into()],
+            vec!["r".into(), "wss://degraded.example".into()],
+        ],
+        "",
+        unix_now_seconds(),
+    )];
+    for (error, issue) in [
+        (
+            DirectoryInspectionError::TimedOut,
+            OnboardingIssue::TimedOut,
+        ),
+        (
+            DirectoryInspectionError::AuthenticationRequired,
+            OnboardingIssue::AuthenticationRequired,
+        ),
+        (
+            DirectoryInspectionError::PaymentRequired,
+            OnboardingIssue::PaymentRequired,
+        ),
+        (
+            DirectoryInspectionError::Restricted,
+            OnboardingIssue::AccessRestricted,
+        ),
+        (
+            DirectoryInspectionError::Unreachable,
+            OnboardingIssue::Unreachable,
+        ),
+    ] {
+        network
+            .inspection_errors
+            .lock()
+            .unwrap()
+            .insert("degraded.example".into(), error);
+        let (status, findings, _) = manager
+            .check_onboarding_step(&c, OnboardingStep::Relays)
+            .await;
+        assert_eq!(status, OnboardingStatus::Passed, "error {error:?}");
+        assert!(findings.iter().any(|f| f.issue == issue));
+        assert!(network.attempts.lock().unwrap().is_empty());
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_route_times_out() {
+    use crate::relay_plane::DirectoryInspectionError;
+
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let declaration = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://read.example".into(), "read".into()],
+            vec!["r".into(), "wss://write.example".into(), "write".into()],
+        ],
+        "unchanged",
+        unix_now_seconds(),
+    );
+    *network.events.lock().unwrap() = vec![declaration.clone()];
+    network
+        .inspection_errors
+        .lock()
+        .unwrap()
+        .insert("write.example".into(), DirectoryInspectionError::TimedOut);
+
+    let (status, findings, observed) = manager
+        .check_onboarding_step(&c, OnboardingStep::Relays)
+        .await;
+    assert_eq!(status, OnboardingStatus::Passed);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::TimedOut)
+    );
+    assert_eq!(observed, Some(declaration));
+    assert!(network.attempts.lock().unwrap().is_empty());
+    assert!(
+        network
+            .inspected_endpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|endpoint| endpoint.contains("read.example"))
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn relay_directionality_and_inconclusive_checks_never_produce_false_readiness() {
+    use crate::relay_plane::DirectoryInspectionError;
+
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    for (step, kind, tags, expected) in [
+        (
+            OnboardingStep::Relays,
+            10002,
+            vec![],
+            OnboardingStatus::NeedsInput,
+        ),
+        (
+            OnboardingStep::InboxRelays,
+            10050,
+            vec![],
+            OnboardingStatus::NeedsInput,
+        ),
+        (
+            OnboardingStep::Relays,
+            10002,
+            vec![vec![
+                "r".into(),
+                "wss://healthy.example".into(),
+                "read".into(),
+            ]],
+            OnboardingStatus::NeedsInput,
+        ),
+        (
+            OnboardingStep::Relays,
+            10002,
+            vec![vec![
+                "r".into(),
+                "wss://healthy.example".into(),
+                "write".into(),
+            ]],
+            OnboardingStatus::NeedsInput,
+        ),
+        (
+            OnboardingStep::Relays,
+            10002,
+            vec![vec!["r".into(), "wss://relay.damus.io".into()]],
+            OnboardingStatus::NeedsInput,
+        ),
+        (
+            OnboardingStep::InboxRelays,
+            10050,
+            vec![vec!["relay".into(), "wss://relay.damus.io".into()]],
+            OnboardingStatus::NeedsInput,
+        ),
+        (
+            OnboardingStep::Relays,
+            10002,
+            vec![vec![
+                "r".into(),
+                "wss://healthy.example".into(),
+                "invalid".into(),
+            ]],
+            OnboardingStatus::NeedsInput,
+        ),
+    ] {
+        *network.events.lock().unwrap() = vec![signed(&keys, kind, tags, "", unix_now_seconds())];
+        let (status, _, _) = manager.check_onboarding_step(&c, step).await;
+        assert_eq!(status, expected);
+    }
+    *network.events.lock().unwrap() = vec![signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        "",
+        unix_now_seconds(),
+    )];
+    network.inspection_errors.lock().unwrap().insert(
+        "healthy.example".into(),
+        DirectoryInspectionError::Unreachable,
+    );
+    let (status, findings, _) = manager
+        .check_onboarding_step(&c, OnboardingStep::Relays)
+        .await;
+    assert_eq!(status, OnboardingStatus::RetryableFailure);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::NoUsableRoute)
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    *network.events.lock().unwrap() = vec![signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://healthy.example".into()]],
+        "",
+        unix_now_seconds(),
+    )];
+    let (status, _, _) = manager
+        .check_onboarding_step(&c, OnboardingStep::InboxRelays)
+        .await;
+    assert_eq!(status, OnboardingStatus::RetryableFailure);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[test]
+fn relay_status_keeps_the_inspection_cap_advisory_only_after_a_completed_check() {
+    assert_eq!(
+        evaluated_onboarding_status(
+            &[finding(OnboardingIssue::Interrupted)],
+            Some(OnboardingStatus::Passed),
+        ),
+        OnboardingStatus::RetryableFailure
+    );
+    assert_eq!(
+        evaluated_onboarding_status(
+            &[finding(OnboardingIssue::TooManyRelays)],
+            Some(OnboardingStatus::Passed),
+        ),
+        OnboardingStatus::Passed
+    );
+    assert_eq!(
+        evaluated_onboarding_status(
+            &[finding(OnboardingIssue::TooManyRelays)],
+            Some(OnboardingStatus::RetryableFailure),
+        ),
+        OnboardingStatus::RetryableFailure
+    );
+    assert_eq!(
+        evaluated_onboarding_status(
+            &[finding(OnboardingIssue::Malformed)],
+            Some(OnboardingStatus::Passed),
+        ),
+        OnboardingStatus::NeedsInput
+    );
 }
 
 #[tokio::test]
@@ -755,7 +1115,7 @@ async fn defaults_preserve_relay_tags() {
         c.set(step, OnboardingStatus::NeedsInput, Vec::new());
         manager.save_onboarding(&mut c).unwrap();
         let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
-        assert_eq!(status, OnboardingStatus::NeedsInput);
+        assert_eq!(status, OnboardingStatus::RetryableFailure);
         assert!(
             findings
                 .iter()
@@ -780,10 +1140,17 @@ async fn defaults_preserve_relay_tags() {
         assert_eq!(published.tags.len(), tags.len() + 1);
         let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
         let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
+        // A completed recommended route permits continuation without rewriting
+        // the existing declaration; the local dial cap remains visible.
         assert_eq!(status, OnboardingStatus::Passed, "{findings:?}");
         assert!(
+            findings
+                .iter()
+                .any(|f| f.issue == OnboardingIssue::TooManyRelays)
+        );
+        assert!(
             !findings.is_empty(),
-            "unsupported routes remain advisory findings"
+            "unsupported routes remain visible in findings"
         );
         assert!(
             findings
