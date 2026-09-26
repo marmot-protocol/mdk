@@ -351,6 +351,13 @@ pub(crate) struct RecoverySelectionWitnessTarget {
     pub(crate) sink: Arc<StdMutex<Vec<crate::client::TestRecoverySelection>>>,
 }
 
+#[cfg(test)]
+pub(crate) struct WorkerLoopPause {
+    pub(crate) account_label: String,
+    pub(crate) entered: oneshot::Sender<()>,
+    pub(crate) release: watch::Receiver<bool>,
+}
+
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     /// Off until the production SDK acquisition backend passes its two-relay
@@ -369,6 +376,8 @@ pub struct RuntimeSharedServices {
     #[cfg(test)]
     pub(crate) recovery_phase_witness:
         Arc<StdMutex<Option<(String, crate::client::TestRecoveryPhaseWitness)>>>,
+    #[cfg(test)]
+    pub(crate) next_worker_loop_pause: Arc<StdMutex<Option<WorkerLoopPause>>>,
     #[cfg(test)]
     pub(crate) bounded_recovery_finished: Arc<Notify>,
     #[cfg(test)]
@@ -496,6 +505,8 @@ impl Default for RuntimeSharedServices {
             #[cfg(test)]
             recovery_phase_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
+            next_worker_loop_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]
             bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -600,6 +611,8 @@ impl RuntimeSharedServices {
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             recovery_phase_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            next_worker_loop_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]

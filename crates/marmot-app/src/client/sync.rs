@@ -81,14 +81,17 @@ struct TestRecoveryPhaseState {
     terminal: Option<TestRecoveryTerminal>,
     target_terminals: Vec<TestRecoveryTerminal>,
     target_group_id: Option<GroupId>,
+    reconciliation_deadline: Option<tokio::time::Instant>,
 }
 
-/// Default-disabled witness for one selected EpochGap grant on one account.
-/// It records whole AppClient phase futures, not an individual SDK request.
+/// Default-disabled witness for selected EpochGap work or an opted-in QueueLoss
+/// attempt on one account. It records whole AppClient phase futures, not an
+/// individual SDK request.
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct TestRecoveryPhaseWitness {
     armed: std::sync::Arc<AtomicBool>,
+    queue_loss: std::sync::Arc<AtomicBool>,
     state: std::sync::Arc<std::sync::Mutex<TestRecoveryPhaseState>>,
 }
 
@@ -97,11 +100,35 @@ pub(crate) struct TestRecoveryPhaseWitness {
 impl TestRecoveryPhaseWitness {
     pub(crate) fn arm(&self) {
         *self.state.lock().unwrap() = TestRecoveryPhaseState::default();
+        self.queue_loss.store(false, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn arm_queue_loss(&self) {
+        self.arm();
+        self.queue_loss.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn active(&self) -> Option<TestRecoveryPhaseSnapshot> {
         self.state.lock().unwrap().active
+    }
+
+    pub(crate) fn reconciliation_deadline_remaining(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap()
+            .reconciliation_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    fn record_reconciliation_deadline(&self, deadline: tokio::time::Instant) {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .active
+            .is_some_and(|active| active.phase == TestRecoveryPhase::Reconciliation)
+        {
+            state.reconciliation_deadline = Some(deadline);
+        }
     }
 
     pub(crate) fn terminal(&self) -> Option<TestRecoveryTerminal> {
@@ -140,7 +167,13 @@ impl TestRecoveryPhaseWitness {
         }
         let mut state = self.state.lock().unwrap();
         match state.selected_attempt {
-            Some(selected) if selected != attempt_serial => return None,
+            Some(selected) if selected != attempt_serial => {
+                if !self.queue_loss.load(Ordering::SeqCst) {
+                    return None;
+                }
+                state.selected_attempt = Some(attempt_serial);
+                state.reconciliation_deadline = None;
+            }
             None => state.selected_attempt = Some(attempt_serial),
             _ => {}
         }
@@ -1320,6 +1353,10 @@ impl AppClient {
     > {
         use storage_sqlite::RecoveryComparisonOutcome as Outcome;
         let deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
+        #[cfg(test)]
+        if let Some(witness) = &self.test_recovery_phase_witness {
+            witness.record_reconciliation_deadline(deadline);
+        }
         let mut outcomes = Vec::new();
         let storage = self.app.account_storage(&self.state.label)?;
         let mut attempted_routes = 0usize;
@@ -2387,6 +2424,8 @@ impl AppClient {
                 SyncSummary::default(),
             ));
         };
+        #[cfg(test)]
+        self.record_test_recovery_selection(&grant);
         let summary = self.execute_recovery_grant(grant, None, None).await?;
         Ok(if self.delivery_overflow_recovery_pending {
             DeliveryOverflowRecoveryOutcome::Incomplete(summary)
@@ -4147,15 +4186,26 @@ impl AppClient {
             return Ok(PendingRecoverySelection::Deferred);
         };
         #[cfg(test)]
+        self.record_test_recovery_selection(&grant);
+        Ok(PendingRecoverySelection::Grant(Box::new(grant)))
+    }
+
+    #[cfg(test)]
+    fn record_test_recovery_selection(&self, grant: &AttemptGrant) {
         if let Some(witness) = &self.test_recovery_selection_witness {
             witness.lock().unwrap().push(super::TestRecoverySelection {
-                seam,
+                seam: grant.seam,
                 attempt_serial: grant.reservation.attempt_serial,
                 comparison_revision: grant.comparison_revision,
                 obligation_count: grant.fence.obligations.len(),
+                causes: grant
+                    .plan()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|item| item.cause)
+                    .collect(),
             });
         }
-        Ok(PendingRecoverySelection::Grant(Box::new(grant)))
     }
 
     pub(crate) async fn execute_pending_epoch_backfill_grant(
@@ -4397,8 +4447,8 @@ impl AppClient {
         result
     }
 
-    /// Start the same reserved executor at the worker's Receive seam, then
-    /// leave only immutable reconciliation I/O outside the account owner.
+    /// Start the same reserved executor for eligible Receive or Maintenance
+    /// work, then leave only immutable reconciliation I/O outside the owner.
     pub(crate) async fn begin_online_epoch_gap(
         &mut self,
         grant: AttemptGrant,
@@ -4636,7 +4686,13 @@ impl AppClient {
         let plan = grant.plan()?;
         if grant.comparison_revision.is_some()
             || plan.len() != 1
-            || plan[0].cause != storage_sqlite::RecoveryCause::EpochGap
+            || (plan[0].cause != storage_sqlite::RecoveryCause::EpochGap
+                && !(self
+                    .test_recovery_phase_witness
+                    .as_ref()?
+                    .queue_loss
+                    .load(Ordering::SeqCst)
+                    && plan[0].cause == storage_sqlite::RecoveryCause::QueueLoss))
         {
             return None;
         }

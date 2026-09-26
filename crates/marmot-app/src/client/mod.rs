@@ -90,8 +90,8 @@ pub(crate) use sync::TestRecoveryPhaseWitness;
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
     ComparisonNetworkJob, ComparisonNetworkResult, ConvergenceScheduleState,
-    DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome, EpochGapQueueJob,
-    OnlineEpochGapRecovery, PendingRecoverySelection, RouteSubmission,
+    EpochBackfillRunOutcome, EpochGapQueueJob, OnlineEpochGapRecovery, PendingRecoverySelection,
+    RouteSubmission,
 };
 
 #[cfg(test)]
@@ -517,6 +517,7 @@ pub(crate) struct TestRecoverySelection {
     pub(crate) attempt_serial: u64,
     pub(crate) comparison_revision: Option<u64>,
     pub(crate) obligation_count: usize,
+    pub(crate) causes: Vec<storage_sqlite::RecoveryCause>,
 }
 
 /// Cross the point-of-no-return for a current-profile group mutation without
