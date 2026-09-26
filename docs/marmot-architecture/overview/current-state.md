@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-25
+updated: 2026-09-26
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -123,11 +123,16 @@ ordering. Eligible owner-selected comparisons from startup, periodic maintenance
 convergence and ordinary receive suspend only the SDK request in the shared worker job. Startup
 keeps live receive and eligible commands active while that request runs; a saturated comparison
 credit pool leaves its retry reservation unspent, and an inline fallback releases a speculative
-credit before waiting. Explicit catch-up, account-wide overflow and
-other waits retain their separate inline paths. The broader
+credit before waiting. A singleton QueueLoss grant with no selected comparison now uses that
+worker-owned immutable network and bounded queue continuation when its routes fit the existing
+four-route and four-endpoint caps. This applies to direct overflow Receive and ordinary Receive or
+Maintenance selection; its drain and loss acknowledgment stay with the account owner. Ineligible
+shapes, explicit catch-up and other waits retain their separate inline paths. The broader
 nonblocking acquisition and scheduling program belongs to #1947.
 See the [owner integration ledger](../further-context/account-recovery-integration.md) for the acceptance matrix,
 same-schema conservative mode, coordinated migration landing and approved unresolved-watermark retention exception.
+The [automatic QueueLoss qualification](../further-context/recovery-automatic-queue-loss-qualification.md)
+records the real SDK/SQLCipher fixture and its limits.
 
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must

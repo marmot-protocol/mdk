@@ -19,11 +19,46 @@ pub(crate) struct TestComparisonActivityWitness {
     pub(crate) attempt_serial: Arc<AtomicU64>,
     pub(crate) active_jobs: Arc<AtomicUsize>,
     pub(crate) active_requests: Arc<AtomicUsize>,
+    pub(crate) network_deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
     pub(crate) target_event_id: Arc<Mutex<Option<String>>>,
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) target_route: Arc<Mutex<Option<TransportReconciliationRoute>>>,
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) route_outcomes: Arc<Mutex<Vec<TestComparisonRouteOutcome>>>,
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) diagnostic_origin: Arc<Mutex<Option<std::time::Instant>>>,
     pub(crate) returned_events: Arc<AtomicUsize>,
     pub(crate) matching_events: Arc<AtomicUsize>,
     pub(crate) matching_queued_deliveries: Arc<AtomicUsize>,
     pub(crate) panic_after_queue_submission: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+#[derive(Clone, Debug)]
+pub(crate) struct TestComparisonRouteOutcome {
+    pub(crate) attempt_serial: u64,
+    pub(crate) target_route: bool,
+    pub(crate) inbox: bool,
+    pub(crate) kind: &'static str,
+    pub(crate) relays_succeeded: usize,
+    pub(crate) relays_failed: usize,
+    pub(crate) remote_items: usize,
+    pub(crate) received_items: usize,
+    pub(crate) comparison_diagnostics: Option<transport_nostr_adapter::NostrComparisonDiagnostics>,
+    pub(crate) started_ms: Option<u64>,
+    pub(crate) finished_ms: Option<u64>,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+fn diagnostic_elapsed_ms(
+    origin: Option<std::time::Instant>,
+    at: std::time::Instant,
+) -> Option<u64> {
+    origin.map(|origin| {
+        at.saturating_duration_since(origin)
+            .as_millis()
+            .min(u64::MAX as u128) as u64
+    })
 }
 
 #[cfg(test)]
@@ -244,13 +279,52 @@ impl ComparisonNetworkJob {
                 ActiveCounter::new(witness.active_jobs.clone())
             });
             let deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
+            #[cfg(test)]
+            if let Some(witness) = &witness {
+                *witness.network_deadline.lock().unwrap() = Some(deadline);
+            }
             let mut results = Vec::with_capacity(routes.len());
             for frozen in routes {
                 let FrozenRoute {
                     inventory,
                     initial_cursor,
                 } = frozen;
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                let started_at = std::time::Instant::now();
                 if tokio::time::Instant::now() >= deadline {
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    if let Some(witness) = &witness {
+                        let origin = *witness.diagnostic_origin.lock().unwrap();
+                        let target_route = witness
+                            .target_route
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|target| target == &inventory.route);
+                        witness
+                            .route_outcomes
+                            .lock()
+                            .unwrap()
+                            .push(TestComparisonRouteOutcome {
+                                attempt_serial,
+                                target_route,
+                                inbox: matches!(
+                                    &inventory.route,
+                                    TransportReconciliationRoute::Inbox
+                                ),
+                                kind: "skipped",
+                                relays_succeeded: 0,
+                                relays_failed: 0,
+                                remote_items: 0,
+                                received_items: 0,
+                                comparison_diagnostics: None,
+                                started_ms: diagnostic_elapsed_ms(origin, started_at),
+                                finished_ms: diagnostic_elapsed_ms(
+                                    origin,
+                                    std::time::Instant::now(),
+                                ),
+                            });
+                    }
                     results.push(ComparisonRouteResult {
                         route: inventory.route,
                         initial_cursor,
@@ -314,6 +388,57 @@ impl ComparisonNetworkJob {
                     }
                 }
                 let cursor = *progress.cursor.lock().expect("comparison progress mutex");
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                if let Some(witness) = &witness {
+                    let finished_at = std::time::Instant::now();
+                    let origin = *witness.diagnostic_origin.lock().unwrap();
+                    let (
+                        kind,
+                        relays_succeeded,
+                        relays_failed,
+                        remote_items,
+                        received_items,
+                        comparison_diagnostics,
+                    ) = match &result {
+                        ComparisonRouteWorkResult::Skipped => ("skipped", 0, 0, 0, 0, None),
+                        ComparisonRouteWorkResult::TimedOut => ("timed_out", 0, 0, 0, 0, None),
+                        ComparisonRouteWorkResult::Returned(Ok(None)) => {
+                            ("unsupported", 0, 0, 0, 0, None)
+                        }
+                        ComparisonRouteWorkResult::Returned(Err(_)) => ("error", 0, 0, 0, 0, None),
+                        ComparisonRouteWorkResult::Returned(Ok(Some((summary, _)))) => (
+                            "returned",
+                            summary.relays_succeeded,
+                            summary.relays_failed,
+                            summary.remote_items,
+                            summary.received_items,
+                            Some(summary.comparison_diagnostics.clone()),
+                        ),
+                    };
+                    let target_route = witness
+                        .target_route
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|target| target == &inventory.route);
+                    witness
+                        .route_outcomes
+                        .lock()
+                        .unwrap()
+                        .push(TestComparisonRouteOutcome {
+                            attempt_serial,
+                            target_route,
+                            inbox: matches!(&inventory.route, TransportReconciliationRoute::Inbox),
+                            kind,
+                            relays_succeeded,
+                            relays_failed,
+                            remote_items,
+                            received_items,
+                            comparison_diagnostics,
+                            started_ms: diagnostic_elapsed_ms(origin, started_at),
+                            finished_ms: diagnostic_elapsed_ms(origin, finished_at),
+                        });
+                }
                 results.push(ComparisonRouteResult {
                     route: inventory.route,
                     initial_cursor,
@@ -391,22 +516,70 @@ impl AppClient {
         }))
     }
 
-    /// The one steady-state expansion of immutable comparison I/O. The
-    /// comparison slot remains ineligible and its completion path is unused.
-    pub(crate) fn epoch_gap_offload_eligible(
+    /// Avoid spending a QueueLoss reservation while the only bounded worker
+    /// continuation is waiting for shared capacity. The frozen grant is still
+    /// checked after a permit becomes available.
+    pub(crate) fn queue_loss_only_waiting_for_credit(&self) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let fence = storage.recovery_eligible_revision_fence(false)?;
+        if fence.obligations.len() != 1 || storage.recovery_comparison()?.pending() {
+            return Ok(false);
+        }
+        let routes = self.routing.snapshot();
+        let visible_routes =
+            routes.group_routes.len() + usize::from(!routes.local_inbox_endpoints.is_empty());
+        if visible_routes == 0
+            || visible_routes > TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
+            || routes.local_inbox_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+            || routes
+                .group_routes
+                .iter()
+                .any(|route| route.endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE)
+            || storage
+                .recovery_scope_snapshots(fence.obligations[0].0)?
+                .iter()
+                .any(|scope| {
+                    scope.plan.required_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+                        || scope.plan.admitted_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+                })
+        {
+            return Ok(false);
+        }
+        Ok(storage.pending_recovery_demands()?.iter().any(|demand| {
+            demand.ticket.id == fence.obligations[0].0
+                && demand.ticket.revision == fence.obligations[0].1
+                && demand.cause == storage_sqlite::RecoveryCause::QueueLoss
+        }))
+    }
+
+    /// The bounded steady-state continuation for one EpochGap or QueueLoss
+    /// owner grant. Comparison-slot completion remains a separate path.
+    pub(crate) fn online_recovery_offload_eligible(
         &self,
         grant: &AttemptGrant,
     ) -> Result<bool, AppError> {
         let Some(plan) = grant.plan() else {
             return Ok(false);
         };
-        if grant.seam != marmot_forensics::EpochBackfillExecutionSeam::Receive
+        let cause = plan.first().map(|obligation| obligation.cause);
+        let eligible_seam = match cause {
+            Some(storage_sqlite::RecoveryCause::EpochGap) => {
+                grant.seam == marmot_forensics::EpochBackfillExecutionSeam::Receive
+            }
+            Some(storage_sqlite::RecoveryCause::QueueLoss) => matches!(
+                grant.seam,
+                marmot_forensics::EpochBackfillExecutionSeam::Receive
+                    | marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+            ),
+            _ => false,
+        };
+        if !eligible_seam
             || grant.comparison_revision.is_some()
             || plan.len() != 1
-            || plan[0].cause != storage_sqlite::RecoveryCause::EpochGap
             || grant.fence.obligations.len() != 1
             || grant.fence.obligations[0].0 != plan[0].id
-            || self.delivery_loss_blocks_cursor()
+            || (cause == Some(storage_sqlite::RecoveryCause::EpochGap)
+                && self.delivery_loss_blocks_cursor())
             || grant.inventory.is_empty()
             || grant.inventory.len() > TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
             || plan[0].scopes.iter().any(|scope| {
@@ -428,7 +601,7 @@ impl AppClient {
         Ok(storage.pending_recovery_demands()?.iter().any(|demand| {
             demand.ticket.id == grant.fence.obligations[0].0
                 && demand.ticket.revision == grant.fence.obligations[0].1
-                && demand.cause == storage_sqlite::RecoveryCause::EpochGap
+                && Some(demand.cause) == cause
         }))
     }
 
@@ -922,6 +1095,122 @@ mod tests {
             .unwrap();
     }
 
+    async fn arm_test_queue_loss(fixture: &mut Fixture) {
+        let baseline = fixture
+            .client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        fixture
+            .client
+            .execute_pending_epoch_backfill_grant(baseline)
+            .await
+            .unwrap();
+        fixture
+            .storage
+            .mark_account_delivery_recovery("alice", 7, 1)
+            .unwrap();
+        fixture
+            .storage
+            .synchronize_account_delivery_loss("alice")
+            .unwrap();
+        fixture.client.delivery_overflow_recovery_pending = true;
+        fixture.client.delivery_overflow_recovery_marker_token = Some(7);
+    }
+
+    #[tokio::test]
+    async fn queue_loss_zero_credit_preflight_and_same_grant_inline_fallback() {
+        let mut eligible = fixture_with_group_relays_and_comparison(None, false).await;
+        arm_test_queue_loss(&mut eligible).await;
+        let serial = eligible
+            .storage
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial;
+        assert!(
+            eligible
+                .client
+                .queue_loss_only_waiting_for_credit()
+                .unwrap()
+        );
+        assert_eq!(
+            eligible
+                .storage
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            serial
+        );
+        eligible
+            .client
+            .recovery_owner
+            .test_advance_clock(Duration::from_secs(300));
+        let grant = eligible
+            .client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Receive)
+            .unwrap()
+            .unwrap();
+        assert!(
+            eligible
+                .client
+                .online_recovery_offload_eligible(&grant)
+                .unwrap()
+        );
+
+        let relays = (0..5)
+            .map(|index| format!("wss://relay-{index}.example"))
+            .collect();
+        let mut over_cap = fixture_with_group_relays_and_comparison(Some(relays), false).await;
+        arm_test_queue_loss(&mut over_cap).await;
+        assert!(
+            !over_cap
+                .client
+                .queue_loss_only_waiting_for_credit()
+                .unwrap()
+        );
+        over_cap
+            .client
+            .recovery_owner
+            .test_advance_clock(Duration::from_secs(300));
+        let grant = over_cap
+            .client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Receive)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !over_cap
+                .client
+                .online_recovery_offload_eligible(&grant)
+                .unwrap()
+        );
+        let serial = grant.reservation.attempt_serial;
+        over_cap
+            .client
+            .execute_pending_epoch_backfill_grant(grant)
+            .await
+            .unwrap();
+        assert_eq!(
+            over_cap
+                .storage
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            serial,
+            "the ineligible shape executes the selected grant without another reservation"
+        );
+        assert!(
+            over_cap
+                .storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some(),
+            "an unfloored attempt without a coverage certificate retains the marker"
+        );
+    }
+
     #[tokio::test]
     async fn epoch_gap_zero_credit_preflight_preserves_inline_fallback() {
         let mut eligible = fixture_with_group_relays_and_comparison(None, false).await;
@@ -955,7 +1244,7 @@ mod tests {
         assert!(
             !eligible
                 .client
-                .epoch_gap_offload_eligible(&maintenance)
+                .online_recovery_offload_eligible(&maintenance)
                 .unwrap()
         );
 
@@ -974,7 +1263,12 @@ mod tests {
             .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Receive)
             .unwrap()
             .unwrap();
-        assert!(!over_cap.client.epoch_gap_offload_eligible(&grant).unwrap());
+        assert!(
+            !over_cap
+                .client
+                .online_recovery_offload_eligible(&grant)
+                .unwrap()
+        );
         let serial = grant.reservation.attempt_serial;
         over_cap
             .client

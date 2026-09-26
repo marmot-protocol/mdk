@@ -47,17 +47,17 @@ use crate::{
     AppDisbandRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppPreparedGroupImageUpload, AppProjectionUpdate, AppQuarantinedGroup, CanonicalCreatedGroup,
     ChatListUpdateTrigger, ClassifiedSyncFailure, ConvergenceScheduleState,
-    DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome, GroupInviteDeclineResult,
-    MaintenanceRunSummary, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, ReceivedMessage, RetentionSweepReport, SecureDeleteExpiredResult,
-    SendSummary, SyncSummary,
+    EpochBackfillRunOutcome, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
+    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
+    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use transport_nostr_adapter::SubscriptionAttempt;
 
 enum ComparisonRecoveryOrigin {
+    DirectOverflow,
     PeriodicMaintenance,
     PostConvergence {
         audit_tracker_update: bool,
@@ -86,8 +86,8 @@ struct OnlineEpochGapJob {
     submissions: Vec<RouteSubmission>,
     observation: Option<crate::product_analytics::ProductObservation>,
     backfill_armed: bool,
-    audit_tracker_update: bool,
-    retry_push_registration: bool,
+    phase: Option<Observation>,
+    origin: ComparisonRecoveryOrigin,
 }
 
 enum OnlineEpochGapIoCompletion {
@@ -1593,10 +1593,63 @@ async fn run_app_runtime_account_worker(
     let mut bounded_recovery: Option<bounded_recovery::Job> = None;
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let mut online_epoch_gap: Option<OnlineEpochGapJob> = None;
+    // Resume the original Receive continuation after an owned direct-overflow
+    // grant settles. In particular, an error must enter its reconnect arm.
+    let mut completed_direct_overflow: Option<Result<(SyncSummary, bool), AppError>> = None;
     let mut yield_to_bounded_admission = false;
     let mut bounded_probe_at = TokioInstant::now();
     let mut bounded_prepare_error_reported = false;
     'worker: loop {
+        #[cfg(test)]
+        let worker_pause = if comparison_recovery.is_none()
+            && online_epoch_gap.is_none()
+            && bounded_recovery.is_none()
+        {
+            shared
+                .next_worker_loop_pause
+                .lock()
+                .unwrap()
+                .take_if(|pause| pause.account_label == account_label)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(mut pause) = worker_pause {
+            let _ = pause.entered.send(());
+            while !*pause.release.borrow_and_update() {
+                if pause.release.changed().await.is_err() {
+                    break;
+                }
+            }
+            if let Some(group_id) = pause.arm_epoch_backfill.take() {
+                let epoch = client
+                    .group_mls_state(&group_id)
+                    .expect("test group exists")
+                    .epoch;
+                client.apply_backfill_decision(
+                    &group_id,
+                    epoch,
+                    crate::client::epoch_stall::BackfillDecision::Arm,
+                    marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+                );
+                assert!(client.has_pending_epoch_backfill());
+            }
+            if let Some(result) = pause.completed_direct_overflow.take() {
+                let resumed = finish_direct_overflow_recovery(
+                    &mut client,
+                    result,
+                    false,
+                    None,
+                    EpochBackfillReportContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
+                );
+                assert!(completed_direct_overflow.replace(resumed).is_none());
+            }
+        }
         // Activation is deliberately test-only until #1358 supplies and
         // qualifies the real backend. This is the actual worker dispatch seam:
         // the grant is captured here, while only the owned request crosses the
@@ -1605,6 +1658,7 @@ async fn run_app_runtime_account_worker(
             .bounded_group_recovery_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
         if bounded_enabled
+            && completed_direct_overflow.is_none()
             && bounded_recovery.is_none()
             && online_epoch_gap.is_none()
             && TokioInstant::now() >= bounded_probe_at
@@ -1650,6 +1704,7 @@ async fn run_app_runtime_account_worker(
             }
         }
         if let Some(job) = online_epoch_gap.as_mut()
+            && completed_direct_overflow.is_none()
             && job.network.is_none()
         {
             #[cfg(test)]
@@ -1684,7 +1739,7 @@ async fn run_app_runtime_account_worker(
                     .lock()
                     .unwrap()
                     .push("online_terminal");
-                finish_online_epoch_gap_receive(
+                completed_direct_overflow = finish_online_recovery(
                     &mut client,
                     job,
                     result,
@@ -1696,6 +1751,8 @@ async fn run_app_runtime_account_worker(
                         scheduled_push_retry: &mut scheduled_push_retry,
                         command_tx: &command_tx,
                     },
+                    &product_backlog,
+                    &mut scheduled_convergence,
                 )
                 .await;
                 continue 'worker;
@@ -1707,6 +1764,9 @@ async fn run_app_runtime_account_worker(
             comparison_recovery.is_some(),
             online_epoch_gap.is_some(),
         );
+        // `select!` is biased so the resumed Receive arm must outrank every
+        // non-shutdown branch until its original continuation has run.
+        let force_receive_continuation = completed_direct_overflow.is_some();
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -1719,10 +1779,10 @@ async fn run_app_runtime_account_worker(
                 }
                 break 'worker;
             }
-            _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() && online_epoch_gap.is_none() => {}
+            _ = tokio::time::sleep_until(bounded_probe_at), if !force_receive_continuation && bounded_enabled && bounded_recovery.is_none() && online_epoch_gap.is_none() => {}
             completed = async {
                 online_epoch_gap.as_mut().expect("online recovery exists").wait_io().await
-            }, if online_epoch_gap.as_ref().is_some_and(OnlineEpochGapJob::waiting) => {
+            }, if !force_receive_continuation && online_epoch_gap.as_ref().is_some_and(OnlineEpochGapJob::waiting) => {
                 match completed {
                     OnlineEpochGapIoCompletion::Network(Ok((credit, network))) => {
                         #[cfg(test)]
@@ -1769,7 +1829,7 @@ async fn run_app_runtime_account_worker(
                                     Err(error) => client.fail_online_epoch_gap(recovery, error).await,
                                     Ok(true) => unreachable!(),
                                 };
-                                finish_online_epoch_gap_receive(
+                                completed_direct_overflow = finish_online_recovery(
                                     &mut client, job, result,
                                     ReceiveTailContext {
                                         events: &events, account_id_hex: &account_id_hex,
@@ -1777,6 +1837,8 @@ async fn run_app_runtime_account_worker(
                                         scheduled_push_retry: &mut scheduled_push_retry,
                                         command_tx: &command_tx,
                                     },
+                                    &product_backlog,
+                                    &mut scheduled_convergence,
                                 ).await;
                             }
                         }
@@ -1792,7 +1854,7 @@ async fn run_app_runtime_account_worker(
                                 if error.is_panic() { "panicked" } else { "cancelled" },
                             )),
                         ).await;
-                        finish_online_epoch_gap_receive(
+                        completed_direct_overflow = finish_online_recovery(
                             &mut client, job, result,
                             ReceiveTailContext {
                                 events: &events, account_id_hex: &account_id_hex,
@@ -1800,6 +1862,8 @@ async fn run_app_runtime_account_worker(
                                 scheduled_push_retry: &mut scheduled_push_retry,
                                 command_tx: &command_tx,
                             },
+                            &product_backlog,
+                            &mut scheduled_convergence,
                         ).await;
                     }
                     OnlineEpochGapIoCompletion::Queue(Ok(submissions)) => {
@@ -1842,7 +1906,7 @@ async fn run_app_runtime_account_worker(
                         ).await;
                         #[cfg(test)]
                         shared.comparison_test_trace.lock().unwrap().push("online_terminal");
-                        finish_online_epoch_gap_receive(
+                        completed_direct_overflow = finish_online_recovery(
                             &mut client, job, result,
                             ReceiveTailContext {
                                 events: &events, account_id_hex: &account_id_hex,
@@ -1850,15 +1914,17 @@ async fn run_app_runtime_account_worker(
                                 scheduled_push_retry: &mut scheduled_push_retry,
                                 command_tx: &command_tx,
                             },
+                            &product_backlog,
+                            &mut scheduled_convergence,
                         ).await;
                     }
                 }
                 continue 'worker;
             }
-            _ = sleep(bounded_recovery::ADMISSION_YIELD_DELAY), if online_epoch_gap.as_ref().is_some_and(|job| job.network.is_none()) => {}
+            _ = sleep(bounded_recovery::ADMISSION_YIELD_DELAY), if !force_receive_continuation && online_epoch_gap.as_ref().is_some_and(|job| job.network.is_none()) => {}
             completed = async {
                 comparison_recovery.as_mut().expect("comparison task exists").network.wait().await
-            }, if comparison_recovery.is_some() => {
+            }, if !force_receive_continuation && comparison_recovery.is_some() => {
                 let job = comparison_recovery.take().expect("completed comparison task exists");
                 let result = match completed {
                     Ok((credit, network)) => {
@@ -1891,17 +1957,25 @@ async fn run_app_runtime_account_worker(
                         Ok(EpochBackfillRunOutcome::Deferred)
                     }
                 };
-                let _ = report_pending_epoch_backfill_result(
-                    &client,
-                    result, job.backfill_armed, job.observation,
-                    EpochBackfillReportContext {
-                        events: &events,
-                        account_id_hex: &account_id_hex,
-                        account_label: &account_label,
-                        shared: &shared,
-                    },
-                );
                 match job.origin {
+                    ComparisonRecoveryOrigin::DirectOverflow => {
+                        completed_direct_overflow = Some(finish_direct_overflow_recovery(
+                            &mut client, result, job.backfill_armed, job.observation,
+                            EpochBackfillReportContext {
+                                events: &events, account_id_hex: &account_id_hex,
+                                account_label: &account_label, shared: &shared,
+                            },
+                        ));
+                    }
+                    origin => {
+                        let _ = report_pending_epoch_backfill_result(
+                            &client, result, job.backfill_armed, job.observation,
+                            EpochBackfillReportContext {
+                                events: &events, account_id_hex: &account_id_hex,
+                                account_label: &account_label, shared: &shared,
+                            },
+                        );
+                        match origin {
                     ComparisonRecoveryOrigin::PeriodicMaintenance => {
                         finish_periodic_maintenance_after_recovery(
                             &mut client, &events, &account_id_hex, &account_label,
@@ -1932,6 +2006,9 @@ async fn run_app_runtime_account_worker(
                         )
                         .await;
                     }
+                    ComparisonRecoveryOrigin::DirectOverflow => unreachable!(),
+                        }
+                    }
                 }
                 if let Some(phase) = job.phase {
                     phase.finish(TelemetryOutcome::Success);
@@ -1939,7 +2016,7 @@ async fn run_app_runtime_account_worker(
             }
             completed = async {
                 bounded_recovery.as_mut().expect("bounded task exists").wait().await
-            }, if bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
+            }, if !force_receive_continuation && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
                 let job = bounded_recovery.as_mut().expect("bounded task exists");
                 job.accept(completed);
                 #[cfg(test)]
@@ -1960,7 +2037,7 @@ async fn run_app_runtime_account_worker(
                     .as_mut()
                     .expect("Welcome recovery branch requires a live task");
                 (&mut recovery.handle).await
-            }, if welcome_recovery.is_some() => {
+            }, if !force_receive_continuation && welcome_recovery.is_some() => {
                 let mut recovery = welcome_recovery
                     .take()
                     .expect("completed Welcome recovery task must still be owned");
@@ -1987,7 +2064,7 @@ async fn run_app_runtime_account_worker(
                 }
             }
             // Consume completed blobs before admitting more commands.
-            done = media_http_rx.recv() => {
+            done = media_http_rx.recv(), if !force_receive_continuation => {
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
@@ -2008,7 +2085,8 @@ async fn run_app_runtime_account_worker(
                     Some(command) => Some((command, true)),
                     None => commands.recv().await.map(|command| (command, false)),
                 }
-            }, if (online_epoch_gap.is_some() || !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
+            }, if !force_receive_continuation
+                && (online_epoch_gap.is_some() || !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
                 && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
                 yield_to_bounded_admission = true;
@@ -2111,7 +2189,7 @@ async fn run_app_runtime_account_worker(
                     None => break 'worker,
                 }
             }
-            _ = scheduled_convergence.timer.as_mut(), if (!yield_to_bounded_admission
+            _ = scheduled_convergence.timer.as_mut(), if !force_receive_continuation && (!yield_to_bounded_admission
                 || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready))
                 && online_epoch_gap.is_none()
                 && !scheduled_convergence_held_for_test(&account_id_hex) => {
@@ -2228,8 +2306,23 @@ async fn run_app_runtime_account_worker(
                                                     });
                                                     return;
                                                 }
+                                                PendingComparisonExecution::OnlineEpochGap { recovery, network } => {
+                                                    online_epoch_gap = Some(OnlineEpochGapJob {
+                                                        recovery: Some(*recovery),
+                                                        network: Some(network),
+                                                        queue: None,
+                                                        credit: None,
+                                                        submissions: Vec::new(),
+                                                        observation,
+                                                        backfill_armed,
+                                                        phase: Some(phase.take().expect("scheduled phase exists")),
+                                                        origin: ComparisonRecoveryOrigin::PostConvergence {
+                                                            audit_tracker_update,
+                                                        },
+                                                    });
+                                                    return;
+                                                }
                                                 PendingComparisonExecution::Inline(result) => result,
-                                                PendingComparisonExecution::OnlineEpochGap { .. } => unreachable!("maintenance does not offload an online Receive grant"),
                                             }
                                         };
                                         let _ = report_pending_epoch_backfill_result(
@@ -2283,7 +2376,7 @@ async fn run_app_runtime_account_worker(
                     phase.finish(TelemetryOutcome::Success);
                 }
             }
-            _ = async {}, if yield_to_bounded_admission
+            _ = async {}, if !force_receive_continuation && yield_to_bounded_admission
                 && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)
                 && !bounded_admission_test_paused(&shared, bounded_recovery.as_ref()) => {
                 let job = bounded_recovery.as_mut().expect("bounded admission job exists");
@@ -2329,14 +2422,23 @@ async fn run_app_runtime_account_worker(
                     std::future::pending::<()>().await;
                 }
                 sleep(bounded_recovery::ADMISSION_YIELD_DELAY).await;
-            }, if !yield_to_bounded_admission
+            }, if !force_receive_continuation && !yield_to_bounded_admission
                 && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
                 yield_to_bounded_admission = true;
             }
-            received = client.receive_next_delivery(), if online_epoch_gap.as_ref().is_none_or(|job| job.network.is_some()) => {
+            received = async {
+                if let Some(result) = completed_direct_overflow.take() {
+                    (Some(result), None)
+                } else {
+                    (None, Some(client.receive_next_delivery().await))
+                }
+            }, if force_receive_continuation || online_epoch_gap.as_ref().is_none_or(|job| job.network.is_some()) => {
+                let (completed_overflow, received) = received;
+                #[cfg(test)]
+                let resumed_direct_overflow = completed_overflow.is_some();
                 yield_to_bounded_admission = true;
                 #[cfg(test)]
-                if let Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) = &received
+                if let Some(Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery))) = &received
                     && let (Ok(event_id), Some(subscription_id)) = (
                         <[u8; 32]>::try_from(delivery.message.id.as_slice()),
                         delivery.source.subscription_id.as_ref(),
@@ -2361,43 +2463,72 @@ async fn run_app_runtime_account_worker(
                 // delivery has been claimed, finish ingest + incidental
                 // publish + projection as one uncancelled worker operation;
                 // commands remain queued until that durable sequence lands.
-                let delivery_started = matches!(&received, Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(_)))
+                let delivery_started = matches!(&received, Some(Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(_))))
                     .then(Instant::now);
                 let receive_observation = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReceive);
-                let (result, overflow_recovery_incomplete) = match received {
+                let (result, overflow_recovery_incomplete) = if let Some(result) = completed_overflow {
+                    match result {
+                        Ok((summary, incomplete)) => (Ok(summary), incomplete),
+                        Err(error) => (Err(error), false),
+                    }
+                } else { match received.expect("relay receive or completed overflow exists") {
                     Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
                         (client.ingest_received_delivery(*delivery).await, false)
                     }
                     Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(_)) => {
-                        match client.recover_delivery_overflow().await {
-                            Ok(DeliveryOverflowRecoveryOutcome::Completed(summary)) => {
-                                (Ok(summary), false)
+                        let backfill_armed = client.has_pending_epoch_backfill();
+                        let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                            crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
+                        )).flatten();
+                        match execute_pending_comparison_or_inline(
+                            &mut client,
+                            &shared,
+                            EpochBackfillExecutionSeam::Receive,
+                        ).await {
+                            PendingComparisonExecution::OnlineEpochGap { recovery, network } => {
+                                online_epoch_gap = Some(OnlineEpochGapJob {
+                                    recovery: Some(*recovery),
+                                    network: Some(network),
+                                    queue: None,
+                                    credit: None,
+                                    submissions: Vec::new(),
+                                    observation,
+                                    backfill_armed,
+                                    phase: None,
+                                    origin: ComparisonRecoveryOrigin::DirectOverflow,
+                                });
+                                receive_observation.finish_app(&Ok(SyncSummary::default()));
+                                continue 'worker;
                             }
-                            Ok(DeliveryOverflowRecoveryOutcome::Incomplete(summary)) => {
-                                publish_app_runtime_account_error(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    "account delivery overflow recovery incomplete".to_owned(),
-                                );
-                                // The durable marker remains armed. Keep the
-                                // account session available and let the next
-                                // receive/catch-up seam retry the replay.
-                                (Ok(summary), true)
+                            PendingComparisonExecution::Offloaded { grant, subscription_attempt, network } => {
+                                comparison_recovery = Some(ComparisonRecoveryJob {
+                                    grant: *grant,
+                                    subscription_attempt,
+                                    network,
+                                    observation,
+                                    backfill_armed,
+                                    phase: None,
+                                    origin: ComparisonRecoveryOrigin::DirectOverflow,
+                                });
+                                receive_observation.finish_app(&Ok(SyncSummary::default()));
+                                continue 'worker;
                             }
-                            Err(failure) => {
-                                publish_app_runtime_summary_with_v5(&client,
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    &failure.partial_summary,
-                                );
-                                (Err(failure.source), false)
+                            PendingComparisonExecution::Inline(result) => {
+                                match finish_direct_overflow_recovery(
+                                    &mut client, result, backfill_armed, observation,
+                                    EpochBackfillReportContext {
+                                        events: &events, account_id_hex: &account_id_hex,
+                                        account_label: &account_label, shared: &shared,
+                                    },
+                                ) {
+                                    Ok((summary, incomplete)) => (Ok(summary), incomplete),
+                                    Err(error) => (Err(error), false),
+                                }
                             }
                         }
                     }
                     Err(err) => (Err(err), false),
-                };
+                }};
                 if result.is_err() && let Some(started) = delivery_started {
                     shared.app_performance_telemetry().record(
                         AppPerformanceOperation::InboundDeliveryProjection,
@@ -2491,8 +2622,11 @@ async fn run_app_runtime_account_worker(
                                             submissions: Vec::new(),
                                             observation,
                                             backfill_armed,
-                                            audit_tracker_update,
-                                            retry_push_registration,
+                                            phase: None,
+                                            origin: ComparisonRecoveryOrigin::Receive {
+                                                audit_tracker_update,
+                                                retry_push_registration,
+                                            },
                                         });
                                         continue 'worker;
                                     }
@@ -2510,9 +2644,19 @@ async fn run_app_runtime_account_worker(
                                     }
                                 }
                             } else {
-                                // Completed account-wide overflow replay keeps
-                                // its existing inline Receive seam and marker
-                                // contract; it is outside this comparison slice.
+                                // A completed overflow has released its grant.
+                                // This original Receive follow-up may select
+                                // newly pending debt discovered during replay;
+                                // incomplete/deferred recovery stays above.
+                                #[cfg(test)]
+                                if resumed_direct_overflow {
+                                    let kind = if client.has_pending_epoch_backfill() {
+                                        "direct_overflow_followup_pending"
+                                    } else {
+                                        "direct_overflow_followup"
+                                    };
+                                    shared.comparison_test_trace.lock().unwrap().push(kind);
+                                }
                                 let _ = run_pending_epoch_backfill_reporting_arm(
                                     &mut client, &events, &account_id_hex,
                                     &account_label, &shared, EpochBackfillExecutionSeam::Receive,
@@ -2531,8 +2675,16 @@ async fn run_app_runtime_account_worker(
                             },
                             audit_tracker_update, retry_push_registration,
                         ).await;
+                        #[cfg(test)]
+                        if resumed_direct_overflow {
+                            shared.comparison_test_trace.lock().unwrap().push("direct_overflow_receive_tail");
+                        }
                     }
                     Err(err) => {
+                        #[cfg(test)]
+                        if resumed_direct_overflow {
+                            shared.comparison_test_trace.lock().unwrap().push("direct_overflow_receive_reconnect");
+                        }
                         publish_app_runtime_account_error(
                             &events,
                             &account_id_hex,
@@ -2974,8 +3126,21 @@ async fn run_app_runtime_account_worker(
                         });
                         continue 'worker;
                     }
+                    PendingComparisonExecution::OnlineEpochGap { recovery, network } => {
+                        online_epoch_gap = Some(OnlineEpochGapJob {
+                            recovery: Some(*recovery),
+                            network: Some(network),
+                            queue: None,
+                            credit: None,
+                            submissions: Vec::new(),
+                            observation,
+                            backfill_armed,
+                            phase: Some(phase),
+                            origin: ComparisonRecoveryOrigin::PeriodicMaintenance,
+                        });
+                        continue 'worker;
+                    }
                     PendingComparisonExecution::Inline(result) => result,
-                    PendingComparisonExecution::OnlineEpochGap { .. } => unreachable!("maintenance does not offload an online Receive grant"),
                 };
                 let _ = report_pending_epoch_backfill_result(
                     &client,
@@ -3016,9 +3181,9 @@ async fn run_app_runtime_account_worker(
     }
 }
 
-/// Select one existing owner grant, then move only an eligible comparison's
-/// immutable SDK request to the shared worker job. Other frozen shapes execute
-/// through the original inline path without reserving a replacement grant.
+/// Select one existing owner grant, then move only an eligible comparison,
+/// EpochGap, or QueueLoss immutable SDK request to the shared worker job.
+/// Other frozen shapes execute inline without a replacement reservation.
 async fn execute_pending_comparison_or_inline(
     client: &mut AppClient,
     shared: &RuntimeSharedServices,
@@ -3028,7 +3193,8 @@ async fn execute_pending_comparison_or_inline(
     let selection = if credit.is_none()
         && (client.comparison_only_waiting_for_credit().unwrap_or(false)
             || (seam == EpochBackfillExecutionSeam::Receive
-                && client.epoch_gap_only_waiting_for_credit().unwrap_or(false)))
+                && client.epoch_gap_only_waiting_for_credit().unwrap_or(false))
+            || client.queue_loss_only_waiting_for_credit().unwrap_or(false))
     {
         Ok(crate::client::PendingRecoverySelection::Deferred)
     } else {
@@ -3039,15 +3205,16 @@ async fn execute_pending_comparison_or_inline(
             let grant = *grant;
             let eligible =
                 credit.is_some() && client.comparison_offload_eligible(&grant).unwrap_or(false);
-            let online_epoch_gap = seam == EpochBackfillExecutionSeam::Receive
-                && credit.is_some()
-                && client.epoch_gap_offload_eligible(&grant).unwrap_or(false);
+            let online_recovery = credit.is_some()
+                && client
+                    .online_recovery_offload_eligible(&grant)
+                    .unwrap_or(false);
             #[cfg(test)]
             shared
                 .comparison_test_trace
                 .lock()
                 .unwrap()
-                .push(if eligible || online_epoch_gap {
+                .push(if eligible || online_recovery {
                     "grant_eligible"
                 } else {
                     "grant_inline"
@@ -3101,7 +3268,7 @@ async fn execute_pending_comparison_or_inline(
                         PendingComparisonExecution::Inline(Err(error))
                     }
                 }
-            } else if online_epoch_gap {
+            } else if online_recovery {
                 match client.begin_online_epoch_gap(grant).await {
                     Ok(recovery) => {
                         #[cfg(test)]
@@ -6780,34 +6947,142 @@ async fn finish_receive_after_recovery(
     }
 }
 
-async fn finish_online_epoch_gap_receive(
+/// Return an owned overflow result to the original Receive arm. Its common
+/// continuation publishes the summary and projection buffer, starts visible
+/// post-join work, schedules convergence, and handles errors by reconnecting.
+fn finish_direct_overflow_recovery(
+    client: &mut AppClient,
+    result: Result<EpochBackfillRunOutcome, AppError>,
+    backfill_armed: bool,
+    observation: Option<crate::product_analytics::ProductObservation>,
+    context: EpochBackfillReportContext<'_>,
+) -> Result<(SyncSummary, bool), AppError> {
+    if let Some(observation) = observation {
+        observation.finish(match &result {
+            Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
+            Ok(EpochBackfillRunOutcome::Incomplete(_)) => "partial",
+            Ok(EpochBackfillRunOutcome::Deferred) => "deferred",
+            Ok(EpochBackfillRunOutcome::NotPending) => "no_work_due",
+            Err(_) => "failure",
+        });
+    }
+    if backfill_armed {
+        context
+            .shared
+            .schedule_audit_log_tracker_update("epoch_backfill_armed");
+    }
+    match result {
+        Ok(EpochBackfillRunOutcome::Completed(summary)) => Ok((summary, false)),
+        Ok(EpochBackfillRunOutcome::Incomplete(summary)) => {
+            publish_app_runtime_account_error(
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                "account delivery overflow recovery incomplete".to_owned(),
+            );
+            Ok((summary, true))
+        }
+        // Deferred retains the original debt; the next seam retries it.
+        Ok(EpochBackfillRunOutcome::Deferred) => Ok((SyncSummary::default(), true)),
+        // No pending grant is a completed no-op, so retain the original
+        // post-overflow Receive follow-up for any newly observed intent.
+        Ok(EpochBackfillRunOutcome::NotPending) => Ok((SyncSummary::default(), false)),
+        Err(error) => {
+            let partial = std::mem::take(&mut client.pending_failed_sync_summary);
+            publish_app_runtime_summary_with_v5(
+                client,
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                &partial,
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn finish_online_recovery(
     client: &mut AppClient,
     job: OnlineEpochGapJob,
     result: Result<EpochBackfillRunOutcome, AppError>,
     context: ReceiveTailContext<'_>,
-) {
-    // The job keeps its shared credit until reporting and the Receive tail
-    // have finished. No other account owner can adopt this grant meanwhile.
+    product_backlog: &crate::product_analytics::ProductBacklogSource,
+    scheduled_convergence: &mut ScheduledConvergence,
+) -> Option<Result<(SyncSummary, bool), AppError>> {
+    // The job keeps its shared credit through reporting and its original
+    // Receive/Maintenance tail. No other owner can adopt the grant meanwhile.
     let _credit = job.credit;
-    let _ = report_pending_epoch_backfill_result(
-        client,
-        result,
-        job.backfill_armed,
-        job.observation,
-        EpochBackfillReportContext {
-            events: context.events,
-            account_id_hex: context.account_id_hex,
-            account_label: context.account_label,
-            shared: context.shared,
-        },
-    );
-    finish_receive_after_recovery(
-        client,
-        context,
-        job.audit_tracker_update,
-        job.retry_push_registration,
-    )
-    .await;
+    let mut completed_overflow = None;
+    match job.origin {
+        ComparisonRecoveryOrigin::DirectOverflow => {
+            completed_overflow = Some(finish_direct_overflow_recovery(
+                client,
+                result,
+                job.backfill_armed,
+                job.observation,
+                EpochBackfillReportContext {
+                    events: context.events,
+                    account_id_hex: context.account_id_hex,
+                    account_label: context.account_label,
+                    shared: context.shared,
+                },
+            ));
+        }
+        origin => {
+            let _ = report_pending_epoch_backfill_result(
+                client,
+                result,
+                job.backfill_armed,
+                job.observation,
+                EpochBackfillReportContext {
+                    events: context.events,
+                    account_id_hex: context.account_id_hex,
+                    account_label: context.account_label,
+                    shared: context.shared,
+                },
+            );
+            match origin {
+                ComparisonRecoveryOrigin::Receive {
+                    audit_tracker_update,
+                    retry_push_registration,
+                } => {
+                    finish_receive_after_recovery(
+                        client,
+                        context,
+                        audit_tracker_update,
+                        retry_push_registration,
+                    )
+                    .await;
+                }
+                ComparisonRecoveryOrigin::PostConvergence {
+                    audit_tracker_update,
+                } => {
+                    if audit_tracker_update {
+                        context
+                            .shared
+                            .schedule_audit_log_tracker_update("scheduled_convergence");
+                    }
+                }
+                ComparisonRecoveryOrigin::PeriodicMaintenance => {
+                    finish_periodic_maintenance_after_recovery(
+                        client,
+                        context.events,
+                        context.account_id_hex,
+                        context.account_label,
+                        context.shared,
+                        product_backlog,
+                        scheduled_convergence,
+                    )
+                    .await;
+                }
+                ComparisonRecoveryOrigin::DirectOverflow => unreachable!(),
+            }
+        }
+    }
+    if let Some(phase) = job.phase {
+        phase.finish(TelemetryOutcome::Success);
+    }
+    completed_overflow
 }
 
 fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
@@ -7357,6 +7632,8 @@ mod tests {
     use std::sync::Arc;
 
     #[cfg(feature = "test-policy-overrides")]
+    mod automatic_delivery_loss_recovery_tests;
+    #[cfg(feature = "test-policy-overrides")]
     mod integrated_recovery_acceptance_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod online_epoch_gap_recovery_tests;
@@ -7392,6 +7669,257 @@ mod tests {
             kind,
             phase,
         }
+    }
+
+    #[tokio::test]
+    async fn owned_direct_overflow_resumes_receive_visibility_tail_and_error_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let runtime = super::super::MarmotAppRuntime::new(app);
+        runtime.reconcile_accounts().await.unwrap();
+        let group_id = runtime
+            .create_group("alice", "tail", &[], None)
+            .await
+            .unwrap();
+        let commands = runtime.accounts().worker_commands("alice").await.unwrap();
+        let mut events = runtime.subscribe();
+        let trace = runtime.shared_services().comparison_test_trace;
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = watch::channel(false);
+        *runtime
+            .shared_services()
+            .next_worker_loop_pause
+            .lock()
+            .unwrap() = Some(crate::runtime::WorkerLoopPause {
+            account_label: "alice".to_owned(),
+            entered: entered_tx,
+            release: release_rx,
+            completed_direct_overflow: Some(Ok(EpochBackfillRunOutcome::Completed(SyncSummary {
+                joined_groups: vec![group_id.clone()],
+                ..Default::default()
+            }))),
+            arm_epoch_backfill: None,
+        });
+        let (respond, _) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        release_tx.send(true).unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(events.recv().await,
+                    Ok(MarmotAppEvent::GroupJoined { group_id: joined, .. }) if joined == group_id)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("resumed overflow summary becomes visible");
+        timeout(Duration::from_secs(15), async {
+            while !trace
+                .lock()
+                .unwrap()
+                .contains(&"direct_overflow_receive_tail")
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the complete Receive success tail runs");
+        assert!(
+            trace.lock().unwrap().contains(&"direct_overflow_followup"),
+            "completed owned overflow must run the pending Receive follow-up"
+        );
+
+        trace.lock().unwrap().clear();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = watch::channel(false);
+        *runtime
+            .shared_services()
+            .next_worker_loop_pause
+            .lock()
+            .unwrap() = Some(crate::runtime::WorkerLoopPause {
+            account_label: "alice".to_owned(),
+            entered: entered_tx,
+            release: release_rx,
+            completed_direct_overflow: Some(Ok(EpochBackfillRunOutcome::Incomplete(
+                SyncSummary::default(),
+            ))),
+            arm_epoch_backfill: None,
+        });
+        let (respond, _) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        release_tx.send(true).unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(events.recv().await,
+                    Ok(MarmotAppEvent::AccountError(error))
+                        if error.message == "account delivery overflow recovery incomplete")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("incomplete owned recovery publishes its warning");
+        timeout(Duration::from_secs(5), async {
+            while !trace
+                .lock()
+                .unwrap()
+                .contains(&"direct_overflow_receive_tail")
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("incomplete recovery still runs the Receive visibility tail");
+        assert!(
+            !trace.lock().unwrap().contains(&"direct_overflow_followup"),
+            "incomplete owned overflow must keep its debt for a later seam"
+        );
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = watch::channel(false);
+        *runtime
+            .shared_services()
+            .next_worker_loop_pause
+            .lock()
+            .unwrap() = Some(crate::runtime::WorkerLoopPause {
+            account_label: "alice".to_owned(),
+            entered: entered_tx,
+            release: release_rx,
+            completed_direct_overflow: Some(Err(AppError::BlockingTask("test failure".into()))),
+            arm_epoch_backfill: None,
+        });
+        let (respond, _) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        release_tx.send(true).unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(events.recv().await,
+                    Ok(MarmotAppEvent::AccountError(error))
+                        if error.message.starts_with("runtime receive failed:"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("resumed overflow error enters Receive reconnect arm");
+        assert!(
+            trace
+                .lock()
+                .unwrap()
+                .contains(&"direct_overflow_receive_reconnect")
+        );
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    timeout(
+                        Duration::from_secs(1),
+                        runtime.group_mls_state("alice", &group_id)
+                    )
+                    .await,
+                    Ok(Ok(_))
+                ) {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the failed Receive arm reopens the account session");
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_owned_overflow_runs_followup_with_new_epoch_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        let group_id = runtime
+            .create_group("alice", "follow-up", &[], None)
+            .await
+            .unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let serial_before = storage.recovery_retry_state().unwrap().attempt_serial;
+        let commands = runtime.accounts().worker_commands("alice").await.unwrap();
+        let trace = runtime.shared_services().comparison_test_trace;
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = watch::channel(false);
+        *runtime
+            .shared_services()
+            .next_worker_loop_pause
+            .lock()
+            .unwrap() = Some(crate::runtime::WorkerLoopPause {
+            account_label: "alice".to_owned(),
+            entered: entered_tx,
+            release: release_rx,
+            completed_direct_overflow: Some(Ok(EpochBackfillRunOutcome::Completed(
+                SyncSummary::default(),
+            ))),
+            arm_epoch_backfill: Some(group_id.clone()),
+        });
+        let (respond, _) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus { group_id, respond })
+            .unwrap();
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        release_tx.send(true).unwrap();
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if trace
+                    .lock()
+                    .unwrap()
+                    .contains(&"direct_overflow_followup_pending")
+                    && storage.recovery_retry_state().unwrap().attempt_serial > serial_before
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed overflow must select newly pending epoch debt");
+        runtime.shutdown_and_close().await.unwrap();
     }
 
     #[tokio::test]

@@ -189,9 +189,7 @@ pub use cgka_traits::{
     PollProjection, PollType,
 };
 pub use client::AppClient;
-pub(crate) use client::{
-    ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
-};
+pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
     AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,

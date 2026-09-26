@@ -8,10 +8,11 @@ publish.workspace = true
 [features]
 default = []
 product-analytics-export = []
-# Test-only convergence timing/rewind overrides. Never enable in app artifacts.
+# Test-only convergence overrides and aggregate recovery diagnostics. Never enable in app artifacts.
 test-policy-overrides = [
     "cgka-engine/test-policy-overrides",
     "cgka-session/test-policy-overrides",
+    "transport-nostr-adapter/test-policy-overrides",
 ]
 # Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
 # privacy-critical mapping and opt-in gate stay in the default build; this

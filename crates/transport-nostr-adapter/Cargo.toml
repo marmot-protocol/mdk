@@ -9,6 +9,8 @@ description = "Nostr transport adapter for Marmot CGKA transport messages."
 [features]
 default = []
 sdk = ["dep:nostr-sdk"]
+# Aggregate comparison-branch evidence for app recovery fixtures only.
+test-policy-overrides = []
 
 [dependencies]
 async-trait.workspace = true
