@@ -35,8 +35,9 @@ use super::{
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::recovery::AttemptGrant;
 use crate::client::{
-    ComparisonNetworkJob, CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish,
-    PreparedGroupImageUploadStart,
+    ComparisonNetworkJob, ComparisonNetworkResult, CompletedWelcomeDeliveryRecovery,
+    EncryptedMediaUploadFinish, EpochGapQueueJob, OnlineEpochGapRecovery,
+    PreparedGroupImageUploadStart, RouteSubmission,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -77,6 +78,43 @@ struct ComparisonRecoveryJob {
     origin: ComparisonRecoveryOrigin,
 }
 
+struct OnlineEpochGapJob {
+    recovery: Option<OnlineEpochGapRecovery>,
+    network: Option<ComparisonNetworkJob>,
+    queue: Option<EpochGapQueueJob>,
+    credit: Option<Arc<OwnedSemaphorePermit>>,
+    submissions: Vec<RouteSubmission>,
+    observation: Option<crate::product_analytics::ProductObservation>,
+    backfill_armed: bool,
+    audit_tracker_update: bool,
+    retry_push_registration: bool,
+}
+
+enum OnlineEpochGapIoCompletion {
+    Network(Result<(OwnedSemaphorePermit, ComparisonNetworkResult), tokio::task::JoinError>),
+    Queue(Result<Vec<RouteSubmission>, tokio::task::JoinError>),
+}
+
+impl OnlineEpochGapJob {
+    fn waiting(&self) -> bool {
+        self.network.is_some() || self.queue.is_some()
+    }
+
+    async fn wait_io(&mut self) -> OnlineEpochGapIoCompletion {
+        if let Some(network) = self.network.as_mut() {
+            OnlineEpochGapIoCompletion::Network(network.wait().await)
+        } else {
+            OnlineEpochGapIoCompletion::Queue(
+                self.queue
+                    .as_mut()
+                    .expect("online queue exists")
+                    .wait()
+                    .await,
+            )
+        }
+    }
+}
+
 /// The initial sync can return the same frozen comparison grant to its worker
 /// while the immutable SDK request runs. The live client stays with the worker
 /// until the bounded result is admitted and the startup summary is finished.
@@ -96,6 +134,10 @@ enum PendingComparisonExecution {
     Offloaded {
         grant: Box<AttemptGrant>,
         subscription_attempt: SubscriptionAttempt,
+        network: ComparisonNetworkJob,
+    },
+    OnlineEpochGap {
+        recovery: Box<OnlineEpochGapRecovery>,
         network: ComparisonNetworkJob,
     },
     Inline(Result<EpochBackfillRunOutcome, AppError>),
@@ -555,6 +597,10 @@ impl AccountWorkerCommand {
         )
     }
 
+    fn allowed_during_online_epoch_gap(&self) -> bool {
+        self.readable_during_comparison_catch_up() || matches!(self, Self::SendMessage { .. })
+    }
+
     fn needs_media_slot(&self) -> bool {
         match self {
             Self::UploadPreparedGroupImage { .. }
@@ -822,6 +868,12 @@ async fn run_app_runtime_account_worker(
             .and_then(|target| {
                 (target.account_label == account_label).then(|| target.sink.clone())
             });
+        client.test_recovery_phase_witness = shared
+            .recovery_phase_witness
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(label, witness)| (label == &account_label).then(|| witness.clone()));
     }
     let mut scheduled_convergence = ScheduledConvergence::with_test_delay(
         convergence_settlement_delay(&app),
@@ -1429,7 +1481,7 @@ async fn run_app_runtime_account_worker(
         })
         .collect::<VecDeque<_>>();
     // Skip only media waiting for capacity; retain FIFO order among the rest.
-    while let Some(index) = ready_command_index(&pending, &media_http, false) {
+    while let Some(index) = ready_command_index(&pending, &media_http, false, false) {
         let command = pending
             .remove(index)
             .expect("selected pending command exists");
@@ -1540,6 +1592,7 @@ async fn run_app_runtime_account_worker(
     let mut yield_to_convergence = false;
     let mut bounded_recovery: Option<bounded_recovery::Job> = None;
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
+    let mut online_epoch_gap: Option<OnlineEpochGapJob> = None;
     let mut yield_to_bounded_admission = false;
     let mut bounded_probe_at = TokioInstant::now();
     let mut bounded_prepare_error_reported = false;
@@ -1551,7 +1604,10 @@ async fn run_app_runtime_account_worker(
         let bounded_enabled = shared
             .bounded_group_recovery_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
-        if bounded_enabled && bounded_recovery.is_none() && TokioInstant::now() >= bounded_probe_at
+        if bounded_enabled
+            && bounded_recovery.is_none()
+            && online_epoch_gap.is_none()
+            && TokioInstant::now() >= bounded_probe_at
         {
             let now = TokioInstant::now();
             bounded_probe_at = now + bounded_recovery::PROBE_INTERVAL;
@@ -1593,8 +1649,64 @@ async fn run_app_runtime_account_worker(
                 }
             }
         }
-        let ready_command =
-            ready_command_index(&pending, &media_http, comparison_recovery.is_some());
+        if let Some(job) = online_epoch_gap.as_mut()
+            && job.network.is_none()
+        {
+            #[cfg(test)]
+            shared
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .push("online_drain_slice");
+            let admission_complete = job.queue.is_none();
+            let drained = client
+                .online_epoch_gap_drain_slice(
+                    job.recovery.as_mut().expect("online grant exists"),
+                    admission_complete,
+                )
+                .await;
+            if !matches!(drained, Ok(None)) {
+                let mut job = online_epoch_gap.take().expect("online drain exists");
+                if let Some(queue) = job.queue.take() {
+                    job.credit = Some(queue.abort_and_wait().await);
+                }
+                let recovery = job.recovery.take().expect("online grant exists");
+                let result = client
+                    .finish_online_epoch_gap(
+                        recovery,
+                        drained.map(|done| done.expect("terminal drain result")),
+                        std::mem::take(&mut job.submissions),
+                    )
+                    .await;
+                #[cfg(test)]
+                shared
+                    .comparison_test_trace
+                    .lock()
+                    .unwrap()
+                    .push("online_terminal");
+                finish_online_epoch_gap_receive(
+                    &mut client,
+                    job,
+                    result,
+                    ReceiveTailContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                        scheduled_push_retry: &mut scheduled_push_retry,
+                        command_tx: &command_tx,
+                    },
+                )
+                .await;
+                continue 'worker;
+            }
+        }
+        let ready_command = ready_command_index(
+            &pending,
+            &media_http,
+            comparison_recovery.is_some(),
+            online_epoch_gap.is_some(),
+        );
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -1608,6 +1720,138 @@ async fn run_app_runtime_account_worker(
                 break 'worker;
             }
             _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
+            completed = async {
+                online_epoch_gap.as_mut().expect("online recovery exists").wait_io().await
+            }, if online_epoch_gap.as_ref().is_some_and(OnlineEpochGapJob::waiting) => {
+                match completed {
+                    OnlineEpochGapIoCompletion::Network(Ok((credit, network))) => {
+                        #[cfg(test)]
+                        shared
+                            .comparison_test_trace
+                            .lock()
+                            .unwrap()
+                            .extend(network.outcome_kinds_for_test());
+                        let job = online_epoch_gap.as_mut().expect("online network exists");
+                        job.network.take();
+                        match client
+                            .online_epoch_gap_network_stable(
+                                job.recovery.as_ref().expect("online grant exists"),
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                client.online_epoch_gap_start_drain(
+                                    job.recovery.as_mut().expect("online grant exists"),
+                                );
+                                job.queue = Some(EpochGapQueueJob::start(
+                                    &client,
+                                    network,
+                                    credit,
+                                    #[cfg(test)]
+                                    shared
+                                        .comparison_activity_witness
+                                        .lock()
+                                        .unwrap()
+                                        .as_ref()
+                                        .and_then(|(label, witness)| {
+                                            (label == &client.state.label).then(|| witness.clone())
+                                        }),
+                                ));
+                                #[cfg(test)]
+                                shared.comparison_test_trace.lock().unwrap().push("online_queue_started");
+                            }
+                            stable => {
+                                let mut job = online_epoch_gap.take().expect("online network exists");
+                                job.credit = Some(Arc::new(credit));
+                                let recovery = job.recovery.take().expect("online grant exists");
+                                let result = match stable {
+                                    Ok(false) => client.abandon_online_epoch_gap(recovery),
+                                    Err(error) => client.fail_online_epoch_gap(recovery, error).await,
+                                    Ok(true) => unreachable!(),
+                                };
+                                finish_online_epoch_gap_receive(
+                                    &mut client, job, result,
+                                    ReceiveTailContext {
+                                        events: &events, account_id_hex: &account_id_hex,
+                                        account_label: &account_label, shared: &shared,
+                                        scheduled_push_retry: &mut scheduled_push_retry,
+                                        command_tx: &command_tx,
+                                    },
+                                ).await;
+                            }
+                        }
+                    }
+                    OnlineEpochGapIoCompletion::Network(Err(error)) => {
+                        let mut job = online_epoch_gap.take().expect("online network exists");
+                        job.network.take();
+                        let recovery = job.recovery.take().expect("online grant exists");
+                        let result = client.fail_online_epoch_gap(
+                            recovery,
+                            AppError::BlockingTask(format!(
+                                "online recovery network task {}",
+                                if error.is_panic() { "panicked" } else { "cancelled" },
+                            )),
+                        ).await;
+                        finish_online_epoch_gap_receive(
+                            &mut client, job, result,
+                            ReceiveTailContext {
+                                events: &events, account_id_hex: &account_id_hex,
+                                account_label: &account_label, shared: &shared,
+                                scheduled_push_retry: &mut scheduled_push_retry,
+                                command_tx: &command_tx,
+                            },
+                        ).await;
+                    }
+                    OnlineEpochGapIoCompletion::Queue(Ok(submissions)) => {
+                        #[cfg(test)]
+                        {
+                            let (attempted, delivered) = submissions.iter().fold(
+                                (0usize, 0usize),
+                                |(attempted, delivered), route| {
+                                    let (route_attempted, route_delivered) =
+                                        route.delivery_counts_for_test();
+                                    (attempted + route_attempted, delivered + route_delivered)
+                                },
+                            );
+                            shared.comparison_test_trace.lock().unwrap().push(
+                                if attempted == 0 {
+                                    "online_queue_no_items"
+                                } else if delivered == 0 {
+                                    "online_queue_no_account_route"
+                                } else {
+                                    "online_queue_delivered"
+                                },
+                            );
+                        }
+                        let job = online_epoch_gap.as_mut().expect("online queue exists");
+                        job.credit = Some(job.queue.take().expect("online queue exists").into_credit());
+                        job.submissions = submissions;
+                    }
+                    OnlineEpochGapIoCompletion::Queue(Err(error)) => {
+                        let mut job = online_epoch_gap.take().expect("online queue exists");
+                        job.credit = Some(job.queue.take().expect("online queue exists").abort_and_wait().await);
+                        let recovery = job.recovery.take().expect("online grant exists");
+                        let result = client.fail_online_epoch_gap(
+                            recovery,
+                            AppError::BlockingTask(format!(
+                                "online recovery queue task {}",
+                                if error.is_panic() { "panicked" } else { "cancelled" },
+                            )),
+                        ).await;
+                        finish_online_epoch_gap_receive(
+                            &mut client, job, result,
+                            ReceiveTailContext {
+                                events: &events, account_id_hex: &account_id_hex,
+                                account_label: &account_label, shared: &shared,
+                                scheduled_push_retry: &mut scheduled_push_retry,
+                                command_tx: &command_tx,
+                            },
+                        ).await;
+                    }
+                }
+                continue 'worker;
+            }
+            _ = sleep(bounded_recovery::ADMISSION_YIELD_DELAY), if online_epoch_gap.as_ref().is_some_and(|job| job.network.is_none()) => {}
             completed = async {
                 comparison_recovery.as_mut().expect("comparison task exists").network.wait().await
             }, if comparison_recovery.is_some() => {
@@ -1760,7 +2004,7 @@ async fn run_app_runtime_account_worker(
                     Some(command) => Some((command, true)),
                     None => commands.recv().await.map(|command| (command, false)),
                 }
-            }, if (!yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
+            }, if (online_epoch_gap.is_some() || !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
                 && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
                 yield_to_bounded_admission = true;
@@ -1774,6 +2018,16 @@ async fn run_app_runtime_account_worker(
                             && (matches!(command, AccountWorkerCommand::CatchUp { .. })
                                 || (pending.iter().any(|queued| {
                                     matches!(queued, AccountWorkerCommand::CatchUp { .. })
+                                }) && !command.readable_during_comparison_catch_up()))
+                        {
+                            pending.push_back(command);
+                            continue;
+                        }
+                        if online_epoch_gap.is_some()
+                            && !approved_pending
+                            && (!command.allowed_during_online_epoch_gap()
+                                || (pending.iter().any(|queued| {
+                                    !queued.allowed_during_online_epoch_gap()
                                 }) && !command.readable_during_comparison_catch_up()))
                         {
                             pending.push_back(command);
@@ -1855,10 +2109,27 @@ async fn run_app_runtime_account_worker(
             }
             _ = scheduled_convergence.timer.as_mut(), if (!yield_to_bounded_admission
                 || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready))
+                && online_epoch_gap.is_none()
                 && !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
                 yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
+                #[cfg(test)]
+                let convergence_epoch_before = client.local_epoch_for_group(&group_id);
+                #[cfg(test)]
+                let target_convergence_witness = shared
+                    .recovery_phase_witness
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|(label, witness)| {
+                        (label == &client.state.label && witness.is_target_group(&group_id))
+                            .then(|| witness.clone())
+                    });
+                #[cfg(test)]
+                if target_convergence_witness.is_some() {
+                    shared.comparison_test_trace.lock().unwrap().push("scheduled_convergence_started");
+                }
                 let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
@@ -1928,7 +2199,7 @@ async fn run_app_runtime_account_worker(
                                         let observation = backfill_armed.then(|| shared.product_analytics.begin(
                                             crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                                         )).flatten();
-                                        let backfill_result = if comparison_recovery.is_some() {
+                                        let backfill_result = if comparison_recovery.is_some() || online_epoch_gap.is_some() {
                                             Ok(EpochBackfillRunOutcome::Deferred)
                                         } else {
                                             match execute_pending_comparison_or_inline(
@@ -1953,6 +2224,7 @@ async fn run_app_runtime_account_worker(
                                                     return;
                                                 }
                                                 PendingComparisonExecution::Inline(result) => result,
+                                                PendingComparisonExecution::OnlineEpochGap { .. } => unreachable!("maintenance does not offload an online Receive grant"),
                                             }
                                         };
                                         let _ = report_pending_epoch_backfill_result(
@@ -2056,7 +2328,7 @@ async fn run_app_runtime_account_worker(
                 && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
                 yield_to_bounded_admission = true;
             }
-            received = client.receive_next_delivery() => {
+            received = client.receive_next_delivery(), if online_epoch_gap.as_ref().is_none_or(|job| job.network.is_some()) => {
                 yield_to_bounded_admission = true;
                 #[cfg(test)]
                 if let Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) = &received
@@ -2177,7 +2449,7 @@ async fn run_app_runtime_account_worker(
                                 // A live job already owns this account's grant.
                                 // Keep this delivered message complete and let
                                 // that job settle the still-durable recovery debt.
-                                let backfill_result = if comparison_recovery.is_some() {
+                                let backfill_result = if comparison_recovery.is_some() || online_epoch_gap.is_some() {
                                     PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
                                 } else {
                                     execute_pending_comparison_or_inline(
@@ -2199,6 +2471,23 @@ async fn run_app_runtime_account_worker(
                                                 audit_tracker_update,
                                                 retry_push_registration,
                                             },
+                                        });
+                                        continue 'worker;
+                                    }
+                                    PendingComparisonExecution::OnlineEpochGap {
+                                        recovery,
+                                        network,
+                                    } => {
+                                        online_epoch_gap = Some(OnlineEpochGapJob {
+                                            recovery: Some(*recovery),
+                                            network: Some(network),
+                                            queue: None,
+                                            credit: None,
+                                            submissions: Vec::new(),
+                                            observation,
+                                            backfill_armed,
+                                            audit_tracker_update,
+                                            retry_push_registration,
                                         });
                                         continue 'worker;
                                     }
@@ -2347,6 +2636,14 @@ async fn run_app_runtime_account_worker(
                                                 (target.account_label == account_label)
                                                     .then(|| target.sink.clone())
                                             });
+                                        reopened.test_recovery_phase_witness = shared
+                                            .recovery_phase_witness
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .and_then(|(label, witness)| {
+                                                (label == &account_label).then(|| witness.clone())
+                                            });
                                     }
                                     // A reconnect open is deferred like the
                                     // startup open; drain the hydration
@@ -2475,7 +2772,7 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
-            _ = tokio::time::sleep_until(local_submission_retry_at), if local_submission_due => {
+            _ = tokio::time::sleep_until(local_submission_retry_at), if local_submission_due && online_epoch_gap.is_none() => {
                 local_submission_due = false;
                 if let Ok(storage) = app.account_storage(&account_label)
                     && let Ok(Some(submission)) = storage.next_local_submission()
@@ -2548,7 +2845,7 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
-                if comparison_recovery.is_some() {
+                if comparison_recovery.is_some() || online_epoch_gap.is_some() {
                     continue 'worker;
                 }
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
@@ -2673,6 +2970,7 @@ async fn run_app_runtime_account_worker(
                         continue 'worker;
                     }
                     PendingComparisonExecution::Inline(result) => result,
+                    PendingComparisonExecution::OnlineEpochGap { .. } => unreachable!("maintenance does not offload an online Receive grant"),
                 };
                 let _ = report_pending_epoch_backfill_result(
                     &client,
@@ -2703,6 +3001,14 @@ async fn run_app_runtime_account_worker(
     if let Some(job) = comparison_recovery {
         job.network.abort_and_wait().await;
     }
+    if let Some(mut job) = online_epoch_gap {
+        if let Some(network) = job.network.take() {
+            network.abort_and_wait().await;
+        }
+        if let Some(queue) = job.queue.take() {
+            let _credit = queue.abort_and_wait().await;
+        }
+    }
 }
 
 /// Select one existing owner grant, then move only an eligible comparison's
@@ -2714,23 +3020,29 @@ async fn execute_pending_comparison_or_inline(
     seam: EpochBackfillExecutionSeam,
 ) -> PendingComparisonExecution {
     let mut credit = bounded_recovery::try_acquire_recovery_credit(&shared.recovery_credit_pool());
-    let selection =
-        if credit.is_none() && client.comparison_only_waiting_for_credit().unwrap_or(false) {
-            Ok(crate::client::PendingRecoverySelection::Deferred)
-        } else {
-            client.select_pending_epoch_backfill(seam)
-        };
+    let selection = if credit.is_none()
+        && (client.comparison_only_waiting_for_credit().unwrap_or(false)
+            || (seam == EpochBackfillExecutionSeam::Receive
+                && client.epoch_gap_only_waiting_for_credit().unwrap_or(false)))
+    {
+        Ok(crate::client::PendingRecoverySelection::Deferred)
+    } else {
+        client.select_pending_epoch_backfill(seam)
+    };
     match selection {
         Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
             let grant = *grant;
             let eligible =
                 credit.is_some() && client.comparison_offload_eligible(&grant).unwrap_or(false);
+            let online_epoch_gap = seam == EpochBackfillExecutionSeam::Receive
+                && credit.is_some()
+                && client.epoch_gap_offload_eligible(&grant).unwrap_or(false);
             #[cfg(test)]
             shared
                 .comparison_test_trace
                 .lock()
                 .unwrap()
-                .push(if eligible {
+                .push(if eligible || online_epoch_gap {
                     "grant_eligible"
                 } else {
                     "grant_inline"
@@ -2783,6 +3095,44 @@ async fn execute_pending_comparison_or_inline(
                             .push("activation_error");
                         PendingComparisonExecution::Inline(Err(error))
                     }
+                }
+            } else if online_epoch_gap {
+                match client.begin_online_epoch_gap(grant).await {
+                    Ok(recovery) => {
+                        #[cfg(test)]
+                        let activity_witness = shared
+                            .comparison_activity_witness
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|(label, witness)| {
+                                (label == &client.state.label).then(|| witness.clone())
+                            });
+                        match ComparisonNetworkJob::start(
+                            client,
+                            recovery.grant(),
+                            credit.take().expect("online grant owns credit"),
+                            #[cfg(test)]
+                            activity_witness,
+                        ) {
+                            Ok(network) => {
+                                #[cfg(test)]
+                                shared
+                                    .comparison_test_trace
+                                    .lock()
+                                    .unwrap()
+                                    .push("online_network_started");
+                                PendingComparisonExecution::OnlineEpochGap {
+                                    recovery: Box::new(recovery),
+                                    network,
+                                }
+                            }
+                            Err(error) => PendingComparisonExecution::Inline(
+                                client.fail_online_epoch_gap(recovery, error).await,
+                            ),
+                        }
+                    }
+                    Err(error) => PendingComparisonExecution::Inline(Err(error)),
                 }
             } else {
                 drop(credit.take());
@@ -3765,6 +4115,7 @@ fn ready_command_index(
     pending: &VecDeque<AccountWorkerCommand>,
     media_http: &MediaHttpContext,
     comparison_waiting: bool,
+    online_epoch_gap_waiting: bool,
 ) -> Option<usize> {
     let has_capacity =
         !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
@@ -3775,10 +4126,21 @@ fn ready_command_index(
                 .position(|command| matches!(command, AccountWorkerCommand::CatchUp { .. }))
         })
         .flatten();
+    let online_barrier = online_epoch_gap_waiting
+        .then(|| {
+            pending
+                .iter()
+                .position(|command| !command.allowed_during_online_epoch_gap())
+        })
+        .flatten();
     pending.iter().enumerate().position(|(index, command)| {
-        (!comparison_waiting
-            || (deferred_catch_up.is_none_or(|barrier| index < barrier)
-                || command.readable_during_comparison_catch_up()))
+        (!online_epoch_gap_waiting
+            || (command.allowed_during_online_epoch_gap()
+                && (online_barrier.is_none_or(|barrier| index < barrier)
+                    || command.readable_during_comparison_catch_up())))
+            && (!comparison_waiting
+                || (deferred_catch_up.is_none_or(|barrier| index < barrier)
+                    || command.readable_during_comparison_catch_up()))
             && (has_capacity || !command.needs_media_slot())
     })
 }
@@ -6413,6 +6775,33 @@ async fn finish_receive_after_recovery(
     }
 }
 
+async fn finish_online_epoch_gap_receive(
+    client: &mut AppClient,
+    job: OnlineEpochGapJob,
+    result: Result<EpochBackfillRunOutcome, AppError>,
+    context: ReceiveTailContext<'_>,
+) {
+    // The job keeps its shared credit until reporting and the Receive tail
+    // have finished. No other account owner can adopt this grant meanwhile.
+    let _credit = job.credit;
+    let _ = report_pending_epoch_backfill_result(
+        result,
+        job.backfill_armed,
+        job.observation,
+        context.events,
+        context.account_id_hex,
+        context.account_label,
+        context.shared,
+    );
+    finish_receive_after_recovery(
+        client,
+        context,
+        job.audit_tracker_update,
+        job.retry_push_registration,
+    )
+    .await;
+}
+
 fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
     !summary.joined_groups.is_empty()
         || !summary.messages.is_empty()
@@ -6961,6 +7350,8 @@ mod tests {
 
     #[cfg(feature = "test-policy-overrides")]
     mod integrated_recovery_acceptance_tests;
+    #[cfg(feature = "test-policy-overrides")]
+    mod online_epoch_gap_recovery_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod post_convergence_comparison_resume_tests;
     mod real_sdk_bounded_tests;

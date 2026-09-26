@@ -19,6 +19,10 @@ pub(crate) struct TestComparisonActivityWitness {
     pub(crate) attempt_serial: Arc<AtomicU64>,
     pub(crate) active_jobs: Arc<AtomicUsize>,
     pub(crate) active_requests: Arc<AtomicUsize>,
+    pub(crate) target_event_id: Arc<Mutex<Option<String>>>,
+    pub(crate) returned_events: Arc<AtomicUsize>,
+    pub(crate) matching_events: Arc<AtomicUsize>,
+    pub(crate) matching_queued_deliveries: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -77,6 +81,87 @@ pub(crate) struct ComparisonRouteResult {
 
 pub(crate) struct ComparisonNetworkResult {
     routes: Vec<ComparisonRouteResult>,
+}
+
+pub(crate) struct RouteSubmission {
+    route: TransportReconciliationRoute,
+    initial_cursor: Option<[u8; 32]>,
+    cursor: Option<[u8; 32]>,
+    cursor_safe: bool,
+    outcome: storage_sqlite::RecoveryComparisonOutcome,
+    #[cfg(test)]
+    attempted: usize,
+    #[cfg(test)]
+    delivered: usize,
+}
+
+#[cfg(test)]
+impl RouteSubmission {
+    pub(crate) fn delivery_counts_for_test(&self) -> (usize, usize) {
+        (self.attempted, self.delivered)
+    }
+}
+
+/// The queue producer owns no account engine or storage. The worker can drain
+/// the same adapter queue while this bounded producer waits for capacity.
+pub(crate) struct EpochGapQueueJob {
+    credit: Option<Arc<OwnedSemaphorePermit>>,
+    handle: JoinHandle<Vec<RouteSubmission>>,
+}
+
+impl Drop for EpochGapQueueJob {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl EpochGapQueueJob {
+    pub(crate) fn start(
+        client: &AppClient,
+        network: ComparisonNetworkResult,
+        credit: OwnedSemaphorePermit,
+        #[cfg(test)] witness: Option<TestComparisonActivityWitness>,
+    ) -> Self {
+        let adapter = client.adapter.clone();
+        let credit = Arc::new(credit);
+        let task_credit = credit.clone();
+        let handle = tokio::spawn(async move {
+            let _credit = task_credit;
+            let deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
+            let mut submitted = Vec::with_capacity(network.routes.len());
+            for route in network.routes {
+                submitted.push(
+                    submit_reconciliation_route(
+                        &adapter,
+                        route,
+                        deadline,
+                        #[cfg(test)]
+                        witness.as_ref(),
+                    )
+                    .await,
+                );
+            }
+            submitted
+        });
+        Self {
+            credit: Some(credit),
+            handle,
+        }
+    }
+
+    pub(crate) async fn wait(&mut self) -> Result<Vec<RouteSubmission>, tokio::task::JoinError> {
+        (&mut self.handle).await
+    }
+
+    pub(crate) async fn abort_and_wait(mut self) -> Arc<OwnedSemaphorePermit> {
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
+        self.credit.take().expect("queue job owns credit")
+    }
+
+    pub(crate) fn into_credit(mut self) -> Arc<OwnedSemaphorePermit> {
+        self.credit.take().expect("queue job owns credit")
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +288,23 @@ impl ComparisonNetworkJob {
                     Ok(value) => ComparisonRouteWorkResult::Returned(value),
                     Err(_) => ComparisonRouteWorkResult::TimedOut,
                 };
+                #[cfg(test)]
+                if let Some(witness) = &witness
+                    && let ComparisonRouteWorkResult::Returned(Ok(Some((_, events)))) = &result
+                {
+                    witness
+                        .returned_events
+                        .fetch_add(events.len(), Ordering::SeqCst);
+                    if let Some(target) = witness.target_event_id.lock().unwrap().as_ref() {
+                        witness.matching_events.fetch_add(
+                            events
+                                .iter()
+                                .filter(|event| event.event.id.eq_ignore_ascii_case(target))
+                                .count(),
+                            Ordering::SeqCst,
+                        );
+                    }
+                }
                 let cursor = *progress.cursor.lock().expect("comparison progress mutex");
                 results.push(ComparisonRouteResult {
                     route: inventory.route,
@@ -224,6 +326,104 @@ impl ComparisonNetworkJob {
 }
 
 impl AppClient {
+    /// Capacity preflight before the owner spends a retry reservation. This is
+    /// deliberately narrower than the post-selection grant check below.
+    pub(crate) fn epoch_gap_only_waiting_for_credit(&self) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let fence = storage.recovery_eligible_revision_fence(false)?;
+        if fence.obligations.len() != 1
+            || storage.recovery_comparison()?.pending()
+            || self.delivery_loss_blocks_cursor()
+            || !storage
+                .recovery_loss_snapshot(
+                    &self.state.label,
+                    storage_sqlite::RecoveryLossCause::Queue,
+                )?
+                .is_empty()
+            || !storage
+                .recovery_loss_snapshot(
+                    &self.state.label,
+                    storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                )?
+                .is_empty()
+        {
+            return Ok(false);
+        }
+        // A zero-credit preflight may defer a grant only when its visible
+        // routing shape fits the off-worker cap. Otherwise preserve the
+        // inline executor even while another account holds both credits.
+        let routes = self.routing.snapshot();
+        let visible_routes =
+            routes.group_routes.len() + usize::from(!routes.local_inbox_endpoints.is_empty());
+        if visible_routes == 0
+            || visible_routes > TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
+            || routes.local_inbox_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+            || routes
+                .group_routes
+                .iter()
+                .any(|route| route.endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE)
+        {
+            return Ok(false);
+        }
+        let selected = fence.obligations[0];
+        if storage
+            .recovery_scope_snapshots(selected.0)?
+            .iter()
+            .any(|scope| {
+                scope.plan.required_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+                    || scope.plan.admitted_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+            })
+        {
+            return Ok(false);
+        }
+        Ok(storage.pending_recovery_demands()?.iter().any(|demand| {
+            demand.ticket.id == selected.0
+                && demand.ticket.revision == selected.1
+                && demand.cause == storage_sqlite::RecoveryCause::EpochGap
+        }))
+    }
+
+    /// The one steady-state expansion of immutable comparison I/O. The
+    /// comparison slot remains ineligible and its completion path is unused.
+    pub(crate) fn epoch_gap_offload_eligible(
+        &self,
+        grant: &AttemptGrant,
+    ) -> Result<bool, AppError> {
+        let Some(plan) = grant.plan() else {
+            return Ok(false);
+        };
+        if grant.seam != marmot_forensics::EpochBackfillExecutionSeam::Receive
+            || grant.comparison_revision.is_some()
+            || plan.len() != 1
+            || plan[0].cause != storage_sqlite::RecoveryCause::EpochGap
+            || grant.fence.obligations.len() != 1
+            || grant.fence.obligations[0].0 != plan[0].id
+            || self.delivery_loss_blocks_cursor()
+            || grant.inventory.is_empty()
+            || grant.inventory.len() > TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
+            || plan[0].scopes.iter().any(|scope| {
+                scope.goal.admitted_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+                    || scope.goal.required_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+            })
+            || grant.inventory.iter().any(|route| match &route.work {
+                TransportReconciliationWork::Inbox(endpoints) => {
+                    endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+                }
+                TransportReconciliationWork::Group(group) => {
+                    group.endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+                }
+            })
+        {
+            return Ok(false);
+        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        Ok(storage.pending_recovery_demands()?.iter().any(|demand| {
+            demand.ticket.id == grant.fence.obligations[0].0
+                && demand.ticket.revision == grant.fence.obligations[0].1
+                && demand.cause == storage_sqlite::RecoveryCause::EpochGap
+        }))
+    }
+
     /// An advisory preflight used only when the shared credit pool is empty.
     /// Independent debt still reaches the legacy executor. The actual frozen
     /// grant is checked again after authorization when a credit exists.
@@ -411,64 +611,137 @@ impl AppClient {
         ),
         AppError,
     > {
-        let mut cursor_safe_to_advance = true;
-        let outcome = match route.result {
-            ComparisonRouteWorkResult::Skipped => {
-                storage_sqlite::RecoveryComparisonOutcome::ServicedPartial
-            }
-            ComparisonRouteWorkResult::TimedOut => {
-                storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-            }
-            ComparisonRouteWorkResult::Returned(Ok(None)) => {
-                storage_sqlite::RecoveryComparisonOutcome::Unsupported
-            }
-            ComparisonRouteWorkResult::Returned(Err(_)) => {
-                storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-            }
-            ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
-                let mut submitted = true;
-                for event in events {
-                    let queue = async {
-                        #[cfg(test)]
-                        if let Ok(Some(action)) = TEST_COMPARISON_QUEUE_ACTIONS
-                            .try_with(|actions| actions.borrow_mut().pop_front())
-                        {
-                            match action {
-                                TestComparisonQueueAction::Fail => {
-                                    return Err(cgka_traits::TransportAdapterError::Subscription(
-                                        "injected comparison queue failure".into(),
-                                    ));
-                                }
-                                TestComparisonQueueAction::Block => {
-                                    std::future::pending::<()>().await;
-                                }
+        let submission = submit_reconciliation_route(
+            &self.adapter,
+            route,
+            admission_deadline,
+            #[cfg(test)]
+            None,
+        )
+        .await;
+        self.persist_reconciliation_submission(storage, submission)
+    }
+
+    pub(crate) fn persist_reconciliation_submission(
+        &self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        submission: RouteSubmission,
+    ) -> Result<
+        (
+            TransportReconciliationRoute,
+            storage_sqlite::RecoveryComparisonOutcome,
+        ),
+        AppError,
+    > {
+        // A failed or timed-out queue step leaves an unqueued suffix whose
+        // IDs cannot be mapped back to individual cursor positions.
+        if submission.cursor_safe && submission.cursor != submission.initial_cursor {
+            storage.advance_transport_reconciliation_replay_cursor(
+                &submission.route,
+                submission.cursor,
+            )?;
+        }
+        Ok((submission.route, submission.outcome))
+    }
+}
+
+async fn submit_reconciliation_route(
+    adapter: &crate::relay_plane::MarmotRelayPlaneAccountAdapter,
+    route: ComparisonRouteResult,
+    admission_deadline: tokio::time::Instant,
+    #[cfg(test)] witness: Option<&TestComparisonActivityWitness>,
+) -> RouteSubmission {
+    let mut cursor_safe = true;
+    #[cfg(test)]
+    let mut attempted = 0usize;
+    #[cfg(test)]
+    let mut delivered = 0usize;
+    let outcome = match route.result {
+        ComparisonRouteWorkResult::Skipped => {
+            storage_sqlite::RecoveryComparisonOutcome::ServicedPartial
+        }
+        ComparisonRouteWorkResult::TimedOut => {
+            storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+        }
+        ComparisonRouteWorkResult::Returned(Ok(None)) => {
+            storage_sqlite::RecoveryComparisonOutcome::Unsupported
+        }
+        ComparisonRouteWorkResult::Returned(Err(_)) => {
+            storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+        }
+        ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
+            let mut submitted = true;
+            for event in events {
+                #[cfg(test)]
+                {
+                    attempted += 1;
+                }
+                #[cfg(test)]
+                let matches_target = witness.is_some_and(|witness| {
+                    witness
+                        .target_event_id
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|target| event.event.id.eq_ignore_ascii_case(target))
+                });
+                let queue = async {
+                    #[cfg(test)]
+                    if let Ok(Some(action)) = TEST_COMPARISON_QUEUE_ACTIONS
+                        .try_with(|actions| actions.borrow_mut().pop_front())
+                    {
+                        match action {
+                            TestComparisonQueueAction::Fail => {
+                                return Err(cgka_traits::TransportAdapterError::Subscription(
+                                    "injected comparison queue failure".into(),
+                                ));
+                            }
+                            TestComparisonQueueAction::Block => {
+                                std::future::pending::<()>().await;
                             }
                         }
-                        self.adapter.queue_reconciled_event(event).await
-                    };
-                    if !matches!(
-                        tokio::time::timeout_at(admission_deadline, queue).await,
-                        Ok(Ok(_))
-                    ) {
+                    }
+                    adapter.queue_reconciled_event(event).await
+                };
+                match tokio::time::timeout_at(admission_deadline, queue).await {
+                    Ok(Ok(route_count)) => {
+                        #[cfg(test)]
+                        {
+                            delivered += route_count;
+                        }
+                        #[cfg(test)]
+                        if matches_target && let Some(witness) = witness {
+                            witness
+                                .matching_queued_deliveries
+                                .fetch_add(route_count, Ordering::SeqCst);
+                        }
+                        #[cfg(not(test))]
+                        let _ = route_count;
+                    }
+                    _ => {
                         submitted = false;
                         break;
                     }
                 }
-                if !submitted || summary.relays_failed > 0 {
-                    cursor_safe_to_advance = submitted;
-                    storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-                } else {
-                    storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown
-                }
             }
-        };
-        // A failed or timed-out queue step leaves an unqueued suffix whose
-        // IDs cannot be mapped back to individual cursor positions. Keep
-        // the entire pre-pass cursor so the next attempt can replay it.
-        if cursor_safe_to_advance && route.cursor != route.initial_cursor {
-            storage.advance_transport_reconciliation_replay_cursor(&route.route, route.cursor)?;
+            if !submitted || summary.relays_failed > 0 {
+                cursor_safe = submitted;
+                storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+            } else {
+                storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown
+            }
         }
-        Ok((route.route, outcome))
+    };
+    RouteSubmission {
+        route: route.route,
+        initial_cursor: route.initial_cursor,
+        cursor: route.cursor,
+        cursor_safe,
+        outcome,
+        #[cfg(test)]
+        attempted,
+        #[cfg(test)]
+        delivered,
     }
 }
 
@@ -562,6 +835,7 @@ mod tests {
         _pump: ScriptedEosePump,
         client: AppClient,
         storage: storage_sqlite::SqliteAccountStorage,
+        group_id: GroupId,
     }
 
     async fn fixture() -> Fixture {
@@ -569,6 +843,13 @@ mod tests {
     }
 
     async fn fixture_with_group_relays(relays: Option<Vec<String>>) -> Fixture {
+        fixture_with_group_relays_and_comparison(relays, true).await
+    }
+
+    async fn fixture_with_group_relays_and_comparison(
+        relays: Option<Vec<String>>,
+        comparison: bool,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -578,7 +859,7 @@ mod tests {
             .with_test_relay_client(relay.clone());
         let pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        client
+        let group_id = client
             .create_group_with_options(
                 "comparison offload",
                 &[],
@@ -589,14 +870,117 @@ mod tests {
             )
             .await
             .unwrap();
-        client.request_bounded_comparison().unwrap();
+        if comparison {
+            client.request_bounded_comparison().unwrap();
+        }
         let storage = app.account_storage("alice").unwrap();
         Fixture {
             _dir: dir,
             _pump: pump,
             client,
             storage,
+            group_id,
         }
+    }
+
+    async fn arm_test_epoch_gap(fixture: &mut Fixture) {
+        // Settle the create-group history demand through the original
+        // executor, leaving its NeedsDeepRepair debt ineligible as in the
+        // online worker fixture. The next selection then belongs to one gap.
+        let baseline = fixture
+            .client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        fixture
+            .client
+            .execute_pending_epoch_backfill_grant(baseline)
+            .await
+            .unwrap();
+        let epoch = fixture
+            .client
+            .group_mls_state(&fixture.group_id)
+            .unwrap()
+            .epoch;
+        fixture
+            .storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(fixture.group_id.as_slice()),
+                stalled_epoch: epoch,
+            }])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn epoch_gap_zero_credit_preflight_preserves_inline_fallback() {
+        let mut eligible = fixture_with_group_relays_and_comparison(None, false).await;
+        arm_test_epoch_gap(&mut eligible).await;
+        let serial = eligible
+            .storage
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial;
+        assert!(eligible.client.epoch_gap_only_waiting_for_credit().unwrap());
+        assert_eq!(
+            eligible
+                .storage
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            serial
+        );
+        eligible
+            .client
+            .recovery_owner
+            .test_advance_clock(Duration::from_secs(300));
+        let maintenance = eligible
+            .client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            !eligible
+                .client
+                .epoch_gap_offload_eligible(&maintenance)
+                .unwrap()
+        );
+
+        let relays = (0..5)
+            .map(|index| format!("wss://relay-{index}.example"))
+            .collect();
+        let mut over_cap = fixture_with_group_relays_and_comparison(Some(relays), false).await;
+        arm_test_epoch_gap(&mut over_cap).await;
+        assert!(!over_cap.client.epoch_gap_only_waiting_for_credit().unwrap());
+        over_cap
+            .client
+            .recovery_owner
+            .test_advance_clock(Duration::from_secs(300));
+        let grant = over_cap
+            .client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Receive)
+            .unwrap()
+            .unwrap();
+        assert!(!over_cap.client.epoch_gap_offload_eligible(&grant).unwrap());
+        let serial = grant.reservation.attempt_serial;
+        over_cap
+            .client
+            .execute_pending_epoch_backfill_grant(grant)
+            .await
+            .unwrap();
+        assert_eq!(
+            over_cap
+                .storage
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            serial
+        );
     }
 
     fn network_result(

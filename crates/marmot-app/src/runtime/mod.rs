@@ -367,6 +367,9 @@ pub struct RuntimeSharedServices {
     #[cfg(test)]
     pub(crate) recovery_selection_witness: Arc<StdMutex<Option<RecoverySelectionWitnessTarget>>>,
     #[cfg(test)]
+    pub(crate) recovery_phase_witness:
+        Arc<StdMutex<Option<(String, crate::client::TestRecoveryPhaseWitness)>>>,
+    #[cfg(test)]
     pub(crate) bounded_recovery_finished: Arc<Notify>,
     #[cfg(test)]
     pub(crate) bounded_preparation_probes: Arc<std::sync::atomic::AtomicUsize>,
@@ -491,6 +494,8 @@ impl Default for RuntimeSharedServices {
             #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
+            recovery_phase_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]
             bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -593,6 +598,8 @@ impl RuntimeSharedServices {
             comparison_activity_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            recovery_phase_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]

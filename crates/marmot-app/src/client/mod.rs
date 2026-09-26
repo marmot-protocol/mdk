@@ -82,11 +82,16 @@ use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 #[cfg(test)]
 pub(crate) use sync::TestComparisonActivityWitness;
+#[cfg(all(test, feature = "test-policy-overrides"))]
+pub(crate) use sync::TestRecoveryPhase;
+#[cfg(test)]
+pub(crate) use sync::TestRecoveryPhaseWitness;
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
-    ComparisonNetworkJob, ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome,
-    EpochBackfillRunOutcome, PendingRecoverySelection,
+    ComparisonNetworkJob, ComparisonNetworkResult, ConvergenceScheduleState,
+    DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome, EpochGapQueueJob,
+    OnlineEpochGapRecovery, PendingRecoverySelection, RouteSubmission,
 };
 
 #[cfg(test)]
@@ -338,6 +343,8 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
         Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
+    #[cfg(test)]
+    pub(crate) test_recovery_phase_witness: Option<TestRecoveryPhaseWitness>,
     pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
     pub(crate) audit_v5_peel_slot:
         Option<std::sync::Arc<std::sync::Mutex<audit_v5_probe::PeelSlot>>>,
