@@ -6625,6 +6625,27 @@ fn publish_app_runtime_summary(
     publication
 }
 
+fn runtime_summary_message_ref(
+    summary: &SyncSummary,
+) -> Option<marmot_forensics::v5::EngineMessageRef> {
+    if summary.messages.len() == 1
+        && summary.joined_groups.is_empty()
+        && summary.epoch_stall_escalations.is_empty()
+    {
+        match summary.events.as_slice() {
+            [cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. }]
+                if hex::encode(message_id.as_slice())
+                    == summary.messages[0].source_message_id_hex =>
+            {
+                marmot_forensics::v5::EngineMessageRef::from_message_id(message_id.as_slice()).ok()
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 fn publish_app_runtime_summary_with_v5(
     client: &AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -6636,19 +6657,7 @@ fn publish_app_runtime_summary_with_v5(
     if publication.attempted == 0 || !client.audit_v5_enabled() {
         return;
     }
-    let message_ref = if summary.messages.len() == 1
-        && summary.joined_groups.is_empty()
-        && summary.epoch_stall_escalations.is_empty()
-        && summary.events.iter().all(|event| {
-            matches!(event, cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. }
-                if hex::encode(message_id.as_slice()) == summary.messages[0].source_message_id_hex)
-        }) {
-        hex::decode(&summary.messages[0].source_message_id_hex)
-            .ok()
-            .and_then(|id| marmot_forensics::v5::EngineMessageRef::from_message_id(&id).ok())
-    } else {
-        None
-    };
+    let message_ref = runtime_summary_message_ref(summary);
     client.runtime.session().record_v5_event(
         None,
         marmot_forensics::v5::Event::RuntimePublicationOutcome(
@@ -10088,6 +10097,48 @@ mod tests {
         assert_eq!(publication.attempted, 1);
         assert_eq!(publication.accepted, 0);
         assert_eq!(publication.no_subscribers, 1);
+    }
+
+    #[test]
+    fn runtime_summary_message_ref_requires_a_matching_typed_engine_event() {
+        let group_id = test_group_id(3);
+        let message_id = cgka_traits::MessageId::new(vec![0xabu8; 32]);
+        let mut summary = SyncSummary {
+            messages: vec![crate::ReceivedMessage {
+                authority: None,
+                message_id_hex: "cc".repeat(32),
+                source_message_id_hex: hex::encode(message_id.as_slice()),
+                sender: "sender".into(),
+                sender_display_name: None,
+                group_id: group_id.clone(),
+                source_epoch: 1,
+                retention: None,
+                plaintext: "test".into(),
+                kind: 1,
+                tags: Vec::new(),
+                recorded_at: 1,
+                received_at: 2,
+            }],
+            ..SyncSummary::default()
+        };
+        assert!(runtime_summary_message_ref(&summary).is_none());
+        summary
+            .events
+            .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                group_id,
+                message_id: message_id.clone(),
+                sender: cgka_traits::MemberId::new(vec![0x11; 32]),
+                epoch: cgka_traits::EpochId(1),
+                payload: Vec::new(),
+                retention: None,
+                authority: None,
+            });
+        assert_eq!(
+            runtime_summary_message_ref(&summary),
+            marmot_forensics::v5::EngineMessageRef::from_message_id(message_id.as_slice()).ok()
+        );
+        summary.messages[0].source_message_id_hex = "dd".repeat(32);
+        assert!(runtime_summary_message_ref(&summary).is_none());
     }
 
     #[test]
