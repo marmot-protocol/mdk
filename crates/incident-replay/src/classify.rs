@@ -186,9 +186,11 @@ impl fmt::Display for BehindEngine {
 pub enum BehindMode {
     /// The engine stopped recording events before — or within the catch-up
     /// grace of — the group provably advancing past it: a dead device, an
-    /// uninstalled app, or stopped uploads. (An engine belonging to a member
-    /// who *left* the group looks identical; telling the two apart needs a
-    /// member-to-engine linkage the export does not carry yet.) A healthy engine
+    /// uninstalled app, or stopped uploads. An engine that recorded its own
+    /// departure (a removed copy, a retired terminal backlog) is not behind at
+    /// all and never reaches this set; a member who left without its engine
+    /// saying so still reads as dark until Goggles' `source` rows link engines
+    /// to members. A healthy engine
     /// sitting at the tip whose audit uploads merely lag reads the same way —
     /// the 2026-07-09 incident export carried a proven instance, uploads three
     /// days behind a live tip — so within one export this mode is not a
@@ -200,12 +202,15 @@ pub enum BehindMode {
     /// catching up: commits are not reaching it even though its other traffic
     /// flows.
     ActiveWhileBehind,
-    /// The engine's newest timed epoch is *below* one it already reported: its
-    /// local state moved backwards. Nothing in the protocol walks an epoch
-    /// back, so this is a local-storage event — a device restored from an
-    /// older backup, a rolled-back database. It outranks the other two modes:
-    /// an engine that rolled back is also, necessarily, active or dark, and
-    /// the rollback is the sharper of the two readings.
+    /// The engine's own state now sits *below* an epoch it already held, and
+    /// no convergence decision walked it back there. A reorg onto a shorter
+    /// branch is the protocol's one lawful rewind; anything else is a
+    /// local-storage event — a device restored from an older backup, a
+    /// rolled-back database. Only own-state rows count: a message row carries
+    /// the handled message's epoch and a `begin_pending` row a projected one,
+    /// and neither is a position the engine held. It outranks the other two
+    /// modes: an engine that rolled back is also, necessarily, active or dark,
+    /// and the rollback is the sharper of the two readings.
     ///
     /// The mode says where the device is, not that it is beyond repair. A
     /// restored device still holds valid state at the epoch it fell back to,
@@ -467,24 +472,149 @@ fn reported_halt_reasons(reasons: &BTreeSet<&str>) -> Vec<String> {
 
 /// Per-engine activity, folded from the event log.
 #[derive(Default)]
-struct EngineActivity {
+struct EngineActivity<'a> {
     /// The engine's newest event timestamp, when its events carry one.
     last_seen_ms: Option<u64>,
-    /// The highest epoch the engine reported itself at.
-    high_water_epoch: Option<u64>,
-    /// The engine's newest *timed* epoch observation, as `(wall_time_ms,
-    /// epoch)`. Held beside the high-water mark because the two disagree
-    /// exactly when local state moved backwards, which is the whole signal
-    /// behind [`BehindMode::RolledBack`] — a max alone reports a restored
-    /// device at the epoch it used to hold and understates its lag.
-    current: Option<(u64, u64)>,
+    /// Per group the engine recorded rows in, whether it left that group.
+    /// A row without a group says nothing about membership and opens no
+    /// entry, unless it is itself a departure or rejoin (an export that
+    /// carries no group refs at all), which scopes it to `None`.
+    departures: BTreeMap<Option<&'a str>, DepartureLifecycle>,
+    /// Epochs from rows that report the engine's own state.
+    own_state: EpochTrail,
+    /// Epochs from message rows, which carry the handled message's epoch
+    /// rather than the engine's. Read only for an engine with no own-state
+    /// rows at all, where they are the only evidence of its position.
+    messages: EpochTrail,
+}
+
+impl EngineActivity<'_> {
+    /// Whether the engine left every group it recorded rows in. Rule 6 compares
+    /// engines across the whole export, so leaving one group must not excuse
+    /// a lag in another the engine still belongs to.
+    fn departed(&self) -> bool {
+        !self.departures.is_empty() && self.departures.values().all(DepartureLifecycle::departed)
+    }
+
+    /// The highest epoch any of the engine's rows evidences.
+    fn high_water(&self) -> Option<u64> {
+        self.own_state.high_water.max(self.messages.high_water)
+    }
+
+    /// Where the engine is now, and whether it moved backwards to get there.
+    /// Message rows place an engine that wrote nothing else, but they carry
+    /// the handled message's epoch, so a drop among them is never a rollback.
+    fn position(self) -> Option<(u64, bool)> {
+        if self.own_state.high_water.is_some() {
+            self.own_state.position()
+        } else {
+            let (epoch, _) = self.messages.position()?;
+            Some((epoch, false))
+        }
+    }
+}
+
+/// One engine's membership lifecycle in one group, folded from the rows it
+/// wrote about itself.
+///
+/// Engines are known only by `engine_id`, and nothing in the export links one
+/// to a member, so another engine's view of a removal cannot be attributed to
+/// it: only self-evidence counts. Like [`HaltLifecycle`], the newest of each
+/// side decides, and a departed copy keeps re-asserting its departure on every
+/// session open.
+#[derive(Default)]
+struct DepartureLifecycle {
+    /// The newest departure marker's timestamp.
+    last_departure_ms: Option<u64>,
+    /// The newest rejoin's timestamp.
+    last_rejoin_ms: Option<u64>,
+    /// Whether any departure or rejoin row carried no clock. Such a row may be
+    /// the newest of its side, so the lifecycle cannot be ordered at all.
+    untimed: bool,
+}
+
+impl DepartureLifecycle {
+    fn observe(&mut self, kind: &EventKind, wall_time_ms: Option<u64>) {
+        let last_ms = if kind.is_departure() {
+            &mut self.last_departure_ms
+        } else if kind.is_rejoin() {
+            &mut self.last_rejoin_ms
+        } else {
+            return;
+        };
+        *last_ms = (*last_ms).max(wall_time_ms);
+        self.untimed |= wall_time_ms.is_none();
+    }
+
+    /// Whether the engine is out of the group at the end of the export: its
+    /// newest departure strictly postdates its newest rejoin. Excusing a lag is
+    /// the direction that can hide an incident, so anything short of that —
+    /// a tie, an untimed row — keeps the engine a member.
+    fn departed(&self) -> bool {
+        !self.untimed
+            && self.last_departure_ms.is_some_and(|departure| {
+                self.last_rejoin_ms.is_none_or(|rejoin| departure > rejoin)
+            })
+    }
+}
+
+/// One engine's epoch observations of one kind.
+#[derive(Default)]
+struct EpochTrail {
+    /// The highest epoch observed.
+    high_water: Option<u64>,
+    /// Every timed observation, as `(wall_time_ms, settled, reached)`: the
+    /// highest epoch the row evidences and the epoch it leaves the engine at
+    /// (see [`EventKind::settled_epoch`]). Kept whole rather than folded,
+    /// because telling a rollback from a lawful rewind depends on their order.
+    timed: Vec<(u64, u64, u64)>,
     /// Whether any epoch observation arrived without a timestamp. One such row
-    /// makes the engine's whole epoch sequence unorderable, exactly as one
-    /// untimed halt row does in [`unrecoverable_halt`]: an untimed epoch may
-    /// be the newest one, so a "newest timed" reading could sit behind the
-    /// engine's real position and invent a rollback. The fail-closed answer is
-    /// to keep the high-water reading, which claims no ordering at all.
-    has_untimed_epoch: bool,
+    /// makes the whole trail unorderable, exactly as one untimed halt row does
+    /// in [`unrecoverable_halt`]: an untimed epoch may be the newest one, so a
+    /// "newest timed" reading could sit behind the engine's real position and
+    /// invent a rollback. The fail-closed answer is to keep the high-water
+    /// reading, which claims no ordering at all.
+    has_untimed: bool,
+}
+
+impl EpochTrail {
+    fn observe(&mut self, reached: u64, settled: u64, wall_time_ms: Option<u64>) {
+        self.high_water = self.high_water.max(Some(reached));
+        match wall_time_ms {
+            Some(ms) => self.timed.push((ms, settled, reached)),
+            None => self.has_untimed = true,
+        }
+    }
+
+    /// Where the trail places the engine now, and whether that is below an
+    /// epoch it already held without a lawful rewind in between.
+    ///
+    /// Lag is measured from where the engine is now, not from the best it ever
+    /// managed. The two differ only when the engine moved backwards, and only
+    /// ever widen the lag, so this can add a finding but never mask one. The
+    /// newest timed row places the engine; on a tie the higher epoch sorts
+    /// last, because a tie orders nothing and must not assert a regression.
+    ///
+    /// A convergence decision that adopts a tip below the one it started from
+    /// walks the engine back lawfully, so it lowers the standing high-water —
+    /// but only when it starts from that high-water: a rewind cannot explain
+    /// a drop that happened before it. An untimed row forfeits the ordered
+    /// reading for the whole trail (see [`Self::has_untimed`]).
+    fn position(mut self) -> Option<(u64, bool)> {
+        let high_water = self.high_water?;
+        if self.has_untimed {
+            return Some((high_water, false));
+        }
+        self.timed.sort_unstable();
+        let (mut standing, mut epoch) = (0, high_water);
+        for (_, settled, reached) in self.timed {
+            if reached >= standing {
+                standing = settled;
+            }
+            epoch = settled;
+        }
+        Some((epoch, epoch < standing))
+    }
 }
 
 /// The weaker of the two gates between "no contested branch" and "healthy":
@@ -512,53 +642,51 @@ fn epoch_divergence(export: &AgentStateExport) -> Option<QuarantineReason> {
         };
         let activity = engines.entry(engine_id).or_default();
         activity.last_seen_ms = activity.last_seen_ms.max(event.wall_time_ms);
-        let observed = event.kind.observed_epoch();
-        activity.high_water_epoch = activity.high_water_epoch.max(observed);
-        if let (Some(epoch), Some(ms)) = (observed, event.wall_time_ms) {
-            // Newest timed observation wins. A tie orders nothing, so it keeps
-            // the higher epoch rather than assert a regression the timestamps
-            // do not actually establish.
-            let candidate = (ms, epoch);
-            activity.current = Some(match activity.current {
-                Some(current) if current > candidate => current,
-                _ => candidate,
-            });
+        if event.group_ref.is_some() || event.kind.is_departure() || event.kind.is_rejoin() {
+            activity
+                .departures
+                .entry(event.group_ref.as_deref())
+                .or_default()
+                .observe(&event.kind, event.wall_time_ms);
+        }
+        let (Some(reached), Some(settled)) =
+            (event.kind.observed_epoch(), event.kind.settled_epoch())
+        else {
+            continue;
+        };
+        let trail = if event.kind.reports_own_state() {
+            &mut activity.own_state
+        } else {
+            &mut activity.messages
+        };
+        trail.observe(reached, settled, event.wall_time_ms);
+        if let Some(ms) = event.wall_time_ms {
             epoch_first_seen
-                .entry(epoch)
+                .entry(reached)
                 .and_modify(|first| *first = (*first).min(ms))
                 .or_insert(ms);
-        } else if observed.is_some() {
-            activity.has_untimed_epoch = true;
         }
     }
 
     let group_epoch = engines
         .values()
-        .filter_map(|activity| activity.high_water_epoch)
+        .filter_map(EngineActivity::high_water)
         .max()?;
     let behind: Vec<BehindEngine> = engines
-        .iter()
+        .into_iter()
         .filter_map(|(engine_id, activity)| {
-            let high_water = activity.high_water_epoch?;
-            // Lag is measured from where the engine is now, not from the best
-            // it ever managed. The two differ only on a rollback, and only
-            // ever widen the lag, so this can add a finding but never mask
-            // one. Any untimed epoch row forfeits that reading for the whole
-            // engine: the untimed row may be its newest, and preferring the
-            // newest *timed* one would then invent a rollback out of ordinary
-            // forward movement nobody stamped.
-            let epoch = match activity.current {
-                Some((_, epoch)) if !activity.has_untimed_epoch => epoch,
-                _ => high_water,
-            };
-            let rolled_back = epoch < high_water;
+            if activity.departed() {
+                return None;
+            }
+            let last_seen_ms = activity.last_seen_ms;
+            let (epoch, rolled_back) = activity.position()?;
             if group_epoch - epoch < EPOCH_DIVERGENCE_MIN_LAG {
                 return None;
             }
             // Both the engine's own liveness and the group's advance past it
             // must be timestamped to order them; untimed evidence stays
             // unarmed rather than guessing.
-            let last_seen = activity.last_seen_ms?;
+            let last_seen = last_seen_ms?;
             let moved_past = epoch_first_seen
                 .range(epoch + 1..)
                 .map(|(_, first_seen)| *first_seen)
@@ -572,7 +700,7 @@ fn epoch_divergence(export: &AgentStateExport) -> Option<QuarantineReason> {
                 BehindMode::WentDark
             };
             Some(BehindEngine {
-                engine_id: (*engine_id).to_owned(),
+                engine_id: engine_id.to_owned(),
                 epoch,
                 mode,
             })

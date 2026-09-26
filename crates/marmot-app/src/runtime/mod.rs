@@ -72,6 +72,8 @@ pub use agent_publisher::{
 };
 mod account_attention;
 mod audit_otlp_delivery;
+pub use audit_otlp_delivery::AuditOtlpAttemptOutcome;
+pub(crate) use audit_otlp_delivery::send_audit_otlp_once_for_app;
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -140,7 +142,9 @@ pub(crate) use account_worker::{
     AccountWorkerCommand, AccountWorkerRuntime, ManagedAccountWorker,
     publish_app_runtime_group_state_updated, spawn_app_runtime_account_worker,
 };
-pub(crate) use audit_tracker::{AuditLogTrackerUploader, post_audit_log_tracker_update_for_app};
+pub(crate) use audit_tracker::{
+    AuditLogTrackerUploader, post_audit_log_tracker_update_for_runtime,
+};
 
 // Surface the split-out `pub(crate)` items the test modules reach for: the
 // crate-root `src/tests.rs` via `crate::runtime::Item`, and `runtime/tests.rs`
@@ -334,11 +338,34 @@ pub(crate) struct BoundedResultWitness {
     pub(crate) matching_items: usize,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct OrdinaryDeliveryDropTarget {
+    pub(crate) account_label: String,
+    pub(crate) event_id: [u8; 32],
+}
+
+#[cfg(test)]
+pub(crate) struct RecoverySelectionWitnessTarget {
+    pub(crate) account_label: String,
+    pub(crate) sink: Arc<StdMutex<Vec<crate::client::TestRecoverySelection>>>,
+}
+
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     /// Off until the production SDK acquisition backend passes its two-relay
     /// conformance gate. Controlled worker fixtures opt in explicitly.
     pub(crate) bounded_group_recovery_enabled: Arc<AtomicBool>,
+    /// Every production runtime points at the same process capacity. The
+    /// indirection permits explicit isolation of capacity-sensitive fixtures.
+    recovery_credits: Arc<StdMutex<Arc<account_worker::bounded_recovery::RecoveryCreditPool>>>,
+    #[cfg(test)]
+    pub(crate) comparison_test_trace: Arc<StdMutex<Vec<&'static str>>>,
+    #[cfg(test)]
+    pub(crate) comparison_activity_witness:
+        Arc<StdMutex<Option<(String, crate::client::TestComparisonActivityWitness)>>>,
+    #[cfg(test)]
+    pub(crate) recovery_selection_witness: Arc<StdMutex<Option<RecoverySelectionWitnessTarget>>>,
     #[cfg(test)]
     pub(crate) bounded_recovery_finished: Arc<Notify>,
     #[cfg(test)]
@@ -353,6 +380,13 @@ pub struct RuntimeSharedServices {
     pub(crate) bounded_pause_before_admission: Arc<AtomicBool>,
     #[cfg(test)]
     pub(crate) bounded_pause_after_first_admission: Arc<AtomicBool>,
+    /// One exact ordinary SDK delivery may be omitted before worker ingest.
+    #[cfg(test)]
+    pub(crate) ordinary_drop_once: Arc<StdMutex<Option<OrdinaryDeliveryDropTarget>>>,
+    #[cfg(test)]
+    pub(crate) ordinary_drop_witness: Arc<StdMutex<Option<String>>>,
+    #[cfg(test)]
+    pub(crate) ordinary_delivery_dropped: Arc<Notify>,
     local_submission_wakeups: watch::Sender<()>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
@@ -368,6 +402,7 @@ pub struct RuntimeSharedServices {
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
     relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
     audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
+    audit_otlp_sender: Arc<StdMutex<Option<Arc<crate::audit_otlp_sender::AuditOtlpSender>>>>,
     service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
     /// Test-only barrier the detached post-create-group catch-up waits on, so
@@ -446,6 +481,15 @@ impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
             bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            recovery_credits: Arc::new(StdMutex::new(
+                account_worker::bounded_recovery::shared_recovery_credit_pool(),
+            )),
+            #[cfg(test)]
+            comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
+            #[cfg(test)]
+            comparison_activity_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]
@@ -460,6 +504,12 @@ impl Default for RuntimeSharedServices {
             bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            ordinary_drop_once: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            ordinary_drop_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            ordinary_delivery_dropped: Arc::new(Notify::new()),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             local_submission_wakeups: watch::channel(()).0,
             attachment_updates: watch::channel(()).0,
@@ -477,6 +527,7 @@ impl Default for RuntimeSharedServices {
                 RelayTelemetryRuntimeConfig::default(),
             )),
             audit_log_tracker_config: Arc::new(StdMutex::new(AuditLogTrackerConfig::default())),
+            audit_otlp_sender: Arc::new(StdMutex::new(None)),
             service_endpoints: MarmotServiceEndpoints::default(),
             audit_log_tracker_uploader: None,
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
@@ -489,6 +540,29 @@ impl Default for RuntimeSharedServices {
 }
 
 impl RuntimeSharedServices {
+    pub(in crate::runtime) fn recovery_credit_pool(
+        &self,
+    ) -> Arc<account_worker::bounded_recovery::RecoveryCreditPool> {
+        self.recovery_credits.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn use_private_recovery_credit_pool_for_test(
+        &self,
+    ) -> Arc<account_worker::bounded_recovery::RecoveryCreditPool> {
+        let pool = account_worker::bounded_recovery::private_recovery_credit_pool_for_test();
+        self.set_recovery_credit_pool_for_test(pool.clone());
+        pool
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn set_recovery_credit_pool_for_test(
+        &self,
+        pool: Arc<account_worker::bounded_recovery::RecoveryCreditPool>,
+    ) {
+        *self.recovery_credits.lock().unwrap() = pool;
+    }
+
     fn for_app(app: &MarmotApp) -> Self {
         app.product_analytics.telemetry_origin(
             app.service_endpoints()
@@ -501,13 +575,24 @@ impl RuntimeSharedServices {
         );
         let lifecycle = RuntimeLifecycle::new();
         let audit_log_tracker_config = app.audit_log_tracker_config.clone();
+        let audit_otlp_sender = Arc::new(StdMutex::new(None));
         let audit_log_tracker_uploader = AuditLogTrackerUploader::new(
             app.clone(),
             audit_log_tracker_config.clone(),
+            audit_otlp_sender.clone(),
             lifecycle.clone(),
         );
         Self {
             bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            recovery_credits: Arc::new(StdMutex::new(
+                account_worker::bounded_recovery::shared_recovery_credit_pool(),
+            )),
+            #[cfg(test)]
+            comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
+            #[cfg(test)]
+            comparison_activity_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             bounded_recovery_finished: Arc::new(Notify::new()),
             #[cfg(test)]
@@ -522,6 +607,12 @@ impl RuntimeSharedServices {
             bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            ordinary_drop_once: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            ordinary_drop_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            ordinary_delivery_dropped: Arc::new(Notify::new()),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
             local_submission_wakeups: watch::channel(()).0,
@@ -541,6 +632,7 @@ impl RuntimeSharedServices {
                 RelayTelemetryRuntimeConfig::default(),
             )),
             audit_log_tracker_config,
+            audit_otlp_sender,
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
@@ -684,6 +776,13 @@ impl RuntimeSharedServices {
             .clone()
     }
 
+    fn audit_otlp_sender(&self) -> Option<Arc<crate::audit_otlp_sender::AuditOtlpSender>> {
+        self.audit_otlp_sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn stop_relay_telemetry_exporter(&self) {
         if let Some(handle) = self
             .relay_telemetry_exporter
@@ -707,6 +806,12 @@ impl RuntimeSharedServices {
             return;
         }
         let config = self.audit_log_tracker_config();
+        if self.audit_otlp_sender().is_some() {
+            if let Some(uploader) = &self.audit_log_tracker_uploader {
+                uploader.schedule(trigger);
+            }
+            return;
+        }
         if config.resolved_endpoint(self.service_endpoints()).is_none() {
             tracing::debug!(
                 target: "marmot_app::audit_log",
@@ -3008,11 +3113,37 @@ impl MarmotAppRuntime {
         self.accounts.app.set_audit_log_tracker_config(config)
     }
 
+    /// Configure a dedicated v5 OTLP audit destination in memory. Recording
+    /// remains controlled by `AuditLogSettings`; `None` removes delivery
+    /// configuration. A change fences any in-flight attempt before it can
+    /// acknowledge a prepared range under the previous destination.
+    pub fn set_audit_otlp_sender(
+        &self,
+        sender: Option<crate::audit_otlp_sender::AuditOtlpSender>,
+    ) -> Result<(), AppError> {
+        self.shared.lifecycle.ensure_running()?;
+        let _mutation = self.accounts.app.audit_export_lifecycle.mutate_all();
+        *self
+            .shared
+            .audit_otlp_sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sender.map(Arc::new);
+        Ok(())
+    }
+
     pub async fn post_audit_log_tracker_update(
         &self,
     ) -> Result<AuditLogTrackerUpdateResult, AppError> {
         let config = self.shared.audit_log_tracker_config();
-        post_audit_log_tracker_update_for_app(&self.accounts.app, config).await
+        let sender = self.shared.audit_otlp_sender();
+        post_audit_log_tracker_update_for_runtime(
+            &self.accounts.app,
+            config,
+            sender.as_deref(),
+            &self.shared.audit_otlp_sender,
+            &self.shared.lifecycle(),
+        )
+        .await
     }
 
     /// Test-only per-runtime window override; production keeps the 30-second default.

@@ -19,7 +19,7 @@ mod signer;
 
 pub use error::NostrPeelerError;
 pub use event::NostrTransportEvent;
-pub use peeler::NostrMlsPeeler;
+pub use peeler::{NostrMlsPeeler, WelcomePeelProvenance};
 pub use signer::{MarmotNostrSigner, MarmotSignerError, SdkSigner, SignerFuture};
 
 /// Nostr kind used by Marmot group messages.

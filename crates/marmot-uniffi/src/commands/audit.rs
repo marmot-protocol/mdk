@@ -3,9 +3,11 @@
 use crate::Marmot;
 use crate::conversions::{
     AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
-    AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi,
+    AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi, AuditLogUploadResultFfi,
+    AuditOtlpConfigV5Ffi,
 };
 use crate::errors::MarmotKitError;
+use marmot_app::audit_otlp_sender::AuditOtlpSender;
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
@@ -45,6 +47,40 @@ impl Marmot {
         Ok(AuditLogTrackerConfigV4Ffi::redacted(
             self.runtime.set_audit_log_tracker_config(config.into())?,
         ))
+    }
+
+    /// Configure the v5 audit OTLP destination in memory. The token is
+    /// write-only; disabling clears it. This does not enable recording.
+    pub fn set_audit_otlp_config_v5(
+        &self,
+        mut config: AuditOtlpConfigV5Ffi,
+    ) -> Result<AuditOtlpConfigV5Ffi, MarmotKitError> {
+        let sender = if config.enabled {
+            let destination = config
+                .destination
+                .clone()
+                .ok_or_else(invalid_audit_otlp_config)?;
+            let endpoint = config
+                .endpoint
+                .clone()
+                .ok_or_else(invalid_audit_otlp_config)?;
+            let token = config
+                .authorization_bearer_token
+                .take()
+                .ok_or_else(invalid_audit_otlp_config)?;
+            Some(
+                if config.allow_loopback_dev {
+                    AuditOtlpSender::for_loopback_dev(destination, endpoint, token)
+                } else {
+                    AuditOtlpSender::new(destination, endpoint, token)
+                }
+                .map_err(|_| invalid_audit_otlp_config())?,
+            )
+        } else {
+            None
+        };
+        self.runtime.set_audit_otlp_sender(sender)?;
+        Ok(config.redacted())
     }
 
     /// Local JSONL audit logs available for explicit forensic upload.
@@ -92,5 +128,18 @@ impl Marmot {
         &self,
     ) -> Result<AuditLogTrackerUpdateResultFfi, MarmotKitError> {
         Ok(self.runtime.post_audit_log_tracker_update().await?.into())
+    }
+
+    /// Run the same manual tracker pass with separate v4 and v5 results.
+    pub async fn post_audit_log_tracker_update_v5(
+        &self,
+    ) -> Result<AuditLogTrackerUpdateResultV5Ffi, MarmotKitError> {
+        Ok(self.runtime.post_audit_log_tracker_update().await?.into())
+    }
+}
+
+fn invalid_audit_otlp_config() -> MarmotKitError {
+    MarmotKitError::Runtime {
+        details: "invalid audit OTLP sender configuration".to_owned(),
     }
 }

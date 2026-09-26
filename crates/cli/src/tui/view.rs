@@ -1785,8 +1785,11 @@ pub(crate) fn relay_health_lines(data: &RelayHealthData) -> Vec<Line<'static>> {
             data.inbound_seen, data.inbound_delivered, data.inbound_dropped,
         )),
         Line::from(format!(
-            "  publish attempts={} successes={} failures={}",
-            data.publish_attempts, data.publish_successes, data.publish_failures,
+            "  publish attempts={} successes={} failures={} cancellations={}",
+            data.publish_attempts,
+            data.publish_successes,
+            data.publish_failures,
+            data.publish_cancellations,
         )),
         Line::from(""),
         Line::from("delivery spread"),

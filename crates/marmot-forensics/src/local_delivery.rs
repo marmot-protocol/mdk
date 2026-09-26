@@ -3,6 +3,7 @@
 //! sent after releasing that lease. One attempt contains original, complete JSONL lines.
 
 use crate::audit::{AUDIT_LOG_SCHEMA_VERSION, AuditEvent};
+use crate::v5::Record as V5Record;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -898,7 +899,13 @@ fn read_line(file: &mut File, start: u64, limit: u64) -> io::Result<(Vec<u8>, u6
 }
 
 fn valid_event(line: &[u8]) -> bool {
-    std::str::from_utf8(line)
+    let Some(body) = line.strip_suffix(b"\n") else {
+        return false;
+    };
+    if V5Record::from_json(body).is_ok() {
+        return true;
+    }
+    std::str::from_utf8(body)
         .ok()
         .and_then(|text| serde_json::from_str::<AuditEvent>(text).ok())
         .is_some_and(|event| event.schema_version == AUDIT_LOG_SCHEMA_VERSION)

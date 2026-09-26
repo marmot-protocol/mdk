@@ -1626,21 +1626,25 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
                 std::fs::read_to_string(file.path)
                     .unwrap()
                     .lines()
-                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .map(|line| {
+                        marmot_forensics::v5::Record::from_json(line.as_bytes())
+                            .expect("real v5 recovery row");
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let armed_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_armed")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_armed")
             .collect();
         let started_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_started")
             .collect();
         let failed_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
             .collect();
         assert_eq!(armed_rows.len(), 1);
         assert_eq!(
@@ -1651,17 +1655,21 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
         let completed_rows: Vec<_> = failed_rows
             .into_iter()
             .filter(|row| {
-                row["context"]["operation_id"] == started_rows[0]["context"]["operation_id"]
+                row["event"]["record_context"]["operation_ref"]
+                    == started_rows[0]["event"]["record_context"]["operation_ref"]
             })
             .collect();
         assert_eq!(completed_rows.len(), 1);
         assert_eq!(
-            completed_rows[0]["kind"]["error_kind"],
+            completed_rows[0]["event"]["error_kind"],
             "history_coverage_unproven"
         );
-        assert_eq!(started_rows[0]["kind"]["seam"], "maintenance");
-        assert_eq!(completed_rows[0]["kind"]["activation_outcome"], "succeeded");
-        assert!(completed_rows[0]["kind"]["deliveries"].as_u64().unwrap() >= 1);
+        assert_eq!(started_rows[0]["event"]["seam"], "maintenance");
+        assert_eq!(
+            completed_rows[0]["event"]["activation_outcome"],
+            "succeeded"
+        );
+        assert!(completed_rows[0]["event"]["deliveries"].as_u64().unwrap() >= 1);
         assert!(
             storage
                 .pending_recovery_demands()
@@ -1669,16 +1677,16 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
         );
-        let audited_epoch_before = completed_rows[0]["kind"]["local_epoch_before"]
+        let audited_epoch_before = completed_rows[0]["event"]["local_epoch_before"]
             .as_u64()
             .expect("completed row local epoch before");
         assert_eq!(
-            completed_rows[0]["kind"]["local_epoch_after"].as_u64(),
+            completed_rows[0]["event"]["local_epoch_after"].as_u64(),
             Some(final_local_epoch),
             "the terminal row must report the observed final local epoch"
         );
         assert_eq!(
-            completed_rows[0]["kind"]["group_advanced"].as_bool(),
+            completed_rows[0]["event"]["group_advanced"].as_bool(),
             Some(final_local_epoch > audited_epoch_before),
             "activation success and group epoch recovery must remain distinct"
         );
@@ -1758,25 +1766,29 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
                 std::fs::read_to_string(file.path)
                     .unwrap()
                     .lines()
-                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .map(|line| {
+                        marmot_forensics::v5::Record::from_json(line.as_bytes())
+                            .expect("real v5 recovery row");
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let rows_of_kind = |kind: &str| {
             audit_rows
                 .iter()
-                .filter(|row| row["kind"]["type"] == kind)
+                .filter(|row| row["event"]["type"] == kind)
                 .collect::<Vec<_>>()
         };
         let armed = rows_of_kind("epoch_stall_backfill_armed");
         let started = rows_of_kind("epoch_stall_backfill_started");
         let failed = rows_of_kind("epoch_stall_backfill_failed")
             .into_iter()
-            .filter(|row| row["kind"]["activation_outcome"] == "failed")
+            .filter(|row| row["event"]["activation_outcome"] == "failed")
             .collect::<Vec<_>>();
         let completed = rows_of_kind("epoch_stall_backfill_failed")
             .into_iter()
-            .filter(|row| row["kind"]["error_kind"] == "history_coverage_unproven")
+            .filter(|row| row["event"]["error_kind"] == "history_coverage_unproven")
             .collect::<Vec<_>>();
         assert_eq!(armed.len(), 1, "one recovery intent must arm once");
         assert_eq!(started.len(), 2, "failure plus retry must start twice");
@@ -1791,32 +1803,33 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             "retry must have one honest incomplete terminal"
         );
         assert_eq!(
-            started[0]["context"]["operation_id"],
-            failed[0]["context"]["operation_id"]
+            started[0]["event"]["record_context"]["operation_ref"],
+            failed[0]["event"]["record_context"]["operation_ref"]
         );
         assert_eq!(
-            started[1]["context"]["operation_id"],
-            completed[0]["context"]["operation_id"]
+            started[1]["event"]["record_context"]["operation_ref"],
+            completed[0]["event"]["record_context"]["operation_ref"]
         );
         assert_ne!(
-            started[0]["context"]["operation_id"], started[1]["context"]["operation_id"],
+            started[0]["event"]["record_context"]["operation_ref"],
+            started[1]["event"]["record_context"]["operation_ref"],
             "each actual owner attempt has its own durable serial"
         );
-        assert_eq!(started[0]["kind"]["retry_ordinal"], 0);
-        assert_eq!(failed[0]["kind"]["retry_ordinal"], 0);
-        assert_eq!(started[1]["kind"]["retry_ordinal"], 1);
-        assert_eq!(completed[0]["kind"]["retry_ordinal"], 1);
+        assert_eq!(started[0]["event"]["retry_ordinal"], 0);
+        assert_eq!(failed[0]["event"]["retry_ordinal"], 0);
+        assert_eq!(started[1]["event"]["retry_ordinal"], 1);
+        assert_eq!(completed[0]["event"]["retry_ordinal"], 1);
         assert_eq!(
-            failed[0]["kind"]["activation_outcome"].as_str(),
+            failed[0]["event"]["activation_outcome"].as_str(),
             Some("failed")
         );
-        assert_eq!(failed[0]["kind"]["deliveries"], 0);
-        assert_eq!(failed[0]["kind"]["group_advanced"], false);
+        assert_eq!(failed[0]["event"]["deliveries"], 0);
+        assert_eq!(failed[0]["event"]["group_advanced"], false);
         // This run did read the group's post-replay epoch, so `group_advanced:
         // false` here is a measurement and the row says so. Without the
         // companion flag a reader cannot separate this row from one whose
         // after-read failed and defaulted to the before-epoch.
-        assert_eq!(failed[0]["kind"]["group_advanced_observed"], true);
+        assert_eq!(failed[0]["event"]["group_advanced_observed"], true);
     });
 }
 
@@ -1867,7 +1880,9 @@ async fn armed_epoch_backfill(
     (app, client, group_id)
 }
 
-/// Every audit row this app has recorded so far.
+/// Every v5 audit row this app has recorded so far. Keep the old `kind` key in
+/// this test-only view so the recovery assertions below continue to examine
+/// their original numeric and categorical facts, after strict v5 admission.
 fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
     app.audit_log_files()
         .unwrap()
@@ -1877,10 +1892,10 @@ fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
                 .unwrap()
                 .lines()
                 .map(|line| {
-                    let row = serde_json::from_str::<serde_json::Value>(line).unwrap();
-                    crate::audit_log::AUDIT_UPLOAD_SCHEMA
-                        .validate(&row)
-                        .expect("real recorder output must satisfy the upload schema");
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real recorder output must satisfy the v5 contract");
+                    let mut row = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                    row["kind"] = row["event"].clone();
                     row
                 })
                 .collect::<Vec<_>>()
@@ -10838,6 +10853,69 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
 }
 
 #[test]
+fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
+    // Equal timestamps stay immutable even when the events differ only by bio
+    // line breaks: a cached `onetwo` may be a current same-second edit, not a
+    // row flattened by the pre-#1973 filter (mdk#206). Only a newer event
+    // replaces it, for peers and for accounts held on this device alike.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let peer = format!("{:064x}", 1973);
+    let created_at = 1_700_001_973;
+    for (account_id, local) in [
+        (peer.as_str(), false),
+        (alice.account_id_hex.as_str(), true),
+    ] {
+        app.remember_directory_profile(
+            account_id,
+            &UserProfileMetadata {
+                name: Some("bob".to_owned()),
+                about: Some("onetwo".to_owned()),
+                created_at,
+                ..UserProfileMetadata::default()
+            },
+        )
+        .unwrap();
+        let ingest = |created_at: u64| {
+            let mut event = NostrTransportEvent::new_unsigned(
+                account_id.to_owned(),
+                KIND_NOSTR_METADATA,
+                Vec::new(),
+                serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
+            );
+            event.created_at = created_at;
+            app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+                event,
+            })
+            .unwrap();
+            app.directory_entry_for_account_id(account_id)
+                .unwrap()
+                .unwrap()
+        };
+
+        let same_second = ingest(created_at);
+        assert_eq!(same_second.local_account.is_some(), local);
+        assert_eq!(
+            same_second
+                .profile
+                .and_then(|profile| profile.about)
+                .as_deref(),
+            Some("onetwo"),
+            "local={local}"
+        );
+        let newer = ingest(created_at + 1);
+        assert_eq!(
+            newer.profile.and_then(|profile| profile.about).as_deref(),
+            Some("one\ntwo"),
+            "local={local}"
+        );
+    }
+}
+
+#[test]
 fn roster_labels_keep_profiles() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -11860,6 +11938,98 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         reopened.source_relays,
         vec!["wss://profiles.example".to_owned()]
     );
+}
+
+#[test]
+fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let author = format!("{:064x}", 868);
+    let payload = "  first\r\nsecond\u{1b}[2J\n\nthird  ";
+    let mut event = NostrTransportEvent::new_unsigned(
+        author.clone(),
+        KIND_NOSTR_METADATA,
+        Vec::new(),
+        serde_json::json!({
+            "name": payload,
+            "displayName": payload,
+            "about": payload,
+            "picture": payload,
+            "banner": payload,
+            "nip05": payload,
+            "lud16": payload,
+            "website": "https://example.test",
+            "created_at": 42,
+            "source_relays": ["wss://spoof.example"]
+        })
+        .to_string(),
+    );
+    event.created_at = 1_700_000_868;
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+        event,
+    })
+    .unwrap();
+
+    let assert_normalized = |profile: &UserProfileMetadata, source_relays: Option<&[String]>| {
+        let single = "firstsecond[2Jthird";
+        assert_eq!(profile.name.as_deref(), Some(single));
+        assert_eq!(profile.display_name.as_deref(), Some(single));
+        assert_eq!(profile.picture.as_deref(), Some(single));
+        assert_eq!(profile.banner.as_deref(), Some(single));
+        assert_eq!(profile.nip05.as_deref(), Some(single));
+        assert_eq!(profile.lud16.as_deref(), Some(single));
+        assert_eq!(profile.about.as_deref(), Some("first\nsecond[2J\n\nthird"));
+        assert_eq!(profile.created_at, 1_700_000_868);
+        assert_eq!(
+            profile.extra.get("website"),
+            Some(&serde_json::json!("https://example.test"))
+        );
+        assert!(!profile.extra.contains_key("created_at"));
+        assert!(!profile.extra.contains_key("source_relays"));
+        if let Some(source_relays) = source_relays {
+            assert_eq!(profile.source_relays, source_relays);
+        }
+    };
+
+    let cached = app
+        .directory_entry_for_account_id(&author)
+        .unwrap()
+        .expect("ingested profile is cached")
+        .profile
+        .expect("cached profile");
+    assert_normalized(&cached, Some(&["wss://profiles.example".to_owned()]));
+
+    let shared = app
+        .shared_storage()
+        .unwrap()
+        .public_directory_user(&author)
+        .unwrap()
+        .expect("shared directory row");
+    let shared_profile: UserProfileMetadata =
+        serde_json::from_str(shared.profile_json.as_ref().expect("profile_json")).unwrap();
+    assert_normalized(&shared_profile, None);
+    assert!(
+        shared_profile.source_relays.is_empty(),
+        "shared records omit source hints"
+    );
+    assert_eq!(shared_profile.about, cached.about);
+    assert!(shared.profile_json.as_ref().unwrap().contains("\\n"));
+
+    drop(app);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let reopened = app
+        .directory_entries()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.account_id_hex == author)
+        .expect("reopened directory_entries still lists the author")
+        .profile
+        .expect("reopened profile");
+    assert_normalized(&reopened, Some(&["wss://profiles.example".to_owned()]));
+    assert_eq!(reopened.about, cached.about);
 }
 
 #[test]
@@ -17735,10 +17905,14 @@ fn audit_rows_of_kind(app: &MarmotApp, kind: &str) -> usize {
             std::fs::read_to_string(&file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real v5 recovery row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
                 .collect::<Vec<_>>()
         })
-        .filter(|row| row["kind"]["type"] == kind)
+        .filter(|row| row["event"]["type"] == kind)
         .count()
 }
 
@@ -19179,12 +19353,15 @@ pub(crate) async fn undecryptable_probe_route(
     (app, client, route)
 }
 
-/// Every `ingest_outcome` audit row the engine recorded for `msg_id`.
+/// Every `ingest_outcome` audit row the engine recorded for raw `msg_id`.
 fn recorded_ingest_outcomes(app: &MarmotApp, msg_id: &str) -> Vec<String> {
+    let raw = hex::decode(msg_id).expect("transport message id is hex");
+    let message_ref = marmot_forensics::v5::EngineMessageRef::from_message_id(&raw)
+        .expect("transport message id has the engine reference shape");
     recorded_audit_rows(app)
         .iter()
         .filter(|row| row["kind"]["type"] == "ingest_outcome")
-        .filter(|row| row["kind"]["msg_id"].as_str() == Some(msg_id))
+        .filter(|row| row["kind"]["message_ref"].as_str() == Some(message_ref.as_str()))
         .filter_map(|row| row["kind"]["outcome_kind"].as_str().map(ToOwned::to_owned))
         .collect()
 }

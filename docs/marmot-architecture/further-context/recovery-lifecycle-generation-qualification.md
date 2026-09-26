@@ -57,11 +57,14 @@ separate replacement gate; this fixture does not activate or retire it.
 
 Durable retention here is not MLS decryption or projection proof. In-process
 SQLCipher checks are not process-kill durability. The test does not prove
-same-live SDK ordinary-seen redelivery, unknown-history coverage, device
-behavior, full wire/RSS bounds or complete #1948 lifecycle acceptance. EOSE is
+unknown-history coverage, device behavior, full wire/RSS bounds or complete
+#1948 lifecycle acceptance. EOSE is
 endpoint evidence, not durable admission. A newly reserved attempt in this
 fixture remains pending; the test does not assert it has made a new network
 request or ultimately completed.
+
+Same-live-SDK ordinary-seen redelivery is qualified separately in the
+[ordinary sighting fixture](recovery-ordinary-seen-redelivery-qualification.md).
 
 ## Verification
 

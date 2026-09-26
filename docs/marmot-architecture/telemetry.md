@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-24
+updated: 2026-09-25
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -58,9 +58,16 @@ runtime. It complements the policy docs:
 | `inbound_events_seen` | Deduplicated relay events passed into the delivery path. | Aggregate count. |
 | `inbound_events_delivered` | Account-scoped deliveries successfully enqueued. A single event may deliver to more than one account route. | Aggregate count. |
 | `inbound_events_dropped` | Deduplicated relay events with no matching active route. | Aggregate count. |
-| `publish_attempts` | Publish attempts through the adapter. | Aggregate count. |
-| `publish_successes` | Publish calls where the relay client returned an outcome. | Aggregate count. |
-| `publish_failures` | Publish calls where the relay client returned an error. | Aggregate count. |
+| `publish_attempts` | `TransportAdapter::publish` calls that entered a relay client after admission checks. One call is one attempt however many endpoints it targets; internal relay retries are not extra attempts. | Aggregate count. |
+| `publish_successes` | Calls whose accepted-endpoint count is at least `max(required_acks, 1)`, the same rule as `TransportPublishReport::met_required_acks`. Partial acceptance at or above that threshold succeeds. | Aggregate count. |
+| `publish_failures` | Client errors and `Ok` outcomes below that threshold, including empty acceptance when `required_acks == 0`. | Aggregate count. |
+| `publish_cancellations` | Started calls whose caller dropped them before the relay client returned. Not a relay failure; the event may still have reached a relay. | Aggregate count. |
+
+Account-scoped publishes and the shared adapter's own `publish` share these counters. They are device-wide and unlabeled. Once every started call has resolved or been dropped, attempts equal successes + failures + cancellations; while calls are in flight, attempts is larger. A future that is never polled, or a request rejected before the client call (wrong account, unsafe endpoint, envelope mismatch, malformed payload), changes nothing. Local fanout runs only after the terminal count and cannot reclassify it.
+
+The account runtime drives group fanout as one single-endpoint call per relay with `required_acks: 1`, so in production an attempt is roughly one relay publish. Once a fanout meets its acknowledgement goal, the runtime drops the endpoints still waiting and retries them later from the durable fanout record. Those abandoned calls are cancellations, and each retry is a new attempt. Read relay health from `publish_failures / (publish_successes + publish_failures)`, not from `attempts - successes`.
+
+These series are relay-publish diagnostics. They are separate from application outbound counters such as `app_outbound_message_publish_*`. Raw relay-client batch publishers outside `TransportAdapter::publish` (account relay lists, KeyPackages, directory records, push tokens, user blocks) do not update them.
 
 These counters are diagnostic only. They must not feed convergence or branch selection.
 
@@ -492,9 +499,10 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `cross_relay_spread_ms` | none | Histogram | Population-level `RelayTelemetryRollup.cross_relay_spread` |
 | `relay_connection_attempts` | none | Counter | `RelayPlaneHealth.connection_attempts` |
 | `relay_connection_successes` | none | Counter | `RelayPlaneHealth.connection_successes` |
-| `relay_publish_attempts` | none | Counter | Adapter `publish_attempts` |
-| `relay_publish_successes` | none | Counter | Adapter `publish_successes` |
-| `relay_publish_failures` | none | Counter | Adapter `publish_failures` |
+| `relay_publish_attempts` | none | Counter | Adapter `publish_attempts` (admitted `TransportAdapter` publishes) |
+| `relay_publish_successes` | none | Counter | Adapter `publish_successes` (acceptance threshold met) |
+| `relay_publish_failures` | none | Counter | Adapter `publish_failures` (error or below threshold) |
+| `relay_publish_cancellations` | none | Counter | Adapter `publish_cancellations` (caller dropped the call in flight) |
 | `message_observed` | none | Counter | `RelayDeliverySpread.observed` |
 | `message_corroborated` | none | Counter | `RelayDeliverySpread.corroborated` |
 | `message_single_source` | none | Counter | `RelayDeliverySpread.single_source` |
@@ -665,7 +673,7 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_sqlcipher_migration_probe_runs` | none | Counter | `AppPerformanceSnapshot.sqlcipher_migration_probe_runs`; each run is one full keyed SQLCipher open paying the passphrase KDF (mdk#1439) |
 | `app_sqlcipher_migration_probe_skips` | none | Counter | `AppPerformanceSnapshot.sqlcipher_migration_probe_skips`; each skip is one passphrase KDF derivation avoided via the cached v2-open verdict (mdk#1439) |
 
-Current implementation note: publish telemetry is device-wide attempts/successes/failures. It is not currently
+Current implementation note: publish telemetry is device-wide attempts/successes/failures/cancellations. It is not currently
 per-relay or per-Nostr-kind, even though the relay observability design doc names those as desired future ranking
 signals.
 

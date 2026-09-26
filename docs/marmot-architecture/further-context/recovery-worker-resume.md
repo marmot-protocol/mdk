@@ -1,10 +1,15 @@
 ---
 title: Account recovery comparison result ownership
 updated: 2026-09-25
-status: First extraction slice; worker wait correction pending
+status: First extraction slice; periodic comparison follow-up implemented
 ---
 
 # Account recovery comparison result ownership
+
+The later periodic-maintenance off-worker slice is recorded in
+[`recovery-worker-comparison-resume.md`](recovery-worker-comparison-resume.md).
+Its worker-join memory cursor handoff supersedes the pre-fetch durable cursor
+recommendation below. This page describes the earlier inline state.
 
 This slice prepares the owner-frozen, bounded reconciliation pass for a later
 off-worker wait. Production bounded recovery remains disabled. The existing

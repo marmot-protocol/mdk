@@ -38,6 +38,8 @@ use transport_nostr_peeler::NostrTransportEvent;
 use crate::directory::DirectorySyncPlan;
 
 mod directory;
+#[cfg(test)]
+pub(crate) mod publish_accounting_tests;
 mod safety;
 mod telemetry;
 
@@ -76,6 +78,18 @@ const RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME: Duration = Duration::from_secs
 #[derive(Clone)]
 pub struct MarmotRelayPlane {
     inner: Arc<MarmotRelayPlaneInner>,
+}
+
+#[cfg(test)]
+/// Holds only this plane's router; drop always resumes it, including on a
+/// fixture panic. Production routing has no pause path.
+pub(crate) struct RouterPauseForTest(MarmotRelayPlane);
+
+#[cfg(test)]
+impl Drop for RouterPauseForTest {
+    fn drop(&mut self) {
+        self.0.spawn_router();
+    }
 }
 
 struct MarmotRelayPlaneInner {
@@ -1420,6 +1434,16 @@ impl MarmotRelayPlane {
             .store(0, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(crate) async fn pause_router_for_test(&self) -> RouterPauseForTest {
+        let handle = self.inner.transport.router.lock().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        RouterPauseForTest(self.clone())
+    }
+
     fn spawn_router(&self) {
         if self.inner.transport.shutting_down.load(Ordering::SeqCst) {
             return;
@@ -2335,6 +2359,17 @@ impl MarmotRelayPlaneAccountAdapter {
         &self.account_id
     }
 
+    /// Read only the live activation ordinal for worker-owned comparison
+    /// admission. An SDK connection generation is a different lifetime.
+    pub(crate) async fn account_subscription_attempt(&self) -> Option<SubscriptionAttempt> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .account_subscription_attempt(&self.account_id)
+            .await
+    }
+
     pub(crate) async fn reconcile_inbox_history(
         &self,
         endpoints: Vec<TransportEndpoint>,
@@ -2731,8 +2766,12 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         let event = NostrTransportEvent::from_transport_message(&request.message)
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
         let outcome = self
-            .publish_client
-            .publish_event_for_account(
+            .relay_plane
+            .inner
+            .transport
+            .adapter
+            .publish_event_with_client(
+                self.publish_client.as_ref(),
                 &request.account_id,
                 request.target.endpoints(),
                 &event,

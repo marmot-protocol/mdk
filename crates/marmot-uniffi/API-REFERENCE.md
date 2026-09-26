@@ -697,7 +697,7 @@ pub fn audit_log_settings(&self) -> Result<AuditLogSettingsFfi, MarmotKitError>
 
 Local forensic audit-log recording settings. Recording is opt-in and only applies to account sessions opened after the setting is enabled.
 
-[Source](src/commands/audit.rs#L14)
+[Source](src/commands/audit.rs#L16)
 
 ### `Marmot::set_audit_log_settings`
 
@@ -709,7 +709,7 @@ pub async fn set_audit_log_settings( &self, settings: AuditLogSettingsFfi, ) -> 
 
 Persist local forensic audit-log recording settings and return the stored value.
 
-[Source](src/commands/audit.rs#L24)
+[Source](src/commands/audit.rs#L26)
 
 ### `Marmot::set_audit_log_tracker_config`
 
@@ -721,7 +721,7 @@ pub fn set_audit_log_tracker_config( &self, config: AuditLogTrackerConfigV4Ffi, 
 
 Supply non-persisted audit tracker upload metadata: optional Goggles upload URL override, bearer token from the host app, and optional system hardware model, platform, and app version.
 
-[Source](src/commands/audit.rs#L41)
+[Source](src/commands/audit.rs#L43)
 
 ### `Marmot::audit_log_files`
 
@@ -733,7 +733,7 @@ pub fn audit_log_files(&self) -> Result<Vec<AuditLogFileFfi>, MarmotKitError>
 
 Local JSONL audit logs available for explicit forensic upload.
 
-[Source](src/commands/audit.rs#L51)
+[Source](src/commands/audit.rs#L87)
 
 ### `Marmot::post_audit_log_file`
 
@@ -745,7 +745,7 @@ pub async fn post_audit_log_file( &self, path: String, endpoint: String, ) -> Re
 
 POST one selected JSONL audit log to a forensic analyzer endpoint.
 
-[Source](src/commands/audit.rs#L61)
+[Source](src/commands/audit.rs#L97)
 
 ### `Marmot::delete_audit_log_file`
 
@@ -757,7 +757,7 @@ pub async fn delete_audit_log_file( &self, path: String, ) -> Result<AuditLogDel
 
 Delete one local JSONL audit log file (e.g. behind a "clear audit log" button).
 
-[Source](src/commands/audit.rs#L81)
+[Source](src/commands/audit.rs#L117)
 
 ### `Marmot::post_audit_log_tracker_update`
 
@@ -769,7 +769,7 @@ pub async fn post_audit_log_tracker_update( &self, ) -> Result<AuditLogTrackerUp
 
 POST all local audit logs to the configured tracker when audit logging is enabled. This is safe for host apps to call unconditionally; disabled or unconfigured states return a structured skip result.
 
-[Source](src/commands/audit.rs#L91)
+[Source](src/commands/audit.rs#L127)
 
 </details>
 
@@ -1140,9 +1140,9 @@ Parse plaintext message content into the same Markdown AST returned on message a
 pub fn user_profile( &self, account_id_hex: String, ) -> Result<Option<UserProfileMetadataFfi>, MarmotKitError>
 ```
 
-Full cached Nostr kind:0 profile for an account id (name, display name, about, picture, nip05, lud16), if the runtime has one projected. The local account's own profile is cached immediately after `publish_user_profile`; other accounts' profiles populate via `refresh_profile`. Returns `None` when nothing is cached yet.
+Full cached Nostr kind:0 profile for an account id (name, display name, about, picture, nip05, lud16), if the runtime has one projected. The local account's own profile is cached immediately after `publish_user_profile` from the submitted value, without reparsing it. Other accounts' profiles populate via `refresh_profile` / `refresh_directory` and are sanitized on ingest: `about` keeps normalized LF line breaks, and every other known string stays single-line. Tab and other controls (NUL, ESC, BEL, DEL, C1) are removed. A cached bio flattened by an older build stays until a newer event replaces it; an equal timestamp does not. Returns `None` when nothing is cached yet.
 
-[Source](src/commands/directory.rs#L75)
+[Source](src/commands/directory.rs#L81)
 
 ### `Marmot::cached_identity_projections`
 
@@ -1154,7 +1154,7 @@ pub fn cached_identity_projections( &self, account_id_hexes: Vec<String>, ) -> R
 
 Bounded local cached-identity page for many account IDs.
 
-[Source](src/commands/directory.rs#L91)
+[Source](src/commands/directory.rs#L97)
 
 ### `Marmot::user_profile_website`
 
@@ -1166,7 +1166,7 @@ pub fn user_profile_website( &self, account_id_hex: String, ) -> Result<Option<S
 
 Cached Nostr kind:0 `website` metadata for an account id, when it is a string. The generic profile record intentionally exposes the fields the host can publish; this read-only accessor preserves arbitrary kind:0 metadata while still making the standard website field available to profile presentation surfaces.
 
-[Source](src/commands/directory.rs#L113)
+[Source](src/commands/directory.rs#L119)
 
 ### `Marmot::refresh_profile`
 
@@ -1178,7 +1178,7 @@ pub async fn refresh_profile( &self, account_id_hex: String, relays: Vec<String>
 
 Fetch and cache an account's own Nostr kind:0 profile from `relays`. After this resolves, `user_profile` / `display_name` return the freshly-fetched metadata (name, picture, etc.) for that account.
 
-[Source](src/commands/directory.rs#L130)
+[Source](src/commands/directory.rs#L136)
 
 ### `Marmot::user_relay_lists`
 
@@ -1190,7 +1190,7 @@ pub fn user_relay_lists( &self, account_id_hex: String, ) -> Result<conversions:
 
 Cached NIP-65 and inbox relay lists for any account id — no network. An account with nothing cached yet returns an empty status with both kinds in `missing` rather than erroring; call `refresh_user_relay_lists` to fetch.
 
-[Source](src/commands/directory.rs#L145)
+[Source](src/commands/directory.rs#L151)
 
 ### `Marmot::refresh_user_relay_lists`
 
@@ -1202,7 +1202,7 @@ pub async fn refresh_user_relay_lists( &self, account_id_hex: String, relays: Ve
 
 Fetch an account's published NIP-65 and inbox relay lists from `relays`, updating the cache. An account with nothing published reports both kinds in `missing` rather than erroring.
 
-[Source](src/commands/directory.rs#L158)
+[Source](src/commands/directory.rs#L164)
 
 ### `Marmot::search_cached_users`
 
@@ -1214,7 +1214,7 @@ pub fn search_cached_users( &self, account_id_hex: String, query: String, limit:
 
 Search public identities cached through any connected account, without network or group-membership work. Follow flags refer only to the selected searcher. Call off the UI thread; zero limit returns no rows.
 
-[Source](src/commands/directory.rs#L173)
+[Source](src/commands/directory.rs#L179)
 
 ### `Marmot::search_users`
 
@@ -1226,7 +1226,7 @@ pub async fn search_users( &self, account_id_hex: String, query: String, radius_
 
 Stream cached public identities across accounts, then independent provider and graph results. The radius window bounds known social distances; cached/provider identities without a known distance remain discoverable. Those identities can recur when paging radii: deduplicate by account id across pages as well as within each subscription.
 
-[Source](src/commands/directory.rs#L199)
+[Source](src/commands/directory.rs#L205)
 
 </details>
 
@@ -3330,7 +3330,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L241)
+[Source](src/lib.rs#L242)
 
 ### `Marmot::new_with_options`
 
@@ -3342,7 +3342,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L257)
+[Source](src/lib.rs#L258)
 
 ### `Marmot::new`
 
@@ -3354,7 +3354,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L285)
+[Source](src/lib.rs#L286)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3366,7 +3366,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L303)
+[Source](src/lib.rs#L304)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3378,7 +3378,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L333)
+[Source](src/lib.rs#L334)
 
 ### `Marmot::new_with_client_name`
 
@@ -3390,7 +3390,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L352)
+[Source](src/lib.rs#L353)
 
 ### `Marmot::start`
 
@@ -3402,7 +3402,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L389)
+[Source](src/lib.rs#L390)
 
 ### `Marmot::shutdown`
 
@@ -3414,7 +3414,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L401)
+[Source](src/lib.rs#L402)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3426,7 +3426,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L436)
+[Source](src/lib.rs#L437)
 
 ### `Marmot::storage_is_closed`
 
@@ -3438,7 +3438,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L444)
+[Source](src/lib.rs#L445)
 
 ### `Marmot::is_stopping`
 
@@ -3450,7 +3450,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L451)
+[Source](src/lib.rs#L452)
 
 </details>
 
@@ -4151,5 +4151,30 @@ author, kind, tag, relay provenance, or MLS group-membership policy; the host
 must enforce those separately and bound any untrusted JSON before passing it.
 
 [Source](src/commands/nostr_verification.rs#L7)
+
+</details>
+
+<details>
+<summary>New exports — complete and organize before merging</summary>
+
+### `Marmot::post_audit_log_tracker_update_v5`
+
+```rust
+pub async fn post_audit_log_tracker_update_v5( &self, ) -> Result<AuditLogTrackerUpdateResultV5Ffi, MarmotKitError>
+```
+
+Run an immediate audit tracker pass and receive separate v4 whole-file and v5 OTLP outcomes. The `v5` field is absent when no dedicated sender is configured; when present, accepted batches, pending accounts, blocked accounts, and idle accounts report the delivery state without treating an empty v4 upload list as success. Recording must be enabled separately. Existing automatic activity triggers use the same v5 sender and retry policy.
+
+[Source](src/commands/audit.rs#L134)
+
+### `Marmot::set_audit_otlp_config_v5`
+
+```rust
+pub fn set_audit_otlp_config_v5( &self, mut config: AuditOtlpConfigV5Ffi, ) -> Result<AuditOtlpConfigV5Ffi, MarmotKitError>
+```
+
+Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, provide a stable destination identity, an HTTPS `/v1/logs` endpoint, and a bearer token; local loopback testing additionally requires `allow_loopback_dev: true`. The returned configuration always omits the token. With `enabled: false`, the runtime clears the sender. This does not enable recording, change the v4 Goggles route, or persist credentials. A configuration change fences in-flight acknowledgments.
+
+[Source](src/commands/audit.rs#L54)
 
 </details>

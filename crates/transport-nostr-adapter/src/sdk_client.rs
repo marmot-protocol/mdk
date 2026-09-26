@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::{
-    MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointFailure,
-    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
-    TransportPublishFailure, collapse_publish_failure_summaries,
+    MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointAckKind,
+    TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
+    TransportEndpointRejectionCategory, TransportPublishFailure,
+    collapse_publish_failure_summaries,
 };
 use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
@@ -19,6 +20,7 @@ use nostr_sdk::prelude::{
     RelayAcquisition, RelayCapabilities, RelayMessage, RelayStatus, RelayUrl, ReqTarget,
     SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions, Tag, Timestamp as NostrTimestamp,
 };
+use nostr_sdk::relay::EventSendStatus;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
@@ -28,8 +30,8 @@ use transport_nostr_peeler::{
 
 use crate::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
-    NostrAcquisitionError, NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope,
-    NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
+    NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
+    NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
     NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome, NostrRelayClient,
     NostrRelayEvent, NostrSubscription, NostrTransportAdapter,
 };
@@ -73,13 +75,23 @@ const SDK_RECONCILIATION_NEGOTIATION_WAIT: Duration = Duration::from_millis(500)
 /// Fetch a bounded rotating portion of the remote-only set. Durable admission
 /// removes accepted ids; rotation reaches dependencies beyond refused ids.
 const SDK_RECONCILIATION_REPLAY_BATCH: usize = 128;
+/// An exact-ID request may return a large event or duplicate copies. Spend a
+/// finite aggregate budget across all request-local acquisitions in one pass.
+const SDK_RECONCILIATION_MAX_ID_REQUESTS: usize = 16;
+const SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT: usize = 16;
+const SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT: usize = 128 * 1024;
+// A single supported event can exceed the ordinary pass allowance. The pinned
+// SDK's default normalized-message ceiling is 5 MiB; one otherwise-empty pass
+// may return one such object, then stops. This is an MDK acquisition ceiling,
+// not a Nostr protocol maximum or a bound for custom SDK clients.
+const SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES: usize = 5 * 1024 * 1024;
 /// Must match the storage inventory ceiling. The relay applies the same limit,
 /// bounding the dry-run result even on first boot with an empty inventory.
 const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384;
 
 /// Account-owned advisory replay progress, independent of admitted event inventory.
 /// The host must preserve this across routine subscription rebuilds and serialize
-/// calls for one route. Saving must complete before replay fetch I/O starts.
+/// calls for one route. Saving each selected ID must complete before its fetch I/O starts.
 /// Implementations should return aggregate errors without route or event identifiers.
 pub trait NostrReconciliationProgress: Send + Sync {
     fn load_cursor(&self) -> Result<Option<[u8; 32]>, TransportAdapterError>;
@@ -91,15 +103,9 @@ fn select_reconciliation_remote_ids(
     progress: &dyn NostrReconciliationProgress,
 ) -> Result<Vec<EventId>, TransportAdapterError> {
     let after = progress.load_cursor()?.map(EventId::from_byte_array);
-    let ids = bounded_reconciliation_remote_ids(remote, after);
-    // Selection is advisory, including cancellation or fetch failure. Refused
-    // IDs recur on wrap; only durable ingestion changes the admitted inventory.
-    // Empty comparisons also occur when all relays fail negotiation. Preserve
-    // progress so the next successful comparison does not restart at a refused prefix.
-    if let Some(last) = ids.last() {
-        progress.save_cursor(Some(last.to_bytes()))?;
-    }
-    Ok(ids)
+    // Empty comparisons can also mean every relay failed negotiation. Leave
+    // the cursor unchanged; only attempted IDs move it below.
+    Ok(bounded_reconciliation_remote_ids(remote, after))
 }
 
 fn bounded_reconciliation_remote_ids(
@@ -126,7 +132,10 @@ pub struct NostrReconciliationItem {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NostrReconciliationSummary {
+    /// Endpoints whose comparison and every selected exact-ID request reached
+    /// their request policy. This is not exhaustive history coverage.
     pub relays_succeeded: usize,
+    /// Endpoints with comparison, acquisition, or selected-suffix gaps.
     pub relays_failed: usize,
     pub remote_items: usize,
     pub received_items: usize,
@@ -640,7 +649,15 @@ impl NostrSdkRelayClient {
         // requested endpoint under this call's finite SDK deadline rather
         // than carrying a stale process-lifetime rejection across sessions.
         // The app recovery owner paces its calls; direct callers own their rate.
-        let endpoints = plan.endpoints;
+        // Reconciliation counts physical relay obligations. Parse first, then
+        // keep each canonical endpoint once so a repeated route URL cannot
+        // make the exact-ID request invalid after cached events were gathered.
+        let mut seen_endpoints = HashSet::new();
+        let endpoints = plan
+            .endpoints
+            .into_iter()
+            .filter(|endpoint| seen_endpoints.insert(endpoint.clone()))
+            .collect::<Vec<_>>();
         let Some(replay_endpoint) = endpoints.first().cloned() else {
             // Preserve the public no-op result for an empty route set. It is
             // neither relay coverage nor backend-wide incapability evidence.
@@ -681,34 +698,47 @@ impl NostrSdkRelayClient {
                 TransportAdapterError::Subscription("NIP-77 reconciliation timed out".to_owned())
             })?;
         let mut remote = HashSet::new();
-        let mut relays_succeeded = 0;
-        let mut relays_failed = 0;
-        for (_, result) in outcomes {
+        let mut remote_by_endpoint = HashMap::new();
+        let mut failed_endpoints = HashSet::new();
+        for (endpoint, result) in outcomes {
             match result {
                 Some(Ok(summary)) => {
-                    relays_succeeded += 1;
-                    remote.extend(summary.remote);
+                    remote.extend(summary.remote.iter().copied());
+                    remote_by_endpoint.insert(endpoint, summary.remote);
                 }
                 Some(Err(_)) => {
-                    relays_failed += 1;
+                    failed_endpoints.insert(endpoint);
                 }
-                None => relays_failed += 1,
+                None => {
+                    failed_endpoints.insert(endpoint);
+                }
             }
         }
-        // Compare without SDK-managed downloads: its download path returns
-        // only after every 100-id REQ/EOSE batch, so an outer timeout discards
-        // all useful progress. Instead, deterministically request a bounded
-        // rotating batch so even a completely refused batch cannot starve
-        // later dependencies; durable app ingestion shrinks the next diff.
+        // Compare without SDK-managed downloads. An exact-ID acquisition owns
+        // each partial result and has finite per-endpoint item/byte budgets.
+        // One ID per REQ prevents a relay's fixed response order from repeating
+        // the same affordable prefix when a later event exceeds the budget.
+        // The durable cursor rotates refused and oversized IDs on later passes.
         let remote_item_count = remote.len();
         let remote_ids = select_reconciliation_remote_ids(&remote, progress)?;
+        let selected_item_count = remote_ids.len();
+        let selected_set = remote_ids.iter().copied().collect::<HashSet<_>>();
+        for ids in remote_by_endpoint.values_mut() {
+            ids.retain(|id| selected_set.contains(id));
+        }
+        drop(remote);
         let mut sdk_events = Vec::new();
-        let mut missing_ids = Vec::new();
-        for event_id in remote_ids {
+        let mut spent_items = 0usize;
+        let mut spent_bytes = 0usize;
+        let mut returned_ids = HashSet::new();
+        let mut requests = 0usize;
+        let mut incomplete = remote_item_count > remote_ids.len();
+        for (index, event_id) in remote_ids.into_iter().enumerate() {
             if tokio::time::Instant::now() >= deadline {
+                incomplete = true;
                 break;
             }
-            match self
+            if let Some(event) = self
                 .client
                 .database()
                 .event_by_id(&event_id)
@@ -717,56 +747,183 @@ impl NostrSdkRelayClient {
                     TransportAdapterError::Subscription(
                         "read reconciled event from SDK database failed".to_owned(),
                     )
-                })? {
-                Some(event) => sdk_events.push(event),
-                None => missing_ids.push(event_id),
+                })?
+            {
+                let event_bytes = event.as_json().len();
+                let remaining_items =
+                    SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
+                let byte_allowance = if sdk_events.is_empty() && spent_bytes == 0 {
+                    SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
+                } else {
+                    SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
+                };
+                let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
+                if remaining_items == 0 || event_bytes > remaining_bytes {
+                    incomplete = true;
+                    if event_bytes > SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES {
+                        // This object can never fit the pass allowance. Rotate
+                        // past it so smaller missing IDs remain reachable;
+                        // durable inventory still keeps it eligible on wrap.
+                        progress.save_cursor(Some(event_id.to_bytes()))?;
+                        continue;
+                    }
+                    // A fitting object deferred by earlier results must be
+                    // the first candidate on the next pass.
+                    break;
+                }
+                progress.save_cursor(Some(event_id.to_bytes()))?;
+                spent_items += 1;
+                spent_bytes += event_bytes;
+                returned_ids.insert(event_id.to_hex());
+                sdk_events.push((
+                    replay_endpoint.clone(),
+                    NostrTransportEvent::from_nostr_event(&event).map_err(|_| {
+                        TransportAdapterError::Subscription(
+                            "decode cached reconciled SDK event failed".to_owned(),
+                        )
+                    })?,
+                ));
+                if event_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
+                    // One large cached object is the entire returned batch.
+                    incomplete |= index + 1 < selected_item_count;
+                    break;
+                }
+                continue;
+            }
+            if requests >= SDK_RECONCILIATION_MAX_ID_REQUESTS {
+                incomplete = true;
+                break;
+            }
+            let remaining_items =
+                SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
+            // The first request must offer enough room to discover the size of
+            // a single event before the SDK can accept or reject it. All later
+            // requests share the ordinary aggregate allowance.
+            let byte_allowance = if sdk_events.is_empty() && spent_bytes == 0 {
+                SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
+            } else {
+                SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
+            };
+            let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
+            let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining_items == 0 || remaining_bytes == 0 || remaining_time.is_zero() {
+                incomplete = true;
+                break;
+            }
+            // Do not advance past an ID merely because this pass ran out of
+            // capacity. A dispatched request saves progress before its I/O;
+            // only worker admission removes the ID from later comparisons.
+            let prior_cursor = progress.load_cursor()?;
+            let single_object_request = byte_allowance == SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES;
+            progress.save_cursor(Some(event_id.to_bytes()))?;
+            requests += 1;
+            let result = self
+                .acquire_history(
+                    NostrAcquisitionRequest {
+                        account_id: subscription.account_id().clone(),
+                        scope: NostrAcquisitionScope::KnownEventIds(vec![event_id.to_bytes()]),
+                        endpoints: endpoints
+                            .iter()
+                            .map(|endpoint| TransportEndpoint(endpoint.to_string()))
+                            .collect(),
+                        limits: NostrAcquisitionLimits {
+                            max_endpoints: endpoints.len(),
+                            max_requested_event_ids: 1,
+                            max_received_items_per_endpoint: remaining_items,
+                            max_serialized_event_bytes_per_endpoint: remaining_bytes,
+                            max_duration: remaining_time,
+                        },
+                    },
+                    NostrAcquisitionCancellation::new(),
+                )
+                .await
+                .map_err(|_| {
+                    TransportAdapterError::Subscription(
+                        "bounded reconciled event acquisition failed".to_owned(),
+                    )
+                })?;
+            // The SDK counts duplicate and rejected events at its boundary.
+            // Charge the largest endpoint cost against the next request's
+            // uniform limits, so neither endpoint can exceed the pass budget
+            // except for the one event observed at the rejection boundary.
+            let mut request_items = 0usize;
+            let mut request_bytes = 0usize;
+            let mut byte_limited = false;
+            let wanted_id = event_id.to_hex();
+            for (endpoint, outcome) in endpoints.iter().zip(result.endpoints) {
+                request_items = request_items.max(outcome.stats.received_items);
+                request_bytes = request_bytes.max(outcome.stats.serialized_event_bytes);
+                byte_limited |= outcome.end == NostrAcquisitionEnd::ByteLimitReached;
+                let claimed_id_missing = remote_by_endpoint
+                    .get(endpoint)
+                    .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id))
+                    && !outcome.events.iter().any(|event| event.id == wanted_id);
+                if outcome.end != NostrAcquisitionEnd::RequestPolicySatisfied || claimed_id_missing
+                {
+                    failed_endpoints.insert(endpoint.clone());
+                }
+                for event in outcome.events {
+                    if event.id != wanted_id {
+                        failed_endpoints.insert(endpoint.clone());
+                        continue;
+                    }
+                    if returned_ids.contains(&event.id) {
+                        continue;
+                    }
+                    // SDK stats charge every received EVENT before accepting
+                    // it, using the same event JSON length. The maximum
+                    // endpoint cost therefore dominates this deduped batch.
+                    returned_ids.insert(event.id.clone());
+                    sdk_events.push((endpoint.clone(), event));
+                }
+            }
+            spent_items = spent_items.saturating_add(request_items);
+            spent_bytes = spent_bytes.saturating_add(request_bytes);
+            if !single_object_request
+                && byte_limited
+                && !returned_ids.contains(&wanted_id)
+                && request_bytes <= SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
+            {
+                // This ID was dispatched with only the bytes left after an
+                // earlier result. Keep the pre-I/O save for cancellation, but
+                // after a completed bounded rejection let this ID lead the
+                // next pass, even if that earlier result stays unadmitted.
+                // An object beyond the single-event ceiling still rotates.
+                progress.save_cursor(prior_cursor)?;
+                incomplete |= index + 1 < selected_item_count;
+                break;
+            }
+            if spent_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
+                // A first oversized result, or expensive duplicate/boundary
+                // traffic, consumes this pass. Failed endpoints remain marked
+                // while the unattempted suffix stays retryable.
+                incomplete |= index + 1 < selected_item_count;
+                break;
             }
         }
-        if !missing_ids.is_empty() {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if !remaining.is_zero() {
-                // A seen id need not have cached event bytes: the default SDK
-                // database retains ids only. Even a successful explicit fetch
-                // can therefore emit no ordinary Event notification. Own every
-                // fetched result here; the account's durable seen index absorbs
-                // any concurrent first-sighting notification.
-                let fetched = self
-                    .client
-                    .fetch_events(ReqTarget::manual(endpoints.into_iter().map(|endpoint| {
-                        (endpoint, vec![Filter::new().ids(missing_ids.clone())])
-                    })))
-                    .timeout(remaining)
-                    .await
-                    .map_err(|_| {
-                        TransportAdapterError::Subscription(
-                            "fetch reconciled event batch failed".to_owned(),
-                        )
-                    })?;
-                sdk_events.extend(fetched);
-            }
+        if incomplete {
+            // Unattempted IDs are still debt on every endpoint, even if its
+            // earlier exact-ID REQs reached EOSE. No partial pass is coverage.
+            failed_endpoints.extend(endpoints.iter().cloned());
         }
         // Negentropy reports a set. MLS input is sequential, so replay the
         // materialized difference in the same authored-time/id order used by
         // stored-event catch-up instead of HashSet iteration order.
-        sdk_events.sort_unstable_by_key(|event| (event.created_at, event.id));
+        sdk_events.sort_unstable_by_key(|(_, event)| (event.created_at, event.id.clone()));
+        sdk_events.dedup_by(|a, b| a.1.id == b.1.id);
         let mut remote_events = Vec::with_capacity(sdk_events.len());
         // The network deadline bounds acquisition, not delivery of the
-        // already-owned bounded batch. A fetch may finish at its timeout;
-        // discarding those results would lose them behind SDK dedup again.
-        for event in sdk_events {
+        // already-owned bounded batch. Partial events still reach the owner.
+        for (endpoint, event) in sdk_events {
             remote_events.push(NostrRelayEvent {
-                endpoint: TransportEndpoint(replay_endpoint.to_string()),
+                endpoint: TransportEndpoint(endpoint.to_string()),
                 subscription_id: Some(subscription_id.clone()),
-                event: NostrTransportEvent::from_nostr_event(&event).map_err(|error| {
-                    TransportAdapterError::Subscription(format!(
-                        "decode reconciled SDK event: {error}"
-                    ))
-                })?,
+                event,
             });
         }
         let summary = NostrReconciliationSummary {
-            relays_succeeded,
-            relays_failed,
+            relays_succeeded: endpoints.len().saturating_sub(failed_endpoints.len()),
+            relays_failed: failed_endpoints.len(),
             remote_items: remote_item_count,
             received_items: remote_events.len(),
         };
@@ -1153,6 +1310,10 @@ impl NostrSdkRelayClient {
                     return Ok(TransportEndpointReceipt {
                         endpoint: transport_endpoint,
                         accepted_at: None,
+                        // Only a typed SDK ACK can establish this detail. The
+                        // legacy failed-map duplicate path remains accepted
+                        // but has no preserved ACK status to classify.
+                        ack_kind: typed_relay_ack_kind(output.success.get(&endpoint)),
                     });
                 }
                 Ok(Ok(output)) => {
@@ -2373,12 +2534,26 @@ fn merge_registration_log(
     }
 }
 
-/// A relay `OK:false` with the NIP-01 `duplicate:` machine prefix proves the
-/// exact event is already stored and counts as idempotent publication success.
-fn relay_duplicate_acknowledgement(relay_failure: &str) -> bool {
+/// A relay ACK with the NIP-01 `duplicate:` machine prefix reports that the
+/// exact event is already held; an `OK:false` duplicate remains idempotent
+/// publication success under the existing admission policy.
+fn relay_duplicate_acknowledgement(relay_message: &str) -> bool {
     matches!(
-        nostr::message::MachineReadablePrefix::parse(relay_failure),
+        nostr::message::MachineReadablePrefix::parse(relay_message),
         Some(nostr::message::MachineReadablePrefix::Duplicate)
+    )
+}
+
+fn typed_relay_ack_kind(status: Option<&EventSendStatus>) -> Option<TransportEndpointAckKind> {
+    let EventSendStatus::Ack(ack) = status? else {
+        return None;
+    };
+    Some(
+        if ack.message().is_some_and(relay_duplicate_acknowledgement) {
+            TransportEndpointAckKind::Duplicate
+        } else {
+            TransportEndpointAckKind::Affirmative
+        },
     )
 }
 
@@ -3009,6 +3184,12 @@ mod tests {
             let selected = select_reconciliation_remote_ids(&remote, route).unwrap();
             assert_eq!(selected.len(), SDK_RECONCILIATION_REPLAY_BATCH);
             assert!(!selected.contains(&dependency));
+            // Simulate a pass that attempted its finite request allowance.
+            route
+                .save_cursor(Some(
+                    selected[SDK_RECONCILIATION_MAX_ID_REQUESTS - 1].to_bytes(),
+                ))
+                .unwrap();
             let cursor = route.load_cursor().unwrap();
             assert!(
                 select_reconciliation_remote_ids(&HashSet::new(), route)
@@ -3023,15 +3204,19 @@ mod tests {
             let selected = select_reconciliation_remote_ids(&remote, route).unwrap();
             assert_eq!(selected.len(), SDK_RECONCILIATION_REPLAY_BATCH);
             assert!(selected.contains(&dependency));
+            route
+                .save_cursor(Some(
+                    selected[SDK_RECONCILIATION_MAX_ID_REQUESTS - 1].to_bytes(),
+                ))
+                .unwrap();
         }
-        for route in &routes {
-            assert!(
-                select_reconciliation_remote_ids(&remote, route)
-                    .unwrap()
-                    .contains(remote.iter().min().unwrap()),
-                "refused prefix recurs on wrap"
-            );
-        }
+        // A cursor beyond a changed remote set wraps; refused IDs remain in
+        // the remote-only set and recur when rotation reaches them again.
+        routes[0].save_cursor(Some([0xff; 32])).unwrap();
+        assert_eq!(
+            select_reconciliation_remote_ids(&remote, &routes[0]).unwrap()[0],
+            *remote.iter().min().unwrap()
+        );
         // Even a saved cursor above a changed remote set wraps without clearing.
         let lower = HashSet::from([*remote.iter().min().unwrap()]);
         routes[0].save_cursor(Some([0xff; 32])).unwrap();
@@ -3096,20 +3281,14 @@ mod tests {
             .unwrap();
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].event.id, event.id.to_hex());
-        let announced_id = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let ClientNotification::Event { event, .. } = notifications.next().await.unwrap()
-                {
-                    break event.id;
-                }
-            }
-        })
-        .await
-        .expect("explicit first fetch emits an SDK first-sighting notification");
-        assert_eq!(
-            announced_id, event.id,
-            "the overlap must be this exact fetched object"
-        );
+        while let Ok(Some(notification)) =
+            tokio::time::timeout(Duration::from_millis(30), notifications.next()).await
+        {
+            assert!(
+                !matches!(notification, ClientNotification::Event { .. }),
+                "request-local acquisition must not emit ordinary Event notifications"
+            );
+        }
         assert!(
             sdk.client
                 .database()
@@ -3211,12 +3390,11 @@ mod tests {
             }
         }
         let after_cancel = progress.load_cursor().unwrap().unwrap();
-        let expected_tail = published
-            .iter()
-            .map(|event| event.id)
-            .filter(|id| id.to_bytes() > after_cancel)
-            .collect::<HashSet<_>>();
-        assert_eq!(expected_tail.len(), 9);
+        assert!(
+            published
+                .iter()
+                .any(|event| event.id.to_bytes() > after_cancel)
+        );
         let (_, resumed) = sdk
             .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
             .await
@@ -3225,17 +3403,21 @@ mod tests {
             .iter()
             .map(|event| EventId::from_hex(&event.event.id).unwrap())
             .collect::<HashSet<_>>();
-        assert!(
-            expected_tail.is_subset(&resumed_ids),
-            "cancellation preserves forward replay progress"
-        );
+        let mut expected_next = published.iter().map(|event| event.id).collect::<Vec<_>>();
+        expected_next.sort_unstable();
+        let expected_next = expected_next
+            .into_iter()
+            .filter(|id| id.to_bytes() > after_cancel)
+            .take(SDK_RECONCILIATION_MAX_ID_REQUESTS)
+            .collect::<HashSet<_>>();
+        assert_eq!(resumed_ids, expected_next);
         progress.save_cursor(None).unwrap();
         let mut notifications = sdk.client.notifications();
         let (_, first) = sdk
             .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
             .await
             .unwrap();
-        assert_eq!(first.len(), SDK_RECONCILIATION_REPLAY_BATCH);
+        assert_eq!(first.len(), SDK_RECONCILIATION_MAX_ID_REQUESTS);
         while let Some(notification) =
             tokio::time::timeout(Duration::from_millis(10), notifications.next())
                 .await
@@ -3253,52 +3435,41 @@ mod tests {
                 .all(|pair| (pair[0].event.created_at, &pair[0].event.id)
                     <= (pair[1].event.created_at, &pair[1].event.id))
         );
-        // Refusing an entire batch must still expose the remaining history,
-        // including a dependency that was outside the first bounded batch.
-        let (_, rotated) = sdk
-            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
-            .await
-            .unwrap();
-        assert_eq!(rotated.len(), SDK_RECONCILIATION_REPLAY_BATCH);
-        let reached = first
+        // Refusing every event must still rotate through the entire set,
+        // including dependencies beyond both the request and selection caps.
+        let mut reached = first
             .iter()
-            .chain(rotated.iter())
             .map(|event| event.event.id.clone())
             .collect::<HashSet<_>>();
-        assert_eq!(reached.len(), published.len());
-        // Refuse one event again; only the accepted batch enters durable inventory.
-        let inventory = first[1..]
+        for _ in 0..9 {
+            let (_, rotated) = sdk
+                .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
+                .await
+                .unwrap();
+            reached.extend(rotated.into_iter().map(|event| event.event.id));
+            if reached.len() == published.len() {
+                break;
+            }
+        }
+        let expected = published
+            .iter()
+            .map(|event| event.id.to_hex())
+            .collect::<HashSet<_>>();
+        assert_eq!(reached, expected);
+        // Only durable account inventory removes an event from the difference.
+        let inventory = published[1..]
             .iter()
             .map(|event| NostrReconciliationItem {
-                event_id: EventId::from_hex(&event.event.id).unwrap().to_bytes(),
-                created_at: event.event.created_at,
+                event_id: event.id.to_bytes(),
+                created_at: event.created_at.as_secs(),
             })
             .collect::<Vec<_>>();
         let (_, second) = sdk
             .reconcile_subscription(subscription, &inventory, 0, u64::MAX, &progress)
             .await
             .unwrap();
-        assert_eq!(second.len(), 10);
-        assert!(
-            second
-                .iter()
-                .any(|event| event.event.id == first[0].event.id)
-        );
-        let mut delivered = first[1..]
-            .iter()
-            .chain(second.iter())
-            .map(|event| event.event.id.clone())
-            .collect::<Vec<_>>();
-        delivered.sort();
-        let mut expected = published
-            .iter()
-            .map(|event| event.id.to_hex())
-            .collect::<Vec<_>>();
-        expected.sort();
-        assert_eq!(
-            delivered, expected,
-            "every retained route event is delivered exactly once after admission"
-        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].event.id, published[0].id.to_hex());
         sdk.client.shutdown().await;
         relay.shutdown();
     }
@@ -3432,6 +3603,7 @@ mod tests {
         let accepted = vec![TransportEndpointReceipt {
             endpoint: TransportEndpoint("wss://good.example".into()),
             accepted_at: None,
+            ack_kind: None,
         }];
         let failed = vec![TransportEndpointFailure {
             endpoint: TransportEndpoint("wss://bad.example".into()),
@@ -3457,7 +3629,15 @@ mod tests {
         ));
         assert!(!relay_duplicate_acknowledgement("blocked: policy"));
         assert!(!relay_duplicate_acknowledgement("relay rejected event"));
+        assert!(!relay_duplicate_acknowledgement(
+            "not-duplicate: already stored"
+        ));
+        assert!(!relay_duplicate_acknowledgement(
+            "Duplicate: already stored"
+        ));
         assert!(!relay_duplicate_acknowledgement(""));
+        assert_eq!(typed_relay_ack_kind(None), None);
+        assert_eq!(typed_relay_ack_kind(Some(&EventSendStatus::Sent)), None);
     }
 
     #[test]
@@ -3522,6 +3702,7 @@ mod tests {
         let accepted = vec![TransportEndpointReceipt {
             endpoint: TransportEndpoint("wss://relay.example".into()),
             accepted_at: None,
+            ack_kind: None,
         }];
         let outcome = NostrSdkRelayClient::finish_publish_outcome(
             message_id,
@@ -4205,13 +4386,18 @@ mod tests {
         .to_event()
         .expect("key package event");
 
-        timeout(
+        let first = timeout(
             Duration::from_secs(2),
             sdk.publish_event(std::slice::from_ref(&endpoint), &dto, 1),
         )
         .await
         .expect("first publish should complete")
         .expect("first publish should succeed");
+        assert_eq!(first.accepted.len(), 1);
+        assert_eq!(
+            first.accepted[0].ack_kind,
+            Some(TransportEndpointAckKind::Affirmative)
+        );
 
         let republish = timeout(
             Duration::from_secs(2),
@@ -4223,6 +4409,71 @@ mod tests {
 
         assert_eq!(republish.accepted.len(), 1);
         assert_eq!(republish.accepted[0].endpoint, endpoint);
+        assert_eq!(
+            republish.accepted[0].ack_kind,
+            Some(TransportEndpointAckKind::Duplicate)
+        );
+        assert_eq!(first.message_id, republish.message_id);
+    }
+
+    #[tokio::test]
+    async fn adapter_report_preserves_real_sdk_duplicate_ack_kind() {
+        let relay = MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let adapter = NostrTransportAdapter::new(Arc::new(signed_sdk(keys)));
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+
+        let message = signed_group_event_dto().to_transport_message().unwrap();
+        let cgka_traits::TransportEnvelope::GroupMessage { transport_group_id } = &message.envelope
+        else {
+            unreachable!()
+        };
+        let request = cgka_traits::TransportPublishRequest {
+            account_id: account_id.clone(),
+            message: message.clone(),
+            target: cgka_traits::TransportPublishTarget::Group {
+                group_id: cgka_traits::GroupId::new(vec![0xAB; 16]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            },
+            required_acks: 1,
+        };
+        let first = timeout(Duration::from_secs(2), adapter.publish(request.clone()))
+            .await
+            .expect("first adapter publish completes")
+            .expect("first adapter publish acknowledged");
+        let duplicate = timeout(Duration::from_secs(2), adapter.publish(request))
+            .await
+            .expect("exact adapter republish completes")
+            .expect("exact adapter republish acknowledged");
+
+        assert_eq!(first.message_id, message.id);
+        assert_eq!(duplicate.message_id, message.id);
+        assert!(first.met_required_acks());
+        assert!(duplicate.met_required_acks());
+        assert_eq!(first.accepted.len(), 1);
+        assert_eq!(duplicate.accepted.len(), 1);
+        assert_eq!(first.accepted[0].endpoint, endpoint);
+        assert_eq!(duplicate.accepted[0].endpoint, endpoint);
+        assert_eq!(
+            first.accepted[0].ack_kind,
+            Some(TransportEndpointAckKind::Affirmative)
+        );
+        assert_eq!(
+            duplicate.accepted[0].ack_kind,
+            Some(TransportEndpointAckKind::Duplicate)
+        );
+        adapter.deactivate_account(&account_id).await.unwrap();
     }
 
     #[tokio::test]

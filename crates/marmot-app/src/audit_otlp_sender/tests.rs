@@ -107,9 +107,11 @@ async fn exact_original_bodies_and_full_success_advance_after_reacquiring_owners
     let sender =
         AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "dedicated-test-token")
             .unwrap();
+    let expected_request_bytes = sender.request_body_bytes(&batch).unwrap();
     assert!(!format!("{sender:?}").contains("dedicated-test-token"));
     assert_eq!(sender.send(batch).await, AuditOtlpSendResult::Complete);
     let request = service.await.unwrap();
+    assert_eq!(request.body.len(), expected_request_bytes);
     assert!(request.headers.starts_with("POST /v1/logs HTTP/1.1\r\n"));
     assert!(
         request

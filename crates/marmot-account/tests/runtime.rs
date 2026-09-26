@@ -597,6 +597,7 @@ impl TransportAdapter for RecordingAdapter {
                     .map(|endpoint| TransportEndpointReceipt {
                         endpoint,
                         accepted_at: None,
+                        ack_kind: None,
                     })
                     .collect(),
                 failed: request
@@ -639,6 +640,7 @@ impl TransportAdapter for RecordingAdapter {
                 .map(|endpoint| TransportEndpointReceipt {
                     endpoint,
                     accepted_at: None,
+                    ack_kind: None,
                 })
                 .collect(),
             failed: Vec::new(),

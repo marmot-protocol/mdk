@@ -44,6 +44,17 @@ use super::epoch_stall::BackfillDecision;
 use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
 use crate::config::CursorPersistence;
 
+mod comparison_job;
+pub(crate) use comparison_job::ComparisonNetworkJob;
+#[cfg(test)]
+pub(crate) use comparison_job::TestComparisonActivityWitness;
+
+pub(crate) enum PendingRecoverySelection {
+    NotPending,
+    Deferred,
+    Grant(Box<AttemptGrant>),
+}
+
 /// Account-wide startup budget for the timestamp-independent correctness pass.
 /// Partial progress is durable, so a slow or non-NIP-77 relay cannot hold the
 /// account worker indefinitely and the next sync can resume from a smaller
@@ -1392,55 +1403,8 @@ impl AppClient {
         telemetry: Option<&AppPerformanceTelemetry>,
         explicit: bool,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        // Reconcile epoch-bounded prior routes before issuing the first relay
-        // subscriptions. This makes retirement deterministic even for a quiet
-        // group that has no new inbound events after restart.
-        let refresh = self.refresh_group_routes().map_err(|error| {
-            ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::StatePersist,
-            )
-        })?;
-        // A routing-table delta lives in memory and obligates the subscription
-        // refresh below, not a state write; only route retirement mutates
-        // persisted group state.
-        if refresh.state_pruned {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::StatePersist,
-                    )
-                })?;
-        }
-        if self.app.cursor_persistence() == CursorPersistence::Advance
-            && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
-        {
-            self.request_bounded_comparison().map_err(|error| {
-                ClassifiedSyncFailure::at_stage(
-                    SyncSummary::default(),
-                    error,
-                    SyncFailureStage::StatePersist,
-                )
-            })?;
-            if !explicit {
-                self.comparison_startup_requested = true;
-            }
-        }
-        let mut caller = ExplicitRecoveryPermit::default();
         let grant = self
-            .authorize_account_recovery(
-                explicit.then_some(&mut caller),
-                if explicit {
-                    EpochBackfillExecutionSeam::ExplicitCatchUp
-                } else if telemetry.is_some() {
-                    EpochBackfillExecutionSeam::Startup
-                } else {
-                    EpochBackfillExecutionSeam::Maintenance
-                },
-            )
+            .prepare_sync_grant(telemetry, explicit, false)
             .map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
                     SyncSummary::default(),
@@ -1448,7 +1412,63 @@ impl AppClient {
                     SyncFailureStage::StatePersist,
                 )
             })?;
-        let mut summary = if let Some(grant) = grant {
+        self.execute_prepared_sync(grant, telemetry, explicit).await
+    }
+
+    /// Keep the same startup/explicit reservation path available to the
+    /// account worker before it lends an immutable comparison request to a
+    /// network task. A grant is selected once; an ineligible shape keeps this
+    /// exact reservation when the inline executor takes over.
+    pub(crate) fn prepare_sync_grant(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        explicit: bool,
+        defer_comparison_without_credit: bool,
+    ) -> Result<Option<AttemptGrant>, AppError> {
+        // Reconcile epoch-bounded prior routes before issuing the first relay
+        // subscriptions. This makes retirement deterministic even for a quiet
+        // group that has no new inbound events after restart.
+        let refresh = self.refresh_group_routes()?;
+        // A routing-table delta lives in memory and obligates the subscription
+        // refresh below, not a state write; only route retirement mutates
+        // persisted group state.
+        if refresh.state_pruned {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        if self.app.cursor_persistence() == CursorPersistence::Advance
+            && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
+        {
+            self.request_bounded_comparison()?;
+            if !explicit {
+                self.comparison_startup_requested = true;
+            }
+        }
+        if defer_comparison_without_credit && self.comparison_only_waiting_for_credit()? {
+            // Startup still activates and drains ordinary live interest below.
+            // A saturated process pool cannot spend a durable comparison
+            // reservation merely to fall back to another inline SDK wait.
+            return Ok(None);
+        }
+        let mut caller = ExplicitRecoveryPermit::default();
+        self.authorize_account_recovery(
+            explicit.then_some(&mut caller),
+            if explicit {
+                EpochBackfillExecutionSeam::ExplicitCatchUp
+            } else if telemetry.is_some() {
+                EpochBackfillExecutionSeam::Startup
+            } else {
+                EpochBackfillExecutionSeam::Maintenance
+            },
+        )
+    }
+
+    pub(crate) async fn execute_prepared_sync(
+        &mut self,
+        grant: Option<AttemptGrant>,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        explicit: bool,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let summary = if let Some(grant) = grant {
             self.execute_recovery_grant(grant, None, telemetry).await?
         } else {
             if self.app.cursor_persistence() == CursorPersistence::Frozen
@@ -1480,6 +1500,23 @@ impl AppClient {
             // events. Receiving existing subscriptions is not a new acquisition.
             self.sync_sdk_relay(&mut DrainCounts::default()).await?.0
         };
+        self.finish_prepared_sync_summary(summary).await
+    }
+
+    /// A startup comparison already activated the live account subscriptions.
+    /// If its fenced result is stale, drain that activation without rebuilding
+    /// every subscription or replaying the account backlog a second time.
+    pub(crate) async fn finish_deferred_comparison_sync(
+        &mut self,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let summary = self.sync_sdk_relay(&mut DrainCounts::default()).await?.0;
+        self.finish_prepared_sync_summary(summary).await
+    }
+
+    pub(crate) async fn finish_prepared_sync_summary(
+        &mut self,
+        mut summary: SyncSummary,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
         // `open()` hydration (mdk#426). If no relay delivery arrived
@@ -1658,6 +1695,15 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
+            #[cfg(test)]
+            if previous_group != updated_group
+                && let Some(probe) = &mut self.audit_v5_probe
+            {
+                probe.projected(
+                    event,
+                    marmot_forensics::v5::UpdateCause::RetainedEventReplay,
+                );
+            }
             routes_dirty |=
                 self.observe_event_projection_effects(event, &local_account_id_hex, &mut summary)?;
             let can_ack_application_event = if crosses_frontier {
@@ -1891,11 +1937,70 @@ impl AppClient {
         &mut self,
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, AppError> {
+        self.ingest_received_delivery_inner(delivery)
+            .await
+            .map_err(|(_, _, _, error, _)| error)
+    }
+
+    /// Startup's off-worker comparison may receive a delivery before its
+    /// immutable network request completes. Keep the applied prefix visible
+    /// on a later checkpoint failure, just as the inline startup drain did.
+    pub(crate) async fn ingest_received_delivery_with_partial(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let drain_started = std::time::Instant::now();
+        let cursor_before_secs = self.state.last_transport_timestamp;
+        match self.ingest_received_delivery_inner(delivery).await {
+            Ok(summary) => Ok(summary),
+            Err((summary, ingested, routes_dirty, error, stage)) => {
+                let counts = DrainCounts {
+                    deliveries: u64::from(ingested),
+                    ..DrainCounts::default()
+                };
+                Err(self
+                    .finish_failed_sync_drain(
+                        summary,
+                        routes_dirty,
+                        counts,
+                        StagedSyncError::new(error, stage),
+                        drain_started,
+                        cursor_before_secs,
+                    )
+                    .await)
+            }
+        }
+    }
+
+    async fn ingest_received_delivery_inner(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
-        let ingested =
-            Self::ingest_delivery(self.transport_receipts()?, delivery, &mut summary).await?;
+        let receipts = self.transport_receipts().map_err(|error| {
+            (
+                SyncSummary::default(),
+                false,
+                false,
+                error,
+                SyncFailureStage::StatePersist,
+            )
+        })?;
+        let ingested = Self::ingest_delivery(receipts, delivery, &mut summary)
+            .await
+            .map_err(|error| {
+                // The inline drain did not merge this delivery's staged
+                // projection when ingest itself failed.
+                (
+                    SyncSummary::default(),
+                    false,
+                    false,
+                    error,
+                    SyncFailureStage::CgkaIngest,
+                )
+            })?;
         if self.delivery_loss_blocks_cursor() {
             // `record_drop` publishes this process-local fence at the exact
             // omission, before marker I/O or the reserved control record can
@@ -1916,17 +2021,44 @@ impl AppClient {
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
-        if routes_dirty {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if routes_dirty
+            && let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
+        {
+            return Err((
+                summary,
+                true,
+                routes_dirty,
+                error,
+                SyncFailureStage::StatePersist,
+            ));
         }
-        let refresh = self.refresh_group_routes()?;
+        let refresh = match self.refresh_group_routes() {
+            Ok(refresh) => refresh,
+            Err(error) => {
+                return Err((
+                    summary,
+                    true,
+                    routes_dirty,
+                    error,
+                    SyncFailureStage::StatePersist,
+                ));
+            }
+        };
         // The routes-dirty save above already persisted this delivery's app
         // projection; save again only when that first save did not run, or
         // when route retirement just mutated persisted group state. The
         // routing-table delta lives in memory and obligates a subscription
         // refresh, not a second identical state write.
-        if !routes_dirty || refresh.state_pruned {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if (!routes_dirty || refresh.state_pruned)
+            && let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
+        {
+            return Err((
+                summary,
+                true,
+                routes_dirty,
+                error,
+                SyncFailureStage::StatePersist,
+            ));
         }
         self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
         self.drain_epoch_stall_escalations(&mut summary);
@@ -2633,6 +2765,15 @@ impl AppClient {
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
+        let probe_receive = if welcome && (client.audit_v5_enabled() || cfg!(test)) {
+            client
+                .audit_v5_probe
+                .as_mut()
+                .and_then(|probe| probe.observe(&delivery.message))
+        } else {
+            None
+        };
+        client.flush_live_v5_events();
         // Hold the same account policy lock through admission and projection, so a
         // block cannot commit between authenticating the inviter and creating state.
         let policy_lock = client.app.block_update_lock(&client.state.label).await;
@@ -2693,6 +2834,9 @@ impl AppClient {
         );
         let telemetry = client.runtime_telemetry.clone();
         let ingest_observation = telemetry.as_ref().map(|t| t.observe(RuntimeOp::Ingest));
+        if let (Some(slot), Some(receive)) = (&client.audit_v5_peel_slot, probe_receive.clone()) {
+            slot.lock().unwrap().arm(&delivery.message, receive);
+        }
         let ingest = client
             .runtime
             .ingest_delivery_with_observer(delivery, |phase, duration, success| {
@@ -2715,6 +2859,48 @@ impl AppClient {
                 }
             })
             .await;
+        if let (Some(probe), Some(slot)) = (&mut client.audit_v5_probe, &client.audit_v5_peel_slot)
+            && let Some(completion) = slot.lock().unwrap().take()
+        {
+            probe.unwrapped(completion);
+        }
+        if let (Some(probe), Some(receive), Ok(effects)) =
+            (&mut client.audit_v5_probe, probe_receive, &ingest)
+            && matches!(effects.outcome, IngestOutcome::Processed)
+        {
+            // The event is journaled in the join transaction. Only this
+            // delivery's exact Welcome may turn it into a join row: the same
+            // effects can also drain older application events.
+            let mut joins = effects
+                .effects
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    cgka_traits::engine::GroupEvent::GroupJoined {
+                        group_id,
+                        via_welcome,
+                        explicitly_confirmed: false,
+                        ..
+                    } if via_welcome == &source_message_id => Some(group_id),
+                    _ => None,
+                });
+            if let Some(group_id) = joins.next()
+                && joins.next().is_none()
+                && let Ok(group) = client.runtime.group_record(group_id)
+            {
+                let initial_join = probe.joined(receive.clone(), &group);
+                if initial_join && client.runtime.session().audit_v5_enabled() {
+                    let admins = client.runtime.admin_pubkeys(group_id).ok();
+                    probe.baseline(
+                        &group,
+                        admins.as_deref(),
+                        marmot_forensics::v5::BaselineReason::Joined,
+                        Some(receive.1),
+                    );
+                }
+            }
+        }
+        client.flush_live_v5_events();
         if let Some(observation) = ingest_observation {
             observation.finish(if ingest.is_ok() {
                 TelemetryOutcome::Success
@@ -3578,7 +3764,7 @@ impl AppClient {
     /// A run is still forgotten when a caller discards the client outright; the
     /// [`super::epoch_stall`] module header covers that case and what
     /// re-escalating then costs.
-    fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
+    pub(crate) fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
             .epoch_stall_escalations
             .append(&mut self.pending_epoch_stall_escalations);
@@ -3644,6 +3830,21 @@ impl AppClient {
         &mut self,
         seam: EpochBackfillExecutionSeam,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
+        match self.select_pending_epoch_backfill(seam)? {
+            PendingRecoverySelection::NotPending => Ok(EpochBackfillRunOutcome::NotPending),
+            PendingRecoverySelection::Deferred => Ok(EpochBackfillRunOutcome::Deferred),
+            PendingRecoverySelection::Grant(grant) => {
+                self.execute_pending_epoch_backfill_grant(*grant).await
+            }
+        }
+    }
+
+    /// Select once. The worker may hand the exact frozen grant to a bounded
+    /// executor without spending a second retry reservation on fallback.
+    pub(crate) fn select_pending_epoch_backfill(
+        &mut self,
+        seam: EpochBackfillExecutionSeam,
+    ) -> Result<PendingRecoverySelection, AppError> {
         self.drop_terminal_epoch_backfill_intents();
         let storage = self.app.account_storage(&self.state.label)?;
         if storage.pending_recovery_demands()?.is_empty()
@@ -3651,13 +3852,30 @@ impl AppClient {
             && self.pending_recovery_arm_writes.is_empty()
             && self.pending_recovery_capacity_writes.is_empty()
         {
-            return Ok(EpochBackfillRunOutcome::NotPending);
+            return Ok(PendingRecoverySelection::NotPending);
         }
         let mut explicit = ExplicitRecoveryPermit::default();
         let permit = (seam == EpochBackfillExecutionSeam::ExplicitCatchUp).then_some(&mut explicit);
         let Some(grant) = self.authorize_account_recovery(permit, seam)? else {
-            return Ok(EpochBackfillRunOutcome::Deferred);
+            return Ok(PendingRecoverySelection::Deferred);
         };
+        #[cfg(test)]
+        if let Some(witness) = &self.test_recovery_selection_witness {
+            witness.lock().unwrap().push(super::TestRecoverySelection {
+                seam,
+                attempt_serial: grant.reservation.attempt_serial,
+                comparison_revision: grant.comparison_revision,
+                obligation_count: grant.fence.obligations.len(),
+            });
+        }
+        Ok(PendingRecoverySelection::Grant(Box::new(grant)))
+    }
+
+    pub(crate) async fn execute_pending_epoch_backfill_grant(
+        &mut self,
+        grant: AttemptGrant,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
         let selected = grant.fence.obligations.clone();
         let comparison_selected = grant.comparison_revision.is_some();
         match self.execute_recovery_grant(grant, None, None).await {
@@ -3858,6 +4076,53 @@ impl AppClient {
         activation_outcome: &mut EpochBackfillActivationOutcome,
         drain_verdict: &mut Option<DrainVerdict>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        self.activate_recovery_grant_inner(grant, telemetry, activation_outcome)
+            .await?;
+        // Routine below-live-cutoff discovery runs only with a frozen owner
+        // comparison request. The retained-inventory floor still bounds it.
+        // Neither a quiet completion nor subscription installation certifies
+        // the still-pending maintenance/history predicate.
+        let quiet_prerequisites =
+            grant
+                .plan()
+                .expect("validated executor grant")
+                .iter()
+                .all(|obligation| {
+                    matches!(
+                        obligation.cause,
+                        storage_sqlite::RecoveryCause::IncrementalHistory
+                            | storage_sqlite::RecoveryCause::Maintenance
+                    )
+                });
+        let comparison_outcomes = if grant.comparison_revision.is_some() || !quiet_prerequisites {
+            self.reconcile_transport_history(&grant.inventory)
+                .await
+                .map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::Unknown,
+                    )
+                })?
+        } else {
+            Vec::new()
+        };
+        self.complete_recovery_grant_inner(
+            grant,
+            repair,
+            counts,
+            drain_verdict,
+            comparison_outcomes,
+        )
+        .await
+    }
+
+    async fn activate_recovery_grant_inner(
+        &mut self,
+        grant: &AttemptGrant,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        activation_outcome: &mut EpochBackfillActivationOutcome,
+    ) -> Result<(), ClassifiedSyncFailure> {
         let obligations = grant.plan().expect("validated executor grant");
         // A bounded comparison freezes acquisition separately from historical
         // goals. Unchanged broad debt cannot widen an automatic comparison.
@@ -3893,18 +4158,9 @@ impl AppClient {
         };
         // Maintenance has its own scoped unfloored REQ. It cannot widen the
         // broad live activation; only selected history/loss goals may do so.
-        // Maintenance installs a temporary subscription and observes its first
-        // boundary later under the domain's existing deadline. Sharing that
-        // prerequisite must not turn ordinary incremental catch-up into a
-        // blocking full-history wait. Neither quiet completion nor installation
-        // certifies the still-pending maintenance/history predicate.
-        let quiet_prerequisites = obligations.iter().all(|obligation| {
-            matches!(
-                obligation.cause,
-                storage_sqlite::RecoveryCause::IncrementalHistory
-                    | storage_sqlite::RecoveryCause::Maintenance
-            )
-        });
+        // Its first boundary is observed later under the domain's deadline.
+        // Sharing that prerequisite cannot turn ordinary incremental catch-up
+        // into a blocking full-history wait.
         self.pending_runtime_group_subscription_refresh = true;
         self.relay_plane
             .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())
@@ -3993,21 +4249,32 @@ impl AppClient {
                     .insert(group, (subscription, route));
             }
         }
-        // Routine below-live-cutoff discovery runs only with a frozen owner
-        // comparison request. The retained-inventory floor still bounds it.
-        let comparison_outcomes = if grant.comparison_revision.is_some() || !quiet_prerequisites {
-            self.reconcile_transport_history(&grant.inventory)
-                .await
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::Unknown,
+        Ok(())
+    }
+
+    async fn complete_recovery_grant_inner(
+        &mut self,
+        grant: &AttemptGrant,
+        repair: Option<&FullHistoryRepairControl<'_>>,
+        counts: &mut DrainCounts,
+        drain_verdict: &mut Option<DrainVerdict>,
+        comparison_outcomes: Vec<(
+            TransportReconciliationRoute,
+            storage_sqlite::RecoveryComparisonOutcome,
+        )>,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let quiet_prerequisites =
+            grant
+                .plan()
+                .expect("validated executor grant")
+                .iter()
+                .all(|obligation| {
+                    matches!(
+                        obligation.cause,
+                        storage_sqlite::RecoveryCause::IncrementalHistory
+                            | storage_sqlite::RecoveryCause::Maintenance
                     )
-                })?
-        } else {
-            Vec::new()
-        };
+                });
         let (mut summary, verdict) = if let Some(control) = repair {
             self.drain_full_history_repair(counts, control).await?
         } else if quiet_prerequisites {
@@ -4711,7 +4978,30 @@ impl AppClient {
             .runtime_telemetry
             .as_ref()
             .map(|t| t.observe(RuntimeOp::ProjectionCheckpoint));
+        let audit_updates = self
+            .audit_v5_probe
+            .as_ref()
+            .map(|probe| {
+                probe.pending_updates(&self.state.groups, &self.pending_group_projection_updates)
+            })
+            .unwrap_or_default();
+        // This fault exists only in unit-test binaries and occurs before any
+        // projection checkpoint write; the engine's join is already committed.
+        #[cfg(test)]
+        let audit_fail_before_commit = !audit_updates.is_empty()
+            && self
+                .audit_v5_probe
+                .as_mut()
+                .is_some_and(|probe| probe.reject_checkpoints);
+        #[cfg(not(test))]
+        let audit_fail_before_commit = false;
         let result = (|| {
+            #[cfg(test)]
+            if audit_fail_before_commit {
+                return Err(AppError::BlockingTask(
+                    "injected v5 probe checkpoint failure".into(),
+                ));
+            }
             let seen_events = self.transport_receipts()?.pending_seen_events();
             let frontiers_to_clear = self
                 .pending_local_group_deletion_frontier_clears
@@ -4766,6 +5056,10 @@ impl AppClient {
         if let Some(observation) = observation {
             observation.finish_app(&result);
         }
+        if let Some(probe) = &mut self.audit_v5_probe {
+            probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);
+        }
+        self.flush_live_v5_events();
         result
     }
 
@@ -5047,6 +5341,12 @@ impl AppClient {
                 updated_group.as_ref(),
                 &event_source,
             );
+            if previous_group != updated_group
+                && let Some(probe) = &mut self.audit_v5_probe
+                && (self.runtime.session().audit_v5_enabled() || cfg!(test))
+            {
+                probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
+            }
             routes_dirty |=
                 self.observe_event_projection_effects(event, &local_account_id_hex, summary)?;
             if self.state.groups.len() != before {
@@ -7264,3 +7564,6 @@ mod tests {
 
 #[cfg(test)]
 mod full_history_tests;
+
+#[cfg(test)]
+mod selective_history_acquisition_tests;
