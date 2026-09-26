@@ -5100,6 +5100,8 @@ impl AppClient {
             && changed_groups != 0
             && welcome_update_count == changed_groups
             && pending_acks <= 1
+            && pending_inputs <= 1
+            && pending_frontiers == 0
             && created_group_id_hex.is_none())
             && (changed_groups != 0
                 || pending_inputs != 0
