@@ -10665,21 +10665,39 @@ async fn runtime_records_app_checkpoint_and_separate_broadcast_outcomes_for_rece
         marmot_forensics::v5::EngineMessageRef::from_message_id(&hex::decode(message_id).unwrap())
             .unwrap();
 
-    let files = app.audit_log_files().unwrap();
-    let rows = files
-        .iter()
-        .filter(|file| file.account_ref == bob.account.label)
-        .flat_map(|file| {
-            std::fs::read_to_string(&file.path)
+    // The broadcast reaches the subscriber before its outcome row is flushed.
+    // Observe the row itself within a bounded wait, rather than racing that
+    // final local recorder write.
+    let rows = timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = app
+                .audit_log_files()
                 .unwrap()
-                .lines()
-                .map(|line| {
-                    V5Record::from_json(line.as_bytes()).expect("strict v5 audit row");
-                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                .iter()
+                .filter(|file| file.account_ref == bob.account.label)
+                .flat_map(|file| {
+                    std::fs::read_to_string(&file.path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| {
+                            V5Record::from_json(line.as_bytes()).expect("strict v5 audit row");
+                            serde_json::from_str::<serde_json::Value>(line).unwrap()
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
+            if rows.iter().any(|row| {
+                row["event"]["type"] == "runtime_publication_outcome"
+                    && row["event"]["category"] == "sync_summary"
+                    && row["event"]["message_ref"] == message_ref.as_str()
+            }) {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("received message has a recorded runtime publication outcome");
     assert!(
         rows.iter().any(|row| {
             row["event"]["type"] == "app_update_outcome"
@@ -10766,6 +10784,109 @@ async fn runtime_records_app_checkpoint_and_separate_broadcast_outcomes_for_rece
     .await
     .expect("committed app update remains distinct from unobserved broadcast");
     runtime.shutdown().await;
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn explicit_shutdown_during_initial_sync_records_clean_audit_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let account = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(barrier.clone());
+    runtime
+        .restart_account(&account.account.account_id_hex)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), barrier.wait())
+        .await
+        .expect("restarted worker entered initial sync");
+    timeout(Duration::from_secs(5), runtime.shutdown_and_close())
+        .await
+        .expect("explicit shutdown interrupts initial sync")
+        .unwrap();
+    let rows = app
+        .audit_log_files()
+        .unwrap()
+        .iter()
+        .filter(|file| file.account_ref == account.account.label)
+        .flat_map(|file| {
+            std::fs::read_to_string(&file.path)
+                .unwrap()
+                .lines()
+                .map(|line| V5Record::from_json(line.as_bytes()).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        &rows.last().expect("v5 audit rows").fields().event,
+        marmot_forensics::v5::Event::RecordingSessionStopped(stop)
+            if stop.reason == marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown
+    ));
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn explicit_shutdown_during_startup_hydration_records_clean_audit_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let account = AccountHome::open(dir.path())
+        .create_account("hydration-audit")
+        .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let mut client = app.client("hydration-audit").await.unwrap();
+    client
+        .create_group("stored hydration group", &[])
+        .await
+        .unwrap();
+    drop(client);
+
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_startup_hydration_batch_delay_ms(3_000),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(5), runtime.shutdown_and_close())
+        .await
+        .expect("explicit shutdown interrupts hydration")
+        .unwrap();
+    let rows = app
+        .audit_log_files()
+        .unwrap()
+        .iter()
+        .filter(|file| file.account_ref == account.label)
+        .flat_map(|file| {
+            std::fs::read_to_string(&file.path)
+                .unwrap()
+                .lines()
+                .map(|line| V5Record::from_json(line.as_bytes()).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        &rows.last().expect("v5 audit rows").fields().event,
+        marmot_forensics::v5::Event::RecordingSessionStopped(stop)
+            if stop.reason == marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown
+    ));
 }
 
 /// mdk#1451: create returns at the canonical founding boundary even when the

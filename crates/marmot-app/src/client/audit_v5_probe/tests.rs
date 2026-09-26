@@ -1352,6 +1352,63 @@ async fn no_op_welcome_replay_does_not_label_unrelated_checkpoint() {
 }
 
 #[tokio::test]
+async fn welcome_checkpoint_with_distinct_application_ack_keeps_generic_outcome() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let group = scenario.create().await;
+        let joined = scenario.bob.sync().await.unwrap();
+        let welcome_event = joined
+            .events
+            .iter()
+            .find(|event| matches!(event, GroupEvent::GroupJoined { .. }))
+            .unwrap()
+            .clone();
+        scenario
+            .alice
+            .send(&group, b"mixed checkpoint message")
+            .await
+            .unwrap();
+        let received = scenario.bob.sync().await.unwrap();
+        let message_id = received
+            .events
+            .iter()
+            .find_map(|event| match event {
+                GroupEvent::MessageReceived { message_id, .. } => Some(message_id.clone()),
+                _ => None,
+            })
+            .expect("authenticated application event");
+        // Recreate the pending mixed checkpoint using IDs observed from the
+        // actual join and receive paths. A single non-Welcome ack must not be
+        // mistaken for the Welcome's own ack merely because its count is one.
+        scenario
+            .bob
+            .audit_v5_probe
+            .as_mut()
+            .unwrap()
+            .projected(&welcome_event, UpdateCause::WelcomeJoin);
+        scenario
+            .bob
+            .pending_application_event_acks
+            .insert(message_id.clone());
+        scenario
+            .bob
+            .pending_group_projection_updates
+            .insert(hex::encode(group.as_slice()));
+        scenario.bob.accept_group_invite(&group).unwrap();
+        let message_ref = EngineMessageRef::from_message_id(message_id.as_slice()).unwrap();
+        assert!(actual_v5_rows(&scenario.bob_app, "bob").iter().any(|row| {
+            matches!(&row.fields().event, Event::AppUpdateOutcome(outcome)
+                if outcome.category == AppUpdateCategory::AccountProjectionCheckpoint
+                    && outcome.transaction == AppUpdateTransaction::Committed
+                    && outcome.message_ref.as_ref() == Some(&message_ref))
+        }));
+        scenario.assert_clean();
+    })
+    .await
+    .expect("bounded mixed Welcome and application checkpoint");
+}
+
+#[tokio::test]
 async fn failed_acceptance_has_one_checkpoint_result_and_restores_origin() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;

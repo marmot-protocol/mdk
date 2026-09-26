@@ -54,7 +54,8 @@ pub(super) struct CheckpointObservation<'a> {
     pub created_row: bool,
     pub error: Option<&'a AppError>,
     pub elapsed: Duration,
-    pub failed_before_commit: bool,
+    pub known_not_committed: bool,
+    pub failure_stage: AppUpdateFailureStage,
 }
 
 impl AppClient {
@@ -71,7 +72,8 @@ impl AppClient {
             created_row,
             error,
             elapsed,
-            failed_before_commit,
+            known_not_committed,
+            failure_stage,
         } = observed;
         self.runtime.session().record_v5_event(
             None,
@@ -96,12 +98,12 @@ impl AppClient {
                 },
                 transaction: if error.is_none() {
                     AppUpdateTransaction::Committed
-                } else if failed_before_commit {
+                } else if known_not_committed {
                     AppUpdateTransaction::NotCommitted
                 } else {
                     AppUpdateTransaction::Unknown
                 },
-                failure_stage: error.map(|_| AppUpdateFailureStage::Transaction),
+                failure_stage: error.map(|_| failure_stage),
                 failure_reason: error.map(reason),
                 elapsed_ms: elapsed_ms(elapsed),
                 affected_group_count: Some(

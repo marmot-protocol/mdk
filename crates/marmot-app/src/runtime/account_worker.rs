@@ -30,7 +30,7 @@ use super::conversation_window::{
 use super::{
     MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
-    wait_for_runtime_shutdown,
+    runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::recovery::AttemptGrant;
@@ -939,7 +939,12 @@ async fn run_app_runtime_account_worker(
     .await
     {
         StartupHydrationOutcome::Completed => {}
-        StartupHydrationOutcome::Shutdown => return,
+        StartupHydrationOutcome::Shutdown { explicit } => {
+            if explicit {
+                client.finish_audit_recording();
+            }
+            return;
+        }
     }
 
     // The snapshot answers read commands while the initial sync holds
@@ -985,6 +990,7 @@ async fn run_app_runtime_account_worker(
     // the network job. Deferred commands replay in arrival order after catch-up.
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
+    let mut startup_explicit_shutdown = false;
     let startup_sync_result = {
         let mut initial_sync: Pin<
             Box<dyn Future<Output = Result<StartupSyncStep, ClassifiedSyncFailure>> + Send + '_>,
@@ -1066,12 +1072,18 @@ async fn run_app_runtime_account_worker(
         });
         loop {
             tokio::select! {
-                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                _ = &mut shutdown => return,
-                result = &mut initial_sync => break result,
+                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                    startup_explicit_shutdown = runtime_shutdown_requested(&lifecycle_shutdown);
+                    break None;
+                }
+                stop = &mut shutdown => {
+                    startup_explicit_shutdown = stop.is_ok();
+                    break None;
+                }
+                result = &mut initial_sync => break Some(result),
                 command = commands.recv() => {
                     match command {
-                        None => return,
+                        None => break None,
                         Some(command) => handle_startup_sync_command(
                             command,
                             read_snapshot.as_ref(),
@@ -1084,6 +1096,12 @@ async fn run_app_runtime_account_worker(
                 }
             }
         }
+    };
+    let Some(startup_sync_result) = startup_sync_result else {
+        if startup_explicit_shutdown {
+            client.finish_audit_recording();
+        }
+        return;
     };
     // Keep the large command/receive continuation out of the enclosing
     // worker's async state while the frozen network request is active.
@@ -1100,10 +1118,12 @@ async fn run_app_runtime_account_worker(
                         tokio::select! {
                             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                                 network.abort_and_wait().await;
+                                startup_explicit_shutdown = runtime_shutdown_requested(&lifecycle_shutdown);
                                 return None;
                             }
-                            _ = &mut shutdown => {
+                            stop = &mut shutdown => {
                                 network.abort_and_wait().await;
+                                startup_explicit_shutdown = stop.is_ok();
                                 return None;
                             }
                             result = network.wait() => match result {
@@ -1272,6 +1292,9 @@ async fn run_app_runtime_account_worker(
             })
         });
         let Some(result) = continuation.await else {
+            if startup_explicit_shutdown {
+                client.finish_audit_recording();
+            }
             return;
         };
         result
@@ -3160,7 +3183,7 @@ const STARTUP_HYDRATION_COMMAND_BUDGET: usize = 8;
 
 enum StartupHydrationOutcome {
     Completed,
-    Shutdown,
+    Shutdown { explicit: bool },
 }
 
 /// Run one storage-only promotion transaction after account readiness.
@@ -3297,9 +3320,13 @@ async fn run_startup_hydration_pipeline(
                 tokio::select! {
                     _ = tokio::time::sleep_until(hold_until) => break,
                     _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-                        return StartupHydrationOutcome::Shutdown;
+                        return StartupHydrationOutcome::Shutdown {
+                            explicit: runtime_shutdown_requested(&lifecycle_shutdown),
+                        };
                     }
-                    _ = &mut *shutdown => return StartupHydrationOutcome::Shutdown,
+                    stop = &mut *shutdown => {
+                        return StartupHydrationOutcome::Shutdown { explicit: stop.is_ok() };
+                    }
                     command = commands.recv() => match command {
                         Some(command) => {
                             handle_startup_hydration_command(
@@ -3313,7 +3340,7 @@ async fn run_startup_hydration_pipeline(
                             )
                             .await;
                         }
-                        None => return StartupHydrationOutcome::Shutdown,
+                        None => return StartupHydrationOutcome::Shutdown { explicit: false },
                     },
                 }
             }
@@ -3336,16 +3363,21 @@ async fn run_startup_hydration_pipeline(
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return StartupHydrationOutcome::Shutdown;
+                    return StartupHydrationOutcome::Shutdown { explicit: false };
                 }
             }
         }
-        if !matches!(
-            shutdown.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ) || lifecycle.ensure_running().is_err()
-        {
-            return StartupHydrationOutcome::Shutdown;
+        match shutdown.try_recv() {
+            Ok(()) => return StartupHydrationOutcome::Shutdown { explicit: true },
+            Err(oneshot::error::TryRecvError::Closed) => {
+                return StartupHydrationOutcome::Shutdown { explicit: false };
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+        if lifecycle.ensure_running().is_err() {
+            return StartupHydrationOutcome::Shutdown {
+                explicit: runtime_shutdown_requested(&lifecycle_shutdown),
+            };
         }
         let progress = match client
             .runtime
@@ -6676,6 +6708,30 @@ fn runtime_summary_message_ref(
     }
 }
 
+fn record_runtime_publication(
+    client: &AppClient,
+    category: marmot_forensics::v5::RuntimePublicationCategory,
+    message_ref: Option<marmot_forensics::v5::EngineMessageRef>,
+    publication: RuntimeSummaryPublication,
+) {
+    if publication.attempted == 0 || !client.audit_v5_enabled() {
+        return;
+    }
+    client.runtime.session().record_v5_event(
+        None,
+        marmot_forensics::v5::Event::RuntimePublicationOutcome(
+            marmot_forensics::v5::RuntimePublicationOutcome {
+                operation_ref: None,
+                message_ref,
+                category,
+                attempted: publication.attempted.into(),
+                accepted_by_broadcast: publication.accepted.into(),
+                no_subscribers: publication.no_subscribers.into(),
+            },
+        ),
+    );
+}
+
 fn publish_app_runtime_summary_with_v5(
     client: &AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -6684,22 +6740,11 @@ fn publish_app_runtime_summary_with_v5(
     summary: &SyncSummary,
 ) {
     let publication = publish_app_runtime_summary(events, account_id_hex, account_label, summary);
-    if publication.attempted == 0 || !client.audit_v5_enabled() {
-        return;
-    }
-    let message_ref = runtime_summary_message_ref(summary);
-    client.runtime.session().record_v5_event(
-        None,
-        marmot_forensics::v5::Event::RuntimePublicationOutcome(
-            marmot_forensics::v5::RuntimePublicationOutcome {
-                operation_ref: None,
-                message_ref,
-                category: marmot_forensics::v5::RuntimePublicationCategory::SyncSummary,
-                attempted: publication.attempted.into(),
-                accepted_by_broadcast: publication.accepted.into(),
-                no_subscribers: publication.no_subscribers.into(),
-            },
-        ),
+    record_runtime_publication(
+        client,
+        marmot_forensics::v5::RuntimePublicationCategory::SyncSummary,
+        runtime_summary_message_ref(summary),
+        publication,
     );
 }
 
@@ -6724,32 +6769,21 @@ fn publish_client_pending_projection_updates(
     account_id_hex: &str,
     account_label: &str,
 ) {
-    let mut attempted = 0u64;
-    let mut accepted = 0u64;
+    let mut publication = RuntimeSummaryPublication::default();
     for update in client.take_pending_projection_updates() {
-        attempted += 1;
-        accepted += u64::from(publish_app_runtime_projection_update(
-            events,
-            account_id_hex,
-            account_label,
-            update,
-        ));
+        publication.attempted += 1;
+        if publish_app_runtime_projection_update(events, account_id_hex, account_label, update) {
+            publication.accepted += 1;
+        } else {
+            publication.no_subscribers += 1;
+        }
     }
-    if attempted != 0 && client.audit_v5_enabled() {
-        client.runtime.session().record_v5_event(
-            None,
-            marmot_forensics::v5::Event::RuntimePublicationOutcome(
-                marmot_forensics::v5::RuntimePublicationOutcome {
-                    operation_ref: None,
-                    message_ref: None,
-                    category: marmot_forensics::v5::RuntimePublicationCategory::ProjectionUpdate,
-                    attempted: attempted.into(),
-                    accepted_by_broadcast: accepted.into(),
-                    no_subscribers: (attempted - accepted).into(),
-                },
-            ),
-        );
-    }
+    record_runtime_publication(
+        client,
+        marmot_forensics::v5::RuntimePublicationCategory::ProjectionUpdate,
+        None,
+        publication,
+    );
     for group_id in client.pending_recovery_status_updates.drain() {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
     }

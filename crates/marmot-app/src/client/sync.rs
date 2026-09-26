@@ -5021,6 +5021,17 @@ impl AppClient {
             })
             .unwrap_or_default();
         let welcome_update_count = audit_updates.len();
+        // A Welcome-owned checkpoint can also carry a separately received
+        // application ack. Suppress the generic row only when its sole ack
+        // identifies the Welcome that owns one of these group projections.
+        let only_welcome_ack = self.pending_application_event_acks.iter().all(|ack| {
+            let ack_hex = hex::encode(ack.as_slice());
+            self.state.groups.iter().any(|group| {
+                self.pending_group_projection_updates
+                    .contains(&group.group_id_hex)
+                    && group.via_welcome_message_id_hex.as_deref() == Some(ack_hex.as_str())
+            })
+        });
         // This fault exists only in unit-test binaries and occurs before any
         // projection checkpoint write; the engine's join is already committed.
         #[cfg(test)]
@@ -5031,6 +5042,7 @@ impl AppClient {
                 .is_some_and(|probe| probe.reject_checkpoints);
         #[cfg(not(test))]
         let audit_fail_before_commit = false;
+        let mut known_not_committed = audit_fail_before_commit;
         let result = (|| {
             #[cfg(test)]
             if audit_fail_before_commit {
@@ -5038,7 +5050,15 @@ impl AppClient {
                     "injected v5 probe checkpoint failure".into(),
                 ));
             }
-            let seen_events = self.transport_receipts()?.pending_seen_events();
+            let seen_events = match self.transport_receipts() {
+                Ok(receipts) => receipts.pending_seen_events(),
+                Err(error) => {
+                    // This failed before either projection save entry point.
+                    // The checkpoint itself therefore did not commit.
+                    known_not_committed = true;
+                    return Err(error);
+                }
+            };
             let frontiers_to_clear = self
                 .pending_local_group_deletion_frontier_clears
                 .iter()
@@ -5096,19 +5116,20 @@ impl AppClient {
             probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);
         }
         self.flush_live_v5_events();
-        if !(result.is_ok()
+        let welcome_only_checkpoint = result.is_ok()
             && changed_groups != 0
             && welcome_update_count == changed_groups
             && pending_acks <= 1
+            && only_welcome_ack
             && pending_inputs <= 1
             && pending_frontiers == 0
-            && created_group_id_hex.is_none())
-            && (changed_groups != 0
-                || pending_inputs != 0
-                || pending_acks != 0
-                || pending_frontiers != 0
-                || created_group_id_hex.is_some())
-        {
+            && created_group_id_hex.is_none();
+        let has_checkpoint_work = changed_groups != 0
+            || pending_inputs != 0
+            || pending_acks != 0
+            || pending_frontiers != 0
+            || created_group_id_hex.is_some();
+        if has_checkpoint_work && !welcome_only_checkpoint {
             self.record_v5_app_checkpoint(super::audit_v5_app_update::CheckpointObservation {
                 message_ref,
                 changed_groups,
@@ -5118,7 +5139,15 @@ impl AppClient {
                 created_row: created_group_id_hex.is_some(),
                 error: result.as_ref().err(),
                 elapsed: checkpoint_started.elapsed(),
-                failed_before_commit: audit_fail_before_commit,
+                known_not_committed,
+                // The injected checkpoint rejection has a known transaction
+                // seam. A receipt setup failure is before that seam, and a
+                // storage error can be uncertain; neither proves a stage.
+                failure_stage: if audit_fail_before_commit {
+                    marmot_forensics::v5::AppUpdateFailureStage::Transaction
+                } else {
+                    marmot_forensics::v5::AppUpdateFailureStage::Unknown
+                },
             });
         }
         result
