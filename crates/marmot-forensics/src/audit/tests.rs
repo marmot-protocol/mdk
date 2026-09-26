@@ -1752,13 +1752,18 @@ fn failed_flush_does_not_seal_or_discard_buffered_rows() {
     let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
     let before = fs::read(&path).unwrap();
     let mut inner = recorder.inner.lock().unwrap();
-    inner.writer = BufWriter::new(File::open(&path).unwrap());
+    inner.writer = Some(BufWriter::new(File::open(&path).unwrap()));
     inner
         .writer
+        .as_mut()
+        .expect("active writer")
         .write_all(b"buffered but unwritable\n")
         .unwrap();
     assert!(recorder.roll_into_segment(&mut inner).is_err());
-    assert_eq!(inner.writer.buffer(), b"buffered but unwritable\n");
+    assert_eq!(
+        inner.writer.as_ref().expect("active writer").buffer(),
+        b"buffered but unwritable\n"
+    );
     assert_eq!(inner.health.flush_failures, 1);
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(segment_paths(&path).is_empty());
@@ -2607,6 +2612,61 @@ fn v5_partial_write_preserves_prepared_delivery_bytes_and_reports_observed_loss(
     assert_eq!(loss["event"]["write_failed_attempts"], "1");
     assert_eq!(loss["event"]["extent"], "unknown");
     assert_eq!(recorder.health_snapshot().write_failures, 1);
+}
+
+#[test]
+fn v5_persistent_write_failure_bounds_segment_creation_until_retry_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    recorder.fail_next_write_after_partial_bytes();
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    recorder.fail_next_write_after_partial_bytes();
+    // The first recovery seals once. The second injected failure occurs while
+    // attempting the retained loss report on the fresh writer.
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert_eq!(segment_paths(&path).len(), 1);
+    for _ in 0..8 {
+        recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    }
+    assert_eq!(segment_paths(&path).len(), 1);
+    // Health also counts the failed best-effort loss-report write itself;
+    // the loss row must not recursively count that internal attempt.
+    assert_eq!(recorder.health_snapshot().write_failures, 11);
+
+    // Advance only the test's retry clock, not wall time. A later safe write
+    // can seal the second uncertain inode and report every observed attempt.
+    recorder.inner.lock().unwrap().seal_retry_after = Some(Instant::now() - Duration::from_secs(1));
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert_eq!(segment_paths(&path).len(), 2);
+    let loss = v5_rows(&path)
+        .into_iter()
+        .find(|row| row["event"]["type"] == "recording_capture_loss")
+        .expect("later safe writer reports attempts observed during backoff");
+    assert_eq!(loss["event"]["write_failed_attempts"], "10");
+}
+
+#[test]
+fn v5_drop_discards_uncertain_buffer_without_committing_a_failed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    let before = fs::read(&path).unwrap();
+    recorder
+        .inner
+        .lock()
+        .unwrap()
+        .fail_next_v5_flush_with_buffered_row = true;
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(recorder.health_snapshot().flush_failures, 1);
+    drop(recorder);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(v5_rows(&path).len(), 2);
 }
 
 #[test]
