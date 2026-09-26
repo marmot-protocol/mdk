@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+type RelayTimeline = Vec<(&'static str, u64, usize)>;
+
 #[derive(Clone, Debug, Default)]
 struct HeldLossReplay {
     inner: MemoryDatabase,
@@ -29,12 +31,33 @@ struct HeldLossReplay {
     neg_active: Arc<AtomicUsize>,
     neg_max_elapsed_ms: Arc<AtomicU64>,
     neg_max_items: Arc<AtomicUsize>,
+    diagnostic_origin: Arc<Mutex<Option<std::time::Instant>>>,
+    diagnostic_timeline: Arc<Mutex<RelayTimeline>>,
+    diagnostic_dropped: Arc<AtomicUsize>,
 }
+
+const RELAY_TIMELINE_LIMIT: usize = 64;
 
 impl HeldLossReplay {
     fn release(&self) {
         self.hold.store(false, Ordering::SeqCst);
         self.release.notify_waiters();
+    }
+
+    fn mark(&self, kind: &'static str, count: usize) {
+        let Some(origin) = *self.diagnostic_origin.lock().unwrap() else {
+            return;
+        };
+        let at_ms = std::time::Instant::now()
+            .saturating_duration_since(origin)
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let mut timeline = self.diagnostic_timeline.lock().unwrap();
+        if timeline.len() < RELAY_TIMELINE_LIMIT {
+            timeline.push((kind, at_ms, count));
+        } else {
+            self.diagnostic_dropped.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -93,7 +116,12 @@ impl NostrDatabase for HeldLossReplay {
     }
 
     fn query(&self, filter: RelayFilter) -> BoxedFuture<'_, Result<Events, DatabaseError>> {
-        self.inner.query(filter)
+        Box::pin(async move {
+            self.mark("db_query_start", 0);
+            let result = self.inner.query(filter).await;
+            self.mark("db_query_done", result.as_ref().map_or(0, Events::len));
+            result
+        })
     }
 
     fn negentropy_items(
@@ -101,6 +129,7 @@ impl NostrDatabase for HeldLossReplay {
         query: RelayFilter,
     ) -> BoxedFuture<'_, Result<Vec<(EventId, RelayTimestamp)>, DatabaseError>> {
         Box::pin(async move {
+            self.mark("neg_db_start", 0);
             self.neg_started.fetch_add(1, Ordering::SeqCst);
             self.neg_active.fetch_add(1, Ordering::SeqCst);
             let _active = ActiveLossRequest(self.neg_active.clone());
@@ -113,6 +142,7 @@ impl NostrDatabase for HeldLossReplay {
             if let Ok(items) = &result {
                 self.neg_max_items.fetch_max(items.len(), Ordering::SeqCst);
             }
+            self.mark("neg_db_done", result.as_ref().map_or(0, Vec::len));
             self.neg_completed.fetch_add(1, Ordering::SeqCst);
             result
         })
@@ -134,6 +164,14 @@ impl nostr_relay_builder::prelude::QueryPolicy for HeldLossReplay {
         _addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
+            self.mark(
+                if query.ids.is_some() {
+                    "req_exact_entry"
+                } else {
+                    "req_broad_entry"
+                },
+                query.ids.as_ref().map_or(0, |ids| ids.len()),
+            );
             let target = *self.target_event_id.lock().unwrap();
             if self.hold.load(Ordering::SeqCst)
                 && target.is_some_and(|target| {
@@ -503,6 +541,11 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     gate.neg_completed.store(0, Ordering::SeqCst);
     gate.neg_max_elapsed_ms.store(0, Ordering::SeqCst);
     gate.neg_max_items.store(0, Ordering::SeqCst);
+    gate.diagnostic_timeline.lock().unwrap().clear();
+    gate.diagnostic_dropped.store(0, Ordering::SeqCst);
+    let diagnostic_origin = std::time::Instant::now();
+    *gate.diagnostic_origin.lock().unwrap() = Some(diagnostic_origin);
+    *activity.diagnostic_origin.lock().unwrap() = Some(diagnostic_origin);
     runtime
         .shared_services()
         .comparison_test_trace
@@ -658,9 +701,13 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
                 outcome.remote_items,
                 outcome.received_items,
                 outcome.comparison_diagnostics.clone(),
+                outcome.started_ms,
+                outcome.finished_ms,
             )
         })
         .collect::<Vec<_>>();
+    let relay_timeline = gate.diagnostic_timeline.lock().unwrap().clone();
+    let relay_timeline_dropped = gate.diagnostic_dropped.load(Ordering::SeqCst);
     assert!(
         route_outcomes
             .iter()
@@ -724,7 +771,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .iter()
         .any(|(_, target_route, target_time, _, _, _, _)| *target_route && *target_time);
     eprintln!(
-        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, neg_started={}, neg_completed={}, neg_active={}, neg_max_elapsed_ms={}, neg_max_items={}, selected={selected:?}, route_outcomes={route_outcomes:?}, trace_counts={trace_counts:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
+        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, neg_started={}, neg_completed={}, neg_active={}, neg_max_elapsed_ms={}, neg_max_items={}, relay_timeline={relay_timeline:?}, relay_timeline_dropped={relay_timeline_dropped}, selected={selected:?}, route_outcomes={route_outcomes:?}, trace_counts={trace_counts:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
         gate.neg_started.load(Ordering::SeqCst),
         gate.neg_completed.load(Ordering::SeqCst),
         gate.neg_active.load(Ordering::SeqCst),

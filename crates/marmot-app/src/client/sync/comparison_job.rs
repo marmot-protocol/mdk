@@ -25,6 +25,8 @@ pub(crate) struct TestComparisonActivityWitness {
     pub(crate) target_route: Arc<Mutex<Option<TransportReconciliationRoute>>>,
     #[cfg(feature = "test-policy-overrides")]
     pub(crate) route_outcomes: Arc<Mutex<Vec<TestComparisonRouteOutcome>>>,
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) diagnostic_origin: Arc<Mutex<Option<std::time::Instant>>>,
     pub(crate) returned_events: Arc<AtomicUsize>,
     pub(crate) matching_events: Arc<AtomicUsize>,
     pub(crate) matching_queued_deliveries: Arc<AtomicUsize>,
@@ -43,6 +45,20 @@ pub(crate) struct TestComparisonRouteOutcome {
     pub(crate) remote_items: usize,
     pub(crate) received_items: usize,
     pub(crate) comparison_diagnostics: Option<transport_nostr_adapter::NostrComparisonDiagnostics>,
+    pub(crate) started_ms: Option<u64>,
+    pub(crate) finished_ms: Option<u64>,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+fn diagnostic_elapsed_ms(
+    origin: Option<std::time::Instant>,
+    at: std::time::Instant,
+) -> Option<u64> {
+    origin.map(|origin| {
+        at.saturating_duration_since(origin)
+            .as_millis()
+            .min(u64::MAX as u128) as u64
+    })
 }
 
 #[cfg(test)]
@@ -273,9 +289,12 @@ impl ComparisonNetworkJob {
                     inventory,
                     initial_cursor,
                 } = frozen;
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                let started_at = std::time::Instant::now();
                 if tokio::time::Instant::now() >= deadline {
                     #[cfg(all(test, feature = "test-policy-overrides"))]
                     if let Some(witness) = &witness {
+                        let origin = *witness.diagnostic_origin.lock().unwrap();
                         let target_route = witness
                             .target_route
                             .lock()
@@ -299,6 +318,11 @@ impl ComparisonNetworkJob {
                                 remote_items: 0,
                                 received_items: 0,
                                 comparison_diagnostics: None,
+                                started_ms: diagnostic_elapsed_ms(origin, started_at),
+                                finished_ms: diagnostic_elapsed_ms(
+                                    origin,
+                                    std::time::Instant::now(),
+                                ),
                             });
                     }
                     results.push(ComparisonRouteResult {
@@ -366,6 +390,8 @@ impl ComparisonNetworkJob {
                 let cursor = *progress.cursor.lock().expect("comparison progress mutex");
                 #[cfg(all(test, feature = "test-policy-overrides"))]
                 if let Some(witness) = &witness {
+                    let finished_at = std::time::Instant::now();
+                    let origin = *witness.diagnostic_origin.lock().unwrap();
                     let (
                         kind,
                         relays_succeeded,
@@ -409,6 +435,8 @@ impl ComparisonNetworkJob {
                             remote_items,
                             received_items,
                             comparison_diagnostics,
+                            started_ms: diagnostic_elapsed_ms(origin, started_at),
+                            finished_ms: diagnostic_elapsed_ms(origin, finished_at),
                         });
                 }
                 results.push(ComparisonRouteResult {
