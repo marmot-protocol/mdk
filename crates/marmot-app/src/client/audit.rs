@@ -469,6 +469,14 @@ impl AppClient {
         }
     }
 
+    /// Used only after the account worker observes an explicit graceful
+    /// shutdown signal. Dropping a client on another path never emits stop.
+    pub(crate) fn finish_audit_recording(&self) {
+        self.runtime.session().finish_audit_v5_recording(
+            marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown,
+        );
+    }
+
     /// Rotate the live forensic recorder iff it is the one appending to
     /// `path`, returning whether a rotation happened.
     ///

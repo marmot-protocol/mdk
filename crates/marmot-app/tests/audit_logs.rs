@@ -609,6 +609,16 @@ async fn deferred_runtime_open_records_the_stored_group_baseline() {
             && row["event"]["selected_group_count"] == 1
     }));
     runtime.shutdown_and_close().await.unwrap();
+    let final_rows = std::fs::read_to_string(&files[0].path)
+        .unwrap()
+        .lines()
+        .map(|line| marmot_forensics::v5::Record::from_json(line.as_bytes()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        &final_rows.last().unwrap().fields().event,
+        marmot_forensics::v5::Event::RecordingSessionStopped(stop)
+            if stop.reason == marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown
+    ));
 }
 
 #[tokio::test]
@@ -1985,10 +1995,12 @@ async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(source_events(&live_path).len(), before_toggle.len());
+    let after_disable_body = std::fs::read_to_string(&live_path).unwrap();
+    assert_eq!(after_disable_body, before_disable_body);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(
         std::fs::read_to_string(&live_path).unwrap(),
-        before_disable_body,
-        "live disable must stop further audit rows"
+        after_disable_body
     );
 
     runtime
@@ -2005,6 +2017,17 @@ async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
     assert_source_linkage(latest, &before_toggle_row);
     assert_ne!(latest["session_id"], before_toggle_row["session_id"]);
     runtime.shutdown().await;
+    let final_rows = std::fs::read_to_string(&live_path)
+        .unwrap()
+        .lines()
+        .map(|line| marmot_forensics::v5::Record::from_json(line.as_bytes()).unwrap())
+        .collect::<Vec<_>>();
+    let last = final_rows.last().unwrap().fields();
+    assert!(matches!(
+        &last.event,
+        marmot_forensics::v5::Event::RecordingSessionStopped(stop)
+            if stop.reason == marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown
+    ));
 }
 
 #[tokio::test]

@@ -2955,6 +2955,12 @@ impl<S: StorageProvider> Engine<S> {
         self.recorder.records_v5()
     }
 
+    /// Observe an explicit clean end to the installed v5 recorder. It does
+    /// not assert that preceding capture was complete or delivery succeeded.
+    pub fn finish_audit_v5_recording(&self, reason: marmot_forensics::v5::RecordingStopReason) {
+        self.recorder.finish_v5_recording(reason);
+    }
+
     /// Rotate the installed forensic recorder: discard its current file and
     /// begin a fresh one, then keep recording. No-op for non-file recorders.
     pub fn rotate_audit_recorder(&self) -> std::io::Result<()> {

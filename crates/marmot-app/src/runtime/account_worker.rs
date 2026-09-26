@@ -30,7 +30,7 @@ use super::conversation_window::{
 use super::{
     MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
-    wait_for_runtime_shutdown,
+    runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::recovery::AttemptGrant;
@@ -939,7 +939,12 @@ async fn run_app_runtime_account_worker(
     .await
     {
         StartupHydrationOutcome::Completed => {}
-        StartupHydrationOutcome::Shutdown => return,
+        StartupHydrationOutcome::Shutdown { explicit } => {
+            if explicit {
+                client.finish_audit_recording();
+            }
+            return;
+        }
     }
 
     // The snapshot answers read commands while the initial sync holds
@@ -985,6 +990,7 @@ async fn run_app_runtime_account_worker(
     // the network job. Deferred commands replay in arrival order after catch-up.
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
+    let mut startup_explicit_shutdown = false;
     let startup_sync_result = {
         let mut initial_sync: Pin<
             Box<dyn Future<Output = Result<StartupSyncStep, ClassifiedSyncFailure>> + Send + '_>,
@@ -1066,12 +1072,18 @@ async fn run_app_runtime_account_worker(
         });
         loop {
             tokio::select! {
-                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                _ = &mut shutdown => return,
-                result = &mut initial_sync => break result,
+                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                    startup_explicit_shutdown = runtime_shutdown_requested(&lifecycle_shutdown);
+                    break None;
+                }
+                stop = &mut shutdown => {
+                    startup_explicit_shutdown = stop.is_ok();
+                    break None;
+                }
+                result = &mut initial_sync => break Some(result),
                 command = commands.recv() => {
                     match command {
-                        None => return,
+                        None => break None,
                         Some(command) => handle_startup_sync_command(
                             command,
                             read_snapshot.as_ref(),
@@ -1084,6 +1096,12 @@ async fn run_app_runtime_account_worker(
                 }
             }
         }
+    };
+    let Some(startup_sync_result) = startup_sync_result else {
+        if startup_explicit_shutdown {
+            client.finish_audit_recording();
+        }
+        return;
     };
     // Keep the large command/receive continuation out of the enclosing
     // worker's async state while the frozen network request is active.
@@ -1100,10 +1118,12 @@ async fn run_app_runtime_account_worker(
                         tokio::select! {
                             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                                 network.abort_and_wait().await;
+                                startup_explicit_shutdown = runtime_shutdown_requested(&lifecycle_shutdown);
                                 return None;
                             }
-                            _ = &mut shutdown => {
+                            stop = &mut shutdown => {
                                 network.abort_and_wait().await;
+                                startup_explicit_shutdown = stop.is_ok();
                                 return None;
                             }
                             result = network.wait() => match result {
@@ -1137,7 +1157,7 @@ async fn run_app_runtime_account_worker(
                                                     AppPerformanceOperation::InboundDeliveryProjection,
                                                     delivery_started.elapsed(), true,
                                                 );
-                                                publish_app_runtime_summary(
+                                                publish_app_runtime_summary_with_v5(&client,
                                                     &events, &account_id_hex, &account_label, &summary,
                                                 );
                                                 publish_client_pending_projection_updates(
@@ -1272,6 +1292,9 @@ async fn run_app_runtime_account_worker(
             })
         });
         let Some(result) = continuation.await else {
+            if startup_explicit_shutdown {
+                client.finish_audit_recording();
+            }
             return;
         };
         result
@@ -1289,7 +1312,13 @@ async fn run_app_runtime_account_worker(
     );
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
-            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+            publish_app_runtime_summary_with_v5(
+                &client,
+                &events,
+                &account_id_hex,
+                &account_label,
+                &summary,
+            );
             start_post_join_history_after_visibility(
                 &mut client,
                 &summary,
@@ -1306,6 +1335,7 @@ async fn run_app_runtime_account_worker(
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
+                &client,
                 &events,
                 &account_id_hex,
                 &account_label,
@@ -1338,7 +1368,13 @@ async fn run_app_runtime_account_worker(
             // failure remains retryable and is reported separately.
             match client.drain_pending_session_events().await {
                 Ok(summary) => {
-                    publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                    publish_app_runtime_summary_with_v5(
+                        &client,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &summary,
+                    );
                     start_post_join_history_after_visibility(
                         &mut client,
                         &summary,
@@ -1562,9 +1598,13 @@ async fn run_app_runtime_account_worker(
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                client.finish_audit_recording();
                 break 'worker;
             }
-            _ = &mut shutdown => {
+            stop = &mut shutdown => {
+                if stop.is_ok() {
+                    client.finish_audit_recording();
+                }
                 break 'worker;
             }
             _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
@@ -1604,8 +1644,14 @@ async fn run_app_runtime_account_worker(
                     }
                 };
                 let _ = report_pending_epoch_backfill_result(
+                    &client,
                     result, job.backfill_armed, job.observation,
-                    &events, &account_id_hex, &account_label, &shared,
+                    EpochBackfillReportContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
                 );
                 match job.origin {
                     ComparisonRecoveryOrigin::PeriodicMaintenance => {
@@ -1838,7 +1884,7 @@ async fn run_app_runtime_account_worker(
                                 if lifecycle.is_stopping() { return; }
                                 match client.advance_convergence_after_runtime_sync(&group_id).await {
                                     Ok(summary) => {
-                                        publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                                        publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                                         // A pass that superseded one of this
                                         // device's own commits reports it
                                         // through the client's pending
@@ -1910,13 +1956,16 @@ async fn run_app_runtime_account_worker(
                                             }
                                         };
                                         let _ = report_pending_epoch_backfill_result(
+                                            &client,
                                             backfill_result,
                                             backfill_armed,
                                             observation,
-                                            &events,
-                                            &account_id_hex,
-                                            &account_label,
-                                            &shared,
+                                            EpochBackfillReportContext {
+                                                events: &events,
+                                                account_id_hex: &account_id_hex,
+                                                account_label: &account_label,
+                                                shared: &shared,
+                                            },
                                         );
                                         if audit_tracker_update {
                                             shared.schedule_audit_log_tracker_update("scheduled_convergence");
@@ -1966,7 +2015,7 @@ async fn run_app_runtime_account_worker(
                     let had_input = job.has_input();
                     match job.admit_one(&mut client).await {
                         Ok(summary) => {
-                            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                            publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                             publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
                             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
                             #[cfg(test)]
@@ -2060,7 +2109,7 @@ async fn run_app_runtime_account_worker(
                                 (Ok(summary), true)
                             }
                             Err(failure) => {
-                                publish_app_runtime_summary(
+                                publish_app_runtime_summary_with_v5(&client,
                                     &events,
                                     &account_id_hex,
                                     &account_label,
@@ -2083,7 +2132,7 @@ async fn run_app_runtime_account_worker(
                 match result {
                     Ok(summary) => {
                         reconnect_backoff.reset();
-                        publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                        publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                         // An inline convergence pass on a delivered rival can
                         // supersede one of this device's own commits; the
                         // report waits in the client's pending buffer and this
@@ -2155,8 +2204,14 @@ async fn run_app_runtime_account_worker(
                                     }
                                     PendingComparisonExecution::Inline(result) => {
                                         let _ = report_pending_epoch_backfill_result(
+                                            &client,
                                             result, backfill_armed, observation,
-                                            &events, &account_id_hex, &account_label, &shared,
+                                            EpochBackfillReportContext {
+                                                events: &events,
+                                                account_id_hex: &account_id_hex,
+                                                account_label: &account_label,
+                                                shared: &shared,
+                                            },
                                         );
                                     }
                                 }
@@ -2321,8 +2376,16 @@ async fn run_app_runtime_account_worker(
                                     // required.
                                     let telemetry = shared.app_performance_telemetry();
                                     let prepare_transport = tokio::select! {
-                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
-                                        _ = &mut shutdown => break 'worker,
+                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                                            reopened.finish_audit_recording();
+                                            break 'worker;
+                                        }
+                                        stop = &mut shutdown => {
+                                            if stop.is_ok() {
+                                                reopened.finish_audit_recording();
+                                            }
+                                            break 'worker;
+                                        }
                                         result = reopened.prepare_transport_with_telemetry(Some(&telemetry)) => result,
                                     };
                                     if let Err(transport_err) = prepare_transport {
@@ -2342,7 +2405,7 @@ async fn run_app_runtime_account_worker(
                                         .await;
                                     match reopened.drain_pending_session_events().await {
                                         Ok(summary) => {
-                                            publish_app_runtime_summary(
+                                            publish_app_runtime_summary_with_v5(&reopened,
                                                 &events,
                                                 &account_id_hex,
                                                 &account_label,
@@ -2517,7 +2580,7 @@ async fn run_app_runtime_account_worker(
                     }
                     match catch_up {
                         Ok(Ok(summary)) => {
-                            publish_app_runtime_summary(
+                            publish_app_runtime_summary_with_v5(&client,
                                 &events,
                                 &account_id_hex,
                                 &account_label,
@@ -2543,7 +2606,7 @@ async fn run_app_runtime_account_worker(
                             );
                         }
                         Ok(Err(failure)) => {
-                            publish_sync_summary_with_audit(
+                            publish_sync_summary_with_audit(&client,
                                 &events,
                                 &account_id_hex,
                                 &account_label,
@@ -2612,8 +2675,15 @@ async fn run_app_runtime_account_worker(
                     PendingComparisonExecution::Inline(result) => result,
                 };
                 let _ = report_pending_epoch_backfill_result(
+                    &client,
                     backfill_result, backfill_armed,
-                    observation, &events, &account_id_hex, &account_label, &shared,
+                    observation,
+                    EpochBackfillReportContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
                 );
                 finish_periodic_maintenance_after_recovery(
                     &mut client,
@@ -2990,7 +3060,8 @@ async fn handle_account_worker_catch_up(
     };
     let result = match sync_result {
         Ok(summary) => {
-            publish_app_runtime_summary(
+            publish_app_runtime_summary_with_v5(
+                client,
                 context.events,
                 context.account_id_hex,
                 context.account_label,
@@ -3011,6 +3082,7 @@ async fn handle_account_worker_catch_up(
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
+                client,
                 context.events,
                 context.account_id_hex,
                 context.account_label,
@@ -3111,7 +3183,7 @@ const STARTUP_HYDRATION_COMMAND_BUDGET: usize = 8;
 
 enum StartupHydrationOutcome {
     Completed,
-    Shutdown,
+    Shutdown { explicit: bool },
 }
 
 /// Run one storage-only promotion transaction after account readiness.
@@ -3248,9 +3320,13 @@ async fn run_startup_hydration_pipeline(
                 tokio::select! {
                     _ = tokio::time::sleep_until(hold_until) => break,
                     _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-                        return StartupHydrationOutcome::Shutdown;
+                        return StartupHydrationOutcome::Shutdown {
+                            explicit: runtime_shutdown_requested(&lifecycle_shutdown),
+                        };
                     }
-                    _ = &mut *shutdown => return StartupHydrationOutcome::Shutdown,
+                    stop = &mut *shutdown => {
+                        return StartupHydrationOutcome::Shutdown { explicit: stop.is_ok() };
+                    }
                     command = commands.recv() => match command {
                         Some(command) => {
                             handle_startup_hydration_command(
@@ -3264,7 +3340,7 @@ async fn run_startup_hydration_pipeline(
                             )
                             .await;
                         }
-                        None => return StartupHydrationOutcome::Shutdown,
+                        None => return StartupHydrationOutcome::Shutdown { explicit: false },
                     },
                 }
             }
@@ -3287,16 +3363,21 @@ async fn run_startup_hydration_pipeline(
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return StartupHydrationOutcome::Shutdown;
+                    return StartupHydrationOutcome::Shutdown { explicit: false };
                 }
             }
         }
-        if !matches!(
-            shutdown.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ) || lifecycle.ensure_running().is_err()
-        {
-            return StartupHydrationOutcome::Shutdown;
+        match shutdown.try_recv() {
+            Ok(()) => return StartupHydrationOutcome::Shutdown { explicit: true },
+            Err(oneshot::error::TryRecvError::Closed) => {
+                return StartupHydrationOutcome::Shutdown { explicit: false };
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+        if lifecycle.ensure_running().is_err() {
+            return StartupHydrationOutcome::Shutdown {
+                explicit: runtime_shutdown_requested(&lifecycle_shutdown),
+            };
         }
         let progress = match client
             .runtime
@@ -3318,7 +3399,13 @@ async fn run_startup_hydration_pipeline(
         // hydration quarantines, restored leave requests) exactly as a live
         // drain would, so the projection updates incrementally.
         if let Ok(summary) = client.drain_pending_session_events().await {
-            publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+            publish_app_runtime_summary_with_v5(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &summary,
+            );
         }
         if progress.remaining == 0 {
             break;
@@ -4179,7 +4266,13 @@ fn account_worker_command_future<'a>(
             let sync_started_at = Instant::now();
             let result = match client.sync_with_classified_partial_progress().await {
                 Ok(summary) => {
-                    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    publish_app_runtime_summary_with_v5(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &summary,
+                    );
                     publish_client_pending_projection_updates(
                         client,
                         events,
@@ -4193,6 +4286,7 @@ fn account_worker_command_future<'a>(
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
+                        client,
                         events,
                         account_id_hex,
                         account_label,
@@ -4253,7 +4347,13 @@ fn account_worker_command_future<'a>(
             .await;
             let result = match repaired {
                 Ok(summary) => {
-                    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    publish_app_runtime_summary_with_v5(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &summary,
+                    );
                     publish_client_pending_projection_updates(
                         client,
                         events,
@@ -4267,6 +4367,7 @@ fn account_worker_command_future<'a>(
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
+                        client,
                         events,
                         account_id_hex,
                         account_label,
@@ -4605,7 +4706,8 @@ fn account_worker_command_future<'a>(
                     // consumers refresh and the group leaves the recovery
                     // surface and reappears as a normal chat.
                     match client.drain_pending_session_events().await {
-                        Ok(summary) => publish_app_runtime_summary(
+                        Ok(summary) => publish_app_runtime_summary_with_v5(
+                            client,
                             events,
                             account_id_hex,
                             account_label,
@@ -6364,6 +6466,7 @@ async fn start_post_join_history_after_visibility(
 }
 
 fn publish_sync_summary_with_audit(
+    client: &AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
@@ -6371,7 +6474,7 @@ fn publish_sync_summary_with_audit(
     shared: &RuntimeSharedServices,
     audit_trigger: &'static str,
 ) {
-    publish_app_runtime_summary(events, account_id_hex, account_label, summary);
+    publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, summary);
     if sync_summary_triggers_audit_tracker_update(summary) {
         shared.schedule_audit_log_tracker_update(audit_trigger);
     }
@@ -6427,27 +6530,41 @@ async fn run_pending_epoch_backfill_reporting_arm(
         .flatten();
     let backfill_result = client.run_pending_epoch_backfill(seam).await;
     report_pending_epoch_backfill_result(
+        client,
         backfill_result,
         backfill_armed,
         observation,
-        events,
-        account_id_hex,
-        account_label,
-        shared,
+        EpochBackfillReportContext {
+            events,
+            account_id_hex,
+            account_label,
+            shared,
+        },
     )
+}
+
+struct EpochBackfillReportContext<'a> {
+    events: &'a broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &'a str,
+    account_label: &'a str,
+    shared: &'a RuntimeSharedServices,
 }
 
 /// A suspended comparison reports through the same product/runtime boundary
 /// after the worker has admitted its owned result and checkpointed the grant.
 fn report_pending_epoch_backfill_result(
+    client: &AppClient,
     backfill_result: Result<EpochBackfillRunOutcome, AppError>,
     backfill_armed: bool,
     observation: Option<crate::product_analytics::ProductObservation>,
-    events: &broadcast::Sender<MarmotAppEvent>,
-    account_id_hex: &str,
-    account_label: &str,
-    shared: &RuntimeSharedServices,
+    context: EpochBackfillReportContext<'_>,
 ) -> Result<(), AccountCatchUpFailure> {
+    let EpochBackfillReportContext {
+        events,
+        account_id_hex,
+        account_label,
+        shared,
+    } = context;
     if let Some(observation) = observation {
         observation.finish(match &backfill_result {
             Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
@@ -6466,7 +6583,13 @@ fn report_pending_epoch_backfill_result(
             EpochBackfillRunOutcome::Completed(summary)
             | EpochBackfillRunOutcome::Incomplete(summary),
         ) => {
-            publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+            publish_app_runtime_summary_with_v5(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &summary,
+            );
             Ok(())
         }
         Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending) => Ok(()),
@@ -6494,14 +6617,30 @@ fn report_pending_epoch_backfill_result(
     result
 }
 
+#[derive(Default)]
+struct RuntimeSummaryPublication {
+    attempted: u64,
+    accepted: u64,
+    no_subscribers: u64,
+}
+
 fn publish_app_runtime_summary(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
     summary: &SyncSummary,
-) {
+) -> RuntimeSummaryPublication {
+    let mut publication = RuntimeSummaryPublication::default();
+    let mut send = |event| {
+        publication.attempted += 1;
+        if events.send(event).is_ok() {
+            publication.accepted += 1;
+        } else {
+            publication.no_subscribers += 1;
+        }
+    };
     for group_id in &summary.joined_groups {
-        let _ = events.send(MarmotAppEvent::GroupJoined {
+        send(MarmotAppEvent::GroupJoined {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
             group_id: group_id.clone(),
@@ -6513,9 +6652,9 @@ fn publish_app_runtime_summary(
         // kind-1200 timeline row so timeline-only subscribers can discover and
         // watch the live stream.
         if let Some(event) = agent_stream_runtime_event(account_id_hex, account_label, message) {
-            let _ = events.send(event);
+            send(event);
         } else {
-            let _ = events.send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
                 account_id_hex: account_id_hex.to_owned(),
                 account_label: account_label.to_owned(),
                 message: message.clone(),
@@ -6523,21 +6662,21 @@ fn publish_app_runtime_summary(
         }
     }
     for update in &summary.projection_updates {
-        let _ = events.send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+        send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
             update: update.clone(),
         }));
     }
     for event in &summary.events {
-        let _ = events.send(MarmotAppEvent::GroupEvent(RuntimeGroupEvent {
+        send(MarmotAppEvent::GroupEvent(RuntimeGroupEvent {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
             event: event.clone(),
         }));
     }
     for escalation in &summary.epoch_stall_escalations {
-        let _ = events.send(MarmotAppEvent::EpochStallEscalated {
+        send(MarmotAppEvent::EpochStallEscalated {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
             group_id: escalation.group_id.clone(),
@@ -6545,6 +6684,68 @@ fn publish_app_runtime_summary(
             arms: escalation.arms,
         });
     }
+    publication
+}
+
+fn runtime_summary_message_ref(
+    summary: &SyncSummary,
+) -> Option<marmot_forensics::v5::EngineMessageRef> {
+    if summary.messages.len() == 1
+        && summary.joined_groups.is_empty()
+        && summary.epoch_stall_escalations.is_empty()
+    {
+        match summary.events.as_slice() {
+            [cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. }]
+                if hex::encode(message_id.as_slice())
+                    == summary.messages[0].source_message_id_hex =>
+            {
+                marmot_forensics::v5::EngineMessageRef::from_message_id(message_id.as_slice()).ok()
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn record_runtime_publication(
+    client: &AppClient,
+    category: marmot_forensics::v5::RuntimePublicationCategory,
+    message_ref: Option<marmot_forensics::v5::EngineMessageRef>,
+    publication: RuntimeSummaryPublication,
+) {
+    if publication.attempted == 0 || !client.audit_v5_enabled() {
+        return;
+    }
+    client.runtime.session().record_v5_event(
+        None,
+        marmot_forensics::v5::Event::RuntimePublicationOutcome(
+            marmot_forensics::v5::RuntimePublicationOutcome {
+                operation_ref: None,
+                message_ref,
+                category,
+                attempted: publication.attempted.into(),
+                accepted_by_broadcast: publication.accepted.into(),
+                no_subscribers: publication.no_subscribers.into(),
+            },
+        ),
+    );
+}
+
+fn publish_app_runtime_summary_with_v5(
+    client: &AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    summary: &SyncSummary,
+) {
+    let publication = publish_app_runtime_summary(events, account_id_hex, account_label, summary);
+    record_runtime_publication(
+        client,
+        marmot_forensics::v5::RuntimePublicationCategory::SyncSummary,
+        runtime_summary_message_ref(summary),
+        publication,
+    );
 }
 
 pub(super) fn publish_app_runtime_projection_update(
@@ -6552,12 +6753,14 @@ pub(super) fn publish_app_runtime_projection_update(
     account_id_hex: &str,
     account_label: &str,
     update: AppProjectionUpdate,
-) {
-    let _ = events.send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
-        account_id_hex: account_id_hex.to_owned(),
-        account_label: account_label.to_owned(),
-        update,
-    }));
+) -> bool {
+    events
+        .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            update,
+        }))
+        .is_ok()
 }
 
 fn publish_client_pending_projection_updates(
@@ -6566,9 +6769,21 @@ fn publish_client_pending_projection_updates(
     account_id_hex: &str,
     account_label: &str,
 ) {
+    let mut publication = RuntimeSummaryPublication::default();
     for update in client.take_pending_projection_updates() {
-        publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+        publication.attempted += 1;
+        if publish_app_runtime_projection_update(events, account_id_hex, account_label, update) {
+            publication.accepted += 1;
+        } else {
+            publication.no_subscribers += 1;
+        }
     }
+    record_runtime_publication(
+        client,
+        marmot_forensics::v5::RuntimePublicationCategory::ProjectionUpdate,
+        None,
+        publication,
+    );
     for group_id in client.pending_recovery_status_updates.drain() {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
     }
@@ -6600,7 +6815,7 @@ fn publish_client_pending_applied_summary(
     account_label: &str,
 ) {
     let summary = client.take_pending_applied_sync_summary();
-    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+    publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, &summary);
 }
 
 pub(crate) fn publish_app_runtime_group_state_updated(
@@ -9909,7 +10124,10 @@ mod tests {
             ..SyncSummary::default()
         };
 
-        publish_app_runtime_summary(&events, "account-id", "label", &summary);
+        let publication = publish_app_runtime_summary(&events, "account-id", "label", &summary);
+        assert_eq!(publication.attempted, 1);
+        assert_eq!(publication.accepted, 1);
+        assert_eq!(publication.no_subscribers, 0);
 
         assert_eq!(
             subscriber.try_recv().unwrap(),
@@ -9925,6 +10143,66 @@ mod tests {
             subscriber.try_recv().is_err(),
             "one escalation must publish exactly one event"
         );
+    }
+
+    #[test]
+    fn summary_publication_reports_no_subscriber_without_relabeling_app_commit() {
+        let (events, receiver) = broadcast::channel(4);
+        drop(receiver);
+        let summary = SyncSummary {
+            epoch_stall_escalations: vec![crate::EpochStallEscalation {
+                group_id: test_group_id(3),
+                stalled_epoch: 12,
+                arms: 3,
+            }],
+            ..SyncSummary::default()
+        };
+        let publication = publish_app_runtime_summary(&events, "account-id", "label", &summary);
+        assert_eq!(publication.attempted, 1);
+        assert_eq!(publication.accepted, 0);
+        assert_eq!(publication.no_subscribers, 1);
+    }
+
+    #[test]
+    fn runtime_summary_message_ref_requires_a_matching_typed_engine_event() {
+        let group_id = test_group_id(3);
+        let message_id = cgka_traits::MessageId::new(vec![0xabu8; 32]);
+        let mut summary = SyncSummary {
+            messages: vec![crate::ReceivedMessage {
+                authority: None,
+                message_id_hex: "cc".repeat(32),
+                source_message_id_hex: hex::encode(message_id.as_slice()),
+                sender: "sender".into(),
+                sender_display_name: None,
+                group_id: group_id.clone(),
+                source_epoch: 1,
+                retention: None,
+                plaintext: "test".into(),
+                kind: 1,
+                tags: Vec::new(),
+                recorded_at: 1,
+                received_at: 2,
+            }],
+            ..SyncSummary::default()
+        };
+        assert!(runtime_summary_message_ref(&summary).is_none());
+        summary
+            .events
+            .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                group_id,
+                message_id: message_id.clone(),
+                sender: cgka_traits::MemberId::new(vec![0x11; 32]),
+                epoch: cgka_traits::EpochId(1),
+                payload: Vec::new(),
+                retention: None,
+                authority: None,
+            });
+        assert_eq!(
+            runtime_summary_message_ref(&summary),
+            marmot_forensics::v5::EngineMessageRef::from_message_id(message_id.as_slice()).ok()
+        );
+        summary.messages[0].source_message_id_hex = "dd".repeat(32);
+        assert!(runtime_summary_message_ref(&summary).is_none());
     }
 
     #[test]

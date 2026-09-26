@@ -1421,6 +1421,10 @@ impl AccountDeviceSession {
         self.engine.audit_v5_enabled()
     }
 
+    pub fn finish_audit_v5_recording(&self, reason: marmot_forensics::v5::RecordingStopReason) {
+        self.engine.finish_audit_v5_recording(reason);
+    }
+
     pub fn record_audit_health(&self) {
         self.engine.audit_recorder_health();
     }
