@@ -45,22 +45,34 @@ fn single_event_message_ref(events: &[GroupEvent]) -> Option<EngineMessageRef> {
     EngineMessageRef::from_message_id(id.as_slice()).ok()
 }
 
+pub(super) struct CheckpointObservation<'a> {
+    pub message_ref: Option<EngineMessageRef>,
+    pub changed_groups: usize,
+    pub pending_inputs: usize,
+    pub pending_acks: usize,
+    pub pending_frontiers: usize,
+    pub created_row: bool,
+    pub error: Option<&'a AppError>,
+    pub elapsed: Duration,
+    pub failed_before_commit: bool,
+}
+
 impl AppClient {
-    pub(super) fn record_v5_app_checkpoint(
-        &self,
-        message_ref: Option<EngineMessageRef>,
-        changed_groups: usize,
-        pending_inputs: usize,
-        pending_acks: usize,
-        pending_frontiers: usize,
-        created_row: bool,
-        error: Option<&AppError>,
-        elapsed: Duration,
-        failed_before_commit: bool,
-    ) {
+    pub(super) fn record_v5_app_checkpoint(&self, observed: CheckpointObservation<'_>) {
         if !self.audit_v5_enabled() {
             return;
         }
+        let CheckpointObservation {
+            message_ref,
+            changed_groups,
+            pending_inputs,
+            pending_acks,
+            pending_frontiers,
+            created_row,
+            error,
+            elapsed,
+            failed_before_commit,
+        } = observed;
         self.runtime.session().record_v5_event(
             None,
             Event::AppUpdateOutcome(AppUpdateOutcome {

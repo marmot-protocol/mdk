@@ -5109,17 +5109,17 @@ impl AppClient {
                 || pending_frontiers != 0
                 || created_group_id_hex.is_some())
         {
-            self.record_v5_app_checkpoint(
+            self.record_v5_app_checkpoint(super::audit_v5_app_update::CheckpointObservation {
                 message_ref,
                 changed_groups,
                 pending_inputs,
                 pending_acks,
                 pending_frontiers,
-                created_group_id_hex.is_some(),
-                result.as_ref().err(),
-                checkpoint_started.elapsed(),
-                audit_fail_before_commit,
-            );
+                created_row: created_group_id_hex.is_some(),
+                error: result.as_ref().err(),
+                elapsed: checkpoint_started.elapsed(),
+                failed_before_commit: audit_fail_before_commit,
+            });
         }
         result
     }

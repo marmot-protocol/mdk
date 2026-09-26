@@ -1623,7 +1623,12 @@ async fn run_app_runtime_account_worker(
                 let _ = report_pending_epoch_backfill_result(
                     &client,
                     result, job.backfill_armed, job.observation,
-                    &events, &account_id_hex, &account_label, &shared,
+                    EpochBackfillReportContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
                 );
                 match job.origin {
                     ComparisonRecoveryOrigin::PeriodicMaintenance => {
@@ -1932,10 +1937,12 @@ async fn run_app_runtime_account_worker(
                                             backfill_result,
                                             backfill_armed,
                                             observation,
-                                            &events,
-                                            &account_id_hex,
-                                            &account_label,
-                                            &shared,
+                                            EpochBackfillReportContext {
+                                                events: &events,
+                                                account_id_hex: &account_id_hex,
+                                                account_label: &account_label,
+                                                shared: &shared,
+                                            },
                                         );
                                         if audit_tracker_update {
                                             shared.schedule_audit_log_tracker_update("scheduled_convergence");
@@ -2176,7 +2183,12 @@ async fn run_app_runtime_account_worker(
                                         let _ = report_pending_epoch_backfill_result(
                                             &client,
                                             result, backfill_armed, observation,
-                                            &events, &account_id_hex, &account_label, &shared,
+                                            EpochBackfillReportContext {
+                                                events: &events,
+                                                account_id_hex: &account_id_hex,
+                                                account_label: &account_label,
+                                                shared: &shared,
+                                            },
                                         );
                                     }
                                 }
@@ -2642,7 +2654,13 @@ async fn run_app_runtime_account_worker(
                 let _ = report_pending_epoch_backfill_result(
                     &client,
                     backfill_result, backfill_armed,
-                    observation, &events, &account_id_hex, &account_label, &shared,
+                    observation,
+                    EpochBackfillReportContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
                 );
                 finish_periodic_maintenance_after_recovery(
                     &mut client,
@@ -3020,7 +3038,7 @@ async fn handle_account_worker_catch_up(
     let result = match sync_result {
         Ok(summary) => {
             publish_app_runtime_summary_with_v5(
-                &client,
+                client,
                 context.events,
                 context.account_id_hex,
                 context.account_label,
@@ -3041,7 +3059,7 @@ async fn handle_account_worker_catch_up(
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
-                &client,
+                client,
                 context.events,
                 context.account_id_hex,
                 context.account_label,
@@ -3350,7 +3368,7 @@ async fn run_startup_hydration_pipeline(
         // drain would, so the projection updates incrementally.
         if let Ok(summary) = client.drain_pending_session_events().await {
             publish_app_runtime_summary_with_v5(
-                &client,
+                client,
                 events,
                 account_id_hex,
                 account_label,
@@ -4217,7 +4235,7 @@ fn account_worker_command_future<'a>(
             let result = match client.sync_with_classified_partial_progress().await {
                 Ok(summary) => {
                     publish_app_runtime_summary_with_v5(
-                        &client,
+                        client,
                         events,
                         account_id_hex,
                         account_label,
@@ -4236,7 +4254,7 @@ fn account_worker_command_future<'a>(
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
-                        &client,
+                        client,
                         events,
                         account_id_hex,
                         account_label,
@@ -4298,7 +4316,7 @@ fn account_worker_command_future<'a>(
             let result = match repaired {
                 Ok(summary) => {
                     publish_app_runtime_summary_with_v5(
-                        &client,
+                        client,
                         events,
                         account_id_hex,
                         account_label,
@@ -4317,7 +4335,7 @@ fn account_worker_command_future<'a>(
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
-                        &client,
+                        client,
                         events,
                         account_id_hex,
                         account_label,
@@ -4657,7 +4675,7 @@ fn account_worker_command_future<'a>(
                     // surface and reappears as a normal chat.
                     match client.drain_pending_session_events().await {
                         Ok(summary) => publish_app_runtime_summary_with_v5(
-                            &client,
+                            client,
                             events,
                             account_id_hex,
                             account_label,
@@ -6484,11 +6502,20 @@ async fn run_pending_epoch_backfill_reporting_arm(
         backfill_result,
         backfill_armed,
         observation,
-        events,
-        account_id_hex,
-        account_label,
-        shared,
+        EpochBackfillReportContext {
+            events,
+            account_id_hex,
+            account_label,
+            shared,
+        },
     )
+}
+
+struct EpochBackfillReportContext<'a> {
+    events: &'a broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &'a str,
+    account_label: &'a str,
+    shared: &'a RuntimeSharedServices,
 }
 
 /// A suspended comparison reports through the same product/runtime boundary
@@ -6498,11 +6525,14 @@ fn report_pending_epoch_backfill_result(
     backfill_result: Result<EpochBackfillRunOutcome, AppError>,
     backfill_armed: bool,
     observation: Option<crate::product_analytics::ProductObservation>,
-    events: &broadcast::Sender<MarmotAppEvent>,
-    account_id_hex: &str,
-    account_label: &str,
-    shared: &RuntimeSharedServices,
+    context: EpochBackfillReportContext<'_>,
 ) -> Result<(), AccountCatchUpFailure> {
+    let EpochBackfillReportContext {
+        events,
+        account_id_hex,
+        account_label,
+        shared,
+    } = context;
     if let Some(observation) = observation {
         observation.finish(match &backfill_result {
             Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
@@ -6522,7 +6552,7 @@ fn report_pending_epoch_backfill_result(
             | EpochBackfillRunOutcome::Incomplete(summary),
         ) => {
             publish_app_runtime_summary_with_v5(
-                &client,
+                client,
                 events,
                 account_id_hex,
                 account_label,
