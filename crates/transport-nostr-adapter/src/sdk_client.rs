@@ -158,6 +158,20 @@ pub struct NostrComparisonDiagnostics {
     pub neg_rejected: usize,
     pub neg_protocol: usize,
     pub neg_other: usize,
+    /// Sum of sequential root and account-client lookup waits.
+    pub account_lookup_ms: u64,
+    /// Inner account client's work before its 2-second reconciliation clock.
+    pub preflight_ms: u64,
+    /// Wall time for the whole concurrent endpoint comparison join.
+    pub comparison_join_ms: u64,
+    /// Inner account client's work after the comparison join.
+    pub post_join_ms: u64,
+    /// Wall time from the outermost SDK call to its returned summary.
+    pub sdk_total_ms: u64,
+    /// Maximum individual endpoint relay lookup, never a parallel sum.
+    pub relay_lookup_max_ms: u64,
+    /// Maximum individual endpoint NEG sync, never a parallel sum.
+    pub neg_sync_max_ms: u64,
 }
 
 #[cfg(feature = "test-policy-overrides")]
@@ -169,8 +183,15 @@ enum ComparisonDiagnostic {
 }
 
 #[cfg(feature = "test-policy-overrides")]
+fn diagnostic_elapsed_ms(started: std::time::Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+#[cfg(feature = "test-policy-overrides")]
 impl NostrComparisonDiagnostics {
-    fn record(&mut self, diagnostic: ComparisonDiagnostic) {
+    fn record(&mut self, diagnostic: ComparisonDiagnostic, relay_lookup_ms: u64, neg_sync_ms: u64) {
+        self.relay_lookup_max_ms = self.relay_lookup_max_ms.max(relay_lookup_ms);
+        self.neg_sync_max_ms = self.neg_sync_max_ms.max(neg_sync_ms);
         match diagnostic {
             ComparisonDiagnostic::RelayMissing => self.relay_missing += 1,
             ComparisonDiagnostic::RelayLookupError => self.relay_lookup_error += 1,
@@ -675,8 +696,15 @@ impl NostrSdkRelayClient {
         reconcile_until: u64,
         progress: &dyn NostrReconciliationProgress,
     ) -> Result<(NostrReconciliationSummary, Vec<NostrRelayEvent>), TransportAdapterError> {
-        if let Some(account_client) = self.account_client(subscription.account_id()).await? {
-            return Box::pin(account_client.reconcile_subscription(
+        #[cfg(feature = "test-policy-overrides")]
+        let sdk_started = std::time::Instant::now();
+        #[cfg(feature = "test-policy-overrides")]
+        let account_lookup_started = std::time::Instant::now();
+        let account_client = self.account_client(subscription.account_id()).await?;
+        #[cfg(feature = "test-policy-overrides")]
+        let account_lookup_ms = diagnostic_elapsed_ms(account_lookup_started);
+        if let Some(account_client) = account_client {
+            let result = Box::pin(account_client.reconcile_subscription(
                 subscription,
                 local_items,
                 reconcile_since,
@@ -684,7 +712,20 @@ impl NostrSdkRelayClient {
                 progress,
             ))
             .await;
+            #[cfg(feature = "test-policy-overrides")]
+            let result = {
+                let mut result = result;
+                if let Ok((summary, _)) = &mut result {
+                    summary.comparison_diagnostics.account_lookup_ms += account_lookup_ms;
+                    summary.comparison_diagnostics.sdk_total_ms =
+                        diagnostic_elapsed_ms(sdk_started);
+                }
+                result
+            };
+            return result;
         }
+        #[cfg(feature = "test-policy-overrides")]
+        let preflight_started = std::time::Instant::now();
         let mut plan = Self::plan_subscription(&subscription)?;
         // Startup compares the gap below the subscription floor; explicit
         // backfill also compares its current window so upstream SDK dedup
@@ -710,7 +751,17 @@ impl NostrSdkRelayClient {
         let Some(replay_endpoint) = endpoints.first().cloned() else {
             // Preserve the public no-op result for an empty route set. It is
             // neither relay coverage nor backend-wide incapability evidence.
-            return Ok((NostrReconciliationSummary::default(), Vec::new()));
+            let summary = NostrReconciliationSummary::default();
+            #[cfg(feature = "test-policy-overrides")]
+            let summary = {
+                let mut summary = summary;
+                summary.comparison_diagnostics.account_lookup_ms = account_lookup_ms;
+                summary.comparison_diagnostics.preflight_ms =
+                    diagnostic_elapsed_ms(preflight_started);
+                summary.comparison_diagnostics.sdk_total_ms = diagnostic_elapsed_ms(sdk_started);
+                summary
+            };
+            return Ok((summary, Vec::new()));
         };
         let subscription_id = plan.subscription_id.to_string();
         let items = local_items
@@ -727,6 +778,8 @@ impl NostrSdkRelayClient {
             .initial_timeout(SDK_RECONCILIATION_NEGOTIATION_WAIT)
             .direction(SyncDirection::Down)
             .dry_run();
+        #[cfg(feature = "test-policy-overrides")]
+        let preflight_ms = diagnostic_elapsed_ms(preflight_started);
         let deadline = tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT;
         let syncs = endpoints.iter().cloned().map(|endpoint| {
             let client = self.client.clone();
@@ -735,18 +788,38 @@ impl NostrSdkRelayClient {
             let options = options.clone();
             async move {
                 #[cfg(feature = "test-policy-overrides")]
-                let (result, diagnostic) = match client.relay(&endpoint).await {
-                    Ok(Some(relay)) => {
-                        let result = relay.sync(filter).items(items).opts(options).await;
-                        let diagnostic = match &result {
-                            Ok(_) => ComparisonDiagnostic::NegOk,
-                            Err(error) => ComparisonDiagnostic::NegError(error.kind()),
-                        };
-                        (Some(result), diagnostic)
-                    }
-                    Ok(None) => (None, ComparisonDiagnostic::RelayMissing),
-                    Err(_) => (None, ComparisonDiagnostic::RelayLookupError),
-                };
+                let relay_lookup_started = std::time::Instant::now();
+                #[cfg(feature = "test-policy-overrides")]
+                let (result, diagnostic, relay_lookup_ms, neg_sync_ms) =
+                    match client.relay(&endpoint).await {
+                        Ok(Some(relay)) => {
+                            let relay_lookup_ms = diagnostic_elapsed_ms(relay_lookup_started);
+                            let neg_sync_started = std::time::Instant::now();
+                            let result = relay.sync(filter).items(items).opts(options).await;
+                            let diagnostic = match &result {
+                                Ok(_) => ComparisonDiagnostic::NegOk,
+                                Err(error) => ComparisonDiagnostic::NegError(error.kind()),
+                            };
+                            (
+                                Some(result),
+                                diagnostic,
+                                relay_lookup_ms,
+                                diagnostic_elapsed_ms(neg_sync_started),
+                            )
+                        }
+                        Ok(None) => (
+                            None,
+                            ComparisonDiagnostic::RelayMissing,
+                            diagnostic_elapsed_ms(relay_lookup_started),
+                            0,
+                        ),
+                        Err(_) => (
+                            None,
+                            ComparisonDiagnostic::RelayLookupError,
+                            diagnostic_elapsed_ms(relay_lookup_started),
+                            0,
+                        ),
+                    };
                 #[cfg(not(feature = "test-policy-overrides"))]
                 let result = match client.relay(&endpoint).await {
                     Ok(Some(relay)) => Some(relay.sync(filter).items(items).opts(options).await),
@@ -754,7 +827,7 @@ impl NostrSdkRelayClient {
                 };
                 #[cfg(feature = "test-policy-overrides")]
                 {
-                    (endpoint, result, diagnostic)
+                    (endpoint, result, diagnostic, relay_lookup_ms, neg_sync_ms)
                 }
                 #[cfg(not(feature = "test-policy-overrides"))]
                 {
@@ -762,11 +835,17 @@ impl NostrSdkRelayClient {
                 }
             }
         });
+        #[cfg(feature = "test-policy-overrides")]
+        let comparison_join_started = std::time::Instant::now();
         let outcomes = timeout_at(deadline, futures::future::join_all(syncs))
             .await
             .map_err(|_| {
                 TransportAdapterError::Subscription("NIP-77 reconciliation timed out".to_owned())
             })?;
+        #[cfg(feature = "test-policy-overrides")]
+        let comparison_join_ms = diagnostic_elapsed_ms(comparison_join_started);
+        #[cfg(feature = "test-policy-overrides")]
+        let post_join_started = std::time::Instant::now();
         let mut remote = HashSet::new();
         let mut remote_by_endpoint = HashMap::new();
         let mut failed_endpoints = HashSet::new();
@@ -774,9 +853,9 @@ impl NostrSdkRelayClient {
         let mut comparison_diagnostics = NostrComparisonDiagnostics::default();
         for outcome in outcomes {
             #[cfg(feature = "test-policy-overrides")]
-            let (endpoint, result, diagnostic) = outcome;
+            let (endpoint, result, diagnostic, relay_lookup_ms, neg_sync_ms) = outcome;
             #[cfg(feature = "test-policy-overrides")]
-            comparison_diagnostics.record(diagnostic);
+            comparison_diagnostics.record(diagnostic, relay_lookup_ms, neg_sync_ms);
             #[cfg(not(feature = "test-policy-overrides"))]
             let (endpoint, result) = outcome;
             match result {
@@ -1002,7 +1081,14 @@ impl NostrSdkRelayClient {
             remote_items: remote_item_count,
             received_items: remote_events.len(),
             #[cfg(feature = "test-policy-overrides")]
-            comparison_diagnostics,
+            comparison_diagnostics: NostrComparisonDiagnostics {
+                account_lookup_ms,
+                preflight_ms,
+                comparison_join_ms,
+                post_join_ms: diagnostic_elapsed_ms(post_join_started),
+                sdk_total_ms: diagnostic_elapsed_ms(sdk_started),
+                ..comparison_diagnostics
+            },
         };
         Ok((summary, remote_events))
     }
