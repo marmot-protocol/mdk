@@ -1902,12 +1902,13 @@ impl SqliteAccountStorage {
     }
 
     /// `group_id_hex` of every `account_groups` row whose `self_membership` is
-    /// still the migration default `'member'`. Used by the one-time
-    /// open/upgrade backfill to decide which legacy rows need their membership
-    /// derived from current engine state — rows already explicitly flipped to
-    /// `'removed'` (or re-affirmed `'member'` by a live event) are skipped, so
-    /// the backfill stays idempotent and the hot path keeps reading the
-    /// projection only.
+    /// `'member'`. Used only while the account-wide migration marker is absent.
+    ///
+    /// The column cannot distinguish its legacy preserving default from an
+    /// explicit `Member` write. The account-open caller therefore reads the
+    /// whole candidate set before writing any classification and records the
+    /// marker only after every candidate roster was readable; steady-state
+    /// membership events run after startup hydration and own later changes.
     pub fn account_group_ids_defaulting_to_member(&self) -> StorageResult<Vec<String>> {
         let conn = self.lock()?;
         let mut statement = conn

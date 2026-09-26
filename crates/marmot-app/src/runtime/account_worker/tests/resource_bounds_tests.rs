@@ -363,13 +363,14 @@ async fn exhausted_execution_credits_preserve_demand_and_control_service() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let fixture = bounded_known_fixture().await;
     let storage = fixture.app.account_storage("bob").unwrap();
-    let credits = bounded_recovery::hold_all_credits_for_test();
-    assert_eq!(bounded_recovery::available_credits(), 0);
-    let refusals = bounded_recovery::credit_refusals_for_test();
+    let pool = fixture.runtime.shared_services().recovery_credit_pool();
+    let credits = bounded_recovery::hold_all_credits_for_test(&pool);
+    assert_eq!(bounded_recovery::available_credits(&pool), 0);
+    let refusals = bounded_recovery::credit_refusals_for_test(&pool);
     advance_bounded_fixture_clock(&fixture).await;
     timeout(Duration::from_secs(8), async {
         loop {
-            if bounded_recovery::credit_refusals_for_test() > refusals {
+            if bounded_recovery::credit_refusals_for_test(&pool) > refusals {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
@@ -403,7 +404,7 @@ async fn exhausted_execution_credits_preserve_demand_and_control_service() {
     drop(credits);
     fixture.runtime.shutdown().await;
     assert_eq!(
-        bounded_recovery::available_credits(),
+        bounded_recovery::available_credits(&pool),
         bounded_recovery::MAX_CONCURRENT_JOBS
     );
 }
@@ -412,6 +413,7 @@ async fn exhausted_execution_credits_preserve_demand_and_control_service() {
 async fn partial_worker_result_admits_useful_input_and_releases_capacity() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let fixture = bounded_known_fixture().await;
+    let pool = fixture.runtime.shared_services().recovery_credit_pool();
     let storage = fixture.app.account_storage("bob").unwrap();
     *fixture.relay.acquisition_result.lock().unwrap() = Some(controlled_bounded_result(
         vec![fixture.historical.clone()],
@@ -441,7 +443,7 @@ async fn partial_worker_result_admits_useful_input_and_releases_capacity() {
     assert_eq!(fixture.relay.acquisition_calls.load(Ordering::SeqCst), 1);
     fixture.runtime.shutdown().await;
     assert_eq!(
-        bounded_recovery::available_credits(),
+        bounded_recovery::available_credits(&pool),
         bounded_recovery::MAX_CONCURRENT_JOBS
     );
 }

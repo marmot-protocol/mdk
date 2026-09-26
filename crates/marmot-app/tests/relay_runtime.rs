@@ -17,15 +17,17 @@ use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
 #[cfg(feature = "test-policy-overrides")]
 use marmot_app::AccountKeyPackageLocalState;
+use marmot_app::audit_otlp_sender::AuditOtlpSender;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
-    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, ChatListRow, MarmotApp,
-    MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
-    MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationTrigger,
-    NotificationWakeSource, PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate,
-    RuntimeNotificationsSubscription, SelfMembership, SignOutOptions, TimelineMessageQuery,
-    TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
+    AuditLogSettings, ChatListRow, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime,
+    MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
+    MissingRelayListKind, NotificationTrigger, NotificationWakeSource, PushPlatform,
+    RetentionSweepStatus, RuntimeMessageUpdate, RuntimeNotificationsSubscription, SelfMembership,
+    SignOutOptions, TimelineMessageQuery, TimelinePagination, UserDirectorySearch,
+    UserProfileMetadata, tag_value,
 };
+use marmot_forensics::v5::{EndpointRef, Record as V5Record};
 use nostr_relay_builder::prelude::{
     BoxedFuture, Kind as OldKind, PolicyResult, QueryPolicy, WritePolicy,
 };
@@ -208,6 +210,33 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
             .with_allow_loopback_relay_endpoints(true),
     );
     (relay, app, url)
+}
+
+async fn mock_audit_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+    let (relay, url) = mock_relay().await;
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        dir.path(),
+        vec![url.clone()],
+        AccountHome::open(dir.path()),
+        MarmotAppConfig::default()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true),
+    )
+    .unwrap();
+    (relay, app, url)
+}
+
+fn configure_v5_audit_tracker(runtime: &MarmotAppRuntime, addr: SocketAddr, token: &str) {
+    runtime
+        .set_audit_otlp_sender(Some(
+            AuditOtlpSender::for_loopback_dev(
+                "relay-runtime-v5",
+                format!("http://{addr}/v1/logs"),
+                token.to_owned(),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
 }
 
 async fn accept_group_invite_retrying_busy(
@@ -712,7 +741,7 @@ async fn capture_delayed_audit_upload(
     let _ = tx.send(captured);
 
     let _ = release.await;
-    write_http_response(&mut stream, 204, "text/plain", b"").await;
+    write_http_response(&mut stream, 200, "application/json", b"{}").await;
 }
 
 async fn capture_delayed_audit_upload_with_overlap_probe(
@@ -731,22 +760,22 @@ async fn capture_delayed_audit_upload_with_overlap_probe(
 
     tokio::select! {
         _ = &mut release => {
-            write_http_response(&mut stream, 204, "text/plain", b"").await;
+            write_http_response(&mut stream, 200, "application/json", b"{}").await;
         }
         accepted = listener.accept() => {
             if let Ok((mut second, _peer)) = accepted {
                 let _ = read_captured_audit_upload(&mut second).await;
                 let _ = overlap_tx.send(());
-                write_http_response(&mut second, 204, "text/plain", b"").await;
+                write_http_response(&mut second, 200, "application/json", b"{}").await;
             }
             let _ = release.await;
-            write_http_response(&mut stream, 204, "text/plain", b"").await;
+            write_http_response(&mut stream, 200, "application/json", b"{}").await;
         }
     }
 }
 
 /// Accept audit uploads in a loop, forwarding each request body over `bodies`
-/// and answering 204 immediately. Unlike the gated `capture_delayed_*` helpers,
+/// and answering the exact OTLP success contract. Unlike gated helpers,
 /// this drains a stream of uploads so a test can wait for the *one* whose body
 /// carries a specific forensic row while ignoring earlier unrelated uploads.
 async fn forward_audit_upload_bodies(
@@ -760,7 +789,7 @@ async fn forward_audit_upload_bodies(
         let Some(captured) = read_captured_audit_upload(&mut stream).await else {
             continue;
         };
-        write_http_response(&mut stream, 204, "text/plain", b"").await;
+        write_http_response(&mut stream, 200, "application/json", b"{}").await;
         if bodies.send(captured.body).is_err() {
             return;
         }
@@ -804,6 +833,22 @@ async fn read_captured_audit_upload(stream: &mut TcpStream) -> Option<CapturedAu
         content_type: header_value(&headers, "content-type"),
         body,
     })
+}
+
+fn v5_rows_from_otlp(body: &[u8]) -> Vec<serde_json::Value> {
+    let wire: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let rows = wire["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+        .as_array()
+        .expect("OTLP log records");
+    assert!(!rows.is_empty());
+    rows.iter()
+        .map(|row| {
+            let original = row["body"]["stringValue"].as_str().unwrap();
+            let record: serde_json::Value = serde_json::from_str(original).unwrap();
+            assert_eq!(record["schema_version"], "marmot-forensics-audit/v5");
+            record
+        })
+        .collect()
 }
 
 impl MockBlossom {
@@ -3886,7 +3931,7 @@ async fn group_roster_reports_removed_after_admin_eviction_without_worker_restar
 #[tokio::test]
 async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
     let dir = tempfile::tempdir().unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, app, url) = mock_audit_app(&dir).await;
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -3914,17 +3959,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
     use_fast_audit_batches(&runtime);
-    runtime
-        .set_audit_log_tracker_config(AuditLogTrackerConfig {
-            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
-            authorization_bearer_token: Some("goggles_runtime_secret".to_owned()),
-            source: AuditLogUploadSource {
-                hardware_model: Some("iPhone17,3".to_owned()),
-                platform: Some("ios".to_owned()),
-                app_version: Some("2026.6.8".to_owned()),
-            },
-        })
-        .unwrap();
+    configure_v5_audit_tracker(&runtime, addr, "audit_runtime_secret");
 
     let send_runtime = runtime.clone();
     let send_account = alice.account.account_id_hex.clone();
@@ -3950,16 +3985,13 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
         .unwrap();
 
     assert_eq!(captured.method, "POST");
-    assert_eq!(captured.path, "/api/v1/audit-logs/");
+    assert_eq!(captured.path, "/v1/logs");
     assert_eq!(
         captured.authorization.as_deref(),
-        Some("Bearer goggles_runtime_secret")
+        Some("Bearer audit_runtime_secret")
     );
-    assert_eq!(
-        captured.content_type.as_deref(),
-        Some("application/x-ndjson")
-    );
-    assert!(!captured.body.is_empty());
+    assert_eq!(captured.content_type.as_deref(), Some("application/json"));
+    v5_rows_from_otlp(&captured.body);
 
     let _ = release_tx.send(());
     server.await.unwrap();
@@ -3969,7 +4001,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
 #[tokio::test]
 async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome() {
     let dir = tempfile::tempdir().unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, app, url) = mock_audit_app(&dir).await;
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -3988,13 +4020,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
     use_fast_audit_batches(&runtime);
-    runtime
-        .set_audit_log_tracker_config(AuditLogTrackerConfig {
-            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
-            authorization_bearer_token: Some("goggles_welcome_secret".to_owned()),
-            source: AuditLogUploadSource::default(),
-        })
-        .unwrap();
+    configure_v5_audit_tracker(&runtime, addr, "audit_welcome_secret");
 
     let create_runtime = runtime.clone();
     let create_account = alice.account.account_id_hex.clone();
@@ -4016,12 +4042,12 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
         .unwrap();
 
     assert_eq!(captured.method, "POST");
-    assert_eq!(captured.path, "/api/v1/audit-logs/");
+    assert_eq!(captured.path, "/v1/logs");
     assert_eq!(
         captured.authorization.as_deref(),
-        Some("Bearer goggles_welcome_secret")
+        Some("Bearer audit_welcome_secret")
     );
-    assert!(!captured.body.is_empty());
+    v5_rows_from_otlp(&captured.body);
 
     let _ = release_tx.send(());
     server.await.unwrap();
@@ -4036,7 +4062,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     home.create_account("bob").unwrap();
     let bob_id = home.account("bob").unwrap().account_id_hex;
 
-    let (_relay, app, _url) = mock_app(&dir).await;
+    let (_relay, app, _url) = mock_audit_app(&dir).await;
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     let mut bob_setup = app.client("bob").await.unwrap();
@@ -4051,13 +4077,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
     use_fast_audit_batches(&runtime);
-    runtime
-        .set_audit_log_tracker_config(AuditLogTrackerConfig {
-            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
-            authorization_bearer_token: Some("goggles_inbound_secret".to_owned()),
-            source: AuditLogUploadSource::default(),
-        })
-        .unwrap();
+    configure_v5_audit_tracker(&runtime, addr, "audit_inbound_secret");
     runtime.start().await.unwrap();
 
     let group_id = runtime
@@ -4078,12 +4098,12 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
         .expect("audit tracker should receive inbound-triggered upload")
         .unwrap();
     assert_eq!(captured.method, "POST");
-    assert_eq!(captured.path, "/api/v1/audit-logs/");
+    assert_eq!(captured.path, "/v1/logs");
     assert_eq!(
         captured.authorization.as_deref(),
-        Some("Bearer goggles_inbound_secret")
+        Some("Bearer audit_inbound_secret")
     );
-    assert!(!captured.body.is_empty());
+    v5_rows_from_otlp(&captured.body);
 
     let _ = release_tx.send(());
     server.await.unwrap();
@@ -4108,7 +4128,7 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
     home.create_account("bob").unwrap();
     let bob_id = home.account("bob").unwrap().account_id_hex;
 
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, app, url) = mock_audit_app(&dir).await;
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     let mut bob_setup = app.client("bob").await.unwrap();
@@ -4122,13 +4142,7 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(forward_audit_upload_bodies(listener, body_tx));
     use_fast_audit_batches(&runtime);
-    runtime
-        .set_audit_log_tracker_config(AuditLogTrackerConfig {
-            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
-            authorization_bearer_token: Some("goggles_backfill_secret".to_owned()),
-            source: AuditLogUploadSource::default(),
-        })
-        .unwrap();
+    configure_v5_audit_tracker(&runtime, addr, "audit_backfill_secret");
     runtime.start().await.unwrap();
 
     // bob's managed worker joins the group so it holds a live subscription on
@@ -4184,7 +4198,10 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
         .await
         {
             Ok(Some(body)) => {
-                if String::from_utf8_lossy(&body).contains("epoch_stall_backfill_armed") {
+                if v5_rows_from_otlp(&body)
+                    .iter()
+                    .any(|row| row["event"]["type"] == "epoch_stall_backfill_armed")
+                {
                     carried_armed_row = true;
                     break;
                 }
@@ -4219,7 +4236,7 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
 #[tokio::test]
 async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight() {
     let dir = tempfile::tempdir().unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, app, url) = mock_audit_app(&dir).await;
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -4250,13 +4267,7 @@ async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight()
         listener, tx, overlap_tx, release_rx,
     ));
     use_fast_audit_batches(&runtime);
-    runtime
-        .set_audit_log_tracker_config(AuditLogTrackerConfig {
-            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
-            authorization_bearer_token: Some("goggles_coalesce_secret".to_owned()),
-            source: AuditLogUploadSource::default(),
-        })
-        .unwrap();
+    configure_v5_audit_tracker(&runtime, addr, "audit_coalesce_secret");
 
     runtime
         .send_message(
@@ -4271,6 +4282,9 @@ async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight()
         .expect("audit tracker should receive the first upload")
         .unwrap();
     assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/v1/logs");
+    assert_eq!(captured.content_type.as_deref(), Some("application/json"));
+    v5_rows_from_otlp(&captured.body);
 
     runtime
         .send_message(
@@ -10554,7 +10568,10 @@ async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
             std::fs::read_to_string(&file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    V5Record::from_json(line.as_bytes()).expect("strict v5 audit row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -10565,36 +10582,311 @@ async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
     // relay the SDK-backed plane must have marked it accepted.
     let rebuild = events
         .iter()
-        .find(|event| event["kind"]["type"] == "subscription_rebuild")
+        .find(|event| event["event"]["type"] == "subscription_rebuild")
         .expect("a subscription_rebuild row is emitted per rebuild");
     assert!(
-        rebuild["kind"]["lookback_secs"].is_u64(),
+        rebuild["event"]["lookback_secs"].is_u64(),
         "rebuild records the lookback: {rebuild}"
     );
-    let relay_results = rebuild["kind"]["relay_results"]
+    let relay_results = rebuild["event"]["relay_results"]
         .as_array()
         .expect("relay_results is an array");
+    let expected_endpoint = EndpointRef::from_normalized_url(&url).unwrap();
     assert!(
         relay_results.iter().any(|entry| {
-            entry["relay_url"]
-                .as_str()
-                .is_some_and(|relay_url| relay_url.contains("127.0.0.1"))
-                && entry["accepted"] == true
+            entry["endpoint_ref"] == expected_endpoint.as_str() && entry["accepted"] == true
         }),
         "the mock relay registered the subscription: {rebuild}"
     );
+    assert!(!rebuild.to_string().contains(&url), "raw relay URL leaked");
 
     // sync_drain: exact wire tag and scalar drain accounting present. A fresh
     // account drains no inbound 445s, so `deliveries` is 0 and the cursor
     // fields stay absent (no delivery advanced the cursor) — both valid.
     let drain = events
         .iter()
-        .find(|event| event["kind"]["type"] == "sync_drain")
+        .find(|event| event["event"]["type"] == "sync_drain")
         .expect("a sync_drain row is emitted at the drain exit");
-    assert!(drain["kind"]["duration_ms"].is_u64(), "{drain}");
-    assert!(drain["kind"]["deliveries"].is_u64(), "{drain}");
+    assert!(drain["event"]["duration_ms"].is_u64(), "{drain}");
+    assert!(drain["event"]["deliveries"].is_u64(), "{drain}");
 
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn runtime_records_app_checkpoint_and_separate_broadcast_outcomes_for_received_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "app outcome boundary",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+            if account_id_hex == &bob.account.account_id_hex && joined == &group_id)
+    })
+    .await;
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"app outcome test message".to_vec(),
+        )
+        .await
+        .unwrap();
+    let received = wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::MessageReceived(message)
+            if message.account_id_hex == bob.account.account_id_hex
+                && message.message.group_id == group_id)
+    })
+    .await;
+    let message_id = match received {
+        MarmotAppEvent::MessageReceived(message) => message.message.source_message_id_hex,
+        _ => unreachable!(),
+    };
+    let message_ref =
+        marmot_forensics::v5::EngineMessageRef::from_message_id(&hex::decode(message_id).unwrap())
+            .unwrap();
+
+    // The broadcast reaches the subscriber before its outcome row is flushed.
+    // Observe the row itself within a bounded wait, rather than racing that
+    // final local recorder write.
+    let rows = timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = app
+                .audit_log_files()
+                .unwrap()
+                .iter()
+                .filter(|file| file.account_ref == bob.account.label)
+                .flat_map(|file| {
+                    std::fs::read_to_string(&file.path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| {
+                            V5Record::from_json(line.as_bytes()).expect("strict v5 audit row");
+                            serde_json::from_str::<serde_json::Value>(line).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            if rows.iter().any(|row| {
+                row["event"]["type"] == "runtime_publication_outcome"
+                    && row["event"]["category"] == "sync_summary"
+                    && row["event"]["message_ref"] == message_ref.as_str()
+            }) {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("received message has a recorded runtime publication outcome");
+    assert!(
+        rows.iter().any(|row| {
+            row["event"]["type"] == "app_update_outcome"
+                && row["event"]["category"] == "account_projection_checkpoint"
+                && row["event"]["transaction"] == "committed"
+                && row["event"]["message_ref"] == message_ref.as_str()
+        }),
+        "app outcomes: {:?}",
+        rows.iter()
+            .filter(|row| row["event"]["type"] == "app_update_outcome")
+            .map(|row| &row["event"])
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        rows.iter().any(|row| {
+            row["event"]["type"] == "runtime_publication_outcome"
+                && row["event"]["category"] == "sync_summary"
+                && row["event"]["message_ref"] == message_ref.as_str()
+                && row["event"]["accepted_by_broadcast"] != "0"
+        }),
+        "runtime outcomes: {:?}",
+        rows.iter()
+            .filter(|row| row["event"]["type"] == "runtime_publication_outcome")
+            .map(|row| &row["event"])
+            .collect::<Vec<_>>()
+    );
+
+    // The next app transaction can still commit after the last runtime
+    // subscriber disappears. Broadcast rejection must stay a separate fact.
+    let committed_before = rows
+        .iter()
+        .filter(|row| {
+            row["event"]["type"] == "app_update_outcome"
+                && row["event"]["category"] == "account_projection_checkpoint"
+                && row["event"]["transaction"] == "committed"
+        })
+        .count();
+    drop(events);
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"committed without a runtime subscriber".to_vec(),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = app
+                .audit_log_files()
+                .unwrap()
+                .iter()
+                .filter(|file| file.account_ref == bob.account.label)
+                .flat_map(|file| {
+                    std::fs::read_to_string(&file.path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| {
+                            V5Record::from_json(line.as_bytes()).expect("strict v5 audit row");
+                            serde_json::from_str::<serde_json::Value>(line).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let committed_after = rows
+                .iter()
+                .filter(|row| {
+                    row["event"]["type"] == "app_update_outcome"
+                        && row["event"]["category"] == "account_projection_checkpoint"
+                        && row["event"]["transaction"] == "committed"
+                })
+                .count();
+            if committed_after > committed_before
+                && rows.iter().any(|row| {
+                    row["event"]["type"] == "runtime_publication_outcome"
+                        && row["event"]["no_subscribers"] != "0"
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("committed app update remains distinct from unobserved broadcast");
+    runtime.shutdown().await;
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn explicit_shutdown_during_initial_sync_records_clean_audit_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let account = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(barrier.clone());
+    runtime
+        .restart_account(&account.account.account_id_hex)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), barrier.wait())
+        .await
+        .expect("restarted worker entered initial sync");
+    timeout(Duration::from_secs(5), runtime.shutdown_and_close())
+        .await
+        .expect("explicit shutdown interrupts initial sync")
+        .unwrap();
+    let rows = app
+        .audit_log_files()
+        .unwrap()
+        .iter()
+        .filter(|file| file.account_ref == account.account.label)
+        .flat_map(|file| {
+            std::fs::read_to_string(&file.path)
+                .unwrap()
+                .lines()
+                .map(|line| V5Record::from_json(line.as_bytes()).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        &rows.last().expect("v5 audit rows").fields().event,
+        marmot_forensics::v5::Event::RecordingSessionStopped(stop)
+            if stop.reason == marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown
+    ));
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn explicit_shutdown_during_startup_hydration_records_clean_audit_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let account = AccountHome::open(dir.path())
+        .create_account("hydration-audit")
+        .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let mut client = app.client("hydration-audit").await.unwrap();
+    client
+        .create_group("stored hydration group", &[])
+        .await
+        .unwrap();
+    drop(client);
+
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_startup_hydration_batch_delay_ms(3_000),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(5), runtime.shutdown_and_close())
+        .await
+        .expect("explicit shutdown interrupts hydration")
+        .unwrap();
+    let rows = app
+        .audit_log_files()
+        .unwrap()
+        .iter()
+        .filter(|file| file.account_ref == account.label)
+        .flat_map(|file| {
+            std::fs::read_to_string(&file.path)
+                .unwrap()
+                .lines()
+                .map(|line| V5Record::from_json(line.as_bytes()).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        &rows.last().expect("v5 audit rows").fields().event,
+        marmot_forensics::v5::Event::RecordingSessionStopped(stop)
+            if stop.reason == marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown
+    ));
 }
 
 /// mdk#1451: create returns at the canonical founding boundary even when the

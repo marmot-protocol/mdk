@@ -35,7 +35,7 @@ use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
     MarmotAuditLogDeleteResult, MarmotAuditLogFileList, MarmotAuditLogSettings,
     MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
-    MarmotAuditLogUploadResult,
+    MarmotAuditLogTrackerUpdateResultV5, MarmotAuditLogUploadResult, MarmotAuditOtlpConfigV5,
 };
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
@@ -900,6 +900,9 @@ c_cmd! {
     /// Free with `marmot_audit_log_tracker_update_result_free`.
     async fn marmot_post_audit_log_tracker_update() -> rec(MarmotAuditLogTrackerUpdateResult) = post_audit_log_tracker_update;
 
+    /// Run the same tracker pass with independent v4/v5 outcomes.
+    async fn marmot_post_audit_log_tracker_update_v5() -> rec(MarmotAuditLogTrackerUpdateResultV5) = post_audit_log_tracker_update_v5;
+
     /// The account's chat list rows. Free with
     /// `marmot_chat_list_row_list_free`.
     sync fn marmot_chat_list(account_ref: str, include_archived: flag) -> rec(MarmotChatListRowList) = chat_list;
@@ -1431,6 +1434,28 @@ pub unsafe extern "C" fn marmot_set_audit_log_tracker_config_v4(
         let config = try_arg!(unsafe { borrowed(config) });
         let config = try_arg!(unsafe { config.to_ffi() });
         unsafe { deliver(client.marmot.set_audit_log_tracker_config(config), out) }
+    })
+}
+
+/// Configure or disable the dedicated v5 OTLP audit sender. The returned
+/// config never contains the bearer token. Free it with
+/// `marmot_audit_otlp_config_v5_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `config` a valid borrowed struct;
+/// `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_audit_otlp_config_v5(
+    client: *const MarmotClient,
+    config: *const MarmotAuditOtlpConfigV5,
+    out: *mut *mut MarmotAuditOtlpConfigV5,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let config = try_arg!(unsafe { borrowed(config) });
+        let config = try_arg!(unsafe { config.to_ffi() });
+        unsafe { deliver(client.marmot.set_audit_otlp_config_v5(config), out) }
     })
 }
 

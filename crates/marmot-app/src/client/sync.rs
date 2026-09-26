@@ -15,6 +15,7 @@ use storage_sqlite::{
 use tokio::time::timeout;
 use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrReconciliationItem as AdapterReconciliationItem,
+    SubscriptionAttempt,
 };
 
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
@@ -43,6 +44,150 @@ use super::audit::EpochBackfillTerminalAudit;
 use super::epoch_stall::BackfillDecision;
 use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
 use crate::config::CursorPersistence;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestRecoveryPhase {
+    Activation,
+    Reconciliation,
+    Completion,
+}
+
+#[cfg(test)]
+#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestRecoveryPhaseSnapshot {
+    pub(crate) attempt_serial: u64,
+    pub(crate) phase: TestRecoveryPhase,
+}
+
+#[cfg(test)]
+#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestRecoveryTerminal {
+    pub(crate) attempt_serial: u64,
+    pub(crate) local_epoch_after: Option<u64>,
+    pub(crate) deliveries: u64,
+    pub(crate) skipped: u64,
+    pub(crate) qualified: bool,
+    pub(crate) result_ok: bool,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestRecoveryPhaseState {
+    selected_attempt: Option<u64>,
+    active: Option<TestRecoveryPhaseSnapshot>,
+    terminal: Option<TestRecoveryTerminal>,
+    target_terminals: Vec<TestRecoveryTerminal>,
+    target_group_id: Option<GroupId>,
+}
+
+/// Default-disabled witness for one selected EpochGap grant on one account.
+/// It records whole AppClient phase futures, not an individual SDK request.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestRecoveryPhaseWitness {
+    armed: std::sync::Arc<AtomicBool>,
+    state: std::sync::Arc<std::sync::Mutex<TestRecoveryPhaseState>>,
+}
+
+#[cfg(test)]
+#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+impl TestRecoveryPhaseWitness {
+    pub(crate) fn arm(&self) {
+        *self.state.lock().unwrap() = TestRecoveryPhaseState::default();
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn active(&self) -> Option<TestRecoveryPhaseSnapshot> {
+        self.state.lock().unwrap().active
+    }
+
+    pub(crate) fn terminal(&self) -> Option<TestRecoveryTerminal> {
+        self.state.lock().unwrap().terminal
+    }
+
+    pub(crate) fn target_terminals(&self) -> Vec<TestRecoveryTerminal> {
+        self.state.lock().unwrap().target_terminals.clone()
+    }
+
+    pub(crate) fn set_target_group_id(&self, id: GroupId) {
+        self.state.lock().unwrap().target_group_id = Some(id);
+    }
+
+    pub(crate) fn is_target_group(&self, id: &GroupId) -> bool {
+        self.state.lock().unwrap().target_group_id.as_ref() == Some(id)
+    }
+
+    fn record_terminal(&self, terminal: TestRecoveryTerminal) {
+        let mut state = self.state.lock().unwrap();
+        if state.selected_attempt.is_some() {
+            state.target_terminals.push(terminal);
+        }
+        if state.selected_attempt == Some(terminal.attempt_serial) {
+            state.terminal = Some(terminal);
+        }
+    }
+
+    fn enter(
+        &self,
+        attempt_serial: u64,
+        phase: TestRecoveryPhase,
+    ) -> Option<TestRecoveryPhaseGuard> {
+        if !self.armed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut state = self.state.lock().unwrap();
+        match state.selected_attempt {
+            Some(selected) if selected != attempt_serial => return None,
+            None => state.selected_attempt = Some(attempt_serial),
+            _ => {}
+        }
+        assert!(state.active.is_none(), "recovery phases must not overlap");
+        state.active = Some(TestRecoveryPhaseSnapshot {
+            attempt_serial,
+            phase,
+        });
+        Some(TestRecoveryPhaseGuard {
+            witness: self.clone(),
+            attempt_serial,
+            phase,
+        })
+    }
+}
+
+#[cfg(test)]
+struct TestRecoveryPhaseGuard {
+    witness: TestRecoveryPhaseWitness,
+    attempt_serial: u64,
+    phase: TestRecoveryPhase,
+}
+
+#[cfg(test)]
+impl Drop for TestRecoveryPhaseGuard {
+    fn drop(&mut self) {
+        let mut state = self.witness.state.lock().unwrap();
+        if state.active.is_some_and(|active| {
+            active.attempt_serial == self.attempt_serial && active.phase == self.phase
+        }) {
+            state.active = None;
+        }
+    }
+}
+
+mod comparison_job;
+#[cfg(test)]
+pub(crate) use comparison_job::TestComparisonActivityWitness;
+pub(crate) use comparison_job::{
+    ComparisonNetworkJob, ComparisonNetworkResult, EpochGapQueueJob, RouteSubmission,
+};
+
+pub(crate) enum PendingRecoverySelection {
+    NotPending,
+    Deferred,
+    Grant(Box<AttemptGrant>),
+}
 
 /// Account-wide startup budget for the timestamp-independent correctness pass.
 /// Partial progress is durable, so a slow or non-NIP-77 relay cannot hold the
@@ -363,6 +508,71 @@ enum DrainCompletion {
     },
 }
 
+/// One account-owner drain. A worker slice may return between completed
+/// deliveries, but the EOSE/silence and forensic clocks belong to the whole
+/// attempt rather than to each slice.
+pub(crate) struct RecoveryDrainState {
+    completion: DrainCompletion,
+    summary: SyncSummary,
+    first_wait: bool,
+    receive_deadline: Option<tokio::time::Instant>,
+    drain_started: std::time::Instant,
+    cursor_before_secs: Option<u64>,
+    routes_dirty: bool,
+    silence_started: std::time::Instant,
+    gate_polled_at: std::time::Instant,
+}
+
+/// Owner scheduling budget between completed recovery deliveries. The
+/// transport receive deadline and the recovery silence budget span slices.
+const ONLINE_EPOCH_GAP_DRAIN_SLICE: Duration = Duration::from_millis(40);
+
+/// The audit and loss guard of one already-reserved executor attempt. Both the
+/// inline executor and the worker continuation close it through the same
+/// terminal path.
+pub(crate) struct RecoveryExecutionState {
+    overflow: Option<crate::relay_plane::AccountDeliveryOverflow>,
+    overflow_guard: Option<super::recovery::RecoveryLossAttemptGuard>,
+    audit_groups: Vec<([u8; 16], GroupId, u64)>,
+    context: AuditEventContext,
+    started: Instant,
+    counts: DrainCounts,
+    activation: EpochBackfillActivationOutcome,
+    drain_verdict: Option<DrainVerdict>,
+}
+
+pub(crate) struct OnlineEpochGapRecovery {
+    grant: AttemptGrant,
+    execution: RecoveryExecutionState,
+    subscription_attempt: SubscriptionAttempt,
+    drain: Option<RecoveryDrainState>,
+    #[cfg(test)]
+    phase: Option<TestRecoveryPhaseGuard>,
+}
+
+impl OnlineEpochGapRecovery {
+    pub(crate) fn grant(&self) -> &AttemptGrant {
+        &self.grant
+    }
+}
+
+impl RecoveryDrainState {
+    fn new(completion: DrainCompletion, cursor_before_secs: Option<u64>) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            completion,
+            summary: SyncSummary::default(),
+            first_wait: true,
+            receive_deadline: None,
+            drain_started: now,
+            cursor_before_secs,
+            routes_dirty: false,
+            silence_started: now,
+            gate_polled_at: now,
+        }
+    }
+}
+
 impl DrainCompletion {
     fn execution_quantum(self) -> Option<Duration> {
         match self {
@@ -380,7 +590,7 @@ impl DrainCompletion {
 /// contracts can instead yield incomplete at their worker quantum; the EOSE
 /// contract also retains its silence-specific unconfirmed verdicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DrainVerdict {
+pub(crate) enum DrainVerdict {
     /// Every endpoint-scoped attempt in the activation's frozen route snapshot
     /// reached end-of-stored-events and the relays then went quiet. This is a
     /// drain boundary, not exhaustive history or durable-admission proof.
@@ -1392,55 +1602,8 @@ impl AppClient {
         telemetry: Option<&AppPerformanceTelemetry>,
         explicit: bool,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        // Reconcile epoch-bounded prior routes before issuing the first relay
-        // subscriptions. This makes retirement deterministic even for a quiet
-        // group that has no new inbound events after restart.
-        let refresh = self.refresh_group_routes().map_err(|error| {
-            ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::StatePersist,
-            )
-        })?;
-        // A routing-table delta lives in memory and obligates the subscription
-        // refresh below, not a state write; only route retirement mutates
-        // persisted group state.
-        if refresh.state_pruned {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::StatePersist,
-                    )
-                })?;
-        }
-        if self.app.cursor_persistence() == CursorPersistence::Advance
-            && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
-        {
-            self.request_bounded_comparison().map_err(|error| {
-                ClassifiedSyncFailure::at_stage(
-                    SyncSummary::default(),
-                    error,
-                    SyncFailureStage::StatePersist,
-                )
-            })?;
-            if !explicit {
-                self.comparison_startup_requested = true;
-            }
-        }
-        let mut caller = ExplicitRecoveryPermit::default();
         let grant = self
-            .authorize_account_recovery(
-                explicit.then_some(&mut caller),
-                if explicit {
-                    EpochBackfillExecutionSeam::ExplicitCatchUp
-                } else if telemetry.is_some() {
-                    EpochBackfillExecutionSeam::Startup
-                } else {
-                    EpochBackfillExecutionSeam::Maintenance
-                },
-            )
+            .prepare_sync_grant(telemetry, explicit, false)
             .map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
                     SyncSummary::default(),
@@ -1448,7 +1611,63 @@ impl AppClient {
                     SyncFailureStage::StatePersist,
                 )
             })?;
-        let mut summary = if let Some(grant) = grant {
+        self.execute_prepared_sync(grant, telemetry, explicit).await
+    }
+
+    /// Keep the same startup/explicit reservation path available to the
+    /// account worker before it lends an immutable comparison request to a
+    /// network task. A grant is selected once; an ineligible shape keeps this
+    /// exact reservation when the inline executor takes over.
+    pub(crate) fn prepare_sync_grant(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        explicit: bool,
+        defer_comparison_without_credit: bool,
+    ) -> Result<Option<AttemptGrant>, AppError> {
+        // Reconcile epoch-bounded prior routes before issuing the first relay
+        // subscriptions. This makes retirement deterministic even for a quiet
+        // group that has no new inbound events after restart.
+        let refresh = self.refresh_group_routes()?;
+        // A routing-table delta lives in memory and obligates the subscription
+        // refresh below, not a state write; only route retirement mutates
+        // persisted group state.
+        if refresh.state_pruned {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        if self.app.cursor_persistence() == CursorPersistence::Advance
+            && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
+        {
+            self.request_bounded_comparison()?;
+            if !explicit {
+                self.comparison_startup_requested = true;
+            }
+        }
+        if defer_comparison_without_credit && self.comparison_only_waiting_for_credit()? {
+            // Startup still activates and drains ordinary live interest below.
+            // A saturated process pool cannot spend a durable comparison
+            // reservation merely to fall back to another inline SDK wait.
+            return Ok(None);
+        }
+        let mut caller = ExplicitRecoveryPermit::default();
+        self.authorize_account_recovery(
+            explicit.then_some(&mut caller),
+            if explicit {
+                EpochBackfillExecutionSeam::ExplicitCatchUp
+            } else if telemetry.is_some() {
+                EpochBackfillExecutionSeam::Startup
+            } else {
+                EpochBackfillExecutionSeam::Maintenance
+            },
+        )
+    }
+
+    pub(crate) async fn execute_prepared_sync(
+        &mut self,
+        grant: Option<AttemptGrant>,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        explicit: bool,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let summary = if let Some(grant) = grant {
             self.execute_recovery_grant(grant, None, telemetry).await?
         } else {
             if self.app.cursor_persistence() == CursorPersistence::Frozen
@@ -1480,6 +1699,23 @@ impl AppClient {
             // events. Receiving existing subscriptions is not a new acquisition.
             self.sync_sdk_relay(&mut DrainCounts::default()).await?.0
         };
+        self.finish_prepared_sync_summary(summary).await
+    }
+
+    /// A startup comparison already activated the live account subscriptions.
+    /// If its fenced result is stale, drain that activation without rebuilding
+    /// every subscription or replaying the account backlog a second time.
+    pub(crate) async fn finish_deferred_comparison_sync(
+        &mut self,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let summary = self.sync_sdk_relay(&mut DrainCounts::default()).await?.0;
+        self.finish_prepared_sync_summary(summary).await
+    }
+
+    pub(crate) async fn finish_prepared_sync_summary(
+        &mut self,
+        mut summary: SyncSummary,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
         // `open()` hydration (mdk#426). If no relay delivery arrived
@@ -1630,6 +1866,7 @@ impl AppClient {
             let group_projection = event_group_id(event).and_then(|group_id| {
                 self.event_group_projection_best_effort(group_id, group_metadata.as_ref())
             });
+            let projection_started = Instant::now();
             if let Some(message) = observe_event(
                 &mut self.state,
                 &display_names,
@@ -1640,10 +1877,22 @@ impl AppClient {
                 source_received_at,
                 None,
                 self.app.allow_loopback_blob_endpoints(),
-            ) && let Some(gossip_message_id) =
-                self.project_received_message(message, group_metadata.as_ref(), &mut summary)?
-            {
-                gossip_message_ids.insert(gossip_message_id);
+            ) {
+                match self.project_received_message(message, group_metadata.as_ref(), &mut summary)
+                {
+                    Ok(Some(gossip_message_id)) => {
+                        gossip_message_ids.insert(gossip_message_id);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.record_v5_event_projection_failure(
+                            std::slice::from_ref(event),
+                            &error,
+                            projection_started.elapsed(),
+                        );
+                        return Err(error);
+                    }
+                }
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -1658,8 +1907,28 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
-            routes_dirty |=
-                self.observe_event_projection_effects(event, &local_account_id_hex, &mut summary)?;
+            #[cfg(test)]
+            if previous_group != updated_group
+                && let Some(probe) = &mut self.audit_v5_probe
+            {
+                probe.projected(
+                    event,
+                    marmot_forensics::v5::UpdateCause::RetainedEventReplay,
+                );
+            }
+            let projected =
+                self.observe_event_projection_effects(event, &local_account_id_hex, &mut summary);
+            match projected {
+                Ok(dirty) => routes_dirty |= dirty,
+                Err(error) => {
+                    self.record_v5_event_projection_failure(
+                        std::slice::from_ref(event),
+                        &error,
+                        projection_started.elapsed(),
+                    );
+                    return Err(error);
+                }
+            }
             let can_ack_application_event = if crosses_frontier {
                 self.prepare_local_group_deletion_frontier_clear(
                     event,
@@ -1891,11 +2160,70 @@ impl AppClient {
         &mut self,
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, AppError> {
+        self.ingest_received_delivery_inner(delivery)
+            .await
+            .map_err(|(_, _, _, error, _)| error)
+    }
+
+    /// Startup's off-worker comparison may receive a delivery before its
+    /// immutable network request completes. Keep the applied prefix visible
+    /// on a later checkpoint failure, just as the inline startup drain did.
+    pub(crate) async fn ingest_received_delivery_with_partial(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let drain_started = std::time::Instant::now();
+        let cursor_before_secs = self.state.last_transport_timestamp;
+        match self.ingest_received_delivery_inner(delivery).await {
+            Ok(summary) => Ok(summary),
+            Err((summary, ingested, routes_dirty, error, stage)) => {
+                let counts = DrainCounts {
+                    deliveries: u64::from(ingested),
+                    ..DrainCounts::default()
+                };
+                Err(self
+                    .finish_failed_sync_drain(
+                        summary,
+                        routes_dirty,
+                        counts,
+                        StagedSyncError::new(error, stage),
+                        drain_started,
+                        cursor_before_secs,
+                    )
+                    .await)
+            }
+        }
+    }
+
+    async fn ingest_received_delivery_inner(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
-        let ingested =
-            Self::ingest_delivery(self.transport_receipts()?, delivery, &mut summary).await?;
+        let receipts = self.transport_receipts().map_err(|error| {
+            (
+                SyncSummary::default(),
+                false,
+                false,
+                error,
+                SyncFailureStage::StatePersist,
+            )
+        })?;
+        let ingested = Self::ingest_delivery(receipts, delivery, &mut summary)
+            .await
+            .map_err(|error| {
+                // The inline drain did not merge this delivery's staged
+                // projection when ingest itself failed.
+                (
+                    SyncSummary::default(),
+                    false,
+                    false,
+                    error,
+                    SyncFailureStage::CgkaIngest,
+                )
+            })?;
         if self.delivery_loss_blocks_cursor() {
             // `record_drop` publishes this process-local fence at the exact
             // omission, before marker I/O or the reserved control record can
@@ -1916,17 +2244,44 @@ impl AppClient {
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
-        if routes_dirty {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if routes_dirty
+            && let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
+        {
+            return Err((
+                summary,
+                true,
+                routes_dirty,
+                error,
+                SyncFailureStage::StatePersist,
+            ));
         }
-        let refresh = self.refresh_group_routes()?;
+        let refresh = match self.refresh_group_routes() {
+            Ok(refresh) => refresh,
+            Err(error) => {
+                return Err((
+                    summary,
+                    true,
+                    routes_dirty,
+                    error,
+                    SyncFailureStage::StatePersist,
+                ));
+            }
+        };
         // The routes-dirty save above already persisted this delivery's app
         // projection; save again only when that first save did not run, or
         // when route retirement just mutated persisted group state. The
         // routing-table delta lives in memory and obligates a subscription
         // refresh, not a second identical state write.
-        if !routes_dirty || refresh.state_pruned {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if (!routes_dirty || refresh.state_pruned)
+            && let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
+        {
+            return Err((
+                summary,
+                true,
+                routes_dirty,
+                error,
+                SyncFailureStage::StatePersist,
+            ));
         }
         self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
         self.drain_epoch_stall_escalations(&mut summary);
@@ -2145,48 +2500,78 @@ impl AppClient {
         counts: &mut DrainCounts,
         completion: DrainCompletion,
     ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
-        let mut summary = SyncSummary::default();
-        let mut first_wait = true;
+        let mut state = RecoveryDrainState::new(completion, self.state.last_transport_timestamp);
+        *counts = DrainCounts::default();
+        loop {
+            if let Some(done) =
+                Box::pin(self.drain_sdk_relay_slice(&mut state, counts, None, true)).await?
+            {
+                return Ok(done);
+            }
+        }
+    }
+
+    /// A slice may yield only before the next transport wait. It never turns a
+    /// scheduling yield into a drain verdict or resets the attempt clocks.
+    async fn drain_sdk_relay_slice(
+        &mut self,
+        state: &mut RecoveryDrainState,
+        counts: &mut DrainCounts,
+        slice: Option<Duration>,
+        admission_complete: bool,
+    ) -> Result<Option<(SyncSummary, DrainVerdict)>, ClassifiedSyncFailure> {
+        let mut summary = std::mem::take(&mut state.summary);
+        let mut first_wait = state.first_wait;
         // Forensic drain accounting: wall-clock span, deliveries actually
         // ingested and receives skipped as echo or duplicate (counted apart, so
         // a long drain that was working is distinguishable from one held open
         // by traffic carrying no new history), and the durable cursor
         // before/after so an analyzer can compare the persisted floor against
         // the ingested `created_at`s.
-        let drain_started = std::time::Instant::now();
-        let cursor_before_secs = self.state.last_transport_timestamp;
-        *counts = DrainCounts::default();
-        let mut routes_dirty = false;
+        let drain_started = state.drain_started;
+        let cursor_before_secs = state.cursor_before_secs;
+        let mut routes_dirty = state.routes_dirty;
         // Every delivery resets the silence budget. The separate wall-clock
         // quantum never resets; it checkpoints long productive replays in
         // pieces and bounds streams that carry only duplicates or echoes.
-        let mut silence_started = std::time::Instant::now();
+        let mut silence_started = state.silence_started;
         // Skipped deliveries poll the end-of-stored-events gate, which the
         // receive timeout below cannot reach while a relay delivers faster than
         // `SDK_DRAIN_WAIT`. Held at the same interval as that timeout.
-        let mut gate_polled_at = silence_started;
+        let mut gate_polled_at = state.gate_polled_at;
+        let slice_started = tokio::time::Instant::now();
+        let completion = state.completion;
 
-        let mut verdict = loop {
+        let maybe_verdict = loop {
+            if slice.is_some_and(|budget| slice_started.elapsed() >= budget) {
+                break None;
+            }
             if completion
                 .execution_quantum()
                 .is_some_and(|quantum| drain_started.elapsed() >= quantum)
+                && admission_complete
             {
                 if matches!(completion, DrainCompletion::EndOfStoredEvents { .. })
                     && self.backfill_drain_verdict().await == DrainVerdict::Complete
                 {
-                    break DrainVerdict::Complete;
+                    break Some(DrainVerdict::Complete);
                 }
-                break DrainVerdict::quantum_yield(counts);
+                break Some(DrainVerdict::quantum_yield(counts));
             }
-            let mut wait = if first_wait {
-                SDK_FIRST_SYNC_WAIT
-            } else {
-                SDK_DRAIN_WAIT
-            };
-            if let Some(quantum) = completion.execution_quantum() {
-                wait = wait.min(quantum.saturating_sub(drain_started.elapsed()));
-            }
-            first_wait = false;
+            let receive_deadline = *state.receive_deadline.get_or_insert_with(|| {
+                let mut wait = if first_wait {
+                    SDK_FIRST_SYNC_WAIT
+                } else {
+                    SDK_DRAIN_WAIT
+                };
+                if admission_complete && let Some(quantum) = completion.execution_quantum() {
+                    wait = wait.min(quantum.saturating_sub(drain_started.elapsed()));
+                }
+                tokio::time::Instant::now() + wait
+            });
+            let slice_deadline = slice.map(|budget| slice_started + budget);
+            let deadline =
+                slice_deadline.map_or(receive_deadline, |slice| slice.min(receive_deadline));
             let receive = async {
                 if !matches!(completion, DrainCompletion::Quiescence) {
                     return self.adapter.receive_account_delivery().await;
@@ -2201,7 +2586,15 @@ impl AppClient {
                     }
                 }
             };
-            let delivery = match timeout(wait, receive).await {
+            let received = tokio::time::timeout_at(deadline, receive).await;
+            if received.is_err() && slice_deadline.is_some_and(|slice| slice < receive_deadline) {
+                // A scheduler slice did not consume the original receive wait.
+                // Keep its deadline and first-wait state for the next turn.
+                break None;
+            }
+            state.receive_deadline = None;
+            first_wait = false;
+            let delivery = match received {
                 Ok(Ok(Some(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)))) => {
                     delivery
                 }
@@ -2223,15 +2616,25 @@ impl AppClient {
                             )
                             .await);
                     }
-                    break DrainVerdict::Overflow;
+                    break Some(DrainVerdict::Overflow);
                 }
                 Ok(Ok(None)) => {
-                    break match completion {
+                    let verdict = match completion {
                         DrainCompletion::Quiescence => DrainVerdict::Complete,
                         DrainCompletion::EndOfStoredEvents { .. } => {
                             self.backfill_drain_verdict().await
                         }
                     };
+                    if verdict == DrainVerdict::Complete && !admission_complete {
+                        // A closed transport can answer immediately. Let the
+                        // worker's slice clock elapse while the queue producer
+                        // still owns deliveries, instead of looping at once.
+                        if let Some(slice_deadline) = slice_deadline {
+                            tokio::time::sleep_until(slice_deadline).await;
+                        }
+                        break None;
+                    }
+                    break Some(verdict);
                 }
                 Ok(Err(error)) => {
                     return Err(self
@@ -2246,20 +2649,20 @@ impl AppClient {
                         .await);
                 }
                 Err(_) => match completion {
-                    DrainCompletion::Quiescence => break DrainVerdict::Complete,
+                    DrainCompletion::Quiescence => break Some(DrainVerdict::Complete),
                     DrainCompletion::EndOfStoredEvents {
                         silence_budget,
                         execution_quantum,
                     } => {
                         let verdict = self.backfill_drain_verdict().await;
                         if verdict == DrainVerdict::Complete {
-                            break verdict;
+                            break Some(verdict);
                         }
-                        if drain_started.elapsed() >= execution_quantum {
-                            break DrainVerdict::quantum_yield(counts);
+                        if admission_complete && drain_started.elapsed() >= execution_quantum {
+                            break Some(DrainVerdict::quantum_yield(counts));
                         }
                         if silence_started.elapsed() >= silence_budget {
-                            break verdict;
+                            break Some(verdict);
                         }
                         continue;
                     }
@@ -2301,7 +2704,7 @@ impl AppClient {
                     .backfill_gate_reports_complete(completion, &mut gate_polled_at)
                     .await
                 {
-                    break DrainVerdict::Complete;
+                    break Some(DrainVerdict::Complete);
                 }
                 continue;
             }
@@ -2380,6 +2783,22 @@ impl AppClient {
             }
         };
 
+        state.first_wait = first_wait;
+        state.routes_dirty = routes_dirty;
+        state.silence_started = silence_started;
+        state.gate_polled_at = gate_polled_at;
+        let Some(mut verdict) = maybe_verdict else {
+            state.summary = summary;
+            return Ok(None);
+        };
+        if verdict == DrainVerdict::Complete && !admission_complete {
+            // The immutable acquisition owns a batch that has not all reached
+            // the account queue. EOSE cannot end the drain before that owner
+            // submits its final item (or its bounded admission window fails).
+            state.summary = summary;
+            return Ok(None);
+        }
+
         if verdict != DrainVerdict::Overflow
             && let Some(overflow) = self
                 .adapter
@@ -2446,7 +2865,7 @@ impl AppClient {
                 "history drain checkpointed"
             );
         }
-        Ok((summary, verdict))
+        Ok(Some((summary, verdict)))
     }
 
     async fn finish_failed_sync_drain(
@@ -2633,6 +3052,15 @@ impl AppClient {
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
+        let probe_receive = if welcome && (client.audit_v5_enabled() || cfg!(test)) {
+            client
+                .audit_v5_probe
+                .as_mut()
+                .and_then(|probe| probe.observe(&delivery.message))
+        } else {
+            None
+        };
+        client.flush_live_v5_events();
         // Hold the same account policy lock through admission and projection, so a
         // block cannot commit between authenticating the inviter and creating state.
         let policy_lock = client.app.block_update_lock(&client.state.label).await;
@@ -2693,6 +3121,9 @@ impl AppClient {
         );
         let telemetry = client.runtime_telemetry.clone();
         let ingest_observation = telemetry.as_ref().map(|t| t.observe(RuntimeOp::Ingest));
+        if let (Some(slot), Some(receive)) = (&client.audit_v5_peel_slot, probe_receive.clone()) {
+            slot.lock().unwrap().arm(&delivery.message, receive);
+        }
         let ingest = client
             .runtime
             .ingest_delivery_with_observer(delivery, |phase, duration, success| {
@@ -2715,6 +3146,48 @@ impl AppClient {
                 }
             })
             .await;
+        if let (Some(probe), Some(slot)) = (&mut client.audit_v5_probe, &client.audit_v5_peel_slot)
+            && let Some(completion) = slot.lock().unwrap().take()
+        {
+            probe.unwrapped(completion);
+        }
+        if let (Some(probe), Some(receive), Ok(effects)) =
+            (&mut client.audit_v5_probe, probe_receive, &ingest)
+            && matches!(effects.outcome, IngestOutcome::Processed)
+        {
+            // The event is journaled in the join transaction. Only this
+            // delivery's exact Welcome may turn it into a join row: the same
+            // effects can also drain older application events.
+            let mut joins = effects
+                .effects
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    cgka_traits::engine::GroupEvent::GroupJoined {
+                        group_id,
+                        via_welcome,
+                        explicitly_confirmed: false,
+                        ..
+                    } if via_welcome == &source_message_id => Some(group_id),
+                    _ => None,
+                });
+            if let Some(group_id) = joins.next()
+                && joins.next().is_none()
+                && let Ok(group) = client.runtime.group_record(group_id)
+            {
+                let initial_join = probe.joined(receive.clone(), &group);
+                if initial_join && client.runtime.session().audit_v5_enabled() {
+                    let admins = client.runtime.admin_pubkeys(group_id).ok();
+                    probe.baseline(
+                        &group,
+                        admins.as_deref(),
+                        marmot_forensics::v5::BaselineReason::Joined,
+                        Some(receive.1),
+                    );
+                }
+            }
+        }
+        client.flush_live_v5_events();
         if let Some(observation) = ingest_observation {
             observation.finish(if ingest.is_ok() {
                 TelemetryOutcome::Success
@@ -3578,7 +4051,7 @@ impl AppClient {
     /// A run is still forgotten when a caller discards the client outright; the
     /// [`super::epoch_stall`] module header covers that case and what
     /// re-escalating then costs.
-    fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
+    pub(crate) fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
             .epoch_stall_escalations
             .append(&mut self.pending_epoch_stall_escalations);
@@ -3621,7 +4094,7 @@ impl AppClient {
     /// error itself has no audit field to land in, so name its privacy-safe
     /// kind here — that is the difference between chasing a deleted group and
     /// chasing lock contention.
-    fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
+    pub(crate) fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
         match self.runtime.group_record(group_id) {
             Ok(record) => Some(record.epoch.0),
             Err(error) => {
@@ -3644,6 +4117,21 @@ impl AppClient {
         &mut self,
         seam: EpochBackfillExecutionSeam,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
+        match self.select_pending_epoch_backfill(seam)? {
+            PendingRecoverySelection::NotPending => Ok(EpochBackfillRunOutcome::NotPending),
+            PendingRecoverySelection::Deferred => Ok(EpochBackfillRunOutcome::Deferred),
+            PendingRecoverySelection::Grant(grant) => {
+                self.execute_pending_epoch_backfill_grant(*grant).await
+            }
+        }
+    }
+
+    /// Select once. The worker may hand the exact frozen grant to a bounded
+    /// executor without spending a second retry reservation on fallback.
+    pub(crate) fn select_pending_epoch_backfill(
+        &mut self,
+        seam: EpochBackfillExecutionSeam,
+    ) -> Result<PendingRecoverySelection, AppError> {
         self.drop_terminal_epoch_backfill_intents();
         let storage = self.app.account_storage(&self.state.label)?;
         if storage.pending_recovery_demands()?.is_empty()
@@ -3651,13 +4139,30 @@ impl AppClient {
             && self.pending_recovery_arm_writes.is_empty()
             && self.pending_recovery_capacity_writes.is_empty()
         {
-            return Ok(EpochBackfillRunOutcome::NotPending);
+            return Ok(PendingRecoverySelection::NotPending);
         }
         let mut explicit = ExplicitRecoveryPermit::default();
         let permit = (seam == EpochBackfillExecutionSeam::ExplicitCatchUp).then_some(&mut explicit);
         let Some(grant) = self.authorize_account_recovery(permit, seam)? else {
-            return Ok(EpochBackfillRunOutcome::Deferred);
+            return Ok(PendingRecoverySelection::Deferred);
         };
+        #[cfg(test)]
+        if let Some(witness) = &self.test_recovery_selection_witness {
+            witness.lock().unwrap().push(super::TestRecoverySelection {
+                seam,
+                attempt_serial: grant.reservation.attempt_serial,
+                comparison_revision: grant.comparison_revision,
+                obligation_count: grant.fence.obligations.len(),
+            });
+        }
+        Ok(PendingRecoverySelection::Grant(Box::new(grant)))
+    }
+
+    pub(crate) async fn execute_pending_epoch_backfill_grant(
+        &mut self,
+        grant: AttemptGrant,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
         let selected = grant.fence.obligations.clone();
         let comparison_selected = grant.comparison_revision.is_some();
         match self.execute_recovery_grant(grant, None, None).await {
@@ -3691,6 +4196,26 @@ impl AppClient {
         repair: Option<&FullHistoryRepairControl<'_>>,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let mut execution = self.begin_recovery_execution(&grant)?;
+        let result = self
+            .execute_recovery_grant_inner(
+                &grant,
+                repair,
+                telemetry,
+                &mut execution.counts,
+                &mut execution.activation,
+                &mut execution.drain_verdict,
+            )
+            .await;
+        self.finish_recovery_execution(&grant, execution, result, repair.is_some())
+    }
+
+    // Shares the existing classified failure payload with the inline executor.
+    #[allow(clippy::result_large_err)]
+    fn begin_recovery_execution(
+        &mut self,
+        grant: &AttemptGrant,
+    ) -> Result<RecoveryExecutionState, ClassifiedSyncFailure> {
         let Some(plan) = grant.plan() else {
             return Err(ClassifiedSyncFailure::at_stage(
                 SyncSummary::default(),
@@ -3705,7 +4230,7 @@ impl AppClient {
             .delivery_overflow_recovery_marker_token
             .filter(|_| self.delivery_overflow_recovery_pending)
             .map(|token| self.adapter.start_delivery_overflow_recovery(token));
-        let mut overflow_guard =
+        let overflow_guard =
             overflow.map(|_| super::recovery::RecoveryLossAttemptGuard::new(self.adapter.clone()));
         let audit_groups = plan
             .iter()
@@ -3729,19 +4254,27 @@ impl AppClient {
                 &context,
             );
         }
-        let mut counts = DrainCounts::default();
-        let mut activation = EpochBackfillActivationOutcome::Failed;
-        let mut drain_verdict = None;
-        let result = self
-            .execute_recovery_grant_inner(
-                &grant,
-                repair,
-                telemetry,
-                &mut counts,
-                &mut activation,
-                &mut drain_verdict,
-            )
-            .await;
+        Ok(RecoveryExecutionState {
+            overflow,
+            overflow_guard,
+            audit_groups,
+            context,
+            started,
+            counts: DrainCounts::default(),
+            activation: EpochBackfillActivationOutcome::Failed,
+            drain_verdict: None,
+        })
+    }
+
+    // Preserve the executor's classified partial summary and audit terminal.
+    #[allow(clippy::result_large_err)]
+    fn finish_recovery_execution(
+        &mut self,
+        grant: &AttemptGrant,
+        mut execution: RecoveryExecutionState,
+        result: Result<SyncSummary, ClassifiedSyncFailure>,
+        repairing: bool,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         if result.is_err() {
             self.abandon_loss_completion().map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
@@ -3755,7 +4288,7 @@ impl AppClient {
                 )
             })?;
         }
-        for (id, group, before) in audit_groups {
+        for (id, group, before) in execution.audit_groups {
             let after = self.local_epoch_for_group(&group);
             let revision = grant
                 .fence
@@ -3769,13 +4302,26 @@ impl AppClient {
                 .account_storage(&self.state.label)
                 .and_then(|storage| Ok(storage.recovery_obligation_is_satisfied(id, revision)?))
                 .unwrap_or(false);
+            #[cfg(test)]
+            if let Some(witness) = &self.test_recovery_phase_witness
+                && witness.is_target_group(&group)
+            {
+                witness.record_terminal(TestRecoveryTerminal {
+                    attempt_serial: grant.reservation.attempt_serial,
+                    local_epoch_after: after,
+                    deliveries: execution.counts.deliveries,
+                    skipped: execution.counts.skipped,
+                    qualified,
+                    result_ok: result.is_ok(),
+                });
+            }
             self.record_epoch_stall_backfill_terminal(
                 &group,
                 qualified && after.is_some(),
                 EpochBackfillTerminalAudit {
                     retry_ordinal: grant.reservation.ordinal.saturating_sub(1),
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    activation_outcome: activation,
+                    duration_ms: execution.started.elapsed().as_millis() as u64,
+                    activation_outcome: execution.activation,
                     completion_kind: None,
                     error_kind: (!qualified).then(|| {
                         result
@@ -3783,26 +4329,27 @@ impl AppClient {
                             .err()
                             .map(|failure| failure.source.privacy_safe_kind().to_owned())
                             .unwrap_or_else(|| {
-                                drain_verdict
+                                execution
+                                    .drain_verdict
                                     .and_then(DrainVerdict::error_kind)
                                     .unwrap_or("history_coverage_unproven")
                                     .into()
                             })
                     }),
-                    deliveries: counts.deliveries,
-                    skipped: counts.skipped,
-                    refused: counts.refused,
+                    deliveries: execution.counts.deliveries,
+                    skipped: execution.counts.skipped,
+                    refused: execution.counts.refused,
                     local_epoch_before: before,
                     local_epoch_after: after,
                 },
-                &context,
+                &execution.context,
             );
         }
         // Qualification/plane acknowledgment is separate from ending the
         // transient acquisition. No EOSE-only outcome may clear the loss guard.
-        if let Some(attempt) = overflow {
+        if let Some(attempt) = execution.overflow {
             let finished = if result.is_ok() {
-                self.finish_qualified_recovery_loss(&grant, attempt)
+                self.finish_qualified_recovery_loss(grant, attempt)
                     .map_err(|error| {
                         ClassifiedSyncFailure::at_stage(
                             result.as_ref().ok().cloned().unwrap_or_default(),
@@ -3833,12 +4380,13 @@ impl AppClient {
                 }
             }
         }
-        if let Some(guard) = overflow_guard.as_mut() {
+        if let Some(guard) = execution.overflow_guard.as_mut() {
             guard.disarm();
         }
-        if repair.is_some()
-            && let Some(verdict) =
-                drain_verdict.filter(|verdict| *verdict != DrainVerdict::Complete)
+        if repairing
+            && let Some(verdict) = execution
+                .drain_verdict
+                .filter(|verdict| *verdict != DrainVerdict::Complete)
         {
             return Err(incomplete_full_history_repair(
                 result?,
@@ -3847,6 +4395,254 @@ impl AppClient {
             ));
         }
         result
+    }
+
+    /// Start the same reserved executor at the worker's Receive seam, then
+    /// leave only immutable reconciliation I/O outside the account owner.
+    pub(crate) async fn begin_online_epoch_gap(
+        &mut self,
+        grant: AttemptGrant,
+    ) -> Result<OnlineEpochGapRecovery, AppError> {
+        let mut execution = self
+            .begin_recovery_execution(&grant)
+            .map_err(|failure| failure.source)?;
+        #[cfg(test)]
+        let phase = self.recovery_phase_guard(&grant, TestRecoveryPhase::Activation);
+        let activation = self
+            .activate_recovery_grant_inner(&grant, None, &mut execution.activation)
+            .await;
+        #[cfg(test)]
+        drop(phase);
+        if let Err(failure) = activation {
+            return self
+                .finish_recovery_execution(&grant, execution, Err(failure), false)
+                .map(|_| unreachable!("failed activation cannot complete"))
+                .map_err(|failure| failure.source);
+        }
+        let Some(subscription_attempt) = self.adapter.account_subscription_attempt().await else {
+            let failure = ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                cgka_traits::TransportAdapterError::Subscription(
+                    "activated recovery subscription disappeared".into(),
+                )
+                .into(),
+                SyncFailureStage::TransportActivation,
+            );
+            return self
+                .finish_recovery_execution(&grant, execution, Err(failure), false)
+                .map(|_| unreachable!("missing activation cannot complete"))
+                .map_err(|failure| failure.source);
+        };
+        #[cfg(test)]
+        let phase = self.recovery_phase_guard(&grant, TestRecoveryPhase::Reconciliation);
+        Ok(OnlineEpochGapRecovery {
+            grant,
+            execution,
+            subscription_attempt,
+            drain: None,
+            #[cfg(test)]
+            phase,
+        })
+    }
+
+    /// No network byte is queued until the worker checks the frozen owner and
+    /// live activation. A changed comparison slot cannot be substituted.
+    pub(crate) async fn online_epoch_gap_network_stable(
+        &mut self,
+        recovery: &OnlineEpochGapRecovery,
+    ) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        drop(self.transport_receipts()?);
+        self.observe_recovery_route_policy()?;
+        let current = storage.recovery_revision_fence()?;
+        Ok(current.loss_revision == recovery.grant.fence.loss_revision
+            && current.route_revision == recovery.grant.fence.route_revision
+            && current.inventory_revision == recovery.grant.fence.inventory_revision
+            && storage.recovery_retry_state()?.attempt_serial
+                == recovery.grant.reservation.attempt_serial
+            && !storage.recovery_comparison()?.pending()
+            && recovery
+                .grant
+                .fence
+                .obligations
+                .iter()
+                .all(|selected| current.obligations.contains(selected))
+            && self.adapter.account_subscription_attempt().await
+                == Some(recovery.subscription_attempt))
+    }
+
+    pub(crate) fn online_epoch_gap_start_drain(&self, recovery: &mut OnlineEpochGapRecovery) {
+        #[cfg(test)]
+        {
+            drop(recovery.phase.take());
+            recovery.phase =
+                self.recovery_phase_guard(&recovery.grant, TestRecoveryPhase::Completion);
+        }
+        recovery.drain = Some(RecoveryDrainState::new(
+            DrainCompletion::EndOfStoredEvents {
+                silence_budget: self.epoch_backfill_eose_wait(),
+                execution_quantum: self.epoch_backfill_execution_quantum(),
+            },
+            self.state.last_transport_timestamp,
+        ));
+    }
+
+    pub(crate) async fn online_epoch_gap_drain_slice(
+        &mut self,
+        recovery: &mut OnlineEpochGapRecovery,
+        admission_complete: bool,
+    ) -> Result<Option<(SyncSummary, DrainVerdict)>, ClassifiedSyncFailure> {
+        self.drain_sdk_relay_slice(
+            recovery.drain.as_mut().expect("online drain initialized"),
+            &mut recovery.execution.counts,
+            Some(ONLINE_EPOCH_GAP_DRAIN_SLICE),
+            admission_complete,
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_online_epoch_gap(
+        &mut self,
+        mut recovery: OnlineEpochGapRecovery,
+        drain: Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure>,
+        submissions: Vec<RouteSubmission>,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        #[cfg(test)]
+        drop(recovery.phase.take());
+        let result = match drain {
+            Ok((summary, verdict)) => {
+                let outcomes = self
+                    .app
+                    .account_storage(&self.state.label)
+                    .and_then(|storage| {
+                        submissions
+                            .into_iter()
+                            .map(|route| self.persist_reconciliation_submission(&storage, route))
+                            .collect::<Result<Vec<_>, AppError>>()
+                    })
+                    .map_err(|error| {
+                        ClassifiedSyncFailure::at_stage(
+                            summary.clone(),
+                            error,
+                            SyncFailureStage::StatePersist,
+                        )
+                    });
+                match outcomes {
+                    Ok(outcomes) => {
+                        self.finish_recovery_grant_after_drain(
+                            &recovery.grant,
+                            &mut recovery.execution.counts,
+                            &mut recovery.execution.drain_verdict,
+                            outcomes,
+                            summary,
+                            verdict,
+                        )
+                        .await
+                    }
+                    Err(failure) => Err(failure),
+                }
+            }
+            Err(failure) => Err(failure),
+        };
+        let selected = recovery.grant.fence.obligations.clone();
+        let result =
+            self.finish_recovery_execution(&recovery.grant, recovery.execution, result, false);
+        match result {
+            Ok(summary) => {
+                let storage = self.app.account_storage(&self.state.label)?;
+                let complete = selected.iter().all(|(id, revision)| {
+                    storage
+                        .recovery_obligation_is_satisfied(*id, *revision)
+                        .unwrap_or(false)
+                });
+                Ok(if complete {
+                    EpochBackfillRunOutcome::Completed(summary)
+                } else {
+                    EpochBackfillRunOutcome::Incomplete(summary)
+                })
+            }
+            Err(failure) => {
+                self.pending_failed_sync_summary
+                    .merge(failure.partial_summary);
+                Err(failure.source)
+            }
+        }
+    }
+
+    pub(crate) fn abandon_online_epoch_gap(
+        &mut self,
+        recovery: OnlineEpochGapRecovery,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        #[cfg(test)]
+        let mut recovery = recovery;
+        #[cfg(test)]
+        drop(recovery.phase.take());
+        self.finish_recovery_execution(
+            &recovery.grant,
+            recovery.execution,
+            Ok(SyncSummary::default()),
+            false,
+        )
+        .map_err(|failure| failure.source)?;
+        Ok(EpochBackfillRunOutcome::Deferred)
+    }
+
+    pub(crate) async fn fail_online_epoch_gap(
+        &mut self,
+        mut recovery: OnlineEpochGapRecovery,
+        error: AppError,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        #[cfg(test)]
+        drop(recovery.phase.take());
+        let failure = if let Some(drain) = recovery.drain.take() {
+            self.finish_failed_sync_drain(
+                drain.summary,
+                drain.routes_dirty,
+                recovery.execution.counts.clone(),
+                StagedSyncError::new(error, SyncFailureStage::Unknown),
+                drain.drain_started,
+                drain.cursor_before_secs,
+            )
+            .await
+        } else {
+            ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                error,
+                SyncFailureStage::Unknown,
+            )
+        };
+        match self.finish_recovery_execution(
+            &recovery.grant,
+            recovery.execution,
+            Err(failure),
+            false,
+        ) {
+            Ok(_) => unreachable!("failed recovery cannot complete"),
+            Err(failure) => {
+                self.pending_failed_sync_summary
+                    .merge(failure.partial_summary);
+                Err(failure.source)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn recovery_phase_guard(
+        &self,
+        grant: &AttemptGrant,
+        phase: TestRecoveryPhase,
+    ) -> Option<TestRecoveryPhaseGuard> {
+        let plan = grant.plan()?;
+        if grant.comparison_revision.is_some()
+            || plan.len() != 1
+            || plan[0].cause != storage_sqlite::RecoveryCause::EpochGap
+        {
+            return None;
+        }
+        self.test_recovery_phase_witness
+            .as_ref()?
+            .enter(grant.reservation.attempt_serial, phase)
     }
 
     async fn execute_recovery_grant_inner(
@@ -3858,6 +4654,61 @@ impl AppClient {
         activation_outcome: &mut EpochBackfillActivationOutcome,
         drain_verdict: &mut Option<DrainVerdict>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        #[cfg(test)]
+        let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Activation);
+        self.activate_recovery_grant_inner(grant, telemetry, activation_outcome)
+            .await?;
+        #[cfg(test)]
+        drop(_phase);
+        // Routine below-live-cutoff discovery runs only with a frozen owner
+        // comparison request. The retained-inventory floor still bounds it.
+        // Neither a quiet completion nor subscription installation certifies
+        // the still-pending maintenance/history predicate.
+        let quiet_prerequisites =
+            grant
+                .plan()
+                .expect("validated executor grant")
+                .iter()
+                .all(|obligation| {
+                    matches!(
+                        obligation.cause,
+                        storage_sqlite::RecoveryCause::IncrementalHistory
+                            | storage_sqlite::RecoveryCause::Maintenance
+                    )
+                });
+        let comparison_outcomes = if grant.comparison_revision.is_some() || !quiet_prerequisites {
+            #[cfg(test)]
+            let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Reconciliation);
+            self.reconcile_transport_history(&grant.inventory)
+                .await
+                .map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::Unknown,
+                    )
+                })?
+        } else {
+            Vec::new()
+        };
+        #[cfg(test)]
+        let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Completion);
+        self.complete_recovery_grant_inner(
+            grant,
+            repair,
+            counts,
+            drain_verdict,
+            comparison_outcomes,
+        )
+        .await
+    }
+
+    async fn activate_recovery_grant_inner(
+        &mut self,
+        grant: &AttemptGrant,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        activation_outcome: &mut EpochBackfillActivationOutcome,
+    ) -> Result<(), ClassifiedSyncFailure> {
         let obligations = grant.plan().expect("validated executor grant");
         // A bounded comparison freezes acquisition separately from historical
         // goals. Unchanged broad debt cannot widen an automatic comparison.
@@ -3893,18 +4744,9 @@ impl AppClient {
         };
         // Maintenance has its own scoped unfloored REQ. It cannot widen the
         // broad live activation; only selected history/loss goals may do so.
-        // Maintenance installs a temporary subscription and observes its first
-        // boundary later under the domain's existing deadline. Sharing that
-        // prerequisite must not turn ordinary incremental catch-up into a
-        // blocking full-history wait. Neither quiet completion nor installation
-        // certifies the still-pending maintenance/history predicate.
-        let quiet_prerequisites = obligations.iter().all(|obligation| {
-            matches!(
-                obligation.cause,
-                storage_sqlite::RecoveryCause::IncrementalHistory
-                    | storage_sqlite::RecoveryCause::Maintenance
-            )
-        });
+        // Its first boundary is observed later under the domain's deadline.
+        // Sharing that prerequisite cannot turn ordinary incremental catch-up
+        // into a blocking full-history wait.
         self.pending_runtime_group_subscription_refresh = true;
         self.relay_plane
             .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())
@@ -3993,22 +4835,33 @@ impl AppClient {
                     .insert(group, (subscription, route));
             }
         }
-        // Routine below-live-cutoff discovery runs only with a frozen owner
-        // comparison request. The retained-inventory floor still bounds it.
-        let comparison_outcomes = if grant.comparison_revision.is_some() || !quiet_prerequisites {
-            self.reconcile_transport_history(&grant.inventory)
-                .await
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::Unknown,
+        Ok(())
+    }
+
+    async fn complete_recovery_grant_inner(
+        &mut self,
+        grant: &AttemptGrant,
+        repair: Option<&FullHistoryRepairControl<'_>>,
+        counts: &mut DrainCounts,
+        drain_verdict: &mut Option<DrainVerdict>,
+        comparison_outcomes: Vec<(
+            TransportReconciliationRoute,
+            storage_sqlite::RecoveryComparisonOutcome,
+        )>,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let quiet_prerequisites =
+            grant
+                .plan()
+                .expect("validated executor grant")
+                .iter()
+                .all(|obligation| {
+                    matches!(
+                        obligation.cause,
+                        storage_sqlite::RecoveryCause::IncrementalHistory
+                            | storage_sqlite::RecoveryCause::Maintenance
                     )
-                })?
-        } else {
-            Vec::new()
-        };
-        let (mut summary, verdict) = if let Some(control) = repair {
+                });
+        let (summary, verdict) = if let Some(control) = repair {
             self.drain_full_history_repair(counts, control).await?
         } else if quiet_prerequisites {
             self.sync_sdk_relay(counts).await?
@@ -4022,6 +4875,29 @@ impl AppClient {
             )
             .await?
         };
+        self.finish_recovery_grant_after_drain(
+            grant,
+            counts,
+            drain_verdict,
+            comparison_outcomes,
+            summary,
+            verdict,
+        )
+        .await
+    }
+
+    async fn finish_recovery_grant_after_drain(
+        &mut self,
+        grant: &AttemptGrant,
+        counts: &mut DrainCounts,
+        drain_verdict: &mut Option<DrainVerdict>,
+        comparison_outcomes: Vec<(
+            TransportReconciliationRoute,
+            storage_sqlite::RecoveryComparisonOutcome,
+        )>,
+        mut summary: SyncSummary,
+        verdict: DrainVerdict,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         *drain_verdict = Some(verdict);
         let local = self.drain_pending_session_events().await.map_err(|error| {
             ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::Unknown)
@@ -4707,12 +5583,67 @@ impl AppClient {
         &mut self,
         created_group_id_hex: Option<&str>,
     ) -> Result<Option<crate::ChatListRow>, AppError> {
+        let checkpoint_started = Instant::now();
+        let changed_groups = self.pending_group_projection_updates.len();
+        let pending_inputs = self.pending_seen_event_count;
+        let pending_acks = self.pending_application_event_acks.len();
+        let pending_frontiers = self.pending_local_group_deletion_frontier_clears.len();
+        let message_ref = (pending_acks == 1)
+            .then(|| self.pending_application_event_acks.iter().next())
+            .flatten()
+            .and_then(|id| {
+                marmot_forensics::v5::EngineMessageRef::from_message_id(id.as_slice()).ok()
+            });
         let observation = self
             .runtime_telemetry
             .as_ref()
             .map(|t| t.observe(RuntimeOp::ProjectionCheckpoint));
+        let audit_updates = self
+            .audit_v5_probe
+            .as_ref()
+            .map(|probe| {
+                probe.pending_updates(&self.state.groups, &self.pending_group_projection_updates)
+            })
+            .unwrap_or_default();
+        let welcome_update_count = audit_updates.len();
+        // A Welcome-owned checkpoint can also carry a separately received
+        // application ack. Suppress the generic row only when its sole ack
+        // identifies the Welcome that owns one of these group projections.
+        let only_welcome_ack = self.pending_application_event_acks.iter().all(|ack| {
+            let ack_hex = hex::encode(ack.as_slice());
+            self.state.groups.iter().any(|group| {
+                self.pending_group_projection_updates
+                    .contains(&group.group_id_hex)
+                    && group.via_welcome_message_id_hex.as_deref() == Some(ack_hex.as_str())
+            })
+        });
+        // This fault exists only in unit-test binaries and occurs before any
+        // projection checkpoint write; the engine's join is already committed.
+        #[cfg(test)]
+        let audit_fail_before_commit = !audit_updates.is_empty()
+            && self
+                .audit_v5_probe
+                .as_mut()
+                .is_some_and(|probe| probe.reject_checkpoints);
+        #[cfg(not(test))]
+        let audit_fail_before_commit = false;
+        let mut known_not_committed = audit_fail_before_commit;
         let result = (|| {
-            let seen_events = self.transport_receipts()?.pending_seen_events();
+            #[cfg(test)]
+            if audit_fail_before_commit {
+                return Err(AppError::BlockingTask(
+                    "injected v5 probe checkpoint failure".into(),
+                ));
+            }
+            let seen_events = match self.transport_receipts() {
+                Ok(receipts) => receipts.pending_seen_events(),
+                Err(error) => {
+                    // This failed before either projection save entry point.
+                    // The checkpoint itself therefore did not commit.
+                    known_not_committed = true;
+                    return Err(error);
+                }
+            };
             let frontiers_to_clear = self
                 .pending_local_group_deletion_frontier_clears
                 .iter()
@@ -4765,6 +5696,44 @@ impl AppClient {
         })();
         if let Some(observation) = observation {
             observation.finish_app(&result);
+        }
+        if let Some(probe) = &mut self.audit_v5_probe {
+            probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);
+        }
+        self.flush_live_v5_events();
+        let welcome_only_checkpoint = result.is_ok()
+            && changed_groups != 0
+            && welcome_update_count == changed_groups
+            && pending_acks <= 1
+            && only_welcome_ack
+            && pending_inputs <= 1
+            && pending_frontiers == 0
+            && created_group_id_hex.is_none();
+        let has_checkpoint_work = changed_groups != 0
+            || pending_inputs != 0
+            || pending_acks != 0
+            || pending_frontiers != 0
+            || created_group_id_hex.is_some();
+        if has_checkpoint_work && !welcome_only_checkpoint {
+            self.record_v5_app_checkpoint(super::audit_v5_app_update::CheckpointObservation {
+                message_ref,
+                changed_groups,
+                pending_inputs,
+                pending_acks,
+                pending_frontiers,
+                created_row: created_group_id_hex.is_some(),
+                error: result.as_ref().err(),
+                elapsed: checkpoint_started.elapsed(),
+                known_not_committed,
+                // The injected checkpoint rejection has a known transaction
+                // seam. A receipt setup failure is before that seam, and a
+                // storage error can be uncertain; neither proves a stage.
+                failure_stage: if audit_fail_before_commit {
+                    marmot_forensics::v5::AppUpdateFailureStage::Transaction
+                } else {
+                    marmot_forensics::v5::AppUpdateFailureStage::Unknown
+                },
+            });
         }
         result
     }
@@ -4965,6 +5934,28 @@ impl AppClient {
         source_message_id_hex: &str,
         source_received_at: u64,
     ) -> Result<bool, AppError> {
+        let started = Instant::now();
+        let result = self
+            .observe_account_device_effects_inner(
+                effects,
+                summary,
+                source_message_id_hex,
+                source_received_at,
+            )
+            .await;
+        if let Err(error) = &result {
+            self.record_v5_event_projection_failure(&effects.events, error, started.elapsed());
+        }
+        result
+    }
+
+    async fn observe_account_device_effects_inner(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        summary: &mut SyncSummary,
+        source_message_id_hex: &str,
+        source_received_at: u64,
+    ) -> Result<bool, AppError> {
         let display_names = self.display_names_for_events(&effects.events);
         self.note_superseded_intent_reports(effects);
         // MLS member ids in this design are the Nostr account pubkey hex, so a
@@ -5047,6 +6038,12 @@ impl AppClient {
                 updated_group.as_ref(),
                 &event_source,
             );
+            if previous_group != updated_group
+                && let Some(probe) = &mut self.audit_v5_probe
+                && (self.runtime.session().audit_v5_enabled() || cfg!(test))
+            {
+                probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
+            }
             routes_dirty |=
                 self.observe_event_projection_effects(event, &local_account_id_hex, summary)?;
             if self.state.groups.len() != before {
@@ -7264,3 +8261,6 @@ mod tests {
 
 #[cfg(test)]
 mod full_history_tests;
+
+#[cfg(test)]
+mod selective_history_acquisition_tests;

@@ -611,9 +611,9 @@ fn a_halt_outranks_the_epoch_divergence_it_explains() {
 
 #[test]
 fn an_engine_whose_local_state_moved_backwards_quarantines_as_rolled_back() {
-    // engine-b reports epoch 5, then reports epoch 2 nearly three hours later:
-    // local state moved backwards, which no protocol step produces — a device
-    // restored from an older backup. Read from the high-water mark alone it
+    // engine-b reports epoch 5, then reports epoch 2 nearly three hours later
+    // with no convergence decision walking it back: local state moved
+    // backwards — a device restored from an older backup. Read from the high-water mark alone it
     // sits at epoch 5, one behind the tip, *below* the divergence threshold and
     // therefore invisible; read from where it actually is, it is four behind.
     // This is the 2026-08-26 cohort's worst device in miniature: nine epochs
@@ -664,5 +664,273 @@ fn an_untimed_epoch_newer_than_the_timed_one_is_not_a_rollback() {
     assert_eq!(
         liveness_advisory(&load("healthy-untimed-epoch-after-timed.json")),
         None
+    );
+}
+
+#[test]
+fn a_message_row_above_the_engines_own_state_is_not_a_rollback() {
+    // engine-b's own state sits at epoch 4 throughout; the one row above it is
+    // a message row stamped with the deferred message's epoch, not the
+    // engine's position. Only own-state rows place an engine, so this is an
+    // engine active while behind, not one whose local state moved backwards.
+    assert_eq!(
+        classify(&load("quarantine-message-row-above-own-state.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 4,
+                    mode: BehindMode::ActiveWhileBehind,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_message_only_engine_is_never_rolled_back() {
+    // engine-b wrote no own-state rows, so its message rows are the only
+    // evidence of where it is and still place it. But each carries the
+    // handled message's epoch, so a lower one arriving later is a different
+    // message, not the engine moving backwards.
+    assert_eq!(
+        classify(&load("quarantine-message-only-engine-behind.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 8,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 4,
+                    mode: BehindMode::ActiveWhileBehind,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_failed_publish_is_not_a_rollback() {
+    // engine-b begins a commit at 7: `begin_pending` is stamped with the
+    // projected epoch 8, and the failed publish then records the epoch 7 the
+    // engine never left. A projection is not a position, so engine-b is behind
+    // the tip where it always was — active, not rolled back.
+    assert_eq!(
+        classify(&load("quarantine-failed-publish-behind.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 9,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 7,
+                    mode: BehindMode::ActiveWhileBehind,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_failed_publish_does_not_raise_the_group_tip() {
+    // The only row at epoch 8 is engine-b's `begin_pending` projection, and
+    // that publish failed: no engine ever reached 8. The tip is 7, so engine-a
+    // at 6 is one epoch behind — routine propagation.
+    assert_eq!(
+        classify(&load("healthy-failed-publish-at-would-be-tip.json")),
+        Verdict::Healthy
+    );
+}
+
+#[test]
+fn a_convergence_reorg_onto_a_shorter_branch_is_not_a_rollback() {
+    // engine-b reached 8, then convergence selected a branch whose tip is 6
+    // and walked it back there. That is the protocol rewinding the engine
+    // lawfully, not local state moving backwards: engine-b is behind the tip
+    // at the epoch it was told to adopt, still active.
+    let export = load("convergence-reorg-onto-shorter-branch.json");
+    assert_eq!(classify(&export), Verdict::ConvergenceSelected);
+    assert_eq!(
+        liveness_advisory(&export),
+        Some(QuarantineReason::EpochDivergence {
+            group_epoch: 9,
+            engines: vec![BehindEngine {
+                engine_id: "engine-b".into(),
+                epoch: 6,
+                mode: BehindMode::ActiveWhileBehind,
+            }],
+        })
+    );
+}
+
+#[test]
+fn a_hydration_below_a_confirmed_publish_is_rolled_back() {
+    // engine-b confirmed its own commit at 81 and then reopened at 78, with no
+    // convergence decision walking it back in between: its local state moved
+    // backwards. The 8413db02 committer self-rollback in miniature.
+    assert_eq!(
+        classify(&load("quarantine-hydration-below-confirmed-publish.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 83,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 78,
+                    mode: BehindMode::RolledBack,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_reorg_after_a_rollback_does_not_excuse_it() {
+    // engine-b fell from 81 to 78 on reopen, and only then did convergence
+    // walk it from 78 to 77. The rewind accounts for 78 → 77; nothing
+    // accounts for 81 → 78, so the rollback still stands.
+    let export = load("quarantine-reorg-after-rollback.json");
+    assert_eq!(
+        liveness_advisory(&export),
+        Some(QuarantineReason::EpochDivergence {
+            group_epoch: 83,
+            engines: vec![BehindEngine {
+                engine_id: "engine-b".into(),
+                epoch: 77,
+                mode: BehindMode::RolledBack,
+            }],
+        })
+    );
+}
+
+#[test]
+fn an_engine_that_retired_its_backlog_as_terminal_is_departed_not_behind() {
+    // engine-b retired its deferred messages as `terminal_group` — what an
+    // engine does once it is removed, its group disbanded, or convergence
+    // evicts it — and then kept reopening the group at 4. It left; it is not
+    // stuck. A departure is not an incident.
+    let export = load("healthy-departed-terminal-backlog.json");
+    assert_eq!(classify(&export), Verdict::Healthy);
+    assert_eq!(liveness_advisory(&export), None);
+}
+
+#[test]
+fn a_removed_copy_hydrating_is_departed_not_behind() {
+    // engine-b's device was removed from the group and keeps its copy: every
+    // session open reseeds it at 4 under `hydrate_removed_group`. The engine
+    // says, about itself, that it is no longer a member.
+    let export = load("healthy-departed-removed-copy-hydrating.json");
+    assert_eq!(classify(&export), Verdict::Healthy);
+    assert_eq!(liveness_advisory(&export), None);
+}
+
+#[test]
+fn an_account_scoped_row_does_not_block_a_departure() {
+    // engine-b left group-1, then recorded an account-wide row with no group.
+    // A row outside every group says nothing about membership, so it cannot
+    // keep the engine a member of some group it never left.
+    let export = load("healthy-departed-with-account-scoped-row.json");
+    assert_eq!(classify(&export), Verdict::Healthy);
+    assert_eq!(liveness_advisory(&export), None);
+}
+
+#[test]
+fn a_departed_engine_does_not_mask_a_live_one_left_behind() {
+    // engine-b reached 6 and was later removed. Its departure takes it out of
+    // the behind set, not out of the evidence: the group did reach 6, so
+    // engine-a at 4 is still two epochs behind.
+    assert_eq!(
+        classify(&load("quarantine-live-engine-behind-departed-one.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-a".into(),
+                    epoch: 4,
+                    mode: BehindMode::ActiveWhileBehind,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_rejoin_after_departure_restores_the_engine_to_the_behind_set() {
+    // engine-b was removed, then joined again by Welcome at 4 — and the group
+    // moved on to 6 without it. The rejoin is newer than the departure, so
+    // engine-b is a member again and its lag is a finding.
+    assert_eq!(
+        classify(&load("quarantine-rejoined-engine-behind.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 4,
+                    mode: BehindMode::ActiveWhileBehind,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn an_untimed_departure_marker_keeps_the_engine_behind() {
+    // engine-b's only departure marker carries no clock, so nothing places it
+    // against the rest of engine-b's life. Excusing a lag is the direction
+    // that can hide an incident, so it needs evidence that can be ordered:
+    // engine-b stays in the behind set.
+    assert_eq!(
+        classify(&load("quarantine-untimed-departure-marker.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 4,
+                    mode: BehindMode::ActiveWhileBehind,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn an_untimed_rejoin_keeps_the_engine_behind() {
+    // engine-b's departure is timed but its rejoin is not, so the rejoin may
+    // be the newer of the two. Reading the departure as final would excuse a
+    // member's lag on a guess: engine-b stays in the behind set. (The untimed
+    // rejoin row also forfeits engine-b's ordered epoch reading, so it is
+    // placed at its high-water.)
+    assert_eq!(
+        classify(&load("quarantine-untimed-rejoin-after-departure.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 4,
+                    mode: BehindMode::ActiveWhileBehind,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_departure_from_another_group_does_not_excuse_a_lag() {
+    // engine-b's copy of group-2 is removed, but it is still a member of
+    // group-1, where it sits two epochs behind. Departure is per group, so
+    // only an engine that left every group it recorded rows in is excused.
+    assert_eq!(
+        classify(&load("quarantine-departure-from-another-group.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 4,
+                    mode: BehindMode::ActiveWhileBehind,
+                }],
+            }
+        }
     );
 }

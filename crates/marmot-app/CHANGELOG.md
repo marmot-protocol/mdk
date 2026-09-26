@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- Preserve normalized line breaks in ingested kind:0 `about` text while still removing
+  unsafe controls from every known profile string. Previously flattened cached bios stay
+  until a newer event replaces them. (#1973)
+
+- Count account-scoped relay publishes on the shared device-wide publish counters.
+  `relay_publish_attempts` was previously always zero in production. Success now
+  requires the acknowledgement threshold, and publishes dropped in flight (such as
+  endpoints abandoned after quorum) count under the new `publish_cancellations` /
+  `relay_publish_cancellations` series rather than as failures. (#1950)
 - Judge epoch-backfill overflow retry backoff by the durable delay. A loaded runner
   can spend more than a second after that reservation is written, which previously
   failed a test that still required nearly the full cooldown to be remaining.

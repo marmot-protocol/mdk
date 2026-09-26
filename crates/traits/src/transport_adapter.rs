@@ -831,11 +831,29 @@ pub struct OutboundFanoutOutcome {
     pub outstanding_targets: usize,
 }
 
+/// Typed provenance for an accepted endpoint publish receipt.
+///
+/// `None` on a receipt means this detail was unavailable, not that the relay
+/// proved the event was new. In particular, reconstructed durable fanout
+/// reports cannot recover the original acknowledgement kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportEndpointAckKind {
+    /// The endpoint returned an affirmative acknowledgement without a typed
+    /// duplicate marker.
+    Affirmative,
+    /// The endpoint acknowledged that it already holds this exact event.
+    Duplicate,
+}
+
 /// Successful endpoint-level publish acknowledgement.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportEndpointReceipt {
     pub endpoint: TransportEndpoint,
     pub accepted_at: Option<Timestamp>,
+    /// Present only when the transport preserved typed acknowledgement detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_kind: Option<TransportEndpointAckKind>,
 }
 
 /// Privacy-safe endpoint publish-rejection category.
@@ -1542,6 +1560,7 @@ mod tests {
                 .map(|i| TransportEndpointReceipt {
                     endpoint: TransportEndpoint(format!("wss://accepted-{i}.example")),
                     accepted_at: None,
+                    ack_kind: None,
                 })
                 .collect(),
             failed: (0..failed)
@@ -1554,6 +1573,36 @@ mod tests {
                 .collect(),
             required_acks,
         }
+    }
+
+    #[test]
+    fn endpoint_receipt_ack_kind_is_optional_and_typed() {
+        let legacy = r#"{"endpoint":"wss://relay.example","accepted_at":null}"#;
+        let receipt: TransportEndpointReceipt = serde_json::from_str(legacy).unwrap();
+        assert_eq!(receipt.ack_kind, None);
+        assert_eq!(serde_json::to_string(&receipt).unwrap(), legacy);
+
+        for (kind, encoded) in [
+            (TransportEndpointAckKind::Affirmative, "affirmative"),
+            (TransportEndpointAckKind::Duplicate, "duplicate"),
+        ] {
+            let receipt = TransportEndpointReceipt {
+                ack_kind: Some(kind),
+                ..receipt.clone()
+            };
+            let json = serde_json::to_string(&receipt).unwrap();
+            assert!(json.contains(&format!("\"ack_kind\":\"{encoded}\"")));
+            assert_eq!(
+                serde_json::from_str::<TransportEndpointReceipt>(&json).unwrap(),
+                receipt
+            );
+        }
+        assert!(
+            serde_json::from_str::<TransportEndpointReceipt>(
+                r#"{"endpoint":"wss://relay.example","accepted_at":null,"ack_kind":"guessed"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -287,6 +287,7 @@ impl NostrRelayClient for CandidateRelay {
                     outcome.accepted.push(TransportEndpointReceipt {
                         endpoint: endpoint.clone(),
                         accepted_at: None,
+                        ack_kind: None,
                     });
                 }
                 Ok(_) => outcome.failed.push(TransportEndpointFailure {

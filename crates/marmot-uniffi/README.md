@@ -306,6 +306,15 @@ the shared text-hash seed is preserved. Passing uppercase hex or an undecoded
 replaces client-owned random-roll wordlists; it is cosmetic, may
 collide, and does not create an account.
 
+`userProfile` returns the cached kind:0 projection. `about` from a fetched
+profile keeps normalized LF line breaks; `name`, `displayName`, `picture`,
+`banner`, `nip05`, and `lud16` stay single-line. Tab and other controls are
+removed on ingest. `publishUserProfile` caches the submitted local value
+without reparsing it, so a same-instance publish/read does not show incoming
+sanitization. Read another account through `refreshProfile`, then
+`userProfile` or `cachedIdentityProjections`. A bio already stored without
+line breaks stays until a newer event replaces it.
+
 `accountKeyPackages` lists the current KeyPackage winner per addressable slot
 plus local-only rows. `accountKeyPackageRelayEvents` is the additive observed
 history for that same fetch window: current and superseded kind-30443 events,
@@ -343,7 +352,22 @@ checksums, provenance, and generated-source synchronization rules.
 The Kotlin binding is generated from the same release host library metadata as Swift, so it exposes the same `Marmot`
 object, subscription objects, records, enums, and error variants.
 
-## Audit v4 adoption
+## Audit v5 recording and delivery
+
+`AuditLogSettingsFfi.enabled` remains the recording opt-in. New account sessions and the live
+runtime switch write `marmot-forensics-audit/v5` to `audit-<engine_id>-v5.jsonl`; existing v4 files
+remain on disk. To deliver v5, supply a dedicated OTLP `/v1/logs` destination and bearer token
+with `set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi)`. The configuration is held in memory and
+the returned record omits the token. Set `enabled: false` to remove delivery configuration.
+An exact loopback endpoint requires `allow_loopback_dev: true`; public endpoints require HTTPS.
+The host then calls `post_audit_log_tracker_update_v5()` for an immediate pass; the existing
+audit tracker also uses this configuration on its activity triggers with the usual batching,
+retry, and shutdown behavior. The v5 result reports accepted batches, pending accounts, blocked
+accounts, and idle accounts separately from legacy v4 uploads. No host should infer receiver
+acceptance from an empty v4 `uploaded` list. The v4 whole-file Goggles endpoint never receives
+v5 records.
+
+## Legacy audit v4 upload
 
 Audit uploads now accept only `marmot-forensics-audit/v4`; old local files are never migrated or sent.
 App construction automatically removes recognized v1-v3 forensic files and rotated segments after acquiring the

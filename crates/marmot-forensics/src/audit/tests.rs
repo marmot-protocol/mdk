@@ -345,6 +345,7 @@ fn audit_event_round_trips_through_serde() {
             group: None,
             convergence: None,
             source: None,
+            v5_welcome_refs: Vec::new(),
         }),
         kind: AuditEventKind::ForkResolution {
             source_epoch: 4,
@@ -1295,6 +1296,7 @@ fn sample_events_serialize_within_schema_property_names() {
                 local_member_ref: Some("b".repeat(32)),
                 ..Default::default()
             }),
+            v5_welcome_refs: Vec::new(),
         }),
         kind: AuditEventKind::SendEntry {
             intent_kind: "app_message".into(),
@@ -1750,13 +1752,18 @@ fn failed_flush_does_not_seal_or_discard_buffered_rows() {
     let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
     let before = fs::read(&path).unwrap();
     let mut inner = recorder.inner.lock().unwrap();
-    inner.writer = BufWriter::new(File::open(&path).unwrap());
+    inner.writer = Some(BufWriter::new(File::open(&path).unwrap()));
     inner
         .writer
+        .as_mut()
+        .expect("active writer")
         .write_all(b"buffered but unwritable\n")
         .unwrap();
     assert!(recorder.roll_into_segment(&mut inner).is_err());
-    assert_eq!(inner.writer.buffer(), b"buffered but unwritable\n");
+    assert_eq!(
+        inner.writer.as_ref().expect("active writer").buffer(),
+        b"buffered but unwritable\n"
+    );
     assert_eq!(inner.health.flush_failures, 1);
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(segment_paths(&path).is_empty());
@@ -2335,4 +2342,418 @@ fn size_rotation_without_source_context_does_not_invent_metadata() {
             AuditEventKind::SourceContext { .. }
         ));
     }
+}
+
+#[test]
+fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
+    use crate::v5::{self, BuildProfile, Platform, Producer};
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder = JsonlRecorder::open_v5_with_account_ref(
+        &path,
+        "11".repeat(16),
+        Some("22".repeat(16)),
+        Producer {
+            mdk_revision: None,
+            build_profile: BuildProfile::Debug,
+            platform: Platform::Other,
+            host_build: None,
+        },
+    )
+    .unwrap();
+    let source_kinds = sample_audit_event_kinds();
+    let expected = source_kinds
+        .iter()
+        .map(AuditEventKind::type_tag)
+        .collect::<std::collections::BTreeSet<_>>();
+    for kind in source_kinds {
+        let tag = kind.type_tag();
+        let op = v5::Event::Operational(Box::new(v5::OperationalEvent::from_audit(
+            AuditRecord::new(None, kind.clone()),
+        )));
+        let converted = serde_json::to_value(op);
+        assert!(
+            converted.is_ok(),
+            "v5 conversion failed for {tag}: {converted:?}"
+        );
+        recorder.record(AuditRecord::new(None, kind));
+    }
+    let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    let mut actual = std::collections::BTreeSet::new();
+    for line in body.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            validator.is_valid(&value),
+            "v5 schema rejected {}: {:?}",
+            value["event"]["type"],
+            validator.iter_errors(&value).collect::<Vec<_>>()
+        );
+        v5::Record::from_json(line.as_bytes()).unwrap();
+        actual.insert(value["event"]["type"].as_str().unwrap().to_owned());
+        assert_eq!(value["producer"]["mdk_revision"], serde_json::Value::Null);
+        assert!(value["seq"].as_str().unwrap().parse::<u64>().unwrap() > 0);
+        assert!(!line.contains("wss://"));
+        assert!(!line.contains("unknown group"));
+    }
+    let operational = actual
+        .into_iter()
+        .filter(|kind| !kind.starts_with("recording_"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        operational,
+        expected.into_iter().map(str::to_owned).collect()
+    );
+    assert_eq!(operational.len(), 44);
+}
+
+#[test]
+fn v5_operational_wire_rejects_legacy_aliases_and_preserves_reference_domains() {
+    use crate::v5::{self, BuildProfile, EngineMessageRef, GroupRef, Platform, Producer};
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder = JsonlRecorder::open_v5_with_account_ref(
+        &path,
+        "11".repeat(16),
+        None,
+        Producer {
+            mdk_revision: None,
+            build_profile: BuildProfile::Debug,
+            platform: Platform::Other,
+            host_build: None,
+        },
+    )
+    .unwrap();
+    let raw_message = "ab".repeat(32);
+    let raw_group = "cd".repeat(16);
+    recorder.record(AuditRecord::new(
+        Some(raw_group.clone()),
+        AuditEventKind::PublishAttempt {
+            msg_id: raw_message.clone(),
+            artifact_kind: Some(MessageArtifactKind::Welcome),
+            target_kind: "group".into(),
+            relay_url: Some("wss://relay.example".into()),
+            relay_urls: vec!["wss://relay.example".into()],
+            required_acks: 1,
+            transport: None,
+        },
+    ));
+    let body = std::fs::read_to_string(path).unwrap();
+    let row = body.lines().last().unwrap();
+    let value: serde_json::Value = serde_json::from_str(row).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let expected_message =
+        EngineMessageRef::from_message_id(&hex::decode(&raw_message).unwrap()).unwrap();
+    let expected_group = GroupRef::from_group_id(&hex::decode(&raw_group).unwrap()).unwrap();
+    assert_eq!(value["event"]["message_ref"], expected_message.as_str());
+    assert_eq!(value["group_ref"], expected_group.as_str());
+    assert_ne!(value["event"]["message_ref"], raw_message);
+    assert!(!row.contains("wss://"));
+    assert!(validator.is_valid(&value));
+    v5::Record::from_json(row.as_bytes()).unwrap();
+
+    let mut mutations = Vec::new();
+    let mut legacy_name = value.clone();
+    let event = legacy_name["event"].as_object_mut().unwrap();
+    let raw_field = event.remove("message_ref").unwrap();
+    event.insert("msg_id".into(), raw_field);
+    mutations.push(legacy_name);
+    let mut raw_endpoint = value.clone();
+    raw_endpoint["event"]["endpoint_ref"] = "wss://relay.example".into();
+    mutations.push(raw_endpoint);
+    let mut object_enum = value.clone();
+    object_enum["event"]["artifact_kind"] = serde_json::json!({"welcome": null});
+    mutations.push(object_enum);
+    let mut extra = value.clone();
+    extra["event"]["unexpected"] = "safe".into();
+    mutations.push(extra);
+    let mut empty_skipped_array = value.clone();
+    empty_skipped_array["event"]["endpoint_refs"] = serde_json::json!([]);
+    mutations.push(empty_skipped_array);
+    let mut unsafe_categorical = value.clone();
+    unsafe_categorical["event"]["target_kind"] = "relay/raw-id".into();
+    mutations.push(unsafe_categorical);
+    let mut non_ascii_categorical = value.clone();
+    non_ascii_categorical["event"]["target_kind"] = "é".into();
+    mutations.push(non_ascii_categorical);
+    for mutated in mutations {
+        assert!(!validator.is_valid(&mutated));
+        assert!(v5::Record::from_json(&serde_json::to_vec(&mutated).unwrap()).is_err());
+    }
+}
+
+fn v5_test_producer() -> crate::v5::Producer {
+    crate::v5::Producer {
+        mdk_revision: None,
+        build_profile: crate::v5::BuildProfile::Debug,
+        platform: crate::v5::Platform::Other,
+        host_build: None,
+    }
+}
+
+fn v5_rows(path: &Path) -> Vec<serde_json::Value> {
+    let schema: serde_json::Value = serde_json::from_str(crate::v5::JSON_SCHEMA).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(validator.is_valid(&value));
+            crate::v5::Record::from_json(line.as_bytes()).unwrap();
+            value
+        })
+        .collect()
+}
+
+#[test]
+fn v5_recording_start_explicit_stop_and_reopen_do_not_infer_drop() {
+    use crate::v5::RecordingStopReason;
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    let rows = v5_rows(&path);
+    assert_eq!(rows[0]["event"]["type"], "recording_session_started");
+    assert_eq!(rows[0]["event"]["mode"], "opt_in_local_jsonl");
+    let first_session = rows[0]["session_id"].clone();
+    recorder.finish_v5_recording(RecordingStopReason::CleanRuntimeShutdown);
+    recorder.finish_v5_recording(RecordingStopReason::CleanRuntimeShutdown);
+    assert_eq!(
+        v5_rows(&path)
+            .iter()
+            .filter(|row| row["event"]["type"] == "recording_session_stopped")
+            .count(),
+        1
+    );
+    drop(recorder);
+
+    let reopened =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    let rows = v5_rows(&path);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event"]["type"] == "recording_session_started")
+            .count(),
+        2
+    );
+    assert_ne!(rows.last().unwrap()["session_id"], first_session);
+    let reopened_session = rows.last().unwrap()["session_id"].clone();
+    reopened.rotate().unwrap();
+    let rotated = v5_rows(&path);
+    assert_eq!(rotated[0]["event"]["type"], "recording_session_started");
+    assert_ne!(rotated[0]["session_id"], reopened_session);
+    let count_before_drop = rotated.len();
+    drop(reopened);
+    assert_eq!(v5_rows(&path).len(), count_before_drop);
+}
+
+#[test]
+fn v5_stop_crossing_segment_threshold_remains_last_in_its_session() {
+    use crate::v5::RecordingStopReason;
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: sample_source(&"22".repeat(16)),
+        },
+    ));
+    let before = v5_rows(&path);
+    assert_eq!(before.last().unwrap()["event"]["type"], "source_context");
+    // Force the exact threshold decision without writing several MiB of
+    // unrelated rows. The stop itself crosses the segment limit.
+    recorder.inner.lock().unwrap().active_bytes = AUDIT_LOG_SEGMENT_MAX_BYTES - 1;
+    recorder.finish_v5_recording(RecordingStopReason::CleanRuntimeShutdown);
+    let rows = v5_rows(&path);
+    assert_eq!(rows.len(), before.len() + 1);
+    assert_eq!(
+        rows.last().unwrap()["event"]["type"],
+        "recording_session_stopped"
+    );
+    assert_eq!(
+        rows.last().unwrap()["session_id"],
+        before.last().unwrap()["session_id"]
+    );
+    assert!(
+        segment_paths(&path).is_empty(),
+        "terminal stop must not roll and replay source"
+    );
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert_eq!(v5_rows(&path).len(), rows.len());
+}
+
+#[test]
+fn v5_partial_write_preserves_prepared_delivery_bytes_and_reports_observed_loss() {
+    use crate::local_delivery::{LocalAuditDelivery, Preparation};
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    let mut delivery =
+        LocalAuditDelivery::open(&path, dir.path().join("delivery"), "local-v5").unwrap();
+    let Preparation::Batch(prepared) = delivery.prepare_once().unwrap() else {
+        panic!("opening rows must be deliverable");
+    };
+    let prepared_bytes = prepared
+        .bodies
+        .iter()
+        .flat_map(|body| body.iter().copied())
+        .collect::<Vec<_>>();
+    recorder.fail_next_write_after_partial_bytes();
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+
+    let segments = segment_paths(&path);
+    assert_eq!(segments.len(), 1);
+    let sealed = fs::read(&segments[0]).unwrap();
+    assert!(sealed.starts_with(&prepared_bytes));
+    assert!(sealed.len() > prepared_bytes.len());
+    assert_ne!(sealed.last(), Some(&b'\n'));
+    let Preparation::Batch(replayed) = delivery.prepare_once().unwrap() else {
+        panic!("prepared original range must replay after inode rename");
+    };
+    assert_eq!(replayed.token, prepared.token);
+    assert_eq!(replayed.bodies, prepared.bodies);
+    assert_eq!(
+        delivery
+            .finish(
+                &prepared.token,
+                crate::local_delivery::ReceiverResult::Complete,
+            )
+            .unwrap(),
+        crate::local_delivery::DeliveryStep::Accepted
+    );
+    assert_eq!(
+        delivery.prepare_once().unwrap(),
+        Preparation::Step(crate::local_delivery::DeliveryStep::Gap)
+    );
+    assert!(
+        delivery
+            .gaps()
+            .iter()
+            .any(|gap| gap.reason == crate::local_delivery::GapReason::TornTail)
+    );
+    let rows = v5_rows(&path);
+    let loss = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "recording_capture_loss")
+        .expect("later safe writer reports the observed failed attempt");
+    assert_eq!(loss["event"]["write_failed_attempts"], "1");
+    assert_eq!(loss["event"]["extent"], "unknown");
+    assert_eq!(recorder.health_snapshot().write_failures, 1);
+}
+
+#[test]
+fn v5_persistent_write_failure_bounds_segment_creation_until_retry_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    recorder.fail_next_write_after_partial_bytes();
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    recorder.fail_next_write_after_partial_bytes();
+    // The first recovery seals once. The second injected failure occurs while
+    // attempting the retained loss report on the fresh writer.
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert_eq!(segment_paths(&path).len(), 1);
+    for _ in 0..8 {
+        recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    }
+    assert_eq!(segment_paths(&path).len(), 1);
+    // Health also counts the failed best-effort loss-report write itself;
+    // the loss row must not recursively count that internal attempt.
+    assert_eq!(recorder.health_snapshot().write_failures, 11);
+
+    // Advance only the test's retry clock, not wall time. A later safe write
+    // can seal the second uncertain inode and report every observed attempt.
+    recorder.inner.lock().unwrap().seal_retry_after = Some(Instant::now() - Duration::from_secs(1));
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert_eq!(segment_paths(&path).len(), 2);
+    let loss = v5_rows(&path)
+        .into_iter()
+        .find(|row| row["event"]["type"] == "recording_capture_loss")
+        .expect("later safe writer reports attempts observed during backoff");
+    assert_eq!(loss["event"]["write_failed_attempts"], "10");
+}
+
+#[test]
+fn v5_drop_discards_uncertain_buffer_without_committing_a_failed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    let before = fs::read(&path).unwrap();
+    recorder
+        .inner
+        .lock()
+        .unwrap()
+        .fail_next_v5_flush_with_buffered_row = true;
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(recorder.health_snapshot().flush_failures, 1);
+    drop(recorder);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(v5_rows(&path).len(), 2);
+}
+
+#[test]
+fn v5_loss_report_retries_in_memory_without_counting_its_own_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    recorder.fail_next_write();
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    recorder.fail_next_v5_write();
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert!(
+        !v5_rows(&path)
+            .iter()
+            .any(|row| row["event"]["type"] == "recording_capture_loss")
+    );
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    let rows = v5_rows(&path);
+    let losses = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "recording_capture_loss")
+        .collect::<Vec<_>>();
+    assert_eq!(losses.len(), 1);
+    assert_eq!(losses[0]["event"]["write_failed_attempts"], "1");
+    assert_eq!(recorder.health_snapshot().write_failures, 2);
+}
+
+#[test]
+fn v5_rejected_record_conversion_reports_a_known_drop_without_echoing_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    recorder.record(AuditRecord::new(
+        Some("secret-group-id".into()),
+        recorder_started_kind(),
+    ));
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    let body = fs::read_to_string(&path).unwrap();
+    assert!(!body.contains("secret-group-id"));
+    let rows = v5_rows(&path);
+    let loss = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "recording_capture_loss")
+        .unwrap();
+    assert_eq!(loss["event"]["serialization_failed_attempts"], "1");
+    assert_eq!(loss["event"]["write_failed_attempts"], "0");
+    assert_eq!(loss["event"]["extent"], "unknown");
 }

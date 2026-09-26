@@ -21,6 +21,10 @@ mod admission_interruption_tests;
 mod interruption_redelivery_tests;
 #[path = "recovery_lifecycle_generation_tests.rs"]
 mod recovery_lifecycle_generation_tests;
+#[path = "recovery_ordinary_seen_redelivery_tests.rs"]
+mod recovery_ordinary_seen_redelivery_tests;
+#[path = "recovery_session_generation_tests.rs"]
+mod recovery_session_generation_tests;
 
 #[derive(Clone, Debug, Default)]
 struct HeldExactQuery {
@@ -310,6 +314,9 @@ async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
     runtime
         .shared_services()
+        .use_private_recovery_credit_pool_for_test();
+    runtime
+        .shared_services()
         .bounded_group_recovery_enabled
         .store(true, Ordering::SeqCst);
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
@@ -540,6 +547,9 @@ async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
     let config = crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
     let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
+    let pool = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
     runtime
         .shared_services()
         .bounded_group_recovery_enabled
@@ -707,7 +717,7 @@ async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
             gate.hold_exact.load(Ordering::SeqCst),
             gate.reject_broad.load(Ordering::SeqCst),
             shared.bounded_preparation_probes.load(Ordering::SeqCst),
-            bounded_recovery::available_credits(),
+            bounded_recovery::available_credits(&pool),
         );
     }
     first_gate.expect("first exact-ID request enters the real relay's query gate");
@@ -763,6 +773,9 @@ async fn bounded_real_sdk_cancel_reopen_reacquires_unretained_exact_id() {
 
     let reopened_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
     let reopened_runtime = super::super::super::MarmotAppRuntime::new(reopened_app.clone());
+    reopened_runtime
+        .shared_services()
+        .set_recovery_credit_pool_for_test(pool.clone());
     reopened_runtime
         .shared_services()
         .bounded_group_recovery_enabled
@@ -907,6 +920,9 @@ async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
         crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
+    let pool = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
     runtime
         .shared_services()
         .bounded_group_recovery_enabled
@@ -1139,7 +1155,7 @@ async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
             let retry_before_finish = storage.recovery_retry_state().unwrap();
             timeout(Duration::from_secs(10), async {
                 loop {
-                    if bounded_recovery::available_credits()
+                    if bounded_recovery::available_credits(&pool)
                         == bounded_recovery::MAX_CONCURRENT_JOBS
                     {
                         break;

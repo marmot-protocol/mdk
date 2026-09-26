@@ -2358,6 +2358,28 @@ typedef struct MarmotAuditLogTrackerUpdateResult {
 } MarmotAuditLogTrackerUpdateResult;
 
 /**
+ * Result of one v5 OTLP tracker pass.
+ */
+typedef struct MarmotAuditOtlpTrackerResultV5 {
+  uint64_t accepted_batches;
+  uint64_t pending_accounts;
+  uint64_t blocked_accounts;
+  uint64_t idle_accounts;
+  char *skipped_reason;
+} MarmotAuditOtlpTrackerResultV5;
+
+/**
+ * Additive tracker result with independent v4 and v5 outcomes.
+ */
+typedef struct MarmotAuditLogTrackerUpdateResultV5 {
+  bool enabled;
+  struct MarmotAuditLogUploadResult *v4_uploaded;
+  uintptr_t v4_uploaded_len;
+  char *v4_skipped_reason;
+  struct MarmotAuditOtlpTrackerResultV5 *v5;
+} MarmotAuditLogTrackerUpdateResultV5;
+
+/**
  * Encrypted Blossom avatar reference for a chat row.
  */
 typedef struct MarmotChatListAvatar {
@@ -3571,6 +3593,18 @@ typedef struct MarmotAuditLogTrackerConfigV4 {
   char *authorization_bearer_token;
   struct MarmotAuditLogUploadSourceV4 source;
 } MarmotAuditLogTrackerConfigV4;
+
+/**
+ * Write-only v5 OTLP delivery configuration. Credentials are redacted in
+ * the returned copy; the host owns the borrowed input strings.
+ */
+typedef struct MarmotAuditOtlpConfigV5 {
+  bool enabled;
+  char *destination;
+  char *endpoint;
+  char *authorization_bearer_token;
+  bool allow_loopback_dev;
+} MarmotAuditOtlpConfigV5;
 
 /**
  * One attachment to encrypt and upload. Borrowed input only: the
@@ -6979,6 +7013,18 @@ MarmotStatus marmot_post_audit_log_tracker_update(const struct MarmotClient *cli
                                                   struct MarmotAuditLogTrackerUpdateResult **out);
 
 /**
+ * Run the same tracker pass with independent v4/v5 outcomes.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_post_audit_log_tracker_update_v5(const struct MarmotClient *client,
+                                                     struct MarmotAuditLogTrackerUpdateResultV5 **out);
+
+/**
  * The account's chat list rows. Free with
  * `marmot_chat_list_row_list_free`.
  *
@@ -8076,6 +8122,19 @@ MarmotStatus marmot_set_audit_log_tracker_config(const struct MarmotClient *clie
 MarmotStatus marmot_set_audit_log_tracker_config_v4(const struct MarmotClient *client,
                                                     const struct MarmotAuditLogTrackerConfigV4 *config,
                                                     struct MarmotAuditLogTrackerConfigV4 **out);
+
+/**
+ * Configure or disable the dedicated v5 OTLP audit sender. The returned
+ * config never contains the bearer token. Free it with
+ * `marmot_audit_otlp_config_v5_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `config` a valid borrowed struct;
+ * `out` valid.
+ */
+MarmotStatus marmot_set_audit_otlp_config_v5(const struct MarmotClient *client,
+                                             const struct MarmotAuditOtlpConfigV5 *config,
+                                             struct MarmotAuditOtlpConfigV5 **out);
 
 /**
  * Publish the account's kind:0 profile metadata. The returned profile is
@@ -10348,6 +10407,26 @@ void marmot_audit_log_delete_result_free(struct MarmotAuditLogDeleteResult *ptr)
  * this library.
  */
 void marmot_audit_log_tracker_update_result_free(struct MarmotAuditLogTrackerUpdateResult *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_audit_otlp_config_v5_free(struct MarmotAuditOtlpConfigV5 *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_audit_log_tracker_update_result_v5_free(struct MarmotAuditLogTrackerUpdateResultV5 *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

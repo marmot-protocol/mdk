@@ -135,10 +135,10 @@ pub use runtime::{
     AccountAttentionUnavailable, AccountManager, AccountSetupReadiness, AccountSetupRequest,
     AccountSetupResult, AgentPublisher, AgentPublisherOptions, AgentPublisherRecord,
     AgentPublisherRouting, AgentStreamWatchOptions, AgentTextStreamCryptoContext,
-    CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
-    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction, OnboardingDeviceDiscovery,
-    OnboardingDevicePackage, OnboardingFinding, OnboardingIssue, OnboardingOptions,
-    OnboardingRelayCapability, OnboardingRelayRepair, OnboardingRelayRepairMode,
+    AuditOtlpAttemptOutcome, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
+    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
+    OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding, OnboardingIssue,
+    OnboardingOptions, OnboardingRelayCapability, OnboardingRelayRepair, OnboardingRelayRepairMode,
     OnboardingRelayTag, OnboardingRelayTagChange, OnboardingRelayTagDisposition,
     OnboardingRelayTagRole, OnboardingRepairProposal, OnboardingSingleDeviceNotice,
     OnboardingSnapshot, OnboardingStatus, OnboardingStep, OnboardingStepState,
@@ -185,7 +185,7 @@ pub use app_telemetry::{
 };
 pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
-    AuditLogUploadResult,
+    AuditLogUploadResult, AuditOtlpTrackerResult,
 };
 pub use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,
@@ -530,6 +530,8 @@ pub struct MarmotApp {
     inventory_snapshot_between_reads: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
     #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
+    #[cfg(test)]
+    audit_v5_peel_slot: Option<(String, Arc<Mutex<client::audit_v5_probe::PeelSlot>>)>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
@@ -1272,6 +1274,7 @@ struct KeyPackageRecord {
 
 struct OpenAppAccount {
     runtime: AppRuntime,
+    audit_v5_peel_slot: Arc<Mutex<client::audit_v5_probe::PeelSlot>>,
     session_guard: AppAccountSessionGuard,
     adapter: MarmotRelayPlaneAccountAdapter,
     routing: AppTransportRouting,
@@ -1470,6 +1473,8 @@ impl MarmotApp {
             inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
+            #[cfg(test)]
+            audit_v5_peel_slot: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
@@ -1556,6 +1561,8 @@ impl MarmotApp {
             inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
+            #[cfg(test)]
+            audit_v5_peel_slot: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
@@ -1753,7 +1760,14 @@ impl MarmotApp {
                 client::recovery::wall_now_ms()?,
             )?;
         }
+        let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
         let mut client = AppClient {
+            #[cfg(test)]
+            test_recovery_selection_witness: None,
+            #[cfg(test)]
+            test_recovery_phase_witness: None,
+            audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
+            audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
             #[cfg(test)]
             test_recovery_evidence: None,
             #[cfg(test)]
@@ -1837,6 +1851,7 @@ impl MarmotApp {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
             client.reconcile_hydrated_account_state()?;
+            client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
         }
         Ok(client)
     }
@@ -3411,9 +3426,9 @@ impl MarmotApp {
         Ok(self.account_storage(label)?.epoch_stall_evidence()?)
     }
 
-    /// `group_id_hex` of every `account_groups` row still carrying the migration
-    /// default `self_membership = 'member'`. The one-time open/upgrade backfill
-    /// uses this to derive membership for legacy rows from current engine state.
+    /// `group_id_hex` of every `account_groups` row carrying
+    /// `self_membership = 'member'`. The one-time open/upgrade backfill reads
+    /// this complete candidate set only while its account marker is absent.
     pub(crate) fn account_group_ids_defaulting_to_member(
         &self,
         account_ref: &str,
@@ -3730,6 +3745,20 @@ impl MarmotApp {
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
         let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer.clone());
+        #[cfg(test)]
+        let audit_v5_peel_slot = self
+            .audit_v5_peel_slot
+            .as_ref()
+            .filter(|(selected, _)| selected == label)
+            .map(|(_, slot)| slot.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default())));
+        #[cfg(not(test))]
+        let audit_v5_peel_slot = Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default()));
+        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> =
+            Box::new(client::audit_v5_probe::ProbePeeler {
+                inner: peeler,
+                slot: audit_v5_peel_slot.clone(),
+            });
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // load_state/account_storage above completed the first database open.
         // Serialize any remaining key-migration probe with other openers.
@@ -3756,7 +3785,7 @@ impl MarmotApp {
             session_path,
             session_key,
             account_id.as_slice().to_vec(),
-            Box::new(peeler),
+            peeler,
         )
         .account_identity_proof_signer(signer.as_proof_signer())
         .feature_registry(app_feature_registry())
@@ -3840,6 +3869,7 @@ impl MarmotApp {
         }
         Ok(OpenAppAccount {
             runtime,
+            audit_v5_peel_slot,
             session_guard,
             adapter,
             routing,

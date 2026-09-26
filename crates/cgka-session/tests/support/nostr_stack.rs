@@ -140,6 +140,7 @@ impl NostrRelayClient for FakeRelayClient {
                 .map(|endpoint| TransportEndpointReceipt {
                     endpoint,
                     accepted_at: None,
+                    ack_kind: None,
                 })
                 .collect(),
             failed: endpoints

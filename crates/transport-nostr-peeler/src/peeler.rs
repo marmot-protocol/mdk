@@ -40,6 +40,15 @@ const MAX_WELCOME_RELAY_URL_LEN: usize = 512;
 /// (`spec/transports/nostr.md`: `aad = ""`).
 const GROUP_AAD: &[u8] = b"";
 
+/// Canonical public event identities established by one successful Welcome peel.
+/// The rumor ID is computed from authenticated fields, never read from the
+/// optional, self-reported ID on an unsigned rumor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WelcomePeelProvenance {
+    pub rumor_event_id: [u8; 32],
+    pub key_package_event_id: [u8; 32],
+}
+
 /// Nostr implementation of the Marmot transport peeler.
 #[derive(Clone, Debug)]
 pub struct NostrMlsPeeler {
@@ -179,6 +188,82 @@ impl NostrMlsPeeler {
             PeelerError::WrapFailed(format!("recipient MemberId is not a Nostr pubkey: {e}"))
         })
     }
+
+    /// Peel once and return the public IDs validated at this transport boundary.
+    /// Existing callers use `TransportPeeler::peel_welcome`, which discards this
+    /// metadata without changing admission or error behavior.
+    pub async fn peel_welcome_with_provenance(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+        let signer = self.welcome_signer()?;
+        let event = NostrTransportEvent::from_transport_message(msg).map_err(to_peeler_error)?;
+        if event.kind != KIND_NIP59_GIFT_WRAP {
+            return Err(PeelerError::Malformed(format!(
+                "expected kind {KIND_NIP59_GIFT_WRAP}, got {}",
+                event.kind
+            )));
+        }
+        ensure_welcome_routing_matches(&event, msg)?;
+        let gift_wrap = event.to_verified_nostr_event().map_err(to_peeler_error)?;
+        let unwrapped =
+            nostr::nips::nip59::extract_rumor_async(&SdkSigner(signer.clone()), &gift_wrap)
+                .await
+                .map_err(map_nip59_error)?;
+
+        if unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR) {
+            return Err(PeelerError::Malformed(format!(
+                "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
+                u16::from(unwrapped.rumor.kind)
+            )));
+        }
+
+        // NIP-59 verifies the signed gift wrap and seal and matches the rumor
+        // author to the seal. It does not verify UnsignedEvent.id; compute the
+        // canonical ID from those authenticated rumor fields instead.
+        let rumor_event_id = unwrapped.rumor.compute_id().to_bytes();
+        // spec/transports/nostr.md — the kind-444 welcome rumor links to the
+        // KeyPackage event consumed for this welcome and carries the group
+        // relay list the new member should use next. Both tags are
+        // routing-significant, so duplicates are rejected and the relay values
+        // are content-validated before anything downstream sees them (#709).
+        let key_package_event_id = rumor_single_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG)?;
+        let key_package_event_id: [u8; 32] =
+            decode_hex_exact("welcome e tag", key_package_event_id, 32)
+                .map_err(to_peeler_error)?
+                .try_into()
+                .map_err(|_| PeelerError::Malformed("welcome e tag is not 32 bytes".into()))?;
+        let relays = rumor_single_tag_values(&unwrapped.rumor, WELCOME_RELAYS_TAG)?;
+        validate_welcome_relays(&relays).map_err(PeelerError::Malformed)?;
+
+        let welcome_bytes = BASE64_STANDARD
+            .decode(unwrapped.rumor.content.as_bytes())
+            .map_err(|e| {
+                PeelerError::Malformed(format!("welcome rumor content is not base64: {e}"))
+            })?;
+        if welcome_bytes.is_empty() {
+            return Err(PeelerError::Malformed(
+                "welcome rumor contained empty MLS welcome bytes".into(),
+            ));
+        }
+
+        Ok((
+            PeeledMessage {
+                id: msg.id.clone(),
+                group_id: None,
+                sender: Some(MemberId::new(unwrapped.sender.to_bytes().to_vec())),
+                content: PeeledContent::Welcome {
+                    created_at: Some(cgka_traits::Timestamp(unwrapped.rumor.created_at.as_secs())),
+                    bytes: welcome_bytes,
+                },
+                origin: msg.clone(),
+            },
+            WelcomePeelProvenance {
+                rumor_event_id,
+                key_package_event_id,
+            },
+        ))
+    }
 }
 
 impl Default for NostrMlsPeeler {
@@ -241,59 +326,9 @@ impl TransportPeeler for NostrMlsPeeler {
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        let signer = self.welcome_signer()?;
-        let event = NostrTransportEvent::from_transport_message(msg).map_err(to_peeler_error)?;
-        if event.kind != KIND_NIP59_GIFT_WRAP {
-            return Err(PeelerError::Malformed(format!(
-                "expected kind {KIND_NIP59_GIFT_WRAP}, got {}",
-                event.kind
-            )));
-        }
-        ensure_welcome_routing_matches(&event, msg)?;
-        let gift_wrap = event.to_verified_nostr_event().map_err(to_peeler_error)?;
-        let unwrapped =
-            nostr::nips::nip59::extract_rumor_async(&SdkSigner(signer.clone()), &gift_wrap)
-                .await
-                .map_err(map_nip59_error)?;
-
-        if unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR) {
-            return Err(PeelerError::Malformed(format!(
-                "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
-                u16::from(unwrapped.rumor.kind)
-            )));
-        }
-
-        // spec/transports/nostr.md — the kind-444 welcome rumor links to the
-        // KeyPackage event consumed for this welcome and carries the group
-        // relay list the new member should use next. Both tags are
-        // routing-significant, so duplicates are rejected and the relay values
-        // are content-validated before anything downstream sees them (#709).
-        let key_package_event_id = rumor_single_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG)?;
-        decode_hex_exact("welcome e tag", key_package_event_id, 32).map_err(to_peeler_error)?;
-        let relays = rumor_single_tag_values(&unwrapped.rumor, WELCOME_RELAYS_TAG)?;
-        validate_welcome_relays(&relays).map_err(PeelerError::Malformed)?;
-
-        let welcome_bytes = BASE64_STANDARD
-            .decode(unwrapped.rumor.content.as_bytes())
-            .map_err(|e| {
-                PeelerError::Malformed(format!("welcome rumor content is not base64: {e}"))
-            })?;
-        if welcome_bytes.is_empty() {
-            return Err(PeelerError::Malformed(
-                "welcome rumor contained empty MLS welcome bytes".into(),
-            ));
-        }
-
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: Some(MemberId::new(unwrapped.sender.to_bytes().to_vec())),
-            content: PeeledContent::Welcome {
-                created_at: Some(cgka_traits::Timestamp(unwrapped.rumor.created_at.as_secs())),
-                bytes: welcome_bytes,
-            },
-            origin: msg.clone(),
-        })
+        self.peel_welcome_with_provenance(msg)
+            .await
+            .map(|(peeled, _)| peeled)
     }
 
     async fn wrap_group_message(
@@ -1049,6 +1084,41 @@ mod tests {
                 bytes: b"mls welcome bytes".to_vec(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn welcome_provenance_uses_computed_unsigned_rumor_id() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+        let base = EventBuilder::new(
+            Kind::Custom(KIND_MARMOT_WELCOME_RUMOR),
+            BASE64_STANDARD.encode(b"mls welcome bytes"),
+        )
+        .tags([
+            Tag::custom(KEY_PACKAGE_EVENT_TAG, ["44".repeat(32)]),
+            Tag::custom(WELCOME_RELAYS_TAG, ["wss://group-a.example"]),
+        ])
+        .finalize_unsigned(sender.public_key());
+        let expected = base.compute_id().to_bytes();
+        for claimed in [
+            None,
+            Some(nostr::prelude::EventId::from_byte_array([0x77; 32])),
+        ] {
+            let mut rumor = base.clone();
+            rumor.id = claimed;
+            let wrap = GiftWrapBuilder::new(receiver.public_key(), rumor)
+                .finalize(&sender)
+                .unwrap();
+            let message = NostrTransportEvent::from_nostr_event(&wrap)
+                .unwrap()
+                .to_transport_message()
+                .unwrap();
+            let (peeled, provenance) = peeler.peel_welcome_with_provenance(&message).await.unwrap();
+            assert!(matches!(peeled.content, PeeledContent::Welcome { .. }));
+            assert_eq!(provenance.rumor_event_id, expected);
+            assert_eq!(provenance.key_package_event_id, [0x44; 32]);
+        }
     }
 
     #[tokio::test]

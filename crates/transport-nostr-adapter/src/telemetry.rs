@@ -870,6 +870,25 @@ mod tests {
         assert_eq!(registry.index_for(&a), first, "stable across calls");
     }
 
+    // Freeze the inactive v5 contract's endpoint inputs against the real owner parser.
+    // This is test-only: no v5 emission, reference export or new dependency is enabled.
+    #[test]
+    fn audit_v5_endpoint_vectors_match_owner_normalization() {
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../marmot-forensics/tests/fixtures/v5/endpoints.json"
+        ))
+        .unwrap();
+        for vector in vectors {
+            let raw = vector["raw"].as_str().unwrap();
+            // Unlike the general registry fallback, audit references require a valid URL.
+            assert!(RelayUrl::parse(raw).is_ok());
+            assert_eq!(
+                relay_index_key(&TransportEndpoint(raw.into())).as_str(),
+                vector["normalized"].as_str().unwrap()
+            );
+        }
+    }
+
     #[test]
     fn registry_folds_verbatim_and_normalized_relay_spellings() {
         let mut registry = RelayIndexRegistry::default();

@@ -227,14 +227,52 @@ Precedence, highest first:
    high-water mark by ≥ 2 epochs (one epoch is routine commit propagation).
    The reason names every engine left behind with its epoch and a per-engine
    mode: **`went_dark`** (its events end before — or within one hour of — the
-   group provably advancing past it: a dead device, stopped uploads, or a
-   member who left; telling a departure apart needs a member↔engine linkage
-   the export does not carry yet), **`active_while_behind`** (it kept
-   recording events for over an hour after the group moved past it without
-   catching up: commits are not reaching it while its other traffic flows), or
-   **`rolled_back`** (its newest timed epoch is *below* one it already
-   reported). A real liveness incident, but not a branch contest, so there is
-   nothing to replay — the named engines are the triage starting point.
+   group provably advancing past it: a dead device or stopped uploads),
+   **`active_while_behind`** (it kept recording events for over an hour after
+   the group moved past it without catching up: commits are not reaching it
+   while its other traffic flows), or **`rolled_back`** (its own state now
+   sits *below* an epoch it already held, with no lawful rewind in between).
+   A real liveness incident, but not a branch contest, so there is nothing to
+   replay — the named engines are the triage starting point.
+
+   **A departed engine is not behind.** A removed copy keeps writing
+   hydration rows on every session open, so without this it reads as active
+   while behind. Engines are known only by `engine_id` and the export links
+   none to a member (`local_member_ref` rides only on Goggles `source` rows,
+   which this parser counts but does not join), so only what an engine records
+   about *itself* counts: `message_state_changed{reason: terminal_group}` (it
+   retired its backlog because the group became terminal for it — removal,
+   disband, convergence eviction; the row's epoch is the retired message's, so
+   it is a marker, not a departure epoch), `epoch_state_changed{reason:
+   hydrate_removed_group}` (mdk#1965). A removed copy's ingest refusal
+   (`ingest_outcome{local_state, removed}`) is not a marker: the engine
+   records it without a `group_ref`, so it cannot say which group was left.
+   A rejoin by Welcome
+   (`epoch_state_changed{new_state: stable}` with reason `join_welcome`,
+   `join_welcome_repair`, or `recipient_confirmed_rejoin`) cancels it. The
+   fold mirrors rule 5's: per `(engine_id, group_ref)`, departed iff the newest
+   marker is strictly after the newest rejoin; a tie or any untimed marker or
+   rejoin keeps the engine a member (excusing a lag is the fail-open
+   direction), and an engine is excused only if it departed every group it
+   recorded rows in. A departed engine leaves the behind set only — it still
+   counts toward the group tip — and is no quarantine reason of its own. Other
+   engines' views of a removal (`member_removed`, a `leave` send) are not
+   used: without the identity join they cannot be pinned to an engine, and a
+   wrong pin hides a stuck device. A member who left without its engine
+   saying so still reads as behind until Goggles `source` rows supply that
+   join.
+
+   An engine's **position** comes only from its own-state rows. A
+   `message_state_changed` row carries the handled message's epoch, which can
+   sit above the engine (a message deferred for a commit it has not applied),
+   so message rows count toward the group tip and liveness but never place an
+   engine — unless it has no own-state rows at all, where they are the only
+   evidence of its position but never of a rollback. An `epoch_state_changed{reason:
+   begin_pending}` row is stamped with the *projected* epoch of a commit being
+   staged, so it counts for nothing: a failed publish would otherwise read as
+   a rollback and raise the group tip to an epoch nobody reached. (Hydration
+   rows in `pending_publish` carry the real epoch, hence the match on reason,
+   not state.)
 
    The lag is measured from each engine's **current** epoch — its newest timed
    observation — not from its high-water mark. The two agree on every engine
@@ -246,17 +284,25 @@ Precedence, highest first:
    the measured lag, reading the current epoch can add a finding but never mask
    one — including engines the high-water reading kept under the ≥ 2 threshold
    entirely (`quarantine-rolled-back-engine.json` is that case: `Healthy`
-   before, quarantined after). **One untimed epoch row forfeits the current
-   reading for that whole engine**, the same way one untimed halt row makes
-   rule 5's halt side unorderable: an untimed row may be the engine's newest,
-   so preferring the newest *timed* row would invent a rollback out of forward
-   movement nobody stamped. Such an engine keeps the high-water reading and
-   classifies exactly as before.
+   before, quarantined after). **One untimed row among those placing the
+   engine forfeits the current reading for that whole engine**, the same way
+   one untimed halt row makes rule 5's halt side unorderable: an untimed row
+   may be the engine's newest, so preferring the newest *timed* row would
+   invent a rollback out of forward movement nobody stamped. Such an engine
+   keeps the high-water reading and is never `rolled_back`.
 
    `rolled_back` outranks the other two modes, which a rolled-back engine also
-   satisfies by construction (it is necessarily either dark or active). Nothing
-   in the protocol walks an epoch backwards, so the rollback is a local-storage
-   event: a device restored from an older backup, a rolled-back database.
+   satisfies by construction (it is necessarily either dark or active). The
+   protocol does walk an epoch backwards in one case: a `convergence_decision`
+   whose `selected_tip_epoch` is below its `current_tip_epoch` reorgs the
+   engine onto a shorter branch (the real a900720e export carries three,
+   61 → 59). So the engine's timed own-state rows are ordered, and such a
+   decision lowers the standing high-water to the tip it selected — but only
+   when it starts from that high-water, because a rewind cannot explain a drop
+   that happened before it. `rolled_back` is a regression still standing at
+   the end: a local-storage event, such as a device restored from an older
+   backup or a rolled-back database (the 8413db02 committer confirmed its own
+   commit at 81, then reopened at 78).
 
    The mode reports where the device is, not that it is beyond repair. A
    restored device still holds valid state at the epoch it fell back to, so a

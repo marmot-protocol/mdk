@@ -144,7 +144,11 @@ impl AuditRowTracker {
             let lines = text.lines().collect::<Vec<_>>();
             let seen = self.consumed_lines.entry(file.path.clone()).or_insert(0);
             for line in &lines[*seen..] {
-                rows.push(serde_json::from_str::<serde_json::Value>(line).unwrap());
+                marmot_forensics::v5::Record::from_json(line.as_bytes())
+                    .expect("real v5 cursor row");
+                let mut row = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                row["kind"] = row["event"].clone();
+                rows.push(row);
             }
             *seen = lines.len();
         }

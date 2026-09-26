@@ -53,9 +53,9 @@ does not attribute ordinary retention to bounded result admission.
 - One bounded attempt with a nonempty durable prefix and a distinct unretained
   eligible suffix; current production selection requests one known ID per
   attempt.
-- SDK-seen but unretained event redelivery with the same live SDK cache, plus
-  released and resource-refused event redelivery through real relay/worker
-  paths.
+- Released and resource-refused event redelivery through real relay/worker
+  paths. Same-live-SDK ordinary-seen redelivery is qualified separately in
+  [the focused fixture](recovery-ordinary-seen-redelivery-qualification.md).
 - In-flight receipt-release and inventory revisions for a real retained
   transport row, and session-generation changes around valid partial progress
   and completion.

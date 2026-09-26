@@ -1,0 +1,4527 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.marmot.dev/forensics/audit-log-event.v5.schema.json",
+  "title": "Marmot audit v5 typed lifecycle, app, Welcome and operational events",
+  "$comment": "Strict JSONL record shape. The 44 operational event types retain typed v4 diagnostic facts with v5 source/session sequence, hashed group/message/endpoint and distinct legacy member reference domains. Record::new enforces typed cross-field semantics. Input framing, duplicates, and <=65535 bytes are checked before typed validation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_ref",
+    "session_id",
+    "seq",
+    "wall_time_ms",
+    "mono_us",
+    "producer",
+    "group_ref",
+    "event"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "#/$defs/SchemaVersion"
+    },
+    "source_ref": {
+      "$ref": "#/$defs/SourceRef"
+    },
+    "session_id": {
+      "$ref": "#/$defs/SessionId"
+    },
+    "seq": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/U64String"
+        },
+        {
+          "not": {
+            "const": "0"
+          }
+        }
+      ]
+    },
+    "wall_time_ms": {
+      "$ref": "#/$defs/I64String"
+    },
+    "mono_us": {
+      "$ref": "#/$defs/U64String"
+    },
+    "producer": {
+      "$ref": "#/$defs/Producer"
+    },
+    "group_ref": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GroupRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "event": {
+      "$ref": "#/$defs/Event"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": { "type": { "enum": [
+              "recording_session_started", "recording_session_stopped", "recording_capture_loss",
+              "runtime_publication_outcome"
+            ] } },
+            "required": ["type"]
+          }
+        }
+      },
+      "then": { "properties": { "group_ref": { "type": "null" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "app_group_update_finished"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "group_baseline"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": { "type": { "const": "group_baseline_inventory" } },
+            "required": ["type"]
+          }
+        }
+      },
+      "then": { "properties": { "group_ref": { "type": "null" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "welcome_prepared"
+              },
+              "construction": {
+                "const": "constructed"
+              }
+            },
+            "required": [
+              "type",
+              "construction"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "welcome_join_finished"
+              },
+              "result": {
+                "const": "joined"
+              }
+            },
+            "required": [
+              "type",
+              "result"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "SourceRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "minLength": 32,
+      "maxLength": 32
+    },
+    "SessionId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "minLength": 32,
+      "maxLength": 32
+    },
+    "LocalId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "minLength": 32,
+      "maxLength": 32
+    },
+    "GroupRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "MemberRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "NostrEventRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "EngineMessageRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "EndpointRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "Revision": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+      "minLength": 40,
+      "maxLength": 64
+    },
+    "BuildToken": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9._+\\-]+$"
+    },
+    "U64String": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+      "minLength": 1,
+      "maxLength": 20
+    },
+    "I64String": {
+      "type": "string",
+      "pattern": "^(?:(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)|-(?!0(?:$))(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-7]|9223372036854775808))$",
+      "minLength": 1,
+      "maxLength": 20
+    },
+    "SchemaVersion": {
+      "enum": [
+        "marmot-forensics-audit/v5"
+      ]
+    },
+    "BuildProfile": {
+      "enum": [
+        "release",
+        "debug"
+      ]
+    },
+    "Platform": {
+      "enum": [
+        "ios",
+        "macos",
+        "android",
+        "linux",
+        "windows",
+        "wasm",
+        "other"
+      ]
+    },
+    "Mode": {
+      "enum": [
+        "founding",
+        "invite"
+      ]
+    },
+    "Construction": {
+      "enum": [
+        "constructed",
+        "failed"
+      ]
+    },
+    "Retention": {
+      "enum": [
+        "committed",
+        "failed",
+        "not_attempted",
+        "unknown"
+      ]
+    },
+    "PreparationStage": {
+      "enum": [
+        "selection",
+        "validation",
+        "construction",
+        "retention"
+      ]
+    },
+    "PreparationReason": {
+      "enum": [
+        "no_usable_key_package",
+        "key_package_invalid",
+        "construction_failed",
+        "retention_failed",
+        "storage_failed",
+        "internal_failed",
+        "unclassified"
+      ]
+    },
+    "RouteSource": {
+      "enum": [
+        "resolved_inbox",
+        "retained_target",
+        "configured_fallback",
+        "unknown"
+      ]
+    },
+    "EndpointStatus": {
+      "enum": [
+        "acknowledged",
+        "failed"
+      ]
+    },
+    "EndpointFailureKind": {
+      "enum": [
+        "terminal_rejected",
+        "not_exposed",
+        "possibly_exposed",
+        "retryable_unavailable"
+      ]
+    },
+    "RejectionCategory": {
+      "enum": [
+        "duplicate",
+        "pow",
+        "blocked",
+        "rate-limited",
+        "invalid",
+        "error",
+        "unsupported",
+        "auth-required",
+        "restricted"
+      ]
+    },
+    "Policy": {
+      "enum": [
+        "met",
+        "unmet",
+        "unknown"
+      ]
+    },
+    "RetainedState": {
+      "enum": [
+        "pending",
+        "completed",
+        "unknown"
+      ]
+    },
+    "NotStartedReason": {
+      "enum": [
+        "no_eligible_route",
+        "route_resolution_failed",
+        "retained_state_failed"
+      ]
+    },
+    "Acquisition": {
+      "enum": [
+        "live",
+        "history",
+        "local_replay",
+        "unknown"
+      ]
+    },
+    "UnwrapResult": {
+      "enum": [
+        "validated",
+        "rejected",
+        "failed"
+      ]
+    },
+    "UnwrapReason": {
+      "enum": [
+        "wrong_recipient",
+        "invalid_signature",
+        "invalid_encoding",
+        "unwrap_failed",
+        "internal_failed",
+        "unclassified"
+      ]
+    },
+    "JoinResult": {
+      "enum": [
+        "joined",
+        "duplicate",
+        "deferred",
+        "rejected",
+        "failed"
+      ]
+    },
+    "JoinReason": {
+      "enum": [
+        "wrong_recipient",
+        "invalid_signature",
+        "invalid_encoding",
+        "unsupported_feature",
+        "authorization_failed",
+        "missing_key_package",
+        "rejoin_confirmation_required",
+        "duplicate",
+        "storage_failed",
+        "internal_failed",
+        "unclassified"
+      ]
+    },
+    "EngineCommit": {
+      "enum": [
+        "committed",
+        "rolled_back",
+        "not_attempted",
+        "unknown"
+      ]
+    },
+    "UpdateCause": {
+      "enum": [
+        "welcome_join",
+        "invite_confirmation",
+        "retained_event_replay"
+      ]
+    },
+    "Compute": {
+      "enum": [
+        "completed",
+        "unchanged",
+        "failed"
+      ]
+    },
+    "Checkpoint": {
+      "enum": [
+        "committed",
+        "failed_before_commit",
+        "unknown"
+      ]
+    },
+    "InviteState": {
+      "enum": [
+        "pending_confirmation",
+        "accepted",
+        "unknown"
+      ]
+    },
+    "UpdateReason": {
+      "enum": [
+        "storage_failed",
+        "projection_failed",
+        "internal_failed",
+        "unclassified"
+      ]
+    },
+    "BaselineReason": {
+      "enum": [
+        "created",
+        "joined",
+        "audit_enabled",
+        "opened",
+        "active_refresh"
+      ]
+    },
+    "Limitation": {
+      "enum": [
+        "member_limit",
+        "member_identity_invalid",
+        "byte_limit",
+        "admin_policy_unavailable",
+        "state_unavailable"
+      ]
+    },
+    "Capture": {
+      "enum": [
+        "complete",
+        "partial",
+        "failed"
+      ]
+    },
+    "Basis": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "founding"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "commit_ref"
+          ],
+          "properties": {
+            "kind": {
+              "const": "commit"
+            },
+            "commit_ref": {
+              "$ref": "#/$defs/EngineMessageRef"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "unavailable"
+            }
+          }
+        }
+      ]
+    },
+    "Producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mdk_revision",
+        "build_profile",
+        "platform",
+        "host_build"
+      ],
+      "properties": {
+        "mdk_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "build_profile": {
+          "$ref": "#/$defs/BuildProfile"
+        },
+        "platform": {
+          "$ref": "#/$defs/Platform"
+        },
+        "host_build": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BuildToken"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "EndpointResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint_ref",
+        "status",
+        "failure_kind",
+        "rejection_category"
+      ],
+      "properties": {
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "status": {
+          "$ref": "#/$defs/EndpointStatus"
+        },
+        "failure_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointFailureKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rejection_category": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RejectionCategory"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "acknowledged"
+                },
+                "failure_kind": {
+                  "const": null
+                },
+                "rejection_category": {
+                  "enum": [
+                    null,
+                    "duplicate"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "failed"
+                },
+                "failure_kind": {
+                  "const": "not_exposed"
+                },
+                "rejection_category": {
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "failed"
+                },
+                "failure_kind": {
+                  "const": "possibly_exposed"
+                },
+                "rejection_category": {
+                  "enum": [
+                    null,
+                    "error"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "failed"
+                },
+                "failure_kind": {
+                  "const": "retryable_unavailable"
+                },
+                "rejection_category": {
+                  "enum": [
+                    null,
+                    "rate-limited",
+                    "auth-required"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "failed"
+                },
+                "failure_kind": {
+                  "const": "terminal_rejected"
+                },
+                "rejection_category": {
+                  "enum": [
+                    "pow",
+                    "blocked",
+                    "invalid",
+                    "unsupported",
+                    "restricted"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "BaselineMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "member_ref",
+        "admin"
+      ],
+      "properties": {
+        "member_ref": {
+          "$ref": "#/$defs/MemberRef"
+        },
+        "admin": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "WelcomePrepared": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "op_id",
+        "recipient_ref",
+        "mode",
+        "basis",
+        "key_package_event_ref",
+        "outer_event_ref",
+        "construction",
+        "retention",
+        "failure_stage",
+        "reason",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_prepared"
+        },
+        "op_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "recipient_ref": {
+          "$ref": "#/$defs/MemberRef"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "basis": {
+          "$ref": "#/$defs/Basis"
+        },
+        "key_package_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outer_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "construction": {
+          "$ref": "#/$defs/Construction"
+        },
+        "retention": {
+          "$ref": "#/$defs/Retention"
+        },
+        "failure_stage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PreparationStage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PreparationReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "founding"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "basis": {
+                "properties": {
+                  "kind": {
+                    "const": "founding"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "invite"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "basis": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "commit",
+                      "unavailable"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "construction"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outer_event_ref": {
+                "type": "null"
+              },
+              "retention": {
+                "const": "not_attempted"
+              },
+              "failure_stage": {
+                "enum": [
+                  "selection",
+                  "validation",
+                  "construction"
+                ]
+              },
+              "reason": {
+                "$ref": "#/$defs/PreparationReason"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "constructed"
+              }
+            },
+            "required": [
+              "construction"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outer_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              },
+              "key_package_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "constructed"
+              },
+              "mode": {
+                "const": "invite"
+              }
+            },
+            "required": [
+              "construction",
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "basis": {
+                "properties": {
+                  "kind": {
+                    "const": "commit"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "constructed"
+              },
+              "retention": {
+                "enum": [
+                  "committed",
+                  "not_attempted"
+                ]
+              }
+            },
+            "required": [
+              "construction",
+              "retention"
+            ]
+          },
+          "then": {
+            "properties": {
+              "failure_stage": {
+                "type": "null"
+              },
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "constructed"
+              },
+              "retention": {
+                "enum": [
+                  "failed",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "construction",
+              "retention"
+            ]
+          },
+          "then": {
+            "properties": {
+              "failure_stage": {
+                "const": "retention"
+              },
+              "reason": {
+                "enum": [
+                  "retention_failed",
+                  "storage_failed",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "failed"
+              },
+              "failure_stage": {
+                "const": "selection"
+              }
+            },
+            "required": [
+              "construction",
+              "failure_stage"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "no_usable_key_package",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              },
+              "key_package_event_ref": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "failed"
+              },
+              "failure_stage": {
+                "const": "validation"
+              }
+            },
+            "required": [
+              "construction",
+              "failure_stage"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "key_package_invalid",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "construction": {
+                "const": "failed"
+              },
+              "failure_stage": {
+                "const": "construction"
+              }
+            },
+            "required": [
+              "construction",
+              "failure_stage"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "construction_failed",
+                  "storage_failed",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomePublishStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "op_id",
+        "attempt_id",
+        "outer_event_ref",
+        "recipient_ref",
+        "route_source",
+        "targets",
+        "target_count",
+        "targets_complete",
+        "required_acks",
+        "accepted_before_count"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_publish_started"
+        },
+        "op_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "recipient_ref": {
+          "$ref": "#/$defs/MemberRef"
+        },
+        "route_source": {
+          "$ref": "#/$defs/RouteSource"
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EndpointRef"
+          },
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "target_count": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targets_complete": {
+          "type": "boolean"
+        },
+        "required_acks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "accepted_before_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "targets_complete": {
+                "const": true
+              }
+            },
+            "required": [
+              "targets_complete"
+            ]
+          },
+          "then": {
+            "properties": {
+              "targets": {
+                "minItems": 1
+              },
+              "target_count": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "target_count": {
+              "not": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomePublishFinished": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "attempt_id",
+        "outer_event_ref",
+        "results",
+        "results_complete",
+        "accepted_this_attempt_count",
+        "accepted_total_count",
+        "required_acks",
+        "policy",
+        "retained_state",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_publish_finished"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EndpointResult"
+          },
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "results_complete": {
+          "type": "boolean"
+        },
+        "accepted_this_attempt_count": {
+          "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            { "type": "null" }
+          ]
+        },
+        "accepted_total_count": {
+          "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            { "type": "null" }
+          ]
+        },
+        "required_acks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "policy": {
+          "$ref": "#/$defs/Policy"
+        },
+        "retained_state": {
+          "$ref": "#/$defs/RetainedState"
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "retained_state": {
+                "const": "completed"
+              }
+            },
+            "required": [
+              "retained_state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "policy": {
+                "const": "met"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "policy": { "enum": ["met", "unmet"] } },
+            "required": ["policy"]
+          },
+          "then": {
+            "properties": { "accepted_total_count": { "type": "integer" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "policy": { "const": "unmet" } },
+            "required": ["policy"]
+          },
+          "then": {
+            "properties": { "results_complete": { "const": true } }
+          }
+        }
+      ]
+    },
+    "WelcomePublishNotStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "op_id",
+        "outer_event_ref",
+        "recipient_ref",
+        "reason",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_publish_not_started"
+        },
+        "op_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "recipient_ref": {
+          "$ref": "#/$defs/MemberRef"
+        },
+        "reason": {
+          "$ref": "#/$defs/NotStartedReason"
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "WelcomeObserved": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "receive_id",
+        "outer_event_ref",
+        "acquisition",
+        "endpoint_ref",
+        "fetch_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_observed"
+        },
+        "receive_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "acquisition": {
+          "$ref": "#/$defs/Acquisition"
+        },
+        "endpoint_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fetch_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "acquisition": {
+                "const": "local_replay"
+              }
+            },
+            "required": [
+              "acquisition"
+            ]
+          },
+          "then": {
+            "properties": {
+              "endpoint_ref": {
+                "type": "null"
+              },
+              "fetch_id": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomeUnwrapped": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "receive_id",
+        "outer_event_ref",
+        "result",
+        "rumor_event_ref",
+        "key_package_event_ref",
+        "reason",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_unwrapped"
+        },
+        "receive_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "result": {
+          "$ref": "#/$defs/UnwrapResult"
+        },
+        "rumor_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "key_package_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnwrapReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "validated"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "rumor_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              },
+              "key_package_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              },
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "enum": [
+                  "rejected",
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "rumor_event_ref": {
+                "type": "null"
+              },
+              "key_package_event_ref": {
+                "type": "null"
+              },
+              "reason": {
+                "$ref": "#/$defs/UnwrapReason"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "rejected"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "wrong_recipient",
+                  "invalid_signature",
+                  "invalid_encoding"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "unwrap_failed",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomeJoinFinished": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "receive_id",
+        "outer_event_ref",
+        "result",
+        "reason",
+        "epoch",
+        "engine_commit",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_join_finished"
+        },
+        "receive_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "result": {
+          "$ref": "#/$defs/JoinResult"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JoinReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "epoch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "engine_commit": {
+          "$ref": "#/$defs/EngineCommit"
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "joined"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "epoch": {
+                "$ref": "#/$defs/U64String"
+              },
+              "engine_commit": {
+                "const": "committed"
+              },
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "enum": [
+                  "duplicate",
+                  "deferred",
+                  "rejected",
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "engine_commit": {
+                "enum": [
+                  "rolled_back",
+                  "not_attempted",
+                  "unknown"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "duplicate"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "const": "duplicate"
+              },
+              "engine_commit": {
+                "const": "not_attempted"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "deferred"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "const": "rejoin_confirmation_required"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "rejected"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "wrong_recipient",
+                  "invalid_signature",
+                  "invalid_encoding",
+                  "unsupported_feature",
+                  "authorization_failed",
+                  "missing_key_package",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "storage_failed",
+                  "internal_failed",
+                  "unclassified"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "AppGroupUpdateFinished": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "update_id",
+        "outer_event_ref",
+        "cause",
+        "compute",
+        "checkpoint",
+        "invite_state",
+        "reason",
+        "elapsed_us"
+      ],
+      "properties": {
+        "type": {
+          "const": "app_group_update_finished"
+        },
+        "update_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "cause": {
+          "$ref": "#/$defs/UpdateCause"
+        },
+        "compute": {
+          "$ref": "#/$defs/Compute"
+        },
+        "checkpoint": {
+          "$ref": "#/$defs/Checkpoint"
+        },
+        "invite_state": {
+          "$ref": "#/$defs/InviteState"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpdateReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "checkpoint": {
+                "const": "committed"
+              }
+            },
+            "required": [
+              "checkpoint"
+            ]
+          },
+          "then": {
+            "properties": {
+              "compute": {
+                "enum": [
+                  "completed",
+                  "unchanged"
+                ]
+              },
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "checkpoint": {
+                "const": "committed"
+              },
+              "cause": {
+                "const": "invite_confirmation"
+              }
+            },
+            "required": [
+              "checkpoint",
+              "cause"
+            ]
+          },
+          "then": {
+            "properties": {
+              "invite_state": {
+                "const": "accepted"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "checkpoint": {
+                "enum": [
+                  "failed_before_commit",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "checkpoint"
+            ]
+          },
+          "then": {
+            "properties": {
+              "invite_state": {
+                "const": "unknown"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "checkpoint": {
+                "const": "failed_before_commit"
+              }
+            },
+            "required": [
+              "checkpoint"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "$ref": "#/$defs/UpdateReason"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "compute": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "compute"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "$ref": "#/$defs/UpdateReason"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "GroupBaseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "reason",
+        "cause_outer_event_ref",
+        "epoch",
+        "basis",
+        "members",
+        "member_count",
+        "members_complete",
+        "limitations",
+        "capture"
+      ],
+      "properties": {
+        "type": {
+          "const": "group_baseline"
+        },
+        "reason": {
+          "$ref": "#/$defs/BaselineReason"
+        },
+        "cause_outer_event_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NostrEventRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "epoch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64String"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "basis": {
+          "$ref": "#/$defs/Basis"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BaselineMember"
+          },
+          "maxItems": 64,
+          "uniqueItems": true
+        },
+        "member_count": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "members_complete": {
+          "type": "boolean"
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Limitation"
+          },
+          "maxItems": 5,
+          "uniqueItems": true
+        },
+        "capture": {
+          "$ref": "#/$defs/Capture"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capture": {
+                "const": "complete"
+              }
+            },
+            "required": [
+              "capture"
+            ]
+          },
+          "then": {
+            "properties": {
+              "epoch": {
+                "$ref": "#/$defs/U64String"
+              },
+              "member_count": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "members_complete": {
+                "const": true
+              },
+              "limitations": {
+                "maxItems": 0
+              },
+              "members": {
+                "minItems": 1,
+                "items": {
+                  "properties": {
+                    "admin": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "capture": {
+                "const": "partial"
+              }
+            },
+            "required": [
+              "capture"
+            ]
+          },
+          "then": {
+            "properties": {
+              "limitations": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "capture": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "capture"
+            ]
+          },
+          "then": {
+            "properties": {
+              "epoch": {
+                "type": "null"
+              },
+              "member_count": {
+                "type": "null"
+              },
+              "members_complete": {
+                "const": false
+              },
+              "members": {
+                "maxItems": 0
+              },
+              "limitations": {
+                "contains": {
+                  "const": "state_unavailable"
+                }
+              },
+              "basis": {
+                "properties": {
+                  "kind": {
+                    "const": "unavailable"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "epoch": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "epoch"
+            ]
+          },
+          "then": {
+            "properties": {
+              "limitations": {
+                "contains": {
+                  "const": "state_unavailable"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "members": {
+                "contains": {
+                  "properties": {
+                    "admin": {
+                      "type": "null"
+                    }
+                  },
+                  "required": [
+                    "admin"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "members"
+            ]
+          },
+          "then": {
+            "properties": {
+              "limitations": {
+                "contains": {
+                  "const": "admin_policy_unavailable"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "limitations": {
+                "contains": {
+                  "enum": [
+                    "member_limit",
+                    "member_identity_invalid",
+                    "byte_limit"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "limitations"
+            ]
+          },
+          "then": {
+            "properties": {
+              "members_complete": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "joined"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "properties": {
+              "cause_outer_event_ref": {
+                "$ref": "#/$defs/NostrEventRef"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "members_complete": {
+                "const": true
+              }
+            },
+            "required": [
+              "members_complete"
+            ]
+          },
+          "then": {
+            "properties": {
+              "member_count": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "GroupBaselineInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type", "reason", "eligible_group_count", "selected_group_count",
+        "omitted_by_limit_count", "failed_read_count"
+      ],
+      "properties": {
+        "type": { "const": "group_baseline_inventory" },
+        "reason": { "enum": ["opened", "audit_enabled"] },
+        "eligible_group_count": { "anyOf": [
+          { "type": "integer", "minimum": 0, "maximum": 4294967295 }, { "type": "null" }
+        ] },
+        "selected_group_count": { "anyOf": [
+          { "type": "integer", "minimum": 0, "maximum": 64 }, { "type": "null" }
+        ] },
+        "omitted_by_limit_count": { "anyOf": [
+          { "type": "integer", "minimum": 0, "maximum": 4294967295 }, { "type": "null" }
+        ] },
+        "failed_read_count": { "anyOf": [
+          { "type": "integer", "minimum": 0, "maximum": 64 }, { "type": "null" }
+        ] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "eligible_group_count": { "type": "null" } } },
+          "then": { "properties": {
+            "selected_group_count": { "type": "null" },
+            "omitted_by_limit_count": { "type": "null" },
+            "failed_read_count": { "type": "null" }
+          } }
+        },
+        {
+          "if": { "properties": { "eligible_group_count": { "type": "integer" } } },
+          "then": { "properties": {
+            "selected_group_count": { "type": "integer" },
+            "omitted_by_limit_count": { "type": "integer" },
+            "failed_read_count": { "type": "integer" }
+          } }
+        }
+      ]
+    },
+    "RecordingSessionStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "mode", "limitations"],
+      "properties": {
+        "type": { "const": "recording_session_started" },
+        "mode": { "const": "opt_in_local_jsonl" },
+        "limitations": {
+          "type": "array", "minItems": 2, "maxItems": 2,
+          "prefixItems": [
+            { "const": "best_effort_local_writes" },
+            { "const": "no_completeness_guarantee" }
+          ]
+        }
+      }
+    },
+    "RecordingSessionStopped": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "reason"],
+      "properties": {
+        "type": { "const": "recording_session_stopped" },
+        "reason": { "const": "clean_runtime_shutdown" }
+      }
+    },
+    "RecordingCaptureLoss": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "serialization_failed_attempts", "write_failed_attempts", "flush_failed_attempts", "extent"],
+      "properties": {
+        "type": { "const": "recording_capture_loss" },
+        "serialization_failed_attempts": { "$ref": "#/$defs/U64String" },
+        "write_failed_attempts": { "$ref": "#/$defs/U64String" },
+        "flush_failed_attempts": { "$ref": "#/$defs/U64String" },
+        "extent": { "const": "unknown" }
+      },
+      "not": {
+        "properties": {
+          "serialization_failed_attempts": { "const": "0" },
+          "write_failed_attempts": { "const": "0" },
+          "flush_failed_attempts": { "const": "0" }
+        }
+      }
+    },
+    "AppUpdateOutcome": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "operation_ref", "message_ref", "category", "input_scope", "compute", "transaction", "failure_stage", "failure_reason", "elapsed_ms", "affected_group_count"],
+      "properties": {
+        "type": { "const": "app_update_outcome" },
+        "operation_ref": { "anyOf": [{ "$ref": "#/$defs/LocalId" }, { "type": "null" }] },
+        "message_ref": { "anyOf": [{ "$ref": "#/$defs/EngineMessageRef" }, { "type": "null" }] },
+        "category": { "enum": ["account_projection_checkpoint", "content_report_backfill", "event_projection"] },
+        "input_scope": { "enum": ["inbound_or_engine_batch", "local_operation", "reconciliation", "unknown"] },
+        "compute": { "enum": ["updated", "unchanged", "deferred", "failed"] },
+        "transaction": { "enum": ["committed", "not_committed", "unknown"] },
+        "failure_stage": { "anyOf": [{ "enum": ["projection", "transaction", "unknown"] }, { "type": "null" }] },
+        "failure_reason": { "anyOf": [{ "enum": ["storage", "projection", "unavailable", "unknown"] }, { "type": "null" }] },
+        "elapsed_ms": { "$ref": "#/$defs/U64String" },
+        "affected_group_count": { "anyOf": [{ "$ref": "#/$defs/U64String" }, { "type": "null" }] }
+      },
+      "allOf": [
+        { "if": { "properties": { "failure_stage": { "type": "null" } } }, "then": { "properties": { "failure_reason": { "type": "null" } } } },
+        { "if": { "properties": { "failure_reason": { "type": "null" } } }, "then": { "properties": { "failure_stage": { "type": "null" } } } },
+        { "if": { "properties": { "transaction": { "const": "committed" } } }, "then": { "properties": {
+          "compute": { "enum": ["updated", "unchanged", "deferred"] },
+          "failure_stage": { "type": "null" },
+          "failure_reason": { "type": "null" }
+        } } }
+      ]
+    },
+    "RuntimePublicationOutcome": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "operation_ref", "message_ref", "category", "attempted", "accepted_by_broadcast", "no_subscribers"],
+      "properties": {
+        "type": { "const": "runtime_publication_outcome" },
+        "operation_ref": { "anyOf": [{ "$ref": "#/$defs/LocalId" }, { "type": "null" }] },
+        "message_ref": { "anyOf": [{ "$ref": "#/$defs/EngineMessageRef" }, { "type": "null" }] },
+        "category": { "enum": ["sync_summary", "projection_update"] },
+        "attempted": { "$ref": "#/$defs/U64String" },
+        "accepted_by_broadcast": { "$ref": "#/$defs/U64String" },
+        "no_subscribers": { "$ref": "#/$defs/U64String" }
+      }
+    },
+    "Event": {
+      "oneOf": [
+        { "$ref": "#/$defs/AppUpdateOutcome" },
+        { "$ref": "#/$defs/RuntimePublicationOutcome" },
+        { "$ref": "#/$defs/RecordingSessionStarted" },
+        { "$ref": "#/$defs/RecordingSessionStopped" },
+        { "$ref": "#/$defs/RecordingCaptureLoss" },
+        {
+          "$ref": "#/$defs/WelcomePrepared"
+        },
+        {
+          "$ref": "#/$defs/WelcomePublishStarted"
+        },
+        {
+          "$ref": "#/$defs/WelcomePublishFinished"
+        },
+        {
+          "$ref": "#/$defs/WelcomePublishNotStarted"
+        },
+        {
+          "$ref": "#/$defs/WelcomeObserved"
+        },
+        {
+          "$ref": "#/$defs/WelcomeUnwrapped"
+        },
+        {
+          "$ref": "#/$defs/WelcomeJoinFinished"
+        },
+        {
+          "$ref": "#/$defs/AppGroupUpdateFinished"
+        },
+        {
+          "$ref": "#/$defs/GroupBaseline"
+        },
+        {
+          "$ref": "#/$defs/GroupBaselineInventory"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recorder_started"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_source_context"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_engine_context"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_group_context"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recorder_health"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_human_action"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_transport_received"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_ingest_entry"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_ingest_outcome"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_ingest_error"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recipient_expectation"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_send_entry"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_send_outcome"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_send_error"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_create_group_entry"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_create_group_outcome"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_create_group_error"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_publish_attempt"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_publish_outcome"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_publish_failure"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_epoch_confirmed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_epoch_rolled_back"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_epoch_state_changed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_group_state_changed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_pending_commit_recovered_on_open"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_group_hydration_quarantined"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_group_hydration_recovered"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_snapshot_created"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_fork_resolution"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_convergence_run_state"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_convergence_decision"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_peeler_outcome"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_auto_commit_decision"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_message_state_changed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_rejection"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_subscription_rebuild"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_sync_drain"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_epoch_stall_backfill_armed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_epoch_stall_backfill_started"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_epoch_stall_backfill_completed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_epoch_stall_backfill_failed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_epoch_stall_backfill_deferred"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_epoch_stall_backfill_escalated"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_convergence_pass_discarded"
+        }
+      ]
+    },
+    "Operational_safeText": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._,+-]*$"
+    },
+    "Operational_u64": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "Operational_u16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "Operational_hexString": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]+$"
+    },
+    "Operational_refHex16": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{32}$",
+      "description": "Legacy v1 16-byte truncated member/account diagnostic hash; not a v5 MemberRef and never comparable to a Welcome member_ref."
+    },
+    "Operational_digestHex": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "Operational_messageId": {
+      "description": "Canonical Marmot message artifact id. For MLS content-bearing artifacts this is the SHA-256 digest of the MLS content bytes. Transport and on-wire ids must be recorded in transportWireEnvelope instead of overloading msg_id.",
+      "$ref": "#/$defs/Operational_digestHex"
+    },
+    "Operational_pubkeyHex": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "Operational_stringArray": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/Operational_safeText"
+      }
+    },
+    "Operational_messageRefArray": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Operational_messageId"
+      }
+    },
+    "Operational_auditEventContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "human_action": {
+          "$ref": "#/$defs/Operational_auditHumanActionContext"
+        },
+        "transport": {
+          "$ref": "#/$defs/Operational_auditTransportContext"
+        },
+        "engine": {
+          "$ref": "#/$defs/Operational_auditEngineContext"
+        },
+        "group": {
+          "$ref": "#/$defs/Operational_auditGroupContext"
+        },
+        "convergence": {
+          "$ref": "#/$defs/Operational_auditConvergenceContext"
+        },
+        "source": {
+          "$ref": "#/$defs/Operational_auditSourceContext"
+        }
+      }
+    },
+    "Operational_auditHumanActionContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "origin"
+      ],
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "origin": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "fields": {
+          "$ref": "#/$defs/Operational_stringArray"
+        },
+        "component_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Operational_u16"
+          }
+        },
+        "target_count": {
+          "$ref": "#/$defs/Operational_u64"
+        }
+      }
+    },
+    "Operational_auditTransportContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transport_source"
+      ],
+      "properties": {
+        "transport_source": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "delivery_plane": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "subscription_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "wire": {
+          "$ref": "#/$defs/Operational_transportWireEnvelope"
+        }
+      }
+    },
+    "Operational_auditEngineContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ciphersuite": {
+          "$ref": "#/$defs/Operational_u16"
+        },
+        "max_past_epochs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "convergence_max_rewind_commits": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "supported_app_component_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "feature_count": {
+          "$ref": "#/$defs/Operational_u64"
+        }
+      }
+    },
+    "Operational_auditGroupContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "member_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "required_app_component_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "admin_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "convergence_max_rewind_commits": {
+          "$ref": "#/$defs/Operational_u64"
+        }
+      }
+    },
+    "Operational_auditConvergenceContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_ref"
+      ],
+      "properties": {
+        "run_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "phase": {
+          "$ref": "#/$defs/Operational_convergencePhase"
+        },
+        "inferred": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Operational_auditSourceContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "hardware_model": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "platform": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "app_version": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "upload_trigger": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "local_member_ref": {
+          "$ref": "#/$defs/Operational_refHex16"
+        }
+      }
+    },
+    "Operational_transportWireEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "transport": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "delivery_plane": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "wire_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "wire_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "wire_pubkey_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "transport_group_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "subscription_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "nostr_event_diagnostic_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "nostr_kind": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "nostr_pubkey_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "gift_wrap_event_diagnostic_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "welcome_nostr_event_diagnostic_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "welcome_rumor_event_diagnostic_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "welcome_key_package_tag_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "publish_result_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        }
+      }
+    },
+    "Operational_messageArtifactKind": {
+      "enum": [
+        "application_message",
+        "commit",
+        "proposal",
+        "welcome",
+        "group_info",
+        "unknown"
+      ]
+    },
+    "Operational_recipientScope": {
+      "enum": [
+        "all_current_group_members",
+        "all_other_current_group_members",
+        "added_member_only",
+        "explicit_members",
+        "self_only",
+        "unknown"
+      ]
+    },
+    "Operational_recipientExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "recipient_scope"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "$ref": "#/$defs/Operational_messageArtifactKind"
+        },
+        "recipient_scope": {
+          "$ref": "#/$defs/Operational_recipientScope"
+        },
+        "membership_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "basis_commit_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "expected_member_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Operational_refHex16"
+          }
+        },
+        "expected_count": {
+          "$ref": "#/$defs/Operational_u64"
+        }
+      }
+    },
+    "Operational_outboundMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "message_ref",
+        "artifact_kind"
+      ],
+      "properties": {
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "artifact_kind": {
+          "$ref": "#/$defs/Operational_messageArtifactKind"
+        },
+        "transport": {
+          "$ref": "#/$defs/Operational_transportWireEnvelope"
+        },
+        "recipient_expectation": {
+          "$ref": "#/$defs/Operational_recipientExpectation"
+        }
+      }
+    },
+    "Operational_groupStateChangeKind": {
+      "enum": [
+        "member_added",
+        "member_removed",
+        "member_left",
+        "admin_added",
+        "admin_removed",
+        "group_renamed",
+        "group_avatar_changed",
+        "message_retention_changed",
+        "group_disbanded"
+      ]
+    },
+    "Operational_membershipChangeSource": {
+      "description": "Explains membership-removal attribution when change_kind alone is not enough. For example, member_removed with admin_action and an actor is an admin removal; member_removed with convergence and no actor is a convergence-resolved departure that must not be rendered as an admin action.",
+      "enum": [
+        "self_leave",
+        "admin_action",
+        "convergence",
+        "remote_commit",
+        "unknown"
+      ]
+    },
+    "Operational_groupStateValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "len": {
+          "$ref": "#/$defs/Operational_u64"
+        }
+      }
+    },
+    "Operational_convergencePhase": {
+      "enum": [
+        "started",
+        "waiting",
+        "evaluating",
+        "selected",
+        "blocked",
+        "applied",
+        "failed",
+        "stable",
+        "unrecoverable"
+      ]
+    },
+    "Operational_convergenceCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch_ref",
+        "fork_epoch",
+        "tip_epoch"
+      ],
+      "properties": {
+        "branch_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "fork_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "tip_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "commit_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/EngineMessageRef"
+          }
+        },
+        "commit_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "state_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "tip_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "tip_priority": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "tip_committer_ref": {
+          "$ref": "#/$defs/Operational_refHex16"
+        },
+        "retained_anchor_status": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "last_input_time_ms": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "eligible": {
+          "type": "boolean"
+        },
+        "rejection_reasons": {
+          "$ref": "#/$defs/Operational_stringArray"
+        },
+        "score": {
+          "$ref": "#/$defs/Operational_convergenceScore"
+        },
+        "app_witnesses": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Operational_appWitness"
+          }
+        }
+      }
+    },
+    "Operational_convergenceScore": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "valid_commit_depth": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "effective_commit_depth": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "witness_quorum_met": {
+          "type": "boolean"
+        },
+        "app_witness_score": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "tip_priority": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "tip_committer_ref": {
+          "$ref": "#/$defs/Operational_refHex16"
+        },
+        "tip_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        }
+      }
+    },
+    "Operational_appWitness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "epoch"
+      ],
+      "properties": {
+        "epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "sender_ref": {
+          "$ref": "#/$defs/Operational_refHex16"
+        }
+      }
+    },
+    "Operational_publishRelayFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint_ref",
+        "reason"
+      ],
+      "properties": {
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        }
+      }
+    },
+    "Operational_relayRegistration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint_ref",
+        "accepted"
+      ],
+      "properties": {
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "accepted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Operational_peelerOutcomeKind": {
+      "enum": [
+        "success",
+        "decrypt_failed",
+        "stale_epoch",
+        "malformed",
+        "invalid_signature",
+        "wrong_recipient",
+        "other"
+      ]
+    },
+    "Operational_epochStallBackfillTrigger": {
+      "enum": [
+        "undecryptable_threshold",
+        "contested_fork_deferral",
+        "resource_refusal"
+      ]
+    },
+    "Operational_epochBackfillExecutionSeam": {
+      "enum": [
+        "startup",
+        "receive",
+        "explicit_catch_up",
+        "maintenance"
+      ]
+    },
+    "Operational_epochBackfillReplayScope": {
+      "enum": [
+        "account_full_history"
+      ]
+    },
+    "Operational_epochBackfillActivationOutcome": {
+      "enum": [
+        "succeeded",
+        "failed"
+      ]
+    },
+    "Operational_epochBackfillCompletionKind": {
+      "enum": [
+        "end_of_stored_events",
+        "quiescence_fallback"
+      ]
+    },
+    "Operational_epochBackfillDeferredReason": {
+      "enum": [
+        "group_epoch_unavailable"
+      ]
+    },
+    "OperationalDiagnosticRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Domain-separated hash of a legacy diagnostic identifier. It is not an authenticated Nostr event reference."
+    },
+    "OperationalEvent_recorder_started": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "recorder"
+      ],
+      "properties": {
+        "type": {
+          "const": "recorder_started"
+        },
+        "recorder": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_source_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "source"
+      ],
+      "properties": {
+        "type": {
+          "const": "source_context"
+        },
+        "source": {
+          "$ref": "#/$defs/Operational_auditSourceContext"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_engine_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "context"
+      ],
+      "properties": {
+        "type": {
+          "const": "engine_context"
+        },
+        "context": {
+          "$ref": "#/$defs/Operational_auditEngineContext"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_group_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "reason",
+        "context"
+      ],
+      "properties": {
+        "type": {
+          "const": "group_context"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "context": {
+          "$ref": "#/$defs/Operational_auditGroupContext"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_recorder_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "serialization_failures",
+        "write_failures",
+        "flush_failures"
+      ],
+      "properties": {
+        "type": {
+          "const": "recorder_health"
+        },
+        "serialization_failures": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "write_failures": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "flush_failures": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_human_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "action",
+        "origin",
+        "phase"
+      ],
+      "properties": {
+        "type": {
+          "const": "human_action"
+        },
+        "action": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "origin": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "phase": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "fields": {
+          "$ref": "#/$defs/Operational_stringArray"
+        },
+        "component_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Operational_u16"
+          }
+        },
+        "target_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "message_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/EngineMessageRef"
+          }
+        },
+        "from_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "to_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "error_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_transport_received": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "transport",
+        "payload_len",
+        "payload_digest"
+      ],
+      "properties": {
+        "type": {
+          "const": "transport_received"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "transport": {
+          "$ref": "#/$defs/Operational_transportWireEnvelope"
+        },
+        "payload_len": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_ingest_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "envelope_kind",
+        "transport_source",
+        "payload_len",
+        "payload_digest"
+      ],
+      "properties": {
+        "type": {
+          "const": "ingest_entry"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "envelope_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "transport_source": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "transport": {
+          "$ref": "#/$defs/Operational_transportWireEnvelope"
+        },
+        "payload_len": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_ingest_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "outcome_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "ingest_outcome"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "outcome_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "stale_reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_ingest_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "error_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "ingest_error"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "error_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_recipient_expectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "expectation"
+      ],
+      "properties": {
+        "type": {
+          "const": "recipient_expectation"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "expectation": {
+          "$ref": "#/$defs/Operational_recipientExpectation"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_send_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "intent_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "send_entry"
+        },
+        "intent_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_send_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "intent_kind",
+        "result_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "send_outcome"
+        },
+        "intent_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "result_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "outbound_messages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Operational_outboundMessage"
+          }
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_send_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "intent_kind",
+        "error_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "send_error"
+        },
+        "intent_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "error_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_create_group_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "member_count",
+        "required_feature_count",
+        "app_component_count",
+        "initial_admin_count"
+      ],
+      "properties": {
+        "type": {
+          "const": "create_group_entry"
+        },
+        "member_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "required_feature_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "app_component_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "initial_admin_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_create_group_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "result_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "create_group_outcome"
+        },
+        "result_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "outbound_messages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Operational_outboundMessage"
+          }
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_create_group_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "error_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "create_group_error"
+        },
+        "error_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_publish_attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "target_kind",
+        "required_acks"
+      ],
+      "properties": {
+        "type": {
+          "const": "publish_attempt"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "artifact_kind": {
+          "$ref": "#/$defs/Operational_messageArtifactKind"
+        },
+        "target_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "transport": {
+          "$ref": "#/$defs/Operational_transportWireEnvelope"
+        },
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "endpoint_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/EndpointRef"
+          }
+        },
+        "required_acks": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_publish_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "target_kind",
+        "required_acks",
+        "met_required_acks"
+      ],
+      "properties": {
+        "type": {
+          "const": "publish_outcome"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "artifact_kind": {
+          "$ref": "#/$defs/Operational_messageArtifactKind"
+        },
+        "target_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "transport": {
+          "$ref": "#/$defs/Operational_transportWireEnvelope"
+        },
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "accepted_endpoint_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/EndpointRef"
+          }
+        },
+        "failed_relays": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Operational_publishRelayFailure"
+          }
+        },
+        "required_acks": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "met_required_acks": {
+          "type": "boolean"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_publish_failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "stage",
+        "target_kind",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "publish_failure"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "artifact_kind": {
+          "$ref": "#/$defs/Operational_messageArtifactKind"
+        },
+        "stage": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "target_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "transport": {
+          "$ref": "#/$defs/Operational_transportWireEnvelope"
+        },
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "endpoint_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/EndpointRef"
+          }
+        },
+        "required_acks": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_epoch_confirmed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "from_epoch",
+        "to_epoch",
+        "pending_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "epoch_confirmed"
+        },
+        "from_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "to_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "pending_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "origin_commit_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_epoch_rolled_back": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "pending_epoch",
+        "restored_epoch",
+        "pending_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "epoch_rolled_back"
+        },
+        "pending_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "restored_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "pending_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_epoch_state_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "new_state",
+        "epoch",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "epoch_state_changed"
+        },
+        "previous_state": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "new_state": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "pending_ref": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "pending_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_group_state_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "epoch",
+        "change_kind"
+      ],
+      "properties": {
+        "type": {
+          "const": "group_state_changed"
+        },
+        "epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "change_kind": {
+          "$ref": "#/$defs/Operational_groupStateChangeKind"
+        },
+        "membership_change_source": {
+          "$ref": "#/$defs/Operational_membershipChangeSource"
+        },
+        "actor_member_ref": {
+          "$ref": "#/$defs/Operational_refHex16"
+        },
+        "subject_member_ref": {
+          "$ref": "#/$defs/Operational_refHex16"
+        },
+        "origin_commit_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "fields": {
+          "$ref": "#/$defs/Operational_stringArray"
+        },
+        "component_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Operational_u16"
+          }
+        },
+        "value": {
+          "$ref": "#/$defs/Operational_groupStateValue"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_pending_commit_recovered_on_open": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "recovered_epoch"
+      ],
+      "properties": {
+        "type": {
+          "const": "pending_commit_recovered_on_open"
+        },
+        "recovered_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_group_hydration_quarantined": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "group_digest",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "group_hydration_quarantined"
+        },
+        "group_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_group_hydration_recovered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "group_digest"
+      ],
+      "properties": {
+        "type": {
+          "const": "group_hydration_recovered"
+        },
+        "group_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_snapshot_created": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "snapshot_ref",
+        "source_epoch",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "snapshot_created"
+        },
+        "snapshot_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "source_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "state_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_fork_resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "source_epoch",
+        "candidate_digest",
+        "winner"
+      ],
+      "properties": {
+        "type": {
+          "const": "fork_resolution"
+        },
+        "source_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "candidate_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "incumbent_digest": {
+          "$ref": "#/$defs/Operational_digestHex"
+        },
+        "winner": {
+          "enum": [
+            "candidate",
+            "incumbent",
+            "missing_snapshot"
+          ]
+        },
+        "invalidated_message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_convergence_run_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "phase"
+      ],
+      "properties": {
+        "type": {
+          "const": "convergence_run_state"
+        },
+        "phase": {
+          "$ref": "#/$defs/Operational_convergencePhase"
+        },
+        "current_tip_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "retained_anchor_horizon": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "error_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_convergence_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "current_tip_epoch",
+        "max_rewind_commits",
+        "candidates"
+      ],
+      "properties": {
+        "type": {
+          "const": "convergence_decision"
+        },
+        "current_tip_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "max_rewind_commits": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Operational_convergenceCandidate"
+          }
+        },
+        "decisive_rule": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "selected_branch_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "selected_fork_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "selected_tip_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "losing_branch_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/OperationalDiagnosticRef"
+          }
+        },
+        "error_kinds": {
+          "$ref": "#/$defs/Operational_stringArray"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_peeler_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "outcome",
+        "fallback_snapshot_used"
+      ],
+      "properties": {
+        "type": {
+          "const": "peeler_outcome"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Operational_peelerOutcomeKind"
+        },
+        "artifact_kind": {
+          "$ref": "#/$defs/Operational_messageArtifactKind"
+        },
+        "fallback_snapshot_used": {
+          "type": "boolean"
+        },
+        "fallback_snapshot_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "fallback_snapshot_source_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "fallback_attempt_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "error_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_auto_commit_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "proposal_kind",
+        "decision"
+      ],
+      "properties": {
+        "type": {
+          "const": "auto_commit_decision"
+        },
+        "proposal_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "decision": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_message_state_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "new_state",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "message_state_changed"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "artifact_kind": {
+          "$ref": "#/$defs/Operational_messageArtifactKind"
+        },
+        "previous_state": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "new_state": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "retry_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "residence_ms": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_rejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message_ref",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "rejection"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_subscription_rebuild": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "const": "subscription_rebuild"
+        },
+        "since_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "lookback_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "relay_results": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Operational_relayRegistration"
+          }
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_sync_drain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "duration_ms",
+        "deliveries"
+      ],
+      "properties": {
+        "type": {
+          "const": "sync_drain"
+        },
+        "duration_ms": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "deliveries": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "skipped": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "refused": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "cursor_before_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "cursor_after_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_epoch_stall_backfill_armed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "stalled_epoch",
+        "threshold"
+      ],
+      "properties": {
+        "type": {
+          "const": "epoch_stall_backfill_armed"
+        },
+        "stalled_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "threshold": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "trigger": {
+          "$ref": "#/$defs/Operational_epochStallBackfillTrigger"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_epoch_stall_backfill_started": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "seam",
+        "replay_scope",
+        "retry_ordinal"
+      ],
+      "properties": {
+        "type": {
+          "const": "epoch_stall_backfill_started"
+        },
+        "seam": {
+          "$ref": "#/$defs/Operational_epochBackfillExecutionSeam"
+        },
+        "replay_scope": {
+          "$ref": "#/$defs/Operational_epochBackfillReplayScope"
+        },
+        "retry_ordinal": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_epoch_stall_backfill_completed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "retry_ordinal",
+        "duration_ms",
+        "activation_outcome",
+        "deliveries",
+        "local_epoch_before",
+        "local_epoch_after",
+        "group_advanced"
+      ],
+      "properties": {
+        "type": {
+          "const": "epoch_stall_backfill_completed"
+        },
+        "retry_ordinal": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "duration_ms": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "activation_outcome": {
+          "$ref": "#/$defs/Operational_epochBackfillActivationOutcome"
+        },
+        "completion_kind": {
+          "$ref": "#/$defs/Operational_epochBackfillCompletionKind"
+        },
+        "deliveries": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "skipped": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "refused": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "local_epoch_before": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "local_epoch_after": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "group_advanced": {
+          "type": "boolean"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_epoch_stall_backfill_failed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "retry_ordinal",
+        "duration_ms",
+        "activation_outcome",
+        "deliveries",
+        "local_epoch_before",
+        "local_epoch_after",
+        "group_advanced"
+      ],
+      "properties": {
+        "type": {
+          "const": "epoch_stall_backfill_failed"
+        },
+        "retry_ordinal": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "duration_ms": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "activation_outcome": {
+          "$ref": "#/$defs/Operational_epochBackfillActivationOutcome"
+        },
+        "error_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "deliveries": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "skipped": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "refused": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "local_epoch_before": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "local_epoch_after": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "group_advanced": {
+          "type": "boolean"
+        },
+        "group_advanced_observed": {
+          "type": "boolean"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_epoch_stall_backfill_deferred": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "reason",
+        "retry_ordinal"
+      ],
+      "properties": {
+        "type": {
+          "const": "epoch_stall_backfill_deferred"
+        },
+        "reason": {
+          "$ref": "#/$defs/Operational_epochBackfillDeferredReason"
+        },
+        "retry_ordinal": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_epoch_stall_backfill_escalated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "stalled_epoch",
+        "arms",
+        "arm_threshold"
+      ],
+      "properties": {
+        "type": {
+          "const": "epoch_stall_backfill_escalated"
+        },
+        "stalled_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "arms": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "arm_threshold": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_convergence_pass_discarded": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "stale_base_epoch",
+        "current_tip_epoch",
+        "generation"
+      ],
+      "properties": {
+        "type": {
+          "const": "convergence_pass_discarded"
+        },
+        "stale_base_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "current_tip_epoch": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "generation": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    }
+  }
+}

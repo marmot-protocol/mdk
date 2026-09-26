@@ -40,6 +40,38 @@ const STABLE_STATE: &str = "stable";
 /// rebuilt the group's state and the durable `unrecoverable` marker is gone.
 const VERIFIED_REPAIR_REASON: &str = "join_welcome_repair";
 
+/// The `reason` on the `epoch_state_changed` row an engine writes when it
+/// stages a commit. The row is stamped with the *projected* epoch the commit
+/// would reach (`cgka-engine/src/message_processor/send.rs`,
+/// `group_lifecycle.rs`), not one the engine holds: a failed publish leaves the
+/// engine where it was. Hydration rows in `pending_publish` carry the real
+/// epoch, which is why this matches the reason and not the state.
+const BEGIN_PENDING_REASON: &str = "begin_pending";
+
+/// The `reason` on the `message_state_changed` row an engine writes as it
+/// retires its deferred backlog because the group became terminal for it:
+/// removed, disbanded, or evicted by convergence
+/// (`cgka-engine/src/message_processor/store.rs`). The row's epoch is the
+/// retired message's, so it marks the departure without dating it by epoch.
+const TERMINAL_GROUP_REASON: &str = "terminal_group";
+
+/// The `reason` on the hydration rows of a group copy this device was removed
+/// from (`cgka-engine/src/engine.rs`, mdk#1965). A removed copy is still
+/// reopened on every session open, so without this it reads as an engine
+/// that stopped receiving commits.
+const HYDRATE_REMOVED_GROUP_REASON: &str = "hydrate_removed_group";
+
+/// The `reason`s on the `epoch_state_changed { new_state: "stable" }` row an
+/// engine writes when it joins a group by Welcome
+/// (`cgka-engine/src/group_lifecycle.rs`): a plain join, the repair of a halted
+/// group, and a rejoin the recipient confirmed. Any of them makes the engine a
+/// member again after a departure.
+const REJOIN_REASONS: [&str; 3] = [
+    "join_welcome",
+    VERIFIED_REPAIR_REASON,
+    "recipient_confirmed_rejoin",
+];
+
 /// Stand-in reason for a halt whose row carried none. Every emitting surface
 /// populates a reason today; this keeps the lenient model from dropping a halt
 /// on the floor should one ever not. It names no cause, so it is reported only
@@ -197,11 +229,16 @@ pub enum EventKind {
         #[serde(default)]
         msg_id: Option<String>,
     },
-    /// The engine handled a message while at `epoch`. The densest per-engine
-    /// epoch signal in real exports; feeds the epoch high-water mark.
+    /// A stored message changed state. `epoch` is the message's, which can
+    /// sit above the engine's own (a message deferred for a commit it has not
+    /// applied), so it feeds the group tip but places an engine only when the
+    /// engine has no own-state rows. `reason: terminal_group` marks a
+    /// departure (see [`EventKind::is_departure`]).
     MessageStateChanged {
         #[serde(default)]
         epoch: Option<u64>,
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// The engine's epoch machine moved (commit confirmed, group hydrated, …).
     /// `new_state` is the state it moved *into*; the classifier reads it for the
@@ -420,14 +457,73 @@ impl EventKind {
         )
     }
 
-    /// The group epoch this event reports the engine itself to be at, if it
-    /// reports one. The liveness gates fold these into a per-engine epoch
-    /// high-water mark, so only kinds that reflect the engine's *own* state
-    /// contribute — kinds describing another engine's traffic do not.
+    /// The epoch this event leaves the engine at, if it reports one. The same
+    /// as [`Self::observed_epoch`] except for a convergence decision, which
+    /// evidences the tip it started from but leaves the engine on the tip it
+    /// selected — below the start when it reorgs onto a shorter branch.
+    pub fn settled_epoch(&self) -> Option<u64> {
+        match self {
+            EventKind::ConvergenceDecision {
+                current_tip_epoch,
+                selected_tip_epoch,
+                ..
+            } => selected_tip_epoch.or(*current_tip_epoch),
+            _ => self.observed_epoch(),
+        }
+    }
+
+    /// Whether this row's epoch is the engine's own position. A message row is
+    /// not: it carries the epoch of the message it handled, which can sit
+    /// above the engine (a message deferred for a commit the engine has not
+    /// applied yet).
+    pub fn reports_own_state(&self) -> bool {
+        !matches!(self, EventKind::MessageStateChanged { .. })
+    }
+
+    /// The engine recorded, about itself, that it is no longer a member of the
+    /// group.
+    pub fn is_departure(&self) -> bool {
+        match self {
+            EventKind::MessageStateChanged {
+                reason: Some(reason),
+                ..
+            } => reason == TERMINAL_GROUP_REASON,
+            EventKind::EpochStateChanged {
+                reason: Some(reason),
+                ..
+            } => reason == HYDRATE_REMOVED_GROUP_REASON,
+            _ => false,
+        }
+    }
+
+    /// The engine joined the group by Welcome — the counterpart to
+    /// [`EventKind::is_departure`].
+    pub fn is_rejoin(&self) -> bool {
+        matches!(
+            self,
+            EventKind::EpochStateChanged {
+                new_state: Some(new_state),
+                reason: Some(reason),
+                ..
+            } if new_state == STABLE_STATE && REJOIN_REASONS.contains(&reason.as_str())
+        )
+    }
+
+    /// The highest group epoch this event evidences the engine materialized,
+    /// if it evidences one. The liveness gate folds these into the group tip
+    /// and each engine's high-water mark, so kinds describing another engine's
+    /// traffic do not contribute, and neither does a `begin_pending` row,
+    /// whose epoch is a projection. Message rows do contribute, but do not
+    /// place the engine — see [`Self::reports_own_state`].
     pub fn observed_epoch(&self) -> Option<u64> {
         match self {
+            EventKind::EpochStateChanged { reason, .. }
+                if reason.as_deref() == Some(BEGIN_PENDING_REASON) =>
+            {
+                None
+            }
             EventKind::GroupStateChanged { epoch, .. }
-            | EventKind::MessageStateChanged { epoch }
+            | EventKind::MessageStateChanged { epoch, .. }
             | EventKind::EpochStateChanged { epoch, .. } => *epoch,
             EventKind::GroupContext { context } => context.epoch,
             EventKind::HumanAction { to_epoch } => *to_epoch,

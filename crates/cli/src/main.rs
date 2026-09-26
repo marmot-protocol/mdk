@@ -3,7 +3,10 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let output = wn_cli::run_from(std::env::args_os()).await;
+    // Bound the binary's async layout query at the CLI library boundary.
+    let command: std::pin::Pin<Box<dyn std::future::Future<Output = wn_cli::CliOutput>>> =
+        Box::pin(wn_cli::run_from(std::env::args_os()));
+    let output = command.await;
     if let Err(err) = write_output(&output) {
         eprintln!("wn: failed to write command output: {err}");
         return ExitCode::FAILURE;

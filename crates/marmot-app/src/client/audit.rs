@@ -86,6 +86,75 @@ fn epoch_backfill_terminal_event_kind(
 }
 
 impl AppClient {
+    pub(crate) fn audit_v5_enabled(&self) -> bool {
+        self.runtime.session().audit_v5_enabled()
+    }
+
+    /// Drain only current-operation events into the installed recorder. The
+    /// session assigns the same source/session/sequence as engine audit rows.
+    pub(crate) fn flush_live_v5_events(&mut self) {
+        let Some(probe) = &mut self.audit_v5_probe else {
+            return;
+        };
+        for (group_ref, event) in probe.take_live_events() {
+            self.runtime.session().record_v5_event(group_ref, event);
+        }
+    }
+
+    /// Seed an enabled recorder with bounded authoritative state at an ordinary
+    /// hydrated account open. The per-group snapshot is observational; an
+    /// unreadable group is omitted without changing account-open behavior.
+    pub(crate) fn record_v5_baselines(&mut self, reason: marmot_forensics::v5::BaselineReason) {
+        if !self.audit_v5_enabled() {
+            return;
+        }
+        let Ok(mut group_ids) = self.runtime.live_group_ids() else {
+            if let Some(probe) = &mut self.audit_v5_probe {
+                probe.baseline_inventory(reason, None);
+            }
+            self.flush_live_v5_events();
+            return;
+        };
+        group_ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        let mut eligible = 0u32;
+        let mut selected_groups = Vec::new();
+        let mut classification_complete = true;
+        for group_id in group_ids {
+            let Ok(group) = self.runtime.group_record(&group_id) else {
+                // An unreadable group's profile is unknown. Do not claim an
+                // exact eligible/omitted count from a partial classification.
+                classification_complete = false;
+                continue;
+            };
+            if group.protocol_profile != cgka_traits::group::ProtocolProfile::Current
+                || group.is_terminal()
+            {
+                continue;
+            }
+            let Some(next_eligible) = eligible.checked_add(1) else {
+                classification_complete = false;
+                continue;
+            };
+            eligible = next_eligible;
+            if selected_groups.len() < 64 {
+                selected_groups.push((group_id, group));
+            }
+        }
+        let selected = selected_groups.len() as u32;
+        for (group_id, group) in selected_groups {
+            let admins = self.runtime.admin_pubkeys(&group_id).ok();
+            if let Some(probe) = &mut self.audit_v5_probe {
+                probe.baseline(&group, admins.as_deref(), reason, None);
+            }
+        }
+        if let Some(probe) = &mut self.audit_v5_probe {
+            probe.baseline_inventory(
+                reason,
+                classification_complete.then_some((eligible, selected, eligible - selected, 0)),
+            );
+        }
+        self.flush_live_v5_events();
+    }
     pub(crate) fn local_human_action_context(
         action: impl Into<String>,
         fields: Vec<&'static str>,
@@ -390,6 +459,22 @@ impl AppClient {
     pub(crate) fn set_audit_recording(&mut self, enabled: bool) {
         let recorder = self.app.build_audit_recorder(&self.state.label, enabled);
         self.runtime.session_mut().set_audit_recorder(recorder);
+        if enabled {
+            if self.audit_v5_enabled() && self.audit_v5_probe.is_none() {
+                self.audit_v5_probe = Some(super::audit_v5_probe::WelcomeProbe::live());
+            }
+            self.record_v5_baselines(marmot_forensics::v5::BaselineReason::AuditEnabled);
+        } else {
+            self.audit_v5_probe = None;
+        }
+    }
+
+    /// Used only after the account worker observes an explicit graceful
+    /// shutdown signal. Dropping a client on another path never emits stop.
+    pub(crate) fn finish_audit_recording(&self) {
+        self.runtime.session().finish_audit_v5_recording(
+            marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown,
+        );
     }
 
     /// Rotate the live forensic recorder iff it is the one appending to

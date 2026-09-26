@@ -186,7 +186,20 @@ evidence only. Changing `strip` changes Cargo's release-profile fingerprint, so
 alternating these scripts with an unpinned `cargo build --release` can rebuild
 release dependencies.
 
-## Audit v4 adoption
+## Audit v5 recording and delivery
+
+Recording remains opt-in through `MarmotAuditLogSettings`. New recordings use v5 JSONL files.
+For v5 delivery, call `marmot_set_audit_otlp_config_v5` with a dedicated OTLP `/v1/logs`
+destination and bearer token, then call `marmot_post_audit_log_tracker_update_v5` for a manual
+pass. The returned config redacts the token; free it with `marmot_audit_otlp_config_v5_free`.
+Free the versioned result with `marmot_audit_log_tracker_update_result_v5_free`. It reports v5
+accepted, pending, blocked, and idle counts independently of v4 whole-file uploads. The existing
+tracker activity triggers use the same in-memory v5 config with their batching and retry policy.
+Set `enabled` to false to clear the destination. Loopback requires the explicit
+`allow_loopback_dev` flag, while public destinations require HTTPS. Existing v4 files remain
+available for the legacy endpoint; v5 bytes never go there.
+
+## Legacy audit v4 upload
 
 Use `MarmotAuditLogTrackerConfigV4` and `marmot_set_audit_log_tracker_config_v4` to supply optional
 system `hardware_model`, platform and app version. Free its returned config with

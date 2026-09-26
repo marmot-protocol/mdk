@@ -214,6 +214,7 @@ struct GrantedLoss {
 }
 
 /// Private input snapshot; identities are deliberately not Debug-printable.
+#[derive(Clone)]
 pub(super) struct FrozenRecoveryInventory {
     pub(super) work: super::sync::TransportReconciliationWork,
     pub(super) route: storage_sqlite::TransportReconciliationRoute,
@@ -758,7 +759,7 @@ impl AppClient {
         Ok(goals)
     }
 
-    pub(super) fn request_bounded_comparison(&mut self) -> Result<(), AppError> {
+    pub(crate) fn request_bounded_comparison(&mut self) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         storage.synchronize_account_delivery_loss(&self.state.label)?;
         drop(self.transport_receipts()?);
