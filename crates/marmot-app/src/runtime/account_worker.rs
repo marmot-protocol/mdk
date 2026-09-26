@@ -1621,6 +1621,19 @@ async fn run_app_runtime_account_worker(
                     break;
                 }
             }
+            if let Some(group_id) = pause.arm_epoch_backfill.take() {
+                let epoch = client
+                    .group_mls_state(&group_id)
+                    .expect("test group exists")
+                    .epoch;
+                client.apply_backfill_decision(
+                    &group_id,
+                    epoch,
+                    crate::client::epoch_stall::BackfillDecision::Arm,
+                    marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+                );
+                assert!(client.has_pending_epoch_backfill());
+            }
             if let Some(result) = pause.completed_direct_overflow.take() {
                 let resumed = finish_direct_overflow_recovery(
                     &mut client,
@@ -1741,8 +1754,7 @@ async fn run_app_runtime_account_worker(
                     &product_backlog,
                     &mut scheduled_convergence,
                 )
-                .await
-                .or(completed_direct_overflow);
+                .await;
                 continue 'worker;
             }
         }
@@ -1827,7 +1839,7 @@ async fn run_app_runtime_account_worker(
                                     },
                                     &product_backlog,
                                     &mut scheduled_convergence,
-                                ).await.or(completed_direct_overflow);
+                                ).await;
                             }
                         }
                     }
@@ -1852,7 +1864,7 @@ async fn run_app_runtime_account_worker(
                             },
                             &product_backlog,
                             &mut scheduled_convergence,
-                        ).await.or(completed_direct_overflow);
+                        ).await;
                     }
                     OnlineEpochGapIoCompletion::Queue(Ok(submissions)) => {
                         #[cfg(test)]
@@ -1904,7 +1916,7 @@ async fn run_app_runtime_account_worker(
                             },
                             &product_backlog,
                             &mut scheduled_convergence,
-                        ).await.or(completed_direct_overflow);
+                        ).await;
                     }
                 }
                 continue 'worker;
@@ -2422,6 +2434,7 @@ async fn run_app_runtime_account_worker(
                 }
             }, if force_receive_continuation || online_epoch_gap.as_ref().is_none_or(|job| job.network.is_some()) => {
                 let (completed_overflow, received) = received;
+                #[cfg(test)]
                 let resumed_direct_overflow = completed_overflow.is_some();
                 yield_to_bounded_admission = true;
                 #[cfg(test)]
@@ -2500,37 +2513,17 @@ async fn run_app_runtime_account_worker(
                                 receive_observation.finish_app(&Ok(SyncSummary::default()));
                                 continue 'worker;
                             }
-                            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Completed(summary))) => {
-                                if let Some(observation) = observation { observation.finish("success"); }
-                                (Ok(summary), false)
-                            }
-                            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Incomplete(summary))) => {
-                                if let Some(observation) = observation { observation.finish("partial"); }
-                                publish_app_runtime_account_error(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    "account delivery overflow recovery incomplete".to_owned(),
-                                );
-                                // The durable marker remains armed. Keep the
-                                // account session available and let the next
-                                // receive/catch-up seam retry the replay.
-                                (Ok(summary), true)
-                            }
-                            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending)) => {
-                                if let Some(observation) = observation { observation.finish("deferred"); }
-                                (Ok(SyncSummary::default()), true)
-                            }
-                            PendingComparisonExecution::Inline(Err(error)) => {
-                                if let Some(observation) = observation { observation.finish("failure"); }
-                                let partial = std::mem::take(&mut client.pending_failed_sync_summary);
-                                publish_app_runtime_summary_with_v5(&client,
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    &partial,
-                                );
-                                (Err(error), false)
+                            PendingComparisonExecution::Inline(result) => {
+                                match finish_direct_overflow_recovery(
+                                    &mut client, result, backfill_armed, observation,
+                                    EpochBackfillReportContext {
+                                        events: &events, account_id_hex: &account_id_hex,
+                                        account_label: &account_label, shared: &shared,
+                                    },
+                                ) {
+                                    Ok((summary, incomplete)) => (Ok(summary), incomplete),
+                                    Err(error) => (Err(error), false),
+                                }
                             }
                         }
                     }
@@ -2650,12 +2643,20 @@ async fn run_app_runtime_account_worker(
                                         );
                                     }
                                 }
-                            } else if !resumed_direct_overflow {
-                                // Completed account-wide overflow replay keeps
-                                // its existing inline Receive seam and marker
-                                // contract. An owned grant has already run that
-                                // seam, so its continuation must not mint a
-                                // second grant before returning to the loop.
+                            } else {
+                                // A completed overflow has released its grant.
+                                // This original Receive follow-up may select
+                                // newly pending debt discovered during replay;
+                                // incomplete/deferred recovery stays above.
+                                #[cfg(test)]
+                                if resumed_direct_overflow {
+                                    let kind = if client.has_pending_epoch_backfill() {
+                                        "direct_overflow_followup_pending"
+                                    } else {
+                                        "direct_overflow_followup"
+                                    };
+                                    shared.comparison_test_trace.lock().unwrap().push(kind);
+                                }
                                 let _ = run_pending_epoch_backfill_reporting_arm(
                                     &mut client, &events, &account_id_hex,
                                     &account_label, &shared, EpochBackfillExecutionSeam::Receive,
@@ -6960,9 +6961,8 @@ fn finish_direct_overflow_recovery(
         observation.finish(match &result {
             Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
             Ok(EpochBackfillRunOutcome::Incomplete(_)) => "partial",
-            Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending) => {
-                "deferred"
-            }
+            Ok(EpochBackfillRunOutcome::Deferred) => "deferred",
+            Ok(EpochBackfillRunOutcome::NotPending) => "no_work_due",
             Err(_) => "failure",
         });
     }
@@ -6982,9 +6982,11 @@ fn finish_direct_overflow_recovery(
             );
             Ok((summary, true))
         }
-        Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending) => {
-            Ok((SyncSummary::default(), true))
-        }
+        // Deferred retains the original debt; the next seam retries it.
+        Ok(EpochBackfillRunOutcome::Deferred) => Ok((SyncSummary::default(), true)),
+        // No pending grant is a completed no-op, so retain the original
+        // post-overflow Receive follow-up for any newly observed intent.
+        Ok(EpochBackfillRunOutcome::NotPending) => Ok((SyncSummary::default(), false)),
         Err(error) => {
             let partial = std::mem::take(&mut client.pending_failed_sync_summary);
             publish_app_runtime_summary_with_v5(
@@ -7700,6 +7702,7 @@ mod tests {
                 joined_groups: vec![group_id.clone()],
                 ..Default::default()
             }))),
+            arm_epoch_backfill: None,
         });
         let (respond, _) = oneshot::channel();
         commands
@@ -7724,7 +7727,7 @@ mod tests {
         })
         .await
         .expect("resumed overflow summary becomes visible");
-        timeout(Duration::from_secs(5), async {
+        timeout(Duration::from_secs(15), async {
             while !trace
                 .lock()
                 .unwrap()
@@ -7735,6 +7738,10 @@ mod tests {
         })
         .await
         .expect("the complete Receive success tail runs");
+        assert!(
+            trace.lock().unwrap().contains(&"direct_overflow_followup"),
+            "completed owned overflow must run the pending Receive follow-up"
+        );
 
         trace.lock().unwrap().clear();
         let (entered_tx, entered_rx) = oneshot::channel();
@@ -7750,6 +7757,7 @@ mod tests {
             completed_direct_overflow: Some(Ok(EpochBackfillRunOutcome::Incomplete(
                 SyncSummary::default(),
             ))),
+            arm_epoch_backfill: None,
         });
         let (respond, _) = oneshot::channel();
         commands
@@ -7786,6 +7794,10 @@ mod tests {
         })
         .await
         .expect("incomplete recovery still runs the Receive visibility tail");
+        assert!(
+            !trace.lock().unwrap().contains(&"direct_overflow_followup"),
+            "incomplete owned overflow must keep its debt for a later seam"
+        );
 
         let (entered_tx, entered_rx) = oneshot::channel();
         let (release_tx, release_rx) = watch::channel(false);
@@ -7798,6 +7810,7 @@ mod tests {
             entered: entered_tx,
             release: release_rx,
             completed_direct_overflow: Some(Err(AppError::BlockingTask("test failure".into()))),
+            arm_epoch_backfill: None,
         });
         let (respond, _) = oneshot::channel();
         commands
@@ -7846,6 +7859,66 @@ mod tests {
         })
         .await
         .expect("the failed Receive arm reopens the account session");
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_owned_overflow_runs_followup_with_new_epoch_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        let group_id = runtime
+            .create_group("alice", "follow-up", &[], None)
+            .await
+            .unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let serial_before = storage.recovery_retry_state().unwrap().attempt_serial;
+        let commands = runtime.accounts().worker_commands("alice").await.unwrap();
+        let trace = runtime.shared_services().comparison_test_trace;
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = watch::channel(false);
+        *runtime
+            .shared_services()
+            .next_worker_loop_pause
+            .lock()
+            .unwrap() = Some(crate::runtime::WorkerLoopPause {
+            account_label: "alice".to_owned(),
+            entered: entered_tx,
+            release: release_rx,
+            completed_direct_overflow: Some(Ok(EpochBackfillRunOutcome::Completed(
+                SyncSummary::default(),
+            ))),
+            arm_epoch_backfill: Some(group_id.clone()),
+        });
+        let (respond, _) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus { group_id, respond })
+            .unwrap();
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        release_tx.send(true).unwrap();
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if trace
+                    .lock()
+                    .unwrap()
+                    .contains(&"direct_overflow_followup_pending")
+                    && storage.recovery_retry_state().unwrap().attempt_serial > serial_before
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed overflow must select newly pending epoch debt");
         runtime.shutdown_and_close().await.unwrap();
     }
 

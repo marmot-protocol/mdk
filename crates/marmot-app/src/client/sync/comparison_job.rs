@@ -21,10 +21,27 @@ pub(crate) struct TestComparisonActivityWitness {
     pub(crate) active_requests: Arc<AtomicUsize>,
     pub(crate) network_deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
     pub(crate) target_event_id: Arc<Mutex<Option<String>>>,
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) target_route: Arc<Mutex<Option<TransportReconciliationRoute>>>,
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) route_outcomes: Arc<Mutex<Vec<TestComparisonRouteOutcome>>>,
     pub(crate) returned_events: Arc<AtomicUsize>,
     pub(crate) matching_events: Arc<AtomicUsize>,
     pub(crate) matching_queued_deliveries: Arc<AtomicUsize>,
     pub(crate) panic_after_queue_submission: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+#[derive(Clone, Debug)]
+pub(crate) struct TestComparisonRouteOutcome {
+    pub(crate) attempt_serial: u64,
+    pub(crate) target_route: bool,
+    pub(crate) inbox: bool,
+    pub(crate) kind: &'static str,
+    pub(crate) relays_succeeded: usize,
+    pub(crate) relays_failed: usize,
+    pub(crate) remote_items: usize,
+    pub(crate) received_items: usize,
 }
 
 #[cfg(test)]
@@ -319,6 +336,45 @@ impl ComparisonNetworkJob {
                     }
                 }
                 let cursor = *progress.cursor.lock().expect("comparison progress mutex");
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                if let Some(witness) = &witness {
+                    let (kind, relays_succeeded, relays_failed, remote_items, received_items) =
+                        match &result {
+                            ComparisonRouteWorkResult::Skipped => ("skipped", 0, 0, 0, 0),
+                            ComparisonRouteWorkResult::TimedOut => ("timed_out", 0, 0, 0, 0),
+                            ComparisonRouteWorkResult::Returned(Ok(None)) => {
+                                ("unsupported", 0, 0, 0, 0)
+                            }
+                            ComparisonRouteWorkResult::Returned(Err(_)) => ("error", 0, 0, 0, 0),
+                            ComparisonRouteWorkResult::Returned(Ok(Some((summary, _)))) => (
+                                "returned",
+                                summary.relays_succeeded,
+                                summary.relays_failed,
+                                summary.remote_items,
+                                summary.received_items,
+                            ),
+                        };
+                    let target_route = witness
+                        .target_route
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|target| target == &inventory.route);
+                    witness
+                        .route_outcomes
+                        .lock()
+                        .unwrap()
+                        .push(TestComparisonRouteOutcome {
+                            attempt_serial,
+                            target_route,
+                            inbox: matches!(&inventory.route, TransportReconciliationRoute::Inbox),
+                            kind,
+                            relays_succeeded,
+                            relays_failed,
+                            remote_items,
+                            received_items,
+                        });
+                }
                 results.push(ComparisonRouteResult {
                     route: inventory.route,
                     initial_cursor,

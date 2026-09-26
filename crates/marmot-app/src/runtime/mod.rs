@@ -359,6 +359,7 @@ pub(crate) struct WorkerLoopPause {
     /// Exercise the actual resumed Receive continuation after a suspended
     /// direct-overflow completion, without depending on relay select order.
     pub(crate) completed_direct_overflow: Option<Result<crate::EpochBackfillRunOutcome, AppError>>,
+    pub(crate) arm_epoch_backfill: Option<GroupId>,
 }
 
 #[derive(Clone)]

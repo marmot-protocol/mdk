@@ -345,6 +345,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         entered: pause_entered_tx,
         release: pause_release_rx,
         completed_direct_overflow: None,
+        arm_epoch_backfill: None,
     });
     let (wake_tx, _wake_rx) = oneshot::channel();
     commands
@@ -451,6 +452,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
             .unwrap();
     }
     let route_key = storage_sqlite::TransportReconciliationRoute::Group(route);
+    *activity.target_route.lock().unwrap() = Some(route_key.clone());
     assert!(
         database
             .event_by_id(&EventId::from_byte_array(missing.id.to_bytes()))
@@ -476,6 +478,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .expect("actual queue drop persisted as typed loss evidence");
     assert!(loss.observed_count > 0);
     selections.lock().unwrap().clear();
+    activity.route_outcomes.lock().unwrap().clear();
     runtime
         .shared_services()
         .comparison_test_trace
@@ -615,6 +618,24 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     let active_requests_at_release = activity.active_requests.load(Ordering::SeqCst);
     gate.release();
     let selected = selections.lock().unwrap().clone();
+    let route_outcomes = activity
+        .route_outcomes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|outcome| {
+            (
+                outcome.attempt_serial,
+                outcome.target_route,
+                outcome.inbox,
+                outcome.kind,
+                outcome.relays_succeeded,
+                outcome.relays_failed,
+                outcome.remote_items,
+                outcome.received_items,
+            )
+        })
+        .collect::<Vec<_>>();
     let trace_counts = {
         let shared = runtime.shared_services();
         let trace = shared.comparison_test_trace.lock().unwrap();
@@ -663,7 +684,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .iter()
         .any(|(_, target_route, target_time, _, _, _, _)| *target_route && *target_time);
     eprintln!(
-        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, selected={selected:?}, trace_counts={trace_counts:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
+        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, selected={selected:?}, route_outcomes={route_outcomes:?}, trace_counts={trace_counts:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
     );
     if status_timed_out {
         timeout(Duration::from_secs(30), status_rx)
