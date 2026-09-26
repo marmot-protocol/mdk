@@ -67,6 +67,7 @@ use crate::{
 };
 
 mod audit;
+mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 pub(crate) mod epoch_stall;
 mod invite_recovery;

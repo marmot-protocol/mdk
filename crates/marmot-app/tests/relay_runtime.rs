@@ -10613,6 +10613,161 @@ async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn runtime_records_app_checkpoint_and_separate_broadcast_outcomes_for_received_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "app outcome boundary",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+            if account_id_hex == &bob.account.account_id_hex && joined == &group_id)
+    })
+    .await;
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"app outcome test message".to_vec(),
+        )
+        .await
+        .unwrap();
+    let received = wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::MessageReceived(message)
+            if message.account_id_hex == bob.account.account_id_hex
+                && message.message.group_id == group_id)
+    })
+    .await;
+    let message_id = match received {
+        MarmotAppEvent::MessageReceived(message) => message.message.source_message_id_hex,
+        _ => unreachable!(),
+    };
+    let message_ref =
+        marmot_forensics::v5::EngineMessageRef::from_message_id(&hex::decode(message_id).unwrap())
+            .unwrap();
+
+    let files = app.audit_log_files().unwrap();
+    let rows = files
+        .iter()
+        .filter(|file| file.account_ref == bob.account.label)
+        .flat_map(|file| {
+            std::fs::read_to_string(&file.path)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    V5Record::from_json(line.as_bytes()).expect("strict v5 audit row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        rows.iter().any(|row| {
+            row["event"]["type"] == "app_update_outcome"
+                && row["event"]["category"] == "account_projection_checkpoint"
+                && row["event"]["transaction"] == "committed"
+                && row["event"]["message_ref"] == message_ref.as_str()
+        }),
+        "app outcomes: {:?}",
+        rows.iter()
+            .filter(|row| row["event"]["type"] == "app_update_outcome")
+            .map(|row| &row["event"])
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        rows.iter().any(|row| {
+            row["event"]["type"] == "runtime_publication_outcome"
+                && row["event"]["category"] == "sync_summary"
+                && row["event"]["message_ref"] == message_ref.as_str()
+                && row["event"]["accepted_by_broadcast"] != "0"
+        }),
+        "runtime outcomes: {:?}",
+        rows.iter()
+            .filter(|row| row["event"]["type"] == "runtime_publication_outcome")
+            .map(|row| &row["event"])
+            .collect::<Vec<_>>()
+    );
+
+    // The next app transaction can still commit after the last runtime
+    // subscriber disappears. Broadcast rejection must stay a separate fact.
+    let committed_before = rows
+        .iter()
+        .filter(|row| {
+            row["event"]["type"] == "app_update_outcome"
+                && row["event"]["category"] == "account_projection_checkpoint"
+                && row["event"]["transaction"] == "committed"
+        })
+        .count();
+    drop(events);
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"committed without a runtime subscriber".to_vec(),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = app
+                .audit_log_files()
+                .unwrap()
+                .iter()
+                .filter(|file| file.account_ref == bob.account.label)
+                .flat_map(|file| {
+                    std::fs::read_to_string(&file.path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| {
+                            V5Record::from_json(line.as_bytes()).expect("strict v5 audit row");
+                            serde_json::from_str::<serde_json::Value>(line).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let committed_after = rows
+                .iter()
+                .filter(|row| {
+                    row["event"]["type"] == "app_update_outcome"
+                        && row["event"]["category"] == "account_projection_checkpoint"
+                        && row["event"]["transaction"] == "committed"
+                })
+                .count();
+            if committed_after > committed_before
+                && rows.iter().any(|row| {
+                    row["event"]["type"] == "runtime_publication_outcome"
+                        && row["event"]["no_subscribers"] != "0"
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("committed app update remains distinct from unobserved broadcast");
+    runtime.shutdown().await;
+}
+
 /// mdk#1451: create returns at the canonical founding boundary even when the
 /// first Welcome attempt is blocked on a delayed relay.
 #[tokio::test]

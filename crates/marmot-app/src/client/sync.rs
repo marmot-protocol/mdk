@@ -1667,6 +1667,7 @@ impl AppClient {
             let group_projection = event_group_id(event).and_then(|group_id| {
                 self.event_group_projection_best_effort(group_id, group_metadata.as_ref())
             });
+            let projection_started = Instant::now();
             if let Some(message) = observe_event(
                 &mut self.state,
                 &display_names,
@@ -1677,10 +1678,22 @@ impl AppClient {
                 source_received_at,
                 None,
                 self.app.allow_loopback_blob_endpoints(),
-            ) && let Some(gossip_message_id) =
-                self.project_received_message(message, group_metadata.as_ref(), &mut summary)?
-            {
-                gossip_message_ids.insert(gossip_message_id);
+            ) {
+                match self.project_received_message(message, group_metadata.as_ref(), &mut summary)
+                {
+                    Ok(Some(gossip_message_id)) => {
+                        gossip_message_ids.insert(gossip_message_id);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.record_v5_event_projection_failure(
+                            std::slice::from_ref(event),
+                            &error,
+                            projection_started.elapsed(),
+                        );
+                        return Err(error);
+                    }
+                }
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -1704,8 +1717,19 @@ impl AppClient {
                     marmot_forensics::v5::UpdateCause::RetainedEventReplay,
                 );
             }
-            routes_dirty |=
-                self.observe_event_projection_effects(event, &local_account_id_hex, &mut summary)?;
+            let projected =
+                self.observe_event_projection_effects(event, &local_account_id_hex, &mut summary);
+            match projected {
+                Ok(dirty) => routes_dirty |= dirty,
+                Err(error) => {
+                    self.record_v5_event_projection_failure(
+                        std::slice::from_ref(event),
+                        &error,
+                        projection_started.elapsed(),
+                    );
+                    return Err(error);
+                }
+            }
             let can_ack_application_event = if crosses_frontier {
                 self.prepare_local_group_deletion_frontier_clear(
                     event,
@@ -4974,6 +4998,17 @@ impl AppClient {
         &mut self,
         created_group_id_hex: Option<&str>,
     ) -> Result<Option<crate::ChatListRow>, AppError> {
+        let checkpoint_started = Instant::now();
+        let changed_groups = self.pending_group_projection_updates.len();
+        let pending_inputs = self.pending_seen_event_count;
+        let pending_acks = self.pending_application_event_acks.len();
+        let pending_frontiers = self.pending_local_group_deletion_frontier_clears.len();
+        let message_ref = (pending_acks == 1)
+            .then(|| self.pending_application_event_acks.iter().next())
+            .flatten()
+            .and_then(|id| {
+                marmot_forensics::v5::EngineMessageRef::from_message_id(id.as_slice()).ok()
+            });
         let observation = self
             .runtime_telemetry
             .as_ref()
@@ -4985,6 +5020,7 @@ impl AppClient {
                 probe.pending_updates(&self.state.groups, &self.pending_group_projection_updates)
             })
             .unwrap_or_default();
+        let welcome_update_count = audit_updates.len();
         // This fault exists only in unit-test binaries and occurs before any
         // projection checkpoint write; the engine's join is already committed.
         #[cfg(test)]
@@ -5060,6 +5096,29 @@ impl AppClient {
             probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);
         }
         self.flush_live_v5_events();
+        if !(result.is_ok()
+            && changed_groups != 0
+            && welcome_update_count == changed_groups
+            && pending_acks <= 1
+            && created_group_id_hex.is_none())
+            && (changed_groups != 0
+                || pending_inputs != 0
+                || pending_acks != 0
+                || pending_frontiers != 0
+                || created_group_id_hex.is_some())
+        {
+            self.record_v5_app_checkpoint(
+                message_ref,
+                changed_groups,
+                pending_inputs,
+                pending_acks,
+                pending_frontiers,
+                created_group_id_hex.is_some(),
+                result.as_ref().err(),
+                checkpoint_started.elapsed(),
+                audit_fail_before_commit,
+            );
+        }
         result
     }
 
@@ -5253,6 +5312,28 @@ impl AppClient {
     }
 
     async fn observe_account_device_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        summary: &mut SyncSummary,
+        source_message_id_hex: &str,
+        source_received_at: u64,
+    ) -> Result<bool, AppError> {
+        let started = Instant::now();
+        let result = self
+            .observe_account_device_effects_inner(
+                effects,
+                summary,
+                source_message_id_hex,
+                source_received_at,
+            )
+            .await;
+        if let Err(error) = &result {
+            self.record_v5_event_projection_failure(&effects.events, error, started.elapsed());
+        }
+        result
+    }
+
+    async fn observe_account_device_effects_inner(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
         summary: &mut SyncSummary,
