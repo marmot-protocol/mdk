@@ -1715,17 +1715,18 @@ impl ForensicRecorder for JsonlRecorder {
         }
         Self::try_report_pending_capture_loss(&mut inner);
         let before = inner.health.clone();
-        if Self::write_v5_event(
+        if !Self::write_v5_event(
             &mut inner,
             None,
             crate::v5::Event::RecordingSessionStopped(crate::v5::RecordingSessionStopped {
                 reason,
             }),
         ) {
-            self.try_roll_segment(&mut inner, Instant::now());
-        } else {
             Self::remember_failed_attempt(&mut inner, &before);
         }
+        // A size roll repeats SourceContext into the new active file. Do not
+        // roll after a terminal row: one bounded stop row may put this closed
+        // file over the segment threshold, but no same-session row follows it.
         // A failed terminal row cannot be retried without another observed
         // clean-close boundary. Absence of stop remains explicitly unknown.
     }

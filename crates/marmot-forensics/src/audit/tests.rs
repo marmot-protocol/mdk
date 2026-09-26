@@ -2553,6 +2553,44 @@ fn v5_recording_start_explicit_stop_and_reopen_do_not_infer_drop() {
 }
 
 #[test]
+fn v5_stop_crossing_segment_threshold_remains_last_in_its_session() {
+    use crate::v5::RecordingStopReason;
+    let dir = tempfile::tempdir().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, v5_test_producer())
+            .unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: sample_source(&"22".repeat(16)),
+        },
+    ));
+    let before = v5_rows(&path);
+    assert_eq!(before.last().unwrap()["event"]["type"], "source_context");
+    // Force the exact threshold decision without writing several MiB of
+    // unrelated rows. The stop itself crosses the segment limit.
+    recorder.inner.lock().unwrap().active_bytes = AUDIT_LOG_SEGMENT_MAX_BYTES - 1;
+    recorder.finish_v5_recording(RecordingStopReason::CleanRuntimeShutdown);
+    let rows = v5_rows(&path);
+    assert_eq!(rows.len(), before.len() + 1);
+    assert_eq!(
+        rows.last().unwrap()["event"]["type"],
+        "recording_session_stopped"
+    );
+    assert_eq!(
+        rows.last().unwrap()["session_id"],
+        before.last().unwrap()["session_id"]
+    );
+    assert!(
+        segment_paths(&path).is_empty(),
+        "terminal stop must not roll and replay source"
+    );
+    recorder.record(AuditRecord::new(None, recorder_started_kind()));
+    assert_eq!(v5_rows(&path).len(), rows.len());
+}
+
+#[test]
 fn v5_partial_write_preserves_prepared_delivery_bytes_and_reports_observed_loss() {
     use crate::local_delivery::{LocalAuditDelivery, Preparation};
     let dir = tempfile::tempdir().unwrap();
