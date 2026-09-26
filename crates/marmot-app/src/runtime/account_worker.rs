@@ -2118,6 +2118,17 @@ async fn run_app_runtime_account_worker(
                 yield_to_convergence = false;
                 yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
+                #[cfg(test)]
+                let target_epoch_before = shared
+                    .recovery_phase_witness
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|(label, witness)| {
+                        (label == &client.state.label && witness.is_target_group(&group_id))
+                            .then(|| client.local_epoch_for_group(&group_id))
+                            .flatten()
+                    });
                 let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
@@ -2143,6 +2154,12 @@ async fn run_app_runtime_account_worker(
                                 if lifecycle.is_stopping() { return; }
                                 match client.advance_convergence_after_runtime_sync(&group_id).await {
                                     Ok(summary) => {
+                                        #[cfg(test)]
+                                        if let Some(before) = target_epoch_before
+                                            && client.local_epoch_for_group(&group_id).is_some_and(|after| after > before)
+                                        {
+                                            shared.comparison_test_trace.lock().unwrap().push("scheduled_target_epoch_advanced");
+                                        }
                                         publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                                         // A pass that superseded one of this
                                         // device's own commits reports it
@@ -6773,13 +6790,16 @@ async fn finish_online_epoch_gap_receive(
     // have finished. No other account owner can adopt this grant meanwhile.
     let _credit = job.credit;
     let _ = report_pending_epoch_backfill_result(
+        client,
         result,
         job.backfill_armed,
         job.observation,
-        context.events,
-        context.account_id_hex,
-        context.account_label,
-        context.shared,
+        EpochBackfillReportContext {
+            events: context.events,
+            account_id_hex: context.account_id_hex,
+            account_label: context.account_label,
+            shared: context.shared,
+        },
     );
     finish_receive_after_recovery(
         client,

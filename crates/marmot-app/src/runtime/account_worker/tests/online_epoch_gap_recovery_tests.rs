@@ -845,6 +845,22 @@ async fn run_online_epoch_gap_fixture(bounded_probe: bool, queue_panic: bool) {
     let terminal = terminal.expect("selected grant records its terminal");
     assert_eq!(terminal.attempt_serial, attempt);
     assert!(terminal.local_epoch_after.is_some());
+    let selected_grant_advanced = terminal
+        .local_epoch_after
+        .is_some_and(|epoch| epoch > initial_epoch);
+    let local_advanced_before_network_retry = online_trace
+        .iter()
+        .position(|entry| *entry == "online_terminal")
+        .is_some_and(|terminal_index| {
+            online_trace[terminal_index + 1..]
+                .iter()
+                .take_while(|entry| **entry != "grant_inline")
+                .any(|entry| *entry == "scheduled_target_epoch_advanced")
+        });
+    assert!(
+        selected_grant_advanced || local_advanced_before_network_retry,
+        "the selected attempt or target-group local convergence must advance before a later network retry"
+    );
     assert!(
         online_trace.contains(&"online_network_started")
             && online_trace.contains(&"online_queue_started")
