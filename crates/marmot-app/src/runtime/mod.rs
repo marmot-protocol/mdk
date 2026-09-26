@@ -356,6 +356,9 @@ pub(crate) struct WorkerLoopPause {
     pub(crate) account_label: String,
     pub(crate) entered: oneshot::Sender<()>,
     pub(crate) release: watch::Receiver<bool>,
+    /// Exercise the actual resumed Receive continuation after a suspended
+    /// direct-overflow completion, without depending on relay select order.
+    pub(crate) completed_direct_overflow: Option<Result<crate::EpochBackfillRunOutcome, AppError>>,
 }
 
 #[derive(Clone)]

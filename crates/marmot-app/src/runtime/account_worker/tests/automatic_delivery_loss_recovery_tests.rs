@@ -344,6 +344,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         account_label: alice.label.clone(),
         entered: pause_entered_tx,
         release: pause_release_rx,
+        completed_direct_overflow: None,
     });
     let (wake_tx, _wake_rx) = oneshot::channel();
     commands
@@ -489,16 +490,21 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     tokio::pin!(entered);
     entered.as_mut().enable();
     pause_release_tx.send(true).unwrap();
-    let (held, stimulated_receive) = match timeout(Duration::from_secs(45), async {
-        let mut stimulated = false;
+    let mut stimulated_receive = false;
+    let held = timeout(Duration::from_secs(45), async {
         loop {
             tokio::select! {
                 biased;
-                _ = &mut entered => break (true, stimulated),
+                _ = &mut entered => break true,
                 _ = sleep(Duration::from_millis(20)) => {
+                    // An online terminal is not guaranteed before this wake.
+                    // Once the ordinary queue has capacity and no network job
+                    // is active, enqueue a real event; the worker chooses its
+                    // Receive seam when that delivery is actually claimed.
                     if stimulate_receive
-                        && !stimulated
-                        && runtime.shared_services().comparison_test_trace.lock().unwrap().contains(&"online_terminal")
+                        && !stimulated_receive
+                        && app.relay_plane.relay_health().await.account_delivery_queue_depth == 0
+                        && activity.active_jobs.load(Ordering::SeqCst) == 0
                     {
                         bob_client
                             .send_custom_event(
@@ -509,15 +515,14 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
                             )
                             .await
                             .unwrap();
-                        stimulated = true;
+                        stimulated_receive = true;
                     }
                 }
             }
         }
-    }).await {
-        Ok(result) => result,
-        Err(_) => (false, false),
-    };
+    })
+    .await
+    .unwrap_or(false);
     activity.matching_events.store(0, Ordering::SeqCst);
     activity
         .matching_queued_deliveries
@@ -610,6 +615,21 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     let active_requests_at_release = activity.active_requests.load(Ordering::SeqCst);
     gate.release();
     let selected = selections.lock().unwrap().clone();
+    let trace_counts = {
+        let shared = runtime.shared_services();
+        let trace = shared.comparison_test_trace.lock().unwrap();
+        [
+            "grant_eligible",
+            "grant_inline",
+            "selection_deferred",
+            "online_network_started",
+            "online_terminal",
+            "route_skipped",
+            "route_timed_out",
+            "route_relay_failed",
+        ]
+        .map(|kind| (kind, trace.iter().filter(|seen| **seen == kind).count()))
+    };
     let loss_demands = storage.pending_recovery_demands().unwrap();
     let loss_demand_covers_missing = loss_demands.iter().any(|demand| {
         demand.cause == storage_sqlite::RecoveryCause::QueueLoss
@@ -643,7 +663,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .iter()
         .any(|(_, target_route, target_time, _, _, _, _)| *target_route && *target_time);
     eprintln!(
-        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, selected={selected:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
+        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, selected={selected:?}, trace_counts={trace_counts:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
     );
     if status_timed_out {
         timeout(Duration::from_secs(30), status_rx)
@@ -682,7 +702,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
                 if epoch
                     .ok()
                     .and_then(Result::ok)
-                    .is_some_and(|state| state.epoch >= pre_burst_epoch + 1)
+                    .is_some_and(|state| state.epoch > pre_burst_epoch)
                 {
                     break;
                 }
@@ -767,7 +787,11 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         selection.attempt_serial == active_attempt_at_entry
             && matches!(
                 selection.seam,
-                EpochBackfillExecutionSeam::Receive | EpochBackfillExecutionSeam::Maintenance
+                seam if seam == if stimulate_receive {
+                    EpochBackfillExecutionSeam::Receive
+                } else {
+                    EpochBackfillExecutionSeam::Maintenance
+                }
             )
             && selection.comparison_revision.is_none()
             && selection.causes == [storage_sqlite::RecoveryCause::QueueLoss]
