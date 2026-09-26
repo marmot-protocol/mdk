@@ -1,8 +1,34 @@
 use super::*;
 use crate::{AppClient, AuditLogSettings, MarmotApp, MarmotAppConfig};
+use cgka_traits::{group::ProtocolProfile, storage::GroupStorage};
 use marmot_account::AccountHome;
 use nostr_relay_builder::MockRelay;
 use std::{path::Path, time::Duration};
+
+fn actual_v5_rows(app: &MarmotApp, account: &str) -> Vec<Record> {
+    let dir = app.account_dir(account);
+    let paths = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-v5.jsonl")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 1, "one active v5 recorder per account");
+    let body = std::fs::read_to_string(&paths[0]).unwrap();
+    assert!(body.len() < 256 * 1024, "bounded local scenario volume");
+    assert!(!body.contains("wss://"));
+    assert!(!body.contains("synthetic private group title"));
+    body.lines()
+        .map(|line| {
+            assert!(line.len() < 65_535);
+            Record::from_json(line.as_bytes()).unwrap()
+        })
+        .collect()
+}
 
 fn probe_with_ids(source: u8, session: u8) -> WelcomeProbe {
     // Explicit synthetic source/build metadata, not an assertion of production
@@ -12,7 +38,7 @@ fn probe_with_ids(source: u8, session: u8) -> WelcomeProbe {
         format!("{source:02x}").repeat(16).try_into().unwrap(),
         format!("{session:02x}").repeat(16).try_into().unwrap(),
         Producer {
-            mdk_revision: "00".repeat(20).try_into().unwrap(),
+            mdk_revision: Some("00".repeat(20).try_into().unwrap()),
             build_profile: BuildProfile::Debug,
             platform: Platform::Other,
             host_build: Some("unit-test-probe".to_owned().try_into().unwrap()),
@@ -30,10 +56,248 @@ fn app(path: &Path, relay: &str) -> MarmotApp {
         relay.to_owned(),
         MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
-    // The existing recorder remains v4 even while the private probe is selected.
+    // Enable the same v5 recorder used by the live app path.
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     app
+}
+
+#[tokio::test]
+async fn opened_inventory_selects_current_groups_before_the_64_group_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let mut client = app.client("alice").await.unwrap();
+    let mut ids = Vec::new();
+    for index in 0..65 {
+        ids.push(
+            client
+                .create_group(&format!("mixed profile group {index}"), &[])
+                .await
+                .unwrap(),
+        );
+    }
+    ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let current_id = ids.pop().unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    for id in ids {
+        let mut group = storage.get_group(&id).unwrap();
+        group.protocol_profile = ProtocolProfile::Legacy;
+        storage.put_group(&group).unwrap();
+    }
+
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    client.set_audit_recording(true);
+    drop(client);
+    let rows = actual_v5_rows(&app, "alice");
+    let inventory = rows
+        .iter()
+        .find_map(|row| match &row.fields().event {
+            Event::GroupBaselineInventory(event)
+                if event.reason == BaselineReason::AuditEnabled =>
+            {
+                Some(event)
+            }
+            _ => None,
+        })
+        .expect("audit enable inventory");
+    assert_eq!(inventory.eligible_group_count, Some(1));
+    assert_eq!(inventory.selected_group_count, Some(1));
+    assert_eq!(inventory.omitted_by_limit_count, Some(0));
+    assert_eq!(inventory.failed_read_count, Some(0));
+    let selected = rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                &row.fields().event,
+                Event::GroupBaseline(event) if event.reason == BaselineReason::AuditEnabled
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected[0].fields().group_ref.as_ref(),
+        Some(&GroupRef::from_group_id(current_id.as_slice()).unwrap())
+    );
+}
+
+#[tokio::test]
+async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let relay = MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+        AccountHome::open(alice_dir.path())
+            .create_account("alice")
+            .unwrap();
+        let bob_id = AccountHome::open(bob_dir.path())
+            .create_account("bob")
+            .unwrap()
+            .account_id_hex;
+        let alice_app = app(alice_dir.path(), &relay_url);
+        let bob_app = app(bob_dir.path(), &relay_url);
+        let mut alice = alice_app.client("alice").await.unwrap();
+        let mut bob = bob_app.client("bob").await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let group = alice
+            .create_group_with_initial_source_and_optional_telemetry(
+                "synthetic private group title",
+                &[&bob_id],
+                crate::AppCreateGroupOptions::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .group_id;
+        let retained = alice.runtime.outstanding_welcome_deliveries().unwrap();
+        assert_eq!(retained.len(), 1);
+        let outer_id = <[u8; 32]>::try_from(retained[0].1.id.as_slice()).unwrap();
+        alice.drive_unpublished_welcome_delivery(None).await;
+        assert!(
+            alice
+                .runtime
+                .outstanding_welcome_deliveries()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(bob.sync().await.unwrap().joined_groups.contains(&group));
+        assert_eq!(bob.runtime.group_record(&group).unwrap().members.len(), 2);
+        alice
+            .send(&group, b"private audit integration message")
+            .await
+            .unwrap();
+
+        let sender = actual_v5_rows(&alice_app, "alice");
+        let recipient = actual_v5_rows(&bob_app, "bob");
+        for rows in [&sender, &recipient] {
+            let mut bytes_by_kind = std::collections::BTreeMap::<String, usize>::new();
+            for row in rows {
+                let kind = serde_json::to_value(&row.fields().event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                *bytes_by_kind.entry(kind).or_default() += row.to_json().unwrap().len();
+            }
+            assert!(bytes_by_kind.values().all(|bytes| *bytes < 64 * 1024));
+            let body = rows
+                .iter()
+                .flat_map(|row| row.to_json().unwrap())
+                .collect::<Vec<_>>();
+            let text = String::from_utf8(body).unwrap();
+            assert!(!text.contains(&bob_id));
+            assert!(!text.contains(&hex::encode(group.as_slice())));
+            assert!(!text.contains(&hex::encode(outer_id)));
+            assert!(!text.contains("private audit integration message"));
+        }
+        let sender_types = sender
+            .iter()
+            .map(|row| {
+                serde_json::to_value(&row.fields().event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let recipient_types = recipient
+            .iter()
+            .map(|row| {
+                serde_json::to_value(&row.fields().event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for kind in [
+            "welcome_prepared",
+            "welcome_publish_started",
+            "welcome_publish_finished",
+            "group_baseline",
+            "publish_outcome",
+        ] {
+            assert!(
+                sender_types.contains(kind),
+                "missing sender {kind}: {sender_types:?}"
+            );
+        }
+        for kind in [
+            "welcome_observed",
+            "welcome_unwrapped",
+            "welcome_join_finished",
+            "app_group_update_finished",
+            "group_baseline",
+        ] {
+            assert!(
+                recipient_types.contains(kind),
+                "missing recipient {kind}: {recipient_types:?}"
+            );
+        }
+        let outer = NostrEventRef::from_validated_event_id(&outer_id);
+        let prepared = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePrepared(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        let published = sender
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomePublishFinished(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        let observed = recipient
+            .iter()
+            .find_map(|row| match &row.fields().event {
+                Event::WelcomeObserved(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(prepared.outer_event_ref.as_ref(), Some(&outer));
+        assert_eq!(published.outer_event_ref, outer);
+        assert_eq!(observed.outer_event_ref, outer);
+        assert_eq!(published.policy, Policy::Met);
+        assert_eq!(published.retained_state, RetainedState::Unknown);
+        assert_eq!(
+            prepared.op_id,
+            sender
+                .iter()
+                .find_map(|row| match &row.fields().event {
+                    Event::WelcomePublishStarted(event) => Some(event.op_id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        );
+        assert_ne!(
+            sender[0].fields().source_ref,
+            recipient[0].fields().source_ref
+        );
+        assert_ne!(
+            sender[0].fields().session_id,
+            recipient[0].fields().session_id
+        );
+        drop(alice);
+        let reopened = alice_app.client("alice").await.unwrap();
+        assert_eq!(
+            reopened.runtime.group_record(&group).unwrap().members.len(),
+            2
+        );
+        assert!(
+            actual_v5_rows(&alice_app, "alice")
+                .iter()
+                .any(|row| matches!(
+                    &row.fields().event,
+                    Event::GroupBaseline(baseline) if baseline.reason == BaselineReason::Opened
+                ))
+        );
+    })
+    .await
+    .expect("bounded live v5 scenario");
 }
 
 struct Scenario {
@@ -414,6 +678,7 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
             scenario.updates()[1].update_id
         );
 
+        let before_message = scenario.capture().rows.len();
         scenario
             .alice
             .send(&group, b"synthetic content must never enter probe")
@@ -427,7 +692,7 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
         );
         assert_eq!(
             scenario.capture().rows.len(),
-            5,
+            before_message,
             "ordinary message work adds no Welcome rows"
         );
         scenario.assert_clean();
@@ -455,13 +720,14 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
                 assert!(!text.contains(forbidden));
             }
         }
-        // A gross-regression bound for this five-row subset, not a bandwidth
+        // A gross-regression bound for this local subset, not a bandwidth
         // target for the complete Welcome lifecycle or an upload measurement.
-        assert!(total < 6500);
+        assert!(total < 7500);
         println!(
-            "v5 recipient subset: rows=5 body_bytes={total} \
+            "v5 recipient subset: rows={} body_bytes={total} \
              jsonl_bytes={} largest_body_bytes={largest} by_kind={by_kind:?}",
-            total + 5
+            scenario.capture().rows.len(),
+            total + scenario.capture().rows.len()
         );
         let sender_rows = &scenario.sender_capture().rows;
         let sender_body: usize = sender_rows
@@ -495,7 +761,17 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
                 (kind, body.len())
             })
             .collect::<Vec<_>>();
-        assert!(sender_body < 1600);
+        assert!(sender_body < 3000);
+        assert!(
+            sender_by_kind
+                .iter()
+                .any(|(kind, _)| kind == "welcome_prepared")
+        );
+        assert!(
+            sender_by_kind
+                .iter()
+                .any(|(kind, _)| kind == "group_baseline")
+        );
         println!(
             "v5 sender subset: rows={} body_bytes={sender_body} jsonl_bytes={} \
              largest_body_bytes={sender_largest} by_kind={sender_by_kind:?}",
@@ -508,10 +784,7 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
             for file in files {
                 for row in std::fs::read_to_string(file.path).unwrap().lines() {
                     let v: serde_json::Value = serde_json::from_str(row).unwrap();
-                    assert_eq!(
-                        v["schema_version"],
-                        marmot_forensics::AUDIT_LOG_SCHEMA_VERSION
-                    );
+                    assert_eq!(v["schema_version"], marmot_forensics::v5::SCHEMA_VERSION);
                 }
             }
         }
@@ -575,7 +848,14 @@ async fn founding_preparation_matches_two_recipients_without_order_inference() {
             );
         }
         let sender = scenario.sender_capture();
-        assert_eq!(sender.rows.len(), 2);
+        assert_eq!(
+            sender
+                .rows
+                .iter()
+                .filter(|row| matches!(row.fields().event, Event::WelcomePrepared(_)))
+                .count(),
+            2
+        );
         let expected = [
             (&scenario.bob_id, scenario.key_package_event_id),
             (&carol_id, carol_key_package_event_id),
@@ -1144,4 +1424,36 @@ fn probe_bounds_and_unknown_checkpoint_do_not_fabricate_success() {
     assert_eq!(capture.dropped, 2);
     assert!(capture.bytes <= MAX_BYTES);
     assert_eq!(capture.invalid, 0);
+}
+
+#[tokio::test]
+async fn baseline_marks_an_invalid_or_duplicate_member_identity_as_partial() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let group_id = scenario.create().await;
+        let group = scenario.alice.runtime.group_record(&group_id).unwrap();
+        let mut capture = probe();
+
+        let mut invalid = group.clone();
+        invalid.members[0].id = cgka_traits::types::MemberId::new(Vec::new());
+        capture.baseline(&invalid, None, BaselineReason::Opened, None);
+        let Event::GroupBaseline(row) = &capture.rows[0].fields().event else {
+            panic!("expected baseline");
+        };
+        assert_eq!(row.capture, Capture::Partial);
+        assert!(!row.members_complete);
+        assert!(row.limitations.contains(&Limitation::MemberIdentityInvalid));
+
+        let mut duplicate = group;
+        duplicate.members[1].id = duplicate.members[0].id.clone();
+        capture.baseline(&duplicate, None, BaselineReason::Opened, None);
+        let Event::GroupBaseline(row) = &capture.rows[1].fields().event else {
+            panic!("expected baseline");
+        };
+        assert_eq!(row.capture, Capture::Partial);
+        assert!(!row.members_complete);
+        assert!(row.limitations.contains(&Limitation::MemberIdentityInvalid));
+    })
+    .await
+    .expect("bounded baseline identity scenario");
 }

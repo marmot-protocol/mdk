@@ -3342,6 +3342,7 @@ async fn run_startup_hydration_pipeline(
 }
 
 fn finish_deferred_hydration_reconciliation(client: &mut AppClient) {
+    client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
     if let Err(err) = client.reconcile_hydrated_account_state() {
         tracing::warn!(
             target: "marmot_app::runtime",
@@ -3361,6 +3362,7 @@ pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(
             .session_mut()
             .hydrate_next_groups(&[], STARTUP_HYDRATION_BATCH_SIZE)?;
         if progress.remaining == 0 {
+            client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
             return client.reconcile_hydrated_account_state();
         }
         tokio::task::yield_now().await;
@@ -9094,42 +9096,46 @@ mod tests {
                     std::fs::read_to_string(file.path)
                         .unwrap()
                         .lines()
-                        .map(|line| serde_json::from_str(line).unwrap())
+                        .map(|line| {
+                            marmot_forensics::v5::Record::from_json(line.as_bytes())
+                                .expect("real v5 recovery row");
+                            serde_json::from_str(line).unwrap()
+                        })
                         .collect::<Vec<_>>()
                 })
                 .collect();
             let attempt_id = rows
                 .iter()
-                .find(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
-                .and_then(|row| row["context"]["operation_id"].as_str())
-                .expect("owner attempt must carry operation_id");
+                .find(|row| row["event"]["type"] == "epoch_stall_backfill_started")
+                .and_then(|row| row["event"]["record_context"]["operation_ref"].as_str())
+                .expect("owner attempt must carry operation_ref");
             assert_eq!(
                 rows.iter()
-                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+                    .filter(|row| row["event"]["type"] == "epoch_stall_backfill_started")
                     .count(),
                 1
             );
             assert_eq!(
                 rows.iter()
-                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
+                    .filter(|row| row["event"]["type"] == "epoch_stall_backfill_completed")
                     .count(),
                 usize::from(qualified)
             );
             assert!(
                 rows.iter()
-                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+                    .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
                     .count()
                     == usize::from(!qualified)
             );
             assert!(rows.iter().all(|row| {
                 !matches!(
-                    row["kind"]["type"].as_str(),
+                    row["event"]["type"].as_str(),
                     Some(
                         "epoch_stall_backfill_started"
                             | "epoch_stall_backfill_completed"
                             | "epoch_stall_backfill_failed"
                     )
-                ) || row["context"]["operation_id"].as_str() == Some(attempt_id)
+                ) || row["event"]["record_context"]["operation_ref"].as_str() == Some(attempt_id)
             }));
         }
     }
@@ -9190,14 +9196,18 @@ mod tests {
                 std::fs::read_to_string(file.path)
                     .unwrap()
                     .lines()
-                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .map(|line| {
+                        marmot_forensics::v5::Record::from_json(line.as_bytes())
+                            .expect("real v5 recovery row");
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()
+                    })
                     .collect::<Vec<_>>()
             })
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
             .collect();
         assert_eq!(failed_rows.len(), 1);
         assert_eq!(
-            failed_rows[0]["kind"]["activation_outcome"].as_str(),
+            failed_rows[0]["event"]["activation_outcome"].as_str(),
             Some("failed")
         );
         assert!(matches!(

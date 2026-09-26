@@ -15,6 +15,7 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
     require(record.seq.get() > 0, "sequence must be positive")?;
     let has_group = record.group_ref.is_some();
     match &record.event {
+        Event::Operational(_) => {}
         Event::WelcomePrepared(e) => {
             require(
                 match e.mode {
@@ -176,21 +177,30 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                 .filter(|r| r.status == EndpointStatus::Acknowledged)
                 .count() as u32;
             require(
-                e.accepted_this_attempt_count >= captured_acks
-                    && (!e.results_complete || e.accepted_this_attempt_count == captured_acks),
+                e.accepted_this_attempt_count
+                    .is_none_or(|n| n >= captured_acks)
+                    && (!e.results_complete
+                        || e.accepted_this_attempt_count == Some(captured_acks)),
                 "current acknowledgment count inconsistent with results",
             )?;
             require(
-                e.accepted_total_count >= e.accepted_this_attempt_count,
+                e.accepted_total_count.is_none_or(|total| {
+                    e.accepted_this_attempt_count
+                        .is_none_or(|current| total >= current)
+                }),
                 "cumulative acknowledgments smaller than current attempt",
             )?;
             require(
                 match e.policy {
-                    Policy::Met => e.accepted_total_count >= e.required_acks,
-                    Policy::Unmet => e.accepted_total_count < e.required_acks,
+                    Policy::Met => e.accepted_total_count.is_some_and(|n| n >= e.required_acks),
+                    Policy::Unmet => e.accepted_total_count.is_some_and(|n| n < e.required_acks),
                     Policy::Unknown => true,
                 },
                 "policy contradicts acknowledgment counts",
+            )?;
+            require(
+                e.results_complete || e.policy != Policy::Unmet,
+                "incomplete endpoint results cannot establish unmet policy",
             )?;
             require(
                 e.retained_state != RetainedState::Completed || e.policy == Policy::Met,
@@ -331,7 +341,7 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                 "complete membership requires exact count",
             )?;
             require(
-                e.limitations.len() <= 4
+                e.limitations.len() <= 5
                     && e.limitations
                         .iter()
                         .enumerate()
@@ -380,6 +390,33 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
                 e.reason != BaselineReason::Joined || e.cause_outer_event_ref.is_some(),
                 "join baseline requires Welcome cause",
             )?;
+        }
+        Event::GroupBaselineInventory(e) => {
+            require(!has_group, "baseline inventory is account-scoped")?;
+            require(
+                matches!(
+                    e.reason,
+                    BaselineReason::Opened | BaselineReason::AuditEnabled
+                ),
+                "baseline inventory reason must be opened or audit enabled",
+            )?;
+            match (
+                e.eligible_group_count,
+                e.selected_group_count,
+                e.omitted_by_limit_count,
+                e.failed_read_count,
+            ) {
+                (Some(eligible), Some(selected), Some(omitted), Some(failed)) => {
+                    require(
+                        selected == eligible.min(64)
+                            && selected.checked_add(omitted) == Some(eligible)
+                            && failed <= selected,
+                        "invalid baseline inventory counts",
+                    )?;
+                }
+                (None, None, None, None) => {}
+                _ => return Err(ContractError::rule("partial baseline inventory counts")),
+            }
         }
     }
     Ok(())

@@ -234,6 +234,44 @@ fn tracker_config(endpoint: String) -> AuditLogTrackerConfig {
 }
 
 #[tokio::test]
+async fn v5_catalog_failure_retains_completed_v4_result_and_requests_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
+    // V4 exits with its own missing-endpoint result before enumerating the
+    // account catalog. V5 must report the catalog failure independently.
+    std::fs::write(tmp.path().join("accounts"), b"not a directory").unwrap();
+    let sender = AuditOtlpSender::for_loopback_dev(
+        "audit-v5-test",
+        "http://127.0.0.1:1/v1/logs",
+        "test-token",
+    )
+    .unwrap();
+    let mut schedule = AuditPassSchedule::default();
+    let result = post_audit_log_tracker_update_with_v5(
+        &app,
+        AuditLogTrackerConfig::default(),
+        Some(&sender),
+        None,
+        &RuntimeLifecycle::new(),
+        false,
+        &mut schedule,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.skipped_reason.as_deref(),
+        Some("audit log tracker endpoint missing")
+    );
+    assert_eq!(
+        result.v5.unwrap().skipped_reason.as_deref(),
+        Some("v5 delivery pass failed")
+    );
+    assert_eq!(schedule.retry_after, Some(Duration::ZERO));
+}
+
+#[tokio::test]
 async fn automatic_pass_stops_on_auth_rate_limit_and_server_failure() {
     // 400 and 413 are the file-specific controls: with Retry-After present,
     // both are ordinary rejections, so the pass continues and the cooldown

@@ -2765,8 +2765,7 @@ impl AppClient {
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
-        #[cfg(test)]
-        let probe_receive = if welcome {
+        let probe_receive = if welcome && (client.audit_v5_enabled() || cfg!(test)) {
             client
                 .audit_v5_probe
                 .as_mut()
@@ -2774,6 +2773,7 @@ impl AppClient {
         } else {
             None
         };
+        client.flush_live_v5_events();
         // Hold the same account policy lock through admission and projection, so a
         // block cannot commit between authenticating the inviter and creating state.
         let policy_lock = client.app.block_update_lock(&client.state.label).await;
@@ -2834,7 +2834,6 @@ impl AppClient {
         );
         let telemetry = client.runtime_telemetry.clone();
         let ingest_observation = telemetry.as_ref().map(|t| t.observe(RuntimeOp::Ingest));
-        #[cfg(test)]
         if let (Some(slot), Some(receive)) = (&client.audit_v5_peel_slot, probe_receive.clone()) {
             slot.lock().unwrap().arm(&delivery.message, receive);
         }
@@ -2860,13 +2859,11 @@ impl AppClient {
                 }
             })
             .await;
-        #[cfg(test)]
         if let (Some(probe), Some(slot)) = (&mut client.audit_v5_probe, &client.audit_v5_peel_slot)
             && let Some(completion) = slot.lock().unwrap().take()
         {
             probe.unwrapped(completion);
         }
-        #[cfg(test)]
         if let (Some(probe), Some(receive), Ok(effects)) =
             (&mut client.audit_v5_probe, probe_receive, &ingest)
             && matches!(effects.outcome, IngestOutcome::Processed)
@@ -2891,9 +2888,19 @@ impl AppClient {
                 && joins.next().is_none()
                 && let Ok(group) = client.runtime.group_record(group_id)
             {
-                probe.joined(receive, &group);
+                let initial_join = probe.joined(receive.clone(), &group);
+                if initial_join && client.runtime.session().audit_v5_enabled() {
+                    let admins = client.runtime.admin_pubkeys(group_id).ok();
+                    probe.baseline(
+                        &group,
+                        admins.as_deref(),
+                        marmot_forensics::v5::BaselineReason::Joined,
+                        Some(receive.1),
+                    );
+                }
             }
         }
+        client.flush_live_v5_events();
         if let Some(observation) = ingest_observation {
             observation.finish(if ingest.is_ok() {
                 TelemetryOutcome::Success
@@ -4971,7 +4978,6 @@ impl AppClient {
             .runtime_telemetry
             .as_ref()
             .map(|t| t.observe(RuntimeOp::ProjectionCheckpoint));
-        #[cfg(test)]
         let audit_updates = self
             .audit_v5_probe
             .as_ref()
@@ -4987,6 +4993,8 @@ impl AppClient {
                 .audit_v5_probe
                 .as_mut()
                 .is_some_and(|probe| probe.reject_checkpoints);
+        #[cfg(not(test))]
+        let audit_fail_before_commit = false;
         let result = (|| {
             #[cfg(test)]
             if audit_fail_before_commit {
@@ -5048,10 +5056,10 @@ impl AppClient {
         if let Some(observation) = observation {
             observation.finish_app(&result);
         }
-        #[cfg(test)]
         if let Some(probe) = &mut self.audit_v5_probe {
             probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);
         }
+        self.flush_live_v5_events();
         result
     }
 
@@ -5333,9 +5341,9 @@ impl AppClient {
                 updated_group.as_ref(),
                 &event_source,
             );
-            #[cfg(test)]
             if previous_group != updated_group
                 && let Some(probe) = &mut self.audit_v5_probe
+                && (self.runtime.session().audit_v5_enabled() || cfg!(test))
             {
                 probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
             }

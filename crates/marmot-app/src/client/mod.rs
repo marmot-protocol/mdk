@@ -67,7 +67,6 @@ use crate::{
 };
 
 mod audit;
-#[cfg(test)]
 pub(crate) mod audit_v5_probe;
 pub(crate) mod epoch_stall;
 mod invite_recovery;
@@ -338,9 +337,7 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
         Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
-    #[cfg(test)]
     pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
-    #[cfg(test)]
     pub(crate) audit_v5_peel_slot:
         Option<std::sync::Arc<std::sync::Mutex<audit_v5_probe::PeelSlot>>>,
     /// Synthetic endpoint certificates for executor/completion contract tests.
@@ -1668,7 +1665,6 @@ impl AppClient {
         // Reject an explicit creator before MLS mutation instead of surfacing
         // OpenMLS's opaque DuplicateSignatureKey error from add_members.
         let creator = self.app.account_home().account(&self.state.label)?;
-        #[cfg(test)]
         let mut founding_selections = Vec::with_capacity(members.len());
         for member in &members {
             let metadata = cgka_engine::key_package::key_package_metadata(member)
@@ -1676,7 +1672,6 @@ impl AppClient {
             if metadata.credential_identity_hex == creator.account_id_hex {
                 return Err(AppError::GroupCreateIncludesCreator);
             }
-            #[cfg(test)]
             founding_selections.push(audit_v5_probe::FoundingSelection {
                 recipient_hex: metadata.credential_identity_hex,
                 key_package_event_id: member.source.as_ref().map(|source| source.event_id.clone()),
@@ -1784,7 +1779,7 @@ impl AppClient {
         if !optional_app_components.is_empty() {
             changed_fields.push("image");
         }
-        let audit_context = Self::local_human_action_context(
+        let mut audit_context = Self::local_human_action_context(
             "create_group",
             changed_fields,
             touched_components,
@@ -1792,15 +1787,17 @@ impl AppClient {
         );
 
         request.members = members;
-        #[cfg(test)]
-        let founding_probe = (self.runtime.session().new_protocol_profile()
-            == ProtocolProfile::Current)
-            .then(|| {
-                self.audit_v5_probe
-                    .as_mut()
-                    .and_then(|probe| probe.begin_founding(founding_selections))
-            })
-            .flatten();
+        let founding_probe = (self.audit_v5_enabled() || cfg!(test))
+            .then_some(())
+            .and_then(|()| {
+                (self.runtime.session().new_protocol_profile() == ProtocolProfile::Current)
+                    .then(|| {
+                        self.audit_v5_probe
+                            .as_mut()
+                            .and_then(|probe| probe.begin_founding(founding_selections))
+                    })
+                    .flatten()
+            });
         let mls_started_at = Instant::now();
         let prepared = self
             .runtime
@@ -1844,10 +1841,22 @@ impl AppClient {
                 "confirmed group creation outpaced prepared-image consumption; retry will reconcile the engine component"
             );
         }
-        #[cfg(test)]
         if let (Some(probe), Some(pending)) = (&mut self.audit_v5_probe, founding_probe) {
             probe.founding_prepared(pending, &group_id, &prepared.effects);
+            audit_context.v5_welcome_refs = probe.take_validated_refs();
+            if self.runtime.session().audit_v5_enabled()
+                && let Ok(group) = self.runtime.group_record(&group_id)
+            {
+                let admins = self.runtime.admin_pubkeys(&group_id).ok();
+                probe.baseline(
+                    &group,
+                    admins.as_deref(),
+                    marmot_forensics::v5::BaselineReason::Created,
+                    None,
+                );
+            }
         }
+        self.flush_live_v5_events();
         // Current-profile founding creation is already canonical before
         // transport delivery: the engine transaction retained the exact
         // Welcome bytes and destinations. Derive only the in-memory ids used
@@ -3200,13 +3209,11 @@ impl AppClient {
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         *group = authoritative;
         let archived = group.archived;
-        #[cfg(test)]
         let audit_origin = self
             .audit_v5_probe
             .as_mut()
             .and_then(|probe| probe.begin_confirmation(group));
         let result = self.set_group_invite_confirmation(group_id, false, archived);
-        #[cfg(test)]
         if result.is_err()
             && let (Some(probe), Some(origin)) = (&mut self.audit_v5_probe, audit_origin)
         {

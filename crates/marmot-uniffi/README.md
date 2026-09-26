@@ -352,7 +352,22 @@ checksums, provenance, and generated-source synchronization rules.
 The Kotlin binding is generated from the same release host library metadata as Swift, so it exposes the same `Marmot`
 object, subscription objects, records, enums, and error variants.
 
-## Audit v4 adoption
+## Audit v5 recording and delivery
+
+`AuditLogSettingsFfi.enabled` remains the recording opt-in. New account sessions and the live
+runtime switch write `marmot-forensics-audit/v5` to `audit-<engine_id>-v5.jsonl`; existing v4 files
+remain on disk. To deliver v5, supply a dedicated OTLP `/v1/logs` destination and bearer token
+with `set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi)`. The configuration is held in memory and
+the returned record omits the token. Set `enabled: false` to remove delivery configuration.
+An exact loopback endpoint requires `allow_loopback_dev: true`; public endpoints require HTTPS.
+The host then calls `post_audit_log_tracker_update_v5()` for an immediate pass; the existing
+audit tracker also uses this configuration on its activity triggers with the usual batching,
+retry, and shutdown behavior. The v5 result reports accepted batches, pending accounts, blocked
+accounts, and idle accounts separately from legacy v4 uploads. No host should infer receiver
+acceptance from an empty v4 `uploaded` list. The v4 whole-file Goggles endpoint never receives
+v5 records.
+
+## Legacy audit v4 upload
 
 Audit uploads now accept only `marmot-forensics-audit/v4`; old local files are never migrated or sent.
 App construction automatically removes recognized v1-v3 forensic files and rotated segments after acquiring the

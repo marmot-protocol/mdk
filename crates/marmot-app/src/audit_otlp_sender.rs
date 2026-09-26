@@ -1,9 +1,9 @@
-//! Inactive, single-attempt audit OTLP/HTTP sender.
+//! Single-attempt audit OTLP/HTTP sender for explicitly configured v5 delivery.
 //!
 //! The caller prepares a [`DeliveryBatch`] under its local account ownership,
 //! releases that ownership while `send` runs, then reacquires it to call
-//! `LocalAuditDelivery::finish` only for a known response. No runtime constructs
-//! this sender, and it does not configure a production endpoint.
+//! `LocalAuditDelivery::finish` only for a known response. The runtime keeps a
+//! sender only when the host configures a dedicated audit destination.
 
 use std::fmt;
 use std::time::Duration;
@@ -74,6 +74,16 @@ impl fmt::Debug for AuditOtlpSender {
 impl AuditOtlpSender {
     pub(crate) fn destination(&self) -> &str {
         &self.destination
+    }
+
+    /// Exact HTTP request-body size for a prepared batch, after JSON escaping.
+    /// A receiver can compare this with the observed Content-Length. This
+    /// returns `None` for a destination mismatch or an unencodable batch.
+    pub fn request_body_bytes(&self, batch: &DeliveryBatch) -> Option<usize> {
+        (batch.token.destination() == self.destination.as_str())
+            .then(|| encode_batch(batch.clone()))
+            .flatten()
+            .map(|wire| wire.len())
     }
 
     /// Create an inactive sender for a dedicated `https://.../v1/logs` gateway.

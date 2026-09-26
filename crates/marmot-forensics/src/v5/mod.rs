@@ -1,9 +1,12 @@
-//! Inactive v5 Welcome contract. No recorder, transport, upload or reader integration.
-//! Existing `AuditEvent`, `JsonlRecorder` and delivery remain v4.
+//! Active opt-in v5 forensic record contract. New app audit sessions record
+//! typed Welcome and operational events here; historical v4 files remain
+//! readable and their whole-file upload contract stays separate.
+mod operational;
 mod primitives;
 mod strict_json;
 mod types;
 mod validation;
+pub use operational::{OperationalEvent, group_ref_from_legacy_hex};
 pub use primitives::*;
 pub use types::*;
 

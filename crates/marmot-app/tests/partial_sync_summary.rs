@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use cgka_traits::GroupId;
 use marmot_account::AccountHome;
+use marmot_app::audit_otlp_sender::AuditOtlpSender;
 use marmot_app::{
-    AppClient, AuditLogSettings, AuditLogTrackerConfig, MarmotApp, MarmotAppConfig, MarmotAppEvent,
-    MarmotAppRuntime,
+    AppClient, AuditLogSettings, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime,
 };
 use nostr_relay_builder::MockRelay;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -157,7 +157,7 @@ async fn acknowledge_one_http_request(listener: TcpListener, observed: oneshot::
     let _ = stream.read(&mut request).await;
     let _ = observed.send(());
     stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
         .await
         .unwrap();
 }
@@ -189,14 +189,18 @@ async fn direct_sync_failure_returns_applied_prefix() {
             std::fs::read_to_string(file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real v5 sync row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     assert!(
         audit_rows
             .iter()
-            .any(|row| { row["kind"]["type"] == "sync_drain" && row["kind"]["deliveries"] == 1 }),
+            .any(|row| { row["event"]["type"] == "sync_drain" && row["event"]["deliveries"] == 1 }),
         "the failed drain must retain forensic span and completed-delivery evidence",
     );
 }
@@ -268,13 +272,17 @@ async fn batch_with_failed_checkpoint_is_excluded_and_replays_exactly_once() {
             std::fs::read_to_string(file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real v5 sync row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
                 .collect::<Vec<_>>()
         })
-        .rfind(|row| row["kind"]["type"] == "sync_drain")
+        .rfind(|row| row["event"]["type"] == "sync_drain")
         .expect("failed drain audit row");
     assert_eq!(
-        failed_drain["kind"]["cursor_after_secs"], failed_drain["kind"]["cursor_before_secs"],
+        failed_drain["event"]["cursor_after_secs"], failed_drain["event"]["cursor_before_secs"],
         "a failed projection checkpoint must not claim an uncommitted cursor",
     );
     drop(bob);
@@ -456,7 +464,15 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
 #[tokio::test]
 async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
     let mut batch = pending_two_message_batch().await;
-    let app_bob_boot2 = batch.bob_app(Some(1));
+    let app_bob_boot2 = MarmotApp::try_with_relays_and_account_home_and_config(
+        batch.bob_dir.path(),
+        vec![batch.relay_url.clone()],
+        AccountHome::open(batch.bob_dir.path()),
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_fail_sync_before_delivery(1),
+    )
+    .unwrap();
     let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2);
     let mut events_bob_boot2 = runtime_bob_boot2.subscribe();
     let tracker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -468,11 +484,14 @@ async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
     ));
     runtime_bob_boot2.set_audit_log_batch_window_for_test(Duration::ZERO);
     runtime_bob_boot2
-        .set_audit_log_tracker_config(AuditLogTrackerConfig {
-            endpoint: Some(format!("http://{tracker_addr}/api/v1/audit-logs/")),
-            authorization_bearer_token: Some("partial-summary-test-token".to_owned()),
-            ..Default::default()
-        })
+        .set_audit_otlp_sender(Some(
+            AuditOtlpSender::for_loopback_dev(
+                "partial-summary-v5",
+                format!("http://{tracker_addr}/v1/logs"),
+                "partial-summary-test-token".to_owned(),
+            )
+            .unwrap(),
+        ))
         .unwrap();
     runtime_bob_boot2.start().await.unwrap();
 

@@ -185,7 +185,11 @@ impl AuditRowTracker {
             let lines = text.lines().collect::<Vec<_>>();
             let seen = self.consumed_lines.entry(file.path.clone()).or_insert(0);
             for line in &lines[*seen..] {
-                rows.push(serde_json::from_str::<serde_json::Value>(line).unwrap());
+                marmot_forensics::v5::Record::from_json(line.as_bytes())
+                    .expect("real v5 recovery row");
+                let mut row = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                row["kind"] = row["event"].clone();
+                rows.push(row);
             }
             *seen = lines.len();
         }
@@ -213,17 +217,17 @@ fn total_sync_drain_deliveries(rows: &[serde_json::Value]) -> u64 {
         .sum()
 }
 
-/// The transport message ids the engine reported an ingest outcome for.
+/// The domain-separated engine message refs reported at ingest.
 ///
 /// This is the per-delivery evidence `sync_drain`'s aggregate count cannot
 /// give: a test that has published a specific message can wait for *that*
 /// delivery to have reached the engine rather than for some delivery to have.
-/// `msg_id` is a public transport id and survives the default obfuscated audit
-/// mode, so the ids match the ones the publishing client reported.
+/// The source message ids are hashed in the same v5 domain as the publishing
+/// client's ids before correlation; raw transport ids never enter v5 JSONL.
 fn ingested_message_ids(rows: &[serde_json::Value]) -> Vec<String> {
     rows_of_kind(rows, "ingest_outcome")
         .iter()
-        .filter_map(|row| row["kind"]["msg_id"].as_str().map(ToOwned::to_owned))
+        .filter_map(|row| row["kind"]["message_ref"].as_str().map(ToOwned::to_owned))
         .collect()
 }
 
@@ -425,6 +429,15 @@ impl StalledGroup {
             2,
             "the carry needs exactly two published commits: {commits:?}",
         );
+        let commits = commits
+            .iter()
+            .map(|id| {
+                marmot_forensics::v5::EngineMessageRef::from_message_id(&hex::decode(id).unwrap())
+                    .unwrap()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
 
         // Phase one: ingest both commits, fold neither.
         let deadline = Instant::now() + EPOCH_ADVANCE_DEADLINE;
@@ -530,7 +543,11 @@ async fn arming_a_backfill_records_one_epoch_stall_backfill_armed_row() {
     );
     assert_eq!(
         row["group_ref"].as_str(),
-        Some(hex::encode(live.group_id.as_slice()).as_str()),
+        Some(
+            marmot_forensics::v5::GroupRef::from_group_id(live.group_id.as_slice())
+                .unwrap()
+                .as_str()
+        ),
         "the row is group-scoped via group_ref, not a duplicated field: {row}"
     );
 }
@@ -739,7 +756,11 @@ async fn repeated_arming_without_recovery_escalates_exactly_once() {
     );
     assert_eq!(
         row["group_ref"].as_str(),
-        Some(hex::encode(live.group_id.as_slice()).as_str()),
+        Some(
+            marmot_forensics::v5::GroupRef::from_group_id(live.group_id.as_slice())
+                .unwrap()
+                .as_str()
+        ),
         "the row is group-scoped via group_ref, not a duplicated field: {row}"
     );
 }
