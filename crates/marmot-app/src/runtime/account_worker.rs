@@ -2118,22 +2118,6 @@ async fn run_app_runtime_account_worker(
                 yield_to_convergence = false;
                 yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
-                #[cfg(test)]
-                let convergence_epoch_before = client.local_epoch_for_group(&group_id);
-                #[cfg(test)]
-                let target_convergence_witness = shared
-                    .recovery_phase_witness
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|(label, witness)| {
-                        (label == &client.state.label && witness.is_target_group(&group_id))
-                            .then(|| witness.clone())
-                    });
-                #[cfg(test)]
-                if target_convergence_witness.is_some() {
-                    shared.comparison_test_trace.lock().unwrap().push("scheduled_convergence_started");
-                }
                 let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.

@@ -1337,6 +1337,108 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn expired_online_quantum_keeps_receiving_pending_queue_admission() {
+        let mut fixture = fixture().await;
+        let group = fixture
+            .client
+            .app
+            .group("alice", &hex::encode(fixture.group_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        let route: [u8; 32] = hex::decode(group.nostr_routing.nostr_group_id_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let candidate = candidate_for_route(route);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture
+                .client
+                .adapter
+                .account_subscription_eose()
+                .await
+                .complete()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the scripted relay completes EOSE before queue admission");
+
+        // Fill the real shared adapter channel without scheduling its router.
+        // The selected account queue is empty; the next send must initially
+        // pend behind another account's routed deliveries.
+        crate::AccountHome::open(fixture._dir.path())
+            .create_account("bob")
+            .unwrap();
+        let mut bob = client_on_app_relay_plane(&fixture.client.app, "bob").await;
+        let bob_group = bob.create_group("backpressure source", &[]).await.unwrap();
+        let bob_record = fixture
+            .client
+            .app
+            .group("bob", &hex::encode(bob_group))
+            .unwrap()
+            .unwrap();
+        let bob_route: [u8; 32] = hex::decode(bob_record.nostr_routing.nostr_group_id_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let bob_event = candidate_for_route(bob_route);
+        let bob_adapter = bob.adapter.clone();
+        let mut context = Context::from_waker(Waker::noop());
+        tokio::task::unconstrained(async {
+            for _ in 0..1024 {
+                assert_eq!(
+                    bob_adapter
+                        .queue_reconciled_event(bob_event.clone())
+                        .await
+                        .unwrap(),
+                    1
+                );
+            }
+        })
+        .await;
+        let adapter = fixture.client.adapter.clone();
+        let mut queued = Box::pin(adapter.queue_reconciled_event(candidate));
+        assert!(matches!(queued.as_mut().poll(&mut context), Poll::Pending));
+
+        let mut state = RecoveryDrainState::new(
+            DrainCompletion::EndOfStoredEvents {
+                silence_budget: Duration::from_secs(5),
+                execution_quantum: Duration::from_secs(5),
+            },
+            None,
+        );
+        state.drain_started = Instant::now() - Duration::from_secs(6);
+        let mut counts = DrainCounts::default();
+        let (queued_result, drain_result) = tokio::join!(
+            queued.as_mut(),
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    assert!(
+                        fixture
+                            .client
+                            .drain_sdk_relay_slice(
+                                &mut state,
+                                &mut counts,
+                                Some(ONLINE_EPOCH_GAP_DRAIN_SLICE),
+                                false,
+                            )
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "pending queue admission cannot end the owner drain"
+                    );
+                    if counts.deliveries + counts.skipped > 0 {
+                        break;
+                    }
+                }
+            })
+        );
+        drain_result.expect("the owner keeps receiving after its quantum expires");
+        assert_eq!(queued_result.unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn comparison_join_timeout_keeps_cursor_and_retry_debt_after_real_queue_block() {
         let mut fixture = fixture().await;
         let grant = fixture

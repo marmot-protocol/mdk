@@ -59,17 +59,6 @@ pub(crate) enum TestRecoveryPhase {
 pub(crate) struct TestRecoveryPhaseSnapshot {
     pub(crate) attempt_serial: u64,
     pub(crate) phase: TestRecoveryPhase,
-    pub(crate) entered_at: Instant,
-}
-
-#[cfg(test)]
-#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TestRecoveryPhaseTransition {
-    pub(crate) attempt_serial: u64,
-    pub(crate) phase: TestRecoveryPhase,
-    pub(crate) entered: bool,
-    pub(crate) at: Instant,
 }
 
 #[cfg(test)]
@@ -85,42 +74,13 @@ pub(crate) struct TestRecoveryTerminal {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TestRecoveryTargetObservations {
-    pub(crate) ordinary_seen: usize,
-    pub(crate) ordinary_skipped: usize,
-    pub(crate) ordinary_returned: usize,
-    pub(crate) drain_seen: usize,
-    pub(crate) drain_skipped: usize,
-    pub(crate) drain_ingested: usize,
-    pub(crate) ordinary_outcome: Option<&'static str>,
-    pub(crate) ordinary_epoch_after: Option<u64>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-enum TestRecoveryTargetStage {
-    OrdinarySeen,
-    OrdinarySkipped,
-    OrdinaryReturned,
-    DrainSeen,
-    DrainSkipped,
-    DrainIngested,
-}
-
-#[cfg(test)]
 #[derive(Default)]
 struct TestRecoveryPhaseState {
     selected_attempt: Option<u64>,
     active: Option<TestRecoveryPhaseSnapshot>,
-    transitions: Vec<TestRecoveryPhaseTransition>,
     terminal: Option<TestRecoveryTerminal>,
     target_terminals: Vec<TestRecoveryTerminal>,
-    target_event_id: Option<String>,
     target_group_id: Option<GroupId>,
-    target: TestRecoveryTargetObservations,
-    target_convergence: Vec<(Option<u64>, Option<u64>)>,
-    target_stages: Vec<(u64, &'static str, Option<u64>)>,
 }
 
 /// Default-disabled witness for one selected EpochGap grant on one account.
@@ -144,10 +104,6 @@ impl TestRecoveryPhaseWitness {
         self.state.lock().unwrap().active
     }
 
-    pub(crate) fn transitions(&self) -> Vec<TestRecoveryPhaseTransition> {
-        self.state.lock().unwrap().transitions.clone()
-    }
-
     pub(crate) fn terminal(&self) -> Option<TestRecoveryTerminal> {
         self.state.lock().unwrap().terminal
     }
@@ -156,81 +112,12 @@ impl TestRecoveryPhaseWitness {
         self.state.lock().unwrap().target_terminals.clone()
     }
 
-    pub(crate) fn set_target_event_id(&self, id: String) {
-        self.state.lock().unwrap().target_event_id = Some(id);
-    }
-
     pub(crate) fn set_target_group_id(&self, id: GroupId) {
         self.state.lock().unwrap().target_group_id = Some(id);
     }
 
     pub(crate) fn is_target_group(&self, id: &GroupId) -> bool {
         self.state.lock().unwrap().target_group_id.as_ref() == Some(id)
-    }
-
-    fn target_group_id(&self) -> Option<GroupId> {
-        self.state.lock().unwrap().target_group_id.clone()
-    }
-
-    fn record_target_stage(&self, attempt: u64, stage: &'static str, epoch: Option<u64>) {
-        let mut state = self.state.lock().unwrap();
-        if state.selected_attempt.is_some() {
-            state.target_stages.push((attempt, stage, epoch));
-        }
-    }
-
-    pub(crate) fn target_stages(&self) -> Vec<(u64, &'static str, Option<u64>)> {
-        self.state.lock().unwrap().target_stages.clone()
-    }
-
-    pub(crate) fn record_target_convergence(&self, before: Option<u64>, after: Option<u64>) {
-        self.state
-            .lock()
-            .unwrap()
-            .target_convergence
-            .push((before, after));
-    }
-
-    pub(crate) fn target_convergence(&self) -> Vec<(Option<u64>, Option<u64>)> {
-        self.state.lock().unwrap().target_convergence.clone()
-    }
-
-    pub(crate) fn target_observations(&self) -> TestRecoveryTargetObservations {
-        self.state.lock().unwrap().target
-    }
-
-    fn note_target(&self, id: &str, stage: TestRecoveryTargetStage) {
-        let mut state = self.state.lock().unwrap();
-        if state.selected_attempt.is_none()
-            || !state
-                .target_event_id
-                .as_ref()
-                .is_some_and(|target| id.eq_ignore_ascii_case(target))
-        {
-            return;
-        }
-        let target = &mut state.target;
-        match stage {
-            TestRecoveryTargetStage::OrdinarySeen => target.ordinary_seen += 1,
-            TestRecoveryTargetStage::OrdinarySkipped => target.ordinary_skipped += 1,
-            TestRecoveryTargetStage::OrdinaryReturned => target.ordinary_returned += 1,
-            TestRecoveryTargetStage::DrainSeen => target.drain_seen += 1,
-            TestRecoveryTargetStage::DrainSkipped => target.drain_skipped += 1,
-            TestRecoveryTargetStage::DrainIngested => target.drain_ingested += 1,
-        }
-    }
-
-    fn note_target_outcome(&self, id: &str, outcome: &'static str, epoch: Option<u64>) {
-        let mut state = self.state.lock().unwrap();
-        if state.selected_attempt.is_some()
-            && state
-                .target_event_id
-                .as_ref()
-                .is_some_and(|target| id.eq_ignore_ascii_case(target))
-        {
-            state.target.ordinary_outcome = Some(outcome);
-            state.target.ordinary_epoch_after = epoch;
-        }
     }
 
     fn record_terminal(&self, terminal: TestRecoveryTerminal) {
@@ -257,18 +144,10 @@ impl TestRecoveryPhaseWitness {
             None => state.selected_attempt = Some(attempt_serial),
             _ => {}
         }
-        let at = Instant::now();
         assert!(state.active.is_none(), "recovery phases must not overlap");
         state.active = Some(TestRecoveryPhaseSnapshot {
             attempt_serial,
             phase,
-            entered_at: at,
-        });
-        state.transitions.push(TestRecoveryPhaseTransition {
-            attempt_serial,
-            phase,
-            entered: true,
-            at,
         });
         Some(TestRecoveryPhaseGuard {
             witness: self.clone(),
@@ -293,12 +172,6 @@ impl Drop for TestRecoveryPhaseGuard {
             active.attempt_serial == self.attempt_serial && active.phase == self.phase
         }) {
             state.active = None;
-            state.transitions.push(TestRecoveryPhaseTransition {
-                attempt_serial: self.attempt_serial,
-                phase: self.phase,
-                entered: false,
-                at: Instant::now(),
-            });
         }
     }
 }
@@ -2273,21 +2146,9 @@ impl AppClient {
                 }
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
-            #[cfg(test)]
-            if let Some(witness) = &self.test_recovery_phase_witness {
-                witness.note_target(&event_id, TestRecoveryTargetStage::OrdinarySeen);
-            }
             if self.transport_receipts()?.contains(&event_id) {
-                #[cfg(test)]
-                if let Some(witness) = &self.test_recovery_phase_witness {
-                    witness.note_target(&event_id, TestRecoveryTargetStage::OrdinarySkipped);
-                }
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 continue;
-            }
-            #[cfg(test)]
-            if let Some(witness) = &self.test_recovery_phase_witness {
-                witness.note_target(&event_id, TestRecoveryTargetStage::OrdinaryReturned);
             }
             return Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(
                 delivery,
@@ -2688,6 +2549,7 @@ impl AppClient {
             if completion
                 .execution_quantum()
                 .is_some_and(|quantum| drain_started.elapsed() >= quantum)
+                && admission_complete
             {
                 if matches!(completion, DrainCompletion::EndOfStoredEvents { .. })
                     && self.backfill_drain_verdict().await == DrainVerdict::Complete
@@ -2702,7 +2564,7 @@ impl AppClient {
                 } else {
                     SDK_DRAIN_WAIT
                 };
-                if let Some(quantum) = completion.execution_quantum() {
+                if admission_complete && let Some(quantum) = completion.execution_quantum() {
                     wait = wait.min(quantum.saturating_sub(drain_started.elapsed()));
                 }
                 tokio::time::Instant::now() + wait
@@ -2757,12 +2619,22 @@ impl AppClient {
                     break Some(DrainVerdict::Overflow);
                 }
                 Ok(Ok(None)) => {
-                    break Some(match completion {
+                    let verdict = match completion {
                         DrainCompletion::Quiescence => DrainVerdict::Complete,
                         DrainCompletion::EndOfStoredEvents { .. } => {
                             self.backfill_drain_verdict().await
                         }
-                    });
+                    };
+                    if verdict == DrainVerdict::Complete && !admission_complete {
+                        // A closed transport can answer immediately. Let the
+                        // worker's slice clock elapse while the queue producer
+                        // still owns deliveries, instead of looping at once.
+                        if let Some(slice_deadline) = slice_deadline {
+                            tokio::time::sleep_until(slice_deadline).await;
+                        }
+                        break None;
+                    }
+                    break Some(verdict);
                 }
                 Ok(Err(error)) => {
                     return Err(self
@@ -2786,7 +2658,7 @@ impl AppClient {
                         if verdict == DrainVerdict::Complete {
                             break Some(verdict);
                         }
-                        if drain_started.elapsed() >= execution_quantum {
+                        if admission_complete && drain_started.elapsed() >= execution_quantum {
                             break Some(DrainVerdict::quantum_yield(counts));
                         }
                         if silence_started.elapsed() >= silence_budget {
@@ -2807,8 +2679,6 @@ impl AppClient {
                     .config
                     .dev_fail_sync_before_delivery
                     .is_some_and(|limit| counts.deliveries >= limit);
-            #[cfg(test)]
-            let target_witness = self.test_recovery_phase_witness.clone();
             let receipts = match self.transport_receipts() {
                 Ok(receipts) => receipts,
                 Err(error) => {
@@ -2825,15 +2695,7 @@ impl AppClient {
                 }
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
-            #[cfg(test)]
-            if let Some(witness) = &target_witness {
-                witness.note_target(&event_id, TestRecoveryTargetStage::DrainSeen);
-            }
             if receipts.contains(&event_id) {
-                #[cfg(test)]
-                if let Some(witness) = &target_witness {
-                    witness.note_target(&event_id, TestRecoveryTargetStage::DrainSkipped);
-                }
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 counts.skipped = counts.skipped.saturating_add(1);
                 // Liveness, but not progress. It must not outlast the moment
@@ -2878,10 +2740,6 @@ impl AppClient {
                             .await);
                     }
                 };
-            #[cfg(test)]
-            if let Some(witness) = &target_witness {
-                witness.note_target(&event_id, TestRecoveryTargetStage::DrainIngested);
-            }
             if ingested.must_stay_fetchable {
                 counts.unpersisted = counts.unpersisted.saturating_add(1);
             }
@@ -3358,26 +3216,6 @@ impl AppClient {
             });
         }
         let effects = ingest?;
-        #[cfg(test)]
-        if let Some(witness) = &client.test_recovery_phase_witness {
-            let outcome = match &effects.outcome {
-                IngestOutcome::Processed => "processed",
-                IngestOutcome::Buffered { .. } => "buffered",
-                IngestOutcome::TransportDeferred { .. } => "transport_deferred",
-                IngestOutcome::LocalState { .. } => "local_state",
-                IngestOutcome::ResourceRefused { .. } => "resource_refused",
-                IngestOutcome::Ignored { .. } => "ignored",
-                IngestOutcome::Stale { .. } => "stale",
-                IngestOutcome::Rejected { .. } => "rejected",
-            };
-            witness.note_target_outcome(
-                &source_message_id_hex,
-                outcome,
-                group_id_hint
-                    .as_ref()
-                    .and_then(|group| client.local_epoch_for_group(group)),
-            );
-        }
         client.observe_recovery_health(&effects.effects)?;
         if let Some(before) = rejoin_offers_before {
             // Account-wide eviction may remove an offer for a different group.
@@ -4807,21 +4645,6 @@ impl AppClient {
             .enter(grant.reservation.attempt_serial, phase)
     }
 
-    #[cfg(test)]
-    fn record_target_recovery_stage(&self, grant: &AttemptGrant, stage: &'static str) {
-        let Some(witness) = &self.test_recovery_phase_witness else {
-            return;
-        };
-        let Some(group) = witness.target_group_id() else {
-            return;
-        };
-        witness.record_target_stage(
-            grant.reservation.attempt_serial,
-            stage,
-            self.local_epoch_for_group(&group),
-        );
-    }
-
     async fn execute_recovery_grant_inner(
         &mut self,
         grant: &AttemptGrant,
@@ -4835,8 +4658,6 @@ impl AppClient {
         let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Activation);
         self.activate_recovery_grant_inner(grant, telemetry, activation_outcome)
             .await?;
-        #[cfg(test)]
-        self.record_target_recovery_stage(grant, "after_activation");
         #[cfg(test)]
         drop(_phase);
         // Routine below-live-cutoff discovery runs only with a frozen owner
@@ -4870,8 +4691,6 @@ impl AppClient {
         } else {
             Vec::new()
         };
-        #[cfg(test)]
-        self.record_target_recovery_stage(grant, "after_reconciliation");
         #[cfg(test)]
         let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Completion);
         self.complete_recovery_grant_inner(
@@ -5030,8 +4849,6 @@ impl AppClient {
             storage_sqlite::RecoveryComparisonOutcome,
         )>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        #[cfg(test)]
-        self.record_target_recovery_stage(grant, "before_drain");
         let quiet_prerequisites =
             grant
                 .plan()
@@ -5058,8 +4875,6 @@ impl AppClient {
             )
             .await?
         };
-        #[cfg(test)]
-        self.record_target_recovery_stage(grant, "after_drain");
         self.finish_recovery_grant_after_drain(
             grant,
             counts,
@@ -5087,8 +4902,6 @@ impl AppClient {
         let local = self.drain_pending_session_events().await.map_err(|error| {
             ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::Unknown)
         })?;
-        #[cfg(test)]
-        self.record_target_recovery_stage(grant, "after_local_drain");
         summary.merge(local);
         let storage = self
             .app
