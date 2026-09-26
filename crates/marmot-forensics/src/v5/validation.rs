@@ -16,6 +16,38 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
     let has_group = record.group_ref.is_some();
     match &record.event {
         Event::Operational(_) => {}
+        Event::AppUpdateOutcome(e) => {
+            require(
+                e.failure_stage.is_some() == e.failure_reason.is_some(),
+                "app update failure stage and reason must be paired",
+            )?;
+        }
+        Event::RuntimePublicationOutcome(_) => {
+            require(!has_group, "runtime publication must be account-scoped")?;
+        }
+        Event::RecordingSessionStarted(e) => {
+            require(!has_group, "recording lifecycle must be account-scoped")?;
+            require(
+                e.limitations
+                    == [
+                        RecordingLimitation::BestEffortLocalWrites,
+                        RecordingLimitation::NoCompletenessGuarantee,
+                    ],
+                "recording mode requires explicit known limitations",
+            )?;
+        }
+        Event::RecordingSessionStopped(_) => {
+            require(!has_group, "recording lifecycle must be account-scoped")?;
+        }
+        Event::RecordingCaptureLoss(e) => {
+            require(!has_group, "recording lifecycle must be account-scoped")?;
+            require(
+                e.serialization_failed_attempts.get() > 0
+                    || e.write_failed_attempts.get() > 0
+                    || e.flush_failed_attempts.get() > 0,
+                "capture loss requires an observed failed attempt",
+            )?;
+        }
         Event::WelcomePrepared(e) => {
             require(
                 match e.mode {

@@ -2392,8 +2392,15 @@ fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
         assert!(!line.contains("wss://"));
         assert!(!line.contains("unknown group"));
     }
-    assert_eq!(actual, expected.into_iter().map(str::to_owned).collect());
-    assert_eq!(actual.len(), 44);
+    let operational = actual
+        .into_iter()
+        .filter(|kind| !kind.starts_with("recording_"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        operational,
+        expected.into_iter().map(str::to_owned).collect()
+    );
+    assert_eq!(operational.len(), 44);
 }
 
 #[test]

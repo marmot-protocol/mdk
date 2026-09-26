@@ -66,6 +66,20 @@
       "if": {
         "properties": {
           "event": {
+            "properties": { "type": { "enum": [
+              "recording_session_started", "recording_session_stopped", "recording_capture_loss",
+              "runtime_publication_outcome"
+            ] } },
+            "required": ["type"]
+          }
+        }
+      },
+      "then": { "properties": { "group_ref": { "type": "null" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
             "properties": {
               "type": {
                 "const": "app_group_update_finished"
@@ -2290,8 +2304,91 @@
         }
       ]
     },
+    "RecordingSessionStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "mode", "limitations"],
+      "properties": {
+        "type": { "const": "recording_session_started" },
+        "mode": { "const": "opt_in_local_jsonl" },
+        "limitations": {
+          "type": "array", "minItems": 2, "maxItems": 2,
+          "prefixItems": [
+            { "const": "best_effort_local_writes" },
+            { "const": "no_completeness_guarantee" }
+          ]
+        }
+      }
+    },
+    "RecordingSessionStopped": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "reason"],
+      "properties": {
+        "type": { "const": "recording_session_stopped" },
+        "reason": { "enum": ["recording_disabled", "clean_runtime_shutdown"] }
+      }
+    },
+    "RecordingCaptureLoss": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "serialization_failed_attempts", "write_failed_attempts", "flush_failed_attempts", "extent"],
+      "properties": {
+        "type": { "const": "recording_capture_loss" },
+        "serialization_failed_attempts": { "$ref": "#/$defs/U64String" },
+        "write_failed_attempts": { "$ref": "#/$defs/U64String" },
+        "flush_failed_attempts": { "$ref": "#/$defs/U64String" },
+        "extent": { "const": "unknown" }
+      },
+      "not": {
+        "properties": {
+          "serialization_failed_attempts": { "const": "0" },
+          "write_failed_attempts": { "const": "0" },
+          "flush_failed_attempts": { "const": "0" }
+        }
+      }
+    },
+    "AppUpdateOutcome": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "operation_ref", "message_ref", "category", "input_scope", "compute", "transaction", "failure_stage", "failure_reason", "elapsed_ms", "affected_group_count"],
+      "properties": {
+        "type": { "const": "app_update_outcome" },
+        "operation_ref": { "anyOf": [{ "$ref": "#/$defs/LocalId" }, { "type": "null" }] },
+        "message_ref": { "anyOf": [{ "$ref": "#/$defs/EngineMessageRef" }, { "type": "null" }] },
+        "category": { "enum": ["account_projection_checkpoint", "content_report_backfill", "event_projection"] },
+        "input_scope": { "enum": ["inbound_or_engine_batch", "local_operation", "reconciliation", "unknown"] },
+        "compute": { "enum": ["updated", "unchanged", "deferred", "failed"] },
+        "transaction": { "enum": ["committed", "not_committed", "unknown"] },
+        "failure_stage": { "anyOf": [{ "enum": ["projection", "transaction", "unknown"] }, { "type": "null" }] },
+        "failure_reason": { "anyOf": [{ "enum": ["storage", "projection", "unavailable", "unknown"] }, { "type": "null" }] },
+        "elapsed_ms": { "$ref": "#/$defs/U64String" },
+        "affected_group_count": { "$ref": "#/$defs/U64String" }
+      },
+      "allOf": [
+        { "if": { "properties": { "failure_stage": { "type": "null" } } }, "then": { "properties": { "failure_reason": { "type": "null" } } } },
+        { "if": { "properties": { "failure_reason": { "type": "null" } } }, "then": { "properties": { "failure_stage": { "type": "null" } } } }
+      ]
+    },
+    "RuntimePublicationOutcome": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "operation_ref", "message_ref", "category", "attempted", "accepted_by_broadcast", "no_subscribers"],
+      "properties": {
+        "type": { "const": "runtime_publication_outcome" },
+        "operation_ref": { "anyOf": [{ "$ref": "#/$defs/LocalId" }, { "type": "null" }] },
+        "message_ref": { "anyOf": [{ "$ref": "#/$defs/EngineMessageRef" }, { "type": "null" }] },
+        "category": { "enum": ["sync_summary", "projection_update"] },
+        "attempted": { "$ref": "#/$defs/U64String" },
+        "accepted_by_broadcast": { "$ref": "#/$defs/U64String" },
+        "no_subscribers": { "$ref": "#/$defs/U64String" }
+      }
+    },
     "Event": {
       "oneOf": [
+        { "$ref": "#/$defs/AppUpdateOutcome" },
+        { "$ref": "#/$defs/RuntimePublicationOutcome" },
+        { "$ref": "#/$defs/RecordingSessionStarted" },
+        { "$ref": "#/$defs/RecordingSessionStopped" },
+        { "$ref": "#/$defs/RecordingCaptureLoss" },
         {
           "$ref": "#/$defs/WelcomePrepared"
         },

@@ -1113,5 +1113,136 @@
         "failed_read_count": 0
       }
     }
+  },
+  {
+    "name": "recording_started",
+    "record": {
+      "schema_version": "marmot-forensics-audit/v5",
+      "source_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "seq": "101",
+      "wall_time_ms": "0",
+      "mono_us": "0",
+      "producer": {
+        "mdk_revision": "0e2c48241da467abfb83830d5e6f72921a1af248",
+        "build_profile": "debug",
+        "platform": "macos",
+        "host_build": null
+      },
+      "group_ref": null,
+      "event": {
+        "type": "recording_session_started",
+        "mode": "opt_in_local_jsonl",
+        "limitations": [
+          "best_effort_local_writes",
+          "no_completeness_guarantee"
+        ]
+      }
+    }
+  },
+  {
+    "name": "recording_stopped",
+    "record": {
+      "schema_version": "marmot-forensics-audit/v5",
+      "source_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "seq": "102",
+      "wall_time_ms": "0",
+      "mono_us": "0",
+      "producer": {
+        "mdk_revision": "0e2c48241da467abfb83830d5e6f72921a1af248",
+        "build_profile": "debug",
+        "platform": "macos",
+        "host_build": null
+      },
+      "group_ref": null,
+      "event": {
+        "type": "recording_session_stopped",
+        "reason": "recording_disabled"
+      }
+    }
+  },
+  {
+    "name": "capture_loss",
+    "record": {
+      "schema_version": "marmot-forensics-audit/v5",
+      "source_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "seq": "103",
+      "wall_time_ms": "0",
+      "mono_us": "0",
+      "producer": {
+        "mdk_revision": "0e2c48241da467abfb83830d5e6f72921a1af248",
+        "build_profile": "debug",
+        "platform": "macos",
+        "host_build": null
+      },
+      "group_ref": null,
+      "event": {
+        "type": "recording_capture_loss",
+        "serialization_failed_attempts": "0",
+        "write_failed_attempts": "1",
+        "flush_failed_attempts": "0",
+        "extent": "unknown"
+      }
+    }
+  },
+  {
+    "name": "app_update_outcome",
+    "record": {
+      "schema_version": "marmot-forensics-audit/v5",
+      "source_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "seq": "104",
+      "wall_time_ms": "0",
+      "mono_us": "0",
+      "producer": {
+        "mdk_revision": "0e2c48241da467abfb83830d5e6f72921a1af248",
+        "build_profile": "debug",
+        "platform": "macos",
+        "host_build": null
+      },
+      "group_ref": null,
+      "event": {
+        "type": "app_update_outcome",
+        "operation_ref": null,
+        "message_ref": null,
+        "category": "account_projection_checkpoint",
+        "input_scope": "local_operation",
+        "compute": "updated",
+        "transaction": "committed",
+        "failure_stage": null,
+        "failure_reason": null,
+        "elapsed_ms": "3",
+        "affected_group_count": "1"
+      }
+    }
+  },
+  {
+    "name": "runtime_publication_outcome",
+    "record": {
+      "schema_version": "marmot-forensics-audit/v5",
+      "source_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "seq": "105",
+      "wall_time_ms": "0",
+      "mono_us": "0",
+      "producer": {
+        "mdk_revision": "0e2c48241da467abfb83830d5e6f72921a1af248",
+        "build_profile": "debug",
+        "platform": "macos",
+        "host_build": null
+      },
+      "group_ref": null,
+      "event": {
+        "type": "runtime_publication_outcome",
+        "operation_ref": null,
+        "message_ref": null,
+        "category": "sync_summary",
+        "attempted": "1",
+        "accepted_by_broadcast": "1",
+        "no_subscribers": "0"
+      }
+    }
   }
 ]

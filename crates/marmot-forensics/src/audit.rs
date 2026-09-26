@@ -1282,6 +1282,10 @@ pub trait ForensicRecorder: Send + Sync {
     /// evidence; an enabled v5 recorder assigns all envelope fields.
     fn record_v5_event(&self, _group_ref: Option<crate::v5::GroupRef>, _event: crate::v5::Event) {}
 
+    /// Observe an explicit clean end to this v5 writer session. Dropping a
+    /// recorder does not imply this happened. Legacy and no-op writers ignore it.
+    fn finish_v5_recording(&self, _reason: crate::v5::RecordingStopReason) {}
+
     fn records_v5(&self) -> bool {
         false
     }
@@ -1364,6 +1368,13 @@ struct JsonlInner {
     recorder_session_id: String,
     format: RecorderFormat,
     health: AuditRecorderHealthSnapshot,
+    /// In-memory failed record attempts since the last successfully persisted
+    /// capture-loss row. This is not a replay journal or a completeness count.
+    pending_capture_loss: PendingCaptureLoss,
+    recording_finished: bool,
+    /// A partial write or flush has left an uncertain tail. No subsequent row
+    /// may append until the last successfully flushed boundary is restored.
+    writer_needs_repair: bool,
     /// Bytes in the file the writer currently owns, driving segment rolls.
     active_bytes: u64,
     /// Retry deadline after a failed roll; recording continues during backoff.
@@ -1390,6 +1401,19 @@ struct JsonlInner {
     /// context, so retention can be proven independently of a durable write.
     #[cfg(test)]
     fail_next_write: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PendingCaptureLoss {
+    serialization: u64,
+    write: u64,
+    flush: u64,
+}
+
+impl PendingCaptureLoss {
+    fn is_empty(self) -> bool {
+        self.serialization == 0 && self.write == 0 && self.flush == 0
+    }
 }
 
 enum RecorderFormat {
@@ -1462,6 +1486,7 @@ impl JsonlRecorder {
         let file = fs_private::open_private_append(&path)?;
         let active_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         let recorder_session_id = generate_recorder_session_id();
+        let is_v5 = producer.is_some();
         let format = if let Some(producer) = producer {
             let source_ref = crate::v5::SourceRef::try_from(engine_id.clone()).map_err(|_| {
                 std::io::Error::new(
@@ -1488,6 +1513,9 @@ impl JsonlRecorder {
                 recorder_session_id,
                 format,
                 health: AuditRecorderHealthSnapshot::default(),
+                pending_capture_loss: PendingCaptureLoss::default(),
+                recording_finished: false,
+                writer_needs_repair: false,
                 active_bytes,
                 segment_retry_after: None,
                 writer_path: path.clone(),
@@ -1518,6 +1546,18 @@ impl JsonlRecorder {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             recorder.try_roll_segment(&mut inner, Instant::now());
+        }
+        if is_v5 {
+            recorder.record_v5_event(
+                None,
+                crate::v5::Event::RecordingSessionStarted(crate::v5::RecordingSessionStarted {
+                    mode: crate::v5::RecordingMode::OptInLocalJsonl,
+                    limitations: vec![
+                        crate::v5::RecordingLimitation::BestEffortLocalWrites,
+                        crate::v5::RecordingLimitation::NoCompletenessGuarantee,
+                    ],
+                }),
+            );
         }
         recorder.record(AuditRecord::new(None, recorder_started_kind()));
         Ok(recorder)
@@ -1586,8 +1626,15 @@ impl ForensicRecorder for JsonlRecorder {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if inner.recording_finished {
+            return;
+        }
+        Self::try_report_pending_capture_loss(&mut inner);
+        let before = inner.health.clone();
         if Self::write_record(&mut inner, record) {
             self.try_roll_segment(&mut inner, Instant::now());
+        } else if matches!(inner.format, RecorderFormat::V5 { .. }) {
+            Self::remember_failed_attempt(&mut inner, &before);
         }
     }
 
@@ -1596,11 +1643,42 @@ impl ForensicRecorder for JsonlRecorder {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if matches!(inner.format, RecorderFormat::V5 { .. })
-            && Self::write_v5_event(&mut inner, group_ref, event)
-        {
-            self.try_roll_segment(&mut inner, Instant::now());
+        if !matches!(inner.format, RecorderFormat::V5 { .. }) || inner.recording_finished {
+            return;
         }
+        Self::try_report_pending_capture_loss(&mut inner);
+        let before = inner.health.clone();
+        if Self::write_v5_event(&mut inner, group_ref, event) {
+            self.try_roll_segment(&mut inner, Instant::now());
+        } else {
+            Self::remember_failed_attempt(&mut inner, &before);
+        }
+    }
+
+    fn finish_v5_recording(&self, reason: crate::v5::RecordingStopReason) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(inner.format, RecorderFormat::V5 { .. }) || inner.recording_finished {
+            return;
+        }
+        Self::try_report_pending_capture_loss(&mut inner);
+        let before = inner.health.clone();
+        if Self::write_v5_event(
+            &mut inner,
+            None,
+            crate::v5::Event::RecordingSessionStopped(crate::v5::RecordingSessionStopped {
+                reason,
+            }),
+        ) {
+            self.try_roll_segment(&mut inner, Instant::now());
+        } else {
+            Self::remember_failed_attempt(&mut inner, &before);
+        }
+        // A failed terminal row cannot be retried without another observed
+        // clean-close boundary. Absence of stop remains explicitly unknown.
+        inner.recording_finished = true;
     }
 
     fn records_v5(&self) -> bool {
@@ -1642,6 +1720,52 @@ impl ForensicRecorder for JsonlRecorder {
 }
 
 impl JsonlRecorder {
+    fn remember_failed_attempt(inner: &mut JsonlInner, before: &AuditRecorderHealthSnapshot) {
+        let pending = &mut inner.pending_capture_loss;
+        pending.serialization = pending.serialization.saturating_add(
+            inner
+                .health
+                .serialization_failures
+                .saturating_sub(before.serialization_failures),
+        );
+        pending.write = pending.write.saturating_add(
+            inner
+                .health
+                .write_failures
+                .saturating_sub(before.write_failures),
+        );
+        pending.flush = pending.flush.saturating_add(
+            inner
+                .health
+                .flush_failures
+                .saturating_sub(before.flush_failures),
+        );
+    }
+
+    fn try_report_pending_capture_loss(inner: &mut JsonlInner) {
+        if !matches!(inner.format, RecorderFormat::V5 { .. })
+            || inner.pending_capture_loss.is_empty()
+        {
+            return;
+        }
+        let pending = inner.pending_capture_loss;
+        // A failed attempt to report loss is not recursively counted as
+        // another lost product observation. Retain the in-memory observation
+        // for a later ordinary write; it is never a second durable journal.
+        if Self::write_v5_event(
+            inner,
+            None,
+            crate::v5::Event::RecordingCaptureLoss(crate::v5::RecordingCaptureLoss {
+                serialization_failed_attempts: pending.serialization.into(),
+                write_failed_attempts: pending.write.into(),
+                flush_failed_attempts: pending.flush.into(),
+                extent: crate::v5::RecordingLossExtent::Unknown,
+            }),
+        ) {
+            inner.pending_capture_loss = PendingCaptureLoss::default();
+        }
+    }
+
     fn write_record(inner: &mut JsonlInner, record: AuditRecord) -> bool {
         if let AuditEventKind::SourceContext { source } = &record.kind {
             inner.retained_source_context = Some(source.clone());
@@ -1756,15 +1880,39 @@ impl JsonlRecorder {
     }
 
     fn write_body(inner: &mut JsonlInner, body: &[u8]) -> bool {
-        if inner.writer.write_all(body).is_err() || inner.writer.write_all(b"\n").is_err() {
+        if inner.writer_needs_repair && !Self::repair_uncertain_tail(inner) {
             inner.health.write_failures = inner.health.write_failures.saturating_add(1);
             return false;
         }
-        inner.active_bytes = inner.active_bytes.saturating_add(body.len() as u64 + 1);
-        if inner.writer.flush().is_err() {
-            inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
+        let last_flushed_bytes = inner.active_bytes;
+        if inner.writer.write_all(body).is_err() || inner.writer.write_all(b"\n").is_err() {
+            inner.health.write_failures = inner.health.write_failures.saturating_add(1);
+            inner.writer_needs_repair = true;
+            let _ = Self::repair_uncertain_tail(inner);
             return false;
         }
+        if inner.writer.flush().is_err() {
+            inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
+            inner.writer_needs_repair = true;
+            let _ = Self::repair_uncertain_tail(inner);
+            return false;
+        }
+        inner.active_bytes = last_flushed_bytes.saturating_add(body.len() as u64 + 1);
+        true
+    }
+
+    fn repair_uncertain_tail(inner: &mut JsonlInner) -> bool {
+        let Ok(file) = fs_private::open_private_append(&inner.writer_path) else {
+            return false;
+        };
+        if file.set_len(inner.active_bytes).is_err() {
+            return false;
+        }
+        // into_parts discards the old BufWriter buffer without a Drop flush.
+        // The new writer starts at the last known complete JSONL boundary.
+        let old = std::mem::replace(&mut inner.writer, BufWriter::new(file));
+        let _ = old.into_parts();
+        inner.writer_needs_repair = false;
         true
     }
 

@@ -457,6 +457,11 @@ impl AppClient {
     /// recorder when off. Dropping the prior recorder flushes and closes any
     /// file it held, so no session reopen is required.
     pub(crate) fn set_audit_recording(&mut self, enabled: bool) {
+        if !enabled {
+            self.runtime.session().finish_audit_v5_recording(
+                marmot_forensics::v5::RecordingStopReason::RecordingDisabled,
+            );
+        }
         let recorder = self.app.build_audit_recorder(&self.state.label, enabled);
         self.runtime.session_mut().set_audit_recorder(recorder);
         if enabled {
@@ -467,6 +472,14 @@ impl AppClient {
         } else {
             self.audit_v5_probe = None;
         }
+    }
+
+    /// Used only after the account worker observes an explicit graceful
+    /// shutdown signal. Dropping a client on another path never emits stop.
+    pub(crate) fn finish_audit_recording(&self) {
+        self.runtime.session().finish_audit_v5_recording(
+            marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown,
+        );
     }
 
     /// Rotate the live forensic recorder iff it is the one appending to

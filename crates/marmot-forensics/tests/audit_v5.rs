@@ -48,10 +48,10 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
         })
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(kinds, catalog);
-    assert_eq!(kinds.len(), 10);
+    assert_eq!(kinds.len(), 15);
     assert_eq!(
         schema["$defs"]["Event"]["oneOf"].as_array().unwrap().len(),
-        54
+        59
     );
 }
 
