@@ -23,6 +23,7 @@ pub(crate) struct TestComparisonActivityWitness {
     pub(crate) returned_events: Arc<AtomicUsize>,
     pub(crate) matching_events: Arc<AtomicUsize>,
     pub(crate) matching_queued_deliveries: Arc<AtomicUsize>,
+    pub(crate) panic_after_queue_submission: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(test)]
@@ -140,6 +141,13 @@ impl EpochGapQueueJob {
                     )
                     .await,
                 );
+            }
+            #[cfg(test)]
+            if witness
+                .as_ref()
+                .is_some_and(|witness| witness.panic_after_queue_submission.load(Ordering::SeqCst))
+            {
+                panic!("injected online recovery queue panic after submission");
             }
             submitted
         });

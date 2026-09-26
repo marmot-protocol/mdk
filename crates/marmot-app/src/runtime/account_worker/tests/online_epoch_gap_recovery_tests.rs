@@ -192,6 +192,20 @@ async fn group_events(
 
 #[tokio::test]
 async fn online_epoch_gap_after_completed_startup_exposes_owner_wait() {
+    run_online_epoch_gap_fixture(false, false).await;
+}
+
+#[tokio::test]
+async fn online_epoch_gap_suspends_expired_bounded_probe_wake() {
+    run_online_epoch_gap_fixture(true, false).await;
+}
+
+#[tokio::test]
+async fn online_epoch_gap_queue_join_error_settles_and_releases_credit() {
+    run_online_epoch_gap_fixture(false, true).await;
+}
+
+async fn run_online_epoch_gap_fixture(bounded_probe: bool, queue_panic: bool) {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldBroadQuery::default();
     let _release_on_drop = ReleaseBroadOnDrop(gate.clone());
@@ -509,6 +523,20 @@ async fn online_epoch_gap_after_completed_startup_exposes_owner_wait() {
     let phase_age_at_relay_entry = phase_at_relay_entry.map(|phase| phase.entered_at.elapsed());
     let request_active_at_relay_entry = activity.active_requests.load(Ordering::SeqCst);
     let request_attempt_at_relay_entry = activity.attempt_serial.load(Ordering::SeqCst);
+    if bounded_probe {
+        runtime
+            .shared_services()
+            .bounded_group_recovery_enabled
+            .store(true, Ordering::SeqCst);
+        // The worker's probe deadline starts at activation and is already
+        // expired here. A short hold keeps the selected network request live;
+        // the adapter's own quantum is shorter than PROBE_INTERVAL.
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            gate.active.load(Ordering::SeqCst) > 0,
+            "the online network request remains held past the expired bounded probe deadline"
+        );
+    }
     let (status_respond, mut status_answer) = oneshot::channel();
     commands
         .try_send(AccountWorkerCommand::GroupRecoveryStatus {
@@ -623,6 +651,11 @@ async fn online_epoch_gap_after_completed_startup_exposes_owner_wait() {
                 && eligible_at_hold.obligations[0] == (demand.ticket.id, demand.ticket.revision)
         })
         && selected_gap_only;
+    if queue_panic {
+        activity
+            .panic_after_queue_submission
+            .store(true, Ordering::SeqCst);
+    }
     gate.release();
     if !status_within_300_ms {
         timeout(Duration::from_secs(20), status_answer)
@@ -636,6 +669,93 @@ async fn online_epoch_gap_after_completed_startup_exposes_owner_wait() {
             .await
             .expect("queued healthy send completes after release")
             .unwrap();
+    }
+    if queue_panic {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if phase_witness
+                    .target_terminals()
+                    .iter()
+                    .any(|terminal| terminal.attempt_serial == attempt && !terminal.result_ok)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("queue JoinError settles the selected grant as failed");
+        assert!(
+            runtime
+                .accounts()
+                .worker_commands(&alice.label)
+                .await
+                .unwrap()
+                .same_channel(&commands),
+            "the same account worker survives queue JoinError"
+        );
+        let (respond, answer) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: groups[0].clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(2), answer)
+            .await
+            .expect("Receive tail leaves the worker responsive")
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if bounded_recovery::available_credits(
+                    &runtime.shared_services().recovery_credit_pool(),
+                ) == bounded_recovery::MAX_CONCURRENT_JOBS
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("failed queue releases its retained recovery credit");
+        let terminal = phase_witness
+            .target_terminals()
+            .into_iter()
+            .find(|terminal| terminal.attempt_serial == attempt)
+            .unwrap();
+        assert!(!terminal.qualified && !terminal.result_ok);
+        assert!(
+            activity.matching_queued_deliveries.load(Ordering::SeqCst) > 0,
+            "the queue admitted the missing commit before its JoinError"
+        );
+        assert!(
+            terminal.deliveries + terminal.skipped > 0,
+            "failure settlement preserves the admitted drain prefix"
+        );
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.cause == storage_sqlite::RecoveryCause::EpochGap)
+        );
+        let trace = runtime
+            .shared_services()
+            .comparison_test_trace
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(
+            trace.contains(&"online_queue_started") && trace.contains(&"online_terminal"),
+            "the worker reached the failed queue completion and terminal"
+        );
+        assert!(gap_only && held && status_within_300_ms && send_within_2s && live_within_2s);
+        drop(bob_client);
+        runtime.shutdown_and_close().await.unwrap();
+        restarted.shutdown();
+        healthy_relay.shutdown();
+        return;
     }
     timeout(Duration::from_secs(45), async {
         loop {

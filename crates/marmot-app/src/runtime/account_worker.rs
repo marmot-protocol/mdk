@@ -1719,7 +1719,7 @@ async fn run_app_runtime_account_worker(
                 }
                 break 'worker;
             }
-            _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
+            _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() && online_epoch_gap.is_none() => {}
             completed = async {
                 online_epoch_gap.as_mut().expect("online recovery exists").wait_io().await
             }, if online_epoch_gap.as_ref().is_some_and(OnlineEpochGapJob::waiting) => {
@@ -1829,7 +1829,9 @@ async fn run_app_runtime_account_worker(
                     }
                     OnlineEpochGapIoCompletion::Queue(Err(error)) => {
                         let mut job = online_epoch_gap.take().expect("online queue exists");
-                        job.credit = Some(job.queue.take().expect("online queue exists").abort_and_wait().await);
+                        // wait_io already consumed this JoinHandle's result. The
+                        // owner still holds the credit after a failed task.
+                        job.credit = Some(job.queue.take().expect("online queue exists").into_credit());
                         let recovery = job.recovery.take().expect("online grant exists");
                         let result = client.fail_online_epoch_gap(
                             recovery,
@@ -1838,6 +1840,8 @@ async fn run_app_runtime_account_worker(
                                 if error.is_panic() { "panicked" } else { "cancelled" },
                             )),
                         ).await;
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push("online_terminal");
                         finish_online_epoch_gap_receive(
                             &mut client, job, result,
                             ReceiveTailContext {
