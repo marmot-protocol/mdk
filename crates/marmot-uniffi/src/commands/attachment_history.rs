@@ -58,7 +58,7 @@ mod tests {
     };
     use cgka_traits::TransportEndpoint;
     use marmot_app::{AccountSetupRequest, MarmotApp};
-    use nostr_relay_builder::MockRelay;
+    use nostr_relay_builder::{LocalRelay, RelayBuilder, builder::RateLimit};
     use std::collections::HashSet;
 
     fn reference(mime: &str) -> MediaAttachmentReferenceFfi {
@@ -86,7 +86,13 @@ mod tests {
     }
     #[tokio::test]
     async fn attachment_native_pages_traverse_beyond_window_and_refresh_deleted_rows() {
-        let relay = MockRelay::run().await.unwrap();
+        // Populate 205 messages on one persistent socket without exercising
+        // the mock's default 60-event/minute limiter in this pagination test.
+        let relay = LocalRelay::new(RelayBuilder::default().rate_limit(RateLimit {
+            notes_per_minute: 1_000,
+            ..Default::default()
+        }));
+        relay.run().await.unwrap();
         let url = relay.url().await.to_string();
         let root = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relays(root.path(), vec![url.clone()]);

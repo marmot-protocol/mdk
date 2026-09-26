@@ -56,6 +56,9 @@ pub const PUSH_VERSION: &str = "marmot-push-v1";
 pub const PUSH_ENCRYPTED_TOKEN_LEN: usize = 1084;
 const PUSH_MAX_GOSSIP_ENTRIES: usize = 32;
 const PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS: usize = 32;
+// NIP-59's nested encryption fits 19 tokens below a 64 KiB event ceiling;
+// 20 tokens cross it. The protocol's 32-token rumor bound remains separate.
+const PUSH_GIFT_WRAP_TOKEN_LIMIT: usize = 19;
 const PUSH_OWNER_TS_MAX_FUTURE_MS: i64 = 3_600_000;
 const PUSH_TOKEN_PLAINTEXT_LEN: usize = 1024;
 const PUSH_MAX_PROVIDER_TOKEN_LEN: usize = PUSH_TOKEN_PLAINTEXT_LEN - 3;
@@ -1059,7 +1062,7 @@ pub fn build_notification_rumor_content(tokens: &[Vec<u8>]) -> Result<String, Ap
 }
 
 pub(crate) fn notification_trigger_chunks(tokens: &[Vec<u8>]) -> std::slice::Chunks<'_, Vec<u8>> {
-    tokens.chunks(PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS)
+    tokens.chunks(PUSH_GIFT_WRAP_TOKEN_LIMIT)
 }
 
 pub async fn build_notification_gift_wrap(

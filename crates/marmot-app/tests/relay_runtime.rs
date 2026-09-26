@@ -33,7 +33,7 @@ use nostr_relay_builder::prelude::{
 };
 use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
+    Client as NostrSdkClient, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
 };
 use sha2::{Digest, Sha256};
@@ -189,6 +189,353 @@ async fn active_group_send_timings() {
             runtime.shutdown_and_close().await.unwrap();
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "send latency and connection reuse diagnostic"]
+async fn send_connection_reuse() {
+    // Warm-up plus thirty messages and pushes exceed the mock's 60-event
+    // budget once group setup uses the same persistent connection.
+    let relay = LocalRelay::new(RelayBuilder::default().rate_limit(
+        nostr_relay_builder::builder::RateLimit {
+            notes_per_minute: 1_000,
+            ..Default::default()
+        },
+    ));
+    relay.run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let relay_addr = relay_url
+        .strip_prefix("ws://")
+        .unwrap()
+        .trim_end_matches('/')
+        .to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepts = connections.clone();
+    // Optional setup delay isolates the cost of reconnecting. No delay by default.
+    let setup_ms = std::env::var("SEND_CONNECT_MS")
+        .unwrap_or_default()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let proxy = tokio::spawn(async move {
+        let mut peers = tokio::task::JoinSet::new();
+        loop {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            downstream.set_nodelay(true).unwrap();
+            accepts.fetch_add(1, Ordering::SeqCst);
+            let addr = relay_addr.clone();
+            peers.spawn(async move {
+                let mut upstream = TcpStream::connect(addr).await.unwrap();
+                upstream.set_nodelay(true).unwrap();
+                sleep(Duration::from_millis(setup_ms)).await;
+                tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+            });
+        }
+    });
+    let urls = std::env::var("SEND_RELAYS")
+        .map(|value| value.split(",").map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_else(|_| vec![url]);
+    let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    config.usage_diagnostics_silent = true;
+    let mut runtimes = Vec::new();
+    let mut homes = Vec::new();
+    let mut accounts = Vec::new();
+    for _ in 0..2 {
+        let home = tempfile::tempdir().unwrap();
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relays_and_config(
+            home.path(),
+            urls.clone(),
+            config.clone(),
+        ));
+        let account = create_network_ready_identity(
+            &runtime,
+            AccountSetupRequest {
+                default_relays: urls.iter().map(|url| endpoint(url)).collect(),
+                bootstrap_relays: urls.iter().map(|url| endpoint(url)).collect(),
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await;
+        accounts.push(account.account.account_id_hex);
+        homes.push(home);
+        runtimes.push(runtime);
+    }
+    let group = runtimes[0]
+        .create_group(&accounts[0], "socket reuse", &accounts[1..], None)
+        .await
+        .unwrap();
+    accept_group_invite_retrying_busy(&runtimes[1], &accounts[1], &group)
+        .await
+        .unwrap();
+    let push_server = Keys::generate();
+    if std::env::var_os("SEND_PUSH").is_some() {
+        runtimes[1]
+            .set_native_push_enabled(&accounts[1], true)
+            .await
+            .unwrap();
+        runtimes[1]
+            .upsert_push_registration(
+                &accounts[1],
+                PushPlatform::Fcm,
+                "latency-test-token",
+                &push_server.public_key().to_hex(),
+                Some(urls[0].clone()),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if runtimes[0]
+                    .group_push_debug_info(&accounts[0], &group)
+                    .await
+                    .unwrap()
+                    .active_token_count
+                    == 1
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("sender receives peer push token");
+    }
+    sleep(Duration::from_secs(2)).await;
+    let mut received = runtimes[1].subscribe();
+    let mut before = connections.load(Ordering::SeqCst);
+    let mut samples = Vec::new();
+    for index in 0..=30 {
+        let text = format!("connection probe {index}");
+        let started = Instant::now();
+        let sent = runtimes[0]
+            .send_message(&accounts[0], &group, text.clone().into_bytes())
+            .await
+            .unwrap();
+        assert!(
+            sent.published > 0,
+            "send must obtain a relay acknowledgement"
+        );
+        let caller_ms = started.elapsed().as_secs_f64() * 1000.0;
+        wait_for_event(&mut received, |event| {
+            matches!(event,
+                MarmotAppEvent::MessageReceived(message)
+                    if message.account_id_hex == accounts[1] && message.message.group_id == group
+                        && message.message.plaintext == text
+            )
+        })
+        .await;
+        if index == 0 {
+            // The anonymous WRITE pool is intentionally separate from receive
+            // subscriptions. Warm its socket before measuring retained reuse.
+            before = connections.load(Ordering::SeqCst);
+            continue;
+        }
+        samples.push(caller_ms);
+        eprintln!(
+            "send_sample={index} caller_ms={caller_ms:.3} received_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    samples.sort_by(f64::total_cmp);
+    let opened = std::env::var_os("SEND_RELAYS")
+        .is_none()
+        .then(|| connections.load(Ordering::SeqCst) - before);
+    let p95_index = (samples.len() * 95).div_ceil(100) - 1;
+    eprintln!(
+        "send_summary setup_ms={setup_ms} samples={} caller_mean_ms={:.3} caller_p95_ms={:.3} caller_max_ms={:.3} new_connections={opened:?}",
+        samples.len(),
+        samples.iter().sum::<f64>() / samples.len() as f64,
+        samples[p95_index],
+        samples.last().unwrap()
+    );
+    if std::env::var_os("SEND_PUSH").is_some() {
+        let client = NostrSdkClient::builder().build();
+        client.add_relay(&urls[0]).await.unwrap();
+        client.connect().await;
+        let events = client
+            .fetch_events(nostr_sdk::prelude::ReqTarget::single(
+                &urls[0],
+                [Filter::new()
+                    .kind(Kind::GiftWrap)
+                    .pubkey(push_server.public_key())],
+            ))
+            .timeout(Duration::from_secs(5))
+            .await
+            .unwrap();
+        // Convergence can re-publish retained messages and emit extra wakes.
+        // Token-only envelopes do not identify their originating message.
+        let minimum_triggers = samples.len() + 1;
+        let observed_triggers = events.len();
+        assert!(
+            observed_triggers >= minimum_triggers,
+            "expected at least {minimum_triggers} triggers, got {observed_triggers}"
+        );
+        for event in events {
+            let gift = nostr::nips::nip59::extract_rumor(&push_server, &event).unwrap();
+            assert_eq!(gift.rumor.kind, Kind::Custom(446));
+            assert_eq!(
+                BASE64_STANDARD.decode(&gift.rumor.content).unwrap().len(),
+                marmot_app::PUSH_ENCRYPTED_TOKEN_LEN,
+                "each trigger carries the peer's single encrypted token"
+            );
+        }
+        eprintln!("push_summary minimum={minimum_triggers} verified={observed_triggers}");
+        client.shutdown().await;
+    }
+    for runtime in runtimes {
+        runtime.shutdown_and_close().await.unwrap();
+    }
+    proxy.abort();
+}
+
+#[tokio::test]
+async fn publish_socket_isolation() {
+    use cgka_traits::{
+        MemberId, TransportAccountActivation, TransportAdapter, TransportPublishRequest,
+        TransportPublishTarget,
+    };
+    use marmot_app::MarmotRelayPlane;
+    use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
+
+    #[derive(Clone, Debug, Default)]
+    struct ConnectionAudit {
+        reads: Arc<Mutex<Vec<SocketAddr>>>,
+        writes: Arc<Mutex<Vec<SocketAddr>>>,
+    }
+
+    impl QueryPolicy for ConnectionAudit {
+        fn admit_query<'a>(
+            &'a self,
+            _: &'a nostr_relay_builder::prelude::Filter,
+            addr: &'a SocketAddr,
+        ) -> BoxedFuture<'a, PolicyResult> {
+            Box::pin(async move {
+                self.reads.lock().await.push(*addr);
+                PolicyResult::Accept
+            })
+        }
+    }
+
+    impl WritePolicy for ConnectionAudit {
+        fn admit_event<'a>(
+            &'a self,
+            event: &'a nostr_relay_builder::prelude::Event,
+            addr: &'a SocketAddr,
+        ) -> BoxedFuture<'a, PolicyResult> {
+            Box::pin(async move {
+                if event.kind == OldKind::MlsGroupMessage {
+                    self.writes.lock().await.push(*addr);
+                }
+                PolicyResult::Accept
+            })
+        }
+    }
+
+    let audit = ConnectionAudit::default();
+    let relay = LocalRelay::new(
+        RelayBuilder::default()
+            .nip42(RelayBuilderNip42 {
+                mode: RelayBuilderNip42Mode::Read,
+            })
+            .query_policy(audit.clone())
+            .write_policy(audit.clone()),
+    );
+    relay.run().await.unwrap();
+    let endpoint = TransportEndpoint(relay.url().await.to_string());
+    let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
+    let first = Keys::generate();
+    let account = MemberId::new(first.public_key().to_bytes().to_vec());
+    plane
+        .set_transport_signer(&account, Arc::new(first))
+        .await
+        .unwrap();
+    // Neither account publisher can rescue an accidental public send through
+    // the signer-bound path. The receive socket must authenticate for REQs.
+    let fallback = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    fallback.client().shutdown().await;
+    let adapter = plane.account_adapter(account.clone(), Arc::new(fallback.clone()));
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while audit.reads.lock().await.is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receive socket must issue its authenticated subscription");
+
+    let request = |account_id, content: &str| {
+        let event = EventBuilder::new(Kind::MlsGroupMessage, content)
+            .tags([Tag::custom("h", [hex::encode([0xD4; 32])])])
+            .finalize(&Keys::generate())
+            .unwrap();
+        TransportPublishRequest {
+            account_id,
+            message: NostrTransportEvent::from_nostr_event(&event)
+                .unwrap()
+                .to_transport_message()
+                .unwrap(),
+            target: TransportPublishTarget::Group {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: vec![0xD4; 32],
+                endpoints: vec![endpoint.clone()],
+            },
+            required_acks: 1,
+        }
+    };
+    let publish = async |adapter: &marmot_app::MarmotRelayPlaneAccountAdapter, account, content| {
+        let request = request(account, content);
+        let report = timeout(Duration::from_secs(5), adapter.publish(request.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.met_required_acks());
+        assert_eq!(report.message_id, request.message.id);
+    };
+    publish(&adapter, account.clone(), "first").await;
+    publish(&adapter.clone(), account.clone(), "clone").await;
+    let second = Keys::generate();
+    let second_id = MemberId::new(second.public_key().to_bytes().to_vec());
+    let second_adapter = plane.account_adapter(second_id.clone(), Arc::new(fallback));
+    plane
+        .set_transport_signer(&second_id, Arc::new(second))
+        .await
+        .unwrap();
+    publish(&second_adapter, second_id.clone(), "second account").await;
+    second_adapter.deactivate_account(&second_id).await.unwrap();
+    publish(&adapter, account.clone(), "first after switch").await;
+    plane.shutdown().await;
+    publish(&adapter, account, "receive pool shut down").await;
+
+    let reads = audit.reads.lock().await;
+    let writes = audit.writes.lock().await;
+    assert_eq!(writes.len(), 5);
+    assert!(
+        writes.iter().all(|peer| !reads.contains(peer)),
+        "group writes must never use an authenticated receive socket"
+    );
+    assert_eq!(
+        writes[0], writes[1],
+        "adapter clones reuse the anonymous socket"
+    );
+    assert_ne!(writes[0], writes[2], "accounts own independent publishers");
+    assert_eq!(
+        writes[0], writes[3],
+        "account switches do not replace its publisher"
+    );
+    assert_eq!(
+        writes[0], writes[4],
+        "receive shutdown does not replace its publisher"
+    );
 }
 
 async fn mock_relay() -> (MockRelay, String) {
@@ -5791,6 +6138,9 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     })
     .await;
 
+    // Drain the leave's remaining projection work before comparing the full
+    // durable row across a rejected stale acceptance.
+    runtime.catch_up_accounts().await.unwrap();
     let reloaded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
     assert_eq!(reloaded.self_membership, SelfMembership::Left);
     assert!(!reloaded.pending_confirmation);

@@ -738,8 +738,8 @@ impl NostrTransportAdapter {
         metrics
     }
 
-    /// Publish one already-validated event through `client` for `account_id`
-    /// and record it on this adapter's shared publish counters.
+    /// Execute one already-validated logical publication and record it on this
+    /// adapter's shared counters, including any endpoint or authentication retries.
     ///
     /// Callers keep account, endpoint-safety, and envelope checks. This method
     /// does not revalidate, build a request, or fan out locally. Success
@@ -747,19 +747,14 @@ impl NostrTransportAdapter {
     /// `accepted >= required_acks.max(1)`. Any other `Ok` outcome and any
     /// `Err` count as one failure. Dropping this future after it has started
     /// counts as one cancellation; dropping it before it is polled counts
-    /// nothing. The client's outcome or error is returned unchanged.
+    /// nothing. The publication's outcome or error is returned unchanged.
     pub async fn publish_event_with_client(
         &self,
-        client: &dyn NostrRelayClient,
-        account_id: &MemberId,
-        endpoints: &[TransportEndpoint],
-        event: &NostrTransportEvent,
+        publication: impl Future<Output = Result<NostrPublishOutcome, TransportAdapterError>>,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
         let mut attempt = self.publish_accounting.begin();
-        let outcome = client
-            .publish_event_for_account(account_id, endpoints, event, required_acks)
-            .await;
+        let outcome = publication.await;
         match &outcome {
             Ok(result)
                 if publish_accounting::outcome_met_required_acks(
@@ -1459,6 +1454,14 @@ impl TransportAdapter for NostrTransportAdapter {
                 .accounts
                 .get(&sync.account_id)
                 .expect("the AccountNotActive guard above proved the account is active");
+            // Sends repeat this sync. Keep the committed routes and telemetry
+            // intact when nothing changed; failed relay teardown still retries.
+            if routes.groups == sync.group_subscriptions
+                && state.pending_unsubscribes.is_empty()
+                && state.pending_scoped_unsubscribes.is_empty()
+            {
+                return Ok(());
+            }
             // A sync amends the live activation's route set; it does not open a
             // new attempt, so both sides of the diff carry the activation's own
             // attempt and the ids stay stable across it.
@@ -1597,10 +1600,12 @@ impl TransportAdapter for NostrTransportAdapter {
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
         let outcome = self
             .publish_event_with_client(
-                self.relay_client.as_ref(),
-                &request.account_id,
-                request.target.endpoints(),
-                &event,
+                self.relay_client.publish_event_for_account(
+                    &request.account_id,
+                    request.target.endpoints(),
+                    &event,
+                    request.required_acks,
+                ),
                 request.required_acks,
             )
             .await?;
