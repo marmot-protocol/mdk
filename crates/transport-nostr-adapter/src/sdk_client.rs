@@ -14,6 +14,8 @@ use cgka_traits::{
 };
 use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
+#[cfg(feature = "test-policy-overrides")]
+use nostr_sdk::error::ErrorKind;
 use nostr_sdk::prelude::{
     AcquisitionEnd as SdkAcquisitionEnd, AcquisitionLimits as SdkAcquisitionLimits, Client,
     ClientNotification, Event, EventBuilder, EventId, Filter, FinalizeEventAsync, Kind, PublicKey,
@@ -139,6 +141,53 @@ pub struct NostrReconciliationSummary {
     pub relays_failed: usize,
     pub remote_items: usize,
     pub received_items: usize,
+    #[cfg(feature = "test-policy-overrides")]
+    pub comparison_diagnostics: NostrComparisonDiagnostics,
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NostrComparisonDiagnostics {
+    pub relay_missing: usize,
+    pub relay_lookup_error: usize,
+    pub neg_error: usize,
+    pub neg_ok: usize,
+    pub neg_timeout: usize,
+    pub neg_state: usize,
+    pub neg_unsupported: usize,
+    pub neg_rejected: usize,
+    pub neg_protocol: usize,
+    pub neg_other: usize,
+}
+
+#[cfg(feature = "test-policy-overrides")]
+enum ComparisonDiagnostic {
+    RelayMissing,
+    RelayLookupError,
+    NegOk,
+    NegError(ErrorKind),
+}
+
+#[cfg(feature = "test-policy-overrides")]
+impl NostrComparisonDiagnostics {
+    fn record(&mut self, diagnostic: ComparisonDiagnostic) {
+        match diagnostic {
+            ComparisonDiagnostic::RelayMissing => self.relay_missing += 1,
+            ComparisonDiagnostic::RelayLookupError => self.relay_lookup_error += 1,
+            ComparisonDiagnostic::NegOk => self.neg_ok += 1,
+            ComparisonDiagnostic::NegError(kind) => {
+                self.neg_error += 1;
+                match kind {
+                    ErrorKind::Timeout => self.neg_timeout += 1,
+                    ErrorKind::State => self.neg_state += 1,
+                    ErrorKind::Unsupported => self.neg_unsupported += 1,
+                    ErrorKind::Rejected => self.neg_rejected += 1,
+                    ErrorKind::Protocol => self.neg_protocol += 1,
+                    _ => self.neg_other += 1,
+                }
+            }
+        }
+    }
 }
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
@@ -685,11 +734,32 @@ impl NostrSdkRelayClient {
             let items = items.clone();
             let options = options.clone();
             async move {
+                #[cfg(feature = "test-policy-overrides")]
+                let (result, diagnostic) = match client.relay(&endpoint).await {
+                    Ok(Some(relay)) => {
+                        let result = relay.sync(filter).items(items).opts(options).await;
+                        let diagnostic = match &result {
+                            Ok(_) => ComparisonDiagnostic::NegOk,
+                            Err(error) => ComparisonDiagnostic::NegError(error.kind()),
+                        };
+                        (Some(result), diagnostic)
+                    }
+                    Ok(None) => (None, ComparisonDiagnostic::RelayMissing),
+                    Err(_) => (None, ComparisonDiagnostic::RelayLookupError),
+                };
+                #[cfg(not(feature = "test-policy-overrides"))]
                 let result = match client.relay(&endpoint).await {
                     Ok(Some(relay)) => Some(relay.sync(filter).items(items).opts(options).await),
                     Ok(None) | Err(_) => None,
                 };
-                (endpoint, result)
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    (endpoint, result, diagnostic)
+                }
+                #[cfg(not(feature = "test-policy-overrides"))]
+                {
+                    (endpoint, result)
+                }
             }
         });
         let outcomes = timeout_at(deadline, futures::future::join_all(syncs))
@@ -700,16 +770,21 @@ impl NostrSdkRelayClient {
         let mut remote = HashSet::new();
         let mut remote_by_endpoint = HashMap::new();
         let mut failed_endpoints = HashSet::new();
-        for (endpoint, result) in outcomes {
+        #[cfg(feature = "test-policy-overrides")]
+        let mut comparison_diagnostics = NostrComparisonDiagnostics::default();
+        for outcome in outcomes {
+            #[cfg(feature = "test-policy-overrides")]
+            let (endpoint, result, diagnostic) = outcome;
+            #[cfg(feature = "test-policy-overrides")]
+            comparison_diagnostics.record(diagnostic);
+            #[cfg(not(feature = "test-policy-overrides"))]
+            let (endpoint, result) = outcome;
             match result {
                 Some(Ok(summary)) => {
                     remote.extend(summary.remote.iter().copied());
                     remote_by_endpoint.insert(endpoint, summary.remote);
                 }
-                Some(Err(_)) => {
-                    failed_endpoints.insert(endpoint);
-                }
-                None => {
+                Some(Err(_)) | None => {
                     failed_endpoints.insert(endpoint);
                 }
             }
@@ -926,6 +1001,8 @@ impl NostrSdkRelayClient {
             relays_failed: failed_endpoints.len(),
             remote_items: remote_item_count,
             received_items: remote_events.len(),
+            #[cfg(feature = "test-policy-overrides")]
+            comparison_diagnostics,
         };
         Ok((summary, remote_events))
     }
@@ -3241,6 +3318,35 @@ mod tests {
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
     }
 
+    /// A route can be in the frozen inventory without an SDK relay entry.
+    #[cfg(feature = "test-policy-overrides")]
+    #[tokio::test]
+    async fn reconciliation_diagnostic_distinguishes_missing_sdk_relay() {
+        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let subscription = NostrSubscription::Group {
+            account_id: MemberId::new(vec![0xa1; 32]),
+            group_id: cgka_traits::GroupId::new(vec![0xb2; 16]),
+            transport_group_id: vec![0xc3; 32],
+            endpoints: vec![TransportEndpoint("wss://unregistered.example".to_owned())],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL,
+        };
+        let (summary, events) = sdk
+            .reconcile_subscription(
+                subscription,
+                &[],
+                0,
+                u64::MAX,
+                &TestReconciliationProgress::default(),
+            )
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(summary.relays_failed, 1);
+        assert_eq!(summary.comparison_diagnostics.relay_missing, 1);
+        assert_eq!(summary.comparison_diagnostics.neg_error, 0);
+    }
+
     /// A fresh explicit fetch and the SDK notification can legitimately carry
     /// the same id. Cache misses do not identify which path owns delivery.
     #[tokio::test]
@@ -3275,10 +3381,14 @@ mod tests {
             since: None,
             attempt: SubscriptionAttempt::INITIAL,
         };
-        let (_, fetched) = sdk
+        let (summary, fetched) = sdk
             .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
             .await
             .unwrap();
+        #[cfg(feature = "test-policy-overrides")]
+        assert_eq!(summary.comparison_diagnostics.neg_ok, 1);
+        #[cfg(not(feature = "test-policy-overrides"))]
+        let _ = summary;
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].event.id, event.id.to_hex());
         while let Ok(Some(notification)) =

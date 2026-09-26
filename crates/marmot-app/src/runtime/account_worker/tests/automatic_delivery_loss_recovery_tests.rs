@@ -14,7 +14,7 @@ use nostr_sdk::prelude::{
 };
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Clone, Debug, Default)]
 struct HeldLossReplay {
@@ -24,6 +24,11 @@ struct HeldLossReplay {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
     active: Arc<AtomicUsize>,
+    neg_started: Arc<AtomicUsize>,
+    neg_completed: Arc<AtomicUsize>,
+    neg_active: Arc<AtomicUsize>,
+    neg_max_elapsed_ms: Arc<AtomicU64>,
+    neg_max_items: Arc<AtomicUsize>,
 }
 
 impl HeldLossReplay {
@@ -95,7 +100,22 @@ impl NostrDatabase for HeldLossReplay {
         &self,
         query: RelayFilter,
     ) -> BoxedFuture<'_, Result<Vec<(EventId, RelayTimestamp)>, DatabaseError>> {
-        self.inner.negentropy_items(query)
+        Box::pin(async move {
+            self.neg_started.fetch_add(1, Ordering::SeqCst);
+            self.neg_active.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveLossRequest(self.neg_active.clone());
+            let started = std::time::Instant::now();
+            let result = self.inner.negentropy_items(query).await;
+            self.neg_max_elapsed_ms.fetch_max(
+                started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                Ordering::SeqCst,
+            );
+            if let Ok(items) = &result {
+                self.neg_max_items.fetch_max(items.len(), Ordering::SeqCst);
+            }
+            self.neg_completed.fetch_add(1, Ordering::SeqCst);
+            result
+        })
     }
 
     fn delete(&self, filter: RelayFilter) -> BoxedFuture<'_, Result<(), DatabaseError>> {
@@ -479,6 +499,10 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     assert!(loss.observed_count > 0);
     selections.lock().unwrap().clear();
     activity.route_outcomes.lock().unwrap().clear();
+    gate.neg_started.store(0, Ordering::SeqCst);
+    gate.neg_completed.store(0, Ordering::SeqCst);
+    gate.neg_max_elapsed_ms.store(0, Ordering::SeqCst);
+    gate.neg_max_items.store(0, Ordering::SeqCst);
     runtime
         .shared_services()
         .comparison_test_trace
@@ -633,9 +657,25 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
                 outcome.relays_failed,
                 outcome.remote_items,
                 outcome.received_items,
+                outcome.comparison_diagnostics.clone(),
             )
         })
         .collect::<Vec<_>>();
+    assert!(
+        route_outcomes
+            .iter()
+            .filter(|outcome| outcome.3 == "returned")
+            .all(|outcome| {
+                outcome.8.as_ref().is_some_and(|diagnostics| {
+                    diagnostics.relay_missing
+                        + diagnostics.relay_lookup_error
+                        + diagnostics.neg_error
+                        + diagnostics.neg_ok
+                        == 1
+                })
+            }),
+        "each returned single-endpoint route carries its comparison-branch witness: {route_outcomes:?}"
+    );
     let trace_counts = {
         let shared = runtime.shared_services();
         let trace = shared.comparison_test_trace.lock().unwrap();
@@ -684,7 +724,12 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .iter()
         .any(|(_, target_route, target_time, _, _, _, _)| *target_route && *target_time);
     eprintln!(
-        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, selected={selected:?}, route_outcomes={route_outcomes:?}, trace_counts={trace_counts:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
+        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, neg_started={}, neg_completed={}, neg_active={}, neg_max_elapsed_ms={}, neg_max_items={}, selected={selected:?}, route_outcomes={route_outcomes:?}, trace_counts={trace_counts:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
+        gate.neg_started.load(Ordering::SeqCst),
+        gate.neg_completed.load(Ordering::SeqCst),
+        gate.neg_active.load(Ordering::SeqCst),
+        gate.neg_max_elapsed_ms.load(Ordering::SeqCst),
+        gate.neg_max_items.load(Ordering::SeqCst),
     );
     if status_timed_out {
         timeout(Duration::from_secs(30), status_rx)
@@ -783,6 +828,27 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .count();
     let target_returned = activity.matching_events.load(Ordering::SeqCst);
     let target_queued = activity.matching_queued_deliveries.load(Ordering::SeqCst);
+    let target_comparisons = activity
+        .route_outcomes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|outcome| outcome.target_route && outcome.kind == "returned")
+        .map(|outcome| outcome.comparison_diagnostics.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !target_comparisons.is_empty()
+            && target_comparisons.iter().all(|diagnostics| {
+                diagnostics.as_ref().is_some_and(|diagnostics| {
+                    diagnostics.relay_missing
+                        + diagnostics.relay_lookup_error
+                        + diagnostics.neg_error
+                        + diagnostics.neg_ok
+                        == 1
+                })
+            }),
+        "completed target route must carry one SDK comparison branch: {target_comparisons:?}"
+    );
     let marker_pending = storage
         .account_delivery_recovery(&alice.label)
         .unwrap()

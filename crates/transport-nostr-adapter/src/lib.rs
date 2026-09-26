@@ -88,6 +88,8 @@ pub use relay_list::{
     NostrAccountRelayListPublication, NostrNip65RelayListPublication, NostrNip65RelaySet,
     parse_nip65_relay_set,
 };
+#[cfg(all(feature = "sdk", feature = "test-policy-overrides"))]
+pub use sdk_client::NostrComparisonDiagnostics;
 #[cfg(feature = "sdk")]
 pub use sdk_client::{
     NostrReconciliationItem, NostrReconciliationProgress, NostrReconciliationSummary,

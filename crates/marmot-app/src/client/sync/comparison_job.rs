@@ -42,6 +42,7 @@ pub(crate) struct TestComparisonRouteOutcome {
     pub(crate) relays_failed: usize,
     pub(crate) remote_items: usize,
     pub(crate) received_items: usize,
+    pub(crate) comparison_diagnostics: Option<transport_nostr_adapter::NostrComparisonDiagnostics>,
 }
 
 #[cfg(test)]
@@ -273,6 +274,33 @@ impl ComparisonNetworkJob {
                     initial_cursor,
                 } = frozen;
                 if tokio::time::Instant::now() >= deadline {
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    if let Some(witness) = &witness {
+                        let target_route = witness
+                            .target_route
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|target| target == &inventory.route);
+                        witness
+                            .route_outcomes
+                            .lock()
+                            .unwrap()
+                            .push(TestComparisonRouteOutcome {
+                                attempt_serial,
+                                target_route,
+                                inbox: matches!(
+                                    &inventory.route,
+                                    TransportReconciliationRoute::Inbox
+                                ),
+                                kind: "skipped",
+                                relays_succeeded: 0,
+                                relays_failed: 0,
+                                remote_items: 0,
+                                received_items: 0,
+                                comparison_diagnostics: None,
+                            });
+                    }
                     results.push(ComparisonRouteResult {
                         route: inventory.route,
                         initial_cursor,
@@ -338,22 +366,29 @@ impl ComparisonNetworkJob {
                 let cursor = *progress.cursor.lock().expect("comparison progress mutex");
                 #[cfg(all(test, feature = "test-policy-overrides"))]
                 if let Some(witness) = &witness {
-                    let (kind, relays_succeeded, relays_failed, remote_items, received_items) =
-                        match &result {
-                            ComparisonRouteWorkResult::Skipped => ("skipped", 0, 0, 0, 0),
-                            ComparisonRouteWorkResult::TimedOut => ("timed_out", 0, 0, 0, 0),
-                            ComparisonRouteWorkResult::Returned(Ok(None)) => {
-                                ("unsupported", 0, 0, 0, 0)
-                            }
-                            ComparisonRouteWorkResult::Returned(Err(_)) => ("error", 0, 0, 0, 0),
-                            ComparisonRouteWorkResult::Returned(Ok(Some((summary, _)))) => (
-                                "returned",
-                                summary.relays_succeeded,
-                                summary.relays_failed,
-                                summary.remote_items,
-                                summary.received_items,
-                            ),
-                        };
+                    let (
+                        kind,
+                        relays_succeeded,
+                        relays_failed,
+                        remote_items,
+                        received_items,
+                        comparison_diagnostics,
+                    ) = match &result {
+                        ComparisonRouteWorkResult::Skipped => ("skipped", 0, 0, 0, 0, None),
+                        ComparisonRouteWorkResult::TimedOut => ("timed_out", 0, 0, 0, 0, None),
+                        ComparisonRouteWorkResult::Returned(Ok(None)) => {
+                            ("unsupported", 0, 0, 0, 0, None)
+                        }
+                        ComparisonRouteWorkResult::Returned(Err(_)) => ("error", 0, 0, 0, 0, None),
+                        ComparisonRouteWorkResult::Returned(Ok(Some((summary, _)))) => (
+                            "returned",
+                            summary.relays_succeeded,
+                            summary.relays_failed,
+                            summary.remote_items,
+                            summary.received_items,
+                            Some(summary.comparison_diagnostics.clone()),
+                        ),
+                    };
                     let target_route = witness
                         .target_route
                         .lock()
@@ -373,6 +408,7 @@ impl ComparisonNetworkJob {
                             relays_failed,
                             remote_items,
                             received_items,
+                            comparison_diagnostics,
                         });
                 }
                 results.push(ComparisonRouteResult {
