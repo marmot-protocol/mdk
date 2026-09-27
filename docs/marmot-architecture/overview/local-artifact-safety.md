@@ -118,6 +118,41 @@ drop anything.
 `StorageError::Closed` is deliberately its own variant, and non-transient: work racing a close must be reportable as
 "we shut down" rather than as a storage fault the user is shown.
 
+## Shared-home access and corruption detection
+
+Commands that may mutate account storage acquire the same root lease as `wnd`
+and `wn-agent`. Pure account metadata listing does not open a hydrated runtime
+and remains available to concurrent direct `wn` callers. When `wnd` owns the
+home, CLI commands that need the runtime, including logout and foreground
+stream watches, use its socket. A failed implicit socket connection does not
+bypass ownership for mutations. Connector clients use `wn-agent` agent-control;
+the two socket protocols are not interchangeable. Babysitter automation that
+previously launched `wn` against a live `wn-agent` home must send supported
+operations through agent-control instead. For administration outside that
+facade, stop the owner and use a coordinated offline window before invoking
+`wn`; a direct CLI mutation during live connector ownership returns
+`runtime_busy`.
+
+The lease remains root-wide, including when `--account` selects one of several
+accounts. The root contains shared SQLite metadata and caches, and the app
+runtime owns account workers as one unit. Two independent runtime processes
+cannot safely mutate different accounts under the same home today. Use one
+`wnd` owner and send commands through it, or use separate home roots for
+independent processes. A per-account lease requires a separate design for
+shared-root storage and runtime ownership.
+
+Ready account workers check SQLite structure every 120 seconds without
+opening a second database connection. The check has a one-second SQLite VM
+budget and runs on a blocking worker. Database size and filesystem delay can
+still make a check incomplete; three consecutive incomplete or overdue
+intervals raise an error-level diagnostic, while a completed healthy check
+clears the streak.
+`corrupt` and `incomplete` are fixed, privacy-safe diagnostic categories.
+This detects structural damage; it does not repair it, check every index or
+foreign key, or prove MLS semantic consistency. A pending close may wait for
+the connection guard held by an already-started check; I/O outside SQLite's
+VM is not preemptible by the budget.
+
 ## Deliberate exception
 
 The application root directory's mode is left as-is when it already exists: retroactively chmod-ing the root of

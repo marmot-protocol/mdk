@@ -1,3 +1,8 @@
+// The daemon connection handler contains several async command paths, including
+// the foreground stream watch's client-disconnect race. Rustc needs a deeper
+// query budget to lay out that future in test builds.
+#![recursion_limit = "256"]
+
 use std::io::Write;
 use std::process::ExitCode;
 

@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Periodic account integrity checks run off the async worker; repeated incomplete
+  checks alert after three distinct intervals, without double-counting an overdue
+  probe when it eventually reports incomplete. (#1937)
+
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay
   until a newer event replaces them. (#1973)

@@ -158,6 +158,10 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .or_else(|| discovery_relays.first().cloned())
         .or_else(|| default_account_relays.first().cloned())
         .ok_or(crate::WnError::MissingRelay)?;
+    // Hold ownership for the entire daemon, including local-command helpers
+    // that intentionally share its root without constructing another lease.
+    // Acquire before touching socket/pid artifacts belonging to another host.
+    let _root_lease = marmot_app::MarmotRootRuntimeLease::try_acquire(&home)?;
     let _socket_parent_guard = socket
         .parent()
         .map(|parent| prepare_socket_dir(parent, &home))
@@ -551,6 +555,15 @@ async fn handle_execute_connection(
     workers: &SharedDaemonWorkers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     apply_defaults(&mut cli, defaults);
+    let foreground_watch = matches!(
+        cli.command,
+        crate::Command::Stream {
+            command: crate::StreamCommand::Watch {
+                background: false,
+                ..
+            },
+        }
+    );
     if let Some(output) = blocked_daemon_execute_output(cli.as_ref()) {
         write_daemon_output(stream, &output).await;
         return Ok(());
@@ -608,15 +621,73 @@ async fn handle_execute_connection(
         write_daemon_output(stream, &output).await;
         return Ok(());
     }
-    // run_cli_local opens its own account/session and touches no shared daemon state, so it runs
-    // entirely off the workers lock — the core head-of-line fix (#633).
-    let output = crate::run_cli_local(*cli, import_nsec).await;
+    // Reuse the owner's app and connection caches even for commands that have
+    // not yet moved to the hosted runtime dispatcher. A second app against the
+    // daemon-owned root is the same unsafe double-hydration as a second process.
+    let hosted_runtime = if app_runtime_enabled(defaults) {
+        let Some(runtime) =
+            reconcile_and_clone_runtime(defaults, state.clone(), events.clone(), workers).await
+        else {
+            write_daemon_output(
+                stream,
+                &crate::command_output_result(cli.json, Err(crate::WnError::MissingRelay)),
+            )
+            .await;
+            return Ok(());
+        };
+        Some(runtime)
+    } else {
+        // Daemon startup requires a relay, so production always uses the
+        // shared runtime above. Keep the relay-less test path off the workers
+        // lock so status and local commands avoid head-of-line blocking.
+        None
+    };
+    let execute = async move {
+        if let Some(runtime) = hosted_runtime {
+            crate::run_cli_with_hosted_app(*cli, import_nsec, runtime.app_handle()).await
+        } else {
+            crate::run_cli_local(*cli, import_nsec).await
+        }
+    };
+    let output = if foreground_watch {
+        let Some(output) = execute_until_daemon_client_closes(stream, execute).await else {
+            return Ok(());
+        };
+        output
+    } else {
+        execute.await
+    };
     if output.code == 0 {
         refresh_app_runtime(defaults, state.clone(), events.clone(), workers, refresh).await;
     }
 
     write_daemon_output(stream, &output).await;
     Ok(())
+}
+
+async fn execute_until_daemon_client_closes(
+    stream: &UnixStream,
+    execute: impl std::future::Future<Output = CliOutput>,
+) -> Option<CliOutput> {
+    tokio::select! {
+        output = execute => Some(output),
+        _ = wait_for_daemon_client_close(stream) => None,
+    }
+}
+
+async fn wait_for_daemon_client_close(stream: &UnixStream) {
+    let mut probe = [0u8; 1];
+    loop {
+        if stream.readable().await.is_err() {
+            return;
+        }
+        match stream.try_read(&mut probe) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => return,
+        }
+    }
 }
 
 #[cfg(test)]

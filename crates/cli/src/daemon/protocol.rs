@@ -535,7 +535,6 @@ pub(crate) async fn send_request(
                 source,
             })?;
     stream.write_all(&bytes).await?;
-    stream.shutdown().await?;
 
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;

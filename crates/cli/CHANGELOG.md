@@ -28,12 +28,34 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Direct CLI commands that open account storage, including read-only queries,
+  now require exclusive ownership of the Marmot home. The lease is root-wide even for a selected
+  `--account`, because account workers share root metadata and caches. Run one
+  `wnd` owner and route commands through it, or use separate homes for
+  independent processes. Read-only `wn accounts list` remains available to
+  concurrent direct callers; its direct response omits cached profile fields.
+  Automation that starts `wn` while `wnd` runs must use the daemon socket for
+  runtime commands. `wn logout` and foreground `wn stream watch` now forward
+  to the daemon automatically. Babysitter automation for a `wn-agent` home
+  must use agent-control, or stop the owner for unsupported administration.
+  If another owner has no compatible socket, storage-backed commands return JSON
+  error code `runtime_busy`.
+
+- `wn tui` can launch while `wnd` owns the home; its `wn` children use the daemon
+  socket. `wn sync` uses the selected hosted account worker, and foreground stream
+  watches end when the client disconnects.
+
 - MarmotKit standard release builds now use thin LTO and one codegen unit, kept in lockstep between the
   workspace profile and the builder-owned MarmotKit environment. Host and Apple archives still keep
   symbols; Android JNI libraries still strip per invocation. Apple provenance records `lto` as JSON
   `false` or `"thin"`.
 
 ### Fixed
+
+- `wn tui` rejects startup when another runtime already owns its home, using
+  the same ownership error as direct CLI commands. The startup lease is released
+  before entering the subprocess-based UI; child commands retain their own
+  runtime ownership checks.
 
 - MarmotKit release-profile measurements now fail closed when `create_group` benchmarks error or
   omit fresh Criterion estimates, including when stale results are already on disk. The Apple

@@ -5,6 +5,9 @@
 //! same database so group snapshot and rollback can be atomic across both
 //! layers.
 
+mod integrity;
+pub use integrity::IntegrityProbe;
+
 mod group_system;
 pub use group_system::{
     GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,

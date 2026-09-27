@@ -457,6 +457,16 @@ impl AccountDeviceSession {
         Ok(self.storage.promote_legacy_message_rows(limit)?)
     }
 
+    /// Run the connection-bound SQLite check off the async worker thread.
+    /// The caller must keep at most one probe in flight per account.
+    pub fn spawn_storage_integrity_probe(
+        &self,
+        budget: std::time::Duration,
+    ) -> tokio::task::JoinHandle<SessionResult<storage_sqlite::IntegrityProbe>> {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || Ok(storage.probe_integrity(budget)?))
+    }
+
     pub async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         tracing::debug!(
             target: TRACE_TARGET,

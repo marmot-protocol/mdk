@@ -215,6 +215,8 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
     }
 
     if matches!(cli.command, Command::Tui { .. }) {
+        // The TUI uses wn subprocesses, which route through a running wnd.
+        // Those children enforce ownership when they open local storage.
         return tui::run_tui(cli).await;
     }
 
@@ -292,6 +294,49 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
         }
     }
 
+    // Listing must stay usable while another process owns the hydrated
+    // runtime. Preserve the cached profile in the usual unowned case, but
+    // fall back to AccountHome metadata when the root is already owned.
+    if matches!(
+        cli.command,
+        Command::Account {
+            command: AccountCommand::List
+        } | Command::Accounts {
+            command: AccountCommand::List
+        }
+    ) || (matches!(cli.command, Command::Whoami) && cli.account.is_none())
+    {
+        // The normal execution path validates the global relay before opening
+        // the app. A metadata-only listing must retain that CLI contract.
+        if let Err(error) = resolve_relay(cli.relay.clone()) {
+            return command_output_result(cli.json, Err(error));
+        }
+        match marmot_app::MarmotRootRuntimeLease::try_acquire(&home) {
+            Ok(lease) => {
+                let output = run_cli_local(cli, import_nsec).await;
+                drop(lease);
+                return output;
+            }
+            Err(marmot_app::AppError::RuntimeBusy) => {
+                return command_output_result(
+                    cli.json,
+                    commands::account::account_list_command(&AccountHome::open(&home), None),
+                );
+            }
+            Err(error) => return command_output_result(cli.json, Err(error.into())),
+        }
+    }
+
+    // Socket clients use the daemon's ownership. Direct storage mutation,
+    // including fallback after a stale socket, must not bypass the root lease.
+    let _root_lease = if stateless_stream_command(&cli.command).is_some() {
+        None
+    } else {
+        match marmot_app::MarmotRootRuntimeLease::try_acquire(&home) {
+            Ok(lease) => Some(lease),
+            Err(error) => return command_output_result(cli.json, Err(error.into())),
+        }
+    };
     run_cli_local(cli, import_nsec).await
 }
 
@@ -494,6 +539,18 @@ pub(crate) async fn run_cli_local(cli: Cli, import_nsec: Option<ImportNsec>) -> 
     }
 }
 
+pub(crate) async fn run_cli_with_hosted_app(
+    cli: Cli,
+    import_nsec: Option<ImportNsec>,
+    app: MarmotApp,
+) -> CliOutput {
+    let json_output = cli.json;
+    command_output_result(
+        json_output,
+        execute_inner(cli, import_nsec, Some(app)).await,
+    )
+}
+
 pub(crate) fn command_output_result(
     json_output: bool,
     result: Result<CommandOutput, WnError>,
@@ -542,32 +599,31 @@ async fn execute(
     import_nsec: Option<ImportNsec>,
 ) -> Result<(bool, CommandOutput), (bool, WnError)> {
     let json_output = cli.json;
-    execute_inner(cli, import_nsec)
+    execute_inner(cli, import_nsec, None)
         .await
         .map(|output| (json_output, output))
         .map_err(|err| (json_output, err))
 }
 
+/// These raw transport commands never open account storage.
+fn stateless_stream_command(command: &Command) -> Option<&StreamCommand> {
+    match command {
+        Command::Stream { command } if client_hosted_stream_command(command).is_some() => {
+            Some(command)
+        }
+        _ => None,
+    }
+}
+
 async fn execute_inner(
     cli: Cli,
     mut import_nsec: Option<ImportNsec>,
+    hosted_app: Option<MarmotApp>,
 ) -> Result<CommandOutput, WnError> {
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
     let command = cli.command.clone();
-    if let Command::Stream { command } = &command
-        && matches!(command, StreamCommand::Receive { .. })
-    {
-        return commands::stream::stream_command_local(command.clone()).await;
-    }
-    if let Command::Stream {
-        command:
-            stream_command @ StreamCommand::Send {
-                start_event_id: None,
-                ..
-            },
-    } = &command
-    {
+    if let Some(stream_command) = stateless_stream_command(&command) {
         return commands::stream::stream_command_local(stream_command.clone()).await;
     }
     let secret_store = resolve_secret_store(cli.secret_store)?;
@@ -582,15 +638,18 @@ async fn execute_inner(
         _ => cli.relay.clone(),
     };
     let relay = resolve_relay(command_relay)?;
-    let app = app_for(
-        home.clone(),
-        relay
-            .clone()
-            .or_else(|| cli.daemon_discovery_relays.first().cloned())
-            .or_else(|| cli.daemon_default_account_relays.first().cloned()),
-        cli.daemon_discovery_relays.clone(),
-        account_home.clone(),
-    )?;
+    let app = match hosted_app {
+        Some(app) => app,
+        None => app_for(
+            home.clone(),
+            relay
+                .clone()
+                .or_else(|| cli.daemon_discovery_relays.first().cloned())
+                .or_else(|| cli.daemon_default_account_relays.first().cloned()),
+            cli.daemon_discovery_relays.clone(),
+            account_home.clone(),
+        )?,
+    };
     match command {
         Command::UsageDiagnostics { command } => {
             let runtime = app.runtime();
@@ -727,9 +786,6 @@ fn daemon_socket_for_client(cli: &Cli, home: &Path) -> Option<PathBuf> {
 
     let socket = daemon_socket_path_for_client(cli, home);
     let explicit_daemon_socket = cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
-    if matches!(cli.command, Command::Logout { .. }) && !explicit_daemon_socket {
-        return None;
-    }
     if explicit_daemon_socket || socket.exists() {
         Some(socket)
     } else {
@@ -751,12 +807,6 @@ pub(crate) fn client_hosted_stream_command(
         } => Some((
             "stream send",
             "it opens a client-hosted stream; anchor the send to an existing stream or run it directly without --socket",
-        )),
-        StreamCommand::Watch {
-            background: false, ..
-        } => Some((
-            "stream watch",
-            "foreground stream watches run until the stream ends; use --background or run directly without --socket",
         )),
         _ => None,
     }
@@ -1714,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_execute_socket_skips_stream_commands_that_must_run_in_client() {
+    fn daemon_execute_socket_skips_raw_transport_commands_that_must_run_in_client() {
         let home = Path::new("/tmp/wn-home");
         let commands = [
             StreamCommand::Receive {
@@ -1733,13 +1783,6 @@ mod tests {
                 chunk_delay_ms: 0,
                 text: vec!["hello".to_owned()],
             },
-            StreamCommand::Watch {
-                group: "aa".repeat(32),
-                stream_id: None,
-                server_cert_der_hex: None,
-                insecure_local: true,
-                background: false,
-            },
         ];
 
         for command in commands {
@@ -1749,10 +1792,9 @@ mod tests {
     }
 
     #[test]
-    fn daemon_execute_socket_skips_implicit_logout() {
-        // WN_SOCKET makes the socket selection explicit; this regression covers
-        // the auto-discovered daemon socket path that previously forwarded
-        // `wn logout` even though the user did not pass `--socket`.
+    fn daemon_execute_socket_forwards_implicit_logout() {
+        // The auto-discovered socket lets logout use the owning daemon's
+        // runtime without opening a second hydrated process on the same home.
         if std::env::var_os("WN_SOCKET").is_some() {
             return;
         }
@@ -1768,7 +1810,7 @@ mod tests {
         });
         cli.socket = None;
 
-        assert_eq!(daemon_socket_for_client(&cli, home.path()), None);
+        assert_eq!(daemon_socket_for_client(&cli, home.path()), Some(socket));
     }
 
     #[test]
@@ -1786,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_execute_socket_keeps_finite_stream_commands() {
+    fn daemon_execute_socket_keeps_hosted_stream_commands() {
         let home = Path::new("/tmp/wn-home");
         let socket = Path::new("/tmp/wnd.sock");
         let commands = [
@@ -1814,6 +1856,13 @@ mod tests {
                 transcript_hash: "dd".repeat(32),
                 chunk_count: 1,
                 text: vec!["hello".to_owned()],
+            },
+            StreamCommand::Watch {
+                group: "aa".repeat(32),
+                stream_id: None,
+                server_cert_der_hex: None,
+                insecure_local: true,
+                background: false,
             },
         ];
 
@@ -1848,11 +1897,12 @@ mod tests {
         std::fs::create_dir_all(socket.parent().expect("socket parent")).expect("socket dir");
         let listener = tokio::net::UnixListener::bind(socket).expect("bind daemon socket");
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept daemon request");
-            let mut request = Vec::new();
-            use tokio::io::AsyncReadExt;
+            let (stream, _) = listener.accept().await.expect("accept daemon request");
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            use tokio::io::AsyncBufReadExt;
             stream
-                .read_to_end(&mut request)
+                .read_line(&mut request)
                 .await
                 .expect("read daemon request");
             assert!(

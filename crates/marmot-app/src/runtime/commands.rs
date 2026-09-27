@@ -2215,7 +2215,7 @@ mod tests {
             let Some(AccountWorkerCommand::CatchUp { respond }) = received.recv().await else {
                 panic!("catch-up must reach the mutation's worker");
             };
-            respond.send(Ok(())).unwrap();
+            respond.send(Ok(crate::SyncSummary::default())).unwrap();
             assert!(received.recv().await.is_none(), "exactly one catch-up");
         };
         tokio::time::timeout(std::time::Duration::from_secs(1), async {

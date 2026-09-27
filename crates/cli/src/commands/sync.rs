@@ -1,6 +1,6 @@
 //! `sync` command namespace handler and output helpers.
 
-use marmot_app::{MarmotApp, ReceivedMessage, SyncFailure, SyncSummary};
+use marmot_app::{MarmotApp, MarmotAppRuntime, ReceivedMessage, SyncFailure, SyncSummary};
 use serde_json::{Value, json};
 
 use crate::{
@@ -21,6 +21,19 @@ pub(crate) async fn sync_command(
     Ok(CommandOutput {
         plain: sync_plain(&summary),
         json: sync_json(app, account, summary)?,
+    })
+}
+
+pub(crate) async fn sync_command_with_runtime(
+    runtime: &MarmotAppRuntime,
+    account: marmot_account::AccountSummary,
+) -> Result<CommandOutput, WnError> {
+    let app = runtime.app_handle();
+    app.status(&account.label)?;
+    let summary = runtime.sync_account(&account.account_id_hex).await?;
+    Ok(CommandOutput {
+        plain: sync_plain(&summary),
+        json: sync_json(&app, account, summary)?,
     })
 }
 

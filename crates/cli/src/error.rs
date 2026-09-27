@@ -636,6 +636,10 @@ fn app_error_json(err: &AppError) -> Value {
         return engine_error_json(engine_error);
     }
     match err {
+        AppError::RuntimeBusy => json!({
+            "code": "runtime_busy",
+            "message": err.to_string(),
+        }),
         AppError::AccountHome(err) => account_home_error_json(err),
         AppError::MissingKeyPackage(account) => json!({
             "code": "missing_key_package",
