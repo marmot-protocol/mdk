@@ -90,6 +90,7 @@ pub(crate) struct RouteSubmission {
     cursor: Option<[u8; 32]>,
     cursor_safe: bool,
     outcome: storage_sqlite::RecoveryComparisonOutcome,
+    certified: bool,
     #[cfg(test)]
     attempted: usize,
     #[cfg(test)]
@@ -467,69 +468,50 @@ impl AppClient {
         )
     }
 
-    /// The sole eligible automatic selection is the comparison and, when
-    /// present, its own IncrementalHistory obligation. The frozen grant is the
-    /// authority; an earlier pending-demand probe never decides this.
+    /// Every automatic grant runs its network wait off the worker, except
+    /// maintenance boundaries and explicit repair, which keep their own
+    /// executor. Per-pass route and endpoint caps still apply. The frozen grant
+    /// is the authority; an earlier pending-demand probe never decides this.
     pub(crate) fn comparison_offload_eligible(
         &self,
         grant: &AttemptGrant,
     ) -> Result<bool, AppError> {
-        if grant.comparison_revision.is_none()
-            || grant.inventory.len() > TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
-            || grant.comparison_plan.as_ref().is_none_or(|plan| {
-                plan.routes.len() > TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
-                    || plan.routes.iter().any(|route| {
-                        route.admitted_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                            || route.required_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                    })
-            })
-            || grant.inventory.iter().any(|route| match &route.work {
-                TransportReconciliationWork::Inbox(endpoints) => {
-                    endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                }
-                TransportReconciliationWork::Group(group) => {
-                    group.endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                }
-            })
-        {
-            return Ok(false);
-        }
         let Some(plan) = grant.plan() else {
             return Ok(false);
         };
-        if plan.len() > 1
-            || plan.iter().any(|item| {
-                item.cause != storage_sqlite::RecoveryCause::IncrementalHistory
-                    || item.scopes.iter().any(|scope| {
-                        scope.goal.admitted_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                            || scope.goal.required_endpoints.len()
-                                > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+        let within_cap = |required: usize, admitted: usize| {
+            required <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+                && admitted <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+        };
+        Ok(plan.iter().all(|obligation| {
+            !matches!(
+                obligation.cause,
+                storage_sqlite::RecoveryCause::Maintenance
+                    | storage_sqlite::RecoveryCause::ExplicitHistory
+            ) && obligation.scopes.iter().all(|scope| {
+                within_cap(
+                    scope.goal.required_endpoints.len(),
+                    scope.goal.admitted_endpoints.len(),
+                )
+            })
+        }) && grant.inventory.len() <= TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
+            && grant.inventory.iter().all(|route| match &route.work {
+                TransportReconciliationWork::Inbox(endpoints) => {
+                    endpoints.len() <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+                }
+                TransportReconciliationWork::Group(group) => {
+                    group.endpoints.len() <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+                }
+            })
+            && grant.comparison_plan.as_ref().is_none_or(|plan| {
+                plan.routes.len() <= TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
+                    && plan.routes.iter().all(|route| {
+                        within_cap(
+                            route.required_endpoints.len(),
+                            route.admitted_endpoints.len(),
+                        )
                     })
-            })
-        {
-            return Ok(false);
-        }
-        let selected = plan.iter().map(|item| item.id).collect::<Vec<_>>();
-        if selected.len() != grant.fence.obligations.len()
-            || !selected.iter().all(|id| {
-                grant
-                    .fence
-                    .obligations
-                    .iter()
-                    .any(|(candidate, _)| candidate == id)
-            })
-        {
-            return Ok(false);
-        }
-        let storage = self.app.account_storage(&self.state.label)?;
-        let pending = storage.pending_recovery_demands()?;
-        Ok(grant.fence.obligations.iter().all(|(id, revision)| {
-            pending.iter().any(|demand| {
-                demand.ticket.id == *id
-                    && demand.ticket.revision == *revision
-                    && demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory
-            })
-        }))
+            }))
     }
 
     pub(crate) async fn activate_comparison_grant(
@@ -563,7 +545,16 @@ impl AppClient {
         drop(self.transport_receipts()?);
         self.observe_recovery_route_policy()?;
         let current = storage.recovery_revision_fence()?;
-        let slot = storage.recovery_comparison()?;
+        let slot_stable = match grant.comparison_revision {
+            Some(revision) => {
+                let slot = storage.recovery_comparison()?;
+                slot.pending()
+                    && slot.revision == revision
+                    && slot.attempt_serial == grant.reservation.attempt_serial
+                    && slot.frozen_revision == slot.revision
+            }
+            None => true,
+        };
         let stable = current.loss_revision == grant.fence.loss_revision
             && current.route_revision == grant.fence.route_revision
             && current.inventory_revision == grant.fence.inventory_revision
@@ -572,10 +563,7 @@ impl AppClient {
                 .obligations
                 .iter()
                 .all(|selected| current.obligations.contains(selected))
-            && slot.pending()
-            && Some(slot.revision) == grant.comparison_revision
-            && slot.attempt_serial == grant.reservation.attempt_serial
-            && slot.frozen_revision == slot.revision
+            && slot_stable
             && self.adapter.account_subscription_attempt().await == Some(attempt);
         if !stable {
             // The network task never wrote to SQLCipher or the delivery queue.
@@ -612,13 +600,7 @@ impl AppClient {
         storage: &storage_sqlite::SqliteAccountStorage,
         route: ComparisonRouteResult,
         admission_deadline: tokio::time::Instant,
-    ) -> Result<
-        (
-            TransportReconciliationRoute,
-            storage_sqlite::RecoveryComparisonOutcome,
-        ),
-        AppError,
-    > {
+    ) -> Result<super::RouteComparison, AppError> {
         let submission = submit_reconciliation_route(
             &self.adapter,
             route,
@@ -634,13 +616,7 @@ impl AppClient {
         &self,
         storage: &storage_sqlite::SqliteAccountStorage,
         submission: RouteSubmission,
-    ) -> Result<
-        (
-            TransportReconciliationRoute,
-            storage_sqlite::RecoveryComparisonOutcome,
-        ),
-        AppError,
-    > {
+    ) -> Result<super::RouteComparison, AppError> {
         // A failed or timed-out queue step leaves an unqueued suffix whose
         // IDs cannot be mapped back to individual cursor positions.
         if submission.cursor_safe && submission.cursor != submission.initial_cursor {
@@ -649,7 +625,11 @@ impl AppClient {
                 submission.cursor,
             )?;
         }
-        Ok((submission.route, submission.outcome))
+        Ok(super::RouteComparison {
+            route: submission.route,
+            outcome: submission.outcome,
+            certified: submission.certified,
+        })
     }
 }
 
@@ -660,6 +640,7 @@ async fn submit_reconciliation_route(
     #[cfg(test)] witness: Option<&TestComparisonActivityWitness>,
 ) -> RouteSubmission {
     let mut cursor_safe = true;
+    let mut certified = false;
     #[cfg(test)]
     let mut attempted = 0usize;
     #[cfg(test)]
@@ -732,6 +713,7 @@ async fn submit_reconciliation_route(
                     }
                 }
             }
+            certified = submitted && super::route_comparison_certified(&summary);
             if !submitted || summary.relays_failed > 0 {
                 cursor_safe = submitted;
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure
@@ -746,6 +728,7 @@ async fn submit_reconciliation_route(
         cursor: route.cursor,
         cursor_safe,
         outcome,
+        certified,
         #[cfg(test)]
         attempted,
         #[cfg(test)]
@@ -1491,7 +1474,11 @@ mod tests {
         // The elapsed admission deadline meets the same genuinely pending
         // production send while the test holds only the router task. Tokio's
         // real timeout fires before that task is restarted.
-        let (route_key, outcome) = tokio::time::timeout(Duration::from_secs(1), admission)
+        let super::RouteComparison {
+            route: route_key,
+            outcome,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(1), admission)
             .await
             .expect("elapsed admission timeout fires on the real queue send")
             .unwrap();
@@ -1516,7 +1503,11 @@ mod tests {
                 None,
                 &mut counts,
                 &mut verdict,
-                vec![(route_key, outcome)],
+                vec![super::RouteComparison {
+                    route: route_key,
+                    outcome,
+                    certified: false,
+                }],
             ),
         )
         .await

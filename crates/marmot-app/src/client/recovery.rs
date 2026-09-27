@@ -158,6 +158,52 @@ pub(super) fn eligibility_after_observation(
     }
 }
 
+/// A stored scope whose certificates survive this grant's freeze: its goal is
+/// unchanged and every required endpoint is covered and admitted.
+fn scope_is_certified(
+    scope: &storage_sqlite::StoredRecoveryScope,
+    revision: u64,
+    fence: &storage_sqlite::RecoveryRevisionFence,
+) -> bool {
+    scope.obligation_revision == revision
+        && scope.route_revision == fence.route_revision
+        && scope.loss_revision == fence.loss_revision
+        && !scope.plan.required_endpoints.is_empty()
+        && scope.plan.required_endpoints.iter().all(|endpoint| {
+            scope.checkpoints.iter().any(|checkpoint| {
+                &checkpoint.endpoint == endpoint
+                    && checkpoint.outcome == storage_sqlite::RecoveryScopeOutcome::Covered
+                    && checkpoint.exhaustive
+                    && checkpoint.admission_complete
+            })
+        })
+}
+
+/// Comparison passes that certify nothing before an obligation parks. The
+/// retry ordinal counts reserved attempts since the last progress.
+const RECOVERY_PARK_AFTER_ATTEMPTS: u64 = 3;
+
+/// Comparison-owned recovery keeps retrying while passes certify new
+/// coverage. After several passes in a row without progress it parks until new
+/// evidence or an explicit repair, instead of retrying forever.
+pub(super) fn eligibility_after_comparison(
+    outcome: storage_sqlite::RecoveryScopeOutcome,
+    admission_refused: bool,
+    progressed: bool,
+    ordinal: u64,
+) -> storage_sqlite::RecoveryEligibility {
+    use storage_sqlite::{RecoveryEligibility as Eligibility, RecoveryScopeOutcome as Outcome};
+    if admission_refused {
+        Eligibility::WaitingCapacity
+    } else if matches!(outcome, Outcome::Unsupported | Outcome::Excluded) {
+        Eligibility::WaitingCapability
+    } else if !progressed && ordinal >= RECOVERY_PARK_AFTER_ATTEMPTS {
+        Eligibility::NeedsDeepRepair
+    } else {
+        Eligibility::Retry
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RecoveryRetryPolicy {
     pub(crate) base: Duration,
@@ -661,6 +707,20 @@ impl AccountRecoveryOwner {
             &admission.fence,
             admission.attempt,
             self.logical_now_ms(now)?,
+            duration_ms(self.policy.base)?,
+        )
+    }
+
+    /// A pass that certified new coverage resets pacing like admitted input.
+    pub(crate) fn observe_certified_progress(
+        &self,
+        storage: &SqliteAccountStorage,
+        grant: &AttemptGrant,
+    ) -> StorageResult<bool> {
+        storage.checkpoint_recovery_progress(
+            &grant.fence,
+            grant.reservation.attempt_serial,
+            self.logical_now_ms(Instant::now())?,
             duration_ms(self.policy.base)?,
         )
     }
@@ -1237,6 +1297,7 @@ impl AppClient {
             .subscription_rebuild_since(self.checkpointed_transport_timestamp)
             .map(|timestamp| timestamp.0);
         let mut goals = Vec::new();
+        let mut certified_scopes = std::collections::HashSet::new();
         let mut independent_broad_acquisition = false;
         for (id, revision) in &grant.fence.obligations {
             let demand = demands
@@ -1246,6 +1307,12 @@ impl AppClient {
                     StorageError::Serialization("selected recovery demand disappeared".into())
                 })?;
             let stored = storage.recovery_scope_snapshots(*id)?;
+            certified_scopes.extend(
+                stored
+                    .iter()
+                    .filter(|scope| scope_is_certified(scope, *revision, &grant.fence))
+                    .map(|scope| (*id, scope.plan.scope_id)),
+            );
             if !matches!(
                 demand.cause,
                 storage_sqlite::RecoveryCause::IncrementalHistory
@@ -1469,9 +1536,12 @@ impl AppClient {
             }
         }
         let (inventory, rotation_claim) = if grant.comparison_revision.is_some() {
-            self.freeze_recovery_inventory(&mut [([0; 16], comparison_goals.clone())])?
+            self.freeze_recovery_inventory(
+                &mut [([0; 16], comparison_goals.clone())],
+                &std::collections::HashSet::new(),
+            )?
         } else {
-            self.freeze_recovery_inventory(&mut goals)?
+            self.freeze_recovery_inventory(&mut goals, &certified_scopes)?
         };
         grant.rotation_claim = rotation_claim;
         if grant.comparison_revision.is_some() {
@@ -1493,7 +1563,9 @@ impl AppClient {
             routes.sort_by_key(|r| r.scope_id);
             grant.comparison_plan = Some(storage_sqlite::RecoveryComparisonPlan {
                 fence: grant.fence.clone(),
-                live_since_seconds: if independent_broad_acquisition {
+                // Automatic history is acquired by comparison, never by an
+                // unfloored replay. Only an explicit caller keeps a wider pass.
+                live_since_seconds: if independent_broad_acquisition && explicit.is_some() {
                     goals
                         .iter()
                         .filter(|(id, _)| {

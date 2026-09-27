@@ -703,6 +703,14 @@ impl NostrSdkRelayClient {
         for (endpoint, result) in outcomes {
             match result {
                 Some(Ok(summary)) => {
+                    // The relay compares at most the filter limit. A matching
+                    // set that reaches it may hide older remote events, so the
+                    // endpoint cannot vouch for the whole window.
+                    let relay_set =
+                        items.len().saturating_sub(summary.local.len()) + summary.remote.len();
+                    if relay_set >= SDK_RECONCILIATION_SET_LIMIT {
+                        failed_endpoints.insert(endpoint.clone());
+                    }
                     remote.extend(summary.remote.iter().copied());
                     remote_by_endpoint.insert(endpoint, summary.remote);
                 }

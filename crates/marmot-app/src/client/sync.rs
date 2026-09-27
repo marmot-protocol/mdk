@@ -767,6 +767,25 @@ struct DeliveryIngest {
     refused_group: Option<cgka_traits::GroupId>,
 }
 
+/// One compared route: its settlement outcome, and whether the comparison
+/// certifies it. A route is certified only when every endpoint finished the
+/// comparison without truncation and every missing event it found was handed
+/// to admission.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RouteComparison {
+    pub(crate) route: TransportReconciliationRoute,
+    pub(crate) outcome: storage_sqlite::RecoveryComparisonOutcome,
+    pub(crate) certified: bool,
+}
+
+/// Every physical endpoint counts as exactly one success or failure, so no
+/// failure and at least one success means every endpoint finished.
+pub(crate) fn route_comparison_certified(
+    summary: &transport_nostr_adapter::NostrReconciliationSummary,
+) -> bool {
+    summary.relays_failed == 0 && summary.relays_succeeded > 0
+}
+
 /// What one drain loop saw on the wire.
 ///
 /// `deliveries` counts receives the drain ingested; `skipped` counts those it
@@ -1217,6 +1236,7 @@ impl AppClient {
     pub(super) fn freeze_recovery_inventory(
         &mut self,
         goals: &mut [([u8; 16], Vec<storage_sqlite::RecoveryScopePlan>)],
+        certified: &HashSet<([u8; 16], u64)>,
     ) -> Result<
         (
             Vec<super::recovery::FrozenRecoveryInventory>,
@@ -1226,7 +1246,12 @@ impl AppClient {
     > {
         let storage = self.app.account_storage(&self.state.label)?;
         let mut work = Vec::new();
-        for scope in goals.iter().flat_map(|(_, scopes)| scopes) {
+        // Certified scopes keep their coverage; passes rotate to the rest.
+        for scope in goals.iter().flat_map(|(id, scopes)| {
+            scopes
+                .iter()
+                .filter(move |scope| !certified.contains(&(*id, scope.scope_id)))
+        }) {
             if scope.admitted_endpoints.is_empty() {
                 continue;
             }
@@ -1311,13 +1336,7 @@ impl AppClient {
     async fn reconcile_transport_history(
         &mut self,
         frozen: &[super::recovery::FrozenRecoveryInventory],
-    ) -> Result<
-        Vec<(
-            TransportReconciliationRoute,
-            storage_sqlite::RecoveryComparisonOutcome,
-        )>,
-        AppError,
-    > {
+    ) -> Result<Vec<RouteComparison>, AppError> {
         use storage_sqlite::RecoveryComparisonOutcome as Outcome;
         let deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
         let mut outcomes = Vec::new();
@@ -1334,7 +1353,11 @@ impl AppClient {
             if tokio::time::Instant::now() >= deadline {
                 // Never turn the route budget into an unbounded sweep. This
                 // unattempted route retains coverage debt, not a claimed success.
-                outcomes.push((inventory.route.clone(), Outcome::ServicedPartial));
+                outcomes.push(RouteComparison {
+                    route: inventory.route.clone(),
+                    outcome: Outcome::ServicedPartial,
+                    certified: false,
+                });
                 continue;
             }
             attempted_routes += 1;
@@ -1412,12 +1435,14 @@ impl AppClient {
                 Ok(Some(summary))
             })
             .await;
+            let mut certified = false;
             let outcome = match result {
                 Ok(Ok(Some(summary))) => {
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
                     remote_items += summary.remote_items;
                     received_items += summary.received_items;
+                    certified = route_comparison_certified(&summary);
                     if summary.relays_failed > 0 {
                         Outcome::TransientFailure
                     } else {
@@ -1436,7 +1461,11 @@ impl AppClient {
                     Outcome::TransientFailure
                 }
             };
-            outcomes.push((inventory.route.clone(), outcome));
+            outcomes.push(RouteComparison {
+                route: inventory.route.clone(),
+                outcome,
+                certified,
+            });
         }
 
         tracing::info!(
@@ -4780,7 +4809,13 @@ impl AppClient {
                     .as_ref()
                     .and_then(|plan| plan.live_since_seconds)
                     .map(cgka_traits::transport::Timestamp)
-            } else if history.peek().is_none() {
+            } else if history.peek().is_none()
+                || !obligations.iter().any(|obligation| {
+                    obligation.cause == storage_sqlite::RecoveryCause::ExplicitHistory
+                })
+            {
+                // Automatic history is acquired by comparison, so activation
+                // only restores the live tail. Explicit repair may widen it.
                 self.subscription_rebuild_since().map_err(|error| {
                     ClassifiedSyncFailure::at_stage(
                         SyncSummary::default(),
@@ -4899,10 +4934,7 @@ impl AppClient {
         repair: Option<&FullHistoryRepairControl<'_>>,
         counts: &mut DrainCounts,
         drain_verdict: &mut Option<DrainVerdict>,
-        comparison_outcomes: Vec<(
-            TransportReconciliationRoute,
-            storage_sqlite::RecoveryComparisonOutcome,
-        )>,
+        comparison_outcomes: Vec<RouteComparison>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let quiet_prerequisites =
             grant
@@ -4946,10 +4978,7 @@ impl AppClient {
         grant: &AttemptGrant,
         counts: &mut DrainCounts,
         drain_verdict: &mut Option<DrainVerdict>,
-        comparison_outcomes: Vec<(
-            TransportReconciliationRoute,
-            storage_sqlite::RecoveryComparisonOutcome,
-        )>,
+        comparison_outcomes: Vec<RouteComparison>,
         mut summary: SyncSummary,
         verdict: DrainVerdict,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
@@ -5008,8 +5037,8 @@ impl AppClient {
                         };
                         let observed = comparison_outcomes
                             .iter()
-                            .find(|(candidate, _)| *candidate == route)
-                            .map_or(Comparison::ServicedPartial, |(_, outcome)| *outcome);
+                            .find(|compared| compared.route == route)
+                            .map_or(Comparison::ServicedPartial, |compared| compared.outcome);
                         let observed = if counts.refused > 0 && observed != Comparison::Unsupported
                         {
                             Comparison::TransientFailure
@@ -5029,108 +5058,136 @@ impl AppClient {
                     unsupported,
                 )?;
             }
+            let drained = matches!(
+                verdict,
+                DrainVerdict::Complete | DrainVerdict::CoverageUnproven
+            );
+            let mut certified_any = false;
             for obligation in grant.plan().expect("validated executor grant") {
                 // A selected group can lack any executable route even though
                 // another obligation made the account ready. Preserve that
                 // debt until capability/policy changes instead of probing it
                 // forever on unrelated account readiness.
-                let outcome = if obligation
+                let unroutable = obligation
                     .scopes
                     .iter()
-                    .all(|scope| scope.goal.admitted_endpoints.is_empty())
-                {
-                    if obligation
-                        .scopes
-                        .iter()
-                        .all(|scope| scope.goal.route_kind == 2)
-                    {
-                        storage_sqlite::RecoveryScopeOutcome::Unsupported
-                    } else {
-                        storage_sqlite::RecoveryScopeOutcome::Excluded
-                    }
-                } else {
+                    .all(|scope| scope.goal.admitted_endpoints.is_empty());
+                let outcome = if !unroutable {
                     outcome
-                };
-                let eligibility = super::recovery::eligibility_after_observation(
-                    obligation.cause,
-                    outcome,
-                    matches!(
-                        verdict,
-                        DrainVerdict::Complete
-                            | DrainVerdict::RepairDeadline
-                            | DrainVerdict::NovelProgressQuantumYield
-                            | DrainVerdict::NoProgressQuantumYield
-                    ),
-                    obligation
-                        .group_id
-                        .as_ref()
-                        .map_or(counts.refused > 0, |group| {
-                            counts.refused_groups.contains(group)
-                        }),
-                );
-                let checkpoints = obligation
+                } else if obligation
                     .scopes
                     .iter()
-                    .map(|scope| {
-                        let route = match (scope.goal.route_kind, scope.goal.transport_group_id) {
-                            (0, _) => Some(TransportReconciliationRoute::Inbox),
-                            (1, Some(id)) => Some(TransportReconciliationRoute::Group(id)),
-                            _ => None,
-                        };
-                        let retained_known_event = match (route, scope.goal.known_event_id) {
-                            (Some(route), Some(event)) => storage.retained_recovery_event(
-                                &route,
-                                &event,
-                                scope.goal.since_seconds,
-                                scope.goal.until_seconds,
-                            )?,
-                            _ => false,
-                        };
-                        Ok::<_, cgka_traits::storage::StorageError>(
-                            storage_sqlite::RecoveryScopeCheckpoint {
-                                token: scope.token.clone(),
-                                retained_known_event,
-                                endpoints: {
-                                    let checkpoints = scope
-                                        .goal
-                                        .required_endpoints
-                                        .iter()
-                                        .map(|endpoint| {
-                                            storage_sqlite::RecoveryEndpointCheckpoint {
-                                                endpoint: endpoint.clone(),
-                                                outcome: if scope
-                                                    .goal
-                                                    .admitted_endpoints
-                                                    .contains(endpoint)
-                                                {
-                                                    outcome
-                                                } else {
-                                                    storage_sqlite::RecoveryScopeOutcome::Excluded
-                                                },
-                                                exhaustive: false,
-                                                admission_complete: false,
-                                                first_boundary: false,
-                                            }
-                                        })
-                                        .collect();
-                                    // Synthetic tests supply independent finite-inventory certificates;
-                                    // ordinary EOSE never manufactures them. Refusal/unfinished drains
-                                    // cannot be promoted by this fixture either.
-                                    #[cfg(test)]
-                                    let checkpoints = if verdict == DrainVerdict::Complete
-                                        && counts.refused == 0
-                                    {
-                                        self.test_recovery_evidence
-                                            .map_or(checkpoints, |evidence| evidence(&scope.goal))
-                                    } else {
-                                        checkpoints
-                                    };
-                                    checkpoints
+                    .all(|scope| scope.goal.route_kind == 2)
+                {
+                    storage_sqlite::RecoveryScopeOutcome::Unsupported
+                } else {
+                    storage_sqlite::RecoveryScopeOutcome::Excluded
+                };
+                let refused = obligation
+                    .group_id
+                    .as_ref()
+                    .map_or(counts.refused > 0, |group| {
+                        counts.refused_groups.contains(group)
+                    });
+                // Maintenance boundaries and explicit repair keep their own
+                // evidence. Every other cause completes on comparison
+                // certificates over the retained-inventory window.
+                let comparison_owned = !matches!(
+                    obligation.cause,
+                    storage_sqlite::RecoveryCause::Maintenance
+                        | storage_sqlite::RecoveryCause::ExplicitHistory
+                );
+                let mut certified = false;
+                let mut checkpoints = Vec::with_capacity(obligation.scopes.len());
+                for scope in &obligation.scopes {
+                    let route = match (scope.goal.route_kind, scope.goal.transport_group_id) {
+                        (0, _) => Some(TransportReconciliationRoute::Inbox),
+                        (1, Some(id)) => Some(TransportReconciliationRoute::Group(id)),
+                        _ => None,
+                    };
+                    let compared = route
+                        .as_ref()
+                        .and_then(|route| comparison_outcomes.iter().find(|c| &c.route == route));
+                    // A scope this pass did not compare keeps the
+                    // certificates it already has.
+                    if comparison_owned
+                        && !unroutable
+                        && compared.is_none()
+                        && scope.goal.known_event_id.is_none()
+                    {
+                        continue;
+                    }
+                    let scope_certified = comparison_owned
+                        && drained
+                        && !refused
+                        && compared.is_some_and(|compared| compared.certified);
+                    certified |= scope_certified;
+                    let retained_known_event = match (&route, scope.goal.known_event_id) {
+                        (Some(route), Some(event)) => storage.retained_recovery_event(
+                            route,
+                            &event,
+                            scope.goal.since_seconds,
+                            scope.goal.until_seconds,
+                        )?,
+                        _ => false,
+                    };
+                    let endpoints = scope
+                        .goal
+                        .required_endpoints
+                        .iter()
+                        .map(|endpoint| {
+                            let admitted = scope.goal.admitted_endpoints.contains(endpoint);
+                            storage_sqlite::RecoveryEndpointCheckpoint {
+                                endpoint: endpoint.clone(),
+                                outcome: match (admitted, scope_certified) {
+                                    (false, _) => storage_sqlite::RecoveryScopeOutcome::Excluded,
+                                    (true, true) => storage_sqlite::RecoveryScopeOutcome::Covered,
+                                    (true, false) => outcome,
                                 },
-                            },
-                        )
-                    })
-                    .collect::<cgka_traits::storage::StorageResult<Vec<_>>>()?;
+                                exhaustive: admitted && scope_certified,
+                                admission_complete: admitted && scope_certified,
+                                first_boundary: false,
+                            }
+                        })
+                        .collect();
+                    // Synthetic tests supply independent finite-inventory certificates;
+                    // ordinary EOSE never manufactures them. Refusal/unfinished drains
+                    // cannot be promoted by this fixture either.
+                    #[cfg(test)]
+                    let endpoints = if verdict == DrainVerdict::Complete && counts.refused == 0 {
+                        self.test_recovery_evidence
+                            .map_or(endpoints, |evidence| evidence(&scope.goal))
+                    } else {
+                        endpoints
+                    };
+                    checkpoints.push(storage_sqlite::RecoveryScopeCheckpoint {
+                        token: scope.token.clone(),
+                        retained_known_event,
+                        endpoints,
+                    });
+                }
+                certified_any |= certified;
+                let eligibility = if comparison_owned {
+                    super::recovery::eligibility_after_comparison(
+                        outcome,
+                        refused,
+                        certified,
+                        grant.reservation.ordinal,
+                    )
+                } else {
+                    super::recovery::eligibility_after_observation(
+                        obligation.cause,
+                        outcome,
+                        matches!(
+                            verdict,
+                            DrainVerdict::Complete
+                                | DrainVerdict::RepairDeadline
+                                | DrainVerdict::NovelProgressQuantumYield
+                                | DrainVerdict::NoProgressQuantumYield
+                        ),
+                        refused,
+                    )
+                };
                 storage.checkpoint_recovery_obligation(
                     &grant.fence,
                     grant.reservation.attempt_serial,
@@ -5138,6 +5195,11 @@ impl AppClient {
                     &checkpoints,
                     eligibility,
                 )?;
+            }
+            if certified_any {
+                // New coverage is progress: the next pass runs at the base delay.
+                self.recovery_owner
+                    .observe_certified_progress(&storage, &grant)?;
             }
             Ok(())
         })();
