@@ -644,3 +644,58 @@ async fn the_in_place_job_holds_its_credit_through_admission() {
     );
     assert_eq!(recovery_credits::available_credits(&pool), 2);
 }
+
+/// A route the pass never compared, here a group whose only relay recovery
+/// may not contact, keeps the explicit request open even while every compared
+/// route certifies: no window was searched there at all.
+#[tokio::test]
+async fn an_uncompared_scope_keeps_the_explicit_request_open() {
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("unreachable route", &[]).await.unwrap();
+    // Model a route whose only relay the host-safety rule refuses, so the
+    // pass freezes no inventory for it and never compares it.
+    let group_hex = hex::encode(group.as_slice());
+    client
+        .state
+        .groups
+        .iter_mut()
+        .find(|projection| projection.group_id_hex == group_hex)
+        .unwrap()
+        .nostr_routing
+        .relays = vec!["wss://127.0.0.1:9".into()];
+    client.refresh_sync_routes().unwrap();
+    let routing = client.routing.snapshot();
+    assert!(
+        routing.group_routes.iter().any(|route| {
+            client
+                .adapter
+                .recovery_admitted_endpoints(&route.endpoints)
+                .is_empty()
+        }),
+        "the group's route has no relay recovery may contact"
+    );
+    assert!(client.recovery_endpoints_admitted(), "the inbox route does");
+    // Every route the pass compares certifies.
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(|_| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )))
+    }));
+    let failure = client.repair_full_history().await.unwrap_err();
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((
+            crate::FullHistoryRepairIncompleteReason::CoverageUnproven,
+            false
+        ))
+    );
+    assert!(
+        explicit_pending(&app),
+        "the uncompared route keeps the explicit request open"
+    );
+}

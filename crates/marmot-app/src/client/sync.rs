@@ -4103,6 +4103,20 @@ impl AppClient {
                         .as_ref()
                         .and_then(|route| comparison_outcomes.iter().find(|c| &c.route == route));
                     fetched |= compared.is_some_and(|compared| compared.fetched > 0);
+                    // Every explicit scope counts, compared or not: one this
+                    // pass skipped, such as a route with no admitted relay,
+                    // keeps the request open.
+                    if obligation.cause == storage_sqlite::RecoveryCause::ExplicitHistory {
+                        explicit_scopes += 1;
+                        explicit_window_certified &= !refused
+                            && compared.is_some_and(|compared| compared.certified)
+                            && route.as_ref().is_some_and(|route| {
+                                grant.inventory.iter().any(|window| {
+                                    &window.route == route
+                                        && scope.goal.until_seconds <= window.until
+                                })
+                            });
+                    }
                     // A scope this pass did not compare, or already certified
                     // for this goal, keeps the certificates it has.
                     if comparison_owned
@@ -4124,17 +4138,6 @@ impl AppClient {
                     // certifies; a certified window only names what is left.
                     let window_bounded =
                         obligation.cause == storage_sqlite::RecoveryCause::IncrementalHistory;
-                    if obligation.cause == storage_sqlite::RecoveryCause::ExplicitHistory {
-                        explicit_scopes += 1;
-                        explicit_window_certified &= !refused
-                            && compared.is_some_and(|compared| compared.certified)
-                            && route.as_ref().is_some_and(|route| {
-                                grant.inventory.iter().any(|window| {
-                                    &window.route == route
-                                        && scope.goal.until_seconds <= window.until
-                                })
-                            });
-                    }
                     let covers_goal = route.as_ref().is_some_and(|route| {
                         grant.inventory.iter().any(|window| {
                             &window.route == route
