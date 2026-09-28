@@ -92,14 +92,19 @@ const SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES: usize = 5 * 1024 * 1024;
 /// inventory. A relay set that fills it may be truncated; a set within the
 /// ceiling, including one sitting exactly on it, is the whole window.
 const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384 + 1;
-/// How many times the lag repair tries to queue a re-issued REQ behind its
-/// CLOSE, first waiting [`SDK_REISSUE_REQ_RETRY_DELAY`] and doubling. Each
-/// frame is queued on its own, so a relay's outbound queue can fill between
-/// them. A queue frees a slot as soon as its sender takes the next frame, so
-/// one still full after the last retry, about 375 ms, belongs to a stalled
-/// connection.
-const SDK_REISSUE_REQ_ATTEMPTS: u32 = 5;
-const SDK_REISSUE_REQ_RETRY_DELAY: Duration = Duration::from_millis(25);
+/// First pause before the lag repair retries a re-issued REQ that did not
+/// queue behind its CLOSE, doubling up to [`SDK_REISSUE_REQ_MAX_RETRY_DELAY`].
+/// Each frame is queued on its own, so a relay's outbound queue can fill
+/// between them, and a live sender frees a slot with every frame it takes.
+const SDK_REISSUE_REQ_RETRY_DELAY: Duration = Duration::from_millis(10);
+const SDK_REISSUE_REQ_MAX_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// How long the lag repair keeps retrying such a REQ on the connection its
+/// CLOSE was queued for. The pinned SDK bounds each frame write and the socket
+/// close at 10 s (`WEBSOCKET_TX_TIMEOUT`), so a sender stuck on a write ends
+/// that connection within about 20 s. The repair holds the adapter's
+/// subscription lifecycle lock while it waits, so this caps the wait even if
+/// that bound stopped holding.
+const SDK_REISSUE_REQ_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Account-owned advisory replay progress, independent of admitted event inventory.
 /// The host must preserve this across routine subscription rebuilds and serialize
@@ -435,6 +440,9 @@ pub struct NostrSdkRelayClient {
     /// outbound queue would.
     #[cfg(test)]
     reissue_req_failures: Arc<AtomicUsize>,
+    /// Runs on the relay right after a re-issue's CLOSE is queued.
+    #[cfg(test)]
+    after_reissue_close: Arc<StdMutex<Option<ReissueCloseHook>>>,
     /// Per-account, per-relay subscription-registration outcomes accumulated
     /// since that account's last
     /// [`take_subscription_registrations`](Self::take_subscription_registrations)
@@ -550,6 +558,8 @@ impl NostrSdkRelayClient {
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
             #[cfg(test)]
             reissue_req_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            after_reissue_close: Arc::default(),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1422,17 +1432,24 @@ impl NostrSdkRelayClient {
         }
     }
 
-    /// Queue a re-issued REQ behind the CLOSE already queued for it, retrying
-    /// while the relay stays connected. A retry still queues behind that
-    /// CLOSE. False when it never queued.
+    /// Queue a re-issued REQ behind the CLOSE already queued for it on
+    /// `connection`, retrying while the relay stays on that connection. False
+    /// when it never queued there. After a reconnect the SDK sends the REQ
+    /// again itself, from its registry and behind that CLOSE, so a REQ of ours
+    /// then would repeat a live id.
     async fn queue_reissued_req(
         &self,
         relay: &Relay,
+        connection: RelayConnection,
         id: &SubscriptionId,
         filters: Vec<Filter>,
     ) -> bool {
+        let deadline = tokio::time::Instant::now() + SDK_REISSUE_REQ_DEADLINE;
         let mut delay = SDK_REISSUE_REQ_RETRY_DELAY;
-        for attempt in 1..=SDK_REISSUE_REQ_ATTEMPTS {
+        loop {
+            if RelayConnection::current(relay) != Some(connection) {
+                return false;
+            }
             #[cfg(test)]
             let refused = self
                 .reissue_req_failures
@@ -1450,13 +1467,17 @@ impl NostrSdkRelayClient {
             {
                 return true;
             }
-            if attempt == SDK_REISSUE_REQ_ATTEMPTS || !relay.status().is_connected() {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    target: "transport_nostr_adapter::sdk_client",
+                    method = "reissue_subscription",
+                    "re-issued REQ found no room on its connection before the deadline"
+                );
                 return false;
             }
             tokio::time::sleep(delay).await;
-            delay = delay.saturating_mul(2);
+            delay = delay.saturating_mul(2).min(SDK_REISSUE_REQ_MAX_RETRY_DELAY);
         }
-        false
     }
 
     /// Issue one planned REQ on this client and record where it registered.
@@ -2504,11 +2525,14 @@ impl NostrRelayClient for NostrSdkRelayClient {
     /// it sends the REQ again itself when it reconnects, and reports EOSE for
     /// it then.
     ///
-    /// Each frame is queued on its own, and the queue can fill between them.
-    /// A REQ that does not queue behind its CLOSE is retried briefly, and
-    /// still queues behind it. A relay that stays connected without it is
-    /// reconnected, so the SDK restores every REQ its registry holds. That
-    /// relay counts as failed.
+    /// Each frame is queued on its own, and the queue can fill between them. A
+    /// REQ that does not queue behind its CLOSE is retried until it does, on
+    /// the connection the CLOSE was queued for. A live sender frees a slot with
+    /// every frame it takes. If that connection ends first, the relay counts as
+    /// failed, and its reconnect sends the REQ again from the registry, behind
+    /// the CLOSE. Forcing a reconnect would not help: the SDK re-sends
+    /// registered REQs before its sender drains the queue, so a still-full
+    /// queue refuses them too.
     async fn reissue_subscription(
         &self,
         account_id: &MemberId,
@@ -2549,6 +2573,11 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 }
                 floors.open(&id, req_since(&filters));
             }
+            // The CLOSE and the REQ belong to the connection current now. A
+            // later reconnect queues its own REQ behind this CLOSE.
+            let Some(connection) = RelayConnection::current(&relay) else {
+                continue;
+            };
             // An unsent CLOSE changed nothing, so the REQ must not follow it.
             if relay
                 .send_msg(ClientMessage::close(id.clone()))
@@ -2557,17 +2586,26 @@ impl NostrRelayClient for NostrSdkRelayClient {
             {
                 continue;
             }
-            if self.queue_reissued_req(&relay, &id, filters).await {
-                reissue.reissued += 1;
-                continue;
+            #[cfg(test)]
+            {
+                let hook = self
+                    .after_reissue_close
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Some(hook) = hook {
+                    hook(relay.clone()).await;
+                }
             }
-            reissue.failed += 1;
-            // The relay has the REQ closed. One still connected could stay so
-            // indefinitely: reconnect it, and the SDK re-sends every REQ its
-            // registry holds. One that is not reconnects on its own.
-            if relay.status().is_connected() {
-                relay.disconnect();
-                relay.connect();
+            if self
+                .queue_reissued_req(&relay, connection, &id, filters)
+                .await
+            {
+                reissue.reissued += 1;
+            } else {
+                // The relay has the REQ closed until it reconnects; its
+                // registry then restores it.
+                reissue.failed += 1;
             }
         }
         tracing::debug!(
@@ -2887,6 +2925,33 @@ fn parse_endpoints(
         })
         .collect()
 }
+
+/// The connection a relay is on, to tell whether a frame queued now still goes
+/// out on the connection an earlier frame was queued for. A reconnect counts
+/// its attempt before the relay reports itself connected again, so reading
+/// the status first catches every reconnect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RelayConnection {
+    attempts: usize,
+    successes: usize,
+}
+
+impl RelayConnection {
+    /// The relay's current connection, or `None` while it is not connected.
+    fn current(relay: &Relay) -> Option<Self> {
+        if !relay.status().is_connected() {
+            return None;
+        }
+        let stats = relay.stats();
+        Some(Self {
+            attempts: stats.attempts(),
+            successes: stats.success(),
+        })
+    }
+}
+
+#[cfg(test)]
+type ReissueCloseHook = Arc<dyn Fn(Relay) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// The `since` floor a REQ's filters put on the events it can deliver: the
 /// lowest among them, or `None` when any filter has none.
@@ -3795,31 +3860,54 @@ mod tests {
         relay.shutdown();
     }
 
+    /// A scripted relay. `log` holds each REQ, CLOSE and refusal it handled,
+    /// with its connection number, except frames whose id starts with
+    /// `filler`. Notifying `drop_connection` closes the current connection,
+    /// and while `paused` holds true the relay stops reading, so the client's
+    /// socket backs up.
+    struct ScriptedRelay {
+        url: String,
+        log: Arc<Mutex<Vec<String>>>,
+        drop_connection: Arc<tokio::sync::Notify>,
+        paused: watch::Sender<bool>,
+    }
+
     /// A relay that holds one subscription per id on each connection and
     /// refuses a REQ whose id is still live with `CLOSED duplicate:`, keeping
     /// the live one, where NIP-01 says to replace it. It answers every other
-    /// REQ with EOSE, and logs each REQ, CLOSE and refusal with its connection
-    /// number. Notifying the returned handle closes the current connection.
-    async fn duplicate_refusing_relay()
-    -> (String, Arc<Mutex<Vec<String>>>, Arc<tokio::sync::Notify>) {
+    /// REQ with EOSE.
+    async fn duplicate_refusing_relay() -> ScriptedRelay {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
         let drop_connection = Arc::new(tokio::sync::Notify::new());
+        let (paused, paused_rx) = watch::channel(false);
         let (server_log, server_drop) = (log.clone(), drop_connection.clone());
         tokio::spawn(async move {
             let mut connection = 0;
             while let Ok((stream, _)) = listener.accept().await {
                 connection += 1;
                 let (log, drop_connection) = (server_log.clone(), server_drop.clone());
+                let mut paused = paused_rx.clone();
                 tokio::spawn(async move {
                     let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
                         return;
                     };
                     let mut live = HashSet::new();
                     loop {
+                        while *paused.borrow_and_update() {
+                            if paused.changed().await.is_err() {
+                                return;
+                            }
+                        }
                         let message = tokio::select! {
                             () = drop_connection.notified() => return,
+                            changed = paused.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
                             message = websocket.next() => message,
                         };
                         let Some(Ok(message)) = message else {
@@ -3837,6 +3925,9 @@ mod tests {
                         ) else {
                             continue;
                         };
+                        if id.starts_with("filler") {
+                            continue;
+                        }
                         log.lock().await.push(format!("{connection} {verb} {id}"));
                         let reply = match verb {
                             "REQ" if live.insert(id.to_owned()) => {
@@ -3859,7 +3950,48 @@ mod tests {
                 });
             }
         });
-        (format!("ws://{addr}"), log, drop_connection)
+        ScriptedRelay {
+            url: format!("ws://{addr}"),
+            log,
+            drop_connection,
+            paused,
+        }
+    }
+
+    /// Stall a relay connection's sender and fill its outbound queue behind it,
+    /// as happens when a relay stops reading and the socket buffers fill: large
+    /// frames until the sender blocks on a write, then small ones until the
+    /// queue refuses more.
+    async fn saturate_outbound_queue(relay: &Relay) {
+        let large = SubscriptionId::new(format!("filler-{}", "x".repeat(64 * 1024)));
+        let mut stalled = false;
+        for _ in 0..2_000 {
+            if relay
+                .send_msg(ClientMessage::close(large.clone()))
+                .wait_until_sent(Duration::from_millis(200))
+                .await
+                .is_err()
+            {
+                stalled = true;
+                break;
+            }
+        }
+        assert!(
+            stalled,
+            "the sender blocks once the socket buffers are full"
+        );
+        for index in 0..10_000 {
+            if relay
+                .send_msg(ClientMessage::close(SubscriptionId::new(format!(
+                    "filler-{index}"
+                ))))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        panic!("the outbound queue never filled");
     }
 
     /// One account's group REQ, floored at `since` 2,000, live on a scripted
@@ -3921,6 +4053,20 @@ mod tests {
                 .unwrap()
         }
 
+        fn spawn_reissue(&self) -> JoinHandle<SubscriptionReissue> {
+            let (root, account_id, wire_id, endpoints) = (
+                self.root.clone(),
+                self.account_id.clone(),
+                self.wire_id.clone(),
+                self.endpoints.clone(),
+            );
+            tokio::spawn(async move {
+                root.reissue_subscription(&account_id, &wire_id, &endpoints)
+                    .await
+                    .unwrap()
+            })
+        }
+
         async fn relay(&self) -> Relay {
             self.account
                 .client()
@@ -3964,8 +4110,9 @@ mod tests {
     /// with EOSE instead, and the SDK still restores the REQ on reconnect.
     #[tokio::test]
     async fn reissue_keeps_the_req_on_a_relay_that_refuses_repeated_ids() {
-        let (url, log, drop_connection) = duplicate_refusing_relay().await;
-        let mut req = ScriptedGroupReq::open(&url).await;
+        let relay = duplicate_refusing_relay().await;
+        let log = relay.log.clone();
+        let mut req = ScriptedGroupReq::open(&relay.url).await;
 
         assert_eq!(
             req.reissue().await,
@@ -3987,7 +4134,7 @@ mod tests {
         let filters = req.registered_filters().await;
 
         // The registry restores the REQ on the SDK's next reconnect.
-        drop_connection.notify_one();
+        relay.drop_connection.notify_one();
         wait_for_entry(
             &log,
             &req.entry(2, "REQ"),
@@ -3997,8 +4144,8 @@ mod tests {
 
         // The hazard: the same REQ repeated without a CLOSE is refused, and the
         // SDK drops it from the registry.
-        let relay = req.relay().await;
-        relay
+        let sdk_relay = req.relay().await;
+        sdk_relay
             .send_msg(ClientMessage::req(req.id.clone(), filters))
             .await
             .unwrap();
@@ -4019,23 +4166,48 @@ mod tests {
         .expect("the relay refuses the repeated id");
         assert!(log.lock().await.contains(&req.entry(2, "CLOSED")));
         assert!(
-            relay.subscription(&req.id).await.is_none(),
+            sdk_relay.subscription(&req.id).await.is_none(),
             "a refused repeat drops the REQ from the SDK registry"
         );
         req.root.shutdown_accounts().await;
     }
 
     /// Each frame is queued on its own, so a REQ can fail to queue behind the
-    /// CLOSE already queued for it. A brief retry still queues it behind that
-    /// CLOSE, and the relay answers it on the same connection.
+    /// CLOSE already queued for it. Here the relay stops reading, the sender
+    /// blocks on a full socket and the queue fills for real, so a reconnect
+    /// would not get the REQ out either. The re-issue waits on the same
+    /// connection, and the REQ goes out behind its CLOSE once a slot frees.
     #[tokio::test]
-    async fn reissue_retries_a_req_that_did_not_queue_behind_its_close() {
-        let (url, log, _drop_connection) = duplicate_refusing_relay().await;
-        let mut req = ScriptedGroupReq::open(&url).await;
-        req.account.reissue_req_failures.store(2, Ordering::SeqCst);
+    async fn reissue_waits_on_its_connection_for_a_full_queue_to_free_a_slot() {
+        let relay = duplicate_refusing_relay().await;
+        let mut req = ScriptedGroupReq::open(&relay.url).await;
+        let saturated = Arc::new(tokio::sync::Notify::new());
+        let hook_saturated = saturated.clone();
+        *req.account.after_reissue_close.lock().unwrap() =
+            Some(Arc::new(move |sdk_relay: Relay| {
+                let saturated = hook_saturated.clone();
+                Box::pin(async move {
+                    saturate_outbound_queue(&sdk_relay).await;
+                    saturated.notify_one();
+                })
+            }));
+        relay.paused.send_replace(true);
 
+        let reissue = req.spawn_reissue();
+        timeout(Duration::from_secs(10), saturated.notified())
+            .await
+            .expect("the outbound queue saturates behind the CLOSE");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !reissue.is_finished(),
+            "the REQ waits for a slot on the connection its CLOSE was queued for"
+        );
+        relay.paused.send_replace(false);
         assert_eq!(
-            req.reissue().await,
+            timeout(Duration::from_secs(10), reissue)
+                .await
+                .expect("the REQ queues once a slot frees")
+                .unwrap(),
             SubscriptionReissue {
                 reissued: 1,
                 failed: 0,
@@ -4043,46 +4215,63 @@ mod tests {
         );
         replay_until_eose(&mut req.notifications, &req.id).await;
         assert_eq!(
-            *log.lock().await,
+            *relay.log.lock().await,
             vec![
                 req.entry(1, "REQ"),
                 req.entry(1, "CLOSE"),
                 req.entry(1, "REQ")
             ],
+            "the REQ went out behind its CLOSE, on the same connection"
         );
         req.registered_filters().await;
         req.root.shutdown_accounts().await;
     }
 
-    /// A REQ that never queues behind its CLOSE would leave the relay with the
-    /// REQ closed on a connection that stays up, and no later repair restores
-    /// it. The re-issue counts that relay as failed and reconnects it, and the
-    /// SDK restores the REQ from its registry on the new connection.
+    /// A reconnect during the wait ends it. The SDK sends the REQ again itself
+    /// on the new connection, from its registry and behind the CLOSE, so a
+    /// retry that outlived its connection would repeat a live id. The relay
+    /// counts as failed and gets the REQ exactly once on the new connection.
     #[tokio::test]
-    async fn reissue_reconnects_a_relay_left_with_its_req_closed() {
-        let (url, log, _drop_connection) = duplicate_refusing_relay().await;
-        let mut req = ScriptedGroupReq::open(&url).await;
+    async fn reissue_stops_at_a_reconnect_and_the_registry_restores_the_req_once() {
+        let relay = duplicate_refusing_relay().await;
+        let mut req = ScriptedGroupReq::open(&relay.url).await;
         req.account
             .reissue_req_failures
             .store(usize::MAX, Ordering::SeqCst);
 
+        let reissue = req.spawn_reissue();
+        wait_for_entry(&relay.log, &req.entry(1, "CLOSE"), "the CLOSE goes out").await;
+        let sdk_relay = req.relay().await;
+        sdk_relay.disconnect();
+        sdk_relay.connect();
+        wait_for_entry(
+            &relay.log,
+            &req.entry(2, "REQ"),
+            "the SDK restores the REQ on the new connection",
+        )
+        .await;
+        // A retry still running now could queue the REQ on the new connection.
+        req.account.reissue_req_failures.store(0, Ordering::SeqCst);
         assert_eq!(
-            req.reissue().await,
+            timeout(Duration::from_secs(10), reissue)
+                .await
+                .expect("a reconnect ends the wait")
+                .unwrap(),
             SubscriptionReissue {
                 reissued: 0,
                 failed: 1,
             }
         );
-        wait_for_entry(&log, &req.entry(2, "REQ"), "the reconnect restores the REQ").await;
         replay_until_eose(&mut req.notifications, &req.id).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
-            *log.lock().await,
+            *relay.log.lock().await,
             vec![
                 req.entry(1, "REQ"),
                 req.entry(1, "CLOSE"),
                 req.entry(2, "REQ")
             ],
-            "the REQ closed on the first connection is live on the second"
+            "the new connection gets the REQ exactly once"
         );
         req.registered_filters().await;
         req.root.shutdown_accounts().await;

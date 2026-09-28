@@ -503,8 +503,8 @@ pub struct EoseReissueSummary {
 pub struct SubscriptionReissue {
     /// Relays the REQ was sent to again.
     pub reissued: usize,
-    /// Relays where the REQ was closed but could not be sent again. Each was
-    /// made to restore it some other way, such as a reconnect.
+    /// Relays where the REQ was closed but did not go out again on that
+    /// connection. The relay's reconnect restores it.
     pub failed: usize,
 }
 
@@ -592,9 +592,12 @@ pub trait NostrRelayClient: Send + Sync {
     /// bounds a later lag's loss. A closed REQ must never be reopened. No
     /// relay may see the id repeated while it is live there: a relay may
     /// refuse the repeat instead of replacing the subscription. And no relay
-    /// may be left with the REQ closed: one where it cannot go out again must
-    /// get it back some other way. An implementation that cannot guarantee
-    /// all four refuses. Unsupported by default.
+    /// may keep the REQ closed on a connection that stays up: once closed, it
+    /// goes out again on that connection, or that connection ends and the
+    /// relay's reconnect restores it. An implementation that cannot guarantee
+    /// all four refuses. It is called under the adapter's subscription
+    /// lifecycle lock, so any wait for room to send must be bounded.
+    /// Unsupported by default.
     async fn reissue_subscription(
         &self,
         _account_id: &MemberId,

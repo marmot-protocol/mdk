@@ -127,9 +127,9 @@
   under its own id, to each connected relay that has not answered it, and the relay replays
   from the same `since` before a fresh EOSE. The REQ is closed on that relay first, so no
   relay sees a repeated id, and the SDK keeps the REQ it restores on reconnect. A REQ that
-  cannot be queued behind its CLOSE is retried briefly, and a relay still connected without
-  it is reconnected so the SDK re-sends every REQ it holds; that relay counts as a failed
-  re-issue. A relay gets each REQ again at most once, and the notification-loss floor does
+  cannot be queued behind its CLOSE is retried on that connection until it can; if the
+  connection ends first, the relay counts as a failed re-issue and its reconnect restores
+  the REQ. A relay gets each REQ again at most once, and the notification-loss floor does
   not move. `NostrRelayClient` gains `reissue_subscription`, unsupported by default, which
   reports a `SubscriptionReissue`, and `NostrTransportAdapter` gains
   `reissue_subscriptions_awaiting_eose`. (#2070)
