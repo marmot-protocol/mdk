@@ -436,8 +436,29 @@ impl AccountDeliveryOverflowState {
             .retired_loss_unsignalled = true;
     }
 
+    /// A control record queued on a route whose receiver is gone died with
+    /// that queue, yet `signal_queued` still claims it, so `finish_recovery`
+    /// could never clear the generation. Mark the signal unsent, as for loss a
+    /// retired writer recorded while no route existed, so that the next route
+    /// carries it. A deferred signal counts too: its marker writer holds the
+    /// dead queue's sender. This assumes one live adapter per account, as the
+    /// worker drops its client before it reopens.
+    fn release_signal_of_closed_route(&self, sender: &mpsc::Sender<AccountDeliveryEvent>) {
+        if !sender.is_closed() {
+            return;
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.pending && state.signal_queued {
+            state.retired_loss_unsignalled = true;
+        }
+    }
+
     /// Claim the signal for loss a retired writer recorded while no route
-    /// existed. Any other pending loss already had its route.
+    /// existed, or whose control record died with a replaced route's queue.
+    /// Any other pending loss already had its route.
     fn claim_retired_loss_signal(&self) -> Option<u64> {
         let mut state = self
             .inner
@@ -1023,7 +1044,7 @@ impl MarmotRelayPlane {
                 })
             })
             .clone();
-        routes.insert(
+        let replaced = routes.insert(
             account_id.clone(),
             AccountDeliveryRoute {
                 sender: delivery_tx,
@@ -1040,8 +1061,12 @@ impl MarmotRelayPlane {
                 recovery_marker,
             },
         );
+        if let Some(replaced) = replaced {
+            delivery_overflow.release_signal_of_closed_route(&replaced.sender);
+        }
         // Loss a retired writer recorded while no route existed has not been
-        // signalled to any consumer. The route lock orders this against that
+        // signalled to any consumer, nor has a record that died with the
+        // replaced route's queue. The route lock orders this against that
         // writer's own check for a route.
         if let Some(generation) = delivery_overflow.claim_retired_loss_signal() {
             enqueue_account_delivery_overflow_signal(&signal_tx, &delivery_overflow, generation);
@@ -1258,7 +1283,15 @@ impl MarmotRelayPlane {
         &self,
         account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
-        account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
+        let removed =
+            account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
+        if let Some(removed) = removed {
+            // Once the worker has stopped, its queue is gone, and so is any
+            // control record in it.
+            removed
+                .overflow
+                .release_signal_of_closed_route(&removed.sender);
+        }
         self.inner
             .transport
             .adapter

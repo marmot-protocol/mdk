@@ -68,6 +68,11 @@
   and `notification_forwarder_restarts`. Only an unexpected consumer exit
   (`notification_forwarder_unexpected_exits`) still closes delivery and reconnects. (#2070)
 
+- Hand a pending loss signal to an account's next delivery route when the worker drops its
+  queue with the control record still in it. The record died with the queue, but the plane
+  still counted it as queued, so the loss generation could never clear and the transport
+  cursor stayed fenced for the rest of the process. (#2070)
+
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay
   until a newer event replaces them. (#1973)

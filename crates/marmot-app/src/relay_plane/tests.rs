@@ -873,6 +873,74 @@ async fn notification_lag_keeps_account_delivery_open_and_bounds_the_loss() {
     relay_plane.shutdown().await;
 }
 
+/// The worker drops its client, and with it the account queue, before it
+/// reopens or retires. A control record still queued there dies with it, and
+/// `signal_queued` would keep `finish_recovery` from ever clearing the
+/// generation, so the next route carries the signal instead.
+#[tokio::test]
+async fn next_route_carries_a_control_record_that_died_with_its_queue() {
+    for retire_first in [false, true] {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let account = MemberId::new(vec![0xA1; 32]);
+        let first = relay_plane.account_adapter(account.clone(), relay.clone());
+        relay_plane.simulate_notification_lag_for_test(
+            &account,
+            1,
+            NostrNotificationLossFloor::Since(10),
+        );
+        assert!(first.delivery_overflow_signal_outstanding());
+        drop(first);
+        if retire_first {
+            relay_plane
+                .deactivate_account_context(&account)
+                .await
+                .unwrap();
+        }
+
+        let next = relay_plane.account_adapter(account.clone(), relay.clone());
+        let Some(AccountDeliveryReceive::Overflow(overflow)) = next.try_receive_account_delivery()
+        else {
+            panic!("retire_first={retire_first}: the next route carries the signal");
+        };
+        assert_eq!(overflow.notification_losses, 1);
+        assert!(
+            next.try_receive_account_delivery().is_none(),
+            "retire_first={retire_first}: one control record per generation"
+        );
+        next.notification_loss_persisted(overflow);
+        let attempt = next.start_delivery_overflow_recovery(overflow.marker_token);
+        assert!(
+            next.finish_delivery_overflow_recovery(attempt).is_some(),
+            "retire_first={retire_first}: the generation can clear"
+        );
+        relay_plane.shutdown().await;
+    }
+}
+
+/// A predecessor whose receiver is still alive keeps its own control record,
+/// so a new route gets no duplicate.
+#[tokio::test]
+async fn live_predecessor_keeps_its_control_record() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let first = relay_plane.account_adapter(account.clone(), relay.clone());
+    relay_plane.simulate_notification_lag_for_test(
+        &account,
+        1,
+        NostrNotificationLossFloor::Since(10),
+    );
+    let second = relay_plane.account_adapter(account, relay);
+    assert!(second.try_receive_account_delivery().is_none());
+    assert!(matches!(
+        first.try_receive_account_delivery(),
+        Some(AccountDeliveryReceive::Overflow(_))
+    ));
+    assert!(!second.delivery_overflow_signal_outstanding());
+    relay_plane.shutdown().await;
+}
+
 /// A scoped supervisor charges the floor its source read at the lag, and the
 /// shared forwarder, whose receiver spans accounts, charges none.
 #[tokio::test]
