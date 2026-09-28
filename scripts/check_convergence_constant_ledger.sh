@@ -124,13 +124,15 @@ discover_constants \
     "crates/marmot-app/src/runtime/account_worker.rs" \
     "(CONVERGENCE_[A-Z0-9_]+|MIN_CONVERGENCE_[A-Z0-9_]+|IDLE_CONVERGENCE_[A-Z0-9_]+)"
 discover_constants \
-    "crates/marmot-app/src/runtime/account_worker/bounded_recovery.rs" \
-    "(MAX_[A-Z0-9_]+|ADMISSION_YIELD_DELAY|PROBE_INTERVAL)"
+    "crates/marmot-app/src/runtime/account_worker/recovery_credits.rs" \
+    "MAX_[A-Z0-9_]+"
+discover_constants \
+    "crates/marmot-app/src/client/sync/comparison_job.rs" \
+    "MAX_COMPARISON_[A-Z0-9_]+"
 discover_constants \
     "crates/transport-nostr-adapter/src/sdk_client.rs" \
     "SDK_RECONCILIATION_MAX_[A-Z0-9_]+"
 discover_constants "crates/marmot-app/src/client/epoch_stall.rs" "EPOCH_STALL_[A-Z0-9_]+"
-discover_constants "crates/marmot-app/src/client/sync.rs" "ONLINE_EPOCH_GAP_DRAIN_SLICE"
 discover_constants \
     "crates/marmot-app/src/lib.rs" \
     "(APP_RUNTIME_RELAY_REBUILD_LOOKBACK|TRANSPORT_CURSOR_MAX_FUTURE_SKEW)"
