@@ -475,9 +475,21 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   comparison, or the epoch gap it causes, recovers it.
   An old Welcome can floor maintenance below the retained-inventory window, and a goal
   there cannot certify. The inbox's two-day NIP-59 widening sets that floor at least two
-  days back on every route; per-route floors would need per-scope storage. An EOSE lost
-  in a lag is not recovered, so the next activation re-subscribes instead of reusing the
-  live one. Relays that ignore `since` are not detected.
+  days back on every route; per-route floors would need per-scope storage. Relays that
+  ignore `since` are not detected.
+- End-of-stored-events lost in a notification lag (#2070). A lag cannot tell a lost EOSE
+  from one still coming, so it marks none complete. Once the receiver has gone 30 seconds
+  without another lag, each REQ issued before the lag is re-issued, unchanged and under
+  its own id, to every relay that has not answered it. The relay replays from the same
+  `since` and answers with a fresh EOSE, so activation reuse returns, EOSE-gated drains
+  can complete, and post-join maintenance observes its boundary. The loss floor does not
+  move. A relay gets each REQ again at most once, so a replay that keeps lagging cannot
+  loop, and nothing is re-issued while lags keep recurring. What remains: a replay still
+  running 30 seconds after the last lag restarts once; a fresh EOSE lost to another lag
+  stays missing until the next activation; a group route removed before its EOSE keeps the
+  activation's frozen coverage incomplete; and a relay that refuses a repeated
+  subscription id instead of replacing the subscription, as NIP-01 requires, loses that
+  REQ until the next activation.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored
