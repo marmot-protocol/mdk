@@ -1,0 +1,328 @@
+// Retained as provenance, not compiled by the current workspace.
+//
+// Compiled and run as an in-crate `marmot-app` test module
+// (`src/tests/upgrade_fixture_gen.rs`, declared from `src/tests.rs`) at exact
+// MDK tag v0.10.4, commit fcc85edd8dbd07c8293c899ee52230f72c54c897:
+//
+//   UPGRADE_OUT=<dir> cargo test -p marmot-app --lib upgrade_fixture_gen -- --ignored
+//
+// It drives four synthetic accounts through the v0.10.4 app runtime against a
+// local nostr-relay-builder relay. `account-v0.10.4.sql` is the account `bob`:
+// `<dir>/bob-v0104-plain.sqlite` (the v0.10.4 `sqlcipher_export` below),
+// rendered with `sqlite3 <db> .dump`. The `dave` part and the relay dump were
+// used only for the manual upgrade check described in README.md.
+
+use super::*;
+use nostr_relay_builder::prelude::{LocalRelay, MemoryDatabase, MemoryDatabaseOptions, RelayBuilder};
+use nostr_sdk::prelude::{Filter, NostrDatabase};
+use std::time::Duration;
+
+const PORT: u16 = 47_104;
+const DEADLINE: Duration = Duration::from_secs(60);
+
+fn out_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("UPGRADE_OUT").expect("UPGRADE_OUT"))
+}
+
+fn open(home: &std::path::Path, url: &str) -> MarmotApp {
+    MarmotApp::with_relay_and_config(
+        home,
+        url.to_owned(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    )
+}
+
+async fn wait_for<F>(events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>, stage: &str, mut f: F)
+where
+    F: FnMut(&MarmotAppEvent) -> bool,
+{
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            match events.recv().await {
+                Ok(event) if f(&event) => return,
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(error) => panic!("{stage}: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out: {stage}"));
+}
+
+fn got_message(event: &MarmotAppEvent, account: &str, group: &GroupId, text: &str) -> bool {
+    matches!(event, MarmotAppEvent::MessageReceived(m)
+        if m.account_id_hex == account && &m.message.group_id == group && m.message.plaintext == text)
+}
+
+fn joined(event: &MarmotAppEvent, account: &str, group: &GroupId) -> bool {
+    matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. }
+        if account_id_hex == account && group_id == group)
+}
+
+fn export_plain(app: &MarmotApp, label: &str, out: &std::path::Path) {
+    let path = app.account_storage_path(label);
+    let keys = app.account_home().load_signing_keys(label).unwrap();
+    let key = app
+        .sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(out);
+    connection
+        .execute_batch(&format!(
+            "ATTACH DATABASE '{}' AS plain KEY ''; SELECT sqlcipher_export('plain'); DETACH DATABASE plain;",
+            out.display()
+        ))
+        .unwrap();
+}
+
+async fn event_ids(db: &MemoryDatabase) -> std::collections::BTreeSet<nostr::EventId> {
+    db.query(Filter::new()).await.unwrap().into_iter().map(|e| e.id).collect()
+}
+
+#[test]
+#[ignore = "scratch v0.10.4 upgrade fixture generator"]
+fn upgrade_fixture_gen() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(generate())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn generate() {
+    let out = out_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let db = MemoryDatabase::with_opts(MemoryDatabaseOptions { events: true, max_events: Some(75_000) });
+    let relay = LocalRelay::new(
+        RelayBuilder::default()
+            .addr(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .port(PORT)
+            .database(db.clone()),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    eprintln!("relay {url}");
+
+    let homes: Vec<_> = ["alice", "bob", "carol", "dave"]
+        .iter()
+        .map(|label| {
+            let home = out.join(format!("{label}-home"));
+            std::fs::create_dir_all(&home).unwrap();
+            AccountHome::open(&home).create_account(label).unwrap();
+            (label.to_string(), home)
+        })
+        .collect();
+    let id = |label: &str| {
+        let home = &homes.iter().find(|(l, _)| l == label).unwrap().1;
+        AccountHome::open(home).account(label).unwrap().account_id_hex
+    };
+    let home = |label: &str| homes.iter().find(|(l, _)| l == label).unwrap().1.clone();
+    let (alice_id, bob_id, carol_id, dave_id) = (id("alice"), id("bob"), id("carol"), id("dave"));
+
+    let app_alice = open(&home("alice"), &url);
+    let app_bob = open(&home("bob"), &url);
+    let app_carol = open(&home("carol"), &url);
+    let app_dave = open(&home("dave"), &url);
+    for (app, label) in [(&app_alice, "alice"), (&app_bob, "bob"), (&app_carol, "carol"), (&app_dave, "dave")] {
+        app.client(label).await.unwrap().publish_key_package().await.unwrap();
+    }
+
+    let mut alice = app_alice.client("alice").await.unwrap();
+    let mut carol = app_carol.client("carol").await.unwrap();
+
+    // --- bob: the account under test, running a production-shaped runtime ---
+    let bob_rt = MarmotAppRuntime::new(app_bob.clone());
+    let mut bob_events = bob_rt.subscribe();
+    bob_rt.start().await.unwrap();
+
+    // G1: three members, messages from all three.
+    let g1 = alice
+        .create_group("upgrade general", &[bob_id.as_str(), carol_id.as_str()])
+        .await
+        .unwrap();
+    wait_for(&mut bob_events, "bob joins g1", |e| joined(e, &bob_id, &g1)).await;
+    carol.sync().await.unwrap();
+    bob_rt.catch_up_accounts().await.unwrap();
+    for i in 0..4 {
+        let text = format!("general alice {i}");
+        alice.send(&g1, text.as_bytes()).await.unwrap();
+        wait_for(&mut bob_events, "bob g1 msg", |e| got_message(e, &bob_id, &g1, &text)).await;
+    }
+    for i in 0..3 {
+        bob_rt
+            .send_message("bob", &g1, format!("general bob {i}").into_bytes())
+            .await
+            .unwrap();
+    }
+    carol.sync().await.unwrap();
+    let text = "general carol 0".to_owned();
+    carol.send(&g1, text.as_bytes()).await.unwrap();
+    wait_for(&mut bob_events, "bob g1 carol msg", |e| got_message(e, &bob_id, &g1, &text)).await;
+
+    // G2: route rotation by the admin, messages on both routes.
+    let g2 = alice.create_group("upgrade rotated", &[bob_id.as_str()]).await.unwrap();
+    wait_for(&mut bob_events, "bob joins g2", |e| joined(e, &bob_id, &g2)).await;
+    bob_rt.catch_up_accounts().await.unwrap();
+    for i in 0..3 {
+        let text = format!("rotated before {i}");
+        alice.send(&g2, text.as_bytes()).await.unwrap();
+        wait_for(&mut bob_events, "bob g2 msg", |e| got_message(e, &bob_id, &g2, &text)).await;
+    }
+    let new_route = NostrRoutingV1::new([0x5a; 32], vec![url.clone()]).unwrap();
+    let effects = alice
+        .runtime
+        .send(cgka_traits::engine::SendIntent::UpdateAppComponents {
+            group_id: g2.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_nostr_routing_v1(&new_route).unwrap(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(effects.failures.is_empty(), "route rotation publish failed");
+    alice.refresh_group(&g2);
+    alice.refresh_group_routes().unwrap();
+    app_alice.save_state(&alice.state).unwrap();
+    // Let bob apply the rotation commit before traffic moves to the new route.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    bob_rt.catch_up_accounts().await.unwrap();
+    for i in 0..3 {
+        let text = format!("rotated after {i}");
+        alice.send(&g2, text.as_bytes()).await.unwrap();
+        wait_for(&mut bob_events, "bob g2 post-rotation msg", |e| got_message(e, &bob_id, &g2, &text)).await;
+    }
+    bob_rt
+        .send_message("bob", &g2, b"rotated bob reply".to_vec())
+        .await
+        .unwrap();
+
+    // G4: a group bob founded, with carol.
+    let g4 = bob_rt
+        .create_group("bob", "bob founded", &[carol_id.clone()], None)
+        .await
+        .unwrap();
+    carol.sync().await.unwrap();
+    for i in 0..2 {
+        bob_rt
+            .send_message("bob", &g4, format!("founded bob {i}").into_bytes())
+            .await
+            .unwrap();
+    }
+    carol.sync().await.unwrap();
+    let text = "founded carol 0".to_owned();
+    carol.send(&g4, text.as_bytes()).await.unwrap();
+    wait_for(&mut bob_events, "bob g4 carol msg", |e| got_message(e, &bob_id, &g4, &text)).await;
+
+    // Age the history past the 120 s restart lookback, then advance the
+    // cursor with one late live message so older history sits below it.
+    bob_rt.catch_up_accounts().await.unwrap();
+    let age = std::env::var("UPGRADE_AGE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    tokio::time::sleep(Duration::from_secs(age)).await;
+    let text = "general alice late".to_owned();
+    alice.send(&g1, text.as_bytes()).await.unwrap();
+    wait_for(&mut bob_events, "bob g1 late msg", |e| got_message(e, &bob_id, &g1, &text)).await;
+    // Settle: one explicit catch-up so drains persist the cursor, then stop.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    bob_rt.catch_up_accounts().await.unwrap();
+    bob_rt.shutdown().await;
+
+    // Offline traffic for bob: the first catch-up on master must fetch it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    alice.send(&g1, b"general alice offline").await.unwrap();
+
+    // --- dave: recovery state with a genuinely missing commit ---
+    let dave_rt = MarmotAppRuntime::new(app_dave.clone());
+    let mut dave_events = dave_rt.subscribe();
+    dave_rt.start().await.unwrap();
+    let g3 = alice.create_group("upgrade gap", &[dave_id.as_str()]).await.unwrap();
+    wait_for(&mut dave_events, "dave joins g3", |e| joined(e, &dave_id, &g3)).await;
+    dave_rt.catch_up_accounts().await.unwrap();
+    let text = "gap before".to_owned();
+    alice.send(&g3, text.as_bytes()).await.unwrap();
+    wait_for(&mut dave_events, "dave g3 msg", |e| got_message(e, &dave_id, &g3, &text)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    dave_rt.catch_up_accounts().await.unwrap();
+    dave_rt.shutdown().await;
+
+    let before = event_ids(&db).await;
+    alice.update_group_profile(&g3, Some("gap one"), None).await.unwrap();
+    let missing: Vec<_> = event_ids(&db).await.difference(&before).copied().collect();
+    alice.update_group_profile(&g3, Some("gap two"), None).await.unwrap();
+    for i in 0..10 {
+        alice.send(&g3, format!("gap after {i}").as_bytes()).await.unwrap();
+    }
+    eprintln!("deleting {} commit event(s) from the relay", missing.len());
+    for event_id in &missing {
+        db.delete(Filter::new().id(*event_id)).await.unwrap();
+    }
+
+    let dave_rt = MarmotAppRuntime::new(app_dave.clone());
+    dave_rt.start().await.unwrap();
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = dave_rt.catch_up_accounts().await;
+    }
+    dave_rt.shutdown().await;
+    // The live run left no durable recovery rows for the gap, so leave the
+    // shapes v0.10.4 persists when its queue overflows and replays stay
+    // fruitless, through v0.10.4's own storage writers.
+    {
+        let storage = app_dave.account_storage("dave").unwrap();
+        storage.mark_account_delivery_recovery("dave", 7, 3).unwrap();
+        storage
+            .record_recovery_evidence(
+                &[storage_sqlite::StoredEpochStallEvidence {
+                    group_id_hex: hex::encode(g3.as_slice()),
+                    stalled_epoch: 1,
+                    fruitless_completions: 3,
+                    fruitless_reported: true,
+                    last_arm_at_ms: unix_now_seconds() * 1000,
+                }],
+                3,
+            )
+            .unwrap();
+    }
+
+    // Exports and relay dump.
+    drop(alice);
+    drop(carol);
+    for (app, label) in [(&app_bob, "bob"), (&app_dave, "dave"), (&app_alice, "alice")] {
+        export_plain(app, label, &out.join(format!("{label}-v0104-plain.sqlite")));
+    }
+    let mut dump = String::new();
+    for event in db.query(Filter::new()).await.unwrap() {
+        dump.push_str(&serde_json::to_string(&event).unwrap());
+        dump.push('\n');
+    }
+    std::fs::write(out.join("relay-events.jsonl"), dump).unwrap();
+    std::fs::write(
+        out.join("ids.json"),
+        serde_json::json!({
+            "alice": alice_id, "bob": bob_id, "carol": carol_id, "dave": dave_id,
+            "g1": hex::encode(g1.as_slice()), "g2": hex::encode(g2.as_slice()),
+            "g3": hex::encode(g3.as_slice()), "g4": hex::encode(g4.as_slice()),
+            "url": url,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for app in [&app_alice, &app_bob, &app_carol, &app_dave] {
+        app.close_storage().unwrap();
+    }
+    relay.shutdown();
+}

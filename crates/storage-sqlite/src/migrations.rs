@@ -148,6 +148,9 @@ mod query_work_tests;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
+#[cfg(test)]
+#[path = "migrations/upgrade_v0_10_4_tests.rs"]
+mod upgrade_v0_10_4_tests;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
