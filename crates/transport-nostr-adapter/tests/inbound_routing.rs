@@ -305,11 +305,8 @@ struct FakeRelayClient {
     refuse_reissue: AtomicBool,
     /// Send nothing: every relay is unreachable.
     fail_reissue: AtomicBool,
-    /// Close each REQ with no room to send it again, leaving it pending.
-    defer_reissue: AtomicBool,
-    /// What each retry of a pending REQ reports, and the retries made.
-    retry_outcome: Mutex<Option<transport_nostr_adapter::ReissueRetry>>,
-    retries: AtomicUsize,
+    /// Report every relay as having already answered with EOSE.
+    complete_reissue: AtomicBool,
 }
 
 impl FakeRelayClient {
@@ -377,7 +374,7 @@ impl NostrRelayClient for FakeRelayClient {
         endpoints: &[TransportEndpoint],
     ) -> Result<transport_nostr_adapter::SubscriptionReissue, cgka_traits::TransportAdapterError>
     {
-        use transport_nostr_adapter::{RelayConnection, RelayReissue};
+        use transport_nostr_adapter::RelayReissue;
         if self.refuse_reissue.load(Ordering::SeqCst) {
             return Err(cgka_traits::TransportAdapterError::Subscription(
                 "injected reissue refusal".into(),
@@ -390,11 +387,8 @@ impl NostrRelayClient for FakeRelayClient {
         ));
         let outcome = if self.fail_reissue.load(Ordering::SeqCst) {
             RelayReissue::Unsent
-        } else if self.defer_reissue.load(Ordering::SeqCst) {
-            RelayReissue::Pending(RelayConnection {
-                attempts: 1,
-                successes: 1,
-            })
+        } else if self.complete_reissue.load(Ordering::SeqCst) {
+            RelayReissue::Complete
         } else {
             RelayReissue::Sent
         };
@@ -404,21 +398,6 @@ impl NostrRelayClient for FakeRelayClient {
                 .map(|endpoint| (endpoint.clone(), outcome))
                 .collect(),
         })
-    }
-
-    async fn retry_reissued_req(
-        &self,
-        _account_id: &MemberId,
-        _subscription_id: &str,
-        _endpoint: &TransportEndpoint,
-        _connection: transport_nostr_adapter::RelayConnection,
-    ) -> Result<transport_nostr_adapter::ReissueRetry, cgka_traits::TransportAdapterError> {
-        self.retries.fetch_add(1, Ordering::SeqCst);
-        Ok(self
-            .retry_outcome
-            .lock()
-            .unwrap()
-            .unwrap_or(transport_nostr_adapter::ReissueRetry::Waiting))
     }
 
     async fn subscribe(
@@ -3769,6 +3748,7 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
         group_id: cgka_traits::GroupId::new(vec![byte; 16]),
         transport_group_id: vec![byte; 32],
         endpoints: vec![a.clone()],
+        retained_since: None,
     };
     adapter
         .activate_account(TransportAccountActivation {
@@ -3790,7 +3770,7 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
     adapter.handle_relay_eose(a.clone(), inbox_id.clone()).await;
     adapter.handle_relay_eose(a.clone(), group_id).await;
     let maintenance_id = adapter
-        .install_group_maintenance_recovery_subscription(&account_id, &group(0x51), 7)
+        .install_group_maintenance_recovery_subscription(&account_id, &group(0x51), 7, None)
         .await
         .expect("maintenance installs");
     let lag = adapter.notification_lag_mark();
@@ -3811,15 +3791,14 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
         .reissue_subscriptions_awaiting_eose(Some(&account_id), lag)
         .await;
     assert_eq!(
-        repair.summary,
+        repair,
         transport_nostr_adapter::EoseReissueSummary {
             awaiting_relays: 2,
+            complete_relays: 0,
             reissued_relays: 2,
-            deferred_relays: 0,
             failed_relays: 0,
         }
     );
-    assert_eq!(repair.unrepaired.await, 0);
     let mut expected = vec![
         (account_id.clone(), inbox_id.clone(), vec![b.clone()]),
         (account_id.clone(), maintenance_id.clone(), vec![a.clone()]),
@@ -3838,7 +3817,6 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
         adapter
             .reissue_subscriptions_awaiting_eose(Some(&account_id), later)
             .await
-            .summary
             .reissued_relays,
         1
     );
@@ -3882,8 +3860,8 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
 /// A lag on a receiver shared across accounts repairs every active account,
 /// but not one deactivated before the repair. A relay whose re-issue went out
 /// keeps its claim. One that got none, because the relay was unreachable or
-/// the client refused the REQ, counts as failed and unrepaired, and a later
-/// repair may claim it again.
+/// the client refused the REQ, counts as failed, and a later repair may claim
+/// it again.
 #[tokio::test]
 async fn shared_receiver_lag_repair_covers_every_active_account() {
     let relay = Arc::new(FakeRelayClient::default());
@@ -3908,8 +3886,7 @@ async fn shared_receiver_lag_repair_covers_every_active_account() {
 
     let lag = adapter.notification_lag_mark();
     let repair = adapter.reissue_subscriptions_awaiting_eose(None, lag).await;
-    assert_eq!(repair.summary.reissued_relays, 2);
-    assert_eq!(repair.unrepaired.await, 0);
+    assert_eq!(repair.reissued_relays, 2);
     let repaired = relay
         .take_reissued()
         .into_iter()
@@ -3920,10 +3897,7 @@ async fn shared_receiver_lag_repair_covers_every_active_account() {
         std::collections::HashSet::from([account(0xA1), account(0xB2)])
     );
     assert_eq!(
-        adapter
-            .reissue_subscriptions_awaiting_eose(None, lag)
-            .await
-            .summary,
+        adapter.reissue_subscriptions_awaiting_eose(None, lag).await,
         transport_nostr_adapter::EoseReissueSummary::default(),
         "a re-issue that went out keeps its claim"
     );
@@ -3948,122 +3922,65 @@ async fn shared_receiver_lag_repair_covers_every_active_account() {
             .reissue_subscriptions_awaiting_eose(Some(&account(0xD4)), later)
             .await;
         assert_eq!(
-            repair.summary,
+            repair,
             transport_nostr_adapter::EoseReissueSummary {
                 awaiting_relays: 2,
+                complete_relays: 0,
                 reissued_relays: 0,
-                deferred_relays: 0,
                 failed_relays: 2,
             },
             "refuse={refuse}: a failed relay's claim is released each time"
         );
-        assert_eq!(repair.unrepaired.await, 2);
     }
     relay.fail_reissue.store(false, Ordering::SeqCst);
     let repair = adapter
         .reissue_subscriptions_awaiting_eose(Some(&account(0xD4)), later)
         .await;
-    assert_eq!(repair.summary.reissued_relays, 2);
-    assert_eq!(repair.unrepaired.await, 0);
+    assert_eq!(repair.reissued_relays, 2);
 }
 
-/// A REQ with no room behind its CLOSE goes to a background retry that waits
-/// without the subscription lifecycle lock: activation, sync and teardown keep
-/// running meanwhile. It stops once the REQ goes out, and it lets the REQ go
-/// once a newer registration or an activation owns it. A connection that ends
-/// first leaves the relay unrepaired, with its claim released for a later
-/// repair.
+/// A relay the client saw answer the REQ needs nothing sent: the lag lost only
+/// the notification. The repair records that EOSE, which completes the
+/// activation's coverage, and the relay is not claimed again.
 #[tokio::test]
-async fn deferred_reissue_retries_without_the_lock_until_it_settles() {
-    use transport_nostr_adapter::ReissueRetry;
+async fn lag_repair_records_an_eose_the_client_already_saw() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone() as Arc<dyn NostrRelayClient>);
     let account_id = MemberId::new(vec![0xF6; 32]);
-    let endpoint = TransportEndpoint("wss://deferred.example".to_owned());
-    let activation = TransportAccountActivation {
-        account_id: account_id.clone(),
-        inbox_endpoints: vec![endpoint.clone()],
-        group_subscriptions: Vec::new(),
-        since: Some(Timestamp(1_700_000_000)),
-    };
     adapter
-        .activate_account(activation.clone())
-        .await
-        .expect("activation succeeds");
-    relay.defer_reissue.store(true, Ordering::SeqCst);
-    let wait_for_retries = |at_least: usize| {
-        let relay = relay.clone();
-        async move {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while relay.retries.load(Ordering::SeqCst) < at_least {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("the background retry runs");
-        }
-    };
-
-    // Sent once there is room.
-    let repair = adapter
-        .reissue_subscriptions_awaiting_eose(Some(&account_id), adapter.notification_lag_mark())
-        .await;
-    assert_eq!(repair.summary.deferred_relays, 1);
-    wait_for_retries(2).await;
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        adapter.sync_account_groups(TransportGroupSync {
+        .activate_account(TransportAccountActivation {
             account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://answered.example".to_owned())],
             group_subscriptions: Vec::new(),
             since: Some(Timestamp(1_700_000_000)),
-        }),
-    )
-    .await
-    .expect("the waiting retry holds no lock")
-    .expect("sync succeeds");
-    *relay.retry_outcome.lock().unwrap() = Some(ReissueRetry::Sent);
-    assert_eq!(repair.unrepaired.await, 0);
-
-    // Let go once an activation owns the REQ: the retry stops asking.
-    adapter
-        .activate_account(activation.clone())
+        })
         .await
         .expect("activation succeeds");
-    *relay.retry_outcome.lock().unwrap() = None;
-    let repair = adapter
-        .reissue_subscriptions_awaiting_eose(Some(&account_id), adapter.notification_lag_mark())
-        .await;
-    let before = relay.retries.load(Ordering::SeqCst);
-    wait_for_retries(before + 1).await;
-    adapter
-        .activate_account(activation.clone())
-        .await
-        .expect("a newer activation replaces the REQ");
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), repair.unrepaired)
-            .await
-            .expect("the retry lets the REQ go"),
-        0
-    );
-    let settled = relay.retries.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(relay.retries.load(Ordering::SeqCst), settled);
-
-    // A connection that ended first leaves the relay unrepaired, and its
-    // released claim lets a later repair try again.
+    relay.complete_reissue.store(true, Ordering::SeqCst);
     let lag = adapter.notification_lag_mark();
-    *relay.retry_outcome.lock().unwrap() = Some(ReissueRetry::ConnectionEnded);
-    let repair = adapter
-        .reissue_subscriptions_awaiting_eose(Some(&account_id), lag)
-        .await;
-    assert_eq!(repair.summary.deferred_relays, 1);
-    assert_eq!(repair.unrepaired.await, 1);
-    relay.defer_reissue.store(false, Ordering::SeqCst);
-    let repair = adapter
-        .reissue_subscriptions_awaiting_eose(Some(&account_id), lag)
-        .await;
-    assert_eq!(repair.summary.reissued_relays, 1);
-    assert_eq!(repair.unrepaired.await, 0);
+    assert_eq!(
+        adapter
+            .reissue_subscriptions_awaiting_eose(Some(&account_id), lag)
+            .await,
+        transport_nostr_adapter::EoseReissueSummary {
+            awaiting_relays: 1,
+            complete_relays: 1,
+            reissued_relays: 0,
+            failed_relays: 0,
+        }
+    );
+    assert!(
+        adapter
+            .account_subscription_eose(&account_id)
+            .await
+            .complete()
+    );
+    assert_eq!(
+        adapter
+            .reissue_subscriptions_awaiting_eose(Some(&account_id), lag)
+            .await,
+        transport_nostr_adapter::EoseReissueSummary::default()
+    );
 }
 
 /// A superseded activation's end-of-stored-events report must not satisfy the

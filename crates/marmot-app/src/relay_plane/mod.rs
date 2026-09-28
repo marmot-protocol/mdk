@@ -3010,7 +3010,7 @@ fn schedule_eose_repair(
     runtime.spawn(run_eose_repair(Arc::downgrade(transport), scope));
 }
 
-/// Wait until a scheduled repair is due, then re-issue each REQ of its scope
+/// Wait until a scheduled repair is due, then repair each REQ of its scope
 /// that a relay has not answered with end-of-stored-events. Holds the plane
 /// only weakly, so it never keeps a shut-down plane alive.
 async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<MemberId>) {
@@ -3053,25 +3053,23 @@ async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<Mem
     if transport.shutting_down.load(Ordering::SeqCst) {
         return;
     }
-    // The repair may wait for the subscription lifecycle lock, and its
-    // deferred relays for room on their connections.
+    // The repair may wait for the subscription lifecycle lock.
     let adapter = transport.adapter.clone();
     let weak = Arc::downgrade(&transport);
     drop(transport);
-    let repair = adapter
+    let summary = adapter
         .reissue_subscriptions_awaiting_eose(scope.as_ref(), lag)
         .await;
-    let summary = repair.summary;
     tracing::info!(
         target: "marmot_app::relay_plane",
         method = "repair_lag_lost_eose",
         awaiting_relays = summary.awaiting_relays,
+        complete_relays = summary.complete_relays,
         reissued_relays = summary.reissued_relays,
-        deferred_relays = summary.deferred_relays,
         failed_relays = summary.failed_relays,
-        "re-issued subscriptions whose end-of-stored-events a notification lag may have lost",
+        "repaired subscriptions whose end-of-stored-events a notification lag may have lost",
     );
-    let unrepaired = repair.unrepaired.await;
+    let unrepaired = summary.failed_relays;
     if unrepaired == 0 {
         return;
     }

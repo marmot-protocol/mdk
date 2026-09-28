@@ -1050,6 +1050,7 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
         group_id: GroupId::new(vec![0xC3; 16]),
         transport_group_id: vec![0xD4; 32],
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
     let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
     let activation = TransportAccountActivation {
@@ -1146,6 +1147,7 @@ async fn notification_lag_repair_leaves_reqs_issued_after_the_lag() {
         group_id: GroupId::new(vec![byte; 16]),
         transport_group_id: vec![byte; 32],
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
     let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
     adapter
