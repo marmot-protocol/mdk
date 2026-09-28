@@ -125,13 +125,19 @@ impl AccountDeliverySpill {
                 batch
             };
             let count = batch.len() as u64;
+            let created_at: Vec<u64> = batch.iter().map(|d| d.message.timestamp.0).collect();
             let dispositions = self.store_with_retry(batch).await;
             let stored = count_of(&dispositions, DeliverySpillDisposition::Stored);
             let seen = count_of(&dispositions, DeliverySpillDisposition::AlreadySeen);
             // Record loss before releasing the spill fence, so the cursor
-            // stays fenced throughout.
-            for _ in stored + seen..count {
-                self.omit();
+            // stays fenced throughout. An empty result lost the whole batch.
+            for (index, created_at) in created_at.into_iter().enumerate() {
+                if dispositions
+                    .get(index)
+                    .is_none_or(|d| *d == DeliverySpillDisposition::Full)
+                {
+                    self.omit(Some(created_at));
+                }
             }
             self.overflow.finish_spill(count, stored, seen);
             if stored > 0 {
@@ -177,16 +183,16 @@ impl AccountDeliverySpill {
         })
     }
 
-    fn omit(&self) {
+    fn omit(&self, created_at: Option<u64>) {
         match self.current_route() {
-            Some(route) => omit_account_delivery(&route),
+            Some(route) => omit_account_delivery(&route, created_at),
             // The route was retired while this batch was in flight. The loss
             // still fences any replacement, which shares this overflow state,
             // and becomes durable through the retired route's marker. A
             // replacement that registers later is signalled when it reuses
             // the state; one that registered meanwhile is signalled here.
             None => {
-                self.overflow.record_retired_drop();
+                self.overflow.record_retired_drop(created_at);
                 if let Some(marker) = self.marker.clone() {
                     persist_retired_queue_loss(&self.overflow, marker);
                 }

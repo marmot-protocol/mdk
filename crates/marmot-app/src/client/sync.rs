@@ -1203,10 +1203,11 @@ impl AppClient {
         let storage = self.app.account_storage(&self.state.label)?;
         storage.synchronize_account_delivery_loss(&self.state.label)?;
         if overflow.dropped > 0 {
-            storage.mark_account_delivery_recovery(
+            storage.mark_account_delivery_recovery_bounded(
                 &self.state.label,
                 overflow.marker_token,
                 overflow.dropped,
+                overflow.earliest_dropped,
             )?;
         }
         if overflow.notification_losses > 0 {

@@ -723,12 +723,32 @@ impl SqliteAccountStorage {
         dropped_count: u64,
         observed_at_seconds: u64,
     ) -> StorageResult<()> {
-        self.record_account_recovery_loss(
+        self.record_account_delivery_loss_bounded(
+            label,
+            marker_token,
+            dropped_count,
+            observed_at_seconds,
+            None,
+        )
+    }
+
+    /// Like [`Self::record_account_delivery_loss`], also charging the earliest
+    /// wire `created_at` among the dropped deliveries, or an unknown time.
+    pub fn record_account_delivery_loss_bounded(
+        &self,
+        label: &str,
+        marker_token: u64,
+        dropped_count: u64,
+        observed_at_seconds: u64,
+        earliest_created_at: Option<u64>,
+    ) -> StorageResult<()> {
+        self.record_account_recovery_loss_bounded(
             label,
             RecoveryLossCause::Queue,
             marker_token,
             dropped_count,
             observed_at_seconds,
+            earliest_created_at,
         )
     }
 }

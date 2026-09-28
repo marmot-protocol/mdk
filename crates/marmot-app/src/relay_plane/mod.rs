@@ -180,8 +180,15 @@ struct AccountDeliveryRoute {
     spill: Option<Arc<delivery_spill::AccountDeliverySpill>>,
 }
 
-pub(crate) type AccountDeliveryRecoveryMarker =
-    Arc<dyn Fn(u64, u64) -> Result<(), AccountDeliveryRecoveryMarkerError> + Send + Sync + 'static>;
+/// Persists a queue-loss generation: its marker token, dropped count and the
+/// earliest wire `created_at` among the dropped deliveries (`None` if any is
+/// unknown).
+pub(crate) type AccountDeliveryRecoveryMarker = Arc<
+    dyn Fn(u64, u64, Option<u64>) -> Result<(), AccountDeliveryRecoveryMarkerError>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountDeliveryRecoveryMarkerError {
@@ -203,6 +210,9 @@ pub(crate) struct AccountDeliveryOverflow {
     pub(crate) generation: u64,
     pub(crate) marker_token: u64,
     pub(crate) dropped: u64,
+    /// Earliest wire `created_at` among this generation's dropped
+    /// deliveries, or `None` when any of them is unknown.
+    pub(crate) earliest_dropped: Option<u64>,
     pub(crate) notification_losses: u64,
     pub(crate) notification_token: u64,
     pub(crate) queue_depth: usize,
@@ -257,6 +267,10 @@ struct AccountDeliveryOverflowInner {
     /// A spill writer recorded loss after its route was retired, so no queue
     /// has carried its signal yet.
     retired_loss_unsignalled: bool,
+    /// Running minimum of the dropped deliveries' wire `created_at`, and
+    /// whether any dropped delivery's time was unknown.
+    earliest_dropped: Option<u64>,
+    earliest_dropped_unknown: bool,
 }
 
 #[derive(Default)]
@@ -334,15 +348,20 @@ impl AccountDeliveryOverflowState {
 
     /// Record an omitted delivery and return the generation only when this
     /// caller must enqueue the generation's control record.
-    fn record_drop(&self, queue_depth: usize) -> Option<u64> {
-        self.record_loss(queue_depth, false)
+    fn record_drop(&self, queue_depth: usize, created_at: Option<u64>) -> Option<u64> {
+        self.record_loss(queue_depth, false, created_at)
     }
 
     fn record_notification_loss(&self) -> Option<u64> {
-        self.record_loss(0, true)
+        self.record_loss(0, true, None)
     }
 
-    fn record_loss(&self, queue_depth: usize, notification: bool) -> Option<u64> {
+    fn record_loss(
+        &self,
+        queue_depth: usize,
+        notification: bool,
+        created_at: Option<u64>,
+    ) -> Option<u64> {
         let mut state = self
             .inner
             .lock()
@@ -351,6 +370,8 @@ impl AccountDeliveryOverflowState {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
             state.dropped = 0;
+            state.earliest_dropped = None;
+            state.earliest_dropped_unknown = false;
             state.notification_losses = 0;
             state.notification_token = 0;
             state.notification_imported = 0;
@@ -365,6 +386,12 @@ impl AccountDeliveryOverflowState {
             state.notification_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
         } else {
             state.dropped = state.dropped.saturating_add(1);
+            match created_at {
+                Some(at) => {
+                    state.earliest_dropped = Some(state.earliest_dropped.map_or(at, |e| e.min(at)))
+                }
+                None => state.earliest_dropped_unknown = true,
+            }
             state.marker_durable = false;
             RelayNotificationForwarderHealth::increment(&self.metrics.dropped, 1);
         }
@@ -378,8 +405,8 @@ impl AccountDeliveryOverflowState {
         }
     }
 
-    fn record_retired_drop(&self) {
-        self.record_drop(0);
+    fn record_retired_drop(&self, created_at: Option<u64>) {
+        self.record_drop(0, created_at);
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -474,15 +501,22 @@ impl AccountDeliveryOverflowState {
             state.generation
         };
         loop {
-            let (marker_token, dropped) = {
+            let (marker_token, dropped, earliest) = {
                 let state = self
                     .inner
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                (state.marker_token, state.dropped)
+                (
+                    state.marker_token,
+                    state.dropped,
+                    state
+                        .earliest_dropped
+                        .filter(|_| !state.earliest_dropped_unknown),
+                )
             };
             let marker = marker.clone();
-            match tokio::task::spawn_blocking(move || marker(marker_token, dropped)).await {
+            match tokio::task::spawn_blocking(move || marker(marker_token, dropped, earliest)).await
+            {
                 Ok(Ok(())) => {
                     let mut state = self
                         .inner
@@ -577,6 +611,8 @@ impl AccountDeliveryOverflowState {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
             state.dropped = 0;
+            state.earliest_dropped = None;
+            state.earliest_dropped_unknown = false;
             state.queue_depth = 0;
             state.started_at = Some(Instant::now());
             // This path exists only because the durable database marker was
@@ -601,6 +637,8 @@ impl AccountDeliveryOverflowState {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
             state.dropped = 0;
+            state.earliest_dropped = None;
+            state.earliest_dropped_unknown = false;
             state.notification_losses = 0;
             state.notification_token = 0;
             state.notification_imported = 0;
@@ -678,6 +716,9 @@ impl AccountDeliveryOverflowState {
             generation: state.generation,
             marker_token: state.marker_token,
             dropped: state.dropped,
+            earliest_dropped: state
+                .earliest_dropped
+                .filter(|_| !state.earliest_dropped_unknown),
             notification_losses: state.notification_losses,
             notification_token: state.notification_token,
             queue_depth: state.queue_depth,
@@ -1665,12 +1706,13 @@ impl MarmotRelayPlane {
                         .saturating_sub(route.sender.capacity());
                     route.overflow.observe_queue_depth(queue_depth);
                     if route.sender.capacity() <= 1 {
+                        let created_at = delivery.message.timestamp.0;
                         let spilled = route
                             .spill
                             .as_ref()
                             .is_some_and(|spill| spill.offer(delivery));
                         if !spilled {
-                            omit_account_delivery(&route);
+                            omit_account_delivery(&route, Some(created_at));
                         }
                         continue;
                     }
@@ -2991,12 +3033,12 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
 
 /// Omit one delivery from a full account queue into the current loss
 /// generation, persisting its evidence before the control record is queued.
-fn omit_account_delivery(route: &AccountDeliveryRoute) {
+fn omit_account_delivery(route: &AccountDeliveryRoute, created_at: Option<u64>) {
     let queue_depth = route
         .sender
         .max_capacity()
         .saturating_sub(route.sender.capacity());
-    let signal_generation = route.overflow.record_drop(queue_depth);
+    let signal_generation = route.overflow.record_drop(queue_depth, created_at);
     if let Some(marker) = route.recovery_marker.clone() {
         persist_queue_loss(&route.sender, &route.overflow, marker, signal_generation);
     } else if let Some(generation) = signal_generation {

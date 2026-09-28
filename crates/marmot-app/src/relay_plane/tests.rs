@@ -193,21 +193,29 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
 #[tokio::test]
 async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identity() {
     let overflow = AccountDeliveryOverflowState::default();
-    let generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    let generation = overflow
+        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+        .unwrap();
     overflow.consume_signal(generation);
     let first = overflow.start_recovery(1);
     assert!(overflow.start_marker_persistence());
     overflow
-        .persist_marker_before_drop(Arc::new(|_, _| Ok(())))
+        .persist_marker_before_drop(Arc::new(|_, _, _| Ok(())))
         .await;
     let elapsed_ms = overflow.finish_recovery(first).unwrap();
     overflow.record_recovery_success(elapsed_ms);
 
-    let generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    let generation = overflow
+        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+        .unwrap();
     overflow.consume_signal(generation);
     let second = overflow.start_recovery(2);
     // A new omission during the replay invalidates this attempt.
-    assert!(overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).is_some());
+    assert!(
+        overflow
+            .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+            .is_some()
+    );
     assert!(overflow.finish_recovery(second).is_none());
     overflow.fail_recovery();
 
@@ -229,7 +237,11 @@ async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identit
 #[tokio::test]
 async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
     let overflow = AccountDeliveryOverflowState::default();
-    assert!(overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).is_some());
+    assert!(
+        overflow
+            .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+            .is_some()
+    );
     assert!(overflow.start_marker_persistence());
     assert!(
         !overflow.start_marker_persistence(),
@@ -238,7 +250,7 @@ async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let observed_attempts = attempts.clone();
-    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
         observed_attempts.fetch_add(1, Ordering::SeqCst);
         Err(AccountDeliveryRecoveryMarkerError::Closed)
     });
@@ -261,7 +273,9 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     result: Result<(), AccountDeliveryRecoveryMarkerError>,
 ) {
     let overflow = Arc::new(AccountDeliveryOverflowState::default());
-    let old_generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    let old_generation = overflow
+        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+        .unwrap();
     overflow.consume_signal(old_generation);
     assert!(overflow.start_marker_persistence());
     let old_attempt = overflow.start_recovery(1);
@@ -271,7 +285,7 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     let marker: AccountDeliveryRecoveryMarker = {
         let entered = entered.clone();
         let release = release.clone();
-        Arc::new(move |_, _| {
+        Arc::new(move |_, _, _| {
             entered.store(true, Ordering::SeqCst);
             while !release.load(Ordering::SeqCst) {
                 std::thread::yield_now();
@@ -298,7 +312,9 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     // Exercise the defensive stale-worker fence independently of the public
     // handoff, which now forbids this transition while a writer is in flight.
     overflow.inner.lock().unwrap().pending = false;
-    let new_generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    let new_generation = overflow
+        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+        .unwrap();
     overflow.consume_signal(new_generation);
     assert!(overflow.start_marker_persistence());
 
@@ -2170,6 +2186,47 @@ async fn fill_account_queue(
     }
 }
 
+/// A queue-loss generation carries the earliest wire `created_at` among the
+/// deliveries it dropped, so recovery can bound what it must compare.
+#[tokio::test]
+async fn router_drops_record_the_earliest_created_at_they_lost() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let marked = Arc::new(StdMutex::new(Vec::new()));
+    let recorded = marked.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, dropped, earliest| {
+        recorded.lock().unwrap().push((dropped, earliest));
+        Ok(())
+    });
+    let adapter = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        Some(marker),
+        None,
+    );
+    // Without a spill the three deliveries past the queue are dropped. They
+    // are the oldest in the fill, and the last is the earliest.
+    fill_account_queue(&relay_plane, &adapter, &alice, 3).await;
+    timeout(Duration::from_secs(5), async {
+        while marked
+            .lock()
+            .unwrap()
+            .last()
+            .is_none_or(|(dropped, _)| *dropped < 3)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the dropped deliveries become a durable marker");
+    let earliest_fill = 1_700_100_000 - (ACCOUNT_DELIVERY_BUFFER as u64 + 2);
+    assert_eq!(
+        marked.lock().unwrap().last().copied(),
+        Some((3, Some(earliest_fill)))
+    );
+}
+
 #[tokio::test]
 async fn transient_spill_store_failures_are_retried_instead_of_lost() {
     let relay = Arc::new(RecordingRelayClient::default());
@@ -2305,7 +2362,7 @@ async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
         });
         let marked = Arc::new(StdMutex::new(Vec::new()));
         let recorded = marked.clone();
-        let marker: AccountDeliveryRecoveryMarker = Arc::new(move |token, dropped| {
+        let marker: AccountDeliveryRecoveryMarker = Arc::new(move |token, dropped, _| {
             recorded.lock().unwrap().push((token, dropped));
             Ok(())
         });
@@ -2492,7 +2549,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
     let marker_attempts = Arc::new(AtomicUsize::new(0));
     let marker_flag = marker_persisted.clone();
     let attempts = marker_attempts.clone();
-    let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
+    let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(AccountDeliveryRecoveryMarkerError::Retryable);
         }
@@ -3608,7 +3665,7 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
     app.relay_plane
         .set_account_delivery_recovery_marker_for_test(
             &account,
-            Arc::new(|_, _| panic!("notification lag must never use the queue writer")),
+            Arc::new(|_, _, _| panic!("notification lag must never use the queue writer")),
         );
     recover_relay_notification_forwarder(
         &app.relay_plane.inner.transport,
@@ -3717,13 +3774,13 @@ fn loss_authority_notification_cannot_claim_the_queue_writer() {
 #[tokio::test]
 async fn loss_authority_persists_count_growth_after_the_first_queue_write() {
     let overflow = AccountDeliveryOverflowState::default();
-    overflow.record_drop(1);
+    overflow.record_drop(1, Some(1));
     assert!(overflow.start_marker_persistence());
     overflow
-        .persist_marker_before_drop(Arc::new(|_, _| Ok(())))
+        .persist_marker_before_drop(Arc::new(|_, _, _| Ok(())))
         .await;
     let original = overflow.pending_snapshot().unwrap();
-    overflow.record_drop(1);
+    overflow.record_drop(1, Some(1));
     assert!(
         overflow.start_marker_persistence(),
         "new count must reach durable evidence"
@@ -3731,7 +3788,7 @@ async fn loss_authority_persists_count_growth_after_the_first_queue_write() {
     let observed = Arc::new(AtomicUsize::new(0));
     let count = observed.clone();
     overflow
-        .persist_marker_before_drop(Arc::new(move |token, dropped| {
+        .persist_marker_before_drop(Arc::new(move |token, dropped, _| {
             assert_eq!(token, original.marker_token);
             count.store(dropped as usize, Ordering::SeqCst);
             Ok(())
@@ -3764,11 +3821,11 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
     let (sender, mut receiver) = mpsc::channel(2);
     let latest = Arc::new(AtomicUsize::new(0));
     let observed = latest.clone();
-    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, count| {
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, count, _| {
         observed.store(count as usize, Ordering::SeqCst);
         Ok(())
     });
-    let signal = overflow.record_drop(1);
+    let signal = overflow.record_drop(1, Some(1));
     persist_queue_loss(&sender, &overflow, marker.clone(), signal);
     timeout(Duration::from_secs(2), async {
         while sender.capacity() == 2 {
@@ -3777,7 +3834,7 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
     })
     .await
     .unwrap();
-    let signal = overflow.record_drop(1);
+    let signal = overflow.record_drop(1, Some(1));
     assert!(signal.is_none(), "existing control record remains queued");
     persist_queue_loss(&sender, &overflow, marker, signal);
     timeout(Duration::from_secs(2), async {
