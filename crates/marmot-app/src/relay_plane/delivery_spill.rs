@@ -2,11 +2,13 @@
 //!
 //! The shared router must never wait on one account's slow consumer. When an
 //! account queue is full, the router hands the delivery to that account's
-//! spill instead of dropping it. One writer task per account stores hand-offs
-//! in the account database; the account worker later admits spilled rows
-//! through its ordinary ingest path. A delivery is lost, and becomes a
-//! queue-loss generation, only when the hand-off or the durable spill is full,
-//! or the store keeps failing.
+//! spill instead of dropping it. It does the same with a delivery a restart
+//! would no longer fetch only because a live ingest promoted the transport
+//! cursor past it, which the in-memory queue must never hold. One writer task
+//! per account stores hand-offs in the account database; the account worker
+//! later admits spilled rows through its ordinary ingest path. A delivery is
+//! lost, and becomes a queue-loss generation, only when the hand-off or the
+//! durable spill is full, or the store keeps failing.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
@@ -88,10 +90,10 @@ impl AccountDeliverySpill {
         })
     }
 
-    /// Accept a delivery the full queue cannot take, without blocking the
-    /// router. Returns false when the hand-off itself is full. Until the
-    /// writer settles it, an accepted delivery fences the account's transport
-    /// cursor.
+    /// Accept a delivery the router placed in the spill, without blocking
+    /// it. Returns false when the hand-off itself is full. The placement
+    /// already counted the delivery in the account's transport-cursor fence,
+    /// and the writer releases that count when it settles the delivery.
     pub(super) fn offer(self: &Arc<Self>, delivery: TransportDelivery) -> bool {
         let size = retained_size(&delivery);
         let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
@@ -100,7 +102,6 @@ impl AccountDeliverySpill {
         {
             return false;
         }
-        self.overflow.begin_spill();
         handoff.bytes += size;
         handoff.items.push_back(delivery);
         if !handoff.writing {

@@ -1455,7 +1455,7 @@ fn epoch_gap_probe(nostr_group_id_hex: &str, created_at: u64, marker: &str) -> N
     NostrTransportEvent::from_nostr_event(&event).expect("convert epoch-gap probe")
 }
 
-async fn inject_epoch_gap_probe(app: &MarmotApp, event: NostrTransportEvent) {
+pub(crate) async fn inject_epoch_gap_probe(app: &MarmotApp, event: NostrTransportEvent) {
     let delivered = app
         .relay_plane
         .handle_relay_event_for_test(NostrRelayEvent {
@@ -4928,7 +4928,7 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
 /// Run app-runtime integration chains on a stack large enough for debug
 /// OpenMLS group creation. Smaller stacks are insufficient once a
 /// test composes the account worker with maintenance and push lifecycle work.
-fn run_composed_app_runtime_test<F, Fut>(thread_name: &str, body: F)
+pub(crate) fn run_composed_app_runtime_test<F, Fut>(thread_name: &str, body: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + 'static,
@@ -13708,6 +13708,505 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let reopened = client_on_app_relay_plane(&app, "alice").await;
         assert!(reopened.delivery_overflow_recovery_pending);
         assert_eq!(reopened.state.last_transport_timestamp, Some(cursor_before));
+    });
+}
+
+/// One account that opened with `cursor_before` persisted, owns a group, and
+/// has every subscription past end-of-stored-events, so live ingests may
+/// promote its transport cursor.
+pub(crate) struct LiveCursorFixture {
+    pub(crate) app: MarmotApp,
+    pub(crate) client: crate::AppClient,
+    account_id: MemberId,
+    nostr_group_id_hex: String,
+    pub(crate) cursor_before: u64,
+    _eose: ScriptedEosePump,
+    _dir: tempfile::TempDir,
+}
+
+impl LiveCursorFixture {
+    pub(crate) async fn open() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane = MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            true,
+        );
+        let cursor_before = crate::unix_now_seconds().saturating_sub(10_000);
+        app.ensure_account_state("alice").unwrap();
+        let mut seeded = app.load_state("alice").unwrap();
+        seeded.last_transport_timestamp = Some(cursor_before);
+        app.save_state(&seeded).unwrap();
+        let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = client.create_group("live cursor", &[]).await.unwrap();
+        let nostr_group_id_hex = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection")
+            .nostr_routing
+            .nostr_group_id_hex;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !client.adapter.account_subscription_eose().await.complete() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every subscription finishes replaying stored history");
+        let fixture = Self {
+            app,
+            client,
+            account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+            nostr_group_id_hex,
+            cursor_before,
+            _eose: eose,
+            _dir: dir,
+        };
+        assert_eq!(fixture.persisted(), Some(cursor_before));
+        fixture
+    }
+
+    pub(crate) fn persisted(&self) -> Option<u64> {
+        self.app
+            .load_state("alice")
+            .unwrap()
+            .last_transport_timestamp
+    }
+
+    pub(crate) fn probe(&self, created_at: u64, marker: &str) -> NostrTransportEvent {
+        epoch_gap_probe(&self.nostr_group_id_hex, created_at, marker)
+    }
+
+    /// The account's delivery of `event`, built as the router receives it
+    /// but not handed to it.
+    pub(crate) async fn delivery(
+        &self,
+        event: NostrTransportEvent,
+    ) -> cgka_traits::TransportDelivery {
+        self.client
+            .adapter
+            .recovered_deliveries(NostrRelayEvent {
+                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                subscription_id: Some("live-cursor-test".to_owned()),
+                event,
+            })
+            .await
+            .unwrap()
+            .pop()
+            .expect("the group route receives the probe")
+    }
+
+    /// Route `late` synchronously at `point` of the next live promotion.
+    fn land_during_promotion(
+        &mut self,
+        point: crate::client::LiveCursorSeal,
+        late: cgka_traits::TransportDelivery,
+    ) {
+        let plane = self.app.relay_plane.clone();
+        let mut late = Some(late);
+        *self.client.live_cursor_seal_probe.get_mut().unwrap() = Some(Box::new(move |at| {
+            if at == point
+                && let Some(late) = late.take()
+            {
+                plane.route_account_delivery_for_test(late);
+            }
+        }));
+    }
+
+    pub(crate) async fn wait_for_queue_depth(&self, depth: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self
+                .app
+                .relay_plane
+                .relay_health()
+                .await
+                .account_delivery_queue_depth
+                < depth
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the router queues every injected probe");
+    }
+
+    pub(crate) async fn ingest_next_live_delivery(&mut self) -> String {
+        let received =
+            tokio::time::timeout(Duration::from_secs(5), self.client.receive_next_delivery())
+                .await
+                .expect("a delivery is ready")
+                .unwrap();
+        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            panic!("a live delivery must not produce a control record");
+        };
+        let event_id = hex::encode(delivery.message.id.as_slice());
+        self.client
+            .ingest_received_delivery(*delivery)
+            .await
+            .unwrap();
+        event_id
+    }
+
+    /// Ingest one live probe at `created_at` and return the delivery built
+    /// for a probe at `late_at`, which a test lands during that promotion.
+    async fn late_delivery_for_promotion(
+        &mut self,
+        created_at: u64,
+        late_at: u64,
+    ) -> (NostrTransportEvent, cgka_traits::TransportDelivery) {
+        let late = self.probe(late_at, "late");
+        let delivery = self.delivery(late.clone()).await;
+        inject_epoch_gap_probe(&self.app, self.probe(created_at, "promoting")).await;
+        self.wait_for_queue_depth(1).await;
+        (late, delivery)
+    }
+}
+
+#[test]
+fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history() {
+    run_composed_app_runtime_test("live-cursor-before-eose", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let cursor_before = crate::unix_now_seconds().saturating_sub(10_000);
+        app.ensure_account_state("alice").unwrap();
+        let mut seeded = app.load_state("alice").unwrap();
+        seeded.last_transport_timestamp = Some(cursor_before);
+        app.save_state(&seeded).unwrap();
+        // No relay reports end-of-stored-events: the relays may still be
+        // replaying stored history newest-first.
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = client.create_group("live cursor", &[]).await.unwrap();
+        let nostr_group_id_hex = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection")
+            .nostr_routing
+            .nostr_group_id_hex;
+        assert!(!client.adapter.account_subscription_eose().await.complete());
+        inject_epoch_gap_probe(
+            &app,
+            epoch_gap_probe(&nostr_group_id_hex, cursor_before + 4_000, "replaying"),
+        )
+        .await;
+        let received = client.receive_next_delivery().await.unwrap();
+        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            panic!("a live delivery must not produce a control record");
+        };
+        client.ingest_received_delivery(*delivery).await.unwrap();
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(cursor_before + 4_000)
+        );
+        assert_eq!(
+            app.load_state("alice").unwrap().last_transport_timestamp,
+            Some(cursor_before),
+            "mid-replay, the durable cursor keeps the older floor"
+        );
+    });
+}
+
+#[test]
+fn live_ingest_promotes_the_cursor_as_far_as_a_restart_still_fetches_the_queue() {
+    run_composed_app_runtime_test("live-cursor-promotion", || async {
+        let mut fixture = LiveCursorFixture::open().await;
+        let cursor_before = fixture.cursor_before;
+        for (created_at, marker) in [
+            (cursor_before + 4_000, "newer"),
+            (cursor_before + 1_000, "older"),
+        ] {
+            inject_epoch_gap_probe(&fixture.app, fixture.probe(created_at, marker)).await;
+        }
+        fixture.wait_for_queue_depth(2).await;
+
+        fixture.ingest_next_live_delivery().await;
+        assert_eq!(
+            fixture.persisted(),
+            Some(cursor_before + 1_000 + 120),
+            "the older delivery still queued caps the promotion where a restart refetches it"
+        );
+        fixture.ingest_next_live_delivery().await;
+        assert_eq!(
+            fixture.persisted(),
+            Some(cursor_before + 4_000),
+            "once the queue is empty the cursor reaches what the account ingested"
+        );
+    });
+}
+
+#[test]
+fn a_delivery_arriving_before_the_live_seal_caps_the_promotion() {
+    run_composed_app_runtime_test("live-cursor-arrival-before-seal", || async {
+        let mut fixture = LiveCursorFixture::open().await;
+        let cursor_before = fixture.cursor_before;
+        let late_at = cursor_before + 1_000;
+        let (_, late) = fixture
+            .late_delivery_for_promotion(cursor_before + 4_000, late_at)
+            .await;
+        // It arrives while the promotion reads end-of-stored-events, after
+        // any queue observation made so far.
+        fixture.land_during_promotion(crate::client::LiveCursorSeal::Before, late);
+        fixture.ingest_next_live_delivery().await;
+
+        let persisted = fixture.persisted();
+        assert_eq!(persisted, Some(late_at + 120));
+        assert!(
+            fixture
+                .app
+                .relay_plane
+                .subscription_rebuild_since(persisted)
+                .is_some_and(|since| since.0 <= late_at),
+            "a stop before its ingest leaves a restart that fetches it again"
+        );
+        fixture.ingest_next_live_delivery().await;
+        assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
+    });
+}
+
+#[test]
+fn a_delivery_arriving_during_the_promoting_save_is_spilled_and_survives_a_stop() {
+    run_composed_app_runtime_test("live-cursor-arrival-during-save", || async {
+        let mut fixture = LiveCursorFixture::open().await;
+        let cursor_before = fixture.cursor_before;
+        let late_at = cursor_before + 1_000;
+        let (late, delivery) = fixture
+            .late_delivery_for_promotion(cursor_before + 4_000, late_at)
+            .await;
+        // It arrives after the promotion's decision, while its save runs.
+        fixture.land_during_promotion(crate::client::LiveCursorSeal::After, delivery);
+        fixture.ingest_next_live_delivery().await;
+
+        let persisted = fixture.persisted();
+        assert_eq!(persisted, Some(cursor_before + 4_000));
+        assert!(
+            fixture
+                .app
+                .relay_plane
+                .subscription_rebuild_since(persisted)
+                .is_some_and(|since| since.0 > late_at),
+            "the regression needs a restart floor above the late delivery"
+        );
+        assert!(
+            fixture
+                .client
+                .adapter
+                .try_receive_account_delivery()
+                .is_none(),
+            "the queue never holds a delivery below the promoted floor"
+        );
+        let storage = fixture.app.account_storage("alice").unwrap();
+        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let rows = storage
+                    .spilled_account_deliveries(10, crate::unix_now_seconds())
+                    .unwrap()
+                    .deliveries;
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the late delivery becomes a durable spill row");
+        assert_eq!(spilled.len(), 1);
+        assert_eq!(
+            hex::encode(spilled[0].delivery.message.id.as_slice()),
+            late.id
+        );
+
+        // Stop before it is ingested. The reopened account admits it from
+        // the spill, not from relays that its restart floor no longer asks.
+        let LiveCursorFixture {
+            app,
+            client,
+            _eose,
+            _dir,
+            ..
+        } = fixture;
+        drop(client);
+        let mut reopened = client_on_app_relay_plane(&app, "alice").await;
+        let received =
+            tokio::time::timeout(Duration::from_secs(5), reopened.receive_next_delivery())
+                .await
+                .expect("the spilled delivery is ready after the stop")
+                .unwrap();
+        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            panic!("a spilled delivery must not produce a control record");
+        };
+        assert_eq!(hex::encode(delivery.message.id.as_slice()), late.id);
+        reopened.ingest_received_delivery(*delivery).await.unwrap();
+        assert!(reopened.transport_receipts().unwrap().contains(&late.id));
+        assert!(
+            storage
+                .spilled_account_deliveries(10, crate::unix_now_seconds())
+                .unwrap()
+                .deliveries
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn a_delivery_arriving_during_the_promoting_save_without_a_spill_is_bounded_loss() {
+    run_composed_app_runtime_test("live-cursor-arrival-without-spill", || async {
+        let mut fixture = LiveCursorFixture::open().await;
+        let cursor_before = fixture.cursor_before;
+        assert!(
+            fixture
+                .app
+                .relay_plane
+                .disable_account_delivery_spill_for_test(&fixture.account_id)
+        );
+        let late_at = cursor_before + 1_000;
+        let (_, delivery) = fixture
+            .late_delivery_for_promotion(cursor_before + 4_000, late_at)
+            .await;
+        fixture.land_during_promotion(crate::client::LiveCursorSeal::After, delivery);
+        fixture.ingest_next_live_delivery().await;
+
+        assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
+        assert!(
+            fixture.client.delivery_loss_blocks_cursor(),
+            "the loss fences the cursor at once"
+        );
+        let storage = fixture.app.account_storage("alice").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while storage
+                .recovery_loss_goal_floor("alice", storage_sqlite::RecoveryLossCause::Queue)
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the loss marker becomes durable");
+        assert_eq!(
+            storage
+                .recovery_loss_goal_floor("alice", storage_sqlite::RecoveryLossCause::Queue)
+                .unwrap(),
+            Some(late_at),
+            "recovery compares from the lost delivery, below the promoted floor"
+        );
+    });
+}
+
+#[test]
+fn deliveries_older_than_the_promoted_floor_go_through_the_spill_and_are_all_admitted() {
+    run_composed_app_runtime_test("live-cursor-older-burst", || async {
+        let mut fixture = LiveCursorFixture::open().await;
+        let cursor_before = fixture.cursor_before;
+        inject_epoch_gap_probe(&fixture.app, fixture.probe(cursor_before + 4_000, "newest")).await;
+        fixture.wait_for_queue_depth(1).await;
+        fixture.ingest_next_live_delivery().await;
+        assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
+
+        // A replay of stored history the promoted floor no longer covers,
+        // such as a relay that restarts a subscription after reconnecting.
+        const OLDER: u64 = 8;
+        let mut older = Vec::new();
+        for index in 0..OLDER {
+            let event = fixture.probe(cursor_before + 2_000 + index, &format!("older-{index}"));
+            older.push(event.id.clone());
+            inject_epoch_gap_probe(&fixture.app, event).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture
+                .app
+                .relay_plane
+                .relay_health()
+                .await
+                .account_delivery_spilled
+                < OLDER
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every older delivery is spilled");
+        assert_eq!(
+            fixture
+                .app
+                .relay_plane
+                .relay_health()
+                .await
+                .account_delivery_queue_depth,
+            0
+        );
+        for _ in 0..OLDER {
+            fixture.ingest_next_live_delivery().await;
+        }
+        let receipts = fixture.client.transport_receipts().unwrap();
+        for id in &older {
+            assert!(
+                receipts.contains(id),
+                "a spilled older delivery was admitted"
+            );
+        }
+        assert!(!fixture.client.delivery_loss_blocks_cursor());
+        assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
+    });
+}
+
+#[test]
+fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
+    run_composed_app_runtime_test("live-cursor-omission-fence", || async {
+        let mut fixture = LiveCursorFixture::open().await;
+        let cursor_before = fixture.cursor_before;
+        assert!(
+            fixture
+                .app
+                .relay_plane
+                .disable_account_delivery_spill_for_test(&fixture.account_id)
+        );
+        let marker_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = marker_attempts.clone();
+        let marker: crate::relay_plane::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable)
+        });
+        assert!(
+            fixture
+                .app
+                .relay_plane
+                .set_account_delivery_recovery_marker_for_test(&fixture.account_id, marker)
+        );
+        for index in 0..=crate::relay_plane::ACCOUNT_DELIVERY_BUFFER {
+            inject_epoch_gap_probe(
+                &fixture.app,
+                fixture.probe(
+                    cursor_before + 4_000 - index as u64,
+                    &format!("burst-{index}"),
+                ),
+            )
+            .await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while marker_attempts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the omission starts its marker writer");
+        fixture.ingest_next_live_delivery().await;
+        assert_eq!(
+            fixture.persisted(),
+            Some(cursor_before),
+            "the omission's process-local fence holds the durable cursor before its marker lands"
+        );
     });
 }
 

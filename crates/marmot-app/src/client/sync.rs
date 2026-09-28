@@ -599,6 +599,16 @@ fn epoch_backfill_terminal_rows(
         .collect()
 }
 
+/// The cursor a settled commit chose, from
+/// [`AppClient::seal_settled_transport_cursor`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SettledTransportCursor {
+    /// The cursor the commit replaced, restored if its save fails.
+    pub(crate) previous: Option<u64>,
+    /// What the commit reached on its own; `None` when a fence held it.
+    reached: Option<u64>,
+}
+
 /// What one delivery's ingest settled, for the two seams that decide whether the
 /// delivery may be dropped from the fetch path.
 struct DeliveryIngest {
@@ -1079,6 +1089,83 @@ impl AppClient {
 
     pub(crate) fn delivery_loss_blocks_cursor(&self) -> bool {
         self.delivery_overflow_recovery_pending || self.adapter.delivery_loss_blocks_cursor()
+    }
+
+    /// Whether a live ingest may promote the transport cursor with its own
+    /// save: the cursor advances, restarts rebuild from it, no loss is
+    /// pending, and every account subscription finished replaying stored
+    /// history. Relays replay newest-first, so a promotion mid-replay would
+    /// leave the rest of the replay below the restart floor, and all of it
+    /// would go to the spill.
+    async fn live_cursor_promotion_ready(&self) -> bool {
+        self.app.cursor_persistence() == CursorPersistence::Advance
+            && self
+                .relay_plane
+                .subscription_rebuild_lookback_secs()
+                .is_some()
+            && !self.delivery_loss_blocks_cursor()
+            && self.adapter.account_subscription_eose().await.complete()
+    }
+
+    /// Promote the cursor the next save persists to what this live ingest
+    /// reached. The seal under the router's placement lock is the commit's
+    /// only decision point, so nothing observed earlier (the EOSE read, the
+    /// queue) can go stale before it. A delivery queued before the seal caps
+    /// the promotion where a restart still fetches it. One placed after the
+    /// seal, while the save runs, sees the raised floor, and if it falls
+    /// below it the router spills it instead of queueing it.
+    fn promote_live_transport_cursor(&mut self) {
+        #[cfg(test)]
+        self.probe_live_cursor_seal(super::LiveCursorSeal::Before);
+        let reached = self.adapter.seal_transport_cursor(
+            self.state.last_transport_timestamp,
+            crate::relay_plane::TransportCursorCommit::Live,
+        );
+        self.checkpointed_transport_timestamp = self.checkpointed_transport_timestamp.max(reached);
+        #[cfg(test)]
+        self.probe_live_cursor_seal(super::LiveCursorSeal::After);
+    }
+
+    /// The save that would have persisted a live promotion failed, so
+    /// `restored` is still the persisted cursor. Keep it, and lower the
+    /// restart floor the seal raised back to it.
+    fn abandon_live_transport_cursor(&mut self, restored: Option<u64>) {
+        self.checkpointed_transport_timestamp = restored;
+        self.adapter.unseal_transport_cursor(restored);
+    }
+
+    #[cfg(test)]
+    fn probe_live_cursor_seal(&mut self, point: super::LiveCursorSeal) {
+        if let Some(probe) = self
+            .live_cursor_seal_probe
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            probe(point);
+        }
+    }
+
+    /// Choose the cursor a drain checkpoint, settled loss or retired notice
+    /// persists. Returns the cursor it replaces, for the error path, and
+    /// what the commit reached on its own, for
+    /// [`Self::settle_transport_cursor`] once its save succeeds.
+    pub(crate) fn seal_settled_transport_cursor(&mut self) -> SettledTransportCursor {
+        let previous = self.checkpointed_transport_timestamp;
+        let reached = self.adapter.seal_transport_cursor(
+            self.state.last_transport_timestamp,
+            crate::relay_plane::TransportCursorCommit::Settled,
+        );
+        self.checkpointed_transport_timestamp = previous.max(reached);
+        SettledTransportCursor { previous, reached }
+    }
+
+    /// A settled commit's save succeeded. Only what it reached on its own
+    /// becomes the settled floor: a cursor an earlier live promotion left
+    /// persisted must not, or the router would stop spilling what only that
+    /// promotion exposed.
+    pub(crate) fn settle_transport_cursor(&self, sealed: SettledTransportCursor) {
+        self.adapter.settle_transport_cursor(sealed.reached);
     }
 
     fn observe_delivery_overflow(
@@ -2226,7 +2313,7 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {
         // A spilled delivery gets exactly the live path's one ingest attempt.
-        let result = self.ingest_received_delivery_once(delivery).await;
+        let result = self.ingest_received_delivery_once(delivery, true).await;
         self.settle_spilled_delivery();
         result.map(|(summary, _)| summary)
     }
@@ -2243,14 +2330,18 @@ impl AppClient {
             self.record_durable_transport_reconciliation_delivery(&delivery);
             return Ok((SyncSummary::default(), RecoveredDelivery::AlreadyHeld));
         }
-        self.ingest_received_delivery_once(delivery)
+        self.ingest_received_delivery_once(delivery, false)
             .await
             .map_err(|(_, _, _, error, _)| error)
     }
 
+    /// Ingest one delivery and checkpoint it. A live delivery (`live_cursor`)
+    /// may also promote the transport cursor with that checkpoint; see
+    /// [`Self::promote_live_transport_cursor`].
     async fn ingest_received_delivery_once(
         &mut self,
         delivery: cgka_traits::TransportDelivery,
+        live_cursor: bool,
     ) -> Result<
         (SyncSummary, RecoveredDelivery),
         (SyncSummary, bool, bool, AppError, SyncFailureStage),
@@ -2301,19 +2392,28 @@ impl AppClient {
             self.remember_seen_event(event_id);
         }
         let routes_dirty = ingested.routes_dirty;
+        let promote = live_cursor && self.live_cursor_promotion_ready().await;
+        let checkpointed_before = self.checkpointed_transport_timestamp;
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
-        if routes_dirty
-            && let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
-        {
-            return Err((
-                summary,
-                true,
-                routes_dirty,
-                error,
-                SyncFailureStage::StatePersist,
-            ));
+        if routes_dirty {
+            if promote {
+                self.promote_live_transport_cursor();
+            }
+            if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
+            {
+                if promote {
+                    self.abandon_live_transport_cursor(checkpointed_before);
+                }
+                return Err((
+                    summary,
+                    true,
+                    routes_dirty,
+                    error,
+                    SyncFailureStage::StatePersist,
+                ));
+            }
         }
         let refresh = match self.refresh_group_routes() {
             Ok(refresh) => refresh,
@@ -2332,16 +2432,24 @@ impl AppClient {
         // when route retirement just mutated persisted group state. The
         // routing-table delta lives in memory and obligates a subscription
         // refresh, not a second identical state write.
-        if (!routes_dirty || refresh.state_pruned)
-            && let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
-        {
-            return Err((
-                summary,
-                true,
-                routes_dirty,
-                error,
-                SyncFailureStage::StatePersist,
-            ));
+        if !routes_dirty || refresh.state_pruned {
+            if promote && !routes_dirty {
+                self.promote_live_transport_cursor();
+            }
+            if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears()
+            {
+                // With dirty routes the first save already persisted it.
+                if promote && !routes_dirty {
+                    self.abandon_live_transport_cursor(checkpointed_before);
+                }
+                return Err((
+                    summary,
+                    true,
+                    routes_dirty,
+                    error,
+                    SyncFailureStage::StatePersist,
+                ));
+            }
         }
         self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
         self.drain_epoch_stall_escalations(&mut summary);
@@ -2994,10 +3102,14 @@ impl AppClient {
         } else {
             false
         };
-        let checkpointed_before = self.checkpointed_transport_timestamp;
-        if !self.delivery_loss_blocks_cursor() {
-            self.checkpointed_transport_timestamp = self.state.last_transport_timestamp;
-        }
+        let sealed = if self.delivery_overflow_recovery_pending {
+            SettledTransportCursor {
+                previous: self.checkpointed_transport_timestamp,
+                reached: None,
+            }
+        } else {
+            self.seal_settled_transport_cursor()
+        };
         let checkpoint = if cfg!(feature = "test-policy-overrides")
             && self
                 .app
@@ -3012,9 +3124,10 @@ impl AppClient {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
         };
         if let Err(error) = checkpoint {
-            self.checkpointed_transport_timestamp = checkpointed_before;
+            self.checkpointed_transport_timestamp = sealed.previous;
             return Err(SyncCheckpointError::BeforePersistence(error));
         }
+        self.settle_transport_cursor(sealed);
 
         summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
 
@@ -4439,18 +4552,18 @@ impl AppClient {
                 // Every drained prefix was persisted while the loss fence held
                 // the old cursor. Promote the admitted candidate only after the
                 // exact live acknowledgment and durable evidence reclamation.
-                let previous = self.checkpointed_transport_timestamp;
-                self.checkpointed_transport_timestamp = self.state.last_transport_timestamp;
+                let sealed = self.seal_settled_transport_cursor();
                 if let Err(error) =
                     self.save_state_with_pending_local_group_deletion_frontier_clears()
                 {
-                    self.checkpointed_transport_timestamp = previous;
+                    self.checkpointed_transport_timestamp = sealed.previous;
                     return Err(ClassifiedSyncFailure::at_stage(
                         result.as_ref().ok().cloned().unwrap_or_default(),
                         error,
                         SyncFailureStage::StatePersist,
                     ));
                 }
+                self.settle_transport_cursor(sealed);
             }
         }
         if let Some(guard) = execution.overflow_guard.as_mut() {
@@ -6282,6 +6395,81 @@ mod membership_change_tests {
         let admin = GroupStateChange::AdminAdded { member };
         assert!(member_departure(&added).is_none());
         assert!(member_departure(&admin).is_none());
+    }
+}
+
+#[cfg(test)]
+mod live_cursor_checkpoint_tests {
+    use super::SyncSummary;
+    use crate::tests::{LiveCursorFixture, run_composed_app_runtime_test};
+
+    /// A drain checkpoint a fence held reaches nothing of its own. The cursor
+    /// it re-persists came from an earlier live promotion, so it must not
+    /// become the settled floor, or the router would queue what only that
+    /// promotion stopped a restart from fetching.
+    #[test]
+    fn a_fenced_drain_checkpoint_keeps_spilling_what_live_promotion_exposed() {
+        run_composed_app_runtime_test("live-cursor-fenced-drain", || async {
+            let mut fixture = LiveCursorFixture::open().await;
+            let cursor_before = fixture.cursor_before;
+            crate::tests::inject_epoch_gap_probe(
+                &fixture.app,
+                fixture.probe(cursor_before + 4_000, "promoting"),
+            )
+            .await;
+            fixture.wait_for_queue_depth(1).await;
+            fixture.ingest_next_live_delivery().await;
+            assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
+
+            let first = fixture
+                .delivery(fixture.probe(cursor_before + 1_000, "first"))
+                .await;
+            let second = fixture
+                .delivery(fixture.probe(cursor_before + 1_001, "second"))
+                .await;
+            // The spill writer has not run yet, so its hand-off fences the
+            // drain checkpoint that follows, which a later ingest would
+            // otherwise have moved past the live promotion.
+            fixture
+                .app
+                .relay_plane
+                .route_account_delivery_for_test(first);
+            assert!(fixture.client.adapter.delivery_loss_blocks_cursor());
+            fixture.client.state.last_transport_timestamp = Some(cursor_before + 5_000);
+            fixture
+                .client
+                .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 0)
+                .await
+                .unwrap_or_else(|_| panic!("the checkpoint saves"));
+            assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
+
+            fixture
+                .app
+                .relay_plane
+                .route_account_delivery_for_test(second);
+            assert!(
+                fixture
+                    .client
+                    .adapter
+                    .try_receive_account_delivery()
+                    .is_none(),
+                "a delivery only the live promotion exposed is still spilled"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while fixture
+                    .app
+                    .relay_plane
+                    .relay_health()
+                    .await
+                    .account_delivery_spilled
+                    < 2
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("both deliveries become durable spill rows");
+        });
     }
 }
 

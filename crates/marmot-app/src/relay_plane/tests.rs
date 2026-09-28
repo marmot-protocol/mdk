@@ -182,6 +182,7 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
         AccountDeliveryRoute {
             sender: delivery_tx,
             overflow: Arc::new(AccountDeliveryOverflowState::default()),
+            epoch: 0,
             recovery_marker: None,
             spill: None,
         },
@@ -2853,6 +2854,451 @@ async fn spill_hand_off_bounds_deliveries_with_empty_payloads() {
         "accepted {accepted} empty deliveries"
     );
     release.store(true, Ordering::SeqCst);
+}
+
+/// The cursor the account opened with, and the plane's rebuild lookback, in
+/// the cursor-floor tests below.
+const OPENED_CURSOR: u64 = 1_700_000_000;
+const CURSOR_LOOKBACK: u64 = 30;
+
+fn cursor_floor_delivery(
+    account: &MemberId,
+    id: u8,
+    created_at: u64,
+    plane: TransportDeliveryPlane,
+) -> TransportDelivery {
+    TransportDelivery {
+        account_id: account.clone(),
+        group_id_hint: None,
+        message: TransportMessage {
+            id: MessageId::new(vec![id; 32]),
+            payload: vec![id; 8],
+            timestamp: Timestamp(created_at),
+            causal_deps: Vec::new(),
+            source: TransportSource(NOSTR_SOURCE.to_owned()),
+            envelope: if plane == TransportDeliveryPlane::AccountInbox {
+                TransportEnvelope::Welcome {
+                    recipient: account.clone(),
+                }
+            } else {
+                TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![0xD3; 32],
+                }
+            },
+        },
+        received_at: Timestamp(created_at),
+        source: TransportDeliverySource {
+            transport: TransportSource(NOSTR_SOURCE.to_owned()),
+            plane,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    }
+}
+
+/// A spill store that keeps every delivery it is handed.
+fn recording_spill_store() -> (
+    AccountDeliverySpillStore,
+    Arc<StdMutex<Vec<TransportDelivery>>>,
+) {
+    let kept = Arc::new(StdMutex::new(Vec::new()));
+    let spill = kept.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        spill.lock().unwrap().extend(deliveries.iter().cloned());
+        Ok(vec![
+            storage_sqlite::DeliverySpillDisposition::Stored;
+            deliveries.len()
+        ])
+    });
+    (store, kept)
+}
+
+fn cursor_floor_adapter(
+    store: Option<AccountDeliverySpillStore>,
+    marker: Option<AccountDeliveryRecoveryMarker>,
+) -> (MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MemberId) {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane =
+        MarmotRelayPlane::new(Some(Duration::from_secs(CURSOR_LOOKBACK)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let adapter =
+        relay_plane.account_adapter_with_recovery_marker(alice.clone(), relay, marker, store);
+    adapter.open_transport_cursor(Some(OPENED_CURSOR));
+    (relay_plane, adapter, alice)
+}
+
+/// Timestamps of the deliveries now in the account queue, in order.
+fn drain_queued_created_at(adapter: &MarmotRelayPlaneAccountAdapter) -> Vec<u64> {
+    let mut queued = Vec::new();
+    while let Some(received) = adapter.try_receive_account_delivery() {
+        let AccountDeliveryReceive::Delivery(delivery) = received else {
+            panic!("no loss was expected");
+        };
+        queued.push(delivery.message.timestamp.0);
+    }
+    queued
+}
+
+#[tokio::test]
+async fn cursor_seal_stops_where_a_restart_still_fetches_every_queued_delivery() {
+    use TransportCursorCommit::Live;
+    let (store, kept) = recording_spill_store();
+    let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
+    let candidate = Some(OPENED_CURSOR + 2_000);
+    for (id, created_at) in [
+        // Already below the opened floor: a restart would not fetch it
+        // whatever this commit does, so it holds nothing back.
+        (1, OPENED_CURSOR - 1_000),
+        (2, OPENED_CURSOR + 500),
+        (3, OPENED_CURSOR + 1_990),
+    ] {
+        relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+            &alice,
+            id,
+            created_at,
+            TransportDeliveryPlane::Group,
+        ));
+    }
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate, Live),
+        Some(OPENED_CURSOR + 500 + CURSOR_LOOKBACK),
+        "the oldest queued delivery a restart still fetches caps the commit"
+    );
+    assert_eq!(
+        drain_queued_created_at(&adapter),
+        [
+            OPENED_CURSOR - 1_000,
+            OPENED_CURSOR + 500,
+            OPENED_CURSOR + 1_990
+        ]
+    );
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate, Live),
+        candidate,
+        "a delivery the consumer took no longer caps a commit"
+    );
+    // A later, lower candidate reaches only itself, which its caller folds
+    // into the higher cursor it persists; the restart floor stays put.
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 1_000), Live),
+        Some(OPENED_CURSOR + 1_000)
+    );
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        4,
+        OPENED_CURSOR + 1_500,
+        TransportDeliveryPlane::Group,
+    ));
+    timeout(Duration::from_secs(5), async {
+        while adapter.delivery_loss_blocks_cursor() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the spill writer settles the hand-off");
+    assert_eq!(kept.lock().unwrap().len(), 1);
+
+    // An inbox wrap keeps the NIP-59 widening its REQ adds: two days older
+    // than the group floor, it still caps only as far as a restart fetches.
+    let inbox_created_at = OPENED_CURSOR - 100_000;
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        5,
+        inbox_created_at,
+        TransportDeliveryPlane::AccountInbox,
+    ));
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 200_000), Live),
+        Some(
+            inbox_created_at
+                + transport_nostr_adapter::NIP59_TIMESTAMP_TWEAK_SECS
+                + CURSOR_LOOKBACK
+        )
+    );
+}
+
+#[tokio::test]
+async fn deliveries_placed_after_a_live_seal_spill_what_only_that_promotion_stopped_covering() {
+    use TransportCursorCommit::Live;
+    let (store, kept) = recording_spill_store();
+    let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
+    let promoted = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(adapter.seal_transport_cursor(promoted, Live), promoted);
+
+    // Everything below arrives while that promotion's save runs.
+    let live_floor = OPENED_CURSOR + 2_000 - CURSOR_LOOKBACK;
+    for (id, created_at, plane) in [
+        (1, OPENED_CURSOR + 1_000, TransportDeliveryPlane::Group),
+        (2, live_floor, TransportDeliveryPlane::Group),
+        // Below the floor the account opened with: live promotion did not
+        // expose it, so it is queued as before.
+        (3, OPENED_CURSOR - 1_000, TransportDeliveryPlane::Group),
+        (
+            4,
+            OPENED_CURSOR + 1_000 - transport_nostr_adapter::NIP59_TIMESTAMP_TWEAK_SECS,
+            TransportDeliveryPlane::AccountInbox,
+        ),
+        (
+            5,
+            OPENED_CURSOR - 3_600,
+            TransportDeliveryPlane::AccountInbox,
+        ),
+    ] {
+        relay_plane
+            .route_account_delivery_for_test(cursor_floor_delivery(&alice, id, created_at, plane));
+    }
+    assert!(
+        adapter.delivery_loss_blocks_cursor(),
+        "the spilled deliveries fence the cursor from their placement on"
+    );
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 3_000), Live),
+        None,
+        "no commit passes a delivery still in the spill hand-off"
+    );
+    timeout(Duration::from_secs(5), async {
+        while adapter.delivery_loss_blocks_cursor() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the spill writer settles both hand-offs");
+    let mut spilled = kept
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|delivery| delivery.message.id.as_slice()[0])
+        .collect::<Vec<_>>();
+    spilled.sort_unstable();
+    assert_eq!(spilled, [1, 4]);
+    assert_eq!(
+        drain_queued_created_at(&adapter),
+        [live_floor, OPENED_CURSOR - 1_000, OPENED_CURSOR - 3_600]
+    );
+    assert_eq!(relay_plane.relay_health().await.account_delivery_dropped, 0);
+}
+
+#[tokio::test]
+async fn a_settled_commit_moves_the_floor_only_after_its_save_and_spills_nothing() {
+    use TransportCursorCommit::{Live, Settled};
+    let (store, kept) = recording_spill_store();
+    let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
+    let drained = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(adapter.seal_transport_cursor(drained, Settled), drained);
+    // Before its save commits, and after, a drain checkpoint queues what it
+    // passes exactly as it did before live promotion existed.
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        1,
+        OPENED_CURSOR + 1_000,
+        TransportDeliveryPlane::Group,
+    ));
+    adapter.settle_transport_cursor(drained);
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        2,
+        OPENED_CURSOR + 1_001,
+        TransportDeliveryPlane::Group,
+    ));
+    // A live promotion past the drained floor spills only what lies between.
+    let promoted = Some(OPENED_CURSOR + 3_000);
+    assert_eq!(adapter.seal_transport_cursor(promoted, Live), promoted);
+    for (id, created_at) in [(3, OPENED_CURSOR + 2_500), (4, OPENED_CURSOR + 1_500)] {
+        relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+            &alice,
+            id,
+            created_at,
+            TransportDeliveryPlane::Group,
+        ));
+    }
+    timeout(Duration::from_secs(5), async {
+        while adapter.delivery_loss_blocks_cursor() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the spill writer settles the hand-off");
+    assert_eq!(
+        kept.lock()
+            .unwrap()
+            .iter()
+            .map(|delivery| delivery.message.timestamp.0)
+            .collect::<Vec<_>>(),
+        [OPENED_CURSOR + 2_500]
+    );
+    assert_eq!(
+        drain_queued_created_at(&adapter),
+        [
+            OPENED_CURSOR + 1_000,
+            OPENED_CURSOR + 1_001,
+            OPENED_CURSOR + 1_500
+        ]
+    );
+}
+
+#[tokio::test]
+async fn without_a_spill_a_delivery_below_the_live_floor_becomes_bounded_loss() {
+    use TransportCursorCommit::Live;
+    let marked = Arc::new(StdMutex::new(Vec::new()));
+    let recorded = marked.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, dropped, earliest| {
+        recorded.lock().unwrap().push((dropped, earliest));
+        Ok(())
+    });
+    let (relay_plane, adapter, alice) = cursor_floor_adapter(None, Some(marker));
+    let promoted = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(adapter.seal_transport_cursor(promoted, Live), promoted);
+    let lost_at = OPENED_CURSOR + 1_000;
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        1,
+        lost_at,
+        TransportDeliveryPlane::Group,
+    ));
+    assert!(adapter.delivery_loss_blocks_cursor());
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 3_000), Live),
+        None,
+        "pending loss holds every commit"
+    );
+    timeout(Duration::from_secs(5), async {
+        while marked.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the loss becomes a durable marker");
+    assert_eq!(
+        marked.lock().unwrap().last().copied(),
+        Some((1, Some(lost_at))),
+        "the marker bounds recovery at the lost delivery"
+    );
+    let received = timeout(Duration::from_secs(5), adapter.receive_account_delivery())
+        .await
+        .expect("the control record follows its durable marker")
+        .unwrap();
+    assert!(matches!(
+        received,
+        Some(AccountDeliveryReceive::Overflow(overflow))
+            if overflow.dropped == 1 && overflow.earliest_dropped == Some(lost_at)
+    ));
+}
+
+#[tokio::test]
+async fn a_failed_live_save_lowers_the_floor_its_seal_raised() {
+    use TransportCursorCommit::Live;
+    let (store, kept) = recording_spill_store();
+    let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
+    let opened = Some(OPENED_CURSOR);
+    let promoted = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(adapter.seal_transport_cursor(promoted, Live), promoted);
+    // Placed while the save runs, below the promoted floor.
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        1,
+        OPENED_CURSOR + 1_000,
+        TransportDeliveryPlane::Group,
+    ));
+    // The save failed; the opened cursor is still what a restart uses.
+    adapter.unseal_transport_cursor(opened);
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        2,
+        OPENED_CURSOR + 1_001,
+        TransportDeliveryPlane::Group,
+    ));
+    timeout(Duration::from_secs(5), async {
+        while adapter.delivery_loss_blocks_cursor() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the spill writer settles the earlier hand-off");
+    assert_eq!(
+        adapter.seal_transport_cursor(promoted, Live),
+        Some(OPENED_CURSOR + 1_001 + CURSOR_LOOKBACK),
+        "what the restored floor covers is queued, and caps the next commit"
+    );
+    assert_eq!(
+        kept.lock()
+            .unwrap()
+            .iter()
+            .map(|delivery| delivery.message.timestamp.0)
+            .collect::<Vec<_>>(),
+        [OPENED_CURSOR + 1_000],
+        "a delivery spilled before the failure stays spilled"
+    );
+    assert_eq!(drain_queued_created_at(&adapter), [OPENED_CURSOR + 1_001]);
+}
+
+#[tokio::test]
+async fn a_replaced_adapter_cannot_promote_the_cursor() {
+    use TransportCursorCommit::{Live, Settled};
+    let (store, _) = recording_spill_store();
+    let (relay_plane, first, alice) = cursor_floor_adapter(Some(store.clone()), None);
+    let replacement = relay_plane.account_adapter_with_recovery_marker(
+        alice,
+        Arc::new(RecordingRelayClient::default()),
+        None,
+        Some(store),
+    );
+    let candidate = Some(OPENED_CURSOR + 2_000);
+    for commit in [Live, Settled] {
+        assert_eq!(
+            first.seal_transport_cursor(candidate, commit),
+            None,
+            "{commit:?}: the queue it drains is not the one the router tracks"
+        );
+    }
+    assert_eq!(
+        replacement.seal_transport_cursor(candidate, Live),
+        candidate
+    );
+}
+
+/// A settled commit a fence held reaches nothing of its own, so the cursor it
+/// re-persists, which an earlier live promotion set, must not become the
+/// settled floor: what only that promotion exposed is still spilled.
+#[tokio::test]
+async fn a_fenced_settled_commit_keeps_spilling_what_live_promotion_exposed() {
+    use TransportCursorCommit::{Live, Settled};
+    let (store, kept) = recording_spill_store();
+    let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
+    let promoted = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(adapter.seal_transport_cursor(promoted, Live), promoted);
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        1,
+        OPENED_CURSOR + 1_000,
+        TransportDeliveryPlane::Group,
+    ));
+    // A drain checkpoint while that hand-off is unsettled.
+    let reached = adapter.seal_transport_cursor(Some(OPENED_CURSOR + 3_000), Settled);
+    assert_eq!(reached, None);
+    adapter.settle_transport_cursor(reached);
+    timeout(Duration::from_secs(5), async {
+        while adapter.delivery_loss_blocks_cursor() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the spill writer settles the hand-off");
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        2,
+        OPENED_CURSOR + 1_001,
+        TransportDeliveryPlane::Group,
+    ));
+    timeout(Duration::from_secs(5), async {
+        while adapter.delivery_loss_blocks_cursor() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the spill writer settles the second hand-off");
+    assert_eq!(kept.lock().unwrap().len(), 2);
+    assert!(drain_queued_created_at(&adapter).is_empty());
 }
 
 #[tokio::test]

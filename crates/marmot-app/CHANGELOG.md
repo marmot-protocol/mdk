@@ -46,6 +46,15 @@
   its row cannot be decoded, or when it is still unadmitted after 8 retries.
   `RelayPlaneHealth` reports `account_delivery_spilled` and
   `account_delivery_spill_already_seen`. (#1947)
+- A live delivery now promotes the persisted transport cursor with its own checkpoint, once
+  every account subscription has replayed its stored history and no loss is pending. Only a
+  drain checkpoint or settled loss used to, so a restart re-downloaded everything the
+  account had received live since its last drain: on the #2069 scorecard, a full pass of the
+  account's history on each relay. No checkpoint passes a queued delivery that a restart
+  would then no longer fetch. A delivery that arrives while a promotion saves, or later, and
+  falls below the floor only that promotion raised goes to the durable spill instead of the
+  queue, or becomes queue loss bounded by its `created_at` when the spill cannot take it;
+  `account_delivery_spilled` counts it. (#2069)
 
 ### Fixed
 
