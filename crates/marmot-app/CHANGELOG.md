@@ -118,6 +118,17 @@
   current one in full. A locally deleted group no longer lists its current route twice.
   A hidden group's route replaced while it was hidden keeps a full backfill until the
   group is restored. (#2070)
+- Recover end-of-stored-events (EOSE) that a relay notification lag lost. A lost EOSE left
+  its subscription's replay coverage incomplete for good: the next activation
+  re-subscribed instead of reusing the live one, EOSE-gated drains waited out their budget,
+  and post-join maintenance waited for its deadline. A lag still marks no EOSE complete,
+  since it cannot tell a lost one from one still coming. Once the receiver has gone 30
+  seconds without another lag, each REQ issued before the lag is re-issued, unchanged and
+  under its own id, to each relay that has not answered it, and the relay replays from the
+  same `since` before a fresh EOSE. A relay gets each REQ again at most once, and the
+  notification-loss floor does not move. `NostrRelayClient` gains `reissue_subscription`,
+  unsupported by default, and `NostrTransportAdapter` gains
+  `reissue_subscriptions_awaiting_eose`. (#2070)
 
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay
