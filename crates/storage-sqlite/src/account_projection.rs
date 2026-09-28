@@ -241,7 +241,8 @@ pub struct StoredNostrRoute {
     /// Unix seconds when the device saw this route replaced as the group's
     /// current route, which anchors its retained history floor. `None` on a
     /// route still current when recorded, and on routes stored before this
-    /// field existed. Stored inside the route JSON, so no schema change.
+    /// field existed until [`SqliteAccountStorage::stamp_unrecorded_prior_route_switches`]
+    /// stamps them. Stored inside the route JSON, so no schema change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced_at: Option<u64>,
 }
@@ -1762,6 +1763,76 @@ impl SqliteAccountStorage {
             )
             .storage()?;
             Ok(())
+        })
+    }
+
+    /// Stamp each retained route in `account_groups` that has no recorded
+    /// switch time with `now_secs`, and persist the stamp at once. Returns how
+    /// many routes were stamped.
+    ///
+    /// Routes stored before switch times were kept carry none, so the first
+    /// load that finds one anchors its relay history floor there. Writing the
+    /// stamp back immediately keeps that anchor fixed across later loads and
+    /// restarts instead of moving it forward with each launch. The
+    /// local-deletion frontier is left alone. A malformed row is skipped; the
+    /// projection loader reports it.
+    pub fn stamp_unrecorded_prior_route_switches(&self, now_secs: u64) -> StorageResult<usize> {
+        let unstamped = |conn: &rusqlite::Connection| -> StorageResult<Vec<_>> {
+            let mut statement = conn
+                .prepare_cached(
+                    "SELECT group_id_hex, prior_nostr_routes_json
+                     FROM account_groups
+                     WHERE prior_nostr_routes_json <> '[]'",
+                )
+                .storage()?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|(group_id_hex, routes_json)| {
+                    let routes =
+                        serde_json::from_str::<Vec<StoredNostrRoute>>(&routes_json).ok()?;
+                    routes
+                        .iter()
+                        .any(|route| route.replaced_at.is_none())
+                        .then_some((group_id_hex, routes))
+                })
+                .collect())
+        };
+        // Loads find nothing to stamp once the first one has, so only that
+        // one takes the write lock.
+        if unstamped(&*self.lock()?)?.is_empty() {
+            return Ok(0);
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let mut stamped = 0;
+            // Read again under the write lock: another process may have
+            // stamped these routes since.
+            for (group_id_hex, mut routes) in unstamped(&conn)? {
+                for route in routes
+                    .iter_mut()
+                    .filter(|route| route.replaced_at.is_none())
+                {
+                    route.replaced_at = Some(now_secs);
+                    stamped += 1;
+                }
+                let routes_json = serde_json::to_string(&routes)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?;
+                conn.execute_cached(
+                    "UPDATE account_groups
+                     SET prior_nostr_routes_json = ?2
+                     WHERE group_id_hex = ?1",
+                    params![group_id_hex, routes_json],
+                )
+                .storage()?;
+            }
+            Ok(stamped)
         })
     }
 

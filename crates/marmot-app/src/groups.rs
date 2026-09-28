@@ -609,9 +609,11 @@ pub struct AppPriorNostrRoute {
     pub last_epoch: u64,
     /// Unix seconds when this device saw the route replaced as the group's
     /// current route. The retained route's relay history floor is this less
-    /// the clock-skew allowance. `None` on routes recorded before this was
-    /// kept, and on a locally deleted group's route that was replaced while
-    /// the group was hidden; both are backfilled in full.
+    /// the clock-skew allowance. A route recorded before this was kept is
+    /// stamped by the first account load that finds it. `None` until then,
+    /// and on a locally deleted group's route that was replaced while the
+    /// group was hidden, until the first load after the group is restored;
+    /// such a route is backfilled in full.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced_at: Option<u64>,
 }
@@ -1326,8 +1328,8 @@ mod prior_nostr_route_tests {
                 (3, Some(crate::history_floor(OBSERVED_AT))),
                 (4, None),
             ],
-            "duplicates keep the earliest known switch; a route recorded before \
-             switch times were kept has no floor and is backfilled in full"
+            "duplicates keep the earliest known switch; a route with no recorded \
+             switch has no floor and is backfilled in full"
         );
     }
 

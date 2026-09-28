@@ -3013,6 +3013,79 @@ fn retaining_a_local_delete_route_keeps_its_earliest_known_switch() {
 }
 
 #[test]
+fn a_retained_route_stored_without_a_switch_is_stamped_once_at_first_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-retained-routes.sqlite");
+    let key = SqlCipherKey::new("legacy retained route stamp key").unwrap();
+    let route = |id: &str, replaced_at| StoredNostrRoute {
+        nostr_group_id_hex: id.repeat(32),
+        relays: vec![format!("wss://retained-{id}.example")],
+        last_epoch: 2,
+        replaced_at,
+    };
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut legacy = group("aa", "alpha");
+    legacy.prior_nostr_routes = vec![route("11", None), route("22", Some(1_700_000_000))];
+    let mut hidden = group("bb", "beta");
+    hidden.prior_nostr_routes = vec![route("33", None)];
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![legacy, hidden, group("cc", "gamma")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    // A locally deleted group keeps its routes in the frontier, which no
+    // projection loads; they stay as they were.
+    insert_protocol_group_marker(&store, &[0xbb]);
+    store.delete_local_group_data("bb").unwrap();
+    let retained = |store: &SqliteAccountStorage| {
+        store.account_groups(Some("aa")).unwrap()[0]
+            .prior_nostr_routes
+            .clone()
+    };
+
+    let first_load = 1_800_000_000;
+    assert_eq!(
+        store
+            .stamp_unrecorded_prior_route_switches(first_load)
+            .unwrap(),
+        1
+    );
+    let stamped = vec![
+        route("11", Some(first_load)),
+        route("22", Some(1_700_000_000)),
+    ];
+    assert_eq!(retained(&store), stamped);
+    assert_eq!(
+        store.local_group_deletion_prior_nostr_routes("bb").unwrap(),
+        vec![route("33", None)]
+    );
+
+    // Later loads, in this process and after a restart, keep the stamp.
+    assert_eq!(
+        store
+            .stamp_unrecorded_prior_route_switches(first_load + 600)
+            .unwrap(),
+        0
+    );
+    drop(store);
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert_eq!(
+        reopened
+            .stamp_unrecorded_prior_route_switches(first_load + 86_400)
+            .unwrap(),
+        0
+    );
+    assert_eq!(retained(&reopened), stamped);
+}
+
+#[test]
 fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let mut deleted_group = group("aa", "alpha");

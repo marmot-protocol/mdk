@@ -328,7 +328,8 @@ impl AppClient {
                         .unwrap_or_default(),
                     // Still current. A hidden group has no projection to see
                     // its next switch, so the route that switch leaves keeps
-                    // no floor and is backfilled in full.
+                    // no floor and is backfilled in full, until the first
+                    // account load after the group is restored stamps it.
                     replaced_at: None,
                 }],
             )

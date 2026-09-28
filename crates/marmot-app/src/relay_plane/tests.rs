@@ -4428,6 +4428,88 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
     plane.shutdown().await;
 }
 
+/// A retained route stored before switch times were kept is stamped at the
+/// first load after the upgrade, so its REQ is floored and a lag on an
+/// account that has one stays bounded.
+#[tokio::test]
+async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let alice = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let account = MemberId::new(hex::decode(&alice.account_id_hex).unwrap());
+    let config = || crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+
+    // Before the upgrade: a group whose retained route has no switch time.
+    {
+        let app = crate::MarmotApp::with_relay_and_config(dir.path(), url.clone(), config());
+        let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
+        client.prepare_transport().await.unwrap();
+        client
+            .create_group_with_options(
+                "legacy retained route",
+                &[],
+                crate::AppCreateGroupOptions {
+                    relays: Some(vec![url.clone()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let storage = app.account_storage(&alice.label).unwrap();
+        let mut stored = storage
+            .load_account_projection_state(&alice.label, crate::MAX_SEEN_EVENT_IDS)
+            .unwrap();
+        stored.groups[0]
+            .prior_nostr_routes
+            .push(storage_sqlite::StoredNostrRoute {
+                nostr_group_id_hex: hex::encode([0x11; 32]),
+                relays: vec![url.clone()],
+                last_epoch: 0,
+                replaced_at: None,
+            });
+        storage
+            .save_account_projection_state(
+                &stored,
+                crate::MAX_SEEN_EVENT_IDS,
+                crate::TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
+            )
+            .unwrap();
+        app.relay_plane.shutdown().await;
+    }
+
+    let app = crate::MarmotApp::with_relay_and_config(dir.path(), url, config());
+    let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
+    client.prepare_transport().await.unwrap();
+    let sdk = app
+        .relay_plane
+        .inner
+        .transport
+        .sdk_relay_client
+        .clone()
+        .unwrap();
+    let floor = sdk.notification_loss_floor_for_account(&account).await;
+    assert!(
+        matches!(floor, NostrNotificationLossFloor::Since(_)),
+        "every REQ carries a floor, so a lag is bounded: {floor:?}"
+    );
+    let stamp = client.state.groups[0].prior_nostr_routes[0]
+        .replaced_at
+        .expect("the first load stamps the legacy route");
+    let retained = client
+        .routing
+        .snapshot()
+        .group_routes
+        .into_iter()
+        .find(|route| route.transport_group_id == vec![0x11; 32])
+        .expect("the retained route is still routed");
+    assert_eq!(retained.retained_since, Some(crate::history_floor(stamp)));
+    app.relay_plane.shutdown().await;
+}
+
 /// A member that was offline joins from a Welcome made before the group's
 /// next commit. Its live group REQ resumes from the account cursor, after that
 /// commit, so only the post-join maintenance REQ, floored at the Welcome, can

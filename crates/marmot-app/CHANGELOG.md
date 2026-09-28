@@ -89,13 +89,16 @@
   cursor fenced. Maintenance is now floored at the creation of the Welcome that installed
   the copy, never the local join, so a member that was offline still sees the commits
   made between that Welcome and its join. A retained route is floored at the moment the
-  device saw it replaced, and from no later than the account cursor. Both floors sit five
-  minutes below their anchor (`HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`) to absorb clock skew.
-  The routing table now keeps each group's current route first. It used to sort a
-  group's routes by id after a route change, so the adapter could resume a retained route
-  from the cursor and backfill the current one in full. A locally deleted group no longer
-  lists its current route twice. Retained routes recorded before this release, and a
-  hidden group's route replaced while it was hidden, keep a full backfill. (#2070)
+  device saw it replaced, and from no later than the account cursor. A retained route
+  stored before this release has no such moment, so the first account load after the
+  upgrade records one and keeps it: earlier sessions fetched its older traffic, and the
+  comparison covers the rest. Both floors sit fifteen minutes below their anchor
+  (`HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`) to absorb clock skew. The routing table now keeps
+  each group's current route first. It used to sort a group's routes by id after a route
+  change, so the adapter could resume a retained route from the cursor and backfill the
+  current one in full. A locally deleted group no longer lists its current route twice.
+  A hidden group's route replaced while it was hidden keeps a full backfill until the
+  group is restored. (#2070)
 
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay

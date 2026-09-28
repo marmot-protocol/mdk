@@ -466,16 +466,18 @@ const TRANSPORT_CURSOR_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 /// can miss a commit made after the Welcome, and the joining member's first
 /// self-update then forks from the group until the epoch gap is acquired. A
 /// floor too low only re-requests history the member cannot open or already
-/// holds, but a retained route pays that again on every activation.
+/// holds: once per join, and on every activation for a retained route.
 ///
-/// Five minutes is the sender-clock tolerance the stack already assumes
-/// ([`TRANSPORT_CURSOR_MAX_FUTURE_SKEW`] and the stall detector's allowance),
-/// and more than the rebuild lookback every reconnecting live REQ relies on,
-/// so a sender slow enough to fall below this floor already loses events to
-/// ordinary catch-up. Anything a floor misses inside the retained-inventory
-/// window stays within reach of the comparison, which covers current and
-/// retained routes alike.
-const HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(5 * 60);
+/// So the allowance leans wide. Fifteen minutes is the future-dated-event
+/// limit relays commonly enforce, so an inviter whose Add commit a relay
+/// accepted cannot run fast enough to put the floor after the commits that
+/// followed it. It also tolerates committers three times further behind than
+/// the stack's five-minute sender-clock tolerance
+/// ([`TRANSPORT_CURSOR_MAX_FUTURE_SKEW`]). The cost is at most fifteen minutes
+/// of history before each anchor. Anything a floor still misses inside the
+/// retained-inventory window stays within reach of the comparison, which
+/// covers current and retained routes alike.
+const HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(15 * 60);
 const ACCOUNT_WORKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 const ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS: u64 = 500;
@@ -5432,10 +5434,22 @@ impl MarmotApp {
 
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
         self.ensure_account_state(label)?;
-        account_state_from_stored(
-            self.account_storage(label)?
-                .load_account_projection_state(label, MAX_SEEN_EVENT_IDS)?,
-        )
+        let storage = self.account_storage(label)?;
+        // A retained route stored before switch times were kept is anchored
+        // at the first load that finds it, persisted at once so the anchor
+        // stays fixed across later loads. Sessions before the upgrade already
+        // fetched its older traffic, and the comparison covers the rest of the
+        // retained window. A failed stamp leaves the route backfilled in full
+        // and is retried on the next load.
+        if let Err(error) = storage.stamp_unrecorded_prior_route_switches(unix_now_seconds()) {
+            tracing::warn!(
+                target: "marmot_app",
+                method = "load_state",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not record switch times for retained routes"
+            );
+        }
+        account_state_from_stored(storage.load_account_projection_state(label, MAX_SEEN_EVENT_IDS)?)
     }
 
     /// Persist the account snapshot. Concurrent runtimes (the main app and a

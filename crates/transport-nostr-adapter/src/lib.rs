@@ -2412,7 +2412,7 @@ fn group_route_since(
 /// A route that carries a retained floor is retained wherever it sits, so it
 /// never takes the current route's place, even where the relay-safety filter
 /// dropped that route. A floorless route after its group's first is a
-/// retained route recorded before switch times were.
+/// retained route whose switch time the caller does not know.
 fn is_retained_route(
     account_id: &MemberId,
     group: &TransportGroupSubscription,
@@ -2506,8 +2506,8 @@ fn diff_group_subscriptions(
 /// historical routes immediately afterward. A floored retained route is
 /// recognized by its floor (see [`is_retained_route`]), so position decides
 /// only among floorless routes: the first is the current route, which keeps
-/// the account cursor, and a later distinct one is retained from before switch
-/// times were recorded.
+/// the account cursor, and a later distinct one is a retained route whose
+/// switch time the caller does not know.
 fn prior_group_route_keys(
     account_id: &MemberId,
     groups: &[TransportGroupSubscription],

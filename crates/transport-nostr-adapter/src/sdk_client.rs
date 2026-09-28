@@ -4275,7 +4275,8 @@ mod tests {
         };
         let now = crate::unix_now_seconds();
         let welcome = now - 3_600;
-        let floor = welcome - 300;
+        // The app floors maintenance fifteen minutes below the Welcome.
+        let floor = welcome - 900;
         let stored = |created_at: u64, content: &str| {
             EventBuilder::new(Kind::MlsGroupMessage, content)
                 .tags([Tag::custom("h", ["c3".repeat(32)])])
@@ -4284,7 +4285,7 @@ mod tests {
                 .unwrap()
         };
         let before_floor = stored(floor - 1, "history from before the member's epochs");
-        let slow_clock = stored(welcome - 60, "a commit from a clock a minute slow");
+        let slow_clock = stored(welcome - 600, "a commit from a clock ten minutes slow");
         let before_join = stored(welcome + 60, "a commit made while the member was offline");
         for event in [&before_floor, &slow_clock, &before_join] {
             relay.add_event(event.clone()).await.unwrap();

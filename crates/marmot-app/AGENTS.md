@@ -176,12 +176,14 @@ App runtime bridge for the first real Marmot app surfaces.
   `docs/marmot-architecture/overview/dial-safety.md` (validate + pin, trust from config, loopback only under an explicit
   dev flag). Do not add an outbound relay/broker path that bypasses them.
 - Floor every history REQ at an anchor, less `HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE` (`history_floor`, ledger A14): the
-  post-join maintenance REQ at the Welcome that installed the copy (`Group::local_copy_welcome_created_at`, never
-  the local join time, which an offline member reaches long after the Welcome), and a retained route at the moment
-  `refresh_from_group` saw it replaced (`AppPriorNostrRoute::replaced_at`). Keep each group's current route first in
-  the routing table (`replace_group_routes` preserves the caller's order; a new lead is a change): the adapter reads
-  the lead as the route that resumes from the cursor. A locally deleted group lists its current route first too,
-  never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
+  post-join maintenance REQ at the Welcome that installed the copy (`Group::local_copy_welcome_created_at`, never the
+  local join time, which an offline member reaches long after the Welcome), and a retained route at the moment
+  `refresh_from_group` saw it replaced (`AppPriorNostrRoute::replaced_at`). A retained route stored before switch times
+  were kept is stamped by the first `load_state` that finds it, and the stamp is persisted at once
+  (`stamp_unrecorded_prior_route_switches`) so later launches never move its floor forward. Keep each group's current
+  route first in the routing table (`replace_group_routes` preserves the caller's order; a new lead is a change): the
+  adapter reads the lead as the route that resumes from the cursor. A locally deleted group lists its current route
+  first too, never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker
   cleanup a bounded budget. The terminal operation must outlive cancellation of its caller. `shutdown` alone does not

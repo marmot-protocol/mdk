@@ -58,8 +58,8 @@ The simulator comes first; Jeff validates on a phone.
      Routing is by content, so a closed REQ's buffered or in-flight notifications still
      arrive, and nothing bounds when: a stalled consumer keeps them buffered, and a relay
      with a deep outbound backlog keeps sending them. Post-join maintenance and retained
-     routes carry floors (design section 5), so only an unfloored REQ, such as a retained
-     route recorded before switch times were kept, makes the charge unknown, and every
+     routes carry floors (design section 5), so only an unfloored REQ, such as a hidden
+     group's route replaced while the group was hidden, makes the charge unknown, and every
      later charge on that context with it. A lag keeps the account route open and forces
      no reconnect. The SDK client has already marked the lost events seen, so only
      comparison and exact-ID acquisition recover them.
@@ -250,20 +250,29 @@ Decided with Jeff (2026-09-28). The two REQs that asked for full history now car
   adapter tells the two apart. A live REQ is reissued only to widen it, never to narrow it:
   a reissue replaces the live REQ under the same id and could cut off history it is still
   returning.
-- **The allowance** is `HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`, five minutes (ledger A14). An
-  event carries its sender's clock, while the anchor carries the inviter's or this device's.
-  Five minutes is the sender-clock tolerance the stack already assumes (A8), and it exceeds
-  the two-minute rebuild lookback (A7) that every reconnecting live REQ relies on, so a
-  sender slow enough to fall below it already loses events to ordinary catch-up. Too small
-  an allowance can miss a commit made after the Welcome, and the member's first self-update
-  then forks until the epoch gap is acquired; too large re-requests history the member
-  cannot open or already holds, and a retained route pays that again on every activation.
-  Anything a floor misses inside the retained-inventory window stays within reach of the
+- **A retained route stored before switch times were kept** (decided with Jeff,
+  2026-09-28) is stamped with the time of the first load that finds it after the upgrade,
+  and the stamp is written to `prior_nostr_routes_json` straight away, so later loads and
+  restarts keep it instead of moving the floor forward with each launch. Its older traffic
+  was fetched by the sessions that ran before the upgrade, and the comparison covers the
+  rest of the retained window.
+- **The allowance** is `HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`, fifteen minutes (ledger A14;
+  widened from five with Jeff, 2026-09-28). An event carries its sender's clock, while the
+  anchor carries the inviter's or this device's. The two directions cost differently. Too
+  small an allowance can miss a commit made after the Welcome, and the member's first
+  self-update then forks until the epoch gap is acquired. Too large only re-requests
+  history the member cannot open or already holds: once per join, and on every activation
+  for a retained route. So it leans wide. Fifteen minutes is the future-dated-event limit
+  relays commonly enforce, so an inviter whose Add commit a relay accepted cannot run fast
+  enough to put the floor after the commits that followed it. It also tolerates committers
+  three times further behind than the stack's five-minute sender tolerance (A8). Anything a
+  floor still misses inside the retained-inventory window stays within reach of the
   comparison, which covers current and retained routes alike.
-- **Still unfloored**: a copy with no Welcome time (created before the field existed), a
-  retained route recorded before switch times were kept (until it ages out, five epochs
-  after its last), and a locally deleted group's route replaced while the group was hidden,
-  which no projection observes. Explicit full-history repair stays unfloored by design.
+- **Still unfloored**: a copy with no Welcome time (created before the field existed), and
+  a locally deleted group's routes that no projection has seen replaced: those stored in
+  its frontier before this change, and one replaced while the group was hidden. They are
+  backfilled in full while the group stays hidden, and stamped at the first account load
+  after it is restored. Explicit full-history repair stays unfloored by design.
 
 ## What gets deleted
 
@@ -300,8 +309,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Worker-startup isolation (#1999).
 - Epoch-stall detector facts.
 - Post-join maintenance subscriptions, now floored at the Welcome that installed the copy
-  less a five-minute clock-skew allowance (design section 5), rather than a full-history
-  request. They still complete on EOSE, not on comparison.
+  less a fifteen-minute clock-skew allowance (design section 5), rather than a
+  full-history request. They still complete on EOSE, not on comparison.
 - The #1946 rule that recovery debt is never evicted. Spill rows are capped; unresolved loss
   is not. Every unresolved loss generation and every parked obligation stays, with no fixed
   row cap, until qualified completion (an explicit deep repair counts only when it achieves
@@ -325,8 +334,10 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   run on the new path as unknown-scope comparisons.
 - The history floors need no migration. The Welcome time was already on the engine's group
   record, and a retained route's `replaced_at` is an optional field inside the existing
-  route JSON (`prior_nostr_routes_json`, also in the local-deletion frontier). Routes
-  stored before it existed read as unfloored.
+  route JSON (`prior_nostr_routes_json`, also in the local-deletion frontier). The first
+  account load after the upgrade stamps each retained route in `account_groups` that has
+  none, and persists the stamp in the same step
+  (`stamp_unrecorded_prior_route_switches`).
 - Tables that no code reads any more are dropped in a later migration, once their rows have
   been converted.
 
@@ -339,7 +350,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   - completion tiers and parking;
   - revision checks;
   - history floors: maintenance and retained-route REQs carry their anchored floors, a
-    live retained REQ is only ever widened, and a lag while either is live stays bounded.
+    retained route stored before switch times were kept is stamped once at its first
+    load, a live retained REQ is only ever widened, and a lag while either is live stays
+    bounded.
 - **Real-relay, a handful:**
   - overflow of known history, which must produce zero network requests;
   - a missing commit fetched through comparison on two relays;
@@ -376,9 +389,10 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   later lag on that account's SDK context unbounded until the context is replaced, and
   its goal parks. A closed REQ's floor keeps counting for the context's life, so the
   floor only falls: every lag compares from the lowest `since` the context ever issued.
-  The floors trade a five-minute clock-skew allowance against a missed commit: a sender
-  clock off by more than that, or a retained route observed long after its switch, can put
-  traffic below a floor, and only the comparison, or the epoch gap it causes, recovers it.
+  The floors trade a fifteen-minute clock-skew allowance against a missed commit: a sender
+  clock off by more than that, a retained route observed long after its switch, or one
+  stamped at its first load after the upgrade, can put traffic below a floor, and only the
+  comparison, or the epoch gap it causes, recovers it.
   An old Welcome can floor maintenance below the retained-inventory window, and a goal
   there cannot certify. The inbox's two-day NIP-59 widening sets that floor at least two
   days back on every route; per-route floors would need per-scope storage. An EOSE lost

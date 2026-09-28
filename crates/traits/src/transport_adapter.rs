@@ -74,7 +74,7 @@ pub struct TransportGroupSubscription {
     /// old address, so an adapter subscribes a retained route from this floor,
     /// and from no later than the activation's own `since`. `None` on the
     /// current route, which resumes from the activation's `since`. A retained
-    /// route without a floor, recorded before its switch time was, is
+    /// route without a floor, whose switch time the caller does not know, is
     /// backfilled in full.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_since: Option<Timestamp>,
