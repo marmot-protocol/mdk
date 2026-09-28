@@ -76,6 +76,7 @@ impl StaticTransportRouting {
             group_id,
             transport_group_id,
             endpoints,
+            retained_since: None,
         });
         self
     }

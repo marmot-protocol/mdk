@@ -454,6 +454,28 @@ const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 /// `since` filter, preventing an account from silently halting message
 /// reception (mdk#182). The margin tolerates benign sender clock skew.
 const TRANSPORT_CURSOR_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+/// Clock-skew allowance below an anchor time from which a REQ requests group
+/// history: the Welcome that installed a joined copy, for its post-join
+/// maintenance REQ, or the moment a route was replaced, for that retained
+/// route's REQ. See [`history_floor`].
+///
+/// Events carry their sender's clock in `created_at`, while the anchor carries
+/// the inviter's clock (the Welcome) or this device's (the switch). The
+/// allowance absorbs the disagreement, and the seconds between an Add commit's
+/// wrap and its Welcome's. The directions cost differently. A floor too high
+/// can miss a commit made after the Welcome, and the joining member's first
+/// self-update then forks from the group until the epoch gap is acquired. A
+/// floor too low only re-requests history the member cannot open or already
+/// holds, but a retained route pays that again on every activation.
+///
+/// Five minutes is the sender-clock tolerance the stack already assumes
+/// ([`TRANSPORT_CURSOR_MAX_FUTURE_SKEW`] and the stall detector's allowance),
+/// and more than the rebuild lookback every reconnecting live REQ relies on,
+/// so a sender slow enough to fall below this floor already loses events to
+/// ordinary catch-up. Anything a floor misses inside the retained-inventory
+/// window stays within reach of the comparison, which covers current and
+/// retained routes alike.
+const HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(5 * 60);
 const ACCOUNT_WORKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 const ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS: u64 = 500;
@@ -6865,22 +6887,33 @@ impl AppTransportRouting {
     }
 
     /// Atomically replace every current/prior subscription for one group.
-    /// Returns whether the desired route set differs from the installed set.
+    /// Returns whether the desired route set, or the route leading it,
+    /// differs from the installed one.
+    ///
+    /// The caller's order is kept: the current route leads and the retained
+    /// routes follow, which is how the transport adapter tells them apart, so
+    /// the current route resumes from the account cursor and each retained
+    /// route from its own floor.
     fn replace_group_routes(
         &self,
         group_id: &GroupId,
-        mut routes: Vec<TransportGroupSubscription>,
+        routes: Vec<TransportGroupSubscription>,
     ) -> bool {
         let mut state = self.write();
-        let mut existing = state
-            .group_routes
-            .iter()
-            .filter(|route| route.group_id == *group_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        normalize_group_subscriptions(&mut existing);
-        normalize_group_subscriptions(&mut routes);
-        if existing == routes {
+        let installed = ordered_group_subscriptions(
+            state
+                .group_routes
+                .iter()
+                .filter(|route| route.group_id == *group_id)
+                .cloned()
+                .collect(),
+        );
+        let routes = ordered_group_subscriptions(routes);
+        let mut installed_set = installed.clone();
+        let mut desired_set = routes.clone();
+        normalize_group_subscriptions(&mut installed_set);
+        normalize_group_subscriptions(&mut desired_set);
+        if installed_set == desired_set && installed.first() == routes.first() {
             return false;
         }
         state
@@ -6922,6 +6955,21 @@ fn normalize_group_subscriptions(routes: &mut Vec<TransportGroupSubscription>) {
             .then_with(|| left.endpoints.cmp(&right.endpoints))
     });
     routes.dedup();
+}
+
+/// Canonical endpoints per route and no repeated route, in the caller's order.
+fn ordered_group_subscriptions(
+    routes: Vec<TransportGroupSubscription>,
+) -> Vec<TransportGroupSubscription> {
+    let mut ordered = Vec::<TransportGroupSubscription>::with_capacity(routes.len());
+    for mut route in routes {
+        route.endpoints.sort();
+        route.endpoints.dedup();
+        if !ordered.contains(&route) {
+            ordered.push(route);
+        }
+    }
+    ordered
 }
 
 impl TransportRoutingPolicy for AppTransportRouting {
@@ -7169,6 +7217,15 @@ fn unix_now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// The relay `since` for group history anchored at `anchor_secs`, a Welcome's
+/// creation or a route switch: the anchor less
+/// [`HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`].
+pub(crate) fn history_floor(anchor_secs: u64) -> cgka_traits::transport::Timestamp {
+    cgka_traits::transport::Timestamp(
+        anchor_secs.saturating_sub(HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs()),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

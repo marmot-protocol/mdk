@@ -607,6 +607,13 @@ pub struct AppPriorNostrRoute {
     pub relays: Vec<String>,
     /// Last epoch known to have used this route.
     pub last_epoch: u64,
+    /// Unix seconds when this device saw the route replaced as the group's
+    /// current route. The retained route's relay history floor is this less
+    /// the clock-skew allowance. `None` on routes recorded before this was
+    /// kept, and on a locally deleted group's route that was replaced while
+    /// the group was hidden; both are backfilled in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -765,7 +772,7 @@ impl AppGroupRecord {
                 .map(|group| group.epoch.0.saturating_sub(1))
                 .unwrap_or_default()
                 .max(self.nostr_routing_last_epoch);
-            self.remember_prior_nostr_route(last_epoch);
+            self.remember_prior_nostr_route(last_epoch, projection.observed_at_secs);
         }
         self.endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         self.nostr_routing = nostr_routing;
@@ -820,11 +827,15 @@ impl AppGroupRecord {
         };
     }
 
-    fn remember_prior_nostr_route(&mut self, last_epoch: u64) {
+    /// Retain the current route as history, replaced at `replaced_at`: the
+    /// moment this device saw the switch, which anchors the retained route's
+    /// history floor.
+    fn remember_prior_nostr_route(&mut self, last_epoch: u64, replaced_at: u64) {
         self.merge_prior_nostr_routes(vec![AppPriorNostrRoute {
             nostr_group_id_hex: self.nostr_routing.nostr_group_id_hex.clone(),
             relays: normalized_relays(&self.nostr_routing.relays),
             last_epoch,
+            replaced_at: Some(replaced_at),
         }]);
     }
 
@@ -848,6 +859,11 @@ impl AppGroupRecord {
                     && normalized_relays(&existing.relays) == route.relays
             }) {
                 existing.last_epoch = existing.last_epoch.max(route.last_epoch);
+                // Keep the earliest known switch: it reaches furthest back.
+                existing.replaced_at = match (existing.replaced_at, route.replaced_at) {
+                    (Some(kept), Some(new)) => Some(kept.min(new)),
+                    (kept, new) => kept.or(new),
+                };
             } else {
                 self.prior_nostr_routes.push(route);
             }
@@ -945,6 +961,9 @@ impl AppGroupRecord {
 }
 
 impl AppPriorNostrRoute {
+    /// The retained route's subscription, floored at its switch less the
+    /// clock-skew allowance. Members that have not applied the switch still
+    /// send here; history before it arrived while the route was current.
     pub(crate) fn subscription(
         &self,
         group_id: &GroupId,
@@ -964,6 +983,7 @@ impl AppPriorNostrRoute {
             group_id: group_id.clone(),
             transport_group_id,
             endpoints: self.relays.iter().cloned().map(TransportEndpoint).collect(),
+            retained_since: self.replaced_at.map(crate::history_floor),
         })
     }
 }
@@ -1049,6 +1069,9 @@ mod prior_nostr_route_tests {
         }
     }
 
+    /// When every projection below is read.
+    const OBSERVED_AT: u64 = 1_800_000_000;
+
     fn projection<'a>(
         nostr_routing: AppGroupNostrRoutingComponent,
         group: &'a Group,
@@ -1063,6 +1086,7 @@ mod prior_nostr_route_tests {
             avatar_url: AppGroupAvatarUrlComponent::absent(),
             encrypted_media: AppGroupEncryptedMediaComponent::disabled(),
             image: AppGroupImageInput::default(),
+            observed_at_secs: OBSERVED_AT,
         }
     }
 
@@ -1090,14 +1114,23 @@ mod prior_nostr_route_tests {
                 nostr_group_id_hex: hex::encode([1u8; 32]),
                 relays: vec!["wss://old.example".to_owned()],
                 last_epoch: 5,
+                replaced_at: Some(OBSERVED_AT),
             }]
         );
+        let subscriptions = record
+            .transport_subscriptions(&GroupId::new(vec![1; 16]))
+            .unwrap();
         assert_eq!(
-            record
-                .transport_subscriptions(&GroupId::new(vec![1; 16]))
-                .unwrap()
-                .len(),
-            2
+            subscriptions
+                .iter()
+                .map(|subscription| (
+                    subscription.transport_group_id[0],
+                    subscription.retained_since
+                ))
+                .collect::<Vec<_>>(),
+            vec![(2, None), (1, Some(crate::history_floor(OBSERVED_AT)))],
+            "the current route resumes from the account cursor; the retained route \
+             from its switch less the clock-skew allowance"
         );
 
         assert!(!record.prune_prior_nostr_routes(10));
@@ -1171,6 +1204,7 @@ mod prior_nostr_route_tests {
                 nostr_group_id_hex: hex::encode([1u8; 32]),
                 relays: vec!["wss://old.example".to_owned()],
                 last_epoch: 5,
+                replaced_at: Some(OBSERVED_AT),
             }]
         );
         assert_eq!(
@@ -1207,6 +1241,7 @@ mod prior_nostr_route_tests {
                 nostr_group_id_hex: hex::encode([2u8; 32]),
                 relays: vec!["wss://losing.example".to_owned()],
                 last_epoch: 10,
+                replaced_at: Some(OBSERVED_AT),
             }]
         );
         assert_eq!(record.nostr_routing_last_epoch, 6);
@@ -1228,11 +1263,13 @@ mod prior_nostr_route_tests {
                 nostr_group_id_hex: "not-hex".to_owned(),
                 relays: vec!["wss://invalid.example".to_owned()],
                 last_epoch: 1,
+                replaced_at: None,
             },
             AppPriorNostrRoute {
                 nostr_group_id_hex: hex::encode([2u8; 32]),
                 relays: vec!["wss://prior.example".to_owned()],
                 last_epoch: 1,
+                replaced_at: None,
             },
         ];
 
@@ -1243,6 +1280,55 @@ mod prior_nostr_route_tests {
         assert_eq!(subscriptions.len(), 2);
         assert_eq!(subscriptions[0].transport_group_id, vec![1u8; 32]);
         assert_eq!(subscriptions[1].transport_group_id, vec![2u8; 32]);
+    }
+
+    #[test]
+    fn retained_route_floor_follows_its_earliest_known_switch() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://current.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        let retained = |id: u8, replaced_at| AppPriorNostrRoute {
+            nostr_group_id_hex: hex::encode([id; 32]),
+            relays: vec![format!("wss://retained-{id}.example")],
+            last_epoch: 1,
+            replaced_at,
+        };
+        record.adopt_prior_nostr_routes(vec![
+            retained(2, Some(OBSERVED_AT)),
+            retained(2, Some(OBSERVED_AT - 60)),
+            retained(3, Some(OBSERVED_AT)),
+            retained(3, None),
+            retained(4, None),
+        ]);
+
+        let floors = record
+            .transport_subscriptions(&GroupId::new(vec![1; 16]))
+            .unwrap()
+            .into_iter()
+            .map(|subscription| {
+                (
+                    subscription.transport_group_id[0],
+                    subscription.retained_since,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            floors,
+            vec![
+                (1, None),
+                (2, Some(crate::history_floor(OBSERVED_AT - 60))),
+                (3, Some(crate::history_floor(OBSERVED_AT))),
+                (4, None),
+            ],
+            "duplicates keep the earliest known switch; a route recorded before \
+             switch times were kept has no floor and is backfilled in full"
+        );
     }
 
     #[test]
@@ -1524,6 +1610,7 @@ impl AppGroupNostrRoutingComponent {
             group_id: group_id.clone(),
             transport_group_id,
             endpoints: self.relays.iter().cloned().map(TransportEndpoint).collect(),
+            retained_since: None,
         })
     }
 }
@@ -1848,6 +1935,9 @@ pub(crate) struct EventGroupProjection<'a> {
     pub(crate) avatar_url: AppGroupAvatarUrlComponent,
     pub(crate) encrypted_media: AppGroupEncryptedMediaComponent,
     pub(crate) image: AppGroupImageInput,
+    /// Unix seconds when this projection was read. A route change it reveals
+    /// is recorded as replaced then.
+    pub(crate) observed_at_secs: u64,
 }
 
 #[derive(Clone, Debug)]

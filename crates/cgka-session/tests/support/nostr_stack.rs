@@ -222,6 +222,7 @@ impl NostrStackHarness {
                     group_id: group_id.clone(),
                     transport_group_id,
                     endpoints: vec![self.group_endpoint.clone()],
+                    retained_since: None,
                 }],
                 since: None,
             })

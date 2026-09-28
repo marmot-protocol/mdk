@@ -1385,12 +1385,16 @@ impl NostrSdkRelayClient {
                 group_id: _,
                 transport_group_id,
                 endpoints,
+                since,
             } => {
                 let h_tag = hex::encode(transport_group_id);
-                let filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+                let mut filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
                     SingleLetterTag::from_char('h').expect("h is a tag"),
                     [h_tag.clone()],
                 );
+                if let Some(since) = since {
+                    filter = filter.since(NostrTimestamp::from_secs(since.0));
+                }
                 let subscription_id = SubscriptionId::new(subscription.subscription_id());
                 Ok(NostrSdkSubscriptionPlan {
                     account_id: account_id.clone(),
@@ -4157,6 +4161,183 @@ mod tests {
             serde_json::json!([hex::encode(&transport_group_id)])
         );
         assert_eq!(json["since"], serde_json::json!(1_700_000_000));
+    }
+
+    #[test]
+    fn group_maintenance_plan_carries_its_history_floor() {
+        let maintenance = |since| NostrSubscription::GroupMaintenance {
+            account_id: MemberId::new(vec![0xA1; 32]),
+            group_id: cgka_traits::GroupId::new(vec![0xB2; 16]),
+            transport_group_id: vec![0xC3; 32],
+            endpoints: vec![TransportEndpoint("wss://group.example".into())],
+            since,
+        };
+        let floored =
+            NostrSdkRelayClient::plan_subscription(&maintenance(Some(Timestamp(1_700_000_000))))
+                .expect("plan");
+        let json = serde_json::to_value(&floored.filter).unwrap();
+        assert_eq!(json["kinds"], serde_json::json!([445]));
+        assert_eq!(json["#h"], serde_json::json!(["c3".repeat(32)]));
+        assert_eq!(json["since"], serde_json::json!(1_700_000_000));
+        assert_eq!(
+            floored.subscription_id,
+            NostrSdkRelayClient::plan_subscription(&maintenance(None))
+                .expect("plan")
+                .subscription_id,
+            "the floor never reaches the id"
+        );
+
+        let unfloored = NostrSdkRelayClient::plan_subscription(&maintenance(None)).expect("plan");
+        let json = serde_json::to_value(&unfloored.filter).unwrap();
+        assert!(
+            json.get("since").is_none(),
+            "no floor requests full history"
+        );
+    }
+
+    /// A post-join maintenance REQ and a retained route REQ now carry floors,
+    /// so a lag while either is live charges a bounded loss.
+    #[tokio::test]
+    async fn floored_maintenance_and_retained_reqs_keep_the_account_loss_floor_bounded() {
+        use NostrNotificationLossFloor::Since;
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let adapter = NostrTransportAdapter::new(Arc::new(root.clone()));
+        let group_id = cgka_traits::GroupId::new(vec![0xB2; 16]);
+        let route = |id: u8, retained_since| crate::TransportGroupSubscription {
+            group_id: group_id.clone(),
+            transport_group_id: vec![id; 32],
+            endpoints: vec![endpoint.clone()],
+            retained_since,
+        };
+        let cursor = 1_800_000_000;
+        let day = 86_400;
+
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![
+                    route(0xC3, None),
+                    route(0xD4, Some(Timestamp(cursor - 3 * day))),
+                ],
+                since: Some(Timestamp(cursor)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            account.notification_loss_floor(),
+            Since(cursor - 3 * day),
+            "the retained route's switch floor is the lowest REQ floor"
+        );
+
+        // An offline member joins from a Welcome five days old.
+        adapter
+            .install_group_maintenance_recovery_subscription(
+                &account_id,
+                &route(0xC3, None),
+                1,
+                Some(Timestamp(cursor - 5 * day)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(account.notification_loss_floor(), Since(cursor - 5 * day));
+        assert_eq!(
+            root.notification_loss_floor_for_account(&account_id).await,
+            Since(cursor - 5 * day)
+        );
+        root.shutdown_accounts().await;
+    }
+
+    /// A maintenance REQ floored at an old Welcome returns the commits made
+    /// after it, however late the member processes it, and none of the group
+    /// history from before its floor.
+    #[tokio::test]
+    async fn floored_maintenance_req_returns_group_history_from_its_floor_only() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        let account = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+        let group = crate::TransportGroupSubscription {
+            group_id: cgka_traits::GroupId::new(vec![0xB2; 16]),
+            transport_group_id: vec![0xC3; 32],
+            endpoints: vec![endpoint.clone()],
+            retained_since: None,
+        };
+        let now = crate::unix_now_seconds();
+        let welcome = now - 3_600;
+        let floor = welcome - 300;
+        let stored = |created_at: u64, content: &str| {
+            EventBuilder::new(Kind::MlsGroupMessage, content)
+                .tags([Tag::custom("h", ["c3".repeat(32)])])
+                .custom_created_at(NostrTimestamp::from_secs(created_at))
+                .finalize(&Keys::generate())
+                .unwrap()
+        };
+        let before_floor = stored(floor - 1, "history from before the member's epochs");
+        let slow_clock = stored(welcome - 60, "a commit from a clock a minute slow");
+        let before_join = stored(welcome + 60, "a commit made while the member was offline");
+        for event in [&before_floor, &slow_clock, &before_join] {
+            relay.add_event(event.clone()).await.unwrap();
+        }
+
+        // The live group REQ resumes from the account cursor, after all three.
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account.clone(),
+                inbox_endpoints: vec![endpoint],
+                group_subscriptions: vec![group.clone()],
+                since: Some(Timestamp(now)),
+            })
+            .await
+            .unwrap();
+        adapter
+            .install_group_maintenance_recovery_subscription(
+                &account,
+                &group,
+                1,
+                Some(Timestamp(floor)),
+            )
+            .await
+            .unwrap();
+        let mut delivered = HashSet::new();
+        while let Ok(delivery) = timeout(Duration::from_secs(1), adapter.receive()).await {
+            let delivery = delivery.unwrap().expect("adapter delivery");
+            delivered.insert(hex::encode(delivery.message.id.as_slice()));
+        }
+        assert!(delivered.contains(&before_join.id.to_hex()));
+        assert!(delivered.contains(&slow_clock.id.to_hex()));
+        assert!(
+            !delivered.contains(&before_floor.id.to_hex()),
+            "nothing below the floor is requested"
+        );
+
+        // Control: the unfloored request would have returned it.
+        adapter
+            .install_group_maintenance_subscription(&account, &group)
+            .await
+            .unwrap();
+        let mut unfloored = HashSet::new();
+        while let Ok(delivery) = timeout(Duration::from_secs(1), adapter.receive()).await {
+            let delivery = delivery.unwrap().expect("adapter delivery");
+            unfloored.insert(hex::encode(delivery.message.id.as_slice()));
+        }
+        assert!(unfloored.contains(&before_floor.id.to_hex()));
+        sdk.client.shutdown().await;
+        timeout(Duration::from_secs(2), forwarder)
+            .await
+            .expect("forwarder exits on shutdown")
+            .unwrap();
+        relay.shutdown();
     }
 
     fn relay(url: &str) -> RelayUrl {

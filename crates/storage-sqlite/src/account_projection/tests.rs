@@ -623,6 +623,7 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
         nostr_group_id_hex: "11".repeat(32),
         relays: vec!["wss://prior.example".to_owned()],
         last_epoch: 7,
+        replaced_at: None,
     }];
     let state = StoredAccountState {
         label: "alice".to_owned(),
@@ -648,6 +649,7 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
             nostr_group_id_hex: "11".repeat(32),
             relays: vec!["wss://prior.example".to_owned()],
             last_epoch: 7,
+            replaced_at: None,
         }]
     );
 }
@@ -2929,6 +2931,7 @@ fn local_group_delete_preserves_exact_prior_nostr_routes_across_reopen() {
         nostr_group_id_hex: "11".repeat(32),
         relays: vec!["wss://old.example".to_owned()],
         last_epoch: 7,
+        replaced_at: Some(1_800_000_000),
     }];
     store
         .save_account_projection_state(
@@ -2956,7 +2959,56 @@ fn local_group_delete_preserves_exact_prior_nostr_routes_across_reopen() {
             nostr_group_id_hex: "11".repeat(32),
             relays: vec!["wss://old.example".to_owned()],
             last_epoch: 7,
-        }]
+            replaced_at: Some(1_800_000_000),
+        }],
+        "the frontier keeps the switch time that floors the retained route"
+    );
+}
+
+#[test]
+fn retaining_a_local_delete_route_keeps_its_earliest_known_switch() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let route = |replaced_at| StoredNostrRoute {
+        nostr_group_id_hex: "22".repeat(32),
+        relays: vec!["wss://retained.example".to_owned()],
+        last_epoch: 2,
+        replaced_at,
+    };
+    let mut deleted_group = group("aa", "alpha");
+    deleted_group.prior_nostr_routes = vec![route(Some(1_800_000_000))];
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![deleted_group],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    store.delete_local_group_data("aa").unwrap();
+    let frontier = || store.local_group_deletion_prior_nostr_routes("aa").unwrap();
+
+    // Retained again as the hidden group's current route: that records no
+    // switch, and the earlier one stays.
+    store
+        .retain_local_group_deletion_nostr_routes("aa", &[route(None)])
+        .unwrap();
+    assert_eq!(frontier(), vec![route(Some(1_800_000_000))]);
+    store
+        .retain_local_group_deletion_nostr_routes("aa", &[route(Some(1_799_999_000))])
+        .unwrap();
+    assert_eq!(frontier(), vec![route(Some(1_799_999_000))]);
+    store
+        .retain_local_group_deletion_nostr_routes("aa", &[route(Some(1_800_001_000))])
+        .unwrap();
+    assert_eq!(
+        frontier(),
+        vec![route(Some(1_799_999_000))],
+        "the earliest known switch reaches furthest back"
     );
 }
 
@@ -2969,11 +3021,13 @@ fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
             nostr_group_id_hex: "11".repeat(32),
             relays: vec!["wss://retired.example".to_owned()],
             last_epoch: 1,
+            replaced_at: None,
         },
         StoredNostrRoute {
             nostr_group_id_hex: "22".repeat(32),
             relays: vec!["wss://retained.example".to_owned()],
             last_epoch: 2,
+            replaced_at: None,
         },
     ];
     store
@@ -3010,6 +3064,7 @@ fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
                 nostr_group_id_hex: "33".repeat(32),
                 relays: vec!["wss://current.example".to_owned()],
                 last_epoch: 3,
+                replaced_at: None,
             }],
         )
         .unwrap();
@@ -3021,11 +3076,13 @@ fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
                 nostr_group_id_hex: "22".repeat(32),
                 relays: vec!["wss://retained.example".to_owned()],
                 last_epoch: 2,
+                replaced_at: None,
             },
             StoredNostrRoute {
                 nostr_group_id_hex: "33".repeat(32),
                 relays: vec!["wss://current.example".to_owned()],
                 last_epoch: 3,
+                replaced_at: None,
             },
         ],
         "durable exact-route history must advance with the engine-owned overlap window",

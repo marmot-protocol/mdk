@@ -6418,7 +6418,7 @@ fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
         || !summary.epoch_stall_escalations.is_empty()
 }
 
-/// Start the temporary full-history subscription only after the caller has
+/// Start the temporary post-join history subscription only after the caller has
 /// published the summary containing `GroupJoined`. This ordering makes the
 /// durable group visible even when relay subscription installation is slow or
 /// fails; the existing maintenance tick retries any obligation still in its

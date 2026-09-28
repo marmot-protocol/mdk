@@ -1408,8 +1408,8 @@ where
         Ok(id)
     }
 
-    /// Record successful installation of the temporary post-join
-    /// full-history subscription. The five-minute EOSE deadline starts here.
+    /// Record successful installation of the temporary post-join history
+    /// subscription. The five-minute EOSE deadline starts here.
     pub fn mark_post_join_subscription_installed(&self, group_id: &GroupId) -> AccountResult<()> {
         let now = self.wall_clock.now();
         for mut obligation in self.session.maintenance_obligations_for_group(group_id)? {

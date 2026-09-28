@@ -798,6 +798,7 @@ async fn notification_lag_keeps_account_delivery_open_and_bounds_the_loss() {
                 group_id: GroupId::new(vec![0xC3; 32]),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_699_999_000)),
         })
@@ -1649,6 +1650,7 @@ async fn unsafe_group_routes_isolated() {
                 1 => [unsafe_endpoints.clone(), vec![safe.clone()]].concat(),
                 _ => unsafe_endpoints.clone(),
             },
+            retained_since: None,
         })
         .collect();
     adapter
@@ -1721,6 +1723,7 @@ fn recovery_route_cap_and_aliases() {
         group_id: GroupId::new(vec![1; 16]),
         transport_group_id: vec![2; 32],
         endpoints: endpoints.clone(),
+        retained_since: None,
     };
     let sync = plane
         .inner
@@ -1765,6 +1768,7 @@ async fn relay_plane_deduplicates_canonical_relay_endpoints() {
                     TransportEndpoint("wss://relay.example/".into()),
                     TransportEndpoint("wss://relay.example/".into()),
                 ],
+                retained_since: None,
             }],
             since: None,
         })
@@ -1795,6 +1799,7 @@ async fn relay_telemetry_reflects_activation_through_the_plane() {
                 group_id,
                 transport_group_id: vec![0xD4; 32],
                 endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+                retained_since: None,
             }],
             since: None,
         })
@@ -1843,6 +1848,7 @@ async fn settled_activation_uses_diff() {
             group_id: GroupId::new(vec![0xC3; 16]),
             transport_group_id: vec![0xD4; 32],
             endpoints: vec![endpoint.clone()],
+            retained_since: None,
         });
     adapter.activate_account(activation.clone()).await.unwrap();
     assert_eq!(
@@ -2291,6 +2297,7 @@ async fn group_subscriptions_remain_account_scoped_for_shared_group_routes() {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(10)),
         })
@@ -2304,6 +2311,7 @@ async fn group_subscriptions_remain_account_scoped_for_shared_group_routes() {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(10)),
         })
@@ -2341,6 +2349,7 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
         group_id: group_id.clone(),
         transport_group_id: transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
 
     alice_adapter
@@ -2420,6 +2429,7 @@ async fn full_account_queue_spills_before_it_omits() {
                 group_id: GroupId::new(vec![0xC3; 32]),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_699_999_900)),
         })
@@ -2487,6 +2497,7 @@ async fn fill_account_queue(
                 group_id: GroupId::new(vec![0xC3; 32]),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_699_999_900)),
         })
@@ -2907,6 +2918,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
                     group_id,
                     transport_group_id,
                     endpoints: vec![endpoint.clone()],
+                    retained_since: None,
                 }],
                 since: Some(Timestamp(1_699_999_900)),
             })
@@ -3064,6 +3076,7 @@ async fn published_group_event_is_fanned_out_to_matching_local_accounts() {
         group_id: group_id.clone(),
         transport_group_id: transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
 
     alice_adapter
@@ -3807,6 +3820,7 @@ async fn supervised_notification_lag_delivers_later_inbound_exactly_once() {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -4322,6 +4336,262 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
         0
     );
     runtime.shutdown().await;
+}
+
+/// A post-join maintenance REQ is floored at the Welcome that installed the
+/// copy, so a lag while it is live still charges a bounded loss, which a
+/// comparison can certify, instead of an unbounded one that parks as "history
+/// may be incomplete". The Welcome here is older than every other REQ floor,
+/// so the lag's floor is the maintenance REQ's own.
+#[tokio::test]
+async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
+    use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let alice = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let account = MemberId::new(hex::decode(&alice.account_id_hex).unwrap());
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let storage = app.account_storage(&alice.label).unwrap();
+    let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
+    client.prepare_transport().await.unwrap();
+    let group = client
+        .create_group_with_options(
+            "maintenance lag",
+            &[],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![url]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // Model a copy installed from a Welcome five days old, still catching up.
+    let welcome_at = crate::unix_now_seconds() - 5 * 86_400;
+    let mut record = storage.get_group(&group).unwrap();
+    record.local_copy_welcome_created_at = Some(Timestamp(welcome_at));
+    storage.put_group(&record).unwrap();
+    storage
+        .put_maintenance_obligation(&cgka_traits::MaintenanceObligation {
+            id: MessageId::new(vec![0x55; 32]),
+            group_id: group.clone(),
+            trigger: cgka_traits::MaintenanceTrigger::PostJoin,
+            phase: cgka_traits::MaintenancePhase::CatchUp,
+            created_at: Timestamp(crate::unix_now_seconds()),
+            operational_target_at: None,
+            overdue: false,
+            eose_deadline_at: None,
+            grace_until: None,
+            quiet_since: None,
+            own_leaf_baseline_hash: None,
+            sampled_jitter_ms: 0,
+            not_before: None,
+            attempt_count: 0,
+            semantic_rearm_count: 0,
+            last_failure_code: None,
+        })
+        .unwrap();
+    client
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert!(
+        client
+            .post_join_maintenance_subscriptions
+            .contains_key(&group),
+        "the post-join maintenance REQ is live"
+    );
+
+    let plane = app.relay_plane.clone();
+    let sdk = plane.inner.transport.sdk_relay_client.clone().unwrap();
+    let floor = sdk.notification_loss_floor_for_account(&account).await;
+    assert_eq!(
+        floor,
+        NostrNotificationLossFloor::Since(crate::history_floor(welcome_at).0),
+        "the lowest REQ floor is the maintenance REQ's Welcome floor"
+    );
+    plane.simulate_notification_lag_for_test(&account, 1, floor);
+    assert_eq!(
+        client
+            .adapter
+            .pending_delivery_overflow()
+            .expect("the lag is pending loss")
+            .notification_floor,
+        Some(crate::history_floor(welcome_at).0)
+    );
+    plane.shutdown().await;
+}
+
+/// A member that was offline joins from a Welcome made before the group's
+/// next commit. Its live group REQ resumes from the account cursor, after that
+/// commit, so only the post-join maintenance REQ, floored at the Welcome, can
+/// bring the commit back before the member's first self-update.
+///
+/// Test-policy builds settle convergence at once. A directly driven client has
+/// no worker timer for the pinned quiescence window, so it needs that.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join() {
+    use crate::relay_plane::AccountDeliveryReceive;
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = || crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    marmot_account::AccountHome::open(alice_dir.path())
+        .create_account("alice")
+        .unwrap();
+    let bob = marmot_account::AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+
+    // Bob publishes a KeyPackage, settles his cold-start history, and leaves.
+    {
+        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config());
+        let mut client = crate::tests::client_on_app_relay_plane(&setup, "bob").await;
+        client.publish_key_package().await.unwrap();
+        client.sync().await.unwrap();
+        drop(client);
+        setup.relay_plane.shutdown().await;
+    }
+
+    // Alice invites Bob, then renames the group before he is back.
+    let alice_app =
+        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config());
+    let mut alice = crate::tests::client_on_app_relay_plane(&alice_app, "alice").await;
+    let group = alice
+        .create_group_with_options(
+            "before bob returns",
+            &[bob.account_id_hex.as_str()],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![url.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let rename = alice
+        .update_group_profile(&group, Some("renamed while bob was away"), None)
+        .await
+        .unwrap();
+    let renamed_at = crate::unix_now_seconds();
+    let renamed_epoch = alice.runtime.group_record(&group).unwrap().epoch;
+    assert!(!rename.message_ids.is_empty());
+
+    // Bob returns with a one-second rebuild lookback and a cursor past the
+    // rename, so his live REQs start after it.
+    let resume_at = renamed_at + 2;
+    while crate::unix_now_seconds() < resume_at + 1 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config());
+    bob_app.relay_plane =
+        MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(1), true);
+    let mut state = bob_app.load_state("bob").unwrap();
+    state.last_transport_timestamp = Some(resume_at);
+    bob_app.save_state(&state).unwrap();
+    let mut bob_client = crate::tests::client_on_app_relay_plane(&bob_app, "bob").await;
+    bob_client.prepare_transport().await.unwrap();
+    timeout(Duration::from_secs(20), async {
+        while bob_client.runtime.group_record(&group).is_err() {
+            if let AccountDeliveryReceive::Delivery(delivery) =
+                bob_client.receive_next_delivery().await.unwrap()
+            {
+                bob_client
+                    .ingest_received_delivery(*delivery)
+                    .await
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .expect("Bob joins from the Welcome");
+    let joined_epoch = bob_client.runtime.group_record(&group).unwrap().epoch;
+    assert!(
+        joined_epoch < renamed_epoch,
+        "the Welcome predates the rename"
+    );
+
+    // Control: the live REQs, which resume after the rename, never bring it.
+    while let Ok(received) = timeout(
+        Duration::from_millis(1_500),
+        bob_client.receive_next_delivery(),
+    )
+    .await
+    {
+        if let AccountDeliveryReceive::Delivery(delivery) = received.unwrap() {
+            bob_client
+                .ingest_received_delivery(*delivery)
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        bob_client.runtime.group_record(&group).unwrap().epoch,
+        joined_epoch,
+        "no live REQ reaches back to the rename"
+    );
+
+    let comparisons = bob_app
+        .relay_telemetry()
+        .await
+        .metrics
+        .reconciliation_attempts;
+    // The maintenance tick runs after the cold-start comparison's paced retry
+    // deadline; move the owner clock there instead of waiting.
+    let bob_storage = bob_app.account_storage("bob").unwrap();
+    bob_client
+        .recovery_owner
+        .test_advance_to_retry(&bob_storage);
+    bob_client
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .post_join_maintenance_subscriptions
+            .contains_key(&group)
+    );
+    timeout(Duration::from_secs(20), async {
+        while bob_client.runtime.group_record(&group).unwrap().epoch < renamed_epoch {
+            if let AccountDeliveryReceive::Delivery(delivery) =
+                bob_client.receive_next_delivery().await.unwrap()
+            {
+                bob_client
+                    .ingest_received_delivery(*delivery)
+                    .await
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .expect("the maintenance REQ brings the rename made before Bob joined");
+    assert_eq!(
+        bob_app
+            .relay_telemetry()
+            .await
+            .metrics
+            .reconciliation_attempts,
+        comparisons,
+        "no comparison stood in for the maintenance REQ"
+    );
+    assert_eq!(
+        bob_app
+            .group("bob", &hex::encode(group.as_slice()))
+            .unwrap()
+            .unwrap()
+            .profile
+            .name,
+        "renamed while bob was away"
+    );
+    bob_app.relay_plane.shutdown().await;
+    alice_app.relay_plane.shutdown().await;
 }
 
 /// A reopen cancelled mid-retirement leaves nothing running. The reaper

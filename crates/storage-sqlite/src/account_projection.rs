@@ -238,6 +238,12 @@ pub struct StoredNostrRoute {
     pub nostr_group_id_hex: String,
     pub relays: Vec<String>,
     pub last_epoch: u64,
+    /// Unix seconds when the device saw this route replaced as the group's
+    /// current route, which anchors its retained history floor. `None` on a
+    /// route still current when recorded, and on routes stored before this
+    /// field existed. Stored inside the route JSON, so no schema change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_at: Option<u64>,
 }
 
 /// `component_data_hex` carries MLS-protected component bytes. Blossom image
@@ -1701,6 +1707,11 @@ impl SqliteAccountStorage {
                         && existing.relays == route.relays
                 }) {
                     existing.last_epoch = existing.last_epoch.max(route.last_epoch);
+                    // Keep the earliest known switch: it reaches furthest back.
+                    existing.replaced_at = match (existing.replaced_at, route.replaced_at) {
+                        (Some(kept), Some(new)) => Some(kept.min(new)),
+                        (kept, new) => kept.or(new),
+                    };
                 } else {
                     retained.push(route.clone());
                 }

@@ -490,8 +490,8 @@ pub struct AppClient {
     /// retirement, for the retry path its callers depend on.
     #[cfg(test)]
     pub(crate) fail_next_terminal_recovery_retire: bool,
-    /// Temporary full-history subscriptions installed only while a post-join
-    /// maintenance obligation is waiting for its first relay EOSE.
+    /// Temporary history subscriptions, floored at each copy's Welcome, installed
+    /// only while a post-join maintenance obligation waits for its first relay EOSE.
     pub(crate) post_join_maintenance_subscriptions:
         HashMap<GroupId, (String, cgka_traits::TransportGroupSubscription)>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the

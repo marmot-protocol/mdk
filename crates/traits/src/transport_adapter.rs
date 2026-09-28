@@ -59,11 +59,25 @@ impl fmt::Display for TransportEndpoint {
 /// transport-visible routing id, such as a Nostr `h` tag. The 0.1 engine still
 /// treats those as equal, but adapters should carry both so the later MIP-01
 /// transport-data split has somewhere clean to land.
+///
+/// A group's current route comes first; the routes it retains from before a
+/// route change follow it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportGroupSubscription {
     pub group_id: GroupId,
     pub transport_group_id: Vec<u8>,
     pub endpoints: Vec<TransportEndpoint>,
+    /// History floor of a retained route: when it stopped being the group's
+    /// current route, less the caller's clock-skew allowance.
+    ///
+    /// Members that have not yet applied the route change still send to the
+    /// old address, so an adapter subscribes a retained route from this floor,
+    /// and from no later than the activation's own `since`. `None` on the
+    /// current route, which resumes from the activation's `since`. A retained
+    /// route without a floor, recorded before its switch time was, is
+    /// backfilled in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_since: Option<Timestamp>,
 }
 
 /// Account-level subscription activation request.

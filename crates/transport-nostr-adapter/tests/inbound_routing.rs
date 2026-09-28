@@ -649,11 +649,13 @@ async fn concurrent_group_syncs_do_not_overlap_relay_unsubscribes() {
         group_id: cgka_traits::GroupId::new(vec![0xC1; 32]),
         transport_group_id: vec![0xD1; 32],
         endpoints: vec![TransportEndpoint("wss://group-a.example".into())],
+        retained_since: None,
     };
     let bob_group = TransportGroupSubscription {
         group_id: cgka_traits::GroupId::new(vec![0xC2; 32]),
         transport_group_id: vec![0xD2; 32],
         endpoints: vec![TransportEndpoint("wss://group-b.example".into())],
+        retained_since: None,
     };
 
     adapter
@@ -724,6 +726,7 @@ async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_a
         group_id: group_id.clone(),
         transport_group_id: transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
 
     adapter
@@ -825,6 +828,7 @@ async fn reconciled_group_event_routes_only_to_the_compared_account() {
         group_id: group_id.clone(),
         transport_group_id: transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
 
     for account_id in [alice, bob.clone()] {
@@ -877,6 +881,7 @@ async fn activate_account_issues_inbox_and_group_subscriptions_concurrently() {
                 group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
                 transport_group_id: vec![0xD4; 32],
                 endpoints: vec![TransportEndpoint("wss://group.example".into())],
+                retained_since: None,
             }],
             since: None,
         })
@@ -899,6 +904,7 @@ async fn failed_activation_rolls_back_routes_and_can_retry() {
             group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
             transport_group_id: vec![0xD4; 32],
             endpoints: vec![TransportEndpoint("wss://group.example".into())],
+            retained_since: None,
         }],
         since: None,
     };
@@ -953,11 +959,13 @@ async fn sync_account_groups_issues_added_group_subscriptions_concurrently() {
                     group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
                     transport_group_id: vec![0xD4; 32],
                     endpoints: vec![TransportEndpoint("wss://group-one.example".into())],
+                    retained_since: None,
                 },
                 TransportGroupSubscription {
                     group_id: cgka_traits::GroupId::new(vec![0xE5; 32]),
                     transport_group_id: vec![0xF6; 32],
                     endpoints: vec![TransportEndpoint("wss://group-two.example".into())],
+                    retained_since: None,
                 },
             ],
             since: None,
@@ -986,6 +994,7 @@ async fn subscribed_group_event_becomes_account_scoped_delivery() {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_700_000_000)),
         })
@@ -1047,6 +1056,7 @@ async fn stored_event_replayed_during_activation_subscribe_is_delivered() {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_700_000_000)),
         })
@@ -1105,6 +1115,7 @@ async fn stored_events_replayed_during_group_sync_subscribe_are_delivered() {
                 group_id: old_group_id.clone(),
                 transport_group_id: old_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_700_000_000)),
         })
@@ -1126,6 +1137,7 @@ async fn stored_events_replayed_during_group_sync_subscribe_are_delivered() {
                 group_id: new_group_id.clone(),
                 transport_group_id: new_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_700_000_100)),
         })
@@ -1176,14 +1188,17 @@ async fn reissued_live_subscription_keeps_synchronous_callbacks() {
         group_id: group_id.clone(),
         transport_group_id: old_transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
 
+    // Floored, so the sync that retains the old route widens it to a full
+    // backfill (its switch time is unknown) and reissues it.
     adapter
         .activate_account(TransportAccountActivation {
             account_id: account_id.clone(),
             inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
             group_subscriptions: vec![old_group.clone()],
-            since: None,
+            since: Some(Timestamp(1_700_000_000)),
         })
         .await
         .expect("activation succeeds");
@@ -1198,6 +1213,7 @@ async fn reissued_live_subscription_keeps_synchronous_callbacks() {
                     group_id: group_id.clone(),
                     transport_group_id: new_transport_group_id.clone(),
                     endpoints: vec![endpoint.clone()],
+                    retained_since: None,
                 },
                 old_group,
             ],
@@ -1259,6 +1275,7 @@ async fn failed_group_sync_rolls_back_staged_routes_and_telemetry() {
         group_id: group_id.clone(),
         transport_group_id: old_transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
     let group_sync = TransportGroupSync {
         account_id: account_id.clone(),
@@ -1267,18 +1284,21 @@ async fn failed_group_sync_rolls_back_staged_routes_and_telemetry() {
                 group_id: group_id.clone(),
                 transport_group_id: new_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             },
             old_group.clone(),
         ],
         since: None,
     };
 
+    // Floored, so the sync that retains the old route widens it to a full
+    // backfill (its switch time is unknown) and reissues it.
     adapter
         .activate_account(TransportAccountActivation {
             account_id: account_id.clone(),
             inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
             group_subscriptions: vec![old_group],
-            since: None,
+            since: Some(Timestamp(1_700_000_000)),
         })
         .await
         .expect("activation succeeds");
@@ -1374,6 +1394,7 @@ async fn cancelled_group_sync_rolls_back_staged_routes_and_telemetry() {
         group_id: old_group_id.clone(),
         transport_group_id: old_transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
 
     adapter
@@ -1414,6 +1435,7 @@ async fn cancelled_group_sync_rolls_back_staged_routes_and_telemetry() {
                         group_id: new_group_id,
                         transport_group_id: new_transport_group_id,
                         endpoints: vec![endpoint],
+                        retained_since: None,
                     }],
                     since: None,
                 })
@@ -1483,18 +1505,22 @@ async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
         group_id: synced_group_id.clone(),
         transport_group_id: vec![0xC2; 32],
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
     let unsynced_old = TransportGroupSubscription {
         group_id: unsynced_group_id.clone(),
         transport_group_id: vec![0xC3; 32],
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
+    // Floored, so the sync that retains both old routes widens them to a full
+    // backfill (their switch times are unknown) and reissues them.
     adapter
         .activate_account(TransportAccountActivation {
             account_id: account_id.clone(),
             inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
             group_subscriptions: vec![synced_old.clone(), unsynced_old.clone()],
-            since: None,
+            since: Some(Timestamp(1_700_000_000)),
         })
         .await
         .expect("activation succeeds");
@@ -1554,12 +1580,14 @@ async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
                             group_id: synced_group_id,
                             transport_group_id: vec![0xD2; 32],
                             endpoints: vec![endpoint.clone()],
+                            retained_since: None,
                         },
                         synced_old,
                         TransportGroupSubscription {
                             group_id: unsynced_group_id,
                             transport_group_id: vec![0xD3; 32],
                             endpoints: vec![endpoint],
+                            retained_since: None,
                         },
                         unsynced_old,
                     ],
@@ -1741,6 +1769,7 @@ async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
                 group_id,
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -1828,6 +1857,7 @@ async fn initial_sync_gate_closes_only_after_every_endpoint_eoses() {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -1899,6 +1929,7 @@ async fn synced_group_subscriptions_replace_old_routes() {
                 group_id: old_group_id,
                 transport_group_id: old_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -1911,6 +1942,7 @@ async fn synced_group_subscriptions_replace_old_routes() {
                 group_id: new_group_id.clone(),
                 transport_group_id: new_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_700_000_100)),
         })
@@ -1981,11 +2013,13 @@ async fn restart_with_retained_route_backfills_and_routes_delayed_old_event() {
                     group_id: group_id.clone(),
                     transport_group_id: current_transport_group_id,
                     endpoints: vec![current_endpoint],
+                    retained_since: None,
                 },
                 TransportGroupSubscription {
                     group_id: group_id.clone(),
                     transport_group_id: prior_transport_group_id.clone(),
                     endpoints: vec![prior_endpoint.clone()],
+                    retained_since: None,
                 },
             ],
             since: Some(Timestamp(1_800_000_000)),
@@ -2045,11 +2079,13 @@ async fn rotating_current_route_reissues_the_displaced_route_for_full_backfill_o
         group_id: group_id.clone(),
         transport_group_id: vec![0xC3; 32],
         endpoints: vec![TransportEndpoint("wss://a.example".into())],
+        retained_since: None,
     };
     let route_b = TransportGroupSubscription {
         group_id: group_id.clone(),
         transport_group_id: vec![0xD4; 32],
         endpoints: vec![TransportEndpoint("wss://b.example".into())],
+        retained_since: None,
     };
     let since = Some(Timestamp(1_800_000_000));
 
@@ -2124,6 +2160,192 @@ async fn rotating_current_route_reissues_the_displaced_route_for_full_backfill_o
     );
 }
 
+/// `(route id byte, since)` of each group REQ issued since the last call.
+fn issued_group_floors(relay: &FakeRelayClient) -> Vec<(u8, Option<Timestamp>)> {
+    relay
+        .take_issued_subscriptions()
+        .into_iter()
+        .filter_map(|subscription| match subscription {
+            NostrSubscription::Group {
+                transport_group_id,
+                since,
+                ..
+            } => Some((transport_group_id[0], since)),
+            NostrSubscription::AccountInbox { .. } | NostrSubscription::GroupMaintenance { .. } => {
+                None
+            }
+        })
+        .collect()
+}
+
+fn floored_route(
+    group_id: &cgka_traits::GroupId,
+    id: u8,
+    retained_since: Option<u64>,
+) -> TransportGroupSubscription {
+    TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: vec![id; 32],
+        endpoints: vec![TransportEndpoint(format!("wss://route-{id}.example"))],
+        retained_since: retained_since.map(Timestamp),
+    }
+}
+
+#[tokio::test]
+async fn retained_routes_resume_from_their_switch_floor_never_after_the_cursor() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 16]);
+    let cursor = 1_800_000_000;
+    let routes = vec![
+        floored_route(&group_id, 1, None),
+        // Replaced an hour before the cursor: members that had not applied the
+        // switch kept sending here, below the cursor the new route drives.
+        floored_route(&group_id, 2, Some(cursor - 3_600)),
+        // Replaced after a stale cursor: it still resumes from the cursor.
+        floored_route(&group_id, 3, Some(cursor + 60)),
+        // Recorded before switch times were kept.
+        floored_route(&group_id, 4, None),
+    ];
+    let activate = |since| TransportAccountActivation {
+        account_id: account_id.clone(),
+        inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+        group_subscriptions: routes.clone(),
+        since,
+    };
+
+    adapter
+        .activate_account(activate(Some(Timestamp(cursor))))
+        .await
+        .expect("activation succeeds");
+    assert_eq!(
+        issued_group_floors(&relay),
+        vec![
+            (1, Some(Timestamp(cursor))),
+            (2, Some(Timestamp(cursor - 3_600))),
+            (3, Some(Timestamp(cursor))),
+            (4, None),
+        ],
+        "the current route keeps the cursor; a retained route resumes from its \
+         switch floor, never later than the cursor, and a route without one \
+         is backfilled in full"
+    );
+
+    // A retained floor marks a route as retained wherever it sits: ahead of
+    // the current route, or with no current route at all.
+    adapter
+        .activate_account(TransportAccountActivation {
+            group_subscriptions: vec![routes[1].clone(), routes[0].clone()],
+            ..activate(Some(Timestamp(cursor)))
+        })
+        .await
+        .expect("activation with a retained route first succeeds");
+    assert_eq!(
+        issued_group_floors(&relay),
+        vec![
+            (2, Some(Timestamp(cursor - 3_600))),
+            (1, Some(Timestamp(cursor))),
+        ]
+    );
+    adapter
+        .activate_account(TransportAccountActivation {
+            group_subscriptions: routes[1..3].to_vec(),
+            ..activate(Some(Timestamp(cursor)))
+        })
+        .await
+        .expect("activation without a current route succeeds");
+    assert_eq!(
+        issued_group_floors(&relay),
+        vec![
+            (2, Some(Timestamp(cursor - 3_600))),
+            (3, Some(Timestamp(cursor))),
+        ]
+    );
+
+    adapter
+        .activate_account(activate(None))
+        .await
+        .expect("full-history activation succeeds");
+    assert_eq!(
+        issued_group_floors(&relay),
+        vec![(1, None), (2, None), (3, None), (4, None)],
+        "a full-history activation backfills every route in full"
+    );
+}
+
+#[tokio::test]
+async fn a_live_retained_route_is_reissued_only_to_widen_it() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 16]);
+    let cursor = 1_800_000_000;
+    let sync = |routes: Vec<TransportGroupSubscription>, since: u64| TransportGroupSync {
+        account_id: account_id.clone(),
+        group_subscriptions: routes,
+        since: Some(Timestamp(since)),
+    };
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![floored_route(&group_id, 1, None)],
+            since: Some(Timestamp(cursor)),
+        })
+        .await
+        .expect("activation succeeds");
+    relay.take_issued_subscriptions();
+
+    // Route 1 was replaced after the REQ it is live on was issued. That REQ
+    // already reaches further back than the switch floor, and a reissue under
+    // the same id would replace it with a narrower one.
+    adapter
+        .sync_account_groups(sync(
+            vec![
+                floored_route(&group_id, 2, None),
+                floored_route(&group_id, 1, Some(cursor + 600)),
+            ],
+            cursor + 900,
+        ))
+        .await
+        .expect("route change sync succeeds");
+    assert_eq!(
+        issued_group_floors(&relay),
+        vec![(2, Some(Timestamp(cursor + 900)))],
+        "the displaced route keeps its wider live REQ"
+    );
+
+    // Route 2 is displaced in turn, with a switch floor below the cursor its
+    // live REQ was issued with: the reissue widens it.
+    let rotated = vec![
+        floored_route(&group_id, 3, None),
+        floored_route(&group_id, 2, Some(cursor + 300)),
+        floored_route(&group_id, 1, Some(cursor + 600)),
+    ];
+    adapter
+        .sync_account_groups(sync(rotated.clone(), cursor + 1_200))
+        .await
+        .expect("second route change sync succeeds");
+    assert_eq!(
+        issued_group_floors(&relay),
+        vec![
+            (3, Some(Timestamp(cursor + 1_200))),
+            (2, Some(Timestamp(cursor + 300))),
+        ]
+    );
+
+    adapter
+        .sync_account_groups(sync(rotated, cursor + 1_500))
+        .await
+        .expect("unchanged sync succeeds");
+    assert_eq!(
+        issued_group_floors(&relay),
+        Vec::new(),
+        "an unchanged retained route is not reissued"
+    );
+}
+
 // Regression for mdk#337: a failed relay unsubscribe must not fail the sync or
 // leave the routing index serving the old group set. The removal takes effect
 // in routing state immediately; the relay-side teardown is queued for retry.
@@ -2145,6 +2367,7 @@ async fn sync_with_failed_unsubscribe_returns_ok_and_routes_reflect_intent() {
                 group_id: cgka_traits::GroupId::new(vec![0xB2; 32]),
                 transport_group_id: old_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -2158,6 +2381,7 @@ async fn sync_with_failed_unsubscribe_returns_ok_and_routes_reflect_intent() {
                 group_id: new_group_id.clone(),
                 transport_group_id: new_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_700_000_100)),
         })
@@ -2205,6 +2429,7 @@ async fn failed_unsubscribe_is_retried_and_drained_on_next_sync() {
         group_id: cgka_traits::GroupId::new(vec![0xD4; 32]),
         transport_group_id: vec![0xE5; 32],
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
 
     adapter
@@ -2215,6 +2440,7 @@ async fn failed_unsubscribe_is_retried_and_drained_on_next_sync() {
                 group_id: old_group_id.clone(),
                 transport_group_id: old_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -2277,11 +2503,13 @@ async fn cancelled_sync_drain_retries_unsubscribe_and_metrics_converge() {
         group_id: cgka_traits::GroupId::new(vec![0xB2; 32]),
         transport_group_id: vec![0xC3; 32],
         endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
     };
     let old_group_b = TransportGroupSubscription {
         group_id: cgka_traits::GroupId::new(vec![0xB3; 32]),
         transport_group_id: vec![0xC4; 32],
         endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
     };
     let new_group_id = cgka_traits::GroupId::new(vec![0xD4; 32]);
     let new_transport_group_id = vec![0xE5; 32];
@@ -2290,6 +2518,7 @@ async fn cancelled_sync_drain_retries_unsubscribe_and_metrics_converge() {
         group_id: new_group_id.clone(),
         transport_group_id: new_transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
     let expected_unsubscribes = |attempt| {
         [
@@ -2448,6 +2677,7 @@ async fn pending_unsubscribe_for_readded_group_is_discarded_not_replayed() {
         group_id: cgka_traits::GroupId::new(vec![0xB2; 32]),
         transport_group_id: vec![0xC3; 32],
         endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
     };
 
     adapter
@@ -2529,6 +2759,7 @@ async fn deactivate_account_clears_pending_unsubscribes() {
                 group_id: cgka_traits::GroupId::new(vec![0xB2; 32]),
                 transport_group_id: vec![0xC3; 32],
                 endpoints: vec![TransportEndpoint("wss://group.example".into())],
+                retained_since: None,
             }],
             since: None,
         })
@@ -2577,6 +2808,7 @@ async fn adapter_metrics_record_routing_publish_and_stale_cleanup() {
                 group_id: group_id.clone(),
                 transport_group_id: old_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -2621,6 +2853,7 @@ async fn adapter_metrics_record_routing_publish_and_stale_cleanup() {
                 group_id,
                 transport_group_id: new_transport_group_id,
                 endpoints: vec![endpoint],
+                retained_since: None,
             }],
             since: None,
         })
@@ -2658,6 +2891,7 @@ async fn group_sync_treats_endpoint_order_as_the_same_subscription() {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -2670,6 +2904,7 @@ async fn group_sync_treats_endpoint_order_as_the_same_subscription() {
                 group_id,
                 transport_group_id,
                 endpoints: vec![endpoint_b, endpoint_a],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_700_000_100)),
         })
@@ -2702,6 +2937,7 @@ async fn activating_existing_account_replaces_old_relay_state() {
                 group_id: old_group_id,
                 transport_group_id: old_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -2715,6 +2951,7 @@ async fn activating_existing_account_replaces_old_relay_state() {
                 group_id: new_group_id.clone(),
                 transport_group_id: new_transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_700_000_100)),
         })
@@ -2773,6 +3010,7 @@ async fn publish_group_message_sends_nostr_event_to_target_endpoints() {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: None,
         })
@@ -2876,6 +3114,7 @@ async fn inbox_subscription_since_is_widened_by_the_nip59_tweak_window() {
                 group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
                 transport_group_id: vec![0xD4; 32],
                 endpoints: vec![TransportEndpoint("wss://group.example".into())],
+                retained_since: None,
             }],
             since: Some(Timestamp(cursor)),
         })
@@ -2966,6 +3205,7 @@ async fn group_event_routes_despite_trailing_slash_mismatch() {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![stored_endpoint],
+                retained_since: None,
             }],
             since: Some(Timestamp(1_700_000_000)),
         })
@@ -3061,6 +3301,7 @@ async fn sync_telemetry_tracks_only_live_subscriptions_across_churn() {
         group_id: cgka_traits::GroupId::new(vec![index; 32]),
         transport_group_id: vec![index; 32],
         endpoints: vec![TransportEndpoint(format!("wss://relay-{index}.example"))],
+        retained_since: None,
     };
 
     adapter
@@ -3144,6 +3385,7 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
         group_id: cgka_traits::GroupId::new(vec![index; 32]),
         transport_group_id: vec![index; 32],
         endpoints: vec![TransportEndpoint(format!("wss://group-{index}.example"))],
+        retained_since: None,
     };
     let group_endpoint = |index: u8| TransportEndpoint(format!("wss://group-{index}.example"));
     // Ids are scoped to the activation attempt that issued them, so both
@@ -3303,6 +3545,7 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
         group_id: cgka_traits::GroupId::new(vec![0x33; 16]),
         transport_group_id: vec![0x44; 32],
         endpoints: vec![group_a.clone(), group_b.clone()],
+        retained_since: None,
     };
     adapter
         .activate_account(TransportAccountActivation {
@@ -3452,6 +3695,7 @@ async fn superseded_activation_eose_does_not_satisfy_the_replay_gate() {
         group_id: cgka_traits::GroupId::new(vec![0x55; 16]),
         transport_group_id: vec![0x66; 32],
         endpoints: vec![group_endpoint.clone()],
+        retained_since: None,
     };
     let activate = |since: Option<Timestamp>| {
         adapter.activate_account(TransportAccountActivation {
@@ -3546,6 +3790,7 @@ async fn eose_from_a_deactivated_attempt_does_not_satisfy_the_next_activation() 
         group_id: cgka_traits::GroupId::new(vec![0x57; 16]),
         transport_group_id: vec![0x67; 32],
         endpoints: vec![group_endpoint.clone()],
+        retained_since: None,
     };
     let activate = |since: Option<Timestamp>| {
         adapter.activate_account(TransportAccountActivation {
@@ -3617,6 +3862,7 @@ async fn eose_from_a_rolled_back_activation_does_not_satisfy_the_retry() {
         group_id: cgka_traits::GroupId::new(vec![0x58; 16]),
         transport_group_id: vec![0x68; 32],
         endpoints: vec![group_endpoint.clone()],
+        retained_since: None,
     };
     let activate = |since: Option<Timestamp>| {
         adapter.activate_account(TransportAccountActivation {
@@ -3704,6 +3950,7 @@ async fn maintenance_replays_on_join() {
         group_id: cgka_traits::GroupId::new(vec![2; 16]),
         transport_group_id: vec![3; 32],
         endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
     };
     adapter
         .activate_account(TransportAccountActivation {
@@ -3743,6 +3990,7 @@ async fn maintenance_replays_on_join() {
             group_id: group.group_id,
             transport_group_id: group.transport_group_id,
             endpoints: group.endpoints,
+            since: None,
         })
         .await
         .unwrap();
@@ -3758,6 +4006,7 @@ async fn maintenance_failure_cleans_up() {
         group_id: cgka_traits::GroupId::new(vec![2; 16]),
         transport_group_id: vec![3; 32],
         endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
     };
     adapter
         .activate_account(TransportAccountActivation {
@@ -3792,6 +4041,7 @@ async fn maintenance_failure_cleans_up() {
         group_id: group.group_id.clone(),
         transport_group_id: group.transport_group_id.clone(),
         endpoints: group.endpoints.clone(),
+        since: None,
     }
     .subscription_id();
     for group_subscriptions in [Some(vec![]), None] {
@@ -3834,6 +4084,7 @@ async fn maintenance_cancel_cleans_up() {
         group_id: cgka_traits::GroupId::new(vec![2; 16]),
         transport_group_id: vec![3; 32],
         endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
     };
     adapter
         .activate_account(TransportAccountActivation {
@@ -3892,6 +4143,7 @@ async fn maintenance_teardown_retries() {
         group_id: cgka_traits::GroupId::new(vec![2; 16]),
         transport_group_id: vec![3; 32],
         endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
     };
     adapter
         .activate_account(TransportAccountActivation {
@@ -3907,6 +4159,7 @@ async fn maintenance_teardown_retries() {
         group_id: group.group_id.clone(),
         transport_group_id: group.transport_group_id.clone(),
         endpoints: group.endpoints.clone(),
+        since: None,
     };
     // A plain retry drains the teardown; reinstalling first must preserve it.
     for reinstall in [None, Some(&group)] {
@@ -3967,6 +4220,7 @@ async fn recovery_maintenance_fences_late_eose_and_retries_exact_teardown() {
         group_id: cgka_traits::GroupId::new(vec![2; 16]),
         transport_group_id: vec![3; 32],
         endpoints: vec![first.clone(), second.clone()],
+        retained_since: None,
     };
     adapter
         .activate_account(TransportAccountActivation {
@@ -3978,7 +4232,7 @@ async fn recovery_maintenance_fences_late_eose_and_retries_exact_teardown() {
         .await
         .unwrap();
     let old = adapter
-        .install_group_maintenance_recovery_subscription(&account, &group, 1)
+        .install_group_maintenance_recovery_subscription(&account, &group, 1, None)
         .await
         .unwrap();
     assert_eq!(relay.scoped.lock().unwrap()[0].0, old);
@@ -4006,7 +4260,7 @@ async fn recovery_maintenance_fences_late_eose_and_retries_exact_teardown() {
     );
     assert_eq!(adapter.metrics().await.unsubscribe_retries_pending, 1);
     let fresh = adapter
-        .install_group_maintenance_recovery_subscription(&account, &group, 2)
+        .install_group_maintenance_recovery_subscription(&account, &group, 2, None)
         .await
         .unwrap();
     assert_ne!(fresh, old);
@@ -4057,6 +4311,75 @@ async fn recovery_maintenance_fences_late_eose_and_retries_exact_teardown() {
 }
 
 #[tokio::test]
+async fn recovery_maintenance_req_carries_the_callers_history_floor() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![1; 32]);
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![2; 16]),
+        transport_group_id: vec![3; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
+    };
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .unwrap();
+    relay.take_issued_subscriptions();
+
+    let floor = Some(Timestamp(1_700_000_000));
+    let id = adapter
+        .install_group_maintenance_recovery_subscription(&account, &group, 1, floor)
+        .await
+        .unwrap();
+    let scoped = relay.scoped.lock().unwrap().clone();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].0, id);
+    assert!(
+        matches!(
+            &scoped[0].1,
+            NostrSubscription::GroupMaintenance { since, .. } if *since == floor
+        ),
+        "the maintenance REQ is floored where the caller anchored it"
+    );
+
+    // The floor never reaches the id: the same session keeps its id.
+    let base = NostrSubscription::GroupMaintenance {
+        account_id: account.clone(),
+        group_id: group.group_id.clone(),
+        transport_group_id: group.transport_group_id.clone(),
+        endpoints: group.endpoints.clone(),
+        since: None,
+    };
+    assert_eq!(
+        NostrSubscription::GroupMaintenance {
+            account_id: account.clone(),
+            group_id: group.group_id.clone(),
+            transport_group_id: group.transport_group_id.clone(),
+            endpoints: group.endpoints.clone(),
+            since: floor,
+        }
+        .subscription_id(),
+        base.subscription_id()
+    );
+
+    // The legacy install keeps its full-history request.
+    adapter
+        .install_group_maintenance_subscription(&account, &group)
+        .await
+        .unwrap();
+    assert!(matches!(
+        relay.take_issued_subscriptions().last(),
+        Some(NostrSubscription::GroupMaintenance { since: None, .. })
+    ));
+}
+
+#[tokio::test]
 async fn unsupported_recovery_maintenance_never_stages_or_queues_teardown() {
     let relay = Arc::new(ConcurrentSubscribeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -4074,12 +4397,13 @@ async fn unsupported_recovery_maintenance_never_stages_or_queues_teardown() {
         group_id: cgka_traits::GroupId::new(vec![2; 16]),
         transport_group_id: vec![3; 32],
         endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        retained_since: None,
     };
     let before = relay.started.load(Ordering::SeqCst);
     for attempt in 1..=3 {
         assert!(
             adapter
-                .install_group_maintenance_recovery_subscription(&account, &group, attempt)
+                .install_group_maintenance_recovery_subscription(&account, &group, attempt, None)
                 .await
                 .is_err()
         );
@@ -4098,6 +4422,7 @@ async fn recovery_maintenance_never_reopens_a_consumed_attempt() {
         group_id: cgka_traits::GroupId::new(vec![2; 16]),
         transport_group_id: vec![3; 32],
         endpoints: vec![endpoint.clone()],
+        retained_since: None,
     };
     let activation = TransportAccountActivation {
         account_id: account.clone(),
@@ -4107,7 +4432,7 @@ async fn recovery_maintenance_never_reopens_a_consumed_attempt() {
     };
     adapter.activate_account(activation.clone()).await.unwrap();
     let id = adapter
-        .install_group_maintenance_recovery_subscription(&account, &group, 7)
+        .install_group_maintenance_recovery_subscription(&account, &group, 7, None)
         .await
         .unwrap();
     assert!(id.starts_with("marmot:maintenance-recovery:"));
@@ -4117,7 +4442,7 @@ async fn recovery_maintenance_never_reopens_a_consumed_attempt() {
         .await;
     assert_eq!(
         adapter
-            .install_group_maintenance_recovery_subscription(&account, &group, 7)
+            .install_group_maintenance_recovery_subscription(&account, &group, 7, None)
             .await
             .unwrap(),
         id
@@ -4140,7 +4465,7 @@ async fn recovery_maintenance_never_reopens_a_consumed_attempt() {
     );
     assert!(
         adapter
-            .install_group_maintenance_recovery_subscription(&account, &group, 7)
+            .install_group_maintenance_recovery_subscription(&account, &group, 7, None)
             .await
             .is_err()
     );
@@ -4162,19 +4487,19 @@ async fn recovery_maintenance_never_reopens_a_consumed_attempt() {
         .unwrap();
     assert!(
         adapter
-            .install_group_maintenance_recovery_subscription(&account, &group, 7)
+            .install_group_maintenance_recovery_subscription(&account, &group, 7, None)
             .await
             .is_err()
     );
     adapter.activate_account(activation).await.unwrap();
     assert!(
         adapter
-            .install_group_maintenance_recovery_subscription(&account, &group, 6)
+            .install_group_maintenance_recovery_subscription(&account, &group, 6, None)
             .await
             .is_err()
     );
     let fresh = adapter
-        .install_group_maintenance_recovery_subscription(&account, &group, 8)
+        .install_group_maintenance_recovery_subscription(&account, &group, 8, None)
         .await
         .unwrap();
     adapter.handle_relay_eose(endpoint.clone(), id).await;

@@ -1178,6 +1178,7 @@ impl AppClient {
                         group_id: cgka_traits::GroupId::new(group.clone()),
                         transport_group_id: route.to_vec(),
                         endpoints,
+                        retained_since: None,
                     })
                 }
                 _ => continue,
@@ -4559,8 +4560,8 @@ impl AppClient {
                     .map(cgka_traits::transport::Timestamp)
             }
         };
-        // Maintenance has its own scoped unfloored REQ. It cannot widen the
-        // broad live activation; only selected history/loss goals may do so.
+        // Maintenance has its own scoped REQ, floored at its Welcome. It cannot
+        // widen the broad live activation; only selected history/loss goals may do so.
         // Its first boundary is observed later under the domain's deadline.
         // Sharing that prerequisite cannot turn ordinary incremental catch-up
         // into a blocking full-history wait.
@@ -4639,6 +4640,7 @@ impl AppClient {
                     .install_group_maintenance_subscription(
                         route.clone(),
                         grant.reservation.attempt_serial,
+                        self.post_join_maintenance_since(&group),
                     )
                     .await
                     .map_err(|error| {
@@ -7847,6 +7849,7 @@ mod tests {
                 group_id: cgka_traits::GroupId::new(vec![route; 16]),
                 transport_group_id: vec![route; 32],
                 endpoints: Vec::new(),
+                retained_since: None,
             })
         }));
         let armed = (3..=6u8)
@@ -7901,6 +7904,7 @@ mod tests {
                     group_id: cgka_traits::GroupId::new(vec![route; 16]),
                     transport_group_id: vec![route; 32],
                     endpoints: Vec::new(),
+                    retained_since: None,
                 })
             }));
 
@@ -7951,6 +7955,7 @@ mod tests {
                 },
                 transport_group_id: vec![route; 32],
                 endpoints: Vec::new(),
+                retained_since: None,
             })
         }));
 
