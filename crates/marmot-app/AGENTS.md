@@ -160,7 +160,9 @@ App runtime bridge for the first real Marmot app surfaces.
   subscriptions. Explicit full-history repair runs the job in place: one comparison pass over every route of its
   grant inside the repair budget. It never reports complete: history below the retained window is unsearched
   (`BelowRetentionWindow` when the window certified), so never certify explicit history from a window; that
-  result closes the request (`close_explicit_history_request`) instead of leaving debt that parks into a notice,
+  result closes the request (`close_explicit_history_request`, revision-checked) instead of leaving debt that parks
+  into a notice; an explicit scope whose window certified reports `RecoveryPassProgress::WindowCertified`, never
+  `Quiet`, and the checkpoint that finds every scope certified closes the request from any pass,
   while `CoverageUnproven`, `Cancelled` and `Deadline` keep it open. Keep
   the budget split: the network pass ends at `FullHistoryRepairControl::network_deadline` and returns its finished
   routes for admission; only cancellation aborts the request at the poll; `stopped` ends admission at a turn

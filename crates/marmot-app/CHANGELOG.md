@@ -38,7 +38,9 @@
   window in one pass inside its 60-second budget and installs no unfloored replay, so it
   no longer fetches history older than the retained window. Full history has no lower
   bound, so the repair never reports complete. When every route's window certified it
-  returns `BelowRetentionWindow` and closes its request: no explicit-history debt is left
+  returns `BelowRetentionWindow` and closes its request. The owner's automatic passes over
+  a pending explicit request keep each route's certified window, off the parking streak,
+  and close it once every route is certified: no explicit-history debt is left
   to park into a "history may be incomplete" notice, and nothing is recorded as coverage.
   Otherwise it returns `CoverageUnproven`, `Cancelled` or `Deadline`, and the debt stays
   open for the owner's ordinary retries. The comparison gets the first 50 seconds; routes

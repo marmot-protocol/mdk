@@ -4087,8 +4087,7 @@ impl AppClient {
                 )?;
             }
             let mut progressed_any = false;
-            let mut explicit_scopes = 0_usize;
-            let mut explicit_window_certified = true;
+            let mut explicit_window_certified = false;
             for obligation in grant.plan().expect("validated executor grant") {
                 // A selected group can lack any executable route even though
                 // another obligation made the account ready. Preserve that
@@ -4160,20 +4159,19 @@ impl AppClient {
                         .as_ref()
                         .and_then(|route| comparison_outcomes.iter().find(|c| &c.route == route));
                     fetched |= compared.is_some_and(|compared| compared.fetched > 0);
-                    // Every explicit scope counts, compared or not: one this
-                    // pass skipped, such as a route with no admitted relay,
-                    // keeps the request open.
-                    if obligation.cause == storage_sqlite::RecoveryCause::ExplicitHistory {
-                        explicit_scopes += 1;
-                        explicit_window_certified &= !refused
-                            && compared.is_some_and(|compared| compared.certified)
-                            && route.as_ref().is_some_and(|route| {
-                                grant.inventory.iter().any(|window| {
-                                    &window.route == route
-                                        && scope.goal.until_seconds <= window.until
-                                })
-                            });
-                    }
+                    // Explicit history has no lower bound, so a comparison
+                    // that certified the retained window searched all it can.
+                    // The scope keeps that fact for its goal, off the quiet
+                    // streak; it is never coverage.
+                    let window_searched = obligation.cause
+                        == storage_sqlite::RecoveryCause::ExplicitHistory
+                        && !refused
+                        && compared.is_some_and(|compared| compared.certified)
+                        && route.as_ref().is_some_and(|route| {
+                            grant.inventory.iter().any(|window| {
+                                &window.route == route && scope.goal.until_seconds <= window.until
+                            })
+                        });
                     // A scope this pass did not compare, or already certified
                     // for this goal, keeps the certificates it has.
                     if comparison_owned
@@ -4213,7 +4211,10 @@ impl AppClient {
                     certified |= scope_certified;
                     progress.push((
                         scope.goal.scope_id,
-                        if scope_certified || compared.is_some_and(|compared| compared.fetched > 0)
+                        if window_searched {
+                            storage_sqlite::RecoveryPassProgress::WindowCertified
+                        } else if scope_certified
+                            || compared.is_some_and(|compared| compared.fetched > 0)
                         {
                             storage_sqlite::RecoveryPassProgress::Progressed
                         } else if !refused && compared.is_some_and(|compared| compared.answered) {
@@ -4277,6 +4278,33 @@ impl AppClient {
                         eligibility,
                         &progress,
                     )?;
+                    // Once every scope of an explicit request has had its
+                    // window certified, on this pass or an earlier slice,
+                    // nothing is left that any pass can search: close it
+                    // instead of letting it park into a notice. A scope never
+                    // compared, such as one with no admitted relay, keeps it
+                    // open.
+                    // The close is revision-checked, so a stale attempt that
+                    // wrote nothing cannot close a newer request.
+                    if obligation.cause == storage_sqlite::RecoveryCause::ExplicitHistory {
+                        let scopes = storage.recovery_scope_snapshots(obligation.id)?;
+                        if !scopes.is_empty() && scopes.iter().all(|scope| scope.window_certified) {
+                            explicit_window_certified = true;
+                            if let Some((_, revision)) = grant
+                                .fence
+                                .obligations
+                                .iter()
+                                .find(|(id, _)| *id == obligation.id)
+                            {
+                                storage.close_explicit_history_request(
+                                    storage_sqlite::RecoveryDemandTicket {
+                                        id: obligation.id,
+                                        revision: *revision,
+                                    },
+                                )?;
+                            }
+                        }
+                    }
                 } else {
                     storage.checkpoint_recovery_obligation(
                         &grant.fence,
@@ -4287,8 +4315,7 @@ impl AppClient {
                     )?;
                 }
             }
-            self.explicit_history_window_certified =
-                explicit_scopes > 0 && explicit_window_certified;
+            self.explicit_history_window_certified = explicit_window_certified;
             if progressed_any {
                 // New coverage or newly fetched history is progress: the next
                 // pass runs at the base delay and the parking streak restarts.

@@ -884,3 +884,64 @@ async fn a_long_credit_wait_still_closes_a_certified_pass() {
         "the certified pass closes its request"
     );
 }
+
+/// An explicit request left pending, for example by an uncertified repair,
+/// is served by the owner's automatic passes four routes at a time. Each
+/// slice whose window certifies is kept, off the quiet streak, and once every
+/// route's window is certified the request closes: it never parks into a
+/// "history may be incomplete" notice.
+#[tokio::test]
+async fn owner_passes_close_a_certified_explicit_request_without_a_notice() {
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    // Six routes: the inbox and five groups, more than one pass freezes.
+    for index in 0..5 {
+        client
+            .create_group(&format!("slice {index}"), &[])
+            .await
+            .unwrap();
+    }
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .request_recovery(
+            storage_sqlite::RecoveryRequest::ExplicitHistory {
+                operation_id: &[9; 16],
+            },
+            crate::unix_now_seconds() * 1000,
+        )
+        .unwrap();
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(|_| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )))
+    }));
+    assert!(client.take_history_notice_changes().is_none(), "baseline");
+    let mut passes = 0;
+    while explicit_pending(&app) {
+        assert!(passes < 3, "three owner passes close the request");
+        if passes > 0 {
+            client.recovery_owner.test_advance_to_retry(&storage);
+        }
+        let grant = client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .expect("the pending explicit request is selected");
+        assert!(grant.inventory.len() <= TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        passes += 1;
+        assert!(
+            storage.parked_recovery_obligations().unwrap().is_empty(),
+            "a certified slice never parks the rest"
+        );
+    }
+    assert!(passes > 1, "the request needed more than one slice");
+    assert!(storage.parked_recovery_obligations().unwrap().is_empty());
+    assert!(
+        client.take_history_notice_changes().is_none(),
+        "no notice was raised"
+    );
+}

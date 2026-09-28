@@ -67,6 +67,9 @@ pub struct StoredRecoveryScope {
     /// Quiet comparisons in a row for this goal; see
     /// [`RECOVERY_PARK_AFTER_QUIET_PASSES`].
     pub quiet_passes: u64,
+    /// A comparison certified this goal's retained window, on this pass or an
+    /// earlier one. It records a searched window, never coverage.
+    pub window_certified: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -100,6 +103,10 @@ pub enum RecoveryPassProgress {
     /// A required relay failed or timed out, or admission was refused. The
     /// pass says nothing about the scope's history.
     Unserved,
+    /// The comparison certified the retained window of a goal that reaches
+    /// below it (explicit history). The window is searched, not quiet; the
+    /// scope keeps that fact for its goal and is never counted as quiet.
+    WindowCertified,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,10 +135,18 @@ pub(super) struct ScopePayloadV1 {
     /// neither certified nor admitted anything.
     #[serde(default, skip_serializing_if = "is_zero")]
     quiet_passes: u64,
+    /// A comparison certified this goal's retained window. It never counts as
+    /// coverage and keeps the scope off the quiet streak.
+    #[serde(default, skip_serializing_if = "is_false")]
+    window_certified: bool,
 }
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn invalid_scope() -> StorageError {
@@ -494,6 +509,7 @@ impl SqliteAccountStorage {
                 inventory_revision: payload.inventory_revision,
                 loss_revision: payload.loss_revision,
                 quiet_passes: payload.quiet_passes,
+                window_certified: payload.window_certified,
             });
         }
         Ok(scopes)
@@ -600,6 +616,7 @@ impl SqliteAccountStorage {
                     loss_revision: expected.loss_revision, route_revision: expected.route_revision,
                     inventory_revision: expected.inventory_revision,
                     quiet_passes: 0,
+                    window_certified: false,
                 };
                 if let Some((_, _, format, Some(bytes), 1)) = prior {
                     let previous = decode_scope(*format, bytes)?;
@@ -627,6 +644,7 @@ impl SqliteAccountStorage {
                         && previous.required_endpoints == plan.required_endpoints
                     {
                         payload.quiet_passes = previous.quiet_passes;
+                        payload.window_certified = previous.window_certified;
                     }
                     if compatible_columns && previous.obligation_revision == *revision
                         && previous.loss_revision == expected.loss_revision
@@ -772,6 +790,10 @@ impl SqliteAccountStorage {
                     progress.iter().find(|(scope, _)| *scope == token.scope_id)
                 }) {
                     Some((_, RecoveryPassProgress::Progressed)) => payload.quiet_passes = 0,
+                    Some((_, RecoveryPassProgress::WindowCertified)) => {
+                        payload.quiet_passes = 0;
+                        payload.window_certified = true;
+                    }
                     Some((_, RecoveryPassProgress::Quiet)) => {
                         payload.quiet_passes = payload.quiet_passes.saturating_add(1);
                     }

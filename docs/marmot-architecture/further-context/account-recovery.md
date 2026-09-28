@@ -220,7 +220,10 @@ every cause and every caller runs it:
   every route's window certified returns `BelowRetentionWindow`, naming the unsearched older
   history, and closes its request (decided with Jeff, 2026-09-28): no explicit-history debt
   remains to park into a notice, and nothing is recorded as coverage. An uncertified,
-  cancelled or expired pass keeps the debt open for the owner's ordinary retries.
+  cancelled or expired pass keeps the debt open for the owner's ordinary retries. Each
+  explicit scope whose window a comparison certified keeps that fact for its goal and is
+  never counted as quiet, so the owner's four-route passes accumulate it across slices; the
+  checkpoint that finds every scope certified closes the request, whichever pass it is.
 
 Rules kept from the current design: complete coverage with a still-stuck engine means no
 replay; the blocked reason is recorded; the existing one-shot wedge report still escalates
