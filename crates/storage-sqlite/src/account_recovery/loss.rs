@@ -98,23 +98,79 @@ impl SqliteAccountStorage {
         observed_count: u64,
         observed_at_seconds: u64,
     ) -> StorageResult<()> {
+        self.record_account_recovery_loss_bounded(
+            label,
+            cause,
+            marker_token,
+            observed_count,
+            observed_at_seconds,
+            None,
+        )
+    }
+
+    /// Like [`Self::record_account_recovery_loss`], also charging the earliest
+    /// wire `created_at` among the lost deliveries, or an unknown time, to the
+    /// generation's bound.
+    pub fn record_account_recovery_loss_bounded(
+        &self,
+        label: &str,
+        cause: RecoveryLossCause,
+        marker_token: u64,
+        observed_count: u64,
+        observed_at_seconds: u64,
+        earliest_created_at: Option<u64>,
+    ) -> StorageResult<()> {
+        let (bound_state, bound_seconds) =
+            crate::account_recovery::loss_bound_values(earliest_created_at)?;
         self.lock()?
             .execute_cached(
-                "INSERT INTO account_delivery_loss_evidence
-             (account_label,cause,marker_token,pending_since,dropped_count)
-             VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(account_label,cause,marker_token) DO UPDATE SET
-                 dropped_count=MAX(dropped_count,excluded.dropped_count)",
+                &format!(
+                    "INSERT INTO account_delivery_loss_evidence
+                     (account_label,cause,marker_token,pending_since,dropped_count,
+                      bound_state,bound_seconds)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(account_label,cause,marker_token) DO UPDATE SET
+                         dropped_count=MAX(dropped_count,excluded.dropped_count),
+                         {}",
+                    crate::account_recovery::LOSS_BOUND_MERGE
+                ),
                 params![
                     label,
                     cause as i64,
                     sqlite_integer(marker_token)?,
                     sqlite_integer(observed_at_seconds)?,
-                    sqlite_integer(observed_count)?
+                    sqlite_integer(observed_count)?,
+                    bound_state,
+                    bound_seconds
                 ],
             )
             .storage()?;
         Ok(())
+    }
+
+    /// The earliest `created_at` every unresolved charge of this cause is
+    /// known to cover, or `None` when any charge had no known time. Legacy
+    /// retired watermarks no longer carry debt and are ignored.
+    pub fn recovery_loss_goal_floor(
+        &self,
+        label: &str,
+        cause: RecoveryLossCause,
+    ) -> StorageResult<Option<u64>> {
+        let (rows, known, earliest): (i64, i64, Option<i64>) = self
+            .lock()?
+            .query_row_cached(
+                "SELECT COUNT(*), COALESCE(SUM(bound_state = 1), 0), MIN(bound_seconds)
+                 FROM account_delivery_loss_evidence
+                 WHERE account_label = ?1 AND cause = ?2
+                   AND (legacy_retired_count IS NULL OR legacy_retired_count < dropped_count)",
+                params![label, cause as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .storage()?;
+        Ok((rows > 0 && known == rows)
+            .then_some(earliest)
+            .flatten()
+            .and_then(|seconds| u64::try_from(seconds).ok()))
     }
 
     pub fn recovery_loss_watermarks(
@@ -253,6 +309,68 @@ impl SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loss_goal_floor_is_a_running_minimum_until_any_charge_is_unknown() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("alice").unwrap();
+        let floor = |store: &SqliteAccountStorage| {
+            store
+                .recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
+                .unwrap()
+        };
+        assert_eq!(floor(&store), None, "no loss has no bound to certify");
+        store
+            .mark_account_delivery_recovery_bounded("alice", 7, 1, Some(500))
+            .unwrap();
+        assert_eq!(floor(&store), Some(500));
+        // A later drop can carry an earlier timestamp, as NIP-59 wraps do.
+        store
+            .mark_account_delivery_recovery_bounded("alice", 7, 2, Some(300))
+            .unwrap();
+        store
+            .mark_account_delivery_recovery_bounded("alice", 7, 3, Some(900))
+            .unwrap();
+        assert_eq!(floor(&store), Some(300));
+        store
+            .record_account_recovery_loss_bounded(
+                "alice",
+                RecoveryLossCause::Queue,
+                8,
+                1,
+                1,
+                Some(200),
+            )
+            .unwrap();
+        assert_eq!(floor(&store), Some(200), "every generation contributes");
+        // A charge with no known time leaves the whole goal unbounded.
+        store
+            .record_account_recovery_loss_bounded("alice", RecoveryLossCause::Queue, 8, 2, 1, None)
+            .unwrap();
+        assert_eq!(floor(&store), None);
+        store
+            .record_account_recovery_loss_bounded(
+                "alice",
+                RecoveryLossCause::Queue,
+                8,
+                3,
+                1,
+                Some(100),
+            )
+            .unwrap();
+        assert_eq!(floor(&store), None, "an unknown charge stays unknown");
+        // Rows written without a bound, including every pre-migration row,
+        // are unknown too.
+        store
+            .record_account_recovery_loss("alice", RecoveryLossCause::NotificationConsumer, 9, 0, 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .recovery_loss_goal_floor("alice", RecoveryLossCause::NotificationConsumer)
+                .unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn loss_snapshot_preserves_every_generation_with_constant_capture_memory() {

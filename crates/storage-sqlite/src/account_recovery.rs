@@ -303,6 +303,7 @@ pub(crate) fn arm_overflow_tx(
     token: i64,
     dropped: i64,
     now: i64,
+    earliest_created_at: Option<u64>,
 ) -> StorageResult<()> {
     // Import may have joined this generation before its queued control record
     // reaches the worker. Changing the represented identity must fence old
@@ -329,17 +330,39 @@ pub(crate) fn arm_overflow_tx(
     }
     // Preserve what the worker already observed, even when this token's marker
     // callback has not committed yet. A delayed duplicate cannot rearm debt.
+    let (bound_state, bound_seconds) = loss_bound_values(earliest_created_at)?;
     conn.execute_cached(
-        "INSERT INTO account_delivery_loss_evidence
-         (account_label, cause, marker_token, pending_since, dropped_count, imported_count)
-         VALUES (?1, 0, ?2, ?3, ?4, ?4)
-         ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
-             dropped_count = MAX(dropped_count, excluded.dropped_count),
-             imported_count = MAX(COALESCE(imported_count, 0), excluded.imported_count)",
-        params![label, token, now, dropped],
+        &format!(
+            "INSERT INTO account_delivery_loss_evidence
+             (account_label, cause, marker_token, pending_since, dropped_count, imported_count,
+              bound_state, bound_seconds)
+             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?5, ?6)
+             ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
+                 dropped_count = MAX(dropped_count, excluded.dropped_count),
+                 imported_count = MAX(COALESCE(imported_count, 0), excluded.imported_count),
+                 {LOSS_BOUND_MERGE}"
+        ),
+        params![label, token, now, dropped, bound_state, bound_seconds],
     )
     .storage()?;
     Ok(())
+}
+
+/// Merges one charge into a generation's `created_at` bound: a running
+/// minimum while every charge is known, and unknown for good once one is not.
+/// SQLite evaluates each assignment against the row before the update.
+pub(crate) const LOSS_BOUND_MERGE: &str = "
+    bound_state = CASE WHEN bound_state = 1 AND excluded.bound_state = 1 THEN 1 ELSE 2 END,
+    bound_seconds = CASE WHEN bound_state = 1 AND excluded.bound_state = 1
+        THEN MIN(bound_seconds, excluded.bound_seconds) END";
+
+pub(crate) fn loss_bound_values(
+    earliest_created_at: Option<u64>,
+) -> StorageResult<(i64, Option<i64>)> {
+    Ok(match earliest_created_at {
+        Some(seconds) => (1, Some(sqlite_integer(seconds)?)),
+        None => (2, None),
+    })
 }
 
 fn join_loss_tx(

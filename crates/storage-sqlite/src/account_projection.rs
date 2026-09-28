@@ -637,6 +637,19 @@ impl SqliteAccountStorage {
         marker_token: u64,
         dropped_count: u64,
     ) -> StorageResult<()> {
+        self.mark_account_delivery_recovery_bounded(label, marker_token, dropped_count, None)
+    }
+
+    /// Like [`Self::mark_account_delivery_recovery`], also charging the
+    /// earliest wire `created_at` among the dropped deliveries, or an unknown
+    /// time, to the generation's bound.
+    pub fn mark_account_delivery_recovery_bounded(
+        &self,
+        label: &str,
+        marker_token: u64,
+        dropped_count: u64,
+        earliest_created_at: Option<u64>,
+    ) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             crate::account_recovery::arm_overflow_tx(
@@ -645,6 +658,7 @@ impl SqliteAccountStorage {
                 i64::try_from(marker_token).unwrap_or(i64::MAX),
                 i64::try_from(dropped_count).unwrap_or(i64::MAX),
                 unix_now_seconds_i64(),
+                earliest_created_at,
             )
         })
     }

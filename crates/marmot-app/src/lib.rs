@@ -195,8 +195,8 @@ pub(crate) use client::{
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
     AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
-    RecoveryExecutorMode, RelayTelemetryExportConfig, RelayTelemetryResource,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings,
 };
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
@@ -1793,13 +1793,12 @@ impl MarmotApp {
                 cap: EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
             }
         };
-        let mut recovery_owner = client::recovery::AccountRecoveryOwner::open(
+        let recovery_owner = client::recovery::AccountRecoveryOwner::open(
             &self.account_storage(&open.state.label)?,
             client::recovery::wall_now_ms()?,
             Instant::now(),
             recovery_policy,
         )?;
-        recovery_owner.select_executor_mode(self.config.recovery_executor_mode);
         if relay_plane
             .subscription_rebuild_since(open.state.last_transport_timestamp)
             .is_none()

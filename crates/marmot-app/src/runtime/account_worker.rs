@@ -36,9 +36,8 @@ use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, S
 use crate::client::recovery::AttemptGrant;
 use crate::client::{
     ComparisonActivation, ComparisonNetworkJob, ComparisonNetworkResult,
-    CompletedWelcomeDeliveryRecovery,
-    EncryptedMediaUploadFinish, EpochGapQueueJob, OnlineEpochGapRecovery,
-    PreparedGroupImageUploadStart, RouteSubmission,
+    CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, EpochGapQueueJob,
+    OnlineEpochGapRecovery, PreparedGroupImageUploadStart, RouteSubmission,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -1315,11 +1314,7 @@ async fn run_app_runtime_account_worker(
                         Ok((credit, network_result)) => {
                             let _credit = credit;
                             client
-                                .finish_comparison_grant(
-                                    *grant,
-                                    activation,
-                                    network_result,
-                                )
+                                .finish_comparison_grant(*grant, activation, network_result)
                                 .await
                                 .map_err(|error| {
                                     ClassifiedSyncFailure::at_stage(

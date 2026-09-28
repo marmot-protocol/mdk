@@ -103,6 +103,7 @@ pub(crate) struct RouteSubmission {
     cursor_safe: bool,
     outcome: storage_sqlite::RecoveryComparisonOutcome,
     certified: bool,
+    fetched: usize,
     #[cfg(test)]
     attempted: usize,
     #[cfg(test)]
@@ -728,6 +729,7 @@ impl AppClient {
             route: submission.route,
             outcome: submission.outcome,
             certified: submission.certified,
+            fetched: submission.fetched,
         })
     }
 }
@@ -740,6 +742,7 @@ async fn submit_reconciliation_route(
 ) -> RouteSubmission {
     let mut cursor_safe = true;
     let mut certified = false;
+    let mut fetched = 0;
     #[cfg(test)]
     let mut attempted = 0usize;
     #[cfg(test)]
@@ -813,6 +816,7 @@ async fn submit_reconciliation_route(
                 }
             }
             certified = submitted && super::route_comparison_certified(&summary);
+            fetched = summary.received_items;
             if !submitted || summary.relays_failed > 0 {
                 cursor_safe = submitted;
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure
@@ -828,6 +832,7 @@ async fn submit_reconciliation_route(
         cursor_safe,
         outcome,
         certified,
+        fetched,
         #[cfg(test)]
         attempted,
         #[cfg(test)]
@@ -1606,6 +1611,7 @@ mod tests {
                     route: route_key,
                     outcome,
                     certified: false,
+                    fetched: 0,
                 }],
             ),
         )

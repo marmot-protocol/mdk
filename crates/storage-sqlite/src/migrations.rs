@@ -196,6 +196,8 @@ mod migration_0094_qualified_stall_observations;
 mod migration_0095_recovery_comparison;
 #[path = "migrations/0096_account_delivery_spill.rs"]
 mod migration_0096_account_delivery_spill;
+#[path = "migrations/0097_loss_created_at_bound.rs"]
+mod migration_0097_loss_created_at_bound;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -691,6 +693,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 96,
         name: "0096_account_delivery_spill",
         apply: migration_0096_account_delivery_spill::apply,
+    },
+    Migration {
+        version: 97,
+        name: "0097_loss_created_at_bound",
+        apply: migration_0097_loss_created_at_bound::apply,
     },
 ];
 
@@ -1236,6 +1243,13 @@ mod tests {
                 for row in &mut upgraded {
                     use rusqlite::types::Value::{Integer, Null};
                     row.extend([Null, Integer(0), Integer(0), Null]);
+                }
+            }
+            if *table == "account_delivery_loss_evidence" {
+                // Older loss has no known created_at, so it bounds no goal.
+                for row in &mut upgraded {
+                    use rusqlite::types::Value::{Integer, Null};
+                    row.extend([Integer(2), Null]);
                 }
             }
             assert_eq!(

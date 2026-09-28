@@ -777,6 +777,9 @@ pub(crate) struct RouteComparison {
     pub(crate) route: TransportReconciliationRoute,
     pub(crate) outcome: storage_sqlite::RecoveryComparisonOutcome,
     pub(crate) certified: bool,
+    /// Events the comparison fetched for admission. Any is progress, even
+    /// while an unsupported required relay withholds the certificate.
+    pub(crate) fetched: usize,
 }
 
 /// Every physical endpoint counts as exactly one success or failure, so no
@@ -1358,6 +1361,7 @@ impl AppClient {
                     route: inventory.route.clone(),
                     outcome: Outcome::ServicedPartial,
                     certified: false,
+                    fetched: 0,
                 });
                 continue;
             }
@@ -1437,12 +1441,14 @@ impl AppClient {
             })
             .await;
             let mut certified = false;
+            let mut fetched = 0;
             let outcome = match result {
                 Ok(Ok(Some(summary))) => {
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
                     remote_items += summary.remote_items;
                     received_items += summary.received_items;
+                    fetched = summary.received_items;
                     certified = route_comparison_certified(&summary);
                     if summary.relays_failed > 0 {
                         Outcome::TransientFailure
@@ -1466,6 +1472,7 @@ impl AppClient {
                 route: inventory.route.clone(),
                 outcome,
                 certified,
+                fetched,
             });
         }
 
@@ -5057,7 +5064,7 @@ impl AppClient {
                 verdict,
                 DrainVerdict::Complete | DrainVerdict::CoverageUnproven
             );
-            let mut certified_any = false;
+            let mut progressed_any = false;
             for obligation in grant.plan().expect("validated executor grant") {
                 // A selected group can lack any executable route even though
                 // another obligation made the account ready. Preserve that
@@ -5094,6 +5101,7 @@ impl AppClient {
                         | storage_sqlite::RecoveryCause::KnownEvent
                 );
                 let mut certified = false;
+                let mut fetched = false;
                 let mut checkpoints = Vec::with_capacity(obligation.scopes.len());
                 for scope in &obligation.scopes {
                     let route = match (scope.goal.route_kind, scope.goal.transport_group_id) {
@@ -5104,12 +5112,16 @@ impl AppClient {
                     let compared = route
                         .as_ref()
                         .and_then(|route| comparison_outcomes.iter().find(|c| &c.route == route));
-                    // A scope this pass did not compare keeps the
-                    // certificates it already has.
+                    fetched |= compared.is_some_and(|compared| compared.fetched > 0);
+                    // A scope this pass did not compare, or already certified
+                    // for this goal, keeps the certificates it has.
                     if comparison_owned
                         && !unroutable
-                        && compared.is_none()
                         && scope.goal.known_event_id.is_none()
+                        && (compared.is_none()
+                            || grant
+                                .certified_scopes
+                                .contains(&(obligation.id, scope.goal.scope_id)))
                     {
                         continue;
                     }
@@ -5119,7 +5131,10 @@ impl AppClient {
                     let covers_goal = route.as_ref().is_some_and(|route| {
                         grant.inventory.iter().any(|window| {
                             &window.route == route
-                                && scope.goal.since_seconds.is_some_and(|since| since >= window.since)
+                                && scope
+                                    .goal
+                                    .since_seconds
+                                    .is_some_and(|since| since >= window.since)
                                 && scope.goal.until_seconds <= window.until
                         })
                     });
@@ -5173,12 +5188,12 @@ impl AppClient {
                         endpoints,
                     });
                 }
-                certified_any |= certified;
+                progressed_any |= certified || fetched;
                 let eligibility = if comparison_owned {
                     super::recovery::eligibility_after_comparison(
                         outcome,
                         refused,
-                        certified,
+                        certified || fetched,
                         grant.reservation.ordinal,
                     )
                 } else {
@@ -5203,8 +5218,9 @@ impl AppClient {
                     eligibility,
                 )?;
             }
-            if certified_any {
-                // New coverage is progress: the next pass runs at the base delay.
+            if progressed_any {
+                // New coverage or newly fetched history is progress: the next
+                // pass runs at the base delay and the parking streak restarts.
                 self.recovery_owner
                     .observe_certified_progress(&storage, &grant)?;
             }
