@@ -336,16 +336,16 @@ pub(crate) struct GroupRouteRefresh {
     pub(crate) state_pruned: bool,
 }
 
-/// Where [`AppClient::live_cursor_seal_probe`] runs relative to the seal.
+/// Where [`AppClient::cursor_seal_probe`] runs relative to a seal.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LiveCursorSeal {
+pub(crate) enum CursorSeal {
     Before,
     After,
 }
 
 #[cfg(test)]
-pub(crate) type LiveCursorSealProbe = Box<dyn FnMut(LiveCursorSeal) + Send>;
+pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 
 pub struct AppClient {
     #[cfg(test)]
@@ -457,13 +457,13 @@ pub struct AppClient {
     /// lock: at a drain checkpoint or settled loss, or with a live ingest's
     /// own save once every subscription finished replaying stored history.
     /// The seal never passes a queued delivery a restart would then no
-    /// longer fetch, and the router spills any later arrival that falls
-    /// below the floor a live promotion raised.
+    /// longer fetch, and the router spills an arrival that falls below the
+    /// floor it raised: during the commit's save, and after a live one.
     pub(crate) checkpointed_transport_timestamp: Option<u64>,
-    /// Runs at the live promotion's seal, before and after, so a test can
+    /// Runs at every transport-cursor seal, before and after, so a test can
     /// land a delivery on either side of the decision.
     #[cfg(test)]
-    pub(crate) live_cursor_seal_probe: std::sync::Mutex<Option<LiveCursorSealProbe>>,
+    pub(crate) cursor_seal_probe: std::sync::Mutex<Option<CursorSealProbe>>,
     /// Durable account-wide marker set when the bounded relay-plane queue
     /// omits a delivery. While true, every subscription rebuild is unfloored
     /// and EOSE-gated recovery must complete before the cursor is trusted.

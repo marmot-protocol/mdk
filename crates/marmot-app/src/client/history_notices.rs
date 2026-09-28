@@ -101,12 +101,12 @@ impl AppClient {
             // Every prefix drained while the fence held stayed on the old
             // cursor. The user accepted the loss, so promote the candidate as
             // qualified completion would, without recording coverage.
-            let sealed = self.seal_settled_transport_cursor();
+            let sealed = self.seal_transport_cursor();
             if self
                 .save_state_with_pending_local_group_deletion_frontier_clears()
                 .is_err()
             {
-                self.checkpointed_transport_timestamp = sealed.previous;
+                self.abandon_transport_cursor(sealed);
                 tracing::warn!(
                     target: "marmot_app::recovery",
                     method = "dismiss_history_notice",

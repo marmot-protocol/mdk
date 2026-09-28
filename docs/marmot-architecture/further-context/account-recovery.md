@@ -248,11 +248,11 @@ A live ingest's own save now promotes the cursor to what the account ingested, w
 - the cursor advances (not a frozen wake pass) and restarts rebuild from it.
 
 The rule it keeps: the account queue never holds a delivery that a restart would no longer
-fetch only because a live ingest promoted the cursor. A delivery's key is the lowest
-restart `since` that still fetches it: its `created_at`, or for an inbox wrap its
-`created_at` plus the two-day NIP-59 widening the inbox REQ adds. Two mechanisms keep the
-rule, and both run under the lock the router already holds when it places a delivery in
-the queue, the spill or loss:
+fetch only because a live ingest promoted the cursor, or because a cursor commit was saving
+when it arrived. A delivery's key is the lowest restart `since` that still fetches it: its
+`created_at`, or for an inbox wrap its `created_at` plus the two-day NIP-59 widening the
+inbox REQ adds. Two mechanisms keep the rule, and both run under the lock the router
+already holds when it places a delivery in the queue, the spill or loss:
 
 - **The seal.** Every cursor commit decides its value there, at one point just before its
   save. It keeps the persisted cursor while loss or a hand-off is pending. Otherwise it is
@@ -260,25 +260,30 @@ the queue, the spill or loss:
   Nothing it relies on can go stale before the decision, which is what broke the first
   attempt: it read an empty queue, then awaited the EOSE read and the save while the
   router could queue an older delivery.
-- **The live floor.** A live seal raises the restart floor before its save. From then on
-  the router sends a delivery whose key falls between the settled floor and the live floor
-  to the durable spill instead of the queue, or to queue loss bounded by its `created_at`
+- **The raised floor.** Every seal raises the restart floor before its save. From then on
+  the router sends a delivery whose key falls between the settled floor and that floor to
+  the durable spill instead of the queue, or to queue loss bounded by its `created_at`
   when the spill cannot take it. The settled floor is what drain checkpoints, settled loss
-  and the cursor the account opened with reached; a delivery below it is exposed exactly as
-  before live promotion existed, and one above the live floor is still fetched.
+  and the cursor the account opened with made durable. A drain checkpoint, settled loss or
+  retired notice raises it to what it reached once its save succeeds, so it spills only
+  what arrives while it saves. A live promotion leaves it, so what only the promotion
+  exposed keeps going to the spill. A delivery below the settled floor is exposed exactly
+  as before live promotion existed, and one above the raised floor is still fetched.
 
 So a delivery that arrives during the EOSE read caps the promotion, and one that arrives
-during the save is spilled. Drain checkpoints and settled loss are capped the same way and
-never divert. Once their save succeeds they raise the settled floor to what they reached
-themselves, never to a cursor an earlier live promotion left persisted, so a fenced drain
-checkpoint cannot stop the spilling that promotion needs. A failed live save lowers the
+while any commit saves is spilled. A settled commit raises the settled floor only to what
+it reached itself, never to a cursor an earlier live promotion left persisted, so a fenced
+drain checkpoint cannot stop the spilling that promotion needs. It stops spilling once its
+save is durable: an older delivery that arrives later is queued, as it always was, because
+spilling every later arrival below a drain's floor would push the rest of a replay into the
+spill, and a repair drain reads only the queue. A failed save of either kind lowers the
 floor again. A replaced adapter cannot promote: the queue it drains is not the one the
 router tracks.
 
 One window stays open. A spilled delivery is volatile until its spill write commits, which
-is usually right after the promoting save, because both use the account database. No
-design with a router that never blocks can close it: a delivery can arrive at the instant
-the promoted cursor commits, and making it durable takes its own write. It is the same
+is usually right after the save it arrived during, because both use the account database.
+No design with a router that never blocks can close it: a delivery can arrive at the
+instant a raised cursor commits, and making it durable takes its own write. It is the same
 hand-off window the overflow tier has. The fence holds every later commit until the write
 settles, and the startup comparison over the retained window still finds what a stop there
 would lose.
@@ -391,14 +396,16 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   route; per-route floors would need per-scope storage. An EOSE lost in a lag is not
   recovered, so the next activation re-subscribes instead of reusing the live one. Relays
   that ignore `since` are not detected.
-- Live cursor promotion (design section 5). A delivery the live floor sends to the spill is
-  volatile until its spill write commits; a stop in that window loses it until the startup
-  comparison. Routing is by content, so the router cannot tell an unfloored maintenance or
-  prior-route replay from a floored REQ: such a replay's events above the settled floor go
-  to the spill too, which costs spill writes (seen events are discarded before they use
-  capacity) but loses nothing. EOSE covers the activation's snapshot, not a group added
-  since, so a new group's replay may still be arriving when a promotion seals; what falls
-  below the floor is spilled, not lost.
+- Live cursor promotion (design section 5). A delivery the raised floor sends to the spill
+  is volatile until its spill write commits; a stop in that window loses it until the
+  startup comparison. Routing is by content, so the router cannot tell an unfloored
+  maintenance or prior-route replay from a floored REQ: such a replay's events above the
+  settled floor go to the spill too, which costs spill writes (seen events are discarded
+  before they use capacity) but loses nothing. EOSE covers the activation's snapshot, not a
+  group added since, so a new group's replay may still be arriving when a promotion seals;
+  what falls below the floor is spilled, not lost. A drain checkpoint spills only what
+  arrives while it saves; an older delivery that arrives after it is queued below its floor,
+  exposed to a stop as it always was.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.

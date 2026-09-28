@@ -3,12 +3,13 @@
 //! The shared router must never wait on one account's slow consumer. When an
 //! account queue is full, the router hands the delivery to that account's
 //! spill instead of dropping it. It does the same with a delivery a restart
-//! would no longer fetch only because a live ingest promoted the transport
-//! cursor past it, which the in-memory queue must never hold. One writer task
-//! per account stores hand-offs in the account database; the account worker
-//! later admits spilled rows through its ordinary ingest path. A delivery is
-//! lost, and becomes a queue-loss generation, only when the hand-off or the
-//! durable spill is full, or the store keeps failing.
+//! would no longer fetch only because a transport-cursor checkpoint was saving
+//! when it arrived, or a live ingest promoted the cursor past it, which the
+//! in-memory queue must never hold. One writer task per account stores
+//! hand-offs in the account database; the account worker later admits
+//! spilled rows through its ordinary ingest path. A delivery is lost, and
+//! becomes a queue-loss generation, only when the hand-off or the durable
+//! spill is full, or the store keeps failing.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};

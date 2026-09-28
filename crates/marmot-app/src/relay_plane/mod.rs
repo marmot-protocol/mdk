@@ -294,13 +294,16 @@ struct AccountDeliveryAdmission {
     epoch: u64,
     /// Keys of the deliveries in the account queue, with their counts.
     queued: BTreeMap<u64, u32>,
-    /// The persisted cursor's restart `since`, raised before a live
-    /// promotion saves.
+    /// The persisted cursor's restart `since`. Every seal raises it before
+    /// its commit saves, so it covers a cursor still being written too.
     durable_since: Option<u64>,
-    /// The part of `durable_since` reached without live promotion: by the
-    /// cursor the account opened with, drain checkpoints and settled loss.
-    /// A delivery keyed between the two is one only a live promotion stopped
-    /// covering, so the router spills it instead of queueing it.
+    /// The part of `durable_since` that drain checkpoints, settled loss and
+    /// the cursor the account opened with made durable, which is where a
+    /// design without live promotion would have it. A delivery keyed between
+    /// the two is one that only a live promotion, or a commit still saving,
+    /// stopped a restart from fetching, so the router spills it instead of
+    /// queueing it. `None` until the account has a cursor: until then a
+    /// restart relies on its comparison, not the cursor, for everything.
     settled_since: Option<u64>,
 }
 
@@ -312,17 +315,6 @@ enum AccountDeliveryPlacement {
     Spill,
     /// Queue loss, because no spill can take it.
     Omit,
-}
-
-/// Which kind of commit is choosing a transport cursor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TransportCursorCommit {
-    /// A drain checkpoint, settled loss or a retired notice. It raises the
-    /// restart floor only once its save succeeds.
-    Settled,
-    /// A live ingest's own save. The floor rises before that save runs, so a
-    /// delivery that arrives during it and falls below goes to the spill.
-    Live,
 }
 
 /// The lowest restart `since` that fetches `delivery` again.
@@ -407,8 +399,8 @@ impl AccountDeliveryOverflowState {
     }
 
     /// Decide where one delivery goes, under the lock every cursor commit
-    /// decides under. A full queue, or a key only a live promotion stopped
-    /// covering, sends it to the spill, or to loss when there is none. A
+    /// decides under. A full queue, or a key between the settled and durable
+    /// floors, sends it to the spill, or to loss when there is none. A
     /// spilled delivery is counted in the cursor fence here, before the
     /// hand-off holds it, so no commit can pass it while it is in neither
     /// place.
@@ -421,11 +413,11 @@ impl AccountDeliveryOverflowState {
     ) -> AccountDeliveryPlacement {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let admission = &mut state.admission;
-        let below_live_floor = matches!(
+        let below_durable_floor = matches!(
             (admission.settled_since, admission.durable_since),
             (Some(settled), Some(durable)) if settled <= key && key < durable
         );
-        if !queue_full && !below_live_floor {
+        if !queue_full && !below_durable_floor {
             if admission.epoch == epoch {
                 *admission.queued.entry(key).or_default() += 1;
             }
@@ -471,15 +463,15 @@ impl AccountDeliveryOverflowState {
     /// lock: `candidate`, capped at the lowest queued key the persisted cursor
     /// still covers, plus the lookback. `None` while loss or a spill hand-off
     /// is pending, and for a replaced adapter, whose queue is not the one
-    /// tracked here. A live commit raises the restart floor here, before its
-    /// save, so any delivery placed from now on that falls below it goes to
-    /// the spill.
+    /// tracked here. The restart floor rises here, before the commit's save
+    /// starts, so any delivery placed while that save runs and falls below it
+    /// goes to the spill. A settled commit moves the settled floor up once its
+    /// save succeeds; a live one leaves it, so its spilling continues.
     fn seal_cursor(
         &self,
         epoch: u64,
         lookback: Option<u64>,
         candidate: Option<u64>,
-        commit: TransportCursorCommit,
     ) -> Option<u64> {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if state.pending || state.spill_in_flight > 0 || state.admission.epoch != epoch {
@@ -499,17 +491,15 @@ impl AccountDeliveryOverflowState {
             .next()
             .map(|(key, _)| key.saturating_add(lookback));
         let reached = cap.map_or(candidate, |cap| candidate.min(cap));
-        if commit == TransportCursorCommit::Live {
-            let since = reached.saturating_sub(lookback);
-            admission.durable_since = Some(admission.durable_since.map_or(since, |d| d.max(since)));
-        }
+        let since = reached.saturating_sub(lookback);
+        admission.durable_since = Some(admission.durable_since.map_or(since, |d| d.max(since)));
         Some(reached)
     }
 
-    /// A live commit's save failed, so `restored` is still the persisted
-    /// cursor: lower the restart floor its seal raised back to it. The router
-    /// queues what that floor covers again, and the next seal is capped by
-    /// it. Deliveries spilled meanwhile stay in the spill.
+    /// A commit's save failed, so `restored` is still the persisted cursor:
+    /// lower the restart floor its seal raised back to it. The router queues
+    /// what that floor covers again, and the next seal is capped by it.
+    /// Deliveries spilled meanwhile stay in the spill.
     fn unseal_cursor(&self, lookback: Option<u64>, restored: Option<u64>) {
         let Some(lookback) = lookback else {
             return;
@@ -1052,8 +1042,9 @@ pub struct RelayPlaneHealth {
     #[serde(default)]
     pub account_delivery_dropped: u64,
     /// Deliveries stored in the durable account spill instead of the queue:
-    /// because it was full, or because a live cursor promotion alone had put
-    /// them below the floor a restart fetches from.
+    /// because it was full, or because a transport-cursor checkpoint still
+    /// saving, or a live promotion alone, had put them below the floor a
+    /// restart fetches from.
     #[serde(default)]
     pub account_delivery_spilled: u64,
     /// Spill candidates discarded because the account had already seen them.
@@ -3197,32 +3188,29 @@ impl MarmotRelayPlaneAccountAdapter {
     /// router's placement lock: at most `candidate`, and never past a queued
     /// delivery that the persisted cursor still lets a restart fetch. `None`
     /// while loss or a spill hand-off is pending. The caller persists the
-    /// larger of this and its current cursor. A [`TransportCursorCommit::Live`]
-    /// commit also raises the restart floor before its save runs, so a
-    /// delivery that arrives during that save and falls below it is spilled
-    /// rather than queued.
-    pub(crate) fn seal_transport_cursor(
-        &self,
-        candidate: Option<u64>,
-        commit: TransportCursorCommit,
-    ) -> Option<u64> {
+    /// larger of this and its current cursor. The restart floor rises here,
+    /// before the commit's save runs, so a delivery that arrives during that
+    /// save and falls below it is spilled rather than queued.
+    pub(crate) fn seal_transport_cursor(&self, candidate: Option<u64>) -> Option<u64> {
         self.delivery_overflow.seal_cursor(
             self.delivery_epoch,
             self.cursor_lookback_secs(),
             candidate,
-            commit,
         )
     }
 
-    /// A [`TransportCursorCommit::Live`] commit's save failed and `restored`
-    /// is still the persisted cursor. Undo the floor its seal raised.
+    /// A sealed commit's save failed and `restored` is still the persisted
+    /// cursor. Undo the floor its seal raised.
     pub(crate) fn unseal_transport_cursor(&self, restored: Option<u64>) {
         self.delivery_overflow
             .unseal_cursor(self.cursor_lookback_secs(), restored);
     }
 
-    /// A [`TransportCursorCommit::Settled`] commit's save succeeded. `reached`
-    /// is what its seal returned, not the cursor it persisted.
+    /// A settled commit (a drain checkpoint, settled loss or a retired
+    /// notice) saved what its seal reached, so the settled floor rises to it
+    /// and the router stops spilling below. `reached` is what the seal
+    /// returned, not the cursor the commit persisted, which may be an earlier
+    /// live promotion's. A live commit never settles.
     pub(crate) fn settle_transport_cursor(&self, reached: Option<u64>) {
         self.delivery_overflow
             .settle_cursor(self.cursor_lookback_secs(), reached, false);
@@ -3484,10 +3472,11 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
 /// upstream, the relay notification pipeline).
 ///
 /// A full queue hands the delivery to the account's durable spill, and so
-/// does a delivery that only live cursor promotion stopped a restart from
-/// fetching again: the queue never holds one of those. Only when the spill
-/// cannot take it does the delivery join an explicit loss generation, using
-/// the one channel slot reserved for its control record.
+/// does a delivery that a transport-cursor checkpoint still saving, or a live
+/// promotion alone, stopped a restart from fetching again: the queue never
+/// holds one of those. Only when the spill cannot take it does the delivery
+/// join an explicit loss generation, using the one channel slot reserved for
+/// its control record.
 fn route_account_delivery(transport: &RelayPlaneTransport, delivery: TransportDelivery) {
     let Some(route) = account_deliveries_read(&transport.account_deliveries)
         .get(&delivery.account_id)

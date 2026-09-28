@@ -51,10 +51,10 @@
   drain checkpoint or settled loss used to, so a restart re-downloaded everything the
   account had received live since its last drain: on the #2069 scorecard, a full pass of the
   account's history on each relay. No checkpoint passes a queued delivery that a restart
-  would then no longer fetch. A delivery that arrives while a promotion saves, or later, and
-  falls below the floor only that promotion raised goes to the durable spill instead of the
-  queue, or becomes queue loss bounded by its `created_at` when the spill cannot take it;
-  `account_delivery_spilled` counts it. (#2069)
+  would then no longer fetch. A delivery goes to the durable spill instead of the queue when
+  it arrives while a checkpoint saves and falls below the floor that checkpoint commits, or
+  when only a live promotion put it below the floor. It becomes queue loss bounded by its
+  `created_at` when the spill cannot take it; `account_delivery_spilled` counts it. (#2069)
 
 ### Fixed
 

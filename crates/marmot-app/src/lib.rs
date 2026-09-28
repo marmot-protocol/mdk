@@ -1857,7 +1857,7 @@ impl MarmotApp {
             pending_runtime_group_subscription_refresh: false,
             checkpointed_transport_timestamp,
             #[cfg(test)]
-            live_cursor_seal_probe: std::sync::Mutex::new(None),
+            cursor_seal_probe: std::sync::Mutex::new(None),
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
             delivery_spill: Default::default(),
@@ -4198,7 +4198,7 @@ impl MarmotApp {
             Some(recovery_marker),
             Some(spill_store),
         );
-        // The router spills what live promotion alone stopped a restart from
+        // The router spills what a raised cursor alone stopped a restart from
         // fetching again, measured from this persisted floor.
         adapter.open_transport_cursor(state.last_transport_timestamp);
 

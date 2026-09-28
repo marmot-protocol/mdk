@@ -13802,21 +13802,97 @@ impl LiveCursorFixture {
             .expect("the group route receives the probe")
     }
 
-    /// Route `late` synchronously at `point` of the next live promotion.
-    fn land_during_promotion(
+    /// Route `late` synchronously at `point` of the next cursor seal: a live
+    /// promotion's, or a drain checkpoint's.
+    pub(crate) fn land_during_seal(
         &mut self,
-        point: crate::client::LiveCursorSeal,
+        point: crate::client::CursorSeal,
         late: cgka_traits::TransportDelivery,
     ) {
         let plane = self.app.relay_plane.clone();
         let mut late = Some(late);
-        *self.client.live_cursor_seal_probe.get_mut().unwrap() = Some(Box::new(move |at| {
+        *self.client.cursor_seal_probe.get_mut().unwrap() = Some(Box::new(move |at| {
             if at == point
                 && let Some(late) = late.take()
             {
                 plane.route_account_delivery_for_test(late);
             }
         }));
+    }
+
+    /// Stop the account's client as a process stop would, losing whatever
+    /// its queue held, and open the account again on the same relay plane.
+    pub(crate) async fn reopen(self) -> Self {
+        let Self {
+            app,
+            client,
+            account_id,
+            nostr_group_id_hex,
+            cursor_before,
+            _eose,
+            _dir,
+        } = self;
+        drop(client);
+        let client = client_on_app_relay_plane(&app, "alice").await;
+        Self {
+            app,
+            client,
+            account_id,
+            nostr_group_id_hex,
+            cursor_before,
+            _eose,
+            _dir,
+        }
+    }
+
+    /// Wait until the durable spill holds exactly `event_id`.
+    pub(crate) async fn wait_for_spilled(&self, event_id: &str) {
+        let storage = self.app.account_storage("alice").unwrap();
+        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let rows = storage
+                    .spilled_account_deliveries(10, crate::unix_now_seconds())
+                    .unwrap()
+                    .deliveries;
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the late delivery becomes a durable spill row");
+        assert_eq!(spilled.len(), 1);
+        assert_eq!(
+            hex::encode(spilled[0].delivery.message.id.as_slice()),
+            event_id
+        );
+    }
+
+    /// Stop before the spilled `event_id` is ingested, reopen, and check the
+    /// reopened account admits it from the spill: its restart floor no
+    /// longer asks relays for it.
+    pub(crate) async fn reopen_and_admit_spilled(self, event_id: &str) -> Self {
+        let mut fixture = self.reopen().await;
+        assert_eq!(fixture.ingest_next_live_delivery().await, event_id);
+        assert!(
+            fixture
+                .client
+                .transport_receipts()
+                .unwrap()
+                .contains(event_id)
+        );
+        assert!(
+            fixture
+                .app
+                .account_storage("alice")
+                .unwrap()
+                .spilled_account_deliveries(10, crate::unix_now_seconds())
+                .unwrap()
+                .deliveries
+                .is_empty()
+        );
+        fixture
     }
 
     pub(crate) async fn wait_for_queue_depth(&self, depth: usize) {
@@ -13957,7 +14033,7 @@ fn a_delivery_arriving_before_the_live_seal_caps_the_promotion() {
             .await;
         // It arrives while the promotion reads end-of-stored-events, after
         // any queue observation made so far.
-        fixture.land_during_promotion(crate::client::LiveCursorSeal::Before, late);
+        fixture.land_during_seal(crate::client::CursorSeal::Before, late);
         fixture.ingest_next_live_delivery().await;
 
         let persisted = fixture.persisted();
@@ -13985,7 +14061,7 @@ fn a_delivery_arriving_during_the_promoting_save_is_spilled_and_survives_a_stop(
             .late_delivery_for_promotion(cursor_before + 4_000, late_at)
             .await;
         // It arrives after the promotion's decision, while its save runs.
-        fixture.land_during_promotion(crate::client::LiveCursorSeal::After, delivery);
+        fixture.land_during_seal(crate::client::CursorSeal::After, delivery);
         fixture.ingest_next_live_delivery().await;
 
         let persisted = fixture.persisted();
@@ -14006,56 +14082,8 @@ fn a_delivery_arriving_during_the_promoting_save_is_spilled_and_survives_a_stop(
                 .is_none(),
             "the queue never holds a delivery below the promoted floor"
         );
-        let storage = fixture.app.account_storage("alice").unwrap();
-        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let rows = storage
-                    .spilled_account_deliveries(10, crate::unix_now_seconds())
-                    .unwrap()
-                    .deliveries;
-                if !rows.is_empty() {
-                    break rows;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the late delivery becomes a durable spill row");
-        assert_eq!(spilled.len(), 1);
-        assert_eq!(
-            hex::encode(spilled[0].delivery.message.id.as_slice()),
-            late.id
-        );
-
-        // Stop before it is ingested. The reopened account admits it from
-        // the spill, not from relays that its restart floor no longer asks.
-        let LiveCursorFixture {
-            app,
-            client,
-            _eose,
-            _dir,
-            ..
-        } = fixture;
-        drop(client);
-        let mut reopened = client_on_app_relay_plane(&app, "alice").await;
-        let received =
-            tokio::time::timeout(Duration::from_secs(5), reopened.receive_next_delivery())
-                .await
-                .expect("the spilled delivery is ready after the stop")
-                .unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
-            panic!("a spilled delivery must not produce a control record");
-        };
-        assert_eq!(hex::encode(delivery.message.id.as_slice()), late.id);
-        reopened.ingest_received_delivery(*delivery).await.unwrap();
-        assert!(reopened.transport_receipts().unwrap().contains(&late.id));
-        assert!(
-            storage
-                .spilled_account_deliveries(10, crate::unix_now_seconds())
-                .unwrap()
-                .deliveries
-                .is_empty()
-        );
+        fixture.wait_for_spilled(&late.id).await;
+        fixture.reopen_and_admit_spilled(&late.id).await;
     });
 }
 
@@ -14074,7 +14102,7 @@ fn a_delivery_arriving_during_the_promoting_save_without_a_spill_is_bounded_loss
         let (_, delivery) = fixture
             .late_delivery_for_promotion(cursor_before + 4_000, late_at)
             .await;
-        fixture.land_during_promotion(crate::client::LiveCursorSeal::After, delivery);
+        fixture.land_during_seal(crate::client::CursorSeal::After, delivery);
         fixture.ingest_next_live_delivery().await;
 
         assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
