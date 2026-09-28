@@ -15,10 +15,11 @@ pub(crate) const MAX_COMPARISON_ENDPOINTS_PER_ROUTE: usize = 4;
 
 /// What the worker keeps while a comparison runs off the worker: the live
 /// subscription attempt admission must still own, and the inline executor's
-/// execution bracket (loss attempt and audit rows).
+/// execution bracket (loss attempt and audit rows). The bracket is boxed so
+/// worker enums that park an activation stay small.
 pub(crate) struct ComparisonActivation {
     attempt: SubscriptionAttempt,
-    execution: RecoveryExecutionState,
+    execution: Box<RecoveryExecutionState>,
 }
 
 fn comparison_failure(error: AppError) -> ClassifiedSyncFailure {
@@ -562,7 +563,10 @@ impl AppClient {
             Err(failure) => Err(failure),
         };
         match attempt {
-            Ok(attempt) => Ok(ComparisonActivation { attempt, execution }),
+            Ok(attempt) => Ok(ComparisonActivation {
+                attempt,
+                execution: Box::new(execution),
+            }),
             Err(failure) => {
                 match self.finish_recovery_execution(grant, execution, Err(failure), false) {
                     Ok(_) => unreachable!("a failed activation cannot complete"),
@@ -592,7 +596,7 @@ impl AppClient {
         let summary = self
             .finish_recovery_execution(
                 &grant,
-                execution,
+                *execution,
                 admitted.map(Option::unwrap_or_default),
                 false,
             )
@@ -617,7 +621,7 @@ impl AppClient {
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         self.finish_recovery_execution(
             &grant,
-            activation.execution,
+            *activation.execution,
             Ok(SyncSummary::default()),
             false,
         )

@@ -3759,15 +3759,7 @@ mod tests {
     fn scripted_routes(
         grant: &AttemptGrant,
         failed: impl Fn(&storage_sqlite::TransportReconciliationRoute) -> bool,
-    ) -> std::collections::VecDeque<
-        Result<
-            Option<(
-                transport_nostr_adapter::NostrReconciliationSummary,
-                Vec<transport_nostr_adapter::NostrRelayEvent>,
-            )>,
-            cgka_traits::TransportAdapterError,
-        >,
-    > {
+    ) -> std::collections::VecDeque<crate::client::sync::TestComparisonResult> {
         grant
             .inventory
             .iter()

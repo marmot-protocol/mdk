@@ -5223,7 +5223,7 @@ impl AppClient {
                 // New coverage or newly fetched history is progress: the next
                 // pass runs at the base delay and the parking streak restarts.
                 self.recovery_owner
-                    .observe_certified_progress(&storage, &grant)?;
+                    .observe_certified_progress(&storage, grant)?;
             }
             Ok(())
         })();
