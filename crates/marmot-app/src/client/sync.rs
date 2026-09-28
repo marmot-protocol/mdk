@@ -114,22 +114,27 @@ impl ScriptedComparisons {
         Self::Timed(std::sync::Arc::new(answer))
     }
 
-    /// The route's answer and how long it takes to arrive.
-    pub(crate) fn answer_after(
+    /// A timed script's answer and its own delay, decided when the route
+    /// starts. Other scripts answer only once the delay has passed.
+    pub(crate) fn timed_answer(
         &self,
         route: &TransportReconciliationRoute,
-    ) -> (Option<Duration>, TestComparisonResult) {
+    ) -> Option<(Option<Duration>, TestComparisonResult)> {
         match self {
-            Self::Queue(queue) => (
-                None,
-                queue
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("one scripted result per selected comparison route"),
-            ),
-            Self::ByRoute(answer) => (None, answer(route)),
-            Self::Timed(answer) => answer(route),
+            Self::Timed(answer) => Some(answer(route)),
+            Self::Queue(_) | Self::ByRoute(_) => None,
+        }
+    }
+
+    pub(crate) fn answer(&self, route: &TransportReconciliationRoute) -> TestComparisonResult {
+        match self {
+            Self::Queue(queue) => queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one scripted result per selected comparison route"),
+            Self::ByRoute(answer) => answer(route),
+            Self::Timed(answer) => answer(route).1,
         }
     }
 

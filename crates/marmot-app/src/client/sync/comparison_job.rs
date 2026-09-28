@@ -232,11 +232,14 @@ impl ComparisonNetworkJob {
                         .map(|witness| ActiveCounter::new(witness.active_requests.clone()));
                     #[cfg(test)]
                     if let Some(scripted) = &scripted {
-                        let (delay, answer) = scripted.answer_after(&inventory.route);
+                        let (delay, timed) = match scripted.timed_answer(&inventory.route) {
+                            Some((delay, answer)) => (delay, Some(answer)),
+                            None => (None, None),
+                        };
                         if let Some(delay) = delay.or(scripted_delay) {
                             tokio::time::sleep(delay).await;
                         }
-                        return answer;
+                        return timed.unwrap_or_else(|| scripted.answer(&inventory.route));
                     }
                     match inventory.work {
                         TransportReconciliationWork::Inbox(endpoints) => {
