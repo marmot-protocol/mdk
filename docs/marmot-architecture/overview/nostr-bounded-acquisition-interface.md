@@ -117,8 +117,10 @@ is older. An unfloored REQ, no REQ at all, or a shared receiver reads as `Unboun
 context's life, so reading it at the lag gives the tightest bound.
 
 A lag can also lose end-of-stored-events. `reissue_subscription` recovers them: it re-sends a live REQ unchanged, under
-its own id, to the relays that never answered it. The account context records it again first, with the `since` it
-was issued with, and never reopens a closed REQ, so the re-issue leaves the floor where it was.
+its own id, to the connected relays that never answered it. It closes the REQ on each of them first, so no relay sees
+the id repeated while it is live there, and sends both as raw frames, which leave the SDK's reconnect registry
+untouched. The account context records the REQ again first, with the `since` it was issued with, and never reopens a
+closed REQ, so the re-issue leaves the floor where it was.
 
 The recovery consumer subscribes for each activated account and never infers a group from a receiver gap. The backend
 must update the watch without waiting for room in the event-delivery queue, so loss stays observable when event

@@ -55,8 +55,11 @@ for reconnect/backoff and relay status mechanics.
 - Recover a lag-lost end-of-stored-events only by re-issuing the live REQ unchanged, under its own id
   (`reissue_subscriptions_awaiting_eose`): only REQs issued by the lag's `NotificationLagMark`, only on relays that
   have not reported EOSE, at most once per relay, under the subscription lifecycle lock. The SDK client re-sends a
-  REQ only while its floor record holds it live, and records it with `open` first. Never infer EOSE at a lag, change
-  a re-issued REQ's filter, or reopen a closed REQ.
+  REQ only to a connected relay and only while its floor record holds it live, and records it with `open` first. It
+  sends a raw CLOSE before the raw REQ: a relay must never see a repeated live id, because one that answers
+  `CLOSED duplicate:` makes the SDK drop the REQ from the registry that restores it on reconnect. Keep that registry
+  untouched; a relay-level unsubscribe and subscribe drops its entry when a send fails. Never infer EOSE at a lag,
+  change a re-issued REQ's filter, or reopen a closed REQ.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`
