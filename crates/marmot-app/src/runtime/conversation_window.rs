@@ -375,11 +375,12 @@ pub(super) fn capture_conversation(
 }
 
 /// Commands apply to the current retained viewport. Background replacements (new
-/// rows, delivery state, reactions, header, draft) never supersede a revision; once
-/// a replacement showing a command's viewport move is published, every earlier
-/// revision returns `StaleWindow`. Consume the latest snapshot and reassess the
-/// user's intent before retrying. Commands from another handle generation are
-/// always rejected.
+/// rows, delivery state, reactions, header, draft) do not supersede a revision;
+/// `set_visible_anchor` returns `StaleWindow` if a background replacement dropped
+/// its row. Once a replacement showing a command's viewport move is published,
+/// every earlier revision returns `StaleWindow`. Consume the latest snapshot and
+/// reassess the user's intent before retrying. Commands from another handle
+/// generation are always rejected.
 #[derive(Clone)]
 pub struct ConversationWindowHandle {
     commands: mpsc::Sender<Command>,
@@ -982,7 +983,11 @@ fn command_position(
                 .anchors
                 .iter()
                 .position(|a| a.message_id_hex().eq_ignore_ascii_case(id))
-                .ok_or(ConversationWindowError::AnchorOutsideWindow)?;
+                .ok_or(if quoted.sequence == current.revision.sequence {
+                    ConversationWindowError::AnchorOutsideWindow
+                } else {
+                    ConversationWindowError::StaleWindow
+                })?;
             next.opening.target = ConversationOpenTarget::Anchor(current.anchors[index].clone());
             next.before_anchor = Some(index);
         }

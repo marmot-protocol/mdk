@@ -391,6 +391,34 @@ async fn commands_quoting_a_revision_replaced_only_by_new_content_apply_to_the_c
 }
 
 #[tokio::test]
+async fn anchor_dropped_by_a_background_replacement_is_stale_for_an_older_revision() {
+    let f = Fixture::new(20).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    let quoted = sub.snapshot.revision.clone();
+    assert_eq!(ids(&sub.snapshot), (15..20).map(id).collect::<Vec<_>>());
+
+    f.add(20);
+    f.signal();
+    let mut replacement = next(&mut sub).await;
+    while ids(&replacement).last() != Some(&id(20)) {
+        replacement = next(&mut sub).await;
+    }
+    assert_eq!(ids(&replacement), (16..21).map(id).collect::<Vec<_>>());
+    assert!(matches!(
+        handle.set_visible_anchor(&quoted, &id(15)).await,
+        Err(ConversationWindowError::StaleWindow)
+    ));
+    assert!(matches!(
+        handle
+            .set_visible_anchor(&replacement.revision, &id(15))
+            .await,
+        Err(ConversationWindowError::AnchorOutsideWindow)
+    ));
+    f.close().await;
+}
+
+#[tokio::test]
 async fn a_command_that_leaves_the_viewport_in_place_does_not_supersede_revisions() {
     let f = Fixture::new(20).await;
     let sub = f.open(ConversationOpenTarget::Latest, 5).await;

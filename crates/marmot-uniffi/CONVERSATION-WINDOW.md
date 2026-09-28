@@ -74,10 +74,12 @@ it changes the UniFFI record schema and the C `MarmotConversationReaction` layou
 
 Commands can run while `next()` waits. Supply the revision from the installed
 replacement; install the command result and deduplicate its stream echo by
-`generation`/`sequence`. Commands apply to the current retained viewport: a
-revision stays valid across background replacements (new rows, delivery state,
-reactions, header, draft) and goes stale only once a replacement showing a
-command's viewport move is published.
+`generation`/`sequence`. Commands apply to the current retained viewport:
+background replacements (new rows, delivery state, reactions, header, draft)
+do not supersede a revision. If a replacement drops the row named by
+`set_visible_anchor`, an older revision returns `StaleWindow` so the host can
+install the latest replacement and reassess the visible row. A replacement
+showing a command's viewport move supersedes every earlier revision.
 A stale sequence means refresh/reassess before retrying.
 A foreign generation is a distinct error: discard that revision and use the
 current handle's snapshot.
