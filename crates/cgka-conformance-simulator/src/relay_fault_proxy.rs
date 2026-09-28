@@ -55,6 +55,9 @@ pub struct RelayEventDeliveryV1 {
     pub kind: u16,
     pub count: u64,
     pub bytes: u64,
+    /// The event's own `created_at`, in seconds.
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 type Traffic = Arc<Mutex<Vec<RelayTrafficSessionV1>>>;
@@ -187,6 +190,7 @@ fn record_message(session: &mut RelayTrafficSessionV1, message: &[u8], upstream:
     {
         let delivery = session.events.entry(id.to_owned()).or_default();
         delivery.kind = u16::try_from(event["kind"].as_u64().unwrap_or_default()).unwrap_or(0);
+        delivery.created_at = event["created_at"].as_u64().unwrap_or_default();
         delivery.count += 1;
         delivery.bytes += message.len() as u64;
     }
@@ -353,6 +357,7 @@ impl RelayFaultProxy {
             for (id, delivery) in session.events.iter().filter(|_| events) {
                 let merged = total.events.entry(id.clone()).or_default();
                 merged.kind = delivery.kind;
+                merged.created_at = delivery.created_at;
                 merged.count += delivery.count;
                 merged.bytes += delivery.bytes;
             }
@@ -571,7 +576,8 @@ mod tests {
 
     #[test]
     fn tap_counts_split_masked_and_fragmented_nostr_messages() {
-        let event = br#"["EVENT","sub",{"id":"ab","kind":445,"content":"x"}]"#;
+        let event =
+            br#"["EVENT","sub",{"id":"ab","kind":445,"created_at":1700000000,"content":"x"}]"#;
         let mut downstream = b"HTTP/1.1 101 Switching Protocols\r\n\r\n".to_vec();
         downstream.extend(frame(0x01, &event[..10], None));
         downstream.extend(frame(0x89, b"ping", None));
@@ -601,6 +607,7 @@ mod tests {
             kind: 445,
             count: 1,
             bytes: event.len() as u64,
+            created_at: 1_700_000_000,
         };
         assert_eq!(session.events["ab"], expected);
         assert_eq!(session.undecoded_frames, 1);

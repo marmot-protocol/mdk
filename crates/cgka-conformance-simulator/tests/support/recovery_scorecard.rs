@@ -40,12 +40,20 @@ const RECOVERY_DEADLINE: Duration = Duration::from_secs(600);
 const IDLE_WINDOW: Duration = Duration::from_secs(60);
 const WATCHDOG: Duration = Duration::from_secs(2_700);
 const GAP_NAME: &str = "gap commit applied";
+/// marmot-app's `APP_RUNTIME_RELAY_REBUILD_LOOKBACK` (ledger A7): a restart
+/// re-subscribes this far below its cursor, by design.
+const REBUILD_LOOKBACK_SECS: u64 = 120;
+/// How far bob's cursor may trail the moment he stops.
+const CURSOR_TRAIL_SECS: u64 = 60;
 
 struct Workload {
     groups: BTreeMap<String, GroupId>,
     /// Relay events admitted before the measured restart, except the gap commit.
     held: BTreeSet<String>,
     commit: String,
+    /// Events created at or after this second are inside the restart's
+    /// rebuild lookback.
+    lookback_from: u64,
     summary: Value,
 }
 
@@ -309,6 +317,10 @@ async fn setup(subject: &mut AppRuntimeHarness, clients: &[String]) -> TestResul
     .await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
     subject.set_online("bob", false).await?;
+    let stopped_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let lookback_from = stopped_at.saturating_sub(REBUILD_LOOKBACK_SECS + CURSOR_TRAIL_SECS);
     // The relays keep withholding the later messages for the rest of the run,
     // so the final timeline can only come from what bob retained. The relay
     // changes presence only while every participant is offline.
@@ -348,6 +360,7 @@ async fn setup(subject: &mut AppRuntimeHarness, clients: &[String]) -> TestResul
         groups,
         held,
         commit,
+        lookback_from,
         summary,
     })
 }
@@ -377,12 +390,16 @@ fn wire_totals(relay: &RelayTrafficV1) -> Value {
 /// missing commit, and counted per event kind.
 fn summarize(relay: &RelayTrafficV1, workload: &Workload) -> Value {
     let (mut held, mut held_bytes, mut novel, mut repeats) = (0, 0, 0, 0);
+    let mut held_beyond_lookback = 0;
     let mut by_kind = BTreeMap::<u16, u64>::new();
     for (id, delivery) in &relay.events {
         repeats += delivery.count - 1;
         *by_kind.entry(delivery.kind).or_default() += delivery.count;
         if workload.held.contains(id) {
             (held, held_bytes) = (held + delivery.count, held_bytes + delivery.bytes);
+            if delivery.created_at < workload.lookback_from {
+                held_beyond_lookback += delivery.count;
+            }
         } else if *id != workload.commit {
             novel += delivery.count;
         }
@@ -391,8 +408,12 @@ fn summarize(relay: &RelayTrafficV1, workload: &Workload) -> Value {
     summary["event_frames"] = json!(totals(relay).1);
     summary["held_history_frames"] = json!(held);
     summary["held_history_bytes"] = json!(held_bytes);
+    summary["held_history_frames_beyond_lookback"] = json!(held_beyond_lookback);
     let commit = relay.events.get(&workload.commit);
     summary["missing_commit_frames"] = json!(commit.map_or(0, |delivery| delivery.count));
+    // Inside the lookback the restart's replay also carries the commit.
+    summary["missing_commit_in_lookback"] =
+        json!(commit.is_some_and(|delivery| delivery.created_at >= workload.lookback_from));
     summary["novel_frames"] = json!(novel);
     summary["same_relay_repeat_frames"] = json!(repeats);
     summary["event_frames_by_kind"] = json!(by_kind);
@@ -627,12 +648,16 @@ fn targets(report: &Value) -> Value {
             .filter_map(|value| value[field].as_u64())
             .sum::<u64>()
     };
-    let held = total(&report["relays"], "held_history_frames");
+    let held = total(&report["relays"], "held_history_frames_beyond_lookback");
+    // Frames beyond the one copy the lookback replay carries.
     let commit_by_relay = report["relays"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|relay| relay["missing_commit_frames"].as_u64().unwrap_or(0))
+        .map(|relay| {
+            let frames = relay["missing_commit_frames"].as_u64().unwrap_or(0);
+            frames.saturating_sub(u64::from(relay["missing_commit_in_lookback"] == true))
+        })
         .collect::<Vec<_>>();
     let idle = total(&report["idle_window"]["relays"], "event_frames");
     let visible = report["live_visibility_ms"]["not_visible"] == 0;
@@ -656,9 +681,13 @@ fn targets(report: &Value) -> Value {
             visible && under("live_visibility_ms", 2_000.0),
             json!(p95("live_visibility_ms")),
         ),
-        target("no re-download of held history", held == 0, json!(held)),
         target(
-            "missing commit fetched at most once per relay",
+            "no re-download of held history beyond the rebuild lookback",
+            held == 0,
+            json!(held),
+        ),
+        target(
+            "missing commit fetched at most once per relay beyond the lookback replay",
             recovered && commit_by_relay.iter().all(|frames| *frames <= 1),
             json!(commit_by_relay)
         ),

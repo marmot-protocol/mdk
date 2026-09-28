@@ -89,8 +89,9 @@ under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
 - a 60-second idle window.
 
 The public API exposes no recovery-attempt counter, so those counts are proxies. Targets (status and send p95 under
-500 ms, visibility p95 under 2 s, no held-history re-download, the commit fetched at most once per relay, no idle
-EVENTs) are evaluated but not enforced.
+500 ms, visibility p95 under 2 s, no held-history re-download beyond the restart's 120-second rebuild lookback, the
+commit fetched at most once per relay besides that replay's copy, no idle EVENTs) are evaluated but not enforced.
+`MDK_SCORECARD_TRACE` takes a tracing filter for bob's in-process runtime.
 
 Bob's runtime runs in the coordinator process so probes can overlap, because process RPC is serial. The relay and the
 other participants keep their own processes. Traffic comes from the relay proxy's WebSocket frames on connections
