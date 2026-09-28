@@ -222,9 +222,9 @@ impl SqliteAccountStorage {
     /// Close an explicit full-history request whose pass finished: its goal
     /// has no lower bound, so nothing can complete it, and leaving it pending
     /// would only park it into a notice. Closing records neither coverage nor
-    /// a retirement notice. Each request has its own operation identity, so
-    /// closing it never touches another caller's. Returns whether a row was
-    /// closed.
+    /// a retirement notice. The explicit-history row is reused by a later
+    /// request, which raises its revision, so only this ticket's revision is
+    /// closed: newer debt survives. Returns whether a row was closed.
     pub fn close_explicit_history_request(
         &self,
         ticket: RecoveryDemandTicket,
@@ -233,8 +233,12 @@ impl SqliteAccountStorage {
             .lock()?
             .execute_cached(
                 "DELETE FROM account_recovery_obligations
-                 WHERE id=?1 AND cause=?2 AND state=0",
-                params![ticket.id.as_slice(), RecoveryCause::ExplicitHistory as i64],
+                 WHERE id=?1 AND revision=?2 AND cause=?3 AND state=0",
+                params![
+                    ticket.id.as_slice(),
+                    sqlite_integer(ticket.revision)?,
+                    RecoveryCause::ExplicitHistory as i64
+                ],
             )
             .storage()?;
         Ok(closed > 0)
@@ -365,6 +369,45 @@ impl SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second explicit request reuses the row and raises its revision. The
+    /// first repair's late close must not delete that newer debt.
+    #[test]
+    fn a_stale_explicit_close_keeps_a_newer_request() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let first = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[1; 16],
+                },
+                1000,
+            )
+            .unwrap();
+        // The second request lands between the first repair's pass and its
+        // close.
+        let second = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[2; 16],
+                },
+                2000,
+            )
+            .unwrap();
+        assert_eq!(second.id, first.id, "the explicit row is reused");
+        assert!(second.revision > first.revision);
+        let explicit_pending = |store: &SqliteAccountStorage| {
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.cause == RecoveryCause::ExplicitHistory)
+        };
+        assert!(!store.close_explicit_history_request(first).unwrap());
+        assert!(explicit_pending(&store), "the newer request survives");
+        assert!(store.close_explicit_history_request(second).unwrap());
+        assert!(!explicit_pending(&store));
+    }
+
     #[test]
     fn cancelling_one_caller_preserves_independent_demand_and_quiescence() {
         let store = SqliteAccountStorage::in_memory().unwrap();
