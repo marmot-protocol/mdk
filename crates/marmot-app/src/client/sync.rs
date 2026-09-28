@@ -7682,11 +7682,13 @@ mod tests {
         assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
     }
 
-    /// A drain gated on end-of-stored-events completes after a lag lost the
-    /// EOSE it waits on. The lag's repair re-issues the unanswered REQ, and
-    /// the relay's fresh answer is the gate, once the loss is in recovery.
+    /// A lag that lost the end-of-stored-events a quiet drain ends on would
+    /// hold every later drain to its full first wait. The lag's repair
+    /// re-issues the unanswered REQ, and once the relay's fresh answer
+    /// completes coverage, a drain after the loss is in recovery ends at its
+    /// first quiet wait again.
     #[tokio::test]
-    async fn eose_gated_drain_completes_after_a_lag_lost_its_eose() {
+    async fn quiet_drain_ends_early_again_after_a_lag_lost_its_eose() {
         let dir = tempfile::tempdir().unwrap();
         let alice = AccountHome::open(dir.path())
             .create_account("alice")
@@ -7745,22 +7747,14 @@ mod tests {
             .adapter
             .start_delivery_overflow_recovery(overflow.marker_token);
 
+        assert!(client.adapter.account_subscription_eose().await.complete());
+
         tokio::time::pause();
         let started = tokio::time::Instant::now();
-        let (_, verdict) = client
-            .drain_sdk_relay(
-                &mut DrainCounts::default(),
-                super::DrainCompletion::EndOfStoredEvents {
-                    silence_budget: crate::EPOCH_BACKFILL_EOSE_WAIT,
-                    execution_quantum: crate::EPOCH_BACKFILL_EXECUTION_QUANTUM,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(verdict, DrainVerdict::Complete);
+        client.sync_sdk_relay().await.unwrap();
         assert!(
-            started.elapsed() <= crate::SDK_FIRST_SYNC_WAIT + Duration::from_millis(1),
-            "the drain ends at its first quiet wait instead of spending its budget"
+            started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1),
+            "the drain ends at its first quiet wait instead of its full first wait"
         );
     }
 

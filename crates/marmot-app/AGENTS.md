@@ -181,8 +181,8 @@ App runtime bridge for the first real Marmot app surfaces.
   loss with the REQ floor its SDK context reported at the lag, and enqueue the generation's control record. Only an
   unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
   notification loss before waiting for its control record.
-- A lag may also lose end-of-stored-events. Never mark EOSE complete at a lag: an EOSE-gated drain would accept
-  history a relay was still sending. The lag schedules the adapter's `reissue_subscriptions_awaiting_eose` for its
+- A lag may also lose end-of-stored-events. Never mark EOSE complete at a lag: live cursor promotion
+  would advance the cursor while a relay was still sending history. The lag schedules the adapter's `reissue_subscriptions_awaiting_eose` for its
   receiver's scope, marked at the lag, to run once the receiver has gone `NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`
   without another lag. A later lag postpones it. Re-issuing earlier restarts replays still arriving. A repair that
   leaves relays unrepaired (`EoseReissueSummary::failed_relays`) schedules itself again the same way, for the same lag

@@ -1112,8 +1112,9 @@ impl NostrTransportAdapter {
     /// and those issued after the lag, are left alone.
     ///
     /// A lost EOSE cannot be inferred from the lag: it cannot tell a lost EOSE
-    /// from one still coming, so marking it at the lag would let an EOSE-gated
-    /// drain accept history a relay was still sending. The relay client can
+    /// from one still coming, so marking it at the lag would let a consumer
+    /// of complete coverage, such as live cursor promotion, act while a relay
+    /// was still sending history. The relay client can
     /// tell: a relay it has seen answer the REQ's current send is recorded
     /// complete with no traffic. Any other relay gets the REQ again, with its
     /// filter, so it replays from the same `since` before a fresh EOSE, and

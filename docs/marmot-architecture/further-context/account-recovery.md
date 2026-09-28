@@ -531,8 +531,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   goes first, so no relay sees a repeated live id, which a relay could refuse instead of
   replacing the subscription, and the SDK's registry keeps the REQ it restores on
   reconnect. The relay replays from the same `since` and answers with a fresh EOSE, so
-  activation reuse returns, EOSE-gated drains can complete, and post-join maintenance
-  observes its boundary. The loss floor does not move. A batch stranded by a disconnect
+  activation reuse returns, live cursor promotion resumes, quiet drains end early again,
+  and post-join maintenance observes its boundary. The loss floor does not move. A batch stranded by a disconnect
   goes out once: the SDK's reconnect skips a REQ already queued. Only the network re-issue
   is limited: a relay gets the REQ again at most once, so a replay that keeps lagging
   cannot loop. A relay that got

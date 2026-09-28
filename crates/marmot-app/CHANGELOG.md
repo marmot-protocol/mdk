@@ -140,8 +140,9 @@
   group is restored. (#2070)
 - Recover end-of-stored-events (EOSE) that a relay notification lag lost. A lost EOSE left
   its subscription's replay coverage incomplete for good: the next activation
-  re-subscribed instead of reusing the live one, EOSE-gated drains waited out their budget,
-  and post-join maintenance waited for its deadline. A lag still marks no EOSE complete,
+  re-subscribed instead of reusing the live one, live cursor promotion stayed off, quiet
+  drains waited out their full first wait, and post-join maintenance did not observe its
+  boundary. A lag still marks no EOSE complete,
   since it cannot tell a lost one from one still coming. Once the receiver has gone 30
   seconds without another lag, each REQ issued before the lag that has not reported EOSE on
   a relay is repaired there. When the SDK recorded that relay's EOSE, the lag lost only the

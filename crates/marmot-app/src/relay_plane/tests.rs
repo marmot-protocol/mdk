@@ -1037,9 +1037,9 @@ fn issued_id(relay: &RecordingRelayClient, wanted: impl Fn(&NostrSubscription) -
 /// A lag may have lost end-of-stored-events and cannot tell which. Once the
 /// receiver has gone the settle window without another lag, the plane
 /// re-issues just the REQs a relay never answered. Their fresh EOSE lets
-/// post-join maintenance observe its boundary, satisfies an EOSE-gated drain
-/// while the loss is in recovery, and brings back activation reuse once it
-/// settles.
+/// post-join maintenance observe its boundary, completes the coverage live
+/// cursor promotion and quiet drains wait on, and brings back activation
+/// reuse once it settles.
 #[tokio::test(start_paused = true)]
 async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
     let relay = Arc::new(RecordingRelayClient::default());
