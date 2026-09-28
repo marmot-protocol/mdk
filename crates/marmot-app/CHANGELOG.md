@@ -17,10 +17,10 @@
   retained 30-day inventory window. An epoch gap also completes once its group's local
   epoch passes the stalled one. A relay whose compared set fills the request limit counts
   as truncated and cannot certify. (#2068)
-- A recovery obligation parks after three completed passes in a row that fetch nothing new
-  and certify nothing, and waits for new evidence or explicit repair. Passes that fail only
-  because relays were unreachable do not count, and a pass that fetches anything resets
-  the streak. (#2068)
+- A recovery obligation parks after three of its own completed passes in a row that admit
+  nothing new and certify nothing, and waits for new evidence or explicit repair. Passes
+  whose required relays failed or timed out do not count. New evidence, or a pass that
+  durably admits anything, starts the count over. (#2068)
 - Every automatic recovery cause except maintenance boundaries, explicit repair and
   known-event demand compares off the account worker. The worker then admits what the
   comparison fetched a few events per turn, between commands and live input, and never

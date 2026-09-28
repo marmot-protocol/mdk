@@ -63,12 +63,13 @@ The simulator comes first; Jeff validates on a phone.
      the retained inventory window, the last 30 days, and a comparison over that window
      certifies them. The earlier rule that an unresolved placeholder had no proven lower
      bound, and so could never certify, is gone.
-   - Otherwise, after **3 completed attempts in a row that admit nothing new and certify
-     nothing**, the obligation parks.
+   - Otherwise, after **3 of its own completed attempts in a row that admit nothing new and
+     certify nothing**, the obligation parks. New evidence starts the count over.
      It shows "history may be incomplete" and offers an explicit deep repair, which can
      still complete it with qualified coverage, or an explicit retirement. There are no
      further automatic retries.
-   - Attempts that fail only because relays were unreachable do not count toward the budget.
+   - Attempts whose required relays failed or timed out do not count toward the budget. A
+     backend that cannot compare a route gives a finished answer, so it does count.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
 3. **Required relays are the relays we operate.** `MarmotAppConfig::recovery_operated_relays`

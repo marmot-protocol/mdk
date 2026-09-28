@@ -11,6 +11,12 @@
 
 ### Added
 
+- Add schema 0099 `quiet_passes` and `quiet_revision` on `account_recovery_obligations`: each
+  obligation's own streak of completed comparison passes without progress at one revision.
+  `checkpoint_recovery_comparison` takes a `RecoveryPassProgress` and, in the checkpoint's
+  transaction, restarts the streak on progress, keeps it on an unserved pass, and parks a
+  retryable obligation after `RECOVERY_PARK_AFTER_QUIET_PASSES` quiet passes. (#2068)
+
 - Add schema 0098 for "history may be incomplete" notices. `parked_recovery_obligations` and
   `parked_group_recovery_obligations` list each pending obligation parked for deep repair as a
   `ParkedRecoveryObligation` (ticket, cause, optional group and new `parked_at_ms`, which parking

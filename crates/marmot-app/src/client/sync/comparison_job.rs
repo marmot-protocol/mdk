@@ -692,6 +692,7 @@ impl AppClient {
                 },
                 certified: route.certified && route.admitted,
                 fetched: route.fetched,
+                queued: Vec::new(),
             });
         }
         self.finish_recovery_grant_after_drain(

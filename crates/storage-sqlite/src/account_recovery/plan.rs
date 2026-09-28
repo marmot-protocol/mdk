@@ -82,6 +82,23 @@ pub struct RecoveryScopeCheckpoint {
     pub retained_known_event: bool,
 }
 
+/// Completed comparison passes in a row, for one obligation at one revision,
+/// that certified nothing and admitted nothing before the obligation parks.
+pub const RECOVERY_PARK_AFTER_QUIET_PASSES: u64 = 3;
+
+/// What one completed comparison pass did for one obligation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryPassProgress {
+    /// It certified coverage or durably admitted fetched history.
+    Progressed,
+    /// Every route it compared was served by its required relays, and it
+    /// certified nothing and admitted nothing.
+    Quiet,
+    /// A required relay failed or timed out, or no route of this obligation
+    /// was compared. The pass says nothing about the obligation's history.
+    Unserved,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
 pub enum RecoveryEligibility {
@@ -544,6 +561,49 @@ impl SqliteAccountStorage {
         checkpoints: &[RecoveryScopeCheckpoint],
         incomplete: RecoveryEligibility,
     ) -> StorageResult<bool> {
+        self.checkpoint_recovery_obligation_inner(
+            expected,
+            attempt_serial,
+            obligation_id,
+            checkpoints,
+            incomplete,
+            None,
+        )
+    }
+
+    /// [`Self::checkpoint_recovery_obligation`] for a comparison pass, which
+    /// also counts the obligation's own quiet streak in the same transaction.
+    /// A quiet pass that reaches [`RECOVERY_PARK_AFTER_QUIET_PASSES`] at this
+    /// revision parks a retryable obligation; progress restarts the streak and
+    /// an unserved pass leaves it where it was.
+    pub fn checkpoint_recovery_comparison(
+        &self,
+        expected: &RecoveryRevisionFence,
+        attempt_serial: u64,
+        obligation_id: [u8; 16],
+        checkpoints: &[RecoveryScopeCheckpoint],
+        incomplete: RecoveryEligibility,
+        progress: RecoveryPassProgress,
+    ) -> StorageResult<bool> {
+        self.checkpoint_recovery_obligation_inner(
+            expected,
+            attempt_serial,
+            obligation_id,
+            checkpoints,
+            incomplete,
+            Some(progress),
+        )
+    }
+
+    fn checkpoint_recovery_obligation_inner(
+        &self,
+        expected: &RecoveryRevisionFence,
+        attempt_serial: u64,
+        obligation_id: [u8; 16],
+        checkpoints: &[RecoveryScopeCheckpoint],
+        incomplete: RecoveryEligibility,
+        progress: Option<RecoveryPassProgress>,
+    ) -> StorageResult<bool> {
         let Some((_, revision)) = expected
             .obligations
             .iter()
@@ -611,6 +671,32 @@ impl SqliteAccountStorage {
                 [obligation_id.as_slice()], |row| row.get(0),
             ).storage()?;
             let qualified = scopes_qualify(&conn, expected, Some(attempt_serial), obligation_id, predicate)?;
+            let mut eligibility = incomplete;
+            if let Some(progress) = progress {
+                // The streak belongs to this revision: new evidence starts it
+                // over, and only a completed quiet pass extends it.
+                let (reset, step) = match progress {
+                    _ if qualified => (true, 0),
+                    RecoveryPassProgress::Progressed => (true, 0),
+                    RecoveryPassProgress::Quiet => (false, 1),
+                    RecoveryPassProgress::Unserved => (false, 0),
+                };
+                let streak: i64 = conn.query_row_cached(
+                    "UPDATE account_recovery_obligations SET
+                         quiet_passes = CASE WHEN ?3 THEN 0
+                             ELSE (CASE WHEN quiet_revision IS ?2 THEN quiet_passes ELSE 0 END) + ?4 END,
+                         quiet_revision = ?2
+                     WHERE id = ?1 RETURNING quiet_passes",
+                    params![obligation_id.as_slice(), sqlite_integer(*revision)?, reset, step],
+                    |row| row.get(0),
+                ).storage()?;
+                if progress == RecoveryPassProgress::Quiet
+                    && incomplete == RecoveryEligibility::Retry
+                    && i64_to_u64(streak)? >= RECOVERY_PARK_AFTER_QUIET_PASSES
+                {
+                    eligibility = RecoveryEligibility::NeedsDeepRepair;
+                }
+            }
             // Parking is what hosts show as "history may be incomplete". Keep
             // the first parking time across later failed deep repairs.
             conn.execute_cached(
@@ -619,7 +705,7 @@ impl SqliteAccountStorage {
                          CASE WHEN eligibility = 4 AND parked_at_ms IS NOT NULL THEN parked_at_ms ELSE ?4 END
                      END
                  WHERE id = ?1",
-                params![obligation_id.as_slice(), if qualified { 1 } else { 0 }, incomplete as i64,
+                params![obligation_id.as_slice(), if qualified { 1 } else { 0 }, eligibility as i64,
                     crate::codec::unix_now_ms().max(0)],
             ).storage()?;
             Ok(qualified)
@@ -680,6 +766,75 @@ mod tests {
             endpoints,
             retained_known_event: false,
         }
+    }
+
+    #[test]
+    fn quiet_streaks_belong_to_each_obligation_and_revision() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("alice").unwrap();
+        store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+        let loss = store.recovery_revision_fence().unwrap().obligations[0].0;
+        let history = store
+            .request_recovery(RecoveryRequest::IncrementalHistory, 1)
+            .unwrap()
+            .id;
+        let now = std::cell::Cell::new(1_000_u64);
+        let pass = |passes: &[([u8; 16], RecoveryPassProgress)]| {
+            let fence = store.recovery_revision_fence().unwrap();
+            now.set(now.get() + 100_000);
+            let attempt = store
+                .reserve_recovery_attempt(&fence, now.get(), 1_000, false)
+                .unwrap()
+                .expect("a retryable pass is reserved")
+                .attempt_serial;
+            for (id, progress) in passes {
+                let token = store
+                    .install_recovery_scope_plan(&fence, attempt, *id, &[plan(&["a", "b"])])
+                    .unwrap()
+                    .unwrap()
+                    .remove(0);
+                assert!(
+                    !store
+                        .checkpoint_recovery_comparison(
+                            &fence,
+                            attempt,
+                            *id,
+                            &[checkpoint(&token, Vec::new())],
+                            RecoveryEligibility::Retry,
+                            *progress,
+                        )
+                        .unwrap()
+                );
+            }
+        };
+        let eligibility = |id: [u8; 16]| {
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.ticket.id == id)
+                .unwrap()
+                .eligibility
+        };
+        use RecoveryPassProgress::{Progressed, Quiet, Unserved};
+        // Progress on one obligation never resets another's streak.
+        pass(&[(loss, Quiet), (history, Progressed)]);
+        pass(&[(loss, Unserved), (history, Progressed)]);
+        pass(&[(loss, Quiet), (history, Progressed)]);
+        assert_eq!(eligibility(loss), RecoveryEligibility::Retry);
+        // New evidence is a new revision, which starts the streak over.
+        store.mark_account_delivery_recovery("alice", 1, 2).unwrap();
+        pass(&[(loss, Quiet), (history, Quiet)]);
+        pass(&[(loss, Quiet), (history, Quiet)]);
+        assert_eq!(eligibility(loss), RecoveryEligibility::Retry);
+        assert_eq!(eligibility(history), RecoveryEligibility::Retry);
+        pass(&[(loss, Quiet), (history, Quiet)]);
+        assert_eq!(eligibility(loss), RecoveryEligibility::NeedsDeepRepair);
+        assert_eq!(
+            eligibility(history),
+            RecoveryEligibility::NeedsDeepRepair,
+            "a first quiet pass after other obligations' attempts still gets its own three"
+        );
     }
 
     #[test]

@@ -645,6 +645,29 @@ pub(crate) struct RouteComparison {
     /// Events the comparison fetched for admission. Any is progress, even
     /// while an unsupported required relay withholds the certificate.
     pub(crate) fetched: usize,
+    /// Events the inline executor handed to the live queue for its drain to
+    /// admit. Empty when the comparison admitted what it fetched itself.
+    pub(crate) queued: Vec<String>,
+}
+
+/// The drain admitted what an inline comparison queued. Only events it
+/// durably ingested are progress, and a route certifies only when all of them
+/// were, as off-worker admission requires.
+fn settle_queued_comparisons(
+    outcomes: Vec<RouteComparison>,
+    durable: impl Fn(&str) -> bool,
+) -> Vec<RouteComparison> {
+    outcomes
+        .into_iter()
+        .map(|mut compared| {
+            if !compared.queued.is_empty() {
+                let admitted = compared.queued.iter().filter(|id| durable(id)).count();
+                compared.certified &= admitted == compared.queued.len();
+                compared.fetched = admitted;
+            }
+            compared
+        })
+        .collect()
 }
 
 /// What one drain loop saw on the wire.
@@ -1239,6 +1262,7 @@ impl AppClient {
                     outcome: Outcome::ServicedPartial,
                     certified: false,
                     fetched: 0,
+                    queued: Vec::new(),
                 });
                 continue;
             }
@@ -1291,6 +1315,7 @@ impl AppClient {
                 let Some((summary, events)) = owned else {
                     return Ok::<_, cgka_traits::TransportAdapterError>(None);
                 };
+                let mut queued = Vec::with_capacity(events.len());
                 // This is still an inline worker phase. Keep queue submission
                 // inside the original per-route deadline and error boundary:
                 // a full queue or closed adapter remains a transient route
@@ -1312,15 +1337,19 @@ impl AppClient {
                             }
                         }
                     }
+                    let id = event.event.id.clone();
                     self.adapter.queue_reconciled_event(event).await?;
+                    queued.push(id);
                 }
-                Ok(Some(summary))
+                Ok(Some((summary, queued)))
             })
             .await;
             let mut certified = false;
             let mut fetched = 0;
+            let mut queued = Vec::new();
             let outcome = match result {
-                Ok(Ok(Some(summary))) => {
+                Ok(Ok(Some((summary, handed)))) => {
+                    queued = handed;
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
                     remote_items += summary.remote_items;
@@ -1347,6 +1376,7 @@ impl AppClient {
                 outcome,
                 certified,
                 fetched,
+                queued,
             });
         }
 
@@ -4619,6 +4649,18 @@ impl AppClient {
             )
             .await?
         };
+        let comparison_outcomes = match self.transport_receipts() {
+            Ok(receipts) => {
+                settle_queued_comparisons(comparison_outcomes, |id| receipts.contains(id))
+            }
+            Err(error) => {
+                return Err(ClassifiedSyncFailure::at_stage(
+                    summary,
+                    error,
+                    SyncFailureStage::StatePersist,
+                ));
+            }
+        };
         self.finish_recovery_grant_after_drain(
             grant,
             counts,
@@ -4740,6 +4782,19 @@ impl AppClient {
                     };
                     comparison_outcomes.iter().find(|c| c.route == route)
                 });
+                // A pass counts toward parking only when every route it compared
+                // for this obligation gave a finished answer: its required relays
+                // completed the comparison, or the backend cannot compare it. A
+                // failed, timed-out or skipped route leaves the pass unserved.
+                let served = drained
+                    && compared.clone().next().is_some()
+                    && compared.clone().all(|c| {
+                        matches!(
+                            c.outcome,
+                            storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown
+                                | storage_sqlite::RecoveryComparisonOutcome::Unsupported
+                        )
+                    });
                 let unsupported = obligation.cause
                     == storage_sqlite::RecoveryCause::IncrementalHistory
                     && compared.clone().next().is_some()
@@ -4868,15 +4923,24 @@ impl AppClient {
                     });
                 }
                 progressed_any |= certified || fetched;
-                let eligibility = if comparison_owned {
-                    super::recovery::eligibility_after_comparison(
-                        outcome,
-                        refused,
-                        certified || fetched,
-                        grant.reservation.ordinal,
-                    )
+                if comparison_owned {
+                    let progress = if certified || fetched {
+                        storage_sqlite::RecoveryPassProgress::Progressed
+                    } else if served && !refused {
+                        storage_sqlite::RecoveryPassProgress::Quiet
+                    } else {
+                        storage_sqlite::RecoveryPassProgress::Unserved
+                    };
+                    storage.checkpoint_recovery_comparison(
+                        &grant.fence,
+                        grant.reservation.attempt_serial,
+                        obligation.id,
+                        &checkpoints,
+                        super::recovery::eligibility_after_comparison(outcome, refused),
+                        progress,
+                    )?;
                 } else {
-                    super::recovery::eligibility_after_observation(
+                    let eligibility = super::recovery::eligibility_after_observation(
                         obligation.cause,
                         outcome,
                         matches!(
@@ -4887,15 +4951,15 @@ impl AppClient {
                                 | DrainVerdict::NoProgressQuantumYield
                         ),
                         refused,
-                    )
-                };
-                storage.checkpoint_recovery_obligation(
-                    &grant.fence,
-                    grant.reservation.attempt_serial,
-                    obligation.id,
-                    &checkpoints,
-                    eligibility,
-                )?;
+                    );
+                    storage.checkpoint_recovery_obligation(
+                        &grant.fence,
+                        grant.reservation.attempt_serial,
+                        obligation.id,
+                        &checkpoints,
+                        eligibility,
+                    )?;
+                }
             }
             if progressed_any {
                 // New coverage or newly fetched history is progress: the next
@@ -6480,6 +6544,7 @@ mod tests {
         incomplete_full_history_repair, order_reconciliation_pass,
         reconciliation_start_after_cursor, transport_reconciliation_record,
     };
+    use super::{RouteComparison, settle_queued_comparisons};
     use crate::tests::{
         ScriptedPushRelayClient, armed_group_ids, bounded_epoch_backfill_config,
         client_on_app_relay_plane, make_group_terminal,
@@ -6628,6 +6693,34 @@ mod tests {
         );
         assert_eq!(storage.recovery_retry_state().unwrap(), retry);
         assert!(client.pending_convergence_groups.contains(&group));
+    }
+
+    #[test]
+    fn inline_comparison_counts_only_durably_admitted_events() {
+        use storage_sqlite::{RecoveryComparisonOutcome, TransportReconciliationRoute};
+        let route = |id: u8, queued: &[&str]| RouteComparison {
+            route: TransportReconciliationRoute::Group([id; 32]),
+            outcome: RecoveryComparisonOutcome::ServicedUnknown,
+            certified: true,
+            fetched: queued.len(),
+            queued: queued.iter().map(|id| (*id).to_owned()).collect(),
+        };
+        let settled = settle_queued_comparisons(
+            vec![route(1, &["a", "b"]), route(2, &["a"]), route(3, &[])],
+            |id| id == "a",
+        );
+        assert!(
+            !settled[0].certified,
+            "an event left fetchable withholds the certificate"
+        );
+        assert_eq!(settled[0].fetched, 1, "only the durable event is progress");
+        assert!(settled[1].certified);
+        assert_eq!(settled[1].fetched, 1);
+        assert!(
+            settled[2].certified,
+            "a route that queued nothing keeps its certificate"
+        );
+        assert_eq!(settled[2].fetched, 0);
     }
 
     #[test]

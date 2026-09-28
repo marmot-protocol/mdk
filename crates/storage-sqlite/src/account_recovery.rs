@@ -13,8 +13,9 @@ mod stall;
 pub use loss::{RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
 pub use notice::ParkedRecoveryObligation;
 pub use plan::{
-    RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
-    RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
+    RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility, RecoveryEndpointCheckpoint,
+    RecoveryPassProgress, RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan,
+    RecoveryScopeToken, StoredRecoveryScope,
 };
 pub use stall::QualifiedRecoveryStallSample;
 

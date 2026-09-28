@@ -204,30 +204,23 @@ fn scope_is_certified(
         })
 }
 
-/// Comparison passes that certify nothing before an obligation parks. The
-/// retry ordinal counts reserved attempts since the last progress.
-const RECOVERY_PARK_AFTER_ATTEMPTS: u64 = 3;
+#[cfg(test)]
+const RECOVERY_PARK_AFTER_ATTEMPTS: u64 = storage_sqlite::RECOVERY_PARK_AFTER_QUIET_PASSES;
 
 /// Comparison-owned recovery keeps retrying while passes certify new
-/// coverage. After several passes in a row without progress it parks until new
-/// evidence or an explicit repair, instead of retrying forever. A pass no relay
-/// served does not count: unreachable relays are waited out with pacing.
+/// coverage. Storage parks an obligation after its own quiet passes in a row
+/// (`RecoveryPassProgress::Quiet`) until new evidence or an explicit repair.
+/// A pass whose required relays failed or timed out does not count:
+/// unreachable relays are waited out with pacing.
 pub(super) fn eligibility_after_comparison(
     outcome: storage_sqlite::RecoveryScopeOutcome,
     admission_refused: bool,
-    progressed: bool,
-    ordinal: u64,
 ) -> storage_sqlite::RecoveryEligibility {
     use storage_sqlite::{RecoveryEligibility as Eligibility, RecoveryScopeOutcome as Outcome};
     if admission_refused {
         Eligibility::WaitingCapacity
     } else if matches!(outcome, Outcome::Unsupported | Outcome::Excluded) {
         Eligibility::WaitingCapability
-    } else if !progressed
-        && outcome != Outcome::Unavailable
-        && ordinal >= RECOVERY_PARK_AFTER_ATTEMPTS
-    {
-        Eligibility::NeedsDeepRepair
     } else {
         Eligibility::Retry
     }
@@ -3915,6 +3908,20 @@ mod tests {
         AppClient,
         crate::tests::ScriptedEosePump,
     ) {
+        loss_fixture(Some(unix_now_seconds())).await
+    }
+
+    /// One queue loss whose lost deliveries start at `bound`, or have no known
+    /// start. The account holds one group and a checkpointed cursor.
+    async fn loss_fixture(
+        bound: Option<u64>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::tests::ScriptedPushRelayClient>,
+        crate::MarmotApp,
+        AppClient,
+        crate::tests::ScriptedEosePump,
+    ) {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
             scripted_eose_pump,
@@ -3938,7 +3945,7 @@ mod tests {
         // The lost deliveries are inside every route's retained window, which
         // starts when the account first retained that route.
         storage
-            .mark_account_delivery_recovery_bounded("alice", 41, 3, Some(unix_now_seconds()))
+            .mark_account_delivery_recovery_bounded("alice", 41, 3, bound)
             .unwrap();
         storage.synchronize_account_delivery_loss("alice").unwrap();
         client.delivery_overflow_recovery_pending = true;
@@ -4065,8 +4072,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passes_that_certify_nothing_park_the_obligation() {
-        let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
+    async fn served_passes_that_certify_nothing_park_the_obligation() {
+        // No known start: every served comparison finishes, none can certify.
+        let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
         let storage = app.account_storage("alice").unwrap();
         for pass in 1..=RECOVERY_PARK_AFTER_ATTEMPTS {
             let grant = client
@@ -4076,7 +4084,7 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap_or_else(|| panic!("pass {pass} is selected"));
-            client.test_comparison_results = Some(scripted_routes(&grant, |_| true));
+            client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
             client
                 .execute_recovery_grant(grant, None, None)
                 .await
@@ -4096,6 +4104,53 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a parked obligation waits for new evidence or explicit repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_relay_outages_never_spend_the_parking_budget() {
+        let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
+        let storage = app.account_storage("alice").unwrap();
+        for pass in 1..=RECOVERY_PARK_AFTER_ATTEMPTS * 2 {
+            let grant = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("pass {pass} is selected"));
+            // Every required relay fails or times out.
+            client.test_comparison_results = Some(scripted_routes(&grant, |_| true));
+            client
+                .execute_recovery_grant(grant, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                queue_loss(&storage),
+                Some(storage_sqlite::RecoveryEligibility::Retry),
+                "pass {pass}: an unserved pass is waited out, not counted"
+            );
+            client.recovery_owner.test_advance_to_retry(&storage);
+        }
+        // Two quiet passes after the outages: the streak starts from zero.
+        for _ in 1..RECOVERY_PARK_AFTER_ATTEMPTS {
+            let grant = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .unwrap()
+                .unwrap();
+            client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
+            client
+                .execute_recovery_grant(grant, None, None)
+                .await
+                .unwrap();
+            client.recovery_owner.test_advance_to_retry(&storage);
+        }
+        assert_eq!(
+            queue_loss(&storage),
+            Some(storage_sqlite::RecoveryEligibility::Retry)
         );
     }
 
