@@ -1351,8 +1351,13 @@ impl AppClient {
                             || scope.loss_revision != grant.fence.loss_revision
                     });
             }
+            // Cold start compares the retained-inventory window, as the
+            // startup comparison does. A checkpoint narrows the goal to the
+            // gap below the live floor.
             let since = if demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory {
-                incremental_since
+                incremental_since.or(Some(
+                    now.saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS),
+                ))
             } else {
                 None
             };

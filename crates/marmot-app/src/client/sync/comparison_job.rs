@@ -482,8 +482,8 @@ impl AppClient {
     }
 
     /// Every automatic grant runs its network wait off the worker, except
-    /// maintenance boundaries, explicit repair and known-event demand, which
-    /// keep their own executors. Per-pass route and endpoint caps still apply. The frozen grant
+    /// maintenance boundaries, explicit repair, known-event demand and epoch
+    /// gaps, which keep their own executors. Per-pass route and endpoint caps still apply. The frozen grant
     /// is the authority; an earlier pending-demand probe never decides this.
     pub(crate) fn comparison_offload_eligible(
         &self,
@@ -497,12 +497,15 @@ impl AppClient {
                 && admitted <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE
         };
         Ok(plan.iter().all(|obligation| {
-            // Known-event demand belongs to the exact-ID worker.
+            // Known-event demand belongs to the exact-ID worker. An epoch gap
+            // keeps its sliced online job at the receive seam until that
+            // admission loop serves every cause.
             !matches!(
                 obligation.cause,
                 storage_sqlite::RecoveryCause::Maintenance
                     | storage_sqlite::RecoveryCause::ExplicitHistory
                     | storage_sqlite::RecoveryCause::KnownEvent
+                    | storage_sqlite::RecoveryCause::EpochGap
             ) && obligation.scopes.iter().all(|scope| {
                 within_cap(
                     scope.goal.required_endpoints.len(),
