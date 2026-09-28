@@ -483,24 +483,24 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   its own id, to every connected relay that has not answered it. The REQ is closed on that
   relay first, so no relay sees a repeated live id; a relay could refuse one instead of
   replacing the subscription. The SDK's registry, which restores REQs on reconnect, stays
-  untouched. The two frames are queued separately. A REQ that does not queue behind its
-  CLOSE is retried on the connection the CLOSE was queued for until it does, which a live
-  sender allows as soon as it takes the next frame. If that connection ends first, the
-  relay counts as a failed re-issue and its reconnect restores the REQ from the registry;
-  the retry stops there, since its REQ after the SDK's would repeat a live id. The retry
-  waits under the subscription lifecycle lock: the SDK's 10-second write and close
-  timeouts end a stuck connection within about 20 seconds, and a 30-second ceiling caps
-  the wait regardless. The relay replays from the same `since` and answers with a fresh
-  EOSE, so activation reuse returns, EOSE-gated drains can complete, and post-join
-  maintenance observes its boundary. The loss floor does not move. A disconnected relay is
-  skipped, because its reconnect sends the REQ again. A relay gets each REQ again at most
-  once, so a replay that keeps lagging cannot loop, and nothing is re-issued while lags
-  keep recurring. What remains: a replay still running 30 seconds after the last lag
-  restarts once; a fresh EOSE lost to another lag stays missing until the next activation;
-  a group route removed before its EOSE keeps the activation's frozen coverage incomplete;
-  and a connection that ends with its outbound queue full restores no REQ on its
-  reconnect, because the SDK re-sends REQs before it drains the queue, which affects every
-  REQ on that relay, not only a re-issued one.
+  untouched. The relay replays from the same `since` and answers with a fresh EOSE, so
+  activation reuse returns, EOSE-gated drains can complete, and post-join maintenance
+  observes its boundary. The loss floor does not move. The two frames are queued
+  separately. A REQ with no room behind its CLOSE goes to a background retry, which waits
+  without the subscription lifecycle lock and takes it only for each attempt. It sends the
+  REQ on the CLOSE's connection once there is room, and lets it go once an activation,
+  close or new registration owns the REQ. If that connection ends first, the reconnect
+  re-sends registered REQs before it drains the queue, so a still-full queue refuses them;
+  the relay counts as unrepaired. A relay whose re-issue went out keeps its claim, so a
+  replay that keeps lagging cannot loop. An unrepaired relay, one that was not connected
+  or had no room for the CLOSE, has its claim released, and the repair runs again after
+  the settle window for the same lag, until the REQ goes out or its EOSE arrives. What
+  remains: a replay still running 30 seconds after the last lag restarts once; a group
+  route removed before its EOSE keeps the activation's frozen coverage incomplete; and a
+  relay that stays unreachable is retried once per settle window. The SDK records each
+  REQ's EOSE in its relay read loop, where a lag cannot drop it, but the pinned fork does
+  not expose that flag (`Relay::subscription` returns only filters). Exposing it would
+  replace this replay with a registry read; that is a fork change, tracked separately.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored

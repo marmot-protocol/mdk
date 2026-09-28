@@ -119,11 +119,10 @@ context's life, so reading it at the lag gives the tightest bound.
 A lag can also lose end-of-stored-events. `reissue_subscription` recovers them: it re-sends a live REQ unchanged, under
 its own id, to the connected relays that never answered it. It closes the REQ on each of them first, so no relay sees
 the id repeated while it is live there, and sends both as raw frames, which leave the SDK's reconnect registry
-untouched. The frames are queued separately, so a REQ that does not queue behind its CLOSE is retried on that
-connection until it does. If the connection ends first, the relay is reported as failed and its reconnect restores
-the REQ from the registry. The retry never sends on a later connection, where the SDK's own REQ would make it a
-repeat. The account context records the REQ again first, with the `since` it was issued with, and never reopens a
-closed REQ, so the re-issue leaves the floor where it was.
+untouched. It never waits: a relay with no room for the REQ behind its CLOSE comes back pending, tied to that
+connection, and the adapter retries it with `retry_reissued_req` without holding its lifecycle lock between attempts,
+never on a later connection. The account context records the REQ again first, with the `since` it was issued with,
+and never reopens a closed REQ, so the re-issue leaves the floor where it was.
 
 The recovery consumer subscribes for each activated account and never infers a group from a receiver gap. The backend
 must update the watch without waiting for room in the event-delivery queue, so loss stays observable when event

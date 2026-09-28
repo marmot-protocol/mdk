@@ -172,7 +172,8 @@ App runtime bridge for the first real Marmot app surfaces.
 - A lag may also lose end-of-stored-events. Never mark EOSE complete at a lag: an EOSE-gated drain would accept
   history a relay was still sending. The lag schedules the adapter's `reissue_subscriptions_awaiting_eose` for its
   receiver's scope, marked at the lag, to run once the receiver has gone `NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`
-  without another lag. A later lag postpones it. Re-issuing earlier restarts replays still arriving.
+  without another lag. A later lag postpones it. Re-issuing earlier restarts replays still arriving. A repair that
+  leaves relays unrepaired schedules itself again the same way, for the same lag mark.
 - Move `checkpointed_transport_timestamp` only through `AppClient::seal_transport_cursor`, never straight to
   `state.last_transport_timestamp`. The seal runs under the lock the router places each delivery under, so it is the
   commit's one decision point: it returns nothing while loss or a spill hand-off is pending, caps the commit at the

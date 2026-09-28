@@ -54,16 +54,16 @@ for reconnect/backoff and relay status mechanics.
   `Unbounded`, never "no loss".
 - Recover a lag-lost end-of-stored-events only by re-issuing the live REQ unchanged, under its own id
   (`reissue_subscriptions_awaiting_eose`): only REQs issued by the lag's `NotificationLagMark`, only on relays that
-  have not reported EOSE, at most once per relay, under the subscription lifecycle lock. The SDK client re-sends a
-  REQ only to a connected relay and only while its floor record holds it live, and records it with `open` first. It
-  sends a raw CLOSE before the raw REQ: a relay must never see a repeated live id, because one that answers
-  `CLOSED duplicate:` makes the SDK drop the REQ from the registry that restores it on reconnect. Keep that registry
-  untouched; a relay-level unsubscribe and subscribe drops its entry when a send fails. Each frame is its own
-  `try_send`, so never leave a relay with the REQ closed on a live connection: retry a REQ that did not queue
-  behind its CLOSE on that connection (`RelayConnection`), stop when it ends, since the reconnect restores the REQ
-  from the registry and a REQ of ours on the new connection would repeat a live id, and report the relay as failed.
-  Do not force a reconnect instead: the SDK re-sends REQs before its sender drains the queue, so a full queue
-  refuses them too. The retry runs under the lifecycle lock, so keep its wait bounded. Never infer EOSE at a lag,
+  have not reported EOSE, under the subscription lifecycle lock. A claim is a distinct `EoseReissueClaim`: one whose
+  re-issue went out stays spent, so a replay that lags again cannot loop; one that got none is released and counted in
+  `EoseRepair::unrepaired` so the caller repairs it again later. The SDK client re-sends a REQ only to a connected
+  relay and only while its floor record holds it live, and records it with `open` first. It sends a raw CLOSE before
+  the raw REQ: a relay must never see a repeated live id, because one that answers `CLOSED duplicate:` makes the SDK
+  drop the REQ from the registry that restores it on reconnect. Keep that registry untouched; a relay-level
+  unsubscribe and subscribe drops its entry when a send fails. Never wait for queue room under the lifecycle lock: a
+  REQ with no room behind its CLOSE comes back pending and the adapter retries it in the background, taking the lock
+  only per attempt, rechecking its own claim, and never sending on a later connection. Do not force a reconnect: the
+  SDK re-sends REQs before its sender drains the queue, so a full queue refuses them too. Never infer EOSE at a lag,
   change a re-issued REQ's filter, or reopen a closed REQ.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
