@@ -502,10 +502,17 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   the settle window for the same lag, until the REQ goes out or its EOSE arrives. What
   remains: a replay still running 30 seconds after the last lag restarts once; a group
   route removed before its EOSE keeps the activation's frozen coverage incomplete; and a
-  relay that stays unreachable is retried once per settle window. The SDK records each
+  relay that stays unreachable is retried once per settle window. One case MDK cannot close
+  alone: when the CLOSE and REQ are both queued and the connection drops before they go out,
+  the SDK's reconnect `resubscribe` appends its own REQ behind them, so the new connection
+  sees the id twice. A relay that refuses a repeated live id with `CLOSED duplicate:` then
+  makes the SDK drop the REQ from its registry, and a later reconnect no longer restores it.
+  The SDK's reconnect causes this, and MDK does not work around it. The SDK records each
   REQ's EOSE in its relay read loop, where a lag cannot drop it, but the pinned fork does
-  not expose that flag (`Relay::subscription` returns only filters). Exposing it would
-  replace this replay with a registry read; that is a fork change, tracked separately.
+  not expose that flag (`Relay::subscription` returns only filters). Both depend on the
+  pending fork change: an atomic multi-frame send, and a per-connection
+  `received_eose` exposed in the registry. With it, the repair reads the flag instead of
+  re-issuing, and this replay and its limits go away.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored
