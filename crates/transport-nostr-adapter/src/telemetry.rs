@@ -475,6 +475,9 @@ struct RelayProgress {
     started_ms: u64,
     first_event_seen: bool,
     eose_seen: bool,
+    /// A notification-lag repair re-issued this REQ on this relay. It does so
+    /// at most once.
+    eose_reissued: bool,
 }
 
 /// Progress of one subscription across the relays it was issued to.
@@ -496,7 +499,8 @@ struct StagedSubscriptionProgress {
     rollback_eose: HashMap<(String, RelayIndex), u64>,
 }
 
-/// Local recorder for subscription sync timing and the initial-sync gate.
+/// Local recorder for subscription sync timing and the initial-sync gate. It
+/// also records which relays a notification-lag repair re-issued a REQ to.
 ///
 /// Diagnostic only; must never feed convergence or branch selection.
 #[derive(Clone, Debug, Default)]
@@ -692,6 +696,31 @@ impl RelaySyncTelemetry {
             .map(|progress| progress.eose_seen)
     }
 
+    /// Claim one relay of a committed subscription for a notification-lag
+    /// repair: true, once, when that relay has not reported EOSE for a REQ
+    /// started at or before `started_by_ms`. The caller then re-issues the REQ
+    /// there. Any later claim is false, so a replay that lags again cannot
+    /// loop.
+    pub(crate) fn claim_eose_reissue(
+        &mut self,
+        subscription_id: &str,
+        relay: RelayIndex,
+        started_by_ms: u64,
+    ) -> bool {
+        let Some(progress) = self
+            .subscriptions
+            .get_mut(subscription_id)
+            .and_then(|subscription| subscription.relays.get_mut(&relay))
+        else {
+            return false;
+        };
+        if progress.eose_seen || progress.eose_reissued || progress.started_ms > started_by_ms {
+            return false;
+        }
+        progress.eose_reissued = true;
+        true
+    }
+
     /// Aggregate, privacy-safe snapshot of subscription sync timing.
     pub fn snapshot(&self) -> RelaySyncSnapshot {
         let tracked = self.subscriptions.len()
@@ -762,6 +791,7 @@ fn subscription_progress(relays: &[RelayIndex], now_ms: u64) -> SubscriptionProg
                         started_ms: now_ms,
                         first_event_seen: false,
                         eose_seen: false,
+                        eose_reissued: false,
                     },
                 )
             })
@@ -1159,6 +1189,36 @@ mod tests {
         // Reissued: the prior EOSE no longer counts.
         telem.record_subscription_start("sub", &[A], 100);
         assert_eq!(telem.subscription_synced("sub"), Some(false));
+    }
+
+    #[test]
+    fn lag_repair_claims_each_relay_awaiting_eose_once() {
+        let mut telem = RelaySyncTelemetry::default();
+        telem.record_subscription_start("sub", &[A, B, C], 100);
+        telem.record_eose("sub", A, 110);
+
+        assert!(!telem.claim_eose_reissue("sub", A, 200), "already had EOSE");
+        assert!(
+            !telem.claim_eose_reissue("sub", B, 99),
+            "started after the lag"
+        );
+        assert!(telem.claim_eose_reissue("sub", B, 200));
+        assert!(!telem.claim_eose_reissue("sub", B, 300), "at most once");
+        assert!(!telem.claim_eose_reissue("sub", RelayIndex(9), 200));
+        assert!(!telem.claim_eose_reissue("unknown", A, 200));
+        // Claiming changes no gate: only the relay's own EOSE does.
+        assert_eq!(telem.subscription_endpoint_eose("sub", B), Some(false));
+        telem.record_eose("sub", B, 400);
+        assert_eq!(telem.subscription_endpoint_eose("sub", B), Some(true));
+
+        // A fresh start of the same id is a new REQ with its own claim.
+        telem.record_subscription_start("sub", &[B], 500);
+        assert!(telem.claim_eose_reissue("sub", B, 500));
+        // Staged starts are not live yet and cannot be claimed.
+        telem.begin_staged_subscription_starts();
+        telem.stage_subscription_start("staged", &[A], 600);
+        assert!(!telem.claim_eose_reissue("staged", A, 700));
+        telem.rollback_staged_subscription_starts();
     }
 
     #[test]

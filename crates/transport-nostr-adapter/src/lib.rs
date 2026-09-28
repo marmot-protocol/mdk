@@ -473,6 +473,29 @@ impl AccountSubscriptionEose {
     }
 }
 
+/// The moment of a notification lag on the adapter's subscription clock, from
+/// [`NostrTransportAdapter::notification_lag_mark`].
+///
+/// Only REQs issued at or before a lag can have lost their end-of-stored-events
+/// in it. [`NostrTransportAdapter::reissue_subscriptions_awaiting_eose`] leaves
+/// later ones alone, because their replay is still arriving. A later mark
+/// covers every earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NotificationLagMark(u64);
+
+/// Counts from one notification-lag EOSE repair, from
+/// [`NostrTransportAdapter::reissue_subscriptions_awaiting_eose`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EoseReissueSummary {
+    /// Relays, across REQs, that had not reported EOSE and were claimed for a
+    /// re-issue.
+    pub awaiting_relays: usize,
+    /// Of those, how many the relay client re-sent the REQ to.
+    pub reissued_relays: usize,
+    /// REQs whose re-issue the relay client refused or failed.
+    pub failed_subscriptions: usize,
+}
+
 /// Boundary between this adapter and the actual Nostr relay implementation.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
@@ -544,6 +567,26 @@ pub trait NostrRelayClient: Send + Sync {
     ) -> Result<(), TransportAdapterError> {
         Err(TransportAdapterError::Subscription(
             "scoped subscription unsupported".to_owned(),
+        ))
+    }
+
+    /// Send a live REQ again to `endpoints`, unchanged and under its own id,
+    /// so that each relay replaces it, replays its stored events and reports
+    /// end-of-stored-events again. Returns how many relays it went to; a
+    /// relay on which the REQ is not live is skipped.
+    ///
+    /// The REQ must keep the filter it was issued with, so its `since` still
+    /// bounds a later lag's loss, and a closed REQ must never be reopened. An
+    /// implementation that cannot guarantee both refuses. Unsupported by
+    /// default.
+    async fn reissue_subscription(
+        &self,
+        _account_id: &MemberId,
+        _subscription_id: &str,
+        _endpoints: &[TransportEndpoint],
+    ) -> Result<usize, TransportAdapterError> {
+        Err(TransportAdapterError::Subscription(
+            "subscription reissue unsupported".to_owned(),
         ))
     }
 
@@ -993,6 +1036,67 @@ impl NostrTransportAdapter {
         account_id: &MemberId,
     ) -> Option<SubscriptionAttempt> {
         self.state.read().await.activation_attempt(account_id)
+    }
+
+    /// Mark a notification lag on the adapter's subscription clock. Take it
+    /// when the lag is observed, before a later activation or group sync
+    /// issues REQs that the lag cannot have affected.
+    pub fn notification_lag_mark(&self) -> NotificationLagMark {
+        NotificationLagMark(self.now_ms())
+    }
+
+    /// Re-issue the REQs whose end-of-stored-events a notification lag may
+    /// have lost. That is every live subscription of `account_id` issued at or
+    /// before `lag`, or of every account when the lagging receiver was shared,
+    /// on each relay that has not reported EOSE for it. It covers the inbox,
+    /// each group route and post-join maintenance. REQs that already had EOSE,
+    /// and those issued after the lag, are left alone.
+    ///
+    /// A lost EOSE cannot be inferred. The lag cannot tell a lost EOSE from
+    /// one still coming, so marking it at the lag would let an EOSE-gated drain
+    /// accept history a relay was still sending. The re-issued REQ keeps its
+    /// filter, so the relay replays from the same `since` before a fresh EOSE,
+    /// and the notification-loss floor does not move. Each relay gets a REQ
+    /// again at most once: a replay that lags again must not loop. This holds
+    /// the subscription lifecycle lock, so no activation, group sync or
+    /// teardown can close a REQ between the choice and the send.
+    pub async fn reissue_subscriptions_awaiting_eose(
+        &self,
+        account_id: Option<&MemberId>,
+        lag: NotificationLagMark,
+    ) -> EoseReissueSummary {
+        let _subscription_guard = self.subscription_lock.lock().await;
+        let awaiting = self
+            .state
+            .write()
+            .await
+            .claim_subscriptions_awaiting_eose(account_id, lag.0);
+        let mut summary = EoseReissueSummary {
+            awaiting_relays: awaiting
+                .iter()
+                .map(|(_, _, endpoints)| endpoints.len())
+                .sum(),
+            ..EoseReissueSummary::default()
+        };
+        for (account_id, subscription_id, endpoints) in awaiting {
+            match self
+                .relay_client
+                .reissue_subscription(&account_id, &subscription_id, &endpoints)
+                .await
+            {
+                Ok(reissued) => summary.reissued_relays += reissued,
+                Err(_) => summary.failed_subscriptions += 1,
+            }
+        }
+        tracing::debug!(
+            target: "transport_nostr_adapter::adapter",
+            method = "reissue_subscriptions_awaiting_eose",
+            awaiting_relays = summary.awaiting_relays,
+            reissued_relays = summary.reissued_relays,
+            failed_subscriptions = summary.failed_subscriptions,
+            "re-issued subscriptions awaiting end-of-stored-events after a notification lag"
+        );
+        summary
     }
 
     /// Install the temporary, full-history subscription used by the post-join
@@ -2245,6 +2349,67 @@ impl AdapterState {
             .get(account_id)
             .map(AccountReplayCoverage::snapshot)
             .unwrap_or_default()
+    }
+
+    /// Claim, for one notification-lag repair, each relay that has not
+    /// reported EOSE for a live REQ started by `started_by_ms`. A live REQ is
+    /// an account's inbox, one of its group routes, or post-join maintenance;
+    /// `None` covers every account. Returns each REQ with the endpoints
+    /// claimed for it. A claimed relay is never returned again.
+    fn claim_subscriptions_awaiting_eose(
+        &mut self,
+        account_id: Option<&MemberId>,
+        started_by_ms: u64,
+    ) -> Vec<(MemberId, String, Vec<TransportEndpoint>)> {
+        let in_scope = |account: &MemberId| account_id.is_none_or(|wanted| wanted == account);
+        let mut live = Vec::new();
+        for (account, routes) in self.accounts.iter().filter(|(id, _)| in_scope(id)) {
+            let inbox = account_inbox_subscription(
+                account,
+                routes
+                    .inbox_endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.verbatim.clone())
+                    .collect(),
+                None,
+                routes.attempt,
+            );
+            live.push((account.clone(), inbox.subscription_id(), inbox));
+            for group in &routes.groups {
+                let subscription = group_subscription(account, group, None, routes.attempt);
+                live.push((
+                    account.clone(),
+                    subscription.subscription_id(),
+                    subscription,
+                ));
+            }
+        }
+        for (id, subscription) in &self.maintenance_routes {
+            if in_scope(subscription.account_id()) {
+                live.push((
+                    subscription.account_id().clone(),
+                    id.clone(),
+                    subscription.clone(),
+                ));
+            }
+        }
+        live.into_iter()
+            .filter_map(|(account, id, subscription)| {
+                let endpoints = subscription
+                    .endpoints()
+                    .iter()
+                    .filter(|endpoint| {
+                        self.relay_index
+                            .existing_index_for(endpoint)
+                            .is_some_and(|relay| {
+                                self.sync.claim_eose_reissue(&id, relay, started_by_ms)
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!endpoints.is_empty()).then_some((account, id, endpoints))
+            })
+            .collect()
     }
 
     fn record_subscription_first_event(

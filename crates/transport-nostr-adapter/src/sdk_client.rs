@@ -16,9 +16,10 @@ use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     AcquisitionEnd as SdkAcquisitionEnd, AcquisitionLimits as SdkAcquisitionLimits, Client,
-    ClientNotification, Event, EventBuilder, EventId, Filter, FinalizeEventAsync, Kind, PublicKey,
-    RelayAcquisition, RelayCapabilities, RelayMessage, RelayStatus, RelayUrl, ReqTarget,
-    SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions, Tag, Timestamp as NostrTimestamp,
+    ClientMessage, ClientNotification, Event, EventBuilder, EventId, Filter, FinalizeEventAsync,
+    Kind, PublicKey, RelayAcquisition, RelayCapabilities, RelayMessage, RelayStatus, RelayUrl,
+    ReqTarget, SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions, Tag,
+    Timestamp as NostrTimestamp,
 };
 use nostr_sdk::relay::EventSendStatus;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
@@ -2437,6 +2438,66 @@ impl NostrRelayClient for NostrSdkRelayClient {
         Ok(())
     }
 
+    /// Re-send the filters the SDK retained for this REQ, as a raw REQ under
+    /// the same id, to each relay that still holds it. The SDK refuses to
+    /// register a live id twice, and its registry must keep the REQ it will
+    /// restore on reconnect, so the REQ bypasses registration. A relay then
+    /// replaces its subscription and replays from the same `since`.
+    async fn reissue_subscription(
+        &self,
+        account_id: &MemberId,
+        subscription_id: &str,
+        endpoints: &[TransportEndpoint],
+    ) -> Result<usize, TransportAdapterError> {
+        if let Some(account_client) = self.account_client(account_id).await? {
+            return Box::pin(account_client.reissue_subscription(
+                account_id,
+                subscription_id,
+                endpoints,
+            ))
+            .await;
+        }
+        let id = SubscriptionId::new(subscription_id);
+        let mut reissued = 0;
+        for endpoint in parse_endpoints(endpoints, "subscription reissue")? {
+            let Ok(Some(relay)) = self.client.relay(&endpoint).await else {
+                continue;
+            };
+            let Some(filters) = relay
+                .subscription(&id)
+                .await
+                .filter(|filters| !filters.is_empty())
+            else {
+                continue;
+            };
+            // Record the REQ before it goes out, like every REQ. It carries the
+            // filter it was issued with, so this cannot lower the floor. A REQ
+            // this context closed stays closed. Only an account context
+            // records floors.
+            if let Some(mut floors) = self.account_subscription_floors() {
+                if !floors.live.contains_key(&id) {
+                    continue;
+                }
+                floors.open(&id, req_since(&filters));
+            }
+            if relay
+                .send_msg(ClientMessage::req(id.clone(), filters))
+                .await
+                .is_ok()
+            {
+                reissued += 1;
+            }
+        }
+        tracing::debug!(
+            target: "transport_nostr_adapter::sdk_client",
+            method = "reissue_subscription",
+            endpoint_count = endpoints.len(),
+            reissued_count = reissued,
+            "re-issued SDK relay subscription"
+        );
+        Ok(reissued)
+    }
+
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
@@ -2742,6 +2803,16 @@ fn parse_endpoints(
             })
         })
         .collect()
+}
+
+/// The `since` floor a REQ's filters put on the events it can deliver: the
+/// lowest among them, or `None` when any filter has none.
+fn req_since(filters: &[Filter]) -> Option<u64> {
+    filters
+        .iter()
+        .map(|filter| filter.since.map(|since| since.as_secs()))
+        .reduce(|lowest, since| lowest.zip(since).map(|(a, b)| a.min(b)))
+        .flatten()
 }
 
 fn member_id_to_pubkey(
@@ -3388,6 +3459,251 @@ mod tests {
         );
         assert_eq!(account.notification_loss_floor(), Since(50));
         root.shutdown_accounts().await;
+    }
+
+    /// Raw relay copies a REQ replays up to its end-of-stored-events, in order.
+    async fn replay_until_eose(
+        notifications: &mut (impl futures::Stream<Item = ClientNotification> + Unpin),
+        id: &SubscriptionId,
+    ) -> Vec<EventId> {
+        timeout(Duration::from_secs(5), async {
+            let mut replayed = Vec::new();
+            while let Some(notification) = notifications.next().await {
+                let ClientNotification::Message { message, .. } = notification else {
+                    continue;
+                };
+                match *message {
+                    RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    } if subscription_id.as_ref() == id => replayed.push(event.id),
+                    RelayMessage::EndOfStoredEvents(subscription_id)
+                        if subscription_id.as_ref() == id =>
+                    {
+                        return replayed;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("notifications ended before end-of-stored-events");
+        })
+        .await
+        .expect("the relay reports end-of-stored-events")
+    }
+
+    fn stored_group_event(transport_group_id: &[u8], created_at: u64) -> Event {
+        EventBuilder::new(Kind::MlsGroupMessage, "stored")
+            .tags([Tag::custom("h", [hex::encode(transport_group_id)])])
+            .custom_created_at(NostrTimestamp::from_secs(created_at))
+            .finalize(&Keys::generate())
+            .unwrap()
+    }
+
+    /// A re-issued REQ is the same REQ: the relay replays it from the same
+    /// `since` and reports end-of-stored-events again, and the floor does not
+    /// move. A relay the REQ never went to is skipped, and a closed REQ is
+    /// never reopened.
+    #[tokio::test]
+    async fn reissued_req_replays_from_its_own_since_and_reports_eose_again() {
+        use NostrNotificationLossFloor::Since;
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoints = vec![TransportEndpoint(relay.url().await.to_string())];
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let transport_group_id = vec![0xD4; 32];
+        let after = stored_group_event(&transport_group_id, 3_000);
+        relay
+            .add_event(stored_group_event(&transport_group_id, 1_000))
+            .await
+            .unwrap();
+        relay.add_event(after.clone()).await.unwrap();
+        let group = NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: cgka_traits::GroupId::new(vec![0xC3; 16]),
+            transport_group_id,
+            endpoints: endpoints.clone(),
+            since: Some(Timestamp(2_000)),
+            attempt: SubscriptionAttempt::INITIAL.next(),
+        };
+        let wire_id = group.subscription_id();
+        let id = SubscriptionId::new(wire_id.clone());
+        let mut notifications = account.client().notifications();
+        root.subscribe(group.clone()).await.unwrap();
+        assert_eq!(
+            replay_until_eose(&mut notifications, &id).await,
+            vec![after.id]
+        );
+        assert_eq!(account.notification_loss_floor(), Since(2_000));
+
+        assert_eq!(
+            root.reissue_subscription(&account_id, &wire_id, &endpoints)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            replay_until_eose(&mut notifications, &id).await,
+            vec![after.id],
+            "the same filter replays from the same since"
+        );
+        assert_eq!(account.notification_loss_floor(), Since(2_000));
+        assert_eq!(
+            account.client().subscription(&id).await.len(),
+            1,
+            "the SDK keeps the REQ it restores on reconnect"
+        );
+
+        assert_eq!(
+            root.reissue_subscription(
+                &account_id,
+                &wire_id,
+                &[TransportEndpoint("wss://elsewhere.example".into())],
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        root.unsubscribe(group).await.unwrap();
+        assert_eq!(
+            root.reissue_subscription(&account_id, &wire_id, &endpoints)
+                .await
+                .unwrap(),
+            0,
+            "a closed REQ stays closed"
+        );
+        assert!(
+            root.reissue_subscription(&MemberId::new(vec![0xEE; 32]), &wire_id, &endpoints)
+                .await
+                .is_err(),
+            "an account without a context cannot re-issue"
+        );
+        root.shutdown_accounts().await;
+        relay.shutdown();
+    }
+
+    /// End to end on a real relay: a consumer that loses a REQ's
+    /// end-of-stored-events, as a lag does, leaves the activation's coverage
+    /// incomplete. The lag repair restores it with a fresh one from the same
+    /// REQ, without re-issuing the REQ that was answered.
+    #[tokio::test]
+    async fn lag_repair_recovers_an_end_of_stored_events_the_consumer_lost() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let adapter = NostrTransportAdapter::new(Arc::new(root.clone()));
+        let group = cgka_traits::TransportGroupSubscription {
+            group_id: cgka_traits::GroupId::new(vec![0xC3; 16]),
+            transport_group_id: vec![0xD4; 32],
+            endpoints: vec![endpoint.clone()],
+        };
+        relay
+            .add_event(stored_group_event(&group.transport_group_id, 5_000))
+            .await
+            .unwrap();
+        let group_req = NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: group.group_id.clone(),
+            transport_group_id: group.transport_group_id.clone(),
+            endpoints: group.endpoints.clone(),
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL.next(),
+        }
+        .subscription_id();
+        // Forward end-of-stored-events as the relay plane's consumer does,
+        // except the first answer to the group REQ.
+        let lost = Arc::new(tokio::sync::Notify::new());
+        let mut notifications = account.client().notifications();
+        let consumer = tokio::spawn({
+            let adapter = adapter.clone();
+            let group_req = group_req.clone();
+            let lost = lost.clone();
+            async move {
+                let mut dropped = false;
+                while let Some(notification) = notifications.next().await {
+                    if let ClientNotification::Message { relay_url, message } = notification
+                        && let RelayMessage::EndOfStoredEvents(id) = *message
+                    {
+                        if !dropped && id.as_str() == group_req {
+                            dropped = true;
+                            lost.notify_one();
+                            continue;
+                        }
+                        adapter
+                            .handle_relay_eose(
+                                TransportEndpoint(relay_url.to_string()),
+                                id.to_string(),
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![group],
+                since: Some(Timestamp(1_000)),
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), lost.notified())
+            .await
+            .expect("the relay answered the group REQ");
+        timeout(Duration::from_secs(5), async {
+            while adapter
+                .account_subscription_eose(&account_id)
+                .await
+                .relay_subscription_attempts_with_eose
+                == 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the inbox's end-of-stored-events is recorded");
+        let coverage = adapter.account_subscription_eose(&account_id).await;
+        assert_eq!(coverage.relay_subscription_attempts, 2);
+        assert!(!coverage.complete(), "the lost answer leaves coverage open");
+        let floor = account.notification_loss_floor();
+
+        let lag = adapter.notification_lag_mark();
+        assert_eq!(
+            adapter
+                .reissue_subscriptions_awaiting_eose(Some(&account_id), lag)
+                .await,
+            crate::EoseReissueSummary {
+                awaiting_relays: 1,
+                reissued_relays: 1,
+                failed_subscriptions: 0,
+            }
+        );
+        timeout(Duration::from_secs(5), async {
+            while !adapter
+                .account_subscription_eose(&account_id)
+                .await
+                .complete()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the re-issued REQ's end-of-stored-events completes coverage");
+        assert_eq!(account.notification_loss_floor(), floor);
+        consumer.abort();
+        root.shutdown_accounts().await;
+        relay.shutdown();
     }
 
     #[tokio::test]
