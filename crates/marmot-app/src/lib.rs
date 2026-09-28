@@ -97,6 +97,8 @@ pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod error;
 mod external_signer;
 mod groups;
+mod history_notices;
+pub use history_notices::{HistoryNotice, HistoryNoticeCause};
 mod ids;
 mod key_package_records;
 #[cfg(test)]
@@ -1839,6 +1841,7 @@ impl MarmotApp {
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_recovery_status_updates: std::collections::HashSet::new(),
+            history_notice_baseline: None,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_failed_sync_summary: SyncSummary::default(),
@@ -1898,6 +1901,8 @@ impl MarmotApp {
             client.reconcile_hydrated_account_state()?;
             client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
         }
+        // Hosts read the notice list after open; later changes raise an event.
+        client.take_history_notice_changes();
         Ok(client)
     }
 

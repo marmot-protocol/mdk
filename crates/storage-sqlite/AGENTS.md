@@ -20,7 +20,7 @@ not "fix" it into the per-account database.
 | `src/storage/` | Marmot storage tables by concern. |
 | `src/storage/snapshots/` | Snapshot/checkpoint capture, restoration and the consistent replay-state fingerprint; see its local `AGENTS.md`. |
 | `src/openmls_storage/` | Custom OpenMLS storage adapter. |
-| `src/account_recovery.rs` | Account-private recovery ledger, evidence import and durable retry reservations; `account_recovery/` holds typed joins, frozen scope checkpoints and loss acknowledgment. The app owner supplies validated facts and owns execution policy. |
+| `src/account_recovery.rs` | Account-private recovery ledger, evidence import and durable retry reservations; `account_recovery/` holds typed joins, frozen scope checkpoints, loss acknowledgment and (`notice.rs`) parked "history may be incomplete" occurrences with their explicit retirement (`state = 2`, never coverage). The app owner supplies validated facts and owns execution policy. |
 | `src/delivery_spill.rs` | Durable overflow tail of the in-memory account delivery queue: bounded spill, seen/released dedup, oldest-first reads and per-row removal after ingest. |
 | `src/account_projection.rs` | Account-level event projection. |
 | `src/chat_list.rs` | Chat-list projection, including avatar URLs. |

@@ -996,6 +996,15 @@ pub struct GroupRecoveryStatus {
     /// Exhausted recovery attempts requiring a new user-initiated invitation.
     pub failed_reinvites: u32,
     pub rejoin_invitations: Vec<GroupRejoinInvitation>,
+    /// Automatic recovery parked on this group's own history, so hosts may
+    /// show "history may be incomplete". Account-wide occurrences, such as
+    /// delivery loss, are listed only by `history_notices`.
+    #[serde(default)]
+    pub history_may_be_incomplete: bool,
+    /// Notice ids of those group-scoped occurrences, oldest first; pass one to
+    /// `dismiss_history_notice`. Empty exactly when the flag is false.
+    #[serde(default)]
+    pub history_notice_ids: Vec<String>,
 }
 
 /// A fully validated Welcome awaiting a recipient's explicit decision to

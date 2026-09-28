@@ -1046,7 +1046,7 @@ impl AppClient {
         )))
     }
 
-    fn delivery_loss_blocks_cursor(&self) -> bool {
+    pub(crate) fn delivery_loss_blocks_cursor(&self) -> bool {
         self.delivery_overflow_recovery_pending || self.adapter.delivery_loss_blocks_cursor()
     }
 
@@ -1077,6 +1077,16 @@ impl AppClient {
             )?;
             storage.synchronize_account_delivery_loss(&self.state.label)?;
             self.adapter.notification_loss_persisted(overflow);
+        }
+        // A late observation of loss the user already retired rearms nothing.
+        // Release its fence as the dismissal would have, never as coverage.
+        if self.release_retired_delivery_loss(Some(overflow))? {
+            tracing::debug!(
+                target: "marmot_app::relay_plane",
+                method = "observe_delivery_overflow",
+                "observed delivery loss was already retired; cursor fence released",
+            );
+            return Ok(());
         }
         self.delivery_overflow_recovery_pending = true;
         self.delivery_overflow_recovery_marker_token = Some(overflow.marker_token);
@@ -8073,3 +8083,83 @@ mod full_history_tests;
 
 #[cfg(test)]
 mod selective_history_acquisition_tests;
+
+#[cfg(test)]
+mod retired_loss_observation_tests {
+    use std::sync::Arc;
+
+    use crate::client::history_notices::park_recovery_for_test;
+    use crate::relay_plane::AccountDeliveryOverflow;
+    use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
+
+    /// A dismissal cannot release the plane while that generation still has
+    /// work in flight, such as a queued control record. The later observation
+    /// of the same, now retired, loss must release the fence rather than
+    /// re-raise it, while genuinely new loss still arms recovery.
+    #[tokio::test]
+    async fn a_late_observation_of_retired_loss_releases_the_fence_without_rearming() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .mark_account_delivery_recovery("alice", 42, 1)
+            .unwrap();
+        client.delivery_overflow_recovery_pending = true;
+        client.delivery_overflow_recovery_marker_token = Some(42);
+        client.adapter.start_delivery_overflow_recovery(42);
+        client.adapter.fail_delivery_overflow_recovery();
+        let loss = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+            .unwrap()
+            .ticket
+            .id;
+        park_recovery_for_test(&storage, loss);
+        let ticket = storage.parked_recovery_obligations().unwrap()[0].ticket;
+        assert!(
+            storage
+                .retire_parked_recovery_obligation(ticket.id, ticket.revision, 1_000)
+                .unwrap()
+        );
+        assert!(client.delivery_loss_blocks_cursor());
+
+        let observed = client.adapter.pending_delivery_overflow().unwrap();
+        client.observe_delivery_overflow(observed).unwrap();
+        assert!(!client.delivery_overflow_recovery_pending);
+        assert!(client.adapter.pending_delivery_overflow().is_none());
+        assert!(!client.delivery_loss_blocks_cursor());
+        assert!(
+            storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none()
+        );
+        assert!(client.history_notices().unwrap().is_empty());
+
+        client
+            .observe_delivery_overflow(AccountDeliveryOverflow {
+                generation: 9,
+                marker_token: 77,
+                dropped: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(client.delivery_overflow_recovery_pending);
+        assert_eq!(
+            storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .unwrap()
+                .marker_token,
+            77,
+            "new loss reopens the retired obligation as pending debt"
+        );
+    }
+}

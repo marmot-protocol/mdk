@@ -55,6 +55,7 @@ use crate::types::group::{
     MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
     MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
+use crate::types::history_notice::MarmotHistoryNoticeList;
 use crate::types::local_submissions::{
     MarmotLocalSendAcceptance, MarmotLocalSendStatus, MarmotMediaUploadSubmission,
 };
@@ -720,6 +721,16 @@ c_cmd! {
 
     /// Decline the selected replacement offer without changing active group state.
     async fn marmot_decline_group_rejoin(account_ref: str, welcome_id_hex: str) -> unit = decline_group_rejoin;
+
+    /// List the account's durable "history may be incomplete" notices, oldest
+    /// first. Re-read on the `HistoryNoticesChanged` event. Free with
+    /// `marmot_history_notice_list_free`.
+    async fn marmot_history_notices(account_ref: str) -> rec(MarmotHistoryNoticeList) = history_notices;
+
+    /// Dismiss one notice once the user accepts the history may be incomplete.
+    /// Durable; recorded as its own outcome, never as recovered history.
+    /// Writes false for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`.
+    async fn marmot_dismiss_history_notice(account_ref: str, notice_id: str) -> scalar(bool) = dismiss_history_notice;
 
     /// Accept a pending group invite; writes the now-confirmed group
     /// record. Free with `marmot_app_group_record_free`.

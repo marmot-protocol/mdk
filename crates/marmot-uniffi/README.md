@@ -79,7 +79,7 @@ All methods, including less common management/diagnostic operations, are listed 
 | --- | --- |
 | Accounts and onboarding | Identity creation/import, setup readiness, local sign-in/out, wipe/export and external signers. Keep local removal, leaving groups, remote publication and wiping credentials distinct; inspect returned cleanup/send outcomes. Interactive onboarding is a persisted approval workflow, not a series of unconditional setters. |
 | Directory and profiles | Canonical member-reference parsing, safe names, cached identities, profile/relay refresh and user search. Cached reads and explicit network refresh are separate. Use prepared identity references on chat screens instead of per-row lookups. |
-| Groups and administration | Creation, staged/prepared images, invitations, membership/admin changes, retention, archive/leave/disband, recovery, quarantine and maintenance. Use current capabilities; a displayed roster is not authorization. Queued operations and uncertain publication require result-aware UI. |
+| Groups and administration | Creation, staged/prepared images, invitations, membership/admin changes, retention, archive/leave/disband, recovery, quarantine and maintenance. Use current capabilities; a displayed roster is not authorization. Queued operations and uncertain publication require result-aware UI. "History may be incomplete" notices report parked recovery; see [History may be incomplete notices](#history-may-be-incomplete-notices). |
 | Messages, edits, reactions and polls | Send/reply/edit/custom events, reaction changes, encrypted NIP-88 polls, deletion and edit history. Render effective prepared content and viewer reaction/poll state; use raw history only when the feature needs it. |
 | Moderation and blocking | Typed reports, individual dismissals, deletion-masked report targets and live block lists. Reports are not deletion evidence; the host designs moderation queue UI from the provided records. |
 | Screens, read state and drafts | Prepared bounded lists/conversations, account attention, read markers, manual unread, pins, mutes and revisioned composers. MDK owns persistent projection state; the host owns viewport/layout. |
@@ -875,6 +875,38 @@ Pages are capped at 100 and cursors are exclusive. C callers deep-free returned
 pages with `marmot_content_report_page_free` or `marmot_report_dismissal_page_free`.
 `reported_message` uses the ordinary timeline record and its free function.
 Use existing projection subscriptions to refresh client review views.
+
+## History may be incomplete notices
+
+Automatic recovery stops retrying an obligation after a fixed budget of attempts that
+recover and certify nothing. Each such parked occurrence is a notice the user should see
+as "history may be incomplete":
+
+- `history_notices(account_ref)` returns `HistoryNoticeFfi` records, oldest first: an
+  opaque `notice_id`, a `HistoryNoticeCauseFfi` for the host's wording, `group_id_hex`
+  for a group-scoped occurrence (an epoch gap) or `None` when the account as a whole is
+  affected (delivery or notification loss, incremental or explicit history), and an
+  optional `parked_at_ms`. It reads local durable state and never touches the network.
+- `group_recovery_status` sets `history_may_be_incomplete` and lists the group's own
+  `history_notice_ids`. Show a banner in that conversation; account-wide notices belong
+  in an account-level surface instead.
+- `MarmotEventFfi::HistoryNoticesChanged` fires when a notice appears (recovery parked),
+  disappears (new evidence re-armed recovery, or it was dismissed), or is replaced. Re-read
+  the list; a group whose own notices changed also receives `GroupStateUpdated`.
+- `dismiss_history_notice(account_ref, notice_id)` records the user's decision durably,
+  as its own outcome and never as recovered history. It returns `false` for a stale id;
+  re-read and show the current notices. After a delivery-loss dismissal the transport
+  cursor can advance again once no loss recovery remains pending.
+
+Do not dismiss on the user's behalf, and do not persist `notice_id` as a group or
+account identity: it changes whenever recovery re-arms. A dismissed occurrence never
+comes back, but genuinely new evidence can raise a new notice: new loss, a higher missing
+epoch, a later startup's incremental comparison, or a new explicit repair. Explicit
+full-history repair remains available and can still complete parked history with
+qualified coverage. Notices carry no relay, message or key identities; keep them out of
+analytics. C callers use `marmot_history_notices` (free with
+`marmot_history_notice_list_free`), `marmot_dismiss_history_notice` and the
+`MARMOT_EVENT_HISTORY_NOTICES_CHANGED` event tag.
 
 ## Durable avatar access
 

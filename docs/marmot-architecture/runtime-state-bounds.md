@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-23
+updated: 2026-09-28
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -136,6 +136,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
+| `AppClient.history_notice_baseline` | One entry (16-byte obligation id, revision, optional group id) per parked recovery obligation; input-relative to the parked demand keys, not to history | Replaced wholesale from one indexed read at each publication seam; dropped with the client. Losing it costs at most one extra `HistoryNoticesChanged`. |
 | `AppClient.encrypted_media_not_required_epochs` | One `u64` per live projected group (mdk#1380) | Pruned to the live group set at the start of every warm pass; stale entries are evicted when the group epoch advances and an authoritative re-check finds the component required; the whole map is dropped with the client. Entries are only ever inserted after a successful authoritative negative, so map loss or eviction costs at most one `MlsGroup::load` re-check, never a wrong skip. |
 | Avatar acquisition | At most 2,048 jobs, each descriptor at most 16 KiB; at most four HTTP/results across foreground media and avatar work, with one permit kept free by background admission | Job rows cascade with asset eviction/removal. Selected source changes replace demand atomically. Interrupted work resumes after worker reconstruction; retry deadlines persist and 16 consecutive transient failures slow to one daily probe. Worker exit cancels active I/O. |
 | Native avatar batches | 16 targets/references; at most 16 MiB returned encoded bytes per call | Per-call ownership; budget-deferred images are not copied. Screen updates carry only metadata. |
@@ -217,11 +218,27 @@ local-access bounds, not convergence or recovery policy.
 | --- | --- | --- |
 | Loss acknowledgment snapshots | At most two 40-byte token/count commitments per active grant, plus at most two pending cross-grant commitments; no per-generation vector in the owner | Streamed from durable evidence; discarded on acknowledgment, error, cancellation recovery or reopen. The compatibility vector inspection API remains available to explicit lower-level callers. |
 | Evidence import temporary state | One row plus a keyset cursor, independent of unresolved generation count; transaction duration remains input-relative | Each row is imported atomically with demand, then the scan advances without retaining it. |
-| `account_delivery_loss_evidence` generation watermarks | One row per unresolved loss generation; **no fixed disk-row cap**. This is the explicitly approved #1946 retention exception, not a bounded-size claim. Duplicate observations reuse a watermark; increased counts rearm that generation. | Only qualified completion followed by exact live acknowledgment may reclaim captured evidence. Legacy retirement preserves watermarks and cannot erase another generation. Unresolved debt survives automatic investigation exhaustion and reopen. |
+| `account_delivery_loss_evidence` generation watermarks | One row per unresolved loss generation; **no fixed disk-row cap**. This is the explicitly approved #1946 retention exception, not a bounded-size claim. Duplicate observations reuse a watermark; increased counts rearm that generation. Rows the user retired keep a `retired_count` watermark and carry no debt. | Only qualified completion followed by exact live acknowledgment may reclaim captured evidence, including retired watermarks of that cause. Legacy retirement preserves watermarks and cannot erase another generation. Unresolved debt survives automatic investigation exhaustion and reopen. |
+
+Recovery debt has exactly two endings, and no cap is one of them:
+
+1. **Qualified completion**, then exact live acknowledgment, reclaims the evidence.
+2. **Explicit, user-authorized retirement**: the user dismisses a parked occurrence's
+   "history may be incomplete" notice. In one transaction, and only for that exact
+   parked revision, the obligation becomes `state = 2` with its reason recorded, never
+   coverage, and every loss generation of that cause gets a `retired_count` watermark
+   at its imported count. Unimported evidence is newer loss, so the retirement is
+   refused instead. Retired watermarks no longer bound any goal; they only stop a
+   delayed duplicate observation from rearming the row. A count above the watermark or
+   a new generation is new loss and reopens the row as fresh pending debt. The row and
+   its watermarks stay until that happens or a later qualified acknowledgment of the
+   cause reclaims them, so retirement adds no row the demand key and generation bounds
+   above do not already cover.
 
 The current transport backend cannot prove exhaustive history, so repeated loss
 can accumulate durable evidence indefinitely. An eventual disk cap needs a
 separate reviewed evidence/retirement contract; silently dropping debt is forbidden.
+Retirement is per occurrence and only on the user's decision; it is not such a cap.
 
 ### Recovery owner and completed metadata (`marmot-app/src/client/recovery.rs`)
 
@@ -234,7 +251,7 @@ separate reviewed evidence/retirement contract; silently dropping debt is forbid
 | Explicit caller metadata | One serialized account-wide explicit-history row | Successful caller detach removes it; cancellation removes urgency only. Reopen performs the same cleanup. |
 | Maintenance boundary metadata and live observations | Input-relative to active post-join domain jobs | Removed with the job/session lifecycle; grace and quiet timers remain domain-owned. |
 | Epoch evidence and qualified certificates | One current record per tracked group/epoch, no per-evaluation log | Authenticated recovery or terminal retirement clears it; replacement updates the same row. |
-| Unresolved obligations/scopes | Input-relative to unresolved events and frozen historical route/endpoint goals; not a fixed account-wide byte cap | Independent qualified completion or explicit terminal domain retirement. Obsolete routes cannot be silently removed from an outstanding goal. Each scope retains one latest checkpoint rather than an attempt history. |
+| Unresolved obligations/scopes | Input-relative to unresolved events and frozen historical route/endpoint goals; not a fixed account-wide byte cap | Independent qualified completion, explicit terminal domain retirement, or the user's explicit retirement of a parked occurrence (`state = 2`, "history may be incomplete"). A retired row keeps its unique demand key and its latest scope checkpoints, so it is bounded by the key space; genuinely new demand for that key reopens it. Obsolete routes cannot be silently removed from an outstanding goal. Each scope retains one latest checkpoint rather than an attempt history. |
 
 Automatic unknown-history investigation stops at the existing drain quantum or
 completed inconclusive boundary and parks the obligation in `needs_deep_repair`.
@@ -242,6 +259,10 @@ Timer ticks and duplicate joins do not rearm it. New loss/policy evidence or a
 serialized explicit caller can authorize another bounded investigation, subject
 to the shared owner. Missing epoch/event input uses the capped durable retry policy;
 local convergence eligibility remains independent of that network cooldown.
+Each parked obligation is one "history may be incomplete" notice, identified by its
+obligation id and revision and recorded with a `parked_at_ms` time. Dismissing it is
+the user-authorized retirement above; when no loss obligation remains pending it also
+releases the process-local cursor fence without counting a recovery success.
 
 ### Recovery comparison slot (#1992 amendment)
 

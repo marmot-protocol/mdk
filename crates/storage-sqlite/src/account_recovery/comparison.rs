@@ -177,10 +177,11 @@ impl SqliteAccountStorage {
             {
                 let conn = storage.lock()?;
                 // Extending debt invalidates old coverage proof. A join is new
-                // evidence, so the comparison it requests may certify the debt.
+                // evidence, so the comparison it requests may certify the debt,
+                // including debt the user retired before this new window.
                 conn.execute_cached("UPDATE account_recovery_obligations SET revision=revision+1,
                     state=0,eligibility=CASE WHEN eligibility IN (1,4) THEN 0 ELSE eligibility END,
-                    updated_at_ms=MAX(updated_at_ms,?2) WHERE id=?1",
+                    incomplete_reason=NULL,updated_at_ms=MAX(updated_at_ms,?2) WHERE id=?1",
                     params![ticket.id.as_slice(), sqlite_integer(now_ms)?]).storage()?;
             }
             let mut fence = storage.recovery_revision_fence()?;

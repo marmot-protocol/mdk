@@ -150,7 +150,8 @@ impl SqliteAccountStorage {
 
     /// The earliest `created_at` every unresolved charge of this cause is
     /// known to cover, or `None` when any charge had no known time. Legacy
-    /// retired watermarks no longer carry debt and are ignored.
+    /// retired watermarks and loss the user retired no longer carry debt and
+    /// are ignored.
     pub fn recovery_loss_goal_floor(
         &self,
         label: &str,
@@ -162,7 +163,8 @@ impl SqliteAccountStorage {
                 "SELECT COUNT(*), COALESCE(SUM(bound_state = 1), 0), MIN(bound_seconds)
                  FROM account_delivery_loss_evidence
                  WHERE account_label = ?1 AND cause = ?2
-                   AND (legacy_retired_count IS NULL OR legacy_retired_count < dropped_count)",
+                   AND (legacy_retired_count IS NULL OR legacy_retired_count < dropped_count)
+                   AND (retired_count IS NULL OR retired_count < dropped_count)",
                 params![label, cause as i64],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )

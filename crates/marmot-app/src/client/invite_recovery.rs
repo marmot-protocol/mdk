@@ -96,16 +96,17 @@ impl AppClient {
                 pending_reinvites = pending_reinvites.saturating_add(1);
             }
         }
+        let storage = self.app.account_storage(&self.state.label)?;
+        let history_notice_ids = self.group_history_notice_ids(group_id)?;
         Ok(crate::GroupRecoveryStatus {
             pending_reinvites,
             failed_reinvites,
             group_id_hex: hex::encode(group_id.as_slice()),
             automatic_recovery_failed: !group.is_terminal()
-                && self
-                    .app
-                    .account_storage(&self.state.label)?
-                    .automatic_recovery_failed(group_id)?,
+                && storage.automatic_recovery_failed(group_id)?,
             rejoin_invitations,
+            history_may_be_incomplete: !history_notice_ids.is_empty(),
+            history_notice_ids,
         })
     }
 

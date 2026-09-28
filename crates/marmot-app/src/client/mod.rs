@@ -71,6 +71,7 @@ mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 mod delivery_spill;
 pub(crate) mod epoch_stall;
+pub(crate) mod history_notices;
 mod invite_recovery;
 mod projection;
 mod push;
@@ -389,6 +390,10 @@ pub struct AppClient {
     pub(crate) pending_group_projection_updates: HashSet<String>,
     /// Recovery status has its own notification queue; saving a projection must not consume it.
     pub(crate) pending_recovery_status_updates: HashSet<GroupId>,
+    /// The parked recovery set as last announced to hosts ("history may be
+    /// incomplete"): one small entry per parked occurrence, compared at each
+    /// publication seam so a change raises `HistoryNoticesChanged`.
+    pub(crate) history_notice_baseline: Option<history_notices::HistoryNoticeBaseline>,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.

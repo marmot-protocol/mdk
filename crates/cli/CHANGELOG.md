@@ -28,6 +28,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- `wn groups recovery-status --json` now includes `history_may_be_incomplete` and
+  `history_notice_ids`, reporting recovery parked on that group's own history ("history may be
+  incomplete"). Existing fields are unchanged. (#2068)
 - MarmotKit standard release builds now use thin LTO and one codegen unit, kept in lockstep between the
   workspace profile and the builder-owned MarmotKit environment. Host and Apple archives still keep
   symbols; Android JNI libraries still strip per invocation. Apple provenance records `lto` as JSON

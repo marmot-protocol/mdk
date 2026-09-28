@@ -875,7 +875,8 @@ impl Marmot {
     }
 
     /// Re-read on GroupStateUpdated; display uncertainty separately from whether
-    /// the user accepted the original invitation.
+    /// the user accepted the original invitation. `history_notice_ids` are this
+    /// group's "history may be incomplete" occurrences.
     pub async fn group_recovery_status(
         &self,
         account_ref: String,

@@ -1448,6 +1448,15 @@ pub enum MarmotAppEvent {
         outcome: cgka_traits::engine::SupersededIntentOutcome,
         reason: &'static str,
     },
+    /// The account's "history may be incomplete" notices changed: recovery
+    /// parked, new evidence re-armed a parked occurrence, or the user
+    /// dismissed one. Re-read `history_notices`. Carries no notice or group
+    /// identities; a group whose own notices changed also gets
+    /// `GroupStateUpdated`.
+    HistoryNoticesChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 impl MarmotAppRuntime {
@@ -2317,6 +2326,36 @@ impl MarmotAppRuntime {
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
         self.accounts
             .group_recovery_status(account_ref, group_id)
+            .await
+    }
+
+    /// The account's "history may be incomplete" notices, oldest first: each
+    /// is one occurrence of automatic recovery parking because it could not
+    /// prove some history complete. Durable and local; refresh on
+    /// `HistoryNoticesChanged`. Group-scoped occurrences also appear in that
+    /// group's `GroupRecoveryStatus`.
+    pub async fn history_notices(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::HistoryNotice>, AppError> {
+        self.accounts.history_notices(account_ref).await
+    }
+
+    /// Dismiss one notice after the user accepts that this history may be
+    /// incomplete. The dismissal is durable and is recorded as its own
+    /// outcome, never as recovered history. Returns false, changing nothing,
+    /// for a stale id: new evidence re-armed recovery, or the notice was
+    /// already dismissed. Dismissing a delivery-loss notice lets the transport
+    /// cursor advance again once no loss recovery remains pending. New loss,
+    /// a higher missing epoch or a new repair request later raises a new
+    /// notice with a new id. A malformed id is an `AppError::Hex`.
+    pub async fn dismiss_history_notice(
+        &self,
+        account_ref: &str,
+        notice_id: &str,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .dismiss_history_notice(account_ref, notice_id)
             .await
     }
 

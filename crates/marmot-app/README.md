@@ -221,12 +221,32 @@ The explicit attempt has a 60-second overall cooperative budget, including setup
 ingest/checkpoint finishes before deadline or caller/runtime cancellation is observed; this is not a hard bound
 on an individual storage or network operation. An earlier terminal transport or drain-silence verdict also ends
 the attempt. Partial progress remains durable, outstanding loss survives reopen, and only qualified completion
-plus the exact live acknowledgment can reclaim captured loss evidence and release its cursor fence.
+plus the exact live acknowledgment can reclaim captured loss evidence. The only other way to release its cursor
+fence is the user dismissing that loss's "history may be incomplete" notice (below), which is never coverage.
 
 The account remains serialized during repair. The worker can serve committed member/roster snapshots while relay
 I/O waits; mutations, subsequent repair requests, and reads behind queued mutations retain FIFO order. Send fairness
 and isolated nonblocking network acquisition remain #1947 work. All automatic history triggers use the same
 owner and durable pacing; bounded investigation can leave unresolved debt parked for new evidence or explicit repair.
+
+## History may be incomplete notices
+
+Recovery parks an obligation after its fixed budget of fruitless attempts instead of retrying forever.
+`MarmotAppRuntime::history_notices(account_ref)` lists each parked occurrence as a `HistoryNotice`: an opaque
+`notice_id`, a `HistoryNoticeCause` (delivery loss, notification loss, a group's epoch gap, incremental or
+explicit history), the group for a group-scoped occurrence, and when it parked. Show it as "history may be
+incomplete". A group's own occurrences also set `GroupRecoveryStatus::history_may_be_incomplete` and list their
+ids in `history_notice_ids`; account-wide ones (loss, incremental and explicit history) appear only in the list.
+`MarmotAppEvent::HistoryNoticesChanged` announces any change, and a group whose own notices changed also gets
+`GroupStateUpdated`.
+
+`dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the
+history may be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as
+coverage. A retired loss keeps its evidence as a watermark, so a delayed duplicate cannot rearm it, and releases
+the transport-cursor fence once no loss obligation remains pending, without counting a recovery success. It
+returns false for a stale id. New evidence re-arms recovery under a new revision, so the notice disappears and a
+later parking is a new notice with a new id. New loss, a higher missing epoch, each startup's incremental
+comparison, or a new explicit repair reopens retired demand as fresh debt. A malformed id is `AppError::Hex`.
 
 ## User blocking
 

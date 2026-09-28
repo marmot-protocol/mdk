@@ -326,6 +326,13 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<crate::GroupRecoveryStatus, AppError>>,
     },
+    HistoryNotices {
+        respond: oneshot::Sender<Result<Vec<crate::HistoryNotice>, AppError>>,
+    },
+    DismissHistoryNotice {
+        notice_id: String,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
     ConfirmGroupRejoin {
         welcome_id: cgka_traits::MessageId,
         token: Vec<u8>,
@@ -586,6 +593,7 @@ impl AccountWorkerCommand {
                 | Self::GroupRoster { .. }
                 | Self::QuarantinedGroups { .. }
                 | Self::GroupRecoveryStatus { .. }
+                | Self::HistoryNotices { .. }
         )
     }
 
@@ -1269,6 +1277,10 @@ async fn run_app_runtime_account_worker(
                                         if deferred.is_empty() => {
                                         let _ = respond.send(group_recovery_after_hydration(&mut client, &group_id));
                                     }
+                                    AccountWorkerCommand::HistoryNotices { respond }
+                                        if deferred.is_empty() => {
+                                        let _ = respond.send(client.history_notices());
+                                    }
                                     AccountWorkerCommand::SendMessage {
                                         enqueued_at, queued, group_id, payload, respond,
                                     } if deferred.is_empty() => {
@@ -1629,6 +1641,13 @@ async fn run_app_runtime_account_worker(
                         account_label: &account_label,
                         shared: &shared,
                     },
+                );
+                // A settled pass is where recovery parks or completes.
+                publish_history_notice_changes(
+                    &mut client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
                 );
                 match job.origin {
                     ComparisonRecoveryOrigin::PeriodicMaintenance => {
@@ -4103,6 +4122,7 @@ async fn handle_account_worker_command(
         // One publication seam covers all successful dispatch completions. Early
         // admission failures and cancelled commands retain their previous behavior.
         publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+        publish_history_notice_changes(client, events, account_id_hex, account_label);
     }
 }
 
@@ -4939,6 +4959,24 @@ fn account_worker_command_future<'a>(
             let _ = respond.send(group_recovery_after_hydration(client, &group_id));
             true
         }),
+        AccountWorkerCommand::HistoryNotices { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.history_notices(),
+            );
+            true
+        }),
+        AccountWorkerCommand::DismissHistoryNotice { notice_id, respond } => {
+            Box::pin(async move {
+                let result = client.dismiss_history_notice(&notice_id);
+                // Announce the removal before the caller re-reads anything.
+                publish_history_notice_changes(client, events, account_id_hex, account_label);
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                true
+            })
+        }
         AccountWorkerCommand::ConfirmGroupRejoin {
             welcome_id,
             token,
@@ -6735,6 +6773,7 @@ fn publish_client_pending_projection_updates(
         None,
         publication,
     );
+    publish_history_notice_changes(client, events, account_id_hex, account_label);
     for group_id in client.pending_recovery_status_updates.drain() {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
     }
@@ -6767,6 +6806,30 @@ fn publish_client_pending_applied_summary(
 ) {
     let summary = client.take_pending_applied_sync_summary();
     publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, &summary);
+}
+
+/// Announce a change in the parked recovery set ("history may be incomplete"):
+/// one account-level `HistoryNoticesChanged`, plus `GroupStateUpdated` for each
+/// group whose own notices appeared or disappeared, so hosts re-read that
+/// group's `GroupRecoveryStatus`. Parking, un-parking by new evidence and
+/// dismissal all surface at the next seam that calls this; each call is one
+/// indexed read of the parked set.
+fn publish_history_notice_changes(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    let Some(groups) = client.take_history_notice_changes() else {
+        return;
+    };
+    let _ = events.send(MarmotAppEvent::HistoryNoticesChanged {
+        account_id_hex: account_id_hex.to_owned(),
+        account_label: account_label.to_owned(),
+    });
+    for group_id in groups {
+        publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
+    }
 }
 
 pub(crate) fn publish_app_runtime_group_state_updated(
@@ -7373,6 +7436,92 @@ mod tests {
                 .unwrap()
                 .automatic_recovery_failed
         );
+    }
+
+    #[tokio::test]
+    async fn history_notice_changes_publish_once_per_transition() {
+        use crate::client::history_notices::park_recovery_for_test;
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("history notices", &[]).await.unwrap();
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch.0;
+        let storage = app.account_storage("alice").unwrap();
+        let arm = |epoch| {
+            storage
+                .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    stalled_epoch: epoch,
+                }])
+                .unwrap()
+        };
+        arm(epoch);
+        let (events, mut received) = broadcast::channel(16);
+        let publish = |client: &mut AppClient| {
+            publish_client_pending_projection_updates(
+                client,
+                &events,
+                &account.account_id_hex,
+                "alice",
+            );
+        };
+        publish(&mut client);
+        while received.try_recv().is_ok() {}
+        let gap = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::EpochGap)
+            .unwrap()
+            .ticket
+            .id;
+        let expect_change = |received: &mut broadcast::Receiver<MarmotAppEvent>| {
+            assert!(matches!(
+                received.try_recv().unwrap(),
+                MarmotAppEvent::HistoryNoticesChanged { account_id_hex, account_label }
+                    if account_id_hex == account.account_id_hex && account_label == "alice"
+            ));
+            assert!(matches!(
+                received.try_recv().unwrap(),
+                MarmotAppEvent::GroupStateUpdated { group_id: updated, .. } if updated == group_id
+            ));
+            assert!(received.try_recv().is_err());
+        };
+
+        // Parking appears once.
+        park_recovery_for_test(&storage, gap);
+        publish(&mut client);
+        expect_change(&mut received);
+        publish(&mut client);
+        assert!(received.try_recv().is_err(), "an unchanged set is quiet");
+
+        // Dismissal disappears once, from the command's own publication.
+        let notice = client.history_notices().unwrap().remove(0);
+        assert!(client.dismiss_history_notice(&notice.notice_id).unwrap());
+        publish_history_notice_changes(&mut client, &events, &account.account_id_hex, "alice");
+        expect_change(&mut received);
+
+        // New evidence reopens the retired gap as pending debt, which is not
+        // a notice; parking it again is a new occurrence, and un-parking it by
+        // yet newer evidence removes that notice.
+        arm(epoch + 1);
+        publish(&mut client);
+        assert!(received.try_recv().is_err());
+        park_recovery_for_test(&storage, gap);
+        publish(&mut client);
+        expect_change(&mut received);
+        assert_ne!(
+            client.history_notices().unwrap()[0].notice_id,
+            notice.notice_id
+        );
+        arm(epoch + 2);
+        publish(&mut client);
+        expect_change(&mut received);
+        assert!(client.history_notices().unwrap().is_empty());
     }
 
     #[tokio::test]

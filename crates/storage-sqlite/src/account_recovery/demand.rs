@@ -60,8 +60,21 @@ pub struct RecoveryDemand {
     pub caller_waiting: bool,
 }
 
-fn invalid_demand() -> StorageError {
+pub(super) fn invalid_demand() -> StorageError {
     StorageError::Serialization("invalid recovery demand".into())
+}
+
+pub(super) fn recovery_cause(value: i64) -> StorageResult<RecoveryCause> {
+    Ok(match value {
+        0 => RecoveryCause::QueueLoss,
+        1 => RecoveryCause::EpochGap,
+        2 => RecoveryCause::Maintenance,
+        3 => RecoveryCause::ExplicitHistory,
+        4 => RecoveryCause::KnownEvent,
+        5 => RecoveryCause::IncrementalHistory,
+        6 => RecoveryCause::NotificationLoss,
+        _ => return Err(invalid_demand()),
+    })
 }
 
 impl SqliteAccountStorage {
@@ -121,18 +134,22 @@ impl SqliteAccountStorage {
                 // duplicate joins idempotent without an unbounded waiter log.
                 conn.execute_cached(
                     "UPDATE account_recovery_obligations SET demand_key=?1,
-                     revision=revision+1,state=0,eligibility=0,urgency=1,updated_at_ms=?2
+                     revision=revision+1,state=0,eligibility=0,urgency=1,updated_at_ms=?2,
+                     incomplete_reason=NULL
                      WHERE cause=3 AND demand_key!=?1",
                     params![key,sqlite_integer(now_ms)?],
                 ).storage()?;
             }
+            // A new request for a known event or incremental history is new
+            // demand even when that key was satisfied or retired before.
             conn.execute_cached(
                 "INSERT INTO account_recovery_obligations
                  (demand_key,cause,predicate,group_id,created_at_ms,updated_at_ms,caller_origin,urgency)
                  VALUES (?1,?2,?3,?4,?5,?5,?6,?6)
                  ON CONFLICT(demand_key) DO UPDATE SET state=0,revision=revision+1,
-                     eligibility=0,updated_at_ms=excluded.updated_at_ms
-                 WHERE account_recovery_obligations.state=1 AND account_recovery_obligations.cause IN (4,5)",
+                     eligibility=0,updated_at_ms=excluded.updated_at_ms,incomplete_reason=NULL
+                 WHERE account_recovery_obligations.state IN (1,2)
+                     AND account_recovery_obligations.cause IN (4,5)",
                 params![key,cause,predicate,group,sqlite_integer(now_ms)?,caller],
             ).storage()?;
             let (id,revision): (Vec<u8>,i64) = conn.query_row_cached(
@@ -310,16 +327,7 @@ impl SqliteAccountStorage {
                             id: id.try_into().map_err(|_| invalid_demand())?,
                             revision: i64_to_u64(revision)?,
                         },
-                        cause: match cause {
-                            0 => RecoveryCause::QueueLoss,
-                            1 => RecoveryCause::EpochGap,
-                            2 => RecoveryCause::Maintenance,
-                            3 => RecoveryCause::ExplicitHistory,
-                            4 => RecoveryCause::KnownEvent,
-                            5 => RecoveryCause::IncrementalHistory,
-                            6 => RecoveryCause::NotificationLoss,
-                            _ => return Err(invalid_demand()),
-                        },
+                        cause: recovery_cause(cause)?,
                         predicate: match predicate {
                             0 => RecoveryPredicate::AllEndpoints,
                             1 => RecoveryPredicate::RetainedKnownEvent,

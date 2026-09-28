@@ -30,7 +30,9 @@ App runtime bridge for the first real Marmot app surfaces.
   kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
   transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
   and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
-  per-group outcome orchestration, and classifier tests), and `audit.rs` (audit-context construction, the local/observed
+  per-group outcome orchestration, and classifier tests), `history_notices.rs` ("history may be incomplete"
+  notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
+  in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
   are widened to `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
   Steady-state sync passes must not rescan full retained state (no full `MlsGroup::load` sweeps, no full
@@ -158,6 +160,11 @@ App runtime bridge for the first real Marmot app surfaces.
   worker can serve committed snapshot reads while repair waits; mutations retain FIFO order. Client continuation
   tests live in `src/client/sync/full_history_tests.rs`; worker cancellation/read-order tests stay in
   `src/runtime/account_worker.rs`. See the README for the automatic-recovery and send-fairness limits.
+- A dismissed "history may be incomplete" notice is the one user-authorized ending for parked recovery debt
+  besides qualified completion. Record it only through `retire_parked_recovery_obligation` (its own outcome,
+  never coverage) and release the delivery-loss fence through `release_retired_delivery_loss`, which keeps the
+  fence while any loss obligation is pending, clears the plane only against the exact observed generation, and
+  never counts a recovery success. Notice ids are opaque and must not be logged.
 - Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; relay filtering may affect
   connections, but must not rewrite signed routing state. Relay endpoints pass through the `RelaySafetyPolicy`
   host-safety chokepoint (`src/relay_plane/safety.rs`), and agent-stream broker candidates through

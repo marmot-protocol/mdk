@@ -278,6 +278,20 @@ Free each result with `marmot_presented_chat_list_update_free` and the handle wi
 `marmot_presented_chat_list_subscription_free`. See the [shared native contract](../marmot-uniffi/README.md#selected-chat-list-presentation)
 for version ordering, localization, readiness, and account-switch behavior.
 
+## History may be incomplete notices
+
+`marmot_history_notices` blocks on the account worker, reads local durable state only, and writes an owned
+`MarmotHistoryNoticeList`; free it with `marmot_history_notice_list_free`. Each `MarmotHistoryNotice` has an
+opaque `notice_id`, a `MarmotHistoryNoticeCause`, a `group_id_hex` that is NULL for an account-wide occurrence,
+and `has_parked_at_ms`/`parked_at_ms`. `marmot_dismiss_history_notice` writes `true` when it durably retired
+that occurrence and `false` for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`. Re-read the list
+on `MARMOT_EVENT_HISTORY_NOTICES_CHANGED`; a group's own occurrences also set
+`MarmotGroupRecoveryStatus.history_may_be_incomplete` and fill its `history_notice_ids` array, released by
+`marmot_group_recovery_status_free`. The status struct gained fields and the event union gained a trailing tag,
+so rebuild consumers with the matching header and library. See the
+[shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when notices appear,
+disappear and return.
+
 ## Bounded chat screens
 
 C4 adds live Chats/Unread/Archived/Left windows and independent account attention.

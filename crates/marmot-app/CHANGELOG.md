@@ -82,11 +82,23 @@
   nine Linux-specific host stages. Downstream exhaustive Rust matches must handle
   the new variants. The snapshot struct layout is unchanged; stages appear in
   `runtime_operations`.
+- `MarmotAppEvent` gains `HistoryNoticesChanged { account_id_hex, account_label }`, and
+  `GroupRecoveryStatus` gains `history_may_be_incomplete` and `history_notice_ids` (both
+  serde-defaulted). Exhaustive Rust matches and struct literals must handle them. (#2068)
 
 ### Added
 
 - Route reviewed host stages through the existing runtime telemetry registry,
   including its fixed metric names and all five outcomes in snapshots and OTLP.
+- Surface parked recovery as "history may be incomplete". `MarmotAppRuntime::history_notices`
+  lists each parked occurrence as a `HistoryNotice` (opaque `notice_id`, `HistoryNoticeCause`,
+  optional group, parking time); a group's own occurrences also appear in
+  `GroupRecoveryStatus`. `dismiss_history_notice` runs on the account worker and durably retires
+  exactly that occurrence as its own outcome, never as coverage, returning false for a stale id.
+  Retiring the last pending loss obligation releases the transport-cursor fence without recording
+  a recovery success, and a late observation of retired loss releases it too instead of
+  re-raising it. `HistoryNoticesChanged` announces parking, un-parking and dismissal; a group
+  whose own notices changed also gets `GroupStateUpdated`. (#2068)
 
 ## 0.10.4 - 2026-09-20
 

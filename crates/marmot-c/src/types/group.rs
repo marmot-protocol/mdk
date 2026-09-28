@@ -371,12 +371,16 @@ mod tests {
                 epoch: 4,
                 local_state_token: "04".repeat(32),
             }],
+            history_may_be_incomplete: true,
+            history_notice_ids: vec!["05".repeat(24)],
         }
         .into();
         assert!(mirror.automatic_recovery_failed);
         assert_eq!((mirror.pending_reinvites, mirror.failed_reinvites), (2, 1));
         assert_eq!(mirror.rejoin_invitations_len, 1);
         assert_eq!(unsafe { (*mirror.rejoin_invitations).epoch }, 4);
+        assert!(mirror.history_may_be_incomplete);
+        assert_eq!(mirror.history_notice_ids_len, 1);
         unsafe {
             marmot_group_recovery_status_free(boxed(mirror));
         }
@@ -653,6 +657,9 @@ c_mirror! {
 
 c_mirror! {
     /// Durable advisory membership health and explicit rejoin offers.
+    /// `history_may_be_incomplete` is set while recovery is parked on this
+    /// group's own history; `history_notice_ids` are those occurrences' ids
+    /// for `marmot_dismiss_history_notice`.
     MarmotGroupRecoveryStatus from GroupRecoveryStatusFfi,
     free marmot_group_recovery_status_free {
         str group_id_hex,
@@ -660,5 +667,7 @@ c_mirror! {
         copy pending_reinvites: u32,
         copy failed_reinvites: u32,
         vec rejoin_invitations/rejoin_invitations_len: MarmotGroupRejoinInvitation,
+        copy history_may_be_incomplete: bool,
+        str_vec history_notice_ids/history_notice_ids_len,
     }
 }

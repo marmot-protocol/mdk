@@ -14,6 +14,7 @@ mod chat_list;
 mod directory;
 mod draft;
 mod group;
+mod history_notice;
 mod local_submissions;
 mod media;
 mod message;

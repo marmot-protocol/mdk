@@ -110,6 +110,14 @@ pub enum MarmotEventFfi {
         outcome: String,
         reason: String,
     },
+    /// The account's "history may be incomplete" notices changed: recovery
+    /// parked, new evidence re-armed a parked occurrence, or one was
+    /// dismissed. Re-read `history_notices`. A group whose own notices
+    /// changed also gets `GroupStateUpdated`.
+    HistoryNoticesChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -422,6 +430,13 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 outcome: outcome.as_str().to_owned(),
                 reason: reason.to_owned(),
             },
+            MarmotAppEvent::HistoryNoticesChanged {
+                account_id_hex,
+                account_label,
+            } => Self::HistoryNoticesChanged {
+                account_id_hex,
+                account_label,
+            },
         }
     }
 }
@@ -481,6 +496,24 @@ mod tests {
                 assert_eq!(kind, "group_profile");
                 assert_eq!(outcome, "conflict");
                 assert_eq!(reason, "winner changed the same field");
+            }
+            other => panic!("unexpected FFI event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_notice_change_reaches_the_ffi_with_only_its_account() {
+        let event = MarmotAppEvent::HistoryNoticesChanged {
+            account_id_hex: "ad".repeat(32),
+            account_label: "carol".to_owned(),
+        };
+        match MarmotEventFfi::from(event) {
+            MarmotEventFfi::HistoryNoticesChanged {
+                account_id_hex,
+                account_label,
+            } => {
+                assert_eq!(account_id_hex, "ad".repeat(32));
+                assert_eq!(account_label, "carol");
             }
             other => panic!("unexpected FFI event: {other:?}"),
         }

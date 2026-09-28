@@ -715,6 +715,10 @@ pub(crate) async fn handle_app_runtime_event(
         // report reaches operators through the runtime event stream, and
         // there is no activity summary shape for it.
         marmot_app::MarmotAppEvent::GroupChangeSuperseded { .. } => {}
+        // The account's "history may be incomplete" notices changed. Like the
+        // signals above this reports a user-facing state, not activity; the
+        // notices themselves are read from the runtime.
+        marmot_app::MarmotAppEvent::HistoryNoticesChanged { .. } => {}
     }
 }
 

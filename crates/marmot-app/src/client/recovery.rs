@@ -1233,6 +1233,43 @@ impl AppClient {
         Ok(true)
     }
 
+    /// The other ending for loss debt: the user retired it as "history may be
+    /// incomplete". Mirrors [`Self::finish_qualified_recovery_loss`] without
+    /// acknowledging coverage or recording success. The fence stays while any
+    /// loss obligation is still pending, and the plane clears only the exact
+    /// generation `observed` before retirement, so an omission that is not yet
+    /// durable keeps the fence until it rearms recovery as new loss. Retired
+    /// evidence keeps its watermark; only a later qualified acknowledgment of
+    /// that cause reclaims it. Returns whether the fence was released.
+    pub(super) fn release_retired_delivery_loss(
+        &mut self,
+        observed: Option<crate::relay_plane::AccountDeliveryOverflow>,
+    ) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        if storage.pending_recovery_demands()?.iter().any(|demand| {
+            matches!(
+                demand.cause,
+                storage_sqlite::RecoveryCause::QueueLoss
+                    | storage_sqlite::RecoveryCause::NotificationLoss
+            )
+        }) {
+            return Ok(false);
+        }
+        if !self.recovery_owner.pending_loss_acknowledgments.is_empty() {
+            // A qualified loss was waiting only for the loss just retired. Its
+            // acknowledgment needs the attempt it was proven against, so rearm
+            // it conservatively; its next qualified pass releases the fence.
+            self.abandon_loss_completion()?;
+            return Ok(false);
+        }
+        if !self.adapter.retire_delivery_overflow(observed) {
+            return Ok(false);
+        }
+        self.delivery_overflow_recovery_pending = false;
+        self.delivery_overflow_recovery_marker_token = None;
+        Ok(true)
+    }
+
     /// Preserve epoch-sensitive deferral diagnostics without restoring a second
     /// dispatcher or retaining another pending-group vector. The digest is
     /// private process state; no identity or digest is emitted in telemetry.
@@ -3303,6 +3340,106 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|o| o.cause == RecoveryCause::QueueLoss)
+        );
+    }
+
+    /// A qualified loss can wait for its acknowledgment while the other loss
+    /// cause is still pending. Retiring that other cause must not strand it:
+    /// the acknowledgment needs the attempt it was proven against, so the
+    /// qualified loss is rearmed and the fence stays until it is proven again.
+    #[tokio::test]
+    async fn retiring_the_last_pending_loss_rearms_a_deferred_acknowledgment() {
+        use crate::client::history_notices::{park_recovery_for_test, settle_recovery_for_test};
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
+        use storage_sqlite::{RecoveryCause, RecoveryLossCause};
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .record_account_recovery_loss("alice", RecoveryLossCause::Queue, 55, 3, 1)
+            .unwrap();
+        storage
+            .record_account_recovery_loss(
+                "alice",
+                RecoveryLossCause::NotificationConsumer,
+                56,
+                0,
+                1,
+            )
+            .unwrap();
+        storage.synchronize_account_delivery_loss("alice").unwrap();
+        client.delivery_overflow_recovery_pending = true;
+        client.delivery_overflow_recovery_marker_token = Some(55);
+        let id = |cause| {
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.cause == cause)
+                .unwrap()
+                .ticket
+                .id
+        };
+        let queue = id(RecoveryCause::QueueLoss);
+        let notification = id(RecoveryCause::NotificationLoss);
+        park_recovery_for_test(&storage, notification);
+        let mut fence = storage.recovery_revision_fence().unwrap();
+        assert!(settle_recovery_for_test(&storage, queue, true));
+        // As `finish_qualified_recovery_loss` leaves it while the notification
+        // loss is still pending.
+        fence
+            .obligations
+            .retain(|(candidate, _)| *candidate == queue);
+        client.recovery_owner.pending_loss_acknowledgments.push((
+            fence,
+            GrantedLoss {
+                id: queue,
+                watermarks: storage
+                    .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+                    .unwrap(),
+            },
+        ));
+        let notice = client
+            .history_notices()
+            .unwrap()
+            .into_iter()
+            .find(|notice| notice.cause == crate::HistoryNoticeCause::NotificationLoss)
+            .unwrap();
+        assert!(client.dismiss_history_notice(&notice.notice_id).unwrap());
+        assert!(
+            client
+                .recovery_owner
+                .pending_loss_acknowledgments
+                .is_empty()
+        );
+        assert!(
+            storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some(),
+            "the qualified loss is proven again before the fence releases"
+        );
+        assert!(
+            !storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == notification)
+        );
+        assert!(client.delivery_overflow_recovery_pending);
+        assert!(client.delivery_loss_blocks_cursor());
+        assert_eq!(
+            storage
+                .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                .unwrap()
+                .len(),
+            1,
+            "no coverage was acknowledged"
         );
     }
 

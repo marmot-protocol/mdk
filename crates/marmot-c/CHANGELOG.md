@@ -30,6 +30,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   accepted open poll remains votable after reclassification. Regenerate and recompile with the matching header and
   library.
 
+- Add "history may be incomplete" notices: `marmot_history_notices` (free with
+  `marmot_history_notice_list_free`), `marmot_dismiss_history_notice`, `MarmotHistoryNotice`,
+  `MarmotHistoryNoticeList` and `MarmotHistoryNoticeCause`. Dismissal is durable, is recorded as
+  its own outcome rather than recovered history, and writes false for a stale id; a malformed id
+  returns `MARMOT_STATUS_INVALID_HEX`. This changes layouts: `MarmotGroupRecoveryStatus` appends
+  `history_may_be_incomplete` and the `history_notice_ids` array (released by its existing deep
+  free), and `MarmotEvent` appends the `MARMOT_EVENT_HISTORY_NOTICES_CHANGED` tag and body.
+  Existing tag values are unchanged. Recompile with the matching header and library. (#2068)
+
 ## [0.10.4] - 2026-09-20
 
 ### Added

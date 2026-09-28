@@ -187,6 +187,31 @@ row that admit nothing new and certify nothing.
 NIP-77 cost scales with the difference, not the set size, so comparing the whole retained
 window is cheap once we are caught up.
 
+### 4. Parked history is a notice the user can dismiss
+
+Decided with Jeff: parked history is shown to the user as "history may be incomplete",
+and the user can dismiss a particular occurrence durably. That dismissal is decision 3's
+explicit user-authorized retirement, recorded as its own outcome, never as coverage.
+
+- Every pending obligation parked for deep repair is one notice. Its id encodes the
+  obligation and its revision, so new evidence that re-arms the obligation removes the
+  notice, and a later parking is a new notice with a new id. The notice carries the cause,
+  the group for group-scoped demand, and when it parked.
+- A group's own occurrences (today an epoch gap) also show in its recovery status.
+  Account-wide ones, such as delivery loss and incremental or explicit history, appear only
+  in the account's list. One account event announces any change to the list.
+- Dismissal runs on the account worker. In one transaction, and only while that exact
+  revision is still parked, it marks the obligation retired and, for loss, gives every
+  evidence generation of that cause a retired watermark. Evidence not yet imported is
+  newer loss and makes the dismissal stale. Retired evidence bounds no goal and never
+  counts as coverage.
+- When no loss obligation remains pending, dismissal also releases the cursor fence, with
+  the plane's exact-generation guard and without counting a recovery success. A later
+  observation of the same retired loss releases it too, rather than raising it again.
+- New demand for the same key reopens a retired row as fresh debt: new loss or a count
+  above the watermark, a higher missing epoch, a new explicit repair, or a later startup's
+  incremental comparison.
+
 ## What gets deleted
 
 Deleted in step 2:
@@ -228,9 +253,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   row cap, until qualified completion (an explicit deep repair counts only when it achieves
   that coverage) or an explicit user-authorized retirement, which is recorded as "history
   may be incomplete" rather than as coverage.
-  [runtime-state-bounds.md](../runtime-state-bounds.md) records the no-cap rule for
-  qualified completion; step 2 adds the retirement ending there when it implements it. A
-  cap on that debt would need its own reviewed retirement rule.
+  [runtime-state-bounds.md](../runtime-state-bounds.md) records the no-cap rule and both
+  endings: qualified completion, and the retirement in design section 4. A cap on that
+  debt would need its own reviewed retirement rule.
 
 ## Storage
 

@@ -639,21 +639,28 @@ impl AccountDeliveryOverflowState {
         }
     }
 
+    /// Whether `observed` is still exactly the pending generation, with every
+    /// omission it counts durable and imported and no control record queued,
+    /// so the account owner may settle it.
+    fn settles(state: &AccountDeliveryOverflowInner, observed: &AccountDeliveryOverflow) -> bool {
+        state.pending
+            && state.generation == observed.generation
+            && state.marker_token == observed.marker_token
+            && state.dropped == observed.dropped
+            && state.notification_losses == observed.notification_losses
+            && state.notification_imported == state.notification_losses
+            && (state.dropped == 0 || state.marker_durable)
+            && !state.marker_in_progress
+            && !state.marker_closed
+            && !state.signal_queued
+    }
+
     fn finish_recovery(&self, attempt: AccountDeliveryOverflow) -> Option<u64> {
         let mut state = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let resolved = state.pending
-            && state.generation == attempt.generation
-            && state.marker_token == attempt.marker_token
-            && state.dropped == attempt.dropped
-            && state.notification_losses == attempt.notification_losses
-            && state.notification_imported == state.notification_losses
-            && (state.dropped == 0 || state.marker_durable)
-            && !state.marker_in_progress
-            && !state.marker_closed
-            && !state.signal_queued;
+        let resolved = Self::settles(&state, &attempt);
         if resolved {
             state.pending = false;
             state.recovery_in_progress = false;
@@ -669,6 +676,37 @@ impl AccountDeliveryOverflowState {
             return Some(elapsed_ms);
         }
         None
+    }
+
+    /// Clear the generation the account owner retired as "history may be
+    /// incomplete", under the same exact-generation guard as `finish_recovery`.
+    /// It is not a recovery success: no success is counted, and an attempt
+    /// still in flight records its own failure when it ends. Returns true when
+    /// no generation is pending any more.
+    fn retire_recovery(&self, observed: Option<AccountDeliveryOverflow>) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.pending {
+            return true;
+        }
+        if !observed.is_some_and(|observed| Self::settles(&state, &observed)) {
+            return false;
+        }
+        state.pending = false;
+        state.marker_durable = false;
+        state.marker_closed = false;
+        state.started_at = None;
+        true
+    }
+
+    fn pending_generation(&self) -> Option<AccountDeliveryOverflow> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending.then(|| Self::snapshot(&state))
     }
 
     fn record_recovery_success(&self, elapsed_ms: u64) {
@@ -2862,6 +2900,21 @@ impl MarmotRelayPlaneAccountAdapter {
 
     pub(crate) fn record_delivery_overflow_recovery_success(&self, elapsed_ms: u64) {
         self.delivery_overflow.record_recovery_success(elapsed_ms);
+    }
+
+    /// The pending loss generation, including one a recovery attempt holds.
+    pub(crate) fn pending_delivery_overflow_generation(&self) -> Option<AccountDeliveryOverflow> {
+        self.delivery_overflow.pending_generation()
+    }
+
+    /// Release the cursor fence for loss the account owner retired, only if
+    /// `observed` is still exactly the pending generation. Never counts a
+    /// recovery success. Returns true when no plane loss remains pending.
+    pub(crate) fn retire_delivery_overflow(
+        &self,
+        observed: Option<AccountDeliveryOverflow>,
+    ) -> bool {
+        self.delivery_overflow.retire_recovery(observed)
     }
 
     pub(crate) fn fail_delivery_overflow_recovery(&self) {

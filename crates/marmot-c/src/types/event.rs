@@ -294,6 +294,13 @@ pub enum MarmotEvent {
         outcome: *mut c_char,
         reason: *mut c_char,
     },
+    /// The account's "history may be incomplete" notices changed; re-read
+    /// `marmot_history_notices`. A group whose own notices changed also
+    /// gets `GroupStateUpdated`.
+    HistoryNoticesChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -394,6 +401,13 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 outcome: owned_c_string(outcome),
                 reason: owned_c_string(reason),
             },
+            F::HistoryNoticesChanged {
+                account_id_hex,
+                account_label,
+            } => Self::HistoryNoticesChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
         }
     }
 }
@@ -439,6 +453,10 @@ impl CFree for MarmotEvent {
                     free_c_string(*message);
                 }
                 Self::AgentStreamActivity {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::HistoryNoticesChanged {
                     account_id_hex,
                     account_label,
                 } => {
@@ -501,4 +519,39 @@ unsafe impl Send for MarmotEvent {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_event_free(event: *mut MarmotEvent) {
     crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(event) });
+}
+
+#[cfg(all(test, feature = "alloc-audit"))]
+mod tests {
+    use super::*;
+    use crate::memory::{audit, boxed};
+
+    #[test]
+    fn history_notice_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::HistoryNoticesChanged {
+            account_id_hex: "ad".repeat(32),
+            account_label: "carol".to_owned(),
+        }));
+        unsafe {
+            let MarmotEvent::HistoryNoticesChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ad".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "carol"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
 }

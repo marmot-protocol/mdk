@@ -990,6 +990,38 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn history_notices(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::HistoryNotice>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::HistoryNotices { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn dismiss_history_notice(
+        &self,
+        account_ref: &str,
+        notice_id: &str,
+    ) -> Result<bool, AppError> {
+        // Reject a malformed id before it queues behind other mutations.
+        crate::history_notices::decode_notice_id(notice_id)?;
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DismissHistoryNotice {
+                notice_id: notice_id.to_owned(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn confirm_group_rejoin(
         &self,
         account_ref: &str,

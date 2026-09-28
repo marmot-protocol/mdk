@@ -611,9 +611,16 @@ impl SqliteAccountStorage {
                 [obligation_id.as_slice()], |row| row.get(0),
             ).storage()?;
             let qualified = scopes_qualify(&conn, expected, Some(attempt_serial), obligation_id, predicate)?;
+            // Parking is what hosts show as "history may be incomplete". Keep
+            // the first parking time across later failed deep repairs.
             conn.execute_cached(
-                "UPDATE account_recovery_obligations SET state = ?2, eligibility = ?3 WHERE id = ?1",
-                params![obligation_id.as_slice(), if qualified { 1 } else { 0 }, incomplete as i64],
+                "UPDATE account_recovery_obligations SET state = ?2, eligibility = ?3,
+                     parked_at_ms = CASE WHEN ?2 = 0 AND ?3 = 4 THEN
+                         CASE WHEN eligibility = 4 AND parked_at_ms IS NOT NULL THEN parked_at_ms ELSE ?4 END
+                     END
+                 WHERE id = ?1",
+                params![obligation_id.as_slice(), if qualified { 1 } else { 0 }, incomplete as i64,
+                    crate::codec::unix_now_ms().max(0)],
             ).storage()?;
             Ok(qualified)
         })

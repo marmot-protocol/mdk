@@ -393,6 +393,42 @@ typedef enum MarmotSendMaintenanceDisposition {
 } MarmotSendMaintenanceDisposition;
 
 /**
+ * Why recovery parked. Current policy parks only the first five;
+ * `KnownEvent` and `MaintenanceBoundary` are reserved.
+ */
+typedef enum MarmotHistoryNoticeCause {
+  /**
+   * Deliveries were dropped from a full account queue, or spilled
+   * rows could not be admitted, and comparison could not recover them.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_DELIVERY_LOSS,
+  /**
+   * The relay notification stream lagged and skipped deliveries.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_NOTIFICATION_LOSS,
+  /**
+   * A group's missing epoch could not be fetched from its relays.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_EPOCH_GAP,
+  /**
+   * History since this device's last checkpoint could not be proven complete.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_INCREMENTAL_HISTORY,
+  /**
+   * An explicit full-history repair ended without proof of completeness.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_EXPLICIT_REPAIR,
+  /**
+   * One known missing event could not be retrieved.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_KNOWN_EVENT,
+  /**
+   * A post-join maintenance boundary was never observed.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_MAINTENANCE_BOUNDARY,
+} MarmotHistoryNoticeCause;
+
+/**
  * Why a stored group was quarantined instead of hydrated.
  */
 typedef enum MarmotAppGroupHydrationQuarantineReason {
@@ -2049,6 +2085,9 @@ typedef struct MarmotGroupRejoinInvitation {
 
 /**
  * Durable advisory membership health and explicit rejoin offers.
+ * `history_may_be_incomplete` is set while recovery is parked on this
+ * group's own history; `history_notice_ids` are those occurrences' ids
+ * for `marmot_dismiss_history_notice`.
  */
 typedef struct MarmotGroupRecoveryStatus {
   char *group_id_hex;
@@ -2057,7 +2096,35 @@ typedef struct MarmotGroupRecoveryStatus {
   uint32_t failed_reinvites;
   struct MarmotGroupRejoinInvitation *rejoin_invitations;
   uintptr_t rejoin_invitations_len;
+  bool history_may_be_incomplete;
+  char **history_notice_ids;
+  uintptr_t history_notice_ids_len;
 } MarmotGroupRecoveryStatus;
+
+/**
+ * One "history may be incomplete" occurrence. `notice_id` is opaque and
+ * changes when recovery re-arms; `group_id_hex` is NULL for an
+ * account-wide occurrence; `has_parked_at_ms` is false when the parking
+ * time was not recorded.
+ */
+typedef struct MarmotHistoryNotice {
+  char *notice_id;
+  enum MarmotHistoryNoticeCause cause;
+  char *group_id_hex;
+  bool has_parked_at_ms;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t parked_at_ms;
+} MarmotHistoryNotice;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotHistoryNoticeList {
+  struct MarmotHistoryNotice *items;
+  uintptr_t len;
+} MarmotHistoryNoticeList;
 
 /**
  * The updated group record plus the decline publish summary.
@@ -4560,6 +4627,12 @@ typedef enum MarmotEvent_Tag {
    * action; every other outcome means the change did not land.
    */
   MARMOT_EVENT_GROUP_CHANGE_SUPERSEDED,
+  /**
+   * The account's "history may be incomplete" notices changed; re-read
+   * `marmot_history_notices`. A group whose own notices changed also
+   * gets `GroupStateUpdated`.
+   */
+  MARMOT_EVENT_HISTORY_NOTICES_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -4626,6 +4699,11 @@ typedef struct MarmotEvent_GroupChangeSuperseded_Body {
   char *reason;
 } MarmotEvent_GroupChangeSuperseded_Body;
 
+typedef struct MarmotEvent_HistoryNoticesChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_HistoryNoticesChanged_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -4639,6 +4717,7 @@ typedef struct MarmotEvent {
     MarmotEvent_WelcomeDeliveryPending_Body WELCOME_DELIVERY_PENDING;
     MarmotEvent_EpochStallEscalated_Body EPOCH_STALL_ESCALATED;
     MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED;
+    MarmotEvent_HistoryNoticesChanged_Body HISTORY_NOTICES_CHANGED;
   };
 } MarmotEvent;
 
@@ -6269,6 +6348,37 @@ MarmotStatus marmot_confirm_group_rejoin(const struct MarmotClient *client,
 MarmotStatus marmot_decline_group_rejoin(const struct MarmotClient *client,
                                          const char *account_ref,
                                          const char *welcome_id_hex);
+
+/**
+ * List the account's durable "history may be incomplete" notices, oldest
+ * first. Re-read on the `HistoryNoticesChanged` event. Free with
+ * `marmot_history_notice_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_history_notices(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    struct MarmotHistoryNoticeList **out);
+
+/**
+ * Dismiss one notice once the user accepts the history may be incomplete.
+ * Durable; recorded as its own outcome, never as recovered history.
+ * Writes false for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_dismiss_history_notice(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           const char *notice_id,
+                                           bool *out);
 
 /**
  * Accept a pending group invite; writes the now-confirmed group
@@ -10705,6 +10815,15 @@ void marmot_prepared_group_image_upload_list_free(struct MarmotPreparedGroupImag
  * this library.
  */
 void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_history_notice_list_free(struct MarmotHistoryNoticeList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

@@ -22,6 +22,10 @@
   Regenerate Swift/Kotlin bindings with the matching native library and update
   exhaustive operation switches. `AppPerformanceSnapshotFfi` keeps its existing
   record fields; read every new stage through `runtime_operations`.
+- `MarmotEventFfi` gains `HistoryNoticesChanged { account_id_hex, account_label }`; update
+  exhaustive event switches. `GroupRecoveryStatusFfi` gains `history_may_be_incomplete` and
+  `history_notice_ids`, with binding defaults for host-constructed records. Regenerate
+  Swift/Kotlin bindings with the matching native library.
 
 ### Added
 
@@ -29,6 +33,11 @@
   counts, participants, local selection and deadline state. Poll creation follows canonical group-conversation
   classification; an accepted open poll remains votable after reclassification. Regenerate Swift/Kotlin
   bindings with the matching library.
+- Add `history_notices` and `dismiss_history_notice` with `HistoryNoticeFfi` and
+  `HistoryNoticeCauseFfi`. Each notice is one parked recovery occurrence to show as "history may
+  be incomplete"; dismissal is durable, is recorded as its own outcome rather than recovered
+  history, and returns false for a stale id. Group-scoped occurrences also appear in
+  `group_recovery_status`. See the README section "History may be incomplete notices". (#2068)
 
 ## 0.10.4 - 2026-09-20
 
