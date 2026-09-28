@@ -328,6 +328,14 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   certify the route. A set of at most 16,384 is complete, including a busy route that sits
   exactly on the cap, and can certify it. A per-relay truncation flag from the fork would
   replace this inference.
+- Notification-lag bounds (#2070). Two kinds of REQ still carry no `since`: post-join
+  maintenance, and a group's retained prior routes. While either is live, or closed less
+  than a minute ago, a lag's loss is unbounded and its goal parks. The inbox's two-day
+  NIP-59 widening sets the account-wide floor, so every lag compares at least two days on
+  every route; per-route floors would need per-scope storage. An EOSE lost in a lag is not
+  recovered, so the next activation re-subscribes instead of reusing the live one. The
+  one-minute grace assumes a consumer stalls for less than that, and relays that ignore
+  `since` are not detected.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.
