@@ -1144,8 +1144,15 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .unwrap()
             .push((subscription_id.to_owned(), endpoints.to_vec()));
         Ok(transport_nostr_adapter::SubscriptionReissue {
-            reissued: endpoints.len(),
-            failed: 0,
+            relays: endpoints
+                .iter()
+                .map(|endpoint| {
+                    (
+                        endpoint.clone(),
+                        transport_nostr_adapter::RelayReissue::Sent,
+                    )
+                })
+                .collect(),
         })
     }
 

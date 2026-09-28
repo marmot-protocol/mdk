@@ -94,6 +94,7 @@ pub use sdk_client::{
     NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
     sign_transport_event_for_publish,
 };
+use telemetry::EoseReissueClaim;
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
     RelayDeliveryTelemetry, RelayExportConsent, RelayIndex, RelayIndexRegistry,
@@ -101,6 +102,24 @@ pub use telemetry::{
 };
 
 const DELIVERY_BUFFER: usize = 1024;
+/// First pause before a background retry of a re-issued REQ that had no room
+/// behind its CLOSE, doubling up to [`REISSUE_RETRY_MAX_DELAY`]. A relay's
+/// live sender frees a slot with every frame it takes.
+const REISSUE_RETRY_DELAY: Duration = Duration::from_millis(10);
+const REISSUE_RETRY_MAX_DELAY: Duration = Duration::from_millis(100);
+
+/// A REQ a lag repair claimed, with each relay it claimed and the claim.
+type ClaimedReq = (MemberId, String, Vec<(TransportEndpoint, EoseReissueClaim)>);
+
+/// A re-issued REQ closed on one relay with no room yet to send it again.
+struct PendingReissue {
+    account_id: MemberId,
+    subscription_id: String,
+    endpoint: TransportEndpoint,
+    claim: EoseReissueClaim,
+    /// The connection its CLOSE was queued on.
+    connection: RelayConnection,
+}
 
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
@@ -490,22 +509,73 @@ pub struct EoseReissueSummary {
     /// Relays, across REQs, that had not reported EOSE and were claimed for a
     /// re-issue.
     pub awaiting_relays: usize,
-    /// Of those, how many the relay client re-sent the REQ to.
+    /// Of those, how many the relay client re-sent the REQ to at once.
     pub reissued_relays: usize,
-    /// Of those, how many the relay client could not re-send the REQ to,
-    /// including every relay of a REQ whose re-issue it refused. The rest were
-    /// skipped: not connected, or no longer holding the REQ.
+    /// Of those, how many had the REQ closed with no room yet to send it
+    /// again. A background retry holds each until the REQ goes out on that
+    /// connection or is no longer the retry's to send.
+    pub deferred_relays: usize,
+    /// Of those, how many got no re-issue: the relay was not connected or had
+    /// no room for the CLOSE, or the client refused the REQ. Each claim is
+    /// released for a later repair. The rest no longer hold the REQ.
     pub failed_relays: usize,
 }
 
-/// What one [`NostrRelayClient::reissue_subscription`] did, counted in relays.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// One notification-lag EOSE repair, from
+/// [`NostrTransportAdapter::reissue_subscriptions_awaiting_eose`].
+pub struct EoseRepair {
+    pub summary: EoseReissueSummary,
+    /// Resolves once every deferred relay settled, to how many relays this
+    /// repair left without a re-issue: the failed ones, and deferred ones whose
+    /// connection ended before the REQ went out. A reconnect whose queue is
+    /// still full re-sends nothing, so each of those had its claim released
+    /// for a later repair. Dropping this leaves the retries running.
+    pub unrepaired: futures::future::BoxFuture<'static, usize>,
+}
+
+/// Which connection of a relay a frame was queued on, as a relay client counts
+/// its connections. A reconnect changes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayConnection {
+    pub attempts: u64,
+    pub successes: u64,
+}
+
+/// What [`NostrRelayClient::reissue_subscription`] did on one relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayReissue {
+    /// The REQ went out again behind its CLOSE.
+    Sent,
+    /// The REQ was closed on this connection with no room yet to send it
+    /// again. The caller retries with [`NostrRelayClient::retry_reissued_req`].
+    Pending(RelayConnection),
+    /// Nothing went out: the relay was not connected, or had no room for the
+    /// CLOSE.
+    Unsent,
+    /// The client no longer holds the REQ on this relay.
+    Gone,
+}
+
+/// What one [`NostrRelayClient::reissue_subscription`] did, per requested
+/// relay.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubscriptionReissue {
-    /// Relays the REQ was sent to again.
-    pub reissued: usize,
-    /// Relays where the REQ was closed but did not go out again on that
-    /// connection. The relay's reconnect restores it.
-    pub failed: usize,
+    pub relays: Vec<(TransportEndpoint, RelayReissue)>,
+}
+
+/// One more attempt to send a re-issued REQ behind its CLOSE, from
+/// [`NostrRelayClient::retry_reissued_req`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReissueRetry {
+    /// It went out on the CLOSE's connection.
+    Sent,
+    /// Still no room on that connection.
+    Waiting,
+    /// That connection ended before the REQ went out. The reconnect sends the
+    /// REQ again from the client's registry, unless its queue is still full.
+    ConnectionEnded,
+    /// The client no longer holds the REQ on this relay.
+    Gone,
 }
 
 /// Boundary between this adapter and the actual Nostr relay implementation.
@@ -584,26 +654,41 @@ pub trait NostrRelayClient: Send + Sync {
 
     /// Send a live REQ again to `endpoints`, unchanged and under its own id,
     /// so that each relay replays its stored events and reports
-    /// end-of-stored-events again. Reports, in relays, where it went out
-    /// again and where it failed. A relay on which the REQ is not live, or
-    /// that is not connected, is skipped.
+    /// end-of-stored-events again. Reports what happened on each relay.
     ///
     /// The REQ must keep the filter it was issued with, so its `since` still
     /// bounds a later lag's loss. A closed REQ must never be reopened. No
     /// relay may see the id repeated while it is live there: a relay may
     /// refuse the repeat instead of replacing the subscription. And no relay
-    /// may keep the REQ closed on a connection that stays up: once closed, it
-    /// goes out again on that connection, or that connection ends and the
-    /// relay's reconnect restores it. An implementation that cannot guarantee
-    /// all four refuses. It is called under the adapter's subscription
-    /// lifecycle lock, so any wait for room to send must be bounded.
-    /// Unsupported by default.
+    /// may be left with the REQ closed and nothing to send it: one without
+    /// room to send it again comes back pending, for
+    /// [`Self::retry_reissued_req`]. This is called under the adapter's
+    /// subscription lifecycle lock, so it must not wait for room. An
+    /// implementation that cannot guarantee all of this refuses. Unsupported
+    /// by default.
     async fn reissue_subscription(
         &self,
         _account_id: &MemberId,
         _subscription_id: &str,
         _endpoints: &[TransportEndpoint],
     ) -> Result<SubscriptionReissue, TransportAdapterError> {
+        Err(TransportAdapterError::Subscription(
+            "subscription reissue unsupported".to_owned(),
+        ))
+    }
+
+    /// Try once more, without waiting, to send a pending re-issued REQ on
+    /// `endpoint`, behind the CLOSE queued on `connection`. Never on a later
+    /// connection: its reconnect sends the REQ again itself, and a second one
+    /// would repeat a live id. Called under the subscription lifecycle lock.
+    /// Unsupported by default.
+    async fn retry_reissued_req(
+        &self,
+        _account_id: &MemberId,
+        _subscription_id: &str,
+        _endpoint: &TransportEndpoint,
+        _connection: RelayConnection,
+    ) -> Result<ReissueRetry, TransportAdapterError> {
         Err(TransportAdapterError::Subscription(
             "subscription reissue unsupported".to_owned(),
         ))
@@ -1075,52 +1160,188 @@ impl NostrTransportAdapter {
     /// one still coming, so marking it at the lag would let an EOSE-gated drain
     /// accept history a relay was still sending. The re-issued REQ keeps its
     /// filter, so the relay replays from the same `since` before a fresh EOSE,
-    /// and the notification-loss floor does not move. Each relay gets a REQ
-    /// again at most once: a replay that lags again must not loop. This holds
-    /// the subscription lifecycle lock, so no activation, group sync or
-    /// teardown can close a REQ between the choice and the send.
+    /// and the notification-loss floor does not move.
+    ///
+    /// A relay whose re-issue went out keeps its claim, so it gets the REQ
+    /// again at most once and a replay that lags again cannot loop. One that
+    /// got none has its claim released, and [`EoseRepair::unrepaired`] counts
+    /// it, so the caller can repair it again later.
+    ///
+    /// This holds the subscription lifecycle lock while it chooses and sends,
+    /// so no activation, group sync or teardown can close a REQ in between. A
+    /// relay with no room yet to send a REQ again behind its CLOSE goes to a
+    /// background retry that waits without the lock. See
+    /// [`Self::retry_pending_reissue`].
     pub async fn reissue_subscriptions_awaiting_eose(
         &self,
         account_id: Option<&MemberId>,
         lag: NotificationLagMark,
-    ) -> EoseReissueSummary {
-        let _subscription_guard = self.subscription_lock.lock().await;
+    ) -> EoseRepair {
+        let subscription_guard = self.subscription_lock.lock().await;
         let awaiting = self
             .state
             .write()
             .await
             .claim_subscriptions_awaiting_eose(account_id, lag.0);
         let mut summary = EoseReissueSummary {
-            awaiting_relays: awaiting
-                .iter()
-                .map(|(_, _, endpoints)| endpoints.len())
-                .sum(),
+            awaiting_relays: awaiting.iter().map(|(_, _, claims)| claims.len()).sum(),
             ..EoseReissueSummary::default()
         };
-        for (account_id, subscription_id, endpoints) in awaiting {
-            match self
+        let mut unsent = Vec::new();
+        let mut pending = Vec::new();
+        for (account_id, subscription_id, claims) in awaiting {
+            let endpoints = claims
+                .iter()
+                .map(|(endpoint, _)| endpoint.clone())
+                .collect::<Vec<_>>();
+            let outcomes = match self
                 .relay_client
                 .reissue_subscription(&account_id, &subscription_id, &endpoints)
                 .await
             {
-                Ok(reissue) => {
-                    summary.reissued_relays += reissue.reissued;
-                    summary.failed_relays += reissue.failed;
+                Ok(reissue) => reissue.relays,
+                Err(_) => endpoints
+                    .into_iter()
+                    .map(|endpoint| (endpoint, RelayReissue::Unsent))
+                    .collect(),
+            };
+            for (endpoint, claim) in claims {
+                let outcome = outcomes
+                    .iter()
+                    .find(|(reported, _)| *reported == endpoint)
+                    .map_or(RelayReissue::Gone, |(_, outcome)| *outcome);
+                match outcome {
+                    RelayReissue::Sent => summary.reissued_relays += 1,
+                    RelayReissue::Pending(connection) => pending.push(PendingReissue {
+                        account_id: account_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                        endpoint,
+                        claim,
+                        connection,
+                    }),
+                    RelayReissue::Unsent => unsent.push((subscription_id.clone(), endpoint, claim)),
+                    RelayReissue::Gone => {}
                 }
-                Err(_) => summary.failed_relays += endpoints.len(),
             }
         }
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        if runtime.is_none() {
+            unsent.extend(
+                pending
+                    .drain(..)
+                    .map(|pending| (pending.subscription_id, pending.endpoint, pending.claim)),
+            );
+        }
+        if !unsent.is_empty() {
+            let mut state = self.state.write().await;
+            for (subscription_id, endpoint, claim) in &unsent {
+                state.release_reissue_claim(subscription_id, endpoint, *claim);
+            }
+        }
+        drop(subscription_guard);
+        summary.failed_relays = unsent.len();
+        summary.deferred_relays = pending.len();
+        let unrepaired = self.spawn_pending_reissues(runtime, pending, unsent.len());
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "reissue_subscriptions_awaiting_eose",
             awaiting_relays = summary.awaiting_relays,
             reissued_relays = summary.reissued_relays,
+            deferred_relays = summary.deferred_relays,
             failed_relays = summary.failed_relays,
             "re-issued subscriptions awaiting end-of-stored-events after a notification lag"
         );
-        summary
+        EoseRepair {
+            summary,
+            unrepaired,
+        }
     }
 
+    /// Detach one background retry per pending relay, and return a future of
+    /// how many relays the repair leaves unrepaired once they all settle.
+    fn spawn_pending_reissues(
+        &self,
+        runtime: Option<tokio::runtime::Handle>,
+        pending: Vec<PendingReissue>,
+        failed: usize,
+    ) -> futures::future::BoxFuture<'static, usize> {
+        let Some(runtime) = runtime.filter(|_| !pending.is_empty()) else {
+            return Box::pin(std::future::ready(failed));
+        };
+        let retries = pending.len();
+        let (settled_tx, mut settled) = mpsc::unbounded_channel();
+        for pending in pending {
+            let (adapter, settled_tx) = (self.clone(), settled_tx.clone());
+            runtime.spawn(async move {
+                let _ = settled_tx.send(adapter.retry_pending_reissue(pending).await);
+            });
+        }
+        Box::pin(async move {
+            let mut unrepaired = failed;
+            for _ in 0..retries {
+                // A retry that never reports ended with the REQ unsent.
+                if !settled.recv().await.unwrap_or(false) {
+                    unrepaired += 1;
+                }
+            }
+            unrepaired
+        })
+    }
+
+    /// Keep trying to send a re-issued REQ behind its CLOSE, on the
+    /// connection the CLOSE was queued on, until it goes out or is no longer
+    /// this retry's to send. Nothing gives up while the relay still has the
+    /// REQ closed on that connection. Returns false only when that connection
+    /// ended first, after releasing the claim for a later repair.
+    ///
+    /// It waits between attempts without the subscription lifecycle lock, and
+    /// takes the lock for each attempt, so no activation, group sync or
+    /// teardown can close or replace the REQ in between. Before each attempt
+    /// this repair's own claim must still hold: a new registration of the REQ
+    /// starts its progress over without the claim, and a close or activation
+    /// drops the progress. Then the REQ belongs to its newer owner. The relay
+    /// client checks that it still holds the REQ on that connection.
+    async fn retry_pending_reissue(&self, pending: PendingReissue) -> bool {
+        let mut delay = REISSUE_RETRY_DELAY;
+        loop {
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2).min(REISSUE_RETRY_MAX_DELAY);
+            let _subscription_guard = self.subscription_lock.lock().await;
+            if !self.state.read().await.reissue_claim_holds(
+                &pending.subscription_id,
+                &pending.endpoint,
+                pending.claim,
+            ) {
+                return true;
+            }
+            match self
+                .relay_client
+                .retry_reissued_req(
+                    &pending.account_id,
+                    &pending.subscription_id,
+                    &pending.endpoint,
+                    pending.connection,
+                )
+                .await
+            {
+                Ok(ReissueRetry::Waiting) => {}
+                // The client no longer holds the REQ, or no longer has this
+                // account's context: there is nothing left to send.
+                Ok(ReissueRetry::Sent | ReissueRetry::Gone) | Err(_) => return true,
+                Ok(ReissueRetry::ConnectionEnded) => {
+                    self.state.write().await.release_reissue_claim(
+                        &pending.subscription_id,
+                        &pending.endpoint,
+                        pending.claim,
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Install the temporary, full-history subscription used by the post-join
+    /// maintenance gate. The caller owns its eventual removal.
     /// Install the temporary, full-history subscription used by the post-join
     /// maintenance gate. The caller owns its eventual removal.
     pub async fn install_group_maintenance_subscription(
@@ -2382,7 +2603,7 @@ impl AdapterState {
         &mut self,
         account_id: Option<&MemberId>,
         started_by_ms: u64,
-    ) -> Vec<(MemberId, String, Vec<TransportEndpoint>)> {
+    ) -> Vec<ClaimedReq> {
         let in_scope = |account: &MemberId| account_id.is_none_or(|wanted| wanted == account);
         let mut live = Vec::new();
         for (account, routes) in self.accounts.iter().filter(|(id, _)| in_scope(id)) {
@@ -2417,21 +2638,53 @@ impl AdapterState {
         }
         live.into_iter()
             .filter_map(|(account, id, subscription)| {
-                let endpoints = subscription
+                let mut claimed = HashSet::new();
+                let claims = subscription
                     .endpoints()
                     .iter()
-                    .filter(|endpoint| {
-                        self.relay_index
-                            .existing_index_for(endpoint)
-                            .is_some_and(|relay| {
-                                self.sync.claim_eose_reissue(&id, relay, started_by_ms)
-                            })
+                    .filter_map(|endpoint| {
+                        let relay = self.relay_index.existing_index_for(endpoint)?;
+                        // Two spellings of one relay are one claim.
+                        if !claimed.insert(relay) {
+                            return None;
+                        }
+                        let claim = self.sync.claim_eose_reissue(&id, relay, started_by_ms)?;
+                        Some((endpoint.clone(), claim))
                     })
-                    .cloned()
                     .collect::<Vec<_>>();
-                (!endpoints.is_empty()).then_some((account, id, endpoints))
+                (!claims.is_empty()).then_some((account, id, claims))
             })
             .collect()
+    }
+
+    /// Whether a lag repair's claim on this relay of this REQ still holds. A
+    /// new registration of the REQ starts its progress over without the
+    /// claim, and a close or activation forgets the progress.
+    fn reissue_claim_holds(
+        &self,
+        subscription_id: &str,
+        endpoint: &TransportEndpoint,
+        claim: EoseReissueClaim,
+    ) -> bool {
+        self.relay_index
+            .existing_index_for(endpoint)
+            .is_some_and(|relay| {
+                self.sync
+                    .eose_reissue_claimed(subscription_id, relay, claim)
+            })
+    }
+
+    /// Release a lag repair's claim for a later repair, if it still holds.
+    fn release_reissue_claim(
+        &mut self,
+        subscription_id: &str,
+        endpoint: &TransportEndpoint,
+        claim: EoseReissueClaim,
+    ) {
+        if let Some(relay) = self.relay_index.existing_index_for(endpoint) {
+            self.sync
+                .release_eose_reissue(subscription_id, relay, claim);
+        }
     }
 
     fn record_subscription_first_event(

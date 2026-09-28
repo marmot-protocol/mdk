@@ -126,12 +126,13 @@
   seconds without another lag, each REQ issued before the lag is re-issued, unchanged and
   under its own id, to each connected relay that has not answered it, and the relay replays
   from the same `since` before a fresh EOSE. The REQ is closed on that relay first, so no
-  relay sees a repeated id, and the SDK keeps the REQ it restores on reconnect. A REQ that
-  cannot be queued behind its CLOSE is retried on that connection until it can; if the
-  connection ends first, the relay counts as a failed re-issue and its reconnect restores
-  the REQ. A relay gets each REQ again at most once, and the notification-loss floor does
-  not move. `NostrRelayClient` gains `reissue_subscription`, unsupported by default, which
-  reports a `SubscriptionReissue`, and `NostrTransportAdapter` gains
+  relay sees a repeated id, and the SDK keeps the REQ it restores on reconnect. A REQ with
+  no room behind its CLOSE is sent by a background retry on that connection once there is
+  room, without holding the subscription lifecycle lock while it waits. A relay whose
+  re-issue went out is not re-issued again; one left without it, such as after a reconnect
+  that met a full queue, is repaired again after the settle window. The
+  notification-loss floor does not move. `NostrRelayClient` gains `reissue_subscription`
+  and `retry_reissued_req`, unsupported by default, and `NostrTransportAdapter` gains
   `reissue_subscriptions_awaiting_eose`. (#2070)
 
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing

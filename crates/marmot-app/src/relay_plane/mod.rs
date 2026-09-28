@@ -2921,7 +2921,11 @@ fn recover_relay_notification_forwarder_scoped(
             drop(routes);
             // The lag may also have lost end-of-stored-events. It cannot tell
             // which, so it repairs coverage rather than marking any complete.
-            schedule_eose_repair(transport, account_id);
+            schedule_eose_repair(
+                transport,
+                account_id,
+                transport.adapter.notification_lag_mark(),
+            );
             let health = &transport.notification_forwarder_health;
             RelayNotificationForwarderHealth::increment(&health.restarts, 1);
             RelayNotificationForwarderHealth::increment(&health.lag_incidents, 1);
@@ -2975,15 +2979,20 @@ fn recover_relay_notification_forwarder_scoped(
 }
 
 /// Schedule a repair of the end-of-stored-events a lag on this receiver may
-/// have lost. `account_id` is the lagging receiver's account, or `None` for a
-/// receiver shared across accounts. The repair runs once the receiver has gone
+/// have lost, for the REQs issued by `lag`. `account_id` is the lagging
+/// receiver's account, or `None` for a receiver shared across accounts. The
+/// repair runs once the receiver has gone
 /// [`NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`] without another lag. A later lag in
-/// the same scope postpones it and widens it to the REQs issued by then.
-fn schedule_eose_repair(transport: &Arc<RelayPlaneTransport>, account_id: Option<&MemberId>) {
+/// the same scope postpones it and widens it to the REQs issued by then. A
+/// repair that leaves relays unrepaired schedules itself again the same way.
+fn schedule_eose_repair(
+    transport: &Arc<RelayPlaneTransport>,
+    account_id: Option<&MemberId>,
+    lag: NotificationLagMark,
+) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    let lag = transport.adapter.notification_lag_mark();
     let settle = Duration::from_millis(transport.eose_repair_settle_ms.load(Ordering::Relaxed));
     let due = tokio::time::Instant::now() + settle;
     let scope = account_id.cloned();
@@ -3044,20 +3053,44 @@ async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<Mem
     if transport.shutting_down.load(Ordering::SeqCst) {
         return;
     }
-    // The repair may wait for the subscription lifecycle lock.
+    // The repair may wait for the subscription lifecycle lock, and its
+    // deferred relays for room on their connections.
     let adapter = transport.adapter.clone();
+    let weak = Arc::downgrade(&transport);
     drop(transport);
-    let summary = adapter
+    let repair = adapter
         .reissue_subscriptions_awaiting_eose(scope.as_ref(), lag)
         .await;
+    let summary = repair.summary;
     tracing::info!(
         target: "marmot_app::relay_plane",
         method = "repair_lag_lost_eose",
         awaiting_relays = summary.awaiting_relays,
         reissued_relays = summary.reissued_relays,
+        deferred_relays = summary.deferred_relays,
         failed_relays = summary.failed_relays,
         "re-issued subscriptions whose end-of-stored-events a notification lag may have lost",
     );
+    let unrepaired = repair.unrepaired.await;
+    if unrepaired == 0 {
+        return;
+    }
+    // Each unrepaired relay's claim was released. A relay that keeps failing
+    // is tried again at most once per settle window, while a re-issue that
+    // went out keeps its claim, so a replay that lags again cannot loop.
+    let Some(transport) = weak.upgrade() else {
+        return;
+    };
+    if transport.shutting_down.load(Ordering::SeqCst) {
+        return;
+    }
+    tracing::info!(
+        target: "marmot_app::relay_plane",
+        method = "repair_lag_lost_eose",
+        unrepaired_relays = unrepaired,
+        "scheduling another lag-lost end-of-stored-events repair",
+    );
+    schedule_eose_repair(&transport, scope.as_ref(), lag);
 }
 
 impl MarmotRelayPlaneAccountAdapter {

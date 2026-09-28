@@ -1203,6 +1203,52 @@ async fn notification_lag_repair_leaves_reqs_issued_after_the_lag() {
     relay_plane.shutdown().await;
 }
 
+/// A repair that leaves a relay unrepaired releases its claim and runs again
+/// after the settle window, for the same lag, until the REQ goes out. One
+/// whose re-issue went out does not run again.
+#[tokio::test(start_paused = true)]
+async fn unrepaired_lag_repair_runs_again_after_the_settle_window() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: Vec::new(),
+            since: Some(Timestamp(1_699_999_000)),
+        })
+        .await
+        .unwrap();
+    let inbox_id = issued_id(&relay, |subscription| {
+        matches!(subscription, NostrSubscription::AccountInbox { .. })
+    });
+    relay.unsent_reissues.store(2, Ordering::SeqCst);
+    relay_plane.simulate_notification_lag_for_test(
+        &account,
+        1,
+        NostrNotificationLossFloor::Since(1_699_999_000),
+    );
+    let settle = NOTIFICATION_LAG_EOSE_REPAIR_SETTLE;
+    for attempts in 1..=3 {
+        tokio::time::sleep(settle + Duration::from_millis(1)).await;
+        assert_eq!(
+            reissued_reqs(&relay, attempts).await,
+            vec![(inbox_id.clone(), vec![endpoint.clone()]); attempts],
+            "attempt {attempts} of the same REQ"
+        );
+    }
+    tokio::time::sleep(settle * 3).await;
+    assert_eq!(
+        relay.reissued.lock().unwrap().len(),
+        3,
+        "a re-issue that went out ends the repairs"
+    );
+    relay_plane.shutdown().await;
+}
+
 #[async_trait::async_trait]
 impl DirectoryRelayFetcher for RecordingRelayClient {
     async fn fetch_directory_events(
@@ -1348,6 +1394,8 @@ struct RecordingRelayClient {
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
     /// REQs re-issued by lag repairs, with the endpoints they went to.
     reissued: StdMutex<Vec<(String, Vec<TransportEndpoint>)>>,
+    /// Re-issues left that reach no relay, as when it is unreachable.
+    unsent_reissues: AtomicUsize,
 }
 
 struct TestNotificationSource {
@@ -1708,9 +1756,22 @@ impl NostrRelayClient for RecordingRelayClient {
             .lock()
             .unwrap()
             .push((subscription_id.to_owned(), endpoints.to_vec()));
+        let outcome = if self
+            .unsent_reissues
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            transport_nostr_adapter::RelayReissue::Unsent
+        } else {
+            transport_nostr_adapter::RelayReissue::Sent
+        };
         Ok(transport_nostr_adapter::SubscriptionReissue {
-            reissued: endpoints.len(),
-            failed: 0,
+            relays: endpoints
+                .iter()
+                .map(|endpoint| (endpoint.clone(), outcome))
+                .collect(),
         })
     }
 
