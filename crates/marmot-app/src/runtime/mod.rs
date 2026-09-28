@@ -4227,6 +4227,11 @@ impl MarmotAppRuntime {
             &merge_source_relays,
             publish_endpoints,
             bootstrap.indexer_relays,
+            bootstrap
+                .default_relays
+                .into_iter()
+                .chain(bootstrap.bootstrap_relays)
+                .collect(),
         )
         .await
     }
@@ -4273,6 +4278,18 @@ impl MarmotAppRuntime {
             &endpoints,
             endpoints.clone(),
             indexer_relays,
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .chain(&relay_lists.nip65.read_relays)
+                .chain(&relay_lists.nip65.write_relays)
+                .chain(&relay_lists.inbox.relays)
+                .chain(&relay_lists.bootstrap_relays)
+                .chain(&relay_lists.default_relays)
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
         )
         .await
     }
@@ -4284,6 +4301,7 @@ impl MarmotAppRuntime {
         merge_source_relays: &[TransportEndpoint],
         publish_endpoints: Vec<TransportEndpoint>,
         indexer_relays: Vec<TransportEndpoint>,
+        declared_relays: Vec<TransportEndpoint>,
     ) -> Result<UserProfileMetadata, AppError> {
         if let Some(current) = self
             .latest_known_user_profile_for_publish(&account.account_id_hex, merge_source_relays)
@@ -4309,6 +4327,7 @@ impl MarmotAppRuntime {
                 profile.clone(),
                 publish_endpoints,
                 indexer_relays,
+                declared_relays,
             )
             .await?;
         self.accounts
@@ -7256,52 +7275,51 @@ impl AccountManager {
                 None
             };
 
-        let (relay_lists, profile, indexer_copy) =
-            if creates_new_private_key && account.local_signing {
-                match self
-                    .setup_generated_account_bootstrap(&account, &request)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(err) => {
-                        if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                            return self.rollback_import_after_setup_failure(
-                                &account,
-                                private_key_import.as_ref(),
-                                err,
-                            );
-                        }
-                        // Once the helper records publication intent, a relay may
-                        // hold one replaceable bootstrap record. Retain the
-                        // journaled identity and retry instead of deleting it.
-                        return Err(err);
+        let (relay_lists, profile) = if creates_new_private_key && account.local_signing {
+            match self
+                .setup_generated_account_bootstrap(&account, &request)
+                .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
+                        return self.rollback_import_after_setup_failure(
+                            &account,
+                            private_key_import.as_ref(),
+                            err,
+                        );
                     }
+                    // Once the helper records publication intent, a relay may
+                    // hold one replaceable bootstrap record. Retain the
+                    // journaled identity and retry instead of deleting it.
+                    return Err(err);
                 }
-            } else {
-                let relay_lists = match self
-                    .setup_relay_lists_for_account(
-                        &account,
-                        &request,
-                        imports_private_key,
-                        creates_new_private_key,
-                        recent_relay_lists,
-                    )
-                    .await
-                {
-                    Ok(relay_lists) => relay_lists,
-                    Err(err) => {
-                        if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                            return self.rollback_import_after_setup_failure(
-                                &account,
-                                private_key_import.as_ref(),
-                                err,
-                            );
-                        }
-                        return Err(err);
+            }
+        } else {
+            let relay_lists = match self
+                .setup_relay_lists_for_account(
+                    &account,
+                    &request,
+                    imports_private_key,
+                    creates_new_private_key,
+                    recent_relay_lists,
+                )
+                .await
+            {
+                Ok(relay_lists) => relay_lists,
+                Err(err) => {
+                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
+                        return self.rollback_import_after_setup_failure(
+                            &account,
+                            private_key_import.as_ref(),
+                            err,
+                        );
                     }
-                };
-                (relay_lists, None, None)
+                    return Err(err);
+                }
             };
+            (relay_lists, None)
+        };
 
         let key_package_bytes = if request.publish_initial_key_package && account.local_signing {
             let setup_phase = self
@@ -7401,12 +7419,6 @@ impl AccountManager {
         self.app
             .account_home()
             .complete_account_setup(&account.label)?;
-        // A slow directory indexer must not delay bootstrap confirmation,
-        // initial KeyPackage publication, or the NetworkReady result.
-        if let Some(copy) = indexer_copy {
-            copy.spawn();
-        }
-
         Ok(AccountSetupResult {
             account,
             relay_lists,
@@ -7700,14 +7712,7 @@ impl AccountManager {
         &self,
         account: &AccountSummary,
         request: &AccountSetupRequest,
-    ) -> Result<
-        (
-            AccountRelayListStatus,
-            Option<UserProfileMetadata>,
-            Option<crate::PublicIndexerCopy>,
-        ),
-        AppError,
-    > {
+    ) -> Result<(AccountRelayListStatus, Option<UserProfileMetadata>), AppError> {
         let mut profile = if let Some(cached) = self
             .app
             .directory_entry_for_account_id(&account.account_id_hex)?
@@ -7757,7 +7762,28 @@ impl AccountManager {
                 profile = cached;
             }
             if status.complete {
-                return Ok((status, Some(profile), None));
+                // A prior attempt may have failed after confirming bootstrap
+                // but before scheduling its best-effort indexer copy.
+                match self
+                    .app
+                    .prepare_generated_account_indexer_copy(
+                        &account.label,
+                        &status,
+                        &profile,
+                        &request.discovery_relays,
+                    )
+                    .await
+                {
+                    Ok(Some(copy)) => copy.spawn(),
+                    Ok(None) => {}
+                    Err(err) => tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "setup_generated_account_bootstrap",
+                        error_kind = err.privacy_safe_kind(),
+                        "could not prepare resumed public indexer copy"
+                    ),
+                }
+                return Ok((status, Some(profile)));
             }
             // The durable publication phase is authoritative, but the local
             // directory projection can still be lost independently. These are
@@ -7809,7 +7835,12 @@ impl AccountManager {
             }
         };
         self.mark_bootstrap_publication_confirmed(&account.label)?;
-        Ok((publication.status, Some(profile), publication.indexer_copy))
+        // The copy must be scheduled before any later KeyPackage or reconcile
+        // failure can drop it. Indexer publication itself stays off this path.
+        if let Some(copy) = publication.indexer_copy {
+            copy.spawn();
+        }
+        Ok((publication.status, Some(profile)))
     }
 
     fn setup_failure_can_roll_back(

@@ -7340,6 +7340,168 @@ async fn loopback_account_relays_suppress_public_indexer_copies() {
     assert!(publication.status.complete);
     assert!(publication.indexer_copy.is_none());
     assert_eq!(relay.attempted_publish_routes.lock().unwrap().len(), 4);
+
+    // A public bootstrap route must not export a list that advertises a
+    // loopback outbox. The operational route alone cannot detect this case.
+    let mixed = app
+        .publish_generated_account_bootstrap(
+            &account.label,
+            AccountRelayListBootstrap::new(
+                vec![TransportEndpoint("ws://127.0.0.1:1234".into())],
+                vec![TransportEndpoint("wss://relay.example".into())],
+            )
+            .with_indexer_relays(default_directory_discovery_relays()),
+            &UserProfileMetadata::default(),
+        )
+        .await
+        .unwrap();
+    assert!(mixed.indexer_copy.is_none());
+}
+
+#[tokio::test]
+async fn mixed_loopback_declarations_suppress_profile_and_relay_list_indexer_copies() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_nostr_account_for_setup()
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let bootstrap = || {
+        AccountRelayListBootstrap::new(
+            vec![TransportEndpoint("ws://127.0.0.1:1234".into())],
+            vec![TransportEndpoint("wss://relay.example".into())],
+        )
+        .with_indexer_relays(vec![TransportEndpoint("wss://index.example".into())])
+    };
+    app.publish_user_profile(&account.label, UserProfileMetadata::default(), bootstrap())
+        .await
+        .unwrap();
+    app.publish_account_relay_lists(&account.label, bootstrap())
+        .await
+        .unwrap();
+    assert!(
+        relay
+            .attempted_publish_routes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, route)| route.iter().all(|relay| relay.0 != "wss://index.example"))
+    );
+}
+
+#[tokio::test]
+async fn confirmed_bootstrap_retry_republishes_public_indexer_copies() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay.fail_publishes_of_kind(KIND_MARMOT_KEY_PACKAGE);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let request = || AccountSetupRequest {
+        default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    runtime
+        .create_identity(request())
+        .await
+        .expect_err("first KeyPackage publish must fail after bootstrap confirmation");
+    let account = app.account_home().accounts().unwrap().remove(0);
+    assert_eq!(
+        app.account_home()
+            .account_setup_state(&account.label)
+            .unwrap()
+            .unwrap()
+            .phase,
+        marmot_account::AccountSetupPhase::KeyPackagePublicationStarted
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let indexer_count = relay
+                .attempted_publish_routes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, route)| route.iter().any(|relay| relay.0 == "wss://index.example"))
+                .count();
+            if indexer_count >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("indexer batch must start despite KeyPackage failure");
+
+    relay.allow_all_publish_kinds();
+    let retried = runtime.create_identity(request()).await.unwrap();
+    assert_eq!(retried.readiness, AccountSetupReadiness::NetworkReady);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let indexer_count = relay
+                .attempted_publish_routes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, route)| route.iter().any(|relay| relay.0 == "wss://index.example"))
+                .count();
+            if indexer_count >= 6 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("confirmed retry must send a fresh indexer batch");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn resumed_indexer_copy_preserves_directional_nip65_roles() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_nostr_account_for_setup()
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay);
+    let mut status = app
+        .publish_generated_account_bootstrap(
+            &account.label,
+            AccountRelayListBootstrap::new(
+                vec![TransportEndpoint("wss://relay.example".into())],
+                vec![TransportEndpoint("wss://relay.example".into())],
+            ),
+            &UserProfileMetadata::default(),
+        )
+        .await
+        .unwrap()
+        .status;
+    status.nip65.read_relays = vec!["wss://read.example".into()];
+    status.nip65.write_relays = vec!["wss://write.example".into()];
+    status.nip65.relays = status.nip65.write_relays.clone();
+    let copy = app
+        .prepare_generated_account_indexer_copy(
+            &account.label,
+            &status,
+            &UserProfileMetadata::default(),
+            &[TransportEndpoint("wss://index.example".into())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let relays = parse_nip65_relay_set(&copy.events[0]);
+    assert_eq!(
+        relays.read_relays,
+        vec![TransportEndpoint("wss://read.example".into())]
+    );
+    assert_eq!(
+        relays.write_relays,
+        vec![TransportEndpoint("wss://write.example".into())]
+    );
 }
 
 #[tokio::test]

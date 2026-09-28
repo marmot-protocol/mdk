@@ -23,7 +23,6 @@ marmot-markdown.workspace = true
 cgka-engine.workspace = true
 cgka-traits.workspace = true
 nostr.workspace = true
-url.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 hex.workspace = true

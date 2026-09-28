@@ -355,7 +355,7 @@ impl Marmot {
             endpoints(&default_relays),
             endpoints(&bootstrap_relays),
         )
-        .with_indexer_relays(ffi_publication_indexers(&default_relays, &bootstrap_relays));
+        .with_indexer_relays(ffi_discovery_relays());
         self.app
             .publish_account_relay_lists(&account_ref, bootstrap)
             .await?;
@@ -485,7 +485,7 @@ impl Marmot {
                 &account_ref,
                 endpoints(&relays),
                 endpoints(&bootstrap_relays),
-                ffi_publication_indexers(&relays, &bootstrap_relays),
+                ffi_discovery_relays(),
             )
             .await?;
         Ok(status.into())
@@ -504,7 +504,7 @@ impl Marmot {
                 &account_ref,
                 endpoints(&relays),
                 endpoints(&bootstrap_relays),
-                ffi_publication_indexers(&relays, &bootstrap_relays),
+                ffi_discovery_relays(),
             )
             .await?;
         Ok(status.into())
@@ -633,7 +633,7 @@ impl Marmot {
             endpoints(&default_relays),
             endpoints(&bootstrap_relays),
         )
-        .with_indexer_relays(ffi_publication_indexers(&default_relays, &bootstrap_relays));
+        .with_indexer_relays(ffi_discovery_relays());
         let pushed = self
             .runtime
             .publish_user_profile(&account_ref, UserProfileMetadata::from(profile), bootstrap)
@@ -656,16 +656,12 @@ impl Marmot {
         account_ref: String,
         profile: UserProfileMetadataFfi,
     ) -> Result<UserProfileMetadataFfi, MarmotKitError> {
-        let account = self.runtime.accounts().resolve(&account_ref)?;
-        let relay_lists = self.app.account_relay_list_status(&account.label)?;
-        let indexers =
-            ffi_publication_indexers(&relay_lists.nip65.relays, &relay_lists.bootstrap_relays);
         let pushed = self
             .runtime
             .publish_user_profile_using_account_relays_and_indexers(
                 &account_ref,
                 UserProfileMetadata::from(profile),
-                indexers,
+                ffi_discovery_relays(),
             )
             .await?;
         Ok(pushed.into())
@@ -703,28 +699,6 @@ fn ffi_discovery_relays() -> Vec<TransportEndpoint> {
     default_directory_discovery_relays()
 }
 
-fn ffi_publication_indexers(
-    operational_relays: &[String],
-    bootstrap_relays: &[String],
-) -> Vec<TransportEndpoint> {
-    // Local development relays must not cause test identities and profiles to
-    // escape to public indexers. Production relay declarations remain public.
-    if operational_relays
-        .iter()
-        .chain(bootstrap_relays)
-        .any(|relay| {
-            url::Url::parse(relay).ok().is_some_and(|url| {
-                url.host()
-                    .is_some_and(cgka_traits::app_components::is_loopback_host)
-            })
-        })
-    {
-        Vec::new()
-    } else {
-        default_directory_discovery_relays()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -734,18 +708,6 @@ mod tests {
     use nostr_relay_builder::MockRelay;
 
     use super::*;
-
-    #[test]
-    fn public_indexer_publication_skips_loopback_development_accounts() {
-        assert!(ffi_publication_indexers(&["ws://127.0.0.1:1234".into()], &[]).is_empty());
-        assert!(ffi_publication_indexers(&[], &["ws://127.0.0.1:1234".into()]).is_empty());
-        assert!(!ffi_discovery_relays().is_empty());
-        assert!(
-            ffi_publication_indexers(&["wss://relay.example".into()], &[])
-                .iter()
-                .any(|relay| relay.0 == "wss://purplepag.es")
-        );
-    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn generated_identity_result_returns_the_exact_local_profile_and_readiness() {

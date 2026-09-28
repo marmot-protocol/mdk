@@ -774,6 +774,11 @@ impl MarmotApp {
             profile,
             endpoints,
             bootstrap.indexer_relays,
+            bootstrap
+                .default_relays
+                .into_iter()
+                .chain(bootstrap.bootstrap_relays)
+                .collect(),
         )
         .await
     }
@@ -788,6 +793,7 @@ impl MarmotApp {
         profile: UserProfileMetadata,
         endpoints: Vec<TransportEndpoint>,
         indexer_relays: Vec<TransportEndpoint>,
+        declared_relays: Vec<TransportEndpoint>,
     ) -> Result<(), AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::Directory,
@@ -795,7 +801,13 @@ impl MarmotApp {
             crate::ProductUnit::Attempt,
         );
         let result = self
-            .publish_user_profile_to_endpoints_unobserved(label, profile, endpoints, indexer_relays)
+            .publish_user_profile_to_endpoints_unobserved(
+                label,
+                profile,
+                endpoints,
+                indexer_relays,
+                declared_relays,
+            )
             .await;
         if let Some(observation) = observation {
             observation.finish(if result.is_ok() { "success" } else { "failure" });
@@ -809,6 +821,7 @@ impl MarmotApp {
         profile: UserProfileMetadata,
         endpoints: Vec<TransportEndpoint>,
         indexer_relays: Vec<TransportEndpoint>,
+        declared_relays: Vec<TransportEndpoint>,
     ) -> Result<(), AppError> {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
@@ -819,7 +832,8 @@ impl MarmotApp {
             Vec::new(),
             content,
         );
-        let indexers = self.public_indexer_publish_endpoints(&indexer_relays, &endpoints);
+        let indexers =
+            self.public_indexer_publish_endpoints(&indexer_relays, &endpoints, &declared_relays);
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
         if !indexers.is_empty() {

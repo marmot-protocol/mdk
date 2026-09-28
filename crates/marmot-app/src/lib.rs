@@ -2044,8 +2044,11 @@ impl MarmotApp {
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
-        let indexer_endpoints =
-            self.public_indexer_publish_endpoints(&bootstrap.indexer_relays, &endpoints);
+        let indexer_endpoints = self.public_indexer_publish_endpoints(
+            &bootstrap.indexer_relays,
+            &endpoints,
+            &bootstrap.default_relays,
+        );
 
         let mut requests = Vec::with_capacity(4);
         for list_kind in [
@@ -2191,6 +2194,79 @@ impl MarmotApp {
                 indexer_endpoints,
             ),
         })
+    }
+
+    /// Rebuild replaceable public directory records after a confirmed setup
+    /// phase is resumed. This does not republish the operational bootstrap.
+    pub(crate) async fn prepare_generated_account_indexer_copy(
+        &self,
+        label: &str,
+        status: &AccountRelayListStatus,
+        profile: &UserProfileMetadata,
+        indexer_relays: &[TransportEndpoint],
+    ) -> Result<Option<PublicIndexerCopy>, AppError> {
+        let operational = status
+            .bootstrap_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let declared = status
+            .nip65
+            .relays
+            .iter()
+            .chain(&status.nip65.read_relays)
+            .chain(&status.nip65.write_relays)
+            .chain(&status.inbox.relays)
+            .chain(&status.default_relays)
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let indexers =
+            self.public_indexer_publish_endpoints(indexer_relays, &operational, &declared);
+        if indexers.is_empty() {
+            return Ok(None);
+        }
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let nostr_signer = signer.as_nostr_signer();
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let mut events = Vec::with_capacity(3);
+        let nip65_event = NostrNip65RelayListPublication {
+            account_id: account_id.clone(),
+            relays: nip65_relay_set_from_state(&status.nip65),
+            publish_endpoints: operational.clone(),
+        }
+        .to_event()?;
+        events.push(sign_account_publication_event(nostr_signer.as_ref(), &nip65_event).await?);
+        let inbox_event = NostrAccountRelayListPublication {
+            account_id: account_id.clone(),
+            list_kind: NostrAccountRelayListKind::Inbox,
+            relays: status
+                .inbox
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            publish_endpoints: operational,
+        }
+        .to_event()?;
+        events.push(sign_account_publication_event(nostr_signer.as_ref(), &inbox_event).await?);
+        let profile_event = NostrTransportEvent::new_unsigned(
+            account.account_id_hex.clone(),
+            KIND_NOSTR_METADATA,
+            Vec::new(),
+            serde_json::to_string(&directory::records::profile_content_json(profile))?,
+        );
+        events.push(sign_account_publication_event(nostr_signer.as_ref(), &profile_event).await?);
+        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
+        Ok(PublicIndexerCopy::new(
+            relay_client,
+            account_id,
+            events,
+            indexers,
+        ))
     }
 
     pub async fn publish_missing_account_relay_lists(
@@ -2462,8 +2538,22 @@ impl MarmotApp {
             &account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
-        let indexer_endpoints =
-            self.public_indexer_publish_endpoints(&bootstrap.indexer_relays, &endpoints);
+        let declared_relays = if let Some(relays) = nip65_relay_set {
+            bootstrap
+                .default_relays
+                .iter()
+                .chain(&relays.read_relays)
+                .chain(&relays.write_relays)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            bootstrap.default_relays.clone()
+        };
+        let indexer_endpoints = self.public_indexer_publish_endpoints(
+            &bootstrap.indexer_relays,
+            &endpoints,
+            &declared_relays,
+        );
         let nostr_signer = signer.as_nostr_signer();
         let relay_client = self.relay_client_for_account_id(&account_id_hex, nostr_signer.clone());
         let mut requests = Vec::with_capacity(list_kinds.len());
@@ -2674,15 +2764,20 @@ impl MarmotApp {
         &self,
         indexer_relays: &[TransportEndpoint],
         operational_relays: &[TransportEndpoint],
+        declared_relays: &[TransportEndpoint],
     ) -> Vec<TransportEndpoint> {
         // Development identities may intentionally use loopback relays. Keep
         // their public discovery reads, but never export their records.
-        if operational_relays.iter().any(|endpoint| {
-            url::Url::parse(endpoint.as_str()).ok().is_some_and(|url| {
-                url.host()
-                    .is_some_and(cgka_traits::app_components::is_loopback_host)
+        if operational_relays
+            .iter()
+            .chain(declared_relays)
+            .any(|endpoint| {
+                url::Url::parse(endpoint.as_str()).ok().is_some_and(|url| {
+                    url.host()
+                        .is_some_and(cgka_traits::app_components::is_loopback_host)
+                })
             })
-        }) {
+        {
             return Vec::new();
         }
         let operational = self.retain_safe_discovered_endpoints(
