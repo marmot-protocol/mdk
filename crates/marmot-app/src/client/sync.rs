@@ -213,11 +213,15 @@ impl FullHistoryRepairControl<'_> {
     }
 
     /// Why a finished repair stopped short: cancellation, or a deadline that
-    /// cut the comparison pass or its admission.
-    pub(crate) fn verdict(&self) -> Option<crate::FullHistoryRepairIncompleteReason> {
+    /// actually cut its comparison pass or admission. A pass that completed
+    /// before the cutoff and was admitted after it did not stop short.
+    pub(crate) fn verdict(
+        &self,
+        hit_deadline: bool,
+    ) -> Option<crate::FullHistoryRepairIncompleteReason> {
         if (self.cancelled)() {
             Some(crate::FullHistoryRepairIncompleteReason::Cancelled)
-        } else if self.started.elapsed() >= self.network_budget() {
+        } else if hit_deadline {
             Some(crate::FullHistoryRepairIncompleteReason::Deadline)
         } else {
             None
@@ -4400,6 +4404,7 @@ impl AppClient {
             )
             .map_err(|error| state_persist(SyncSummary::default(), error))?;
         self.explicit_history_window_certified = false;
+        self.recovery_job_hit_deadline = false;
         let result = match grant {
             Some(grant) => self.run_recovery_job(grant, credit, Some(control)).await,
             None => Ok(EpochBackfillRunOutcome::Deferred),
@@ -4414,13 +4419,13 @@ impl AppClient {
         let qualified = storage
             .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
             .map_err(|error| state_persist(summary.clone(), error.into()))?;
-        let reason = control
-            .verdict()
-            .unwrap_or(if self.explicit_history_window_certified {
+        let reason = control.verdict(self.recovery_job_hit_deadline).unwrap_or(
+            if self.explicit_history_window_certified {
                 crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow
             } else {
                 crate::FullHistoryRepairIncompleteReason::CoverageUnproven
-            });
+            },
+        );
         if result.is_ok()
             && !qualified
             && reason == crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow

@@ -768,3 +768,79 @@ async fn a_pass_cut_by_the_network_deadline_admits_what_it_fetched() {
     );
     assert!(explicit_pending(&app), "an expired repair keeps its debt");
 }
+
+/// A pass that completes just before the network cutoff and is admitted
+/// after it did not stop short: every route certified its window, so the
+/// repair reports the unsearched history below it and closes its request,
+/// not `Deadline`.
+#[tokio::test]
+async fn an_early_pass_admitted_past_the_network_cutoff_is_not_a_deadline() {
+    const FETCHED: usize = 24;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("late admission", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let now = crate::unix_now_seconds();
+    let events = (0..FETCHED)
+        .map(|index| transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: crate::tests::epoch_gap_probe(&route, now - 60, &format!("late-{index}")),
+        })
+        .collect::<Vec<_>>();
+    let ids = events
+        .iter()
+        .map(|event| event.event.id.clone())
+        .collect::<Vec<_>>();
+    // The budget is 6 s, so the network cutoff falls at 5 s.
+    let budget = Duration::from_secs(6);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let answered_calls = calls.clone();
+    client.test_comparison_results = Some(ScriptedComparisons::timed(move |_| {
+        let mut answer = Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )));
+        if answered_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The first route finishes just inside the cutoff with a batch
+            // whose admission crosses it.
+            if let Ok(Some((_, returned))) = &mut answer {
+                returned.extend(events.clone());
+            }
+            (Some(Duration::from_millis(4_950)), answer)
+        } else {
+            (None, answer)
+        }
+    }));
+    let started = Instant::now();
+    let failure = client
+        .repair_full_history_with_control(&control(budget, &|| false))
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "admission crossed the network cutoff"
+    );
+    assert!(started.elapsed() < budget, "and finished inside the budget");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "both routes were compared");
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((
+            crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
+            false
+        ))
+    );
+    assert!(ids.iter().all(|id| client.state.seen_events.contains(id)));
+    assert!(
+        !explicit_pending(&app),
+        "the completed pass closes its request"
+    );
+}

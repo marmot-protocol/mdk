@@ -210,7 +210,9 @@ every cause and every caller runs it:
   inside the first 50 seconds of its 60-second budget. At that network deadline a route
   still comparing times out and the routes that finished come back; their events are
   admitted and checkpointed in the last 10 seconds, stopping at a turn boundary if the whole
-  budget runs out, and the repair reports `Deadline`. Only cancellation, polled every 50 ms,
+  budget runs out. The repair reports `Deadline` only when the cutoff actually skipped or
+  timed out a route, or admission ran out of budget; a pass that finished before the
+  cutoff and was admitted after it is judged on its routes as usual. Only cancellation, polled every 50 ms,
   discards a pass in flight; it also stops admission at a turn boundary, keeping the
   admitted prefix. Explicit history has no lower bound, so no window certifies it: a pass whose
   every route's window certified returns `BelowRetentionWindow`, naming the unsearched older

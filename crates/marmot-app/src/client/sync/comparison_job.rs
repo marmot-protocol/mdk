@@ -558,6 +558,15 @@ impl AppClient {
         let Some((credit, result)) = completed else {
             return self.abandon_comparison_grant(grant, execution);
         };
+        // Under a repair's control the only network deadline is its cutoff,
+        // so a skipped or timed-out route is one that cutoff cut short.
+        self.recovery_job_hit_deadline = control.is_some()
+            && result.routes.iter().any(|route| {
+                matches!(
+                    route.result,
+                    ComparisonRouteWorkResult::Skipped | ComparisonRouteWorkResult::TimedOut
+                )
+            });
         // The job counts against the process pool until admission and its
         // checkpoint finish, not only while the network request runs.
         let settled = self
@@ -612,7 +621,9 @@ impl AppClient {
                 // reserve, stops at a turn boundary. The admitted prefix stays
                 // durable; the pass certifies nothing, so the debt waits for a
                 // later grant.
-                if control.is_some_and(|control| control.stopped().is_some()) {
+                if let Some(reason) = control.and_then(FullHistoryRepairControl::stopped) {
+                    self.recovery_job_hit_deadline |=
+                        reason == crate::FullHistoryRepairIncompleteReason::Deadline;
                     admission.invalid = true;
                     admission.pending.clear();
                     break;
