@@ -483,14 +483,17 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   its own id, to every connected relay that has not answered it. The REQ is closed on that
   relay first, so no relay sees a repeated live id; a relay could refuse one instead of
   replacing the subscription. The SDK's registry, which restores REQs on reconnect, stays
-  untouched. The relay replays from the same `since` and answers with a fresh EOSE, so
-  activation reuse returns, EOSE-gated drains can complete, and post-join maintenance
-  observes its boundary. The loss floor does not move. A disconnected relay is skipped,
-  because its reconnect sends the REQ again. A relay gets each REQ again at most once, so
-  a replay that keeps lagging cannot loop, and nothing is re-issued while lags keep
-  recurring. What remains: a replay still running 30 seconds after the last lag restarts
-  once; a fresh EOSE lost to another lag stays missing until the next activation; and a
-  group route removed before its EOSE keeps the activation's frozen coverage incomplete.
+  untouched. The two frames are queued separately. A REQ that does not queue behind its
+  CLOSE is retried briefly. A relay that stays connected without it is reconnected, so the
+  SDK re-sends every REQ it holds, and counts as a failed re-issue. The relay replays from
+  the same `since` and answers with a fresh EOSE, so activation reuse returns, EOSE-gated
+  drains can complete, and post-join maintenance observes its boundary. The loss floor
+  does not move. A disconnected relay is skipped, because its reconnect sends the REQ
+  again. A relay gets each REQ again at most once, so a replay that keeps lagging cannot
+  loop, and nothing is re-issued while lags keep recurring. What remains: a replay still
+  running 30 seconds after the last lag restarts once; a fresh EOSE lost to another lag
+  stays missing until the next activation; and a group route removed before its EOSE keeps
+  the activation's frozen coverage incomplete.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored

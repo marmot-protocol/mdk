@@ -58,8 +58,10 @@ for reconnect/backoff and relay status mechanics.
   REQ only to a connected relay and only while its floor record holds it live, and records it with `open` first. It
   sends a raw CLOSE before the raw REQ: a relay must never see a repeated live id, because one that answers
   `CLOSED duplicate:` makes the SDK drop the REQ from the registry that restores it on reconnect. Keep that registry
-  untouched; a relay-level unsubscribe and subscribe drops its entry when a send fails. Never infer EOSE at a lag,
-  change a re-issued REQ's filter, or reopen a closed REQ.
+  untouched; a relay-level unsubscribe and subscribe drops its entry when a send fails. Each frame is its own
+  `try_send`, so never leave a relay with the REQ closed: retry a REQ that did not queue behind its CLOSE, then
+  reconnect a relay still connected without it, and report that relay as failed. Never infer EOSE at a lag, change a
+  re-issued REQ's filter, or reopen a closed REQ.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`
