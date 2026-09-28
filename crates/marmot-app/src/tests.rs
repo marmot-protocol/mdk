@@ -13302,7 +13302,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
 }
 
 #[test]
-fn reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment() {
+fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
     run_composed_app_runtime_test("delivery-overflow-reopen", || async {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -13377,20 +13377,20 @@ fn reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment
         client
             .sync()
             .await
-            .expect("ordinary catch-up admits the replay prefix without certifying coverage");
+            .expect("ordinary catch-up runs its floored pass without certifying coverage");
         assert!(
             reopened
                 .load_state("alice")
                 .unwrap()
                 .seen_events
                 .contains(&omitted_id),
-            "the unfloored recovery must ingest the older event omitted below the ordinary cursor floor"
+            "live delivery ingests the older event without any replay"
         );
         assert!(
             client.delivery_overflow_recovery_pending,
-            "EOSE without an exhaustive admission certificate cannot acknowledge loss"
+            "a loss with no known bound cannot be certified by comparison"
         );
-        assert_eq!(relay.unfloored_account_subscription_count(), 1);
+        assert_eq!(relay.unfloored_account_subscription_count(), 0);
         let storage = reopened.account_storage("alice").unwrap();
         assert!(
             storage
@@ -13404,7 +13404,11 @@ fn reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment
         // delivery/admission, token fencing and live acknowledgment stay real.
         client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
         client.repair_full_history().await.unwrap();
-        assert_eq!(relay.unfloored_account_subscription_count(), 2);
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            1,
+            "only explicit full-history repair widens the replay"
+        );
         assert!(!client.delivery_overflow_recovery_pending);
         assert!(
             reopened

@@ -5128,14 +5128,19 @@ impl AppClient {
                     }
                     // A comparison proves only the window it compared. A goal
                     // that reaches below the retained-inventory floor, or has
-                    // no lower bound, keeps its debt.
+                    // no lower bound, keeps its debt. Cold-start and
+                    // incremental history is that window: its floor, raised by
+                    // retention or compaction, is the goal's lower bound.
+                    let window_bounded =
+                        obligation.cause == storage_sqlite::RecoveryCause::IncrementalHistory;
                     let covers_goal = route.as_ref().is_some_and(|route| {
                         grant.inventory.iter().any(|window| {
                             &window.route == route
-                                && scope
-                                    .goal
-                                    .since_seconds
-                                    .is_some_and(|since| since >= window.since)
+                                && (window_bounded
+                                    || scope
+                                        .goal
+                                        .since_seconds
+                                        .is_some_and(|since| since >= window.since))
                                 && scope.goal.until_seconds <= window.until
                         })
                     });

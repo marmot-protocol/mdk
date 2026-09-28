@@ -10107,7 +10107,11 @@ mod tests {
             client.has_pending_epoch_backfill(),
             "ordinary catch-up cannot certify complete historical coverage",
         );
-        assert_eq!(relay.unfloored_account_subscription_count(), before + 1);
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            before,
+            "the backfill acquires history by comparison, never by an unfloored replay"
+        );
         assert_eq!(
             app.account_storage("alice")
                 .unwrap()

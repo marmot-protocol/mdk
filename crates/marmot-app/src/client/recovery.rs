@@ -1534,7 +1534,14 @@ impl AppClient {
         }
         let comparison = storage.recovery_comparison()?;
         let mut comparison_goals = if grant.comparison_revision.is_some() {
-            self.comparison_route_goals(comparison.requested_until_seconds)?
+            // The frozen window must reach every selected goal, or debt newer
+            // than the comparison request could never certify on this pass.
+            let until = goals
+                .iter()
+                .flat_map(|(_, scopes)| scopes)
+                .map(|scope| scope.until_seconds)
+                .fold(comparison.requested_until_seconds, u64::max);
+            self.comparison_route_goals(until)?
         } else {
             Vec::new()
         };

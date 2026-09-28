@@ -150,25 +150,19 @@ impl SqliteAccountStorage {
                 ).storage()?;
                 if duplicate { return Ok(read(&conn)?.revision); }
             }
-            let unresolved_prior = {
-                let conn = storage.lock()?;
-                conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM account_recovery_obligations o
-                    JOIN account_recovery_scopes s ON s.obligation_id=o.id
-                    WHERE o.demand_key='incremental' AND o.state=0 AND s.snapshot_state=0)",
-                    [], |row| row.get::<_,bool>(0)).storage()?
-            };
             let ticket = storage.request_recovery(RecoveryRequest::IncrementalHistory, now_ms)?;
             let stored = storage.recovery_scope_snapshots(ticket.id)?;
             let mut merged: Vec<_> = stored.iter().map(|s| s.plan.clone()).collect();
             for goal in goals {
-                let mut goal = goal.clone();
-                // An existing unresolved placeholder carries no proven lower
-                // bound. Hydration cannot replace that older debt with the
-                // newer comparison floor; only acquisition stays bounded.
-                if unresolved_prior { goal.since_seconds = None; }
+                // Cold-start and incremental history is bounded by the retained
+                // window, so every goal has a lower bound. A goal stored without
+                // one predates that rule and takes the new window.
                 if let Some(old) = merged.iter_mut().find(|s| s.route_kind == goal.route_kind
                     && s.group_id == goal.group_id && s.transport_group_id == goal.transport_group_id) {
-                    old.since_seconds = old.since_seconds.zip(goal.since_seconds).map(|(a,b)| a.min(b));
+                    old.since_seconds = match (old.since_seconds, goal.since_seconds) {
+                        (Some(old), Some(new)) => Some(old.min(new)),
+                        (old, new) => new.or(old),
+                    };
                     old.until_seconds = old.until_seconds.max(goal.until_seconds);
                     old.required_endpoints.extend(goal.required_endpoints.iter().cloned());
                     old.required_endpoints.sort(); old.required_endpoints.dedup();
@@ -181,10 +175,10 @@ impl SqliteAccountStorage {
             }
             {
                 let conn = storage.lock()?;
-                // Extending debt invalidates old coverage proof, never its parked
-                // eligibility. The comparison slot owns only operational intent.
+                // Extending debt invalidates old coverage proof. A join is new
+                // evidence, so the comparison it requests may certify the debt.
                 conn.execute_cached("UPDATE account_recovery_obligations SET revision=revision+1,
-                    state=0,eligibility=CASE WHEN eligibility IN (0,1) THEN 4 ELSE eligibility END,
+                    state=0,eligibility=CASE WHEN eligibility IN (1,4) THEN 0 ELSE eligibility END,
                     updated_at_ms=MAX(updated_at_ms,?2) WHERE id=?1",
                     params![ticket.id.as_slice(), sqlite_integer(now_ms)?]).storage()?;
             }
@@ -497,9 +491,11 @@ mod tests {
             .unwrap(),
             "a duplicate settlement cannot rewrite a serviced opportunity"
         );
+        // Settling the slot is operational only. The debt stays ready for a
+        // pass whose certificates can satisfy it.
         let debt = s.pending_recovery_demands().unwrap();
         assert_eq!(debt.len(), 1);
-        assert_eq!(debt[0].eligibility, RecoveryEligibility::NeedsDeepRepair);
+        assert_eq!(debt[0].eligibility, RecoveryEligibility::Ready);
         assert!(
             !s.recovery_obligation_is_satisfied(debt[0].ticket.id, debt[0].ticket.revision)
                 .unwrap()
@@ -659,7 +655,7 @@ mod tests {
     fn comparison_goal_extension_preserves_old_bounds_and_rejects_unknown_formats() {
         let s = storage();
         let mut old = scope();
-        old.since_seconds = None;
+        old.since_seconds = Some(5);
         s.join_recovery_comparison(&[1; 16], 100_000, &[old])
             .unwrap();
         let mut new = scope();
@@ -673,7 +669,7 @@ mod tests {
             .unwrap()
             .remove(0)
             .plan;
-        assert_eq!(plan.since_seconds, None);
+        assert_eq!(plan.since_seconds, Some(5));
         assert_eq!(plan.until_seconds, 200);
         assert_eq!(plan.required_endpoints.len(), 2);
         s.lock()
@@ -803,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn comparison_join_does_not_narrow_preexisting_unresolved_history() {
+    fn comparison_join_bounds_preexisting_cold_start_debt_by_the_window() {
         let s = storage();
         let prior = s
             .request_recovery(RecoveryRequest::IncrementalHistory, 1)
@@ -813,8 +809,9 @@ mod tests {
             .unwrap();
         let debt = s.recovery_scope_snapshots(prior.id).unwrap();
         assert_eq!(
-            debt[0].plan.since_seconds, None,
-            "an unresolved earlier goal has no proven lower bound"
+            debt[0].plan.since_seconds,
+            scope().since_seconds,
+            "cold-start history is bounded by the compared window"
         );
         let (revision, attempt, _) = reserve(&s, 100_000, vec![scope()]);
         assert!(
@@ -826,17 +823,32 @@ mod tests {
             )
             .unwrap()
         );
+        // The slot settlement proves nothing; only certificates close the debt.
         assert!(
             s.pending_recovery_demands()
                 .unwrap()
                 .iter()
                 .any(|d| d.ticket.id == prior.id)
         );
+        // A goal stored without a bound takes the next join's window.
+        let mut unbounded = scope();
+        unbounded.since_seconds = None;
+        let fresh = storage();
+        fresh
+            .join_recovery_comparison(&[1; 16], 100_000, &[unbounded])
+            .unwrap();
+        let mut later = scope();
+        later.since_seconds = Some(40);
+        later.until_seconds = 150;
+        fresh
+            .join_recovery_comparison(&[2; 16], 150_000, &[later])
+            .unwrap();
+        let debt = fresh.pending_recovery_demands().unwrap();
         assert_eq!(
-            s.recovery_scope_snapshots(prior.id).unwrap()[0]
+            fresh.recovery_scope_snapshots(debt[0].ticket.id).unwrap()[0]
                 .plan
                 .since_seconds,
-            None
+            Some(40)
         );
     }
 }
