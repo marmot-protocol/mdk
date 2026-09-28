@@ -27,7 +27,7 @@ tracing.workspace = true
 transport-nostr-peeler.workspace = true
 
 [dev-dependencies]
-nostr-memory = { git = "https://github.com/erskingardner/rust-nostr", rev = "63384e485d55097cb3d9e57a2146f453a5742570" }
+nostr-memory = { git = "https://github.com/erskingardner/rust-nostr", rev = "a9c7a6423d104c603de6ea8244265ea17f0f9d89" }
 nostr-relay-builder.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
 tokio-tungstenite = "0.26"

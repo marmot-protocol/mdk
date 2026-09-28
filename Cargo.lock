@@ -3887,7 +3887,7 @@ dependencies = [
 [[package]]
 name = "nostr"
 version = "0.45.5"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=63384e485d55097cb3d9e57a2146f453a5742570#63384e485d55097cb3d9e57a2146f453a5742570"
+source = "git+https://github.com/erskingardner/rust-nostr?rev=a9c7a6423d104c603de6ea8244265ea17f0f9d89#a9c7a6423d104c603de6ea8244265ea17f0f9d89"
 dependencies = [
  "aes",
  "base64",
@@ -3924,7 +3924,7 @@ dependencies = [
 [[package]]
 name = "nostr-database"
 version = "0.45.2"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=63384e485d55097cb3d9e57a2146f453a5742570#63384e485d55097cb3d9e57a2146f453a5742570"
+source = "git+https://github.com/erskingardner/rust-nostr?rev=a9c7a6423d104c603de6ea8244265ea17f0f9d89#a9c7a6423d104c603de6ea8244265ea17f0f9d89"
 dependencies = [
  "nostr 0.45.5",
  "opaquerr",
@@ -3933,7 +3933,7 @@ dependencies = [
 [[package]]
 name = "nostr-gossip"
 version = "0.45.1"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=63384e485d55097cb3d9e57a2146f453a5742570#63384e485d55097cb3d9e57a2146f453a5742570"
+source = "git+https://github.com/erskingardner/rust-nostr?rev=a9c7a6423d104c603de6ea8244265ea17f0f9d89#a9c7a6423d104c603de6ea8244265ea17f0f9d89"
 dependencies = [
  "nostr 0.45.5",
  "opaquerr",
@@ -3942,7 +3942,7 @@ dependencies = [
 [[package]]
 name = "nostr-memory"
 version = "0.45.2"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=63384e485d55097cb3d9e57a2146f453a5742570#63384e485d55097cb3d9e57a2146f453a5742570"
+source = "git+https://github.com/erskingardner/rust-nostr?rev=a9c7a6423d104c603de6ea8244265ea17f0f9d89#a9c7a6423d104c603de6ea8244265ea17f0f9d89"
 dependencies = [
  "btreecap",
  "nostr 0.45.5",
@@ -3970,7 +3970,7 @@ dependencies = [
 [[package]]
 name = "nostr-sdk"
 version = "0.45.4"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=63384e485d55097cb3d9e57a2146f453a5742570#63384e485d55097cb3d9e57a2146f453a5742570"
+source = "git+https://github.com/erskingardner/rust-nostr?rev=a9c7a6423d104c603de6ea8244265ea17f0f9d89#a9c7a6423d104c603de6ea8244265ea17f0f9d89"
 dependencies = [
  "async-utility",
  "async-wsocket 0.17.0",
