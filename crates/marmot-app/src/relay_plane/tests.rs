@@ -2918,13 +2918,21 @@ fn cursor_floor_adapter(
     store: Option<AccountDeliverySpillStore>,
     marker: Option<AccountDeliveryRecoveryMarker>,
 ) -> (MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MemberId) {
+    cursor_floor_adapter_opened(store, marker, Some(OPENED_CURSOR))
+}
+
+fn cursor_floor_adapter_opened(
+    store: Option<AccountDeliverySpillStore>,
+    marker: Option<AccountDeliveryRecoveryMarker>,
+    opened: Option<u64>,
+) -> (MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MemberId) {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane =
         MarmotRelayPlane::new(Some(Duration::from_secs(CURSOR_LOOKBACK)), relay.clone());
     let alice = MemberId::new(vec![0xA1; 32]);
     let adapter =
         relay_plane.account_adapter_with_recovery_marker(alice.clone(), relay, marker, store);
-    adapter.open_transport_cursor(Some(OPENED_CURSOR));
+    adapter.open_transport_cursor(opened);
     (relay_plane, adapter, alice)
 }
 
@@ -3291,6 +3299,69 @@ async fn a_fenced_settled_commit_keeps_spilling_what_live_promotion_exposed() {
     .expect("the spill writer settles the second hand-off");
     assert_eq!(kept.lock().unwrap().len(), 2);
     assert!(drain_queued_created_at(&adapter).is_empty());
+}
+
+/// An account that never persisted a cursor has no floor at all. A delivery
+/// queued before its first seal still caps it. Once that seal raised the
+/// durable floor, every older arrival is spilled, however old, until a
+/// settled cursor exists: before it, a restart relied on its comparison, not
+/// the cursor, for everything.
+#[tokio::test]
+async fn before_the_first_settled_cursor_a_seal_spills_every_older_arrival() {
+    let (store, kept) = recording_spill_store();
+    let (relay_plane, adapter, alice) = cursor_floor_adapter_opened(Some(store), None, None);
+    let route = |id: u8, created_at: u64| {
+        relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+            &alice,
+            id,
+            created_at,
+            TransportDeliveryPlane::Group,
+        ));
+    };
+    let settles = || async {
+        timeout(Duration::from_secs(5), async {
+            while adapter.delivery_loss_blocks_cursor() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the spill writer settles the hand-off");
+    };
+    let candidate = Some(OPENED_CURSOR + 2_000);
+    route(1, OPENED_CURSOR + 500);
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate),
+        Some(OPENED_CURSOR + 500 + CURSOR_LOOKBACK),
+        "with no floor yet, every queued delivery caps the first seal"
+    );
+    assert_eq!(drain_queued_created_at(&adapter), [OPENED_CURSOR + 500]);
+    assert_eq!(adapter.seal_transport_cursor(candidate), candidate);
+    assert!(!adapter.transport_cursor_settled());
+
+    route(2, OPENED_CURSOR - 50_000);
+    route(3, OPENED_CURSOR + 2_000 - CURSOR_LOOKBACK);
+    settles().await;
+    assert_eq!(
+        kept.lock()
+            .unwrap()
+            .iter()
+            .map(|delivery| delivery.message.timestamp.0)
+            .collect::<Vec<_>>(),
+        [OPENED_CURSOR - 50_000],
+        "an arrival below the durable floor is spilled with no settled floor under it"
+    );
+    assert_eq!(
+        drain_queued_created_at(&adapter),
+        [OPENED_CURSOR + 2_000 - CURSOR_LOOKBACK]
+    );
+
+    // A settled commit sets the settled floor, below which arrivals are
+    // queued again, as they always were.
+    adapter.settle_transport_cursor(candidate);
+    assert!(adapter.transport_cursor_settled());
+    route(4, OPENED_CURSOR - 40_000);
+    assert_eq!(drain_queued_created_at(&adapter), [OPENED_CURSOR - 40_000]);
+    assert_eq!(kept.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

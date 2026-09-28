@@ -1092,10 +1092,16 @@ impl AppClient {
 
     /// Whether a live ingest may promote the transport cursor with its own
     /// save: the cursor advances, restarts rebuild from it, no loss is
-    /// pending, and every account subscription finished replaying stored
-    /// history. Relays replay newest-first, so a promotion mid-replay would
-    /// leave the rest of the replay below the restart floor, and all of it
-    /// would go to the spill.
+    /// pending, the account has a settled cursor floor, and every account
+    /// subscription finished replaying stored history. Relays replay
+    /// newest-first, so a promotion mid-replay would leave the rest of the
+    /// replay below the restart floor, and all of it would go to the spill.
+    ///
+    /// An account that has never persisted a cursor has no settled floor, so
+    /// a live promotion would spill every older arrival until its first drain
+    /// checkpoint, such as the whole history of each group it joins. It holds
+    /// no history a restart would re-download, so it waits for that
+    /// checkpoint instead, as it did before live promotion existed.
     async fn live_cursor_promotion_ready(&self) -> bool {
         self.app.cursor_persistence() == CursorPersistence::Advance
             && self
@@ -1103,6 +1109,7 @@ impl AppClient {
                 .subscription_rebuild_lookback_secs()
                 .is_some()
             && !self.delivery_loss_blocks_cursor()
+            && self.adapter.transport_cursor_settled()
             && self.adapter.account_subscription_eose().await.complete()
     }
 
@@ -6513,6 +6520,108 @@ mod live_cursor_checkpoint_tests {
             );
             fixture.wait_for_spilled(&late.id).await;
             fixture.reopen_and_admit_spilled(&late.id).await;
+        });
+    }
+
+    /// Before its first cursor an account's restart relies on its
+    /// comparison for everything, so the first cursor it persists stops a
+    /// restart from fetching any older delivery, however old. One that
+    /// arrives while that first checkpoint saves is spilled, and a stop still
+    /// admits it.
+    #[test]
+    fn an_older_arrival_during_an_accounts_first_checkpoint_survives_a_stop() {
+        run_composed_app_runtime_test("first-cursor-arrival-during-save", || async {
+            let mut fixture = LiveCursorFixture::open_without_cursor().await;
+            let cursor_before = fixture.cursor_before;
+            let drained = fixture
+                .delivery(fixture.probe(cursor_before + 4_000, "drained"))
+                .await;
+            fixture
+                .client
+                .admit_recovered_delivery(drained)
+                .await
+                .unwrap();
+            assert_eq!(fixture.persisted(), None);
+
+            let late_at = cursor_before + 1_000;
+            let late = fixture.probe(late_at, "late");
+            let delivery = fixture.delivery(late.clone()).await;
+            fixture.land_during_seal(crate::client::CursorSeal::After, delivery);
+            fixture
+                .client
+                .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 1)
+                .await
+                .unwrap_or_else(|_| panic!("the checkpoint saves"));
+
+            let persisted = fixture.persisted();
+            assert_eq!(persisted, Some(cursor_before + 4_000));
+            assert!(
+                fixture
+                    .app
+                    .relay_plane
+                    .subscription_rebuild_since(persisted)
+                    .is_some_and(|since| since.0 > late_at),
+                "the regression needs a restart floor above the late delivery"
+            );
+            assert!(
+                fixture
+                    .client
+                    .adapter
+                    .try_receive_account_delivery()
+                    .is_none(),
+                "the queue never holds a delivery below the first cursor's floor"
+            );
+            fixture.wait_for_spilled(&late.id).await;
+            fixture.reopen_and_admit_spilled(&late.id).await;
+        });
+    }
+
+    /// An account that never persisted a cursor does not promote it live: it
+    /// would have to spill every older arrival, such as each joined group's
+    /// history, until a settled floor exists. Its first drain checkpoint
+    /// sets one, capped by what is still queued, and live promotion follows.
+    #[test]
+    fn a_new_account_promotes_live_only_after_its_first_drain_checkpoint() {
+        run_composed_app_runtime_test("first-cursor-live-waits", || async {
+            let mut fixture = LiveCursorFixture::open_without_cursor().await;
+            let cursor_before = fixture.cursor_before;
+            crate::tests::inject_epoch_gap_probe(
+                &fixture.app,
+                fixture.probe(cursor_before + 4_000, "live"),
+            )
+            .await;
+            fixture.wait_for_queue_depth(1).await;
+            fixture.ingest_next_live_delivery().await;
+            assert_eq!(
+                fixture.client.state.last_transport_timestamp,
+                Some(cursor_before + 4_000)
+            );
+            assert_eq!(
+                fixture.persisted(),
+                None,
+                "no live promotion before a settled floor"
+            );
+
+            // Queued before the first seal, below any floor, it caps it.
+            crate::tests::inject_epoch_gap_probe(
+                &fixture.app,
+                fixture.probe(cursor_before + 1_000, "queued"),
+            )
+            .await;
+            fixture.wait_for_queue_depth(1).await;
+            fixture
+                .client
+                .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 0)
+                .await
+                .unwrap_or_else(|_| panic!("the checkpoint saves"));
+            assert_eq!(fixture.persisted(), Some(cursor_before + 1_000 + 120));
+
+            fixture.ingest_next_live_delivery().await;
+            assert_eq!(
+                fixture.persisted(),
+                Some(cursor_before + 4_000),
+                "once a settled floor exists the next live ingest promotes"
+            );
         });
     }
 }

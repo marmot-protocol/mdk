@@ -302,8 +302,10 @@ struct AccountDeliveryAdmission {
     /// design without live promotion would have it. A delivery keyed between
     /// the two is one that only a live promotion, or a commit still saving,
     /// stopped a restart from fetching, so the router spills it instead of
-    /// queueing it. `None` until the account has a cursor: until then a
-    /// restart relies on its comparison, not the cursor, for everything.
+    /// queueing it. `None` until the account's first settled cursor: before
+    /// any cursor a restart relied on its comparison, not the cursor, for
+    /// everything, so while this is `None` every delivery below
+    /// `durable_since` is spilled.
     settled_since: Option<u64>,
 }
 
@@ -399,11 +401,12 @@ impl AccountDeliveryOverflowState {
     }
 
     /// Decide where one delivery goes, under the lock every cursor commit
-    /// decides under. A full queue, or a key between the settled and durable
-    /// floors, sends it to the spill, or to loss when there is none. A
-    /// spilled delivery is counted in the cursor fence here, before the
-    /// hand-off holds it, so no commit can pass it while it is in neither
-    /// place.
+    /// decides under. A full queue, or a key below the durable floor and not
+    /// below the settled one, sends it to the spill, or to loss when there is
+    /// none. Before the first settled cursor every key below the durable
+    /// floor goes there. A spilled delivery is counted in the cursor fence
+    /// here, before the hand-off holds it, so no commit can pass it while it
+    /// is in neither place.
     fn place(
         &self,
         epoch: u64,
@@ -413,10 +416,9 @@ impl AccountDeliveryOverflowState {
     ) -> AccountDeliveryPlacement {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let admission = &mut state.admission;
-        let below_durable_floor = matches!(
-            (admission.settled_since, admission.durable_since),
-            (Some(settled), Some(durable)) if settled <= key && key < durable
-        );
+        let below_durable_floor = admission.durable_since.is_some_and(|durable| {
+            key < durable && admission.settled_since.is_none_or(|settled| settled <= key)
+        });
         if !queue_full && !below_durable_floor {
             if admission.epoch == epoch {
                 *admission.queued.entry(key).or_default() += 1;
@@ -3220,6 +3222,20 @@ impl MarmotRelayPlaneAccountAdapter {
     pub(crate) fn open_transport_cursor(&self, persisted: Option<u64>) {
         self.delivery_overflow
             .settle_cursor(self.cursor_lookback_secs(), persisted, true);
+    }
+
+    /// Whether the account has a settled cursor floor: the one it opened
+    /// with, or one a drain checkpoint, settled loss or retired notice made
+    /// durable. Only the account worker settles, so this cannot change
+    /// between the worker's read and its next seal.
+    pub(crate) fn transport_cursor_settled(&self) -> bool {
+        self.delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admission
+            .settled_since
+            .is_some()
     }
 
     /// Process-local overflow evidence becomes visible at the exact omission,

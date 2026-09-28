@@ -173,8 +173,9 @@ App runtime bridge for the first real Marmot app surfaces.
   `state.last_transport_timestamp`. The seal runs under the lock the router places each delivery under, so it is the
   commit's one decision point: it returns nothing while loss or a spill hand-off is pending, caps the commit at the
   lowest queued delivery a restart still fetches, and raises the restart floor before the save, so the router spills a
-  delivery that arrives during the save and falls below it. A live ingest promotes with its own save only after every
-  account subscription reported EOSE, and leaves the floor raised. A drain checkpoint, settled loss or retired notice
+  delivery that arrives during the save and falls below it; before the account's first settled floor that is every
+  older delivery. A live ingest promotes with its own save only after every account subscription reported EOSE and
+  once the account has a settled floor, and leaves the floor raised. A drain checkpoint, settled loss or retired notice
   confirms what its seal reached with `settle_transport_cursor` once its save succeeds, which ends the spilling. Every
   failed save undoes its seal with `abandon_transport_cursor`. Keep every condition cursor safety relies on inside the
   seal: anything read before an `.await` or a save is stale by the time that save commits. See

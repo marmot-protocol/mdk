@@ -245,7 +245,11 @@ A live ingest's own save now promotes the cursor to what the account ingested, w
 - every account subscription reported end-of-stored-events (relays replay newest-first, so
   promoting mid-replay would put the rest of the replay below the new floor);
 - no loss or spill hand-off is pending, as for any other checkpoint;
-- the cursor advances (not a frozen wake pass) and restarts rebuild from it.
+- the cursor advances (not a frozen wake pass) and restarts rebuild from it;
+- the account has a settled floor (below). An account that has never persisted a cursor
+  waits for its first drain checkpoint, as before. It holds no history a restart would
+  re-download, and promoting first would spill every older arrival until that
+  checkpoint, such as the whole history of each group it joins.
 
 The rule it keeps: the account queue never holds a delivery that a restart would no longer
 fetch only because a live ingest promoted the cursor, or because a cursor commit was saving
@@ -269,6 +273,10 @@ already holds when it places a delivery in the queue, the spill or loss:
   what arrives while it saves. A live promotion leaves it, so what only the promotion
   exposed keeps going to the spill. A delivery below the settled floor is exposed exactly
   as before live promotion existed, and one above the raised floor is still fetched.
+  Before an account's first settled floor there is nothing below: a restart without a
+  cursor relied on its comparison, not the cursor, for everything, so the first raised
+  floor spills every older arrival, however old. A delivery queued before that first seal
+  caps it like any other.
 
 So a delivery that arrives during the EOSE read caps the promotion, and one that arrives
 while any commit saves is spilled. A settled commit raises the settled floor only to what

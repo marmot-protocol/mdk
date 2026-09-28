@@ -13711,9 +13711,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
     });
 }
 
-/// One account that opened with `cursor_before` persisted, owns a group, and
-/// has every subscription past end-of-stored-events, so live ingests may
-/// promote its transport cursor.
+/// One account that opened with `cursor_before` persisted (unless opened
+/// without a cursor), owns a group, and has every subscription past
+/// end-of-stored-events, so live ingests may promote its transport cursor.
 pub(crate) struct LiveCursorFixture {
     pub(crate) app: MarmotApp,
     pub(crate) client: crate::AppClient,
@@ -13726,6 +13726,20 @@ pub(crate) struct LiveCursorFixture {
 
 impl LiveCursorFixture {
     pub(crate) async fn open() -> Self {
+        let fixture = Self::open_with_cursor(true).await;
+        assert_eq!(fixture.persisted(), Some(fixture.cursor_before));
+        fixture
+    }
+
+    /// The same account before it has ever persisted a transport cursor.
+    /// `cursor_before` is then only a reference time for probes.
+    pub(crate) async fn open_without_cursor() -> Self {
+        let fixture = Self::open_with_cursor(false).await;
+        assert_eq!(fixture.persisted(), None);
+        fixture
+    }
+
+    async fn open_with_cursor(seed_cursor: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
@@ -13740,9 +13754,11 @@ impl LiveCursorFixture {
         );
         let cursor_before = crate::unix_now_seconds().saturating_sub(10_000);
         app.ensure_account_state("alice").unwrap();
-        let mut seeded = app.load_state("alice").unwrap();
-        seeded.last_transport_timestamp = Some(cursor_before);
-        app.save_state(&seeded).unwrap();
+        if seed_cursor {
+            let mut seeded = app.load_state("alice").unwrap();
+            seeded.last_transport_timestamp = Some(cursor_before);
+            app.save_state(&seeded).unwrap();
+        }
         let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client.create_group("live cursor", &[]).await.unwrap();
@@ -13759,7 +13775,7 @@ impl LiveCursorFixture {
         })
         .await
         .expect("every subscription finishes replaying stored history");
-        let fixture = Self {
+        Self {
             app,
             client,
             account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
@@ -13767,9 +13783,7 @@ impl LiveCursorFixture {
             cursor_before,
             _eose: eose,
             _dir: dir,
-        };
-        assert_eq!(fixture.persisted(), Some(cursor_before));
-        fixture
+        }
     }
 
     pub(crate) fn persisted(&self) -> Option<u64> {

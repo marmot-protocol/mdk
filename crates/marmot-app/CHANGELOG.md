@@ -47,7 +47,8 @@
   `RelayPlaneHealth` reports `account_delivery_spilled` and
   `account_delivery_spill_already_seen`. (#1947)
 - A live delivery now promotes the persisted transport cursor with its own checkpoint, once
-  every account subscription has replayed its stored history and no loss is pending. Only a
+  every account subscription has replayed its stored history and no loss is pending. An
+  account that has never persisted a cursor waits for its first drain checkpoint. Only a
   drain checkpoint or settled loss used to, so a restart re-downloaded everything the
   account had received live since its last drain: on the #2069 scorecard, a full pass of the
   account's history on each relay. No checkpoint passes a queued delivery that a restart

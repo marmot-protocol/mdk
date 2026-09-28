@@ -455,7 +455,8 @@ pub struct AppClient {
     /// The transport cursor every save persists. `state` holds the ingested
     /// maximum; this moves only through a seal under the router's placement
     /// lock: at a drain checkpoint or settled loss, or with a live ingest's
-    /// own save once every subscription finished replaying stored history.
+    /// own save once every subscription finished replaying stored history
+    /// and the account has a settled cursor floor.
     /// The seal never passes a queued delivery a restart would then no
     /// longer fetch, and the router spills an arrival that falls below the
     /// floor it raised: during the commit's save, and after a live one.
