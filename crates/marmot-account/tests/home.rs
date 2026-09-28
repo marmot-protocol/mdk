@@ -185,6 +185,67 @@ fn setup_phase_update_fails_when_journal_is_missing() {
     ));
 }
 
+/// Runtime readiness polls read the journal while background setup advances
+/// it. Holding a reader's handle across the phase write pins the widest race
+/// window deterministically: the reader must still see one complete journal.
+#[cfg(unix)]
+#[test]
+fn setup_phase_update_leaves_an_open_journal_reader_a_complete_record() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account_for_setup().unwrap();
+    let journal = home.account_dir(&account.label).join(".account-setup.json");
+    let mut reader = std::fs::File::open(&journal).unwrap();
+
+    home.set_account_setup_phase(&account.label, AccountSetupPhase::LocalReady)
+        .unwrap();
+
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    let observed: AccountSetupState = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(observed.phase, AccountSetupPhase::LocalStateCreated);
+    assert_eq!(
+        home.account_setup_state(&account.label)
+            .unwrap()
+            .unwrap()
+            .phase,
+        AccountSetupPhase::LocalReady
+    );
+    assert_eq!(
+        std::fs::metadata(&journal).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+/// Readiness also reads the onboarding checkpoint, which every onboarding step
+/// rewrites. An open reader must keep the whole previous checkpoint.
+#[cfg(unix)]
+#[test]
+fn onboarding_checkpoint_rewrite_leaves_an_open_reader_the_previous_checkpoint() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+    home.set_account_onboarding(&account.label, br#"{"revision":1}"#)
+        .unwrap();
+    let checkpoint = home.account_dir(&account.label).join("onboarding.json");
+    let mut reader = std::fs::File::open(&checkpoint).unwrap();
+
+    home.set_account_onboarding(&account.label, br#"{"revision":2}"#)
+        .unwrap();
+
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, br#"{"revision":1}"#);
+    assert_eq!(
+        home.account_onboarding(&account.label).unwrap().unwrap(),
+        br#"{"revision":2}"#
+    );
+}
+
 #[test]
 fn generated_setup_context_is_private_and_removed_with_the_journal() {
     let dir = tempfile::tempdir().unwrap();

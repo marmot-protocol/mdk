@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::io::{
-    read_json, validate_account_label, write_json, write_secret_bytes, write_secret_json,
+    read_json, validate_account_label, write_json, write_private_bytes, write_private_json,
 };
 use crate::secret_store::{
     AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
@@ -590,7 +590,7 @@ impl AccountHome {
             return Err(AccountHomeError::AccountIdMismatch);
         }
         state.phase = phase;
-        write_secret_json(self.account_setup_state_path(&account.label), &state)
+        write_private_json(self.account_setup_state_path(&account.label), &state)
     }
 
     fn write_account_setup_state(
@@ -599,7 +599,7 @@ impl AccountHome {
         state: &AccountSetupState,
     ) -> AccountHomeResult<()> {
         validate_account_label(label)?;
-        write_secret_json(self.account_setup_state_path(label), state)
+        write_private_json(self.account_setup_state_path(label), state)
     }
 
     pub fn complete_account_setup(&self, account_ref: &str) -> AccountHomeResult<()> {
@@ -629,7 +629,7 @@ impl AccountHome {
         if self.raw_account_setup_state(&account.label)?.is_none() {
             return Err(AccountHomeError::AccountSetupStateMissing);
         }
-        write_secret_bytes(self.account_setup_context_path(&account.label), bytes)
+        write_private_bytes(self.account_setup_context_path(&account.label), bytes)
     }
 
     pub fn account_setup_context(&self, account_ref: &str) -> AccountHomeResult<Option<Vec<u8>>> {
@@ -647,7 +647,7 @@ impl AccountHome {
     /// to their schema or to the onboarding policy.
     pub fn set_account_onboarding(&self, account_ref: &str, bytes: &[u8]) -> AccountHomeResult<()> {
         let account = self.account(account_ref)?;
-        write_secret_bytes(
+        write_private_bytes(
             self.account_dir(&account.label).join("onboarding.json"),
             bytes,
         )
@@ -693,7 +693,7 @@ impl AccountHome {
         bytes: &[u8],
     ) -> AccountHomeResult<()> {
         let account = self.account(account_ref)?;
-        write_secret_bytes(
+        write_private_bytes(
             self.account_dir(&account.label)
                 .join("onboarding-recovery.json"),
             bytes,
@@ -729,7 +729,7 @@ impl AccountHome {
             return Err(AccountHomeError::AccountExists(account.label));
         }
         let directory = self.account_dir(&account.label);
-        write_secret_bytes(directory.join("onboarding.json"), tombstone)?;
+        write_private_bytes(directory.join("onboarding.json"), tombstone)?;
         fs::rename(
             directory.join("onboarding.json"),
             directory.join("onboarding-cancelled.json"),

@@ -1,7 +1,6 @@
 //! Account secret storage: the `AccountSecretStore` trait and its file- and
 //! keychain-backed implementations.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -9,7 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::home::{ACCOUNT_SECRET_FILE, AccountSummary, LOCAL_FILE_SECRET_BACKEND};
-use crate::io::{overwrite_file_with_zeros, read_secret_json, write_secret_json};
+use crate::io::{read_secret_json, remove_file_then_scrub, write_secret_json};
 #[cfg(target_os = "ios")]
 use crate::keyring::build_legacy_ios_keyring_entry;
 use crate::keyring::{
@@ -135,33 +134,22 @@ impl AccountSecretStore for LocalFileSecretStore {
     }
 }
 
-/// Best-effort overwrite of the local secret file's bytes before unlinking it.
+/// Best-effort overwrite of the local secret file's bytes as it is unlinked.
 ///
 /// The plaintext signing key sits at rest in this file, so deleting it with a
 /// bare `fs::remove_file` would leave the key hex recoverable in freed disk
-/// blocks. We first overwrite the file contents with zeros and `fsync`, then
-/// unlink. A missing file is treated as already-removed (`NotFound -> Ok`) to
-/// preserve idempotent removal semantics.
+/// blocks. We unlink it, then overwrite the removed inode with zeros and
+/// `fsync` through a handle opened before the unlink, so a concurrent reader
+/// never parses a zeroed file that is still linked (see
+/// [`remove_file_then_scrub`]). A missing file is treated as already-removed
+/// (`NotFound -> Ok`) to preserve idempotent removal semantics.
 ///
 /// The scrub is best-effort: on some filesystems (copy-on-write, log-structured,
 /// SSD wear-leveling) an in-place overwrite does not necessarily reach the
 /// original physical blocks. This narrows the residue window for the dev-only
 /// local-file backend without claiming a guaranteed secure erase.
 pub(crate) fn scrub_and_remove_local_secret_file(path: &Path) -> AccountHomeResult<()> {
-    match overwrite_file_with_zeros(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        // The overwrite is best-effort: if it fails for any other reason we
-        // still fall through to the unlink so removal is not blocked, but the
-        // unlink error (if any) is the one we surface.
-        Err(_) => {}
-    }
-
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
+    Ok(remove_file_then_scrub(path)?)
 }
 
 #[derive(Clone, Debug)]
@@ -357,6 +345,8 @@ pub(crate) fn stored_secret_backend() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::overwrite_file_with_zeros;
+    use std::fs;
 
     #[test]
     fn overwrite_file_with_zeros_replaces_all_bytes_in_place() {

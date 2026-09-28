@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,6 +12,9 @@ use zeroize::Zeroizing;
 use crate::error::{AccountHomeError, AccountHomeResult};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Bound on re-reads of a secret file that keeps being replaced mid-read.
+const SECRET_READ_ATTEMPTS: usize = 8;
 
 pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(
     path: impl AsRef<Path>,
@@ -23,8 +26,43 @@ pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(
 pub(crate) fn read_secret_json<T: for<'de> Deserialize<'de>>(
     path: impl AsRef<Path>,
 ) -> AccountHomeResult<T> {
-    let bytes = Zeroizing::new(fs::read(path)?);
+    let bytes = read_linked_secret(path.as_ref(), || {})?;
     Ok(serde_json::from_slice(bytes.as_slice())?)
+}
+
+/// Read key material that a concurrent [`FileMode::Secret`] replacement or
+/// [`remove_file_then_scrub`] may race.
+///
+/// Both zero the old inode after unlinking it, so a reader that opened it
+/// first can read zeros. A read counts only if its inode was still linked once
+/// the read finished, which puts it before that scrub. `after_open` lets tests
+/// replace the file inside that window.
+fn read_linked_secret(path: &Path, mut after_open: impl FnMut()) -> io::Result<Zeroizing<Vec<u8>>> {
+    for _ in 0..SECRET_READ_ATTEMPTS {
+        let mut file = File::open(path)?;
+        after_open();
+        let mut bytes = Zeroizing::new(Vec::new());
+        file.read_to_end(&mut bytes)?;
+        if still_linked(&file)? {
+            return Ok(bytes);
+        }
+    }
+    Err(io::Error::other(
+        "secret file was replaced during every read",
+    ))
+}
+
+#[cfg(unix)]
+fn still_linked(file: &File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(file.metadata()?.nlink() > 0)
+}
+
+/// Without a portable link count, other platforms accept every read.
+#[cfg(not(unix))]
+fn still_linked(_file: &File) -> io::Result<bool> {
+    Ok(true)
 }
 
 pub(crate) fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> AccountHomeResult<()> {
@@ -32,22 +70,38 @@ pub(crate) fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Acc
     write_file_atomically(path.as_ref(), &bytes, FileMode::Public)
 }
 
+pub(crate) fn write_private_json<T: Serialize>(
+    path: impl AsRef<Path>,
+    value: &T,
+) -> AccountHomeResult<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    write_file_atomically(path.as_ref(), &bytes, FileMode::Private)
+}
+
+pub(crate) fn write_private_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> AccountHomeResult<()> {
+    write_file_atomically(path.as_ref(), bytes, FileMode::Private)
+}
+
+/// Key material only: read it back with [`read_secret_json`].
 pub(crate) fn write_secret_json<T: Serialize>(
     path: impl AsRef<Path>,
     value: &T,
 ) -> AccountHomeResult<()> {
     let bytes = Zeroizing::new(serde_json::to_vec_pretty(value)?);
-    write_file_atomically(path.as_ref(), bytes.as_slice(), FileMode::Private)
+    write_file_atomically(path.as_ref(), bytes.as_slice(), FileMode::Secret)
 }
 
-pub(crate) fn write_secret_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> AccountHomeResult<()> {
-    write_file_atomically(path.as_ref(), bytes, FileMode::Private)
-}
-
+/// Every mode publishes by renaming a synced temp file over the target, so on
+/// Unix a reader sees the complete previous file or the complete new one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileMode {
     Public,
+    /// Owner-only. The replaced inode is left intact for readers that still
+    /// hold it open.
     Private,
+    /// Owner-only key material. Failed temp files and the replaced inode are
+    /// zeroed, so readers must reject reads of an unlinked inode.
+    Secret,
 }
 
 fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHomeResult<()> {
@@ -62,7 +116,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         file.write_all(bytes)?;
 
         #[cfg(unix)]
-        if mode == FileMode::Private {
+        if mode != FileMode::Public {
             use std::os::unix::fs::PermissionsExt;
 
             let mut permissions = file.metadata()?.permissions();
@@ -73,7 +127,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         file.sync_all()?;
         drop(file);
 
-        let mut replaced_private_file = if mode == FileMode::Private {
+        let mut replaced_secret_file = if mode == FileMode::Secret {
             match open_file_for_zero_overwrite(path) {
                 Ok(file) => Some(file),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => None,
@@ -86,7 +140,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         // The handle still refers to the replaced inode after the atomic rename,
         // so scrub it without creating a window where the live secret path is
         // zeroed if replacement fails. Best-effort, matching secret deletion.
-        if let Some(file) = &mut replaced_private_file {
+        if let Some(file) = &mut replaced_secret_file {
             let _ = overwrite_open_file_with_zeros(file);
         }
         sync_directory(parent)?;
@@ -94,7 +148,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
     })();
 
     if result.is_err() {
-        if mode == FileMode::Private {
+        if mode == FileMode::Secret {
             let _ = overwrite_file_with_zeros(&temp_path);
         }
         let _ = fs::remove_file(&temp_path);
@@ -103,8 +157,32 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
     result
 }
 
+/// Unlink `path`, then zero the removed inode through a handle opened first.
+///
+/// Readers therefore see the complete file or no file, never a zeroed one
+/// that is still linked. If the unlink fails, the file is zeroed in place
+/// anyway: a failed removal still destroys the key material and surfaces the
+/// error. The scrub is best-effort, and symlinks and hard-linked files are
+/// unlinked unscrubbed.
+pub(crate) fn remove_file_then_scrub(path: &Path) -> io::Result<()> {
+    let mut removed_file = match open_file_for_zero_overwrite(path) {
+        Ok(file) => Some(file),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => None,
+    };
+    let removed = fs::remove_file(path);
+    if let Some(file) = &mut removed_file {
+        let _ = overwrite_open_file_with_zeros(file);
+    }
+    match removed {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
+}
+
 /// Best-effort in-place zero overwrite used before unlinking files that may
-/// contain plaintext key material.
+/// contain plaintext key material and that no reader opens, such as a failed
+/// write's temp file. Live paths go through [`remove_file_then_scrub`].
 pub(crate) fn overwrite_file_with_zeros(path: &Path) -> io::Result<()> {
     let mut file = open_file_for_zero_overwrite(path)?;
     overwrite_open_file_with_zeros(&mut file)
@@ -173,7 +251,7 @@ fn create_temp_file(
         options.write(true).create_new(true);
 
         #[cfg(unix)]
-        if mode == FileMode::Private {
+        if mode != FileMode::Public {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
@@ -234,8 +312,7 @@ pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn secret_write_creates_account_directory_owner_only() {
@@ -251,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_private_atomic_write_scrubs_temp_before_unlink() {
+    fn failed_secret_atomic_write_scrubs_temp_before_unlink() {
         let source = include_str!("io.rs");
         let cleanup = source
             .split("if result.is_err()")
@@ -284,5 +361,131 @@ mod tests {
                 .unwrap()
                 .contains("new-key")
         );
+    }
+
+    /// A reader that opened a private file just before its replacement still
+    /// reads the whole previous version, so it never parses zeros.
+    #[test]
+    fn private_replacement_leaves_open_readers_the_previous_file() {
+        let root = tempfile::tempdir().unwrap();
+        let json_path = root.path().join("account").join("journal.json");
+        let bytes_path = root.path().join("account").join("checkpoint.json");
+        write_private_json(&json_path, &serde_json::json!({ "phase": "old" })).unwrap();
+        write_private_bytes(&bytes_path, br#"{"revision":1}"#).unwrap();
+        let mut json_reader = File::open(&json_path).unwrap();
+        let mut bytes_reader = File::open(&bytes_path).unwrap();
+
+        write_private_json(&json_path, &serde_json::json!({ "phase": "new" })).unwrap();
+        write_private_bytes(&bytes_path, br#"{"revision":2}"#).unwrap();
+
+        let mut previous = Vec::new();
+        json_reader.read_to_end(&mut previous).unwrap();
+        let previous: serde_json::Value = serde_json::from_slice(&previous).unwrap();
+        assert_eq!(previous["phase"], "old");
+        let mut previous = Vec::new();
+        bytes_reader.read_to_end(&mut previous).unwrap();
+        assert_eq!(previous, br#"{"revision":1}"#);
+        assert_eq!(
+            read_json::<serde_json::Value>(&json_path).unwrap()["phase"],
+            "new"
+        );
+        assert_eq!(fs::read(&bytes_path).unwrap(), br#"{"revision":2}"#);
+        for path in [&json_path, &bytes_path] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn secret_read_retries_past_a_replacement_that_scrubbed_its_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "old-key" })).unwrap();
+        let mut opens = 0;
+
+        let bytes = read_linked_secret(&secret_path, || {
+            opens += 1;
+            if opens == 1 {
+                let mut old_inode = File::open(&secret_path).unwrap();
+                write_secret_json(&secret_path, &serde_json::json!({ "secret": "new-key" }))
+                    .unwrap();
+                let mut scrubbed = Vec::new();
+                old_inode.read_to_end(&mut scrubbed).unwrap();
+                assert!(scrubbed.iter().all(|byte| *byte == 0));
+            }
+        })
+        .unwrap();
+
+        assert_eq!(opens, 2);
+        let secret: serde_json::Value = serde_json::from_slice(bytes.as_slice()).unwrap();
+        assert_eq!(secret["secret"], "new-key");
+    }
+
+    #[test]
+    fn secret_read_reports_a_removal_instead_of_its_scrubbed_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "old-key" })).unwrap();
+
+        let err = read_linked_secret(&secret_path, || {
+            remove_file_then_scrub(&secret_path).unwrap();
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn secret_read_gives_up_rather_than_return_a_scrubbed_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": 0 })).unwrap();
+        let mut replacements = 0;
+
+        let err = read_linked_secret(&secret_path, || {
+            replacements += 1;
+            write_secret_json(&secret_path, &serde_json::json!({ "secret": replacements }))
+                .unwrap();
+        })
+        .unwrap_err();
+
+        assert_eq!(replacements, SECRET_READ_ATTEMPTS);
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn removing_a_secret_unlinks_before_scrubbing() {
+        let source = include_str!("io.rs");
+        let removal = source
+            .split("fn remove_file_then_scrub")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+
+        assert!(
+            removal.find("fs::remove_file").unwrap()
+                < removal.find("overwrite_open_file_with_zeros").unwrap()
+        );
+    }
+
+    #[test]
+    fn removing_a_secret_scrubs_the_removed_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "old-key" })).unwrap();
+        let mut reader = File::open(&secret_path).unwrap();
+
+        remove_file_then_scrub(&secret_path).unwrap();
+
+        assert!(!secret_path.exists());
+        assert_eq!(reader.metadata().unwrap().nlink(), 0);
+        let mut scrubbed = Vec::new();
+        reader.read_to_end(&mut scrubbed).unwrap();
+        assert!(!scrubbed.is_empty());
+        assert!(scrubbed.iter().all(|byte| *byte == 0));
     }
 }

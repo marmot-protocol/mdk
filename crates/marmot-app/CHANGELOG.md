@@ -16,6 +16,13 @@
 
 ### Fixed
 
+- Account setup readiness, setup resume and onboarding reads no longer fail with a JSON
+  parse error (`expected value at line 1 column 1`) when they race a setup-phase or
+  onboarding-checkpoint update. Each atomic replacement of those owner-only files used to
+  zero the previous file afterwards, so a reader that had already opened it could read
+  zeros. Only local signing-key files are still zeroed, and their reader now re-reads
+  instead of parsing a replaced key file.
+
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay
   until a newer event replaces them. (#1973)
