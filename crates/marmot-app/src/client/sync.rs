@@ -166,12 +166,13 @@ impl<const N: usize> From<[TestComparisonResult; N]> for ScriptedComparisons {
     }
 }
 
-/// Overall explicit repair budget. The comparison pass gets the first five
-/// sixths of it (50 s of 60 s): a route still comparing then times out and
-/// the routes that finished come back. The last sixth is reserved for
+/// Explicit repair budget. Waiting for a process credit may take up to one
+/// budget; the job then gets a whole one of its own. The comparison pass gets
+/// its first five sixths (50 s of 60 s): a route still comparing then times
+/// out and the routes that finished come back. The last sixth is reserved for
 /// admitting and checkpointing what they fetched; admission stops at a turn
-/// boundary once the whole budget is spent. Leave headroom inside the public
-/// worker RPC deadline for setup and cleanup.
+/// boundary once the job's whole budget is spent. Both fit well inside the
+/// long worker RPC deadline.
 const FULL_HISTORY_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The share of the repair budget reserved for admission, as a divisor.
@@ -212,19 +213,14 @@ impl FullHistoryRepairControl<'_> {
         self.timeout - self.timeout / FULL_HISTORY_ADMISSION_RESERVE_DIVISOR
     }
 
-    /// Why a finished repair stopped short: cancellation, or a deadline that
-    /// actually cut its comparison pass or admission. A pass that completed
-    /// before the cutoff and was admitted after it did not stop short.
-    pub(crate) fn verdict(
-        &self,
-        hit_deadline: bool,
-    ) -> Option<crate::FullHistoryRepairIncompleteReason> {
-        if (self.cancelled)() {
-            Some(crate::FullHistoryRepairIncompleteReason::Cancelled)
-        } else if hit_deadline {
-            Some(crate::FullHistoryRepairIncompleteReason::Deadline)
-        } else {
-            None
+    /// This control's budget, restarted once the job holds its credit: the
+    /// credit wait is bounded by the caller's own budget, and the pass that
+    /// follows gets a whole one.
+    fn for_job(&self) -> Self {
+        FullHistoryRepairControl {
+            started: Instant::now(),
+            timeout: self.timeout,
+            cancelled: self.cancelled,
         }
     }
 }
@@ -4404,9 +4400,11 @@ impl AppClient {
             )
             .map_err(|error| state_persist(SyncSummary::default(), error))?;
         self.explicit_history_window_certified = false;
-        self.recovery_job_hit_deadline = false;
+        self.recovery_job_network_cut = false;
+        self.recovery_job_admission_expired = false;
+        let job = control.for_job();
         let result = match grant {
-            Some(grant) => self.run_recovery_job(grant, credit, Some(control)).await,
+            Some(grant) => self.run_recovery_job(grant, credit, Some(&job)).await,
             None => Ok(EpochBackfillRunOutcome::Deferred),
         };
         let summary = match &result {
@@ -4419,13 +4417,24 @@ impl AppClient {
         let qualified = storage
             .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
             .map_err(|error| state_persist(summary.clone(), error.into()))?;
-        let reason = control.verdict(self.recovery_job_hit_deadline).unwrap_or(
-            if self.explicit_history_window_certified {
-                crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow
+        // The certified window wins over the clock: a pass that finished,
+        // however late, is judged on its routes. Only cancellation, admission
+        // cut at the whole budget, or a network cutoff that left the window
+        // uncertified reports otherwise.
+        let reason = {
+            use crate::FullHistoryRepairIncompleteReason as Reason;
+            if job.cancelled() {
+                Reason::Cancelled
+            } else if self.recovery_job_admission_expired {
+                Reason::Deadline
+            } else if self.explicit_history_window_certified {
+                Reason::BelowRetentionWindow
+            } else if self.recovery_job_network_cut {
+                Reason::Deadline
             } else {
-                crate::FullHistoryRepairIncompleteReason::CoverageUnproven
-            },
-        );
+                Reason::CoverageUnproven
+            }
+        };
         if result.is_ok()
             && !qualified
             && reason == crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow

@@ -43,8 +43,9 @@
   Otherwise it returns `CoverageUnproven`, `Cancelled` or `Deadline`, and the debt stays
   open for the owner's ordinary retries. The comparison gets the first 50 seconds; routes
   that finished by then are admitted in the last 10, stopping at a turn boundary if the
-  budget runs out. `Deadline` means the cutoff actually cut a route or admission ran out,
-  not merely that the pass finished late. Only cancellation discards what a pass already
+  budget runs out; that budget starts once the repair holds its process credit. A certified
+  window wins over the clock: `Deadline` means admission ran out, or the cutoff cut a
+  route and left the window uncertified. Only cancellation discards what a pass already
   fetched.
 - Account recovery certifies a route on its operated relays only.
   `MarmotAppConfig::recovery_operated_relays` names them and defaults to

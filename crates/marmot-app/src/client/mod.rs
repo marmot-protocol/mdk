@@ -432,10 +432,11 @@ pub struct AppClient {
     /// explicit-history scope it compared. Explicit history reaches below
     /// that window, so this never completes it; it names why it stays open.
     pub(crate) explicit_history_window_certified: bool,
-    /// Whether the last in-place job stopped short at a deadline: its network
-    /// cutoff skipped or timed out a route, or admission reached the whole
-    /// budget. A pass that finished early and was admitted late did not.
-    pub(crate) recovery_job_hit_deadline: bool,
+    /// Whether the last in-place job's network cutoff skipped or timed out a
+    /// route. A pass that finished early and was admitted late was not cut.
+    pub(crate) recovery_job_network_cut: bool,
+    /// Whether the last in-place job's admission stopped at the whole budget.
+    pub(crate) recovery_job_admission_expired: bool,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
     ///

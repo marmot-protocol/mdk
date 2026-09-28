@@ -560,7 +560,7 @@ impl AppClient {
         };
         // Under a repair's control the only network deadline is its cutoff,
         // so a skipped or timed-out route is one that cutoff cut short.
-        self.recovery_job_hit_deadline = control.is_some()
+        self.recovery_job_network_cut = control.is_some()
             && result.routes.iter().any(|route| {
                 matches!(
                     route.result,
@@ -622,7 +622,7 @@ impl AppClient {
                 // durable; the pass certifies nothing, so the debt waits for a
                 // later grant.
                 if let Some(reason) = control.and_then(FullHistoryRepairControl::stopped) {
-                    self.recovery_job_hit_deadline |=
+                    self.recovery_job_admission_expired |=
                         reason == crate::FullHistoryRepairIncompleteReason::Deadline;
                     admission.invalid = true;
                     admission.pending.clear();

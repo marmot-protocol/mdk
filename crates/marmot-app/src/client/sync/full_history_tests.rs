@@ -769,10 +769,10 @@ async fn a_pass_cut_by_the_network_deadline_admits_what_it_fetched() {
     assert!(explicit_pending(&app), "an expired repair keeps its debt");
 }
 
-/// A pass that completes just before the network cutoff and is admitted
-/// after it did not stop short: every route certified its window, so the
-/// repair reports the unsearched history below it and closes its request,
-/// not `Deadline`.
+/// Every route returns before the network cutoff and the pass crosses it only
+/// while admitting. The certified window wins over the clock: the repair
+/// reports the unsearched history below it and closes its request, not
+/// `Deadline`.
 #[tokio::test]
 async fn an_early_pass_admitted_past_the_network_cutoff_is_not_a_deadline() {
     const FETCHED: usize = 24;
@@ -842,5 +842,45 @@ async fn an_early_pass_admitted_past_the_network_cutoff_is_not_a_deadline() {
     assert!(
         !explicit_pending(&app),
         "the completed pass closes its request"
+    );
+}
+
+/// The credit wait does not eat the job's budget. A repair that waits past
+/// its own network cutoff for a credit still runs a whole pass once it holds
+/// one, and a certified window closes the request.
+#[tokio::test]
+async fn a_long_credit_wait_still_closes_a_certified_pass() {
+    use crate::runtime::account_worker::recovery_credits;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    client.test_comparison_results = Some(answered(1));
+    // The budget is 3 s, so a cutoff counted from the call would fall at
+    // 2.5 s; the credit is released only after that.
+    let budget = Duration::from_secs(3);
+    let held = recovery_credits::hold_all_credits_for_test(&client.recovery_credits);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2_800)).await;
+        drop(held);
+    });
+    let started = Instant::now();
+    let failure = client
+        .repair_full_history_with_control(&control(budget, &|| false))
+        .await
+        .unwrap_err();
+    release.await.unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(2_800),
+        "it waited for the credit"
+    );
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((
+            crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
+            false
+        ))
+    );
+    assert!(
+        !explicit_pending(&app),
+        "the certified pass closes its request"
     );
 }
