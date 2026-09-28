@@ -172,14 +172,19 @@ App runtime bridge for the first real Marmot app surfaces.
 - Move `checkpointed_transport_timestamp` only through `AppClient::seal_transport_cursor`, never straight to
   `state.last_transport_timestamp`. The seal runs under the lock the router places each delivery under, so it is the
   commit's one decision point: it returns nothing while loss or a spill hand-off is pending, caps the commit at the
-  lowest queued delivery a restart still fetches, and raises the restart floor before the save, so the router spills a
-  delivery that arrives during the save and falls below it; before the account's first settled floor that is every
-  older delivery. A live ingest promotes with its own save only after every account subscription reported EOSE and
-  once the account has a settled floor, and leaves the floor raised. A drain checkpoint, settled loss or retired notice
-  confirms what its seal reached with `settle_transport_cursor` once its save succeeds, which ends the spilling. Every
-  failed save undoes its seal with `abandon_transport_cursor`. Keep every condition cursor safety relies on inside the
-  seal: anything read before an `.await` or a save is stale by the time that save commits. See
-  `docs/marmot-architecture/further-context/account-recovery.md` section 5.
+  lowest delivery a restart still fetches that is queued or taken and not yet released, and raises the restart floor
+  before the save, so the router spills a delivery that arrives during the save and falls below it; before the
+  account's first settled floor that is every older delivery. A live ingest promotes with its own save only after every
+  account subscription reported EOSE and once the account has a settled floor, and leaves the floor raised. A drain
+  checkpoint, settled loss or retired notice confirms what its seal reached with `settle_transport_cursor` once its save
+  succeeds, which ends the spilling. Every failed save undoes its seal with `abandon_transport_cursor`. Keep every
+  condition cursor safety relies on inside the seal: anything read before an `.await` or a save is stale by the time
+  that save commits. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
+- Every path that takes a delivery from the account queue calls `release_account_delivery` once its ingest returns
+  `Ok`, or when it skips the delivery as already held, and before the save that follows. Never release on an ingest
+  error: the key must keep capping the checkpoint that failure runs, because newest-first replay has usually remembered
+  a newer cursor. A new consumer of the queue that forgets to release holds the cursor back until the queue generation
+  ends; one that releases early lets a failed ingest's checkpoint pass the delivery.
 - Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; relay filtering may affect
   connections, but must not rewrite signed routing state. Relay endpoints pass through the `RelaySafetyPolicy`
   host-safety chokepoint (`src/relay_plane/safety.rs`), and agent-stream broker candidates through

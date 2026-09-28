@@ -260,10 +260,11 @@ already holds when it places a delivery in the queue, the spill or loss:
 
 - **The seal.** Every cursor commit decides its value there, at one point just before its
   save. It keeps the persisted cursor while loss or a hand-off is pending. Otherwise it is
-  capped at the lowest queued key the persisted cursor still covers, plus the lookback.
-  Nothing it relies on can go stale before the decision, which is what broke the first
-  attempt: it read an empty queue, then awaited the EOSE read and the save while the
-  router could queue an older delivery.
+  capped at the lowest key the persisted cursor still covers of a delivery that is queued,
+  or taken and not yet durably ingested, plus the lookback. Nothing it relies on can go
+  stale before the decision, which is what broke the first attempt: it read an empty
+  queue, then awaited the EOSE read and the save while the router could queue an older
+  delivery.
 - **The raised floor.** Every seal raises the restart floor before its save. From then on
   the router sends a delivery whose key falls between the settled floor and that floor to
   the durable spill instead of the queue, or to queue loss bounded by its `created_at`
@@ -287,6 +288,19 @@ spilling every later arrival below a drain's floor would push the rest of a repl
 spill, and a repair drain reads only the queue. A failed save of either kind lowers the
 floor again. A replaced adapter cannot promote: the queue it drains is not the one the
 router tracks.
+
+Taking a delivery from the queue does not end its cap. Its consumer releases it once the
+ingest is durable, or when it drops it on purpose (an event the account already holds, or
+input the account keeps no trace of by design), and always before the save that follows, so
+a committed delivery never holds the cursor back. A failed ingest never releases it. Relays
+replay newest-first, so a catch-up drain or startup receive has usually remembered a newer
+cursor when an older delivery fails, and the checkpoint that failure runs would otherwise
+persist a cursor a restart no longer fetches the failed delivery from, as it did before
+live promotion existed. Kept, the key caps that checkpoint and every later commit until a
+redelivery of the same event is released or the queue generation ends, so a restart, or the
+next generation's subscriptions, start from a cursor no commit moved past it. A resource
+refusal releases like any other completed ingest: as before, it holds back only its own
+timestamp, and its epoch-stall backfill owns the re-fetch.
 
 One window stays open. A spilled delivery is volatile until its spill write commits, which
 is usually right after the save it arrived during, because both use the account database.

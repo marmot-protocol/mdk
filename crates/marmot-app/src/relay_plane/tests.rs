@@ -2936,13 +2936,24 @@ fn cursor_floor_adapter_opened(
     (relay_plane, adapter, alice)
 }
 
-/// Timestamps of the deliveries now in the account queue, in order.
+/// Take the next delivery in the account queue.
+fn take_queued(adapter: &MarmotRelayPlaneAccountAdapter) -> TransportDelivery {
+    match adapter.try_receive_account_delivery() {
+        Some(AccountDeliveryReceive::Delivery(delivery)) => *delivery,
+        Some(AccountDeliveryReceive::Overflow(_)) => panic!("no loss was expected"),
+        None => panic!("a delivery is queued"),
+    }
+}
+
+/// Timestamps of the deliveries now in the account queue, in order, each
+/// taken and released as a durable ingest would.
 fn drain_queued_created_at(adapter: &MarmotRelayPlaneAccountAdapter) -> Vec<u64> {
     let mut queued = Vec::new();
     while let Some(received) = adapter.try_receive_account_delivery() {
         let AccountDeliveryReceive::Delivery(delivery) = received else {
             panic!("no loss was expected");
         };
+        adapter.release_account_delivery(&delivery.message.id);
         queued.push(delivery.message.timestamp.0);
     }
     queued
@@ -2972,8 +2983,12 @@ async fn cursor_seal_stops_where_a_restart_still_fetches_every_queued_delivery()
         Some(OPENED_CURSOR + 500 + CURSOR_LOOKBACK),
         "the oldest queued delivery a restart still fetches caps the commit"
     );
+    let taken = (0..3).map(|_| take_queued(&adapter)).collect::<Vec<_>>();
     assert_eq!(
-        drain_queued_created_at(&adapter),
+        taken
+            .iter()
+            .map(|delivery| delivery.message.timestamp.0)
+            .collect::<Vec<_>>(),
         [
             OPENED_CURSOR - 1_000,
             OPENED_CURSOR + 500,
@@ -2982,8 +2997,16 @@ async fn cursor_seal_stops_where_a_restart_still_fetches_every_queued_delivery()
     );
     assert_eq!(
         adapter.seal_transport_cursor(candidate),
+        Some(OPENED_CURSOR + 500 + CURSOR_LOOKBACK),
+        "a delivery taken but not yet ingested durably still caps a commit"
+    );
+    for delivery in &taken {
+        adapter.release_account_delivery(&delivery.message.id);
+    }
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate),
         candidate,
-        "a delivery the consumer took no longer caps a commit"
+        "a released delivery no longer caps a commit"
     );
     // A later, lower candidate reaches only itself, which its caller folds
     // into the higher cursor it persists; the restart floor stays put.
@@ -3022,6 +3045,106 @@ async fn cursor_seal_stops_where_a_restart_still_fetches_every_queued_delivery()
                 + transport_nostr_adapter::NIP59_TIMESTAMP_TWEAK_SECS
                 + CURSOR_LOOKBACK
         )
+    );
+}
+
+/// Relays replay newest-first, so a drain has already remembered a newer
+/// cursor when an older delivery's ingest fails. That delivery is never
+/// released, so the checkpoint the failure runs, and every later commit,
+/// stops where a restart fetches it again. A redelivery of the same event
+/// takes over its pin, and once that redelivery is ingested nothing holds the
+/// cursor back.
+#[tokio::test]
+async fn a_delivery_whose_ingest_failed_caps_commits_until_a_redelivery_is_released() {
+    let (store, _) = recording_spill_store();
+    let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
+    let route = |id: u8, created_at: u64| {
+        relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+            &alice,
+            id,
+            created_at,
+            TransportDeliveryPlane::Group,
+        ));
+    };
+    let older_at = OPENED_CURSOR + 1_000;
+    route(1, OPENED_CURSOR + 2_000);
+    route(2, older_at);
+    let newer = take_queued(&adapter);
+    adapter.release_account_delivery(&newer.message.id);
+    let failed = take_queued(&adapter);
+    assert_eq!(failed.message.timestamp.0, older_at);
+
+    let capped = Some(older_at + CURSOR_LOOKBACK);
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 2_000)),
+        capped,
+        "the failed ingest's checkpoint stops where a restart fetches it"
+    );
+    adapter.settle_transport_cursor(capped);
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 3_000)),
+        capped,
+        "so does every later commit"
+    );
+    // Releasing an event the queue holds no pin for changes nothing.
+    adapter.release_account_delivery(&newer.message.id);
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 3_000)),
+        capped
+    );
+
+    route(2, older_at);
+    let redelivered = take_queued(&adapter);
+    assert_eq!(redelivered.message.id, failed.message.id);
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 3_000)),
+        capped,
+        "the redelivery is not ingested yet"
+    );
+    adapter.release_account_delivery(&redelivered.message.id);
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 3_000)),
+        Some(OPENED_CURSOR + 3_000),
+        "one release frees the event, however many times it was taken"
+    );
+}
+
+/// What a replaced queue's consumer took and never released went with that
+/// queue: the new route's subscriptions fetch it again from a cursor it
+/// capped. Its pin must not survive into the new generation, where the same
+/// event's release would free the count of a different delivery.
+#[tokio::test]
+async fn a_new_queue_generation_drops_the_pins_of_the_last() {
+    let (store, _) = recording_spill_store();
+    let (relay_plane, first, alice) = cursor_floor_adapter(Some(store.clone()), None);
+    let route = |id: u8, created_at: u64| {
+        relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+            &alice,
+            id,
+            created_at,
+            TransportDeliveryPlane::Group,
+        ));
+    };
+    let key_at = OPENED_CURSOR + 1_000;
+    route(1, key_at);
+    let failed = take_queued(&first);
+    let replacement = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        Arc::new(RecordingRelayClient::default()),
+        None,
+        Some(store),
+    );
+    // The new route fetches the same event again, and another delivery with
+    // the same key arrives behind it.
+    route(1, key_at);
+    route(2, key_at);
+    let again = take_queued(&replacement);
+    assert_eq!(again.message.id, failed.message.id);
+    replacement.release_account_delivery(&again.message.id);
+    assert_eq!(
+        replacement.seal_transport_cursor(Some(OPENED_CURSOR + 4_000)),
+        Some(key_at + CURSOR_LOOKBACK),
+        "the other delivery, still queued, caps the commit"
     );
 }
 

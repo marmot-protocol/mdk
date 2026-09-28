@@ -2259,6 +2259,7 @@ impl AppClient {
             let event_id = hex::encode(delivery.message.id.as_slice());
             if self.transport_receipts()?.contains(&event_id) {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
+                self.adapter.release_account_delivery(&delivery.message.id);
                 self.settle_spilled_delivery();
                 continue;
             }
@@ -2327,6 +2328,7 @@ impl AppClient {
         let event_id = hex::encode(delivery.message.id.as_slice());
         if self.transport_receipts()?.contains(&event_id) {
             self.record_durable_transport_reconciliation_delivery(&delivery);
+            self.adapter.release_account_delivery(&delivery.message.id);
             return Ok((SyncSummary::default(), RecoveredDelivery::AlreadyHeld));
         }
         self.ingest_received_delivery_once(delivery, false)
@@ -2347,7 +2349,8 @@ impl AppClient {
     > {
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut summary = SyncSummary::default();
-        let event_id = hex::encode(delivery.message.id.as_slice());
+        let message_id = delivery.message.id.clone();
+        let event_id = hex::encode(message_id.as_slice());
         let receipts = self.transport_receipts().map_err(|error| {
             (
                 SyncSummary::default(),
@@ -2370,6 +2373,11 @@ impl AppClient {
                     SyncFailureStage::CgkaIngest,
                 )
             })?;
+        // The ingest is durable, or dropped on purpose: its delivery must not
+        // hold back the cursor the saves below commit. A failed ingest never
+        // gets here, so it keeps capping every later commit, including the
+        // checkpoint a startup receive runs on that failure.
+        self.adapter.release_account_delivery(&message_id);
         let settled = RecoveredDelivery::Ingested {
             unpersisted: ingested.must_stay_fetchable,
             refused_group: ingested.refused_group.clone(),
@@ -2859,6 +2867,7 @@ impl AppClient {
             let event_id = hex::encode(delivery.message.id.as_slice());
             if receipts.contains(&event_id) {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
+                self.adapter.release_account_delivery(&delivery.message.id);
                 counts.skipped = counts.skipped.saturating_add(1);
                 // Liveness, but not progress. It must not outlast the moment
                 // the relays confirm they served this account's history.
@@ -2886,10 +2895,15 @@ impl AppClient {
                     .await);
             }
             let mut delivery_summary = SyncSummary::default();
+            let message_id = delivery.message.id.clone();
             let ingested =
                 match Self::ingest_delivery(receipts, *delivery, &mut delivery_summary).await {
                     Ok(ingested) => ingested,
                     Err(error) => {
+                        // The failed delivery is still taken, so this
+                        // checkpoint stops where a restart fetches it again,
+                        // though newest-first replay already remembered a
+                        // newer cursor.
                         return Err(self
                             .finish_failed_sync_drain(
                                 summary,
@@ -2902,6 +2916,7 @@ impl AppClient {
                             .await);
                     }
                 };
+            self.adapter.release_account_delivery(&message_id);
             if ingested.must_stay_fetchable {
                 counts.unpersisted = counts.unpersisted.saturating_add(1);
             }
@@ -3207,6 +3222,13 @@ impl AppClient {
         summary: &mut SyncSummary,
     ) -> Result<DeliveryIngest, AppError> {
         let client = receipts.into_client();
+        #[cfg(test)]
+        if client.fail_ingest_of.as_ref() == Some(&delivery.message.id) {
+            client.fail_ingest_of = None;
+            return Err(AppError::BlockingTask(
+                "injected delivery ingest failure".to_owned(),
+            ));
+        }
         let source_message_id = delivery.message.id.clone();
         let source_message_id_hex = hex::encode(source_message_id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
@@ -6393,8 +6415,182 @@ mod membership_change_tests {
 
 #[cfg(test)]
 mod live_cursor_checkpoint_tests {
-    use super::SyncSummary;
-    use crate::tests::{LiveCursorFixture, run_composed_app_runtime_test};
+    use super::{DrainCounts, SyncSummary};
+    use crate::tests::{LiveCursorFixture, inject_epoch_gap_probe, run_composed_app_runtime_test};
+
+    /// Queue a newer delivery ahead of an older one, as relays replay stored
+    /// history newest-first, and arm the older one's ingest to fail. Returns
+    /// the older probe.
+    async fn queue_newest_first_with_a_failing_older(
+        fixture: &mut LiveCursorFixture,
+    ) -> transport_nostr_peeler::NostrTransportEvent {
+        let cursor_before = fixture.cursor_before;
+        let older = fixture.probe(cursor_before + 1_000, "older");
+        fixture.client.fail_ingest_of = Some(fixture.delivery(older.clone()).await.message.id);
+        queue_in_order(
+            fixture,
+            [fixture.probe(cursor_before + 4_000, "newer"), older.clone()],
+        )
+        .await;
+        older
+    }
+
+    /// The cursor a failed ingest's checkpoint persisted still lets a
+    /// restart fetch `failed`, and after a stop the account admits it when
+    /// the restart's subscriptions serve it again.
+    async fn a_stop_still_admits(
+        fixture: LiveCursorFixture,
+        failed: transport_nostr_peeler::NostrTransportEvent,
+    ) {
+        let persisted = fixture.persisted();
+        assert_eq!(
+            persisted,
+            Some(failed.created_at + 120),
+            "the checkpoint stops where a restart fetches the failed delivery"
+        );
+        let mut fixture = fixture.reopen().await;
+        assert!(
+            fixture
+                .client
+                .subscription_rebuild_since()
+                .unwrap()
+                .is_some_and(|since| since.0 <= failed.created_at),
+            "the restart's subscriptions start at or below it"
+        );
+        inject_epoch_gap_probe(&fixture.app, failed.clone()).await;
+        assert_eq!(fixture.ingest_next_live_delivery().await, failed.id);
+        assert!(
+            fixture
+                .client
+                .transport_receipts()
+                .unwrap()
+                .contains(&failed.id)
+        );
+    }
+
+    /// Inject `events` in order and wait until the account queue holds them.
+    async fn queue_in_order(
+        fixture: &LiveCursorFixture,
+        events: impl IntoIterator<Item = transport_nostr_peeler::NostrTransportEvent>,
+    ) {
+        let mut queued = 0;
+        for event in events {
+            inject_epoch_gap_probe(&fixture.app, event).await;
+            queued += 1;
+        }
+        fixture.wait_for_queue_depth(queued).await;
+    }
+
+    /// A delivery stops capping the cursor once its ingest is durable, or
+    /// once it is skipped because the account already holds it, in a drain
+    /// and on the live path alike, so the cursor still reaches what the
+    /// account ingested.
+    #[test]
+    fn ingested_and_already_held_deliveries_stop_capping_the_cursor() {
+        run_composed_app_runtime_test("live-cursor-releases", || async {
+            let mut fixture = LiveCursorFixture::open().await;
+            let cursor_before = fixture.cursor_before;
+            let held = fixture.probe(cursor_before + 1_000, "held");
+            queue_in_order(&fixture, [held.clone()]).await;
+            fixture.ingest_next_live_delivery().await;
+            assert_eq!(fixture.persisted(), Some(cursor_before + 1_000));
+
+            // A drain: newest first, then an older new event, then the held
+            // one served again.
+            let newest = fixture.probe(cursor_before + 4_000, "newest");
+            queue_in_order(
+                &fixture,
+                [
+                    newest.clone(),
+                    fixture.probe(cursor_before + 3_000, "older"),
+                    held,
+                ],
+            )
+            .await;
+            fixture
+                .client
+                .sync_sdk_relay(&mut DrainCounts::default())
+                .await
+                .unwrap_or_else(|_| panic!("the drain completes"));
+            assert_eq!(
+                fixture.persisted(),
+                Some(cursor_before + 4_000),
+                "the checkpoint passes what the drain ingested or already held"
+            );
+
+            // Live: the newest one served again, ahead of a newer arrival.
+            queue_in_order(
+                &fixture,
+                [newest, fixture.probe(cursor_before + 5_000, "live")],
+            )
+            .await;
+            fixture.ingest_next_live_delivery().await;
+            assert_eq!(
+                fixture.persisted(),
+                Some(cursor_before + 5_000),
+                "the promotion passes the delivery the receive skipped as held"
+            );
+        });
+    }
+
+    /// A catch-up drain ingests the newer delivery first, so it remembers a
+    /// cursor above the older one before that one fails to ingest. The failed
+    /// delivery stays taken, so the checkpoint the failure runs is capped
+    /// where a restart fetches it again.
+    #[test]
+    fn a_drain_checkpoint_after_a_failed_older_ingest_still_covers_it() {
+        run_composed_app_runtime_test("drain-failed-older-ingest", || async {
+            let mut fixture = LiveCursorFixture::open().await;
+            let cursor_before = fixture.cursor_before;
+            let older = queue_newest_first_with_a_failing_older(&mut fixture).await;
+            assert!(
+                fixture
+                    .client
+                    .sync_sdk_relay(&mut DrainCounts::default())
+                    .await
+                    .is_err(),
+                "the older delivery's ingest fails the drain"
+            );
+            assert_eq!(
+                fixture.client.state.last_transport_timestamp,
+                Some(cursor_before + 4_000),
+                "the drain remembered the newer delivery before the failure"
+            );
+            a_stop_still_admits(fixture, older).await;
+        });
+    }
+
+    /// The startup receive checkpoints the applied prefix when a delivery
+    /// fails to ingest, as the drain does. The newer delivery's live
+    /// promotion already stopped at the queued older one, and the failure's
+    /// checkpoint must not pass the older one either.
+    #[test]
+    fn a_startup_receive_checkpoint_after_a_failed_older_ingest_still_covers_it() {
+        run_composed_app_runtime_test("startup-failed-older-ingest", || async {
+            let mut fixture = LiveCursorFixture::open().await;
+            let older = queue_newest_first_with_a_failing_older(&mut fixture).await;
+            for expect_failure in [false, true] {
+                let received = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    fixture.client.receive_next_delivery(),
+                )
+                .await
+                .expect("a delivery is ready")
+                .unwrap();
+                let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received
+                else {
+                    panic!("a live delivery must not produce a control record");
+                };
+                let result = fixture
+                    .client
+                    .ingest_received_delivery_with_partial(*delivery)
+                    .await;
+                assert_eq!(result.is_err(), expect_failure);
+                assert_eq!(fixture.persisted(), Some(older.created_at + 120));
+            }
+            a_stop_still_admits(fixture, older).await;
+        });
+    }
 
     /// A drain checkpoint a fence held reaches nothing of its own. The cursor
     /// it re-persists came from an earlier live promotion, so it must not

@@ -1858,6 +1858,8 @@ impl MarmotApp {
             checkpointed_transport_timestamp,
             #[cfg(test)]
             cursor_seal_probe: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_ingest_of: None,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
             delivery_spill: Default::default(),

@@ -51,11 +51,15 @@
   account that has never persisted a cursor waits for its first drain checkpoint. Only a
   drain checkpoint or settled loss used to, so a restart re-downloaded everything the
   account had received live since its last drain: on the #2069 scorecard, a full pass of the
-  account's history on each relay. No checkpoint passes a queued delivery that a restart
-  would then no longer fetch. A delivery goes to the durable spill instead of the queue when
-  it arrives while a checkpoint saves and falls below the floor that checkpoint commits, or
-  when only a live promotion put it below the floor. It becomes queue loss bounded by its
-  `created_at` when the spill cannot take it; `account_delivery_spilled` counts it. (#2069)
+  account's history on each relay. No checkpoint passes a delivery that a restart would then
+  no longer fetch while it is queued, or taken and not yet ingested durably. That includes
+  the checkpoint a catch-up drain or startup receive runs when an older delivery fails to
+  ingest after newest-first replay remembered a newer cursor, which used to persist a cursor
+  a restart no longer fetched the failed delivery from. A delivery goes to the durable spill
+  instead of the queue when it arrives while a checkpoint saves and falls below the floor
+  that checkpoint commits, or when only a live promotion put it below the floor. It becomes
+  queue loss bounded by its `created_at` when the spill cannot take it;
+  `account_delivery_spilled` counts it. (#2069)
 
 ### Fixed
 

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use cgka_traits::transport::Timestamp;
 use cgka_traits::{
-    MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
+    MemberId, MessageId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
     TransportDelivery, TransportDeliveryPlane, TransportEndpoint, TransportGroupSubscription,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
@@ -292,8 +292,14 @@ struct AccountDeliveryAdmission {
     /// The queue generation `queued` describes. A replaced route's queue
     /// dies with its receiver.
     epoch: u64,
-    /// Keys of the deliveries in the account queue, with their counts.
+    /// Keys of the deliveries in the account queue, and of those its
+    /// consumer took but has not yet ingested durably, with their counts.
     queued: BTreeMap<u64, u32>,
+    /// The key in `queued` each taken delivery holds until its consumer
+    /// releases it, by event. A delivery whose ingest failed is never
+    /// released, so its key keeps capping commits for the rest of the queue
+    /// generation, unless a redelivery of the same event is released.
+    taken: HashMap<MessageId, u64>,
     /// The persisted cursor's restart `since`. Every seal raises it before
     /// its commit saves, so it covers a cursor still being written too.
     durable_since: Option<u64>,
@@ -307,6 +313,19 @@ struct AccountDeliveryAdmission {
     /// everything, so while this is `None` every delivery below
     /// `durable_since` is spilled.
     settled_since: Option<u64>,
+}
+
+impl AccountDeliveryAdmission {
+    /// One delivery keyed `key` no longer caps a commit.
+    fn remove_queued(&mut self, key: u64) {
+        if let std::collections::btree_map::Entry::Occupied(mut count) = self.queued.entry(key) {
+            if *count.get() > 1 {
+                *count.get_mut() -= 1;
+            } else {
+                count.remove();
+            }
+        }
+    }
 }
 
 /// Where the router puts one delivery.
@@ -433,42 +452,76 @@ impl AccountDeliveryOverflowState {
         }
     }
 
-    /// A delivery `place` queued has left the queue: its consumer took it,
-    /// or the send never happened.
+    /// A delivery `place` queued never reached the queue: its send failed.
     fn unqueue(&self, epoch: u64, key: u64) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        if admission.epoch == epoch {
+            admission.remove_queued(key);
+        }
+    }
+
+    /// The consumer took a queued delivery. It keeps its key, so it caps
+    /// every commit until the consumer releases it: until then its ingest may
+    /// still fail, and a restart must fetch it again. An event holds one key
+    /// at a time, so a redelivery of one whose ingest failed takes over the
+    /// pin that failure left.
+    fn take(&self, epoch: u64, key: u64, id: &MessageId) {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let admission = &mut state.admission;
         if admission.epoch != epoch {
             return;
         }
-        if let std::collections::btree_map::Entry::Occupied(mut count) = admission.queued.entry(key)
-        {
-            if *count.get() > 1 {
-                *count.get_mut() -= 1;
-            } else {
-                count.remove();
+        let spare = match admission.taken.get_mut(id) {
+            Some(held) => {
+                let spare = (*held).max(key);
+                *held = (*held).min(key);
+                spare
             }
+            None => {
+                admission.taken.insert(id.clone(), key);
+                return;
+            }
+        };
+        admission.remove_queued(spare);
+    }
+
+    /// A taken delivery's ingest is durable, or its consumer dropped it on
+    /// purpose, so it no longer caps a commit.
+    fn release(&self, epoch: u64, id: &MessageId) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        if admission.epoch != epoch {
+            return;
+        }
+        if let Some(key) = admission.taken.remove(id) {
+            admission.remove_queued(key);
         }
     }
 
     /// Start the generation of a new route's queue. The previous queue died
-    /// with its receiver, and nothing in it can be taken any more.
+    /// with its receiver, and nothing in it can be taken any more. Its
+    /// deliveries, and those its consumer took and never released, went with
+    /// it: the new route's subscriptions start from a cursor no commit moved
+    /// past them, so they fetch them again.
     fn open_queue(&self) -> u64 {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let admission = &mut state.admission;
         admission.epoch = admission.epoch.wrapping_add(1);
         admission.queued.clear();
+        admission.taken.clear();
         admission.epoch
     }
 
     /// How far a commit may promote the cursor, decided under the placement
-    /// lock: `candidate`, capped at the lowest queued key the persisted cursor
-    /// still covers, plus the lookback. `None` while loss or a spill hand-off
-    /// is pending, and for a replaced adapter, whose queue is not the one
-    /// tracked here. The restart floor rises here, before the commit's save
-    /// starts, so any delivery placed while that save runs and falls below it
-    /// goes to the spill. A settled commit moves the settled floor up once its
-    /// save succeeds; a live one leaves it, so its spilling continues.
+    /// lock: `candidate`, capped at the lowest key the persisted cursor still
+    /// covers of a delivery queued or taken and not yet released, plus the
+    /// lookback. `None` while loss or a spill hand-off is pending, and for a
+    /// replaced adapter, whose queue is not the one tracked here. The restart
+    /// floor rises here, before the commit's save starts, so any delivery
+    /// placed while that save runs and falls below it goes to the spill. A
+    /// settled commit moves the settled floor up once its save succeeds; a
+    /// live one leaves it, so its spilling continues.
     fn seal_cursor(
         &self,
         epoch: u64,
@@ -3169,11 +3222,13 @@ impl MarmotRelayPlaneAccountAdapter {
     fn account_delivery_receive(&self, event: AccountDeliveryEvent) -> AccountDeliveryReceive {
         match event {
             AccountDeliveryEvent::Delivery(delivery) => {
-                // In the consumer's hands the delivery no longer caps a
-                // commit: its own ingest precedes any save that could pass
-                // it.
-                self.delivery_overflow
-                    .unqueue(self.delivery_epoch, account_delivery_restart_key(&delivery));
+                // Taken, it still caps every commit until its consumer
+                // releases it: a failed ingest's checkpoint must not pass it.
+                self.delivery_overflow.take(
+                    self.delivery_epoch,
+                    account_delivery_restart_key(&delivery),
+                    &delivery.message.id,
+                );
                 AccountDeliveryReceive::Delivery(delivery)
             }
             AccountDeliveryEvent::Overflow { generation } => {
@@ -3187,18 +3242,32 @@ impl MarmotRelayPlaneAccountAdapter {
     }
 
     /// How far a commit may promote the transport cursor, decided under the
-    /// router's placement lock: at most `candidate`, and never past a queued
-    /// delivery that the persisted cursor still lets a restart fetch. `None`
-    /// while loss or a spill hand-off is pending. The caller persists the
-    /// larger of this and its current cursor. The restart floor rises here,
-    /// before the commit's save runs, so a delivery that arrives during that
-    /// save and falls below it is spilled rather than queued.
+    /// router's placement lock: at most `candidate`, and never past a
+    /// delivery still queued, or taken and not yet released, that the
+    /// persisted cursor still lets a restart fetch. `None` while loss or a
+    /// spill hand-off is pending. The caller persists the larger of this and
+    /// its current cursor. The restart floor rises here, before the commit's
+    /// save runs, so a delivery that arrives during that save and falls below
+    /// it is spilled rather than queued.
     pub(crate) fn seal_transport_cursor(&self, candidate: Option<u64>) -> Option<u64> {
         self.delivery_overflow.seal_cursor(
             self.delivery_epoch,
             self.cursor_lookback_secs(),
             candidate,
         )
+    }
+
+    /// The delivery of event `id` no longer needs a restart to fetch it: its
+    /// ingest is durable, or its consumer dropped it on purpose, as a
+    /// duplicate or as input the account keeps no trace of by design. Its
+    /// consumer calls this before the save that follows, so a committed
+    /// delivery never holds the cursor back. A delivery whose ingest failed
+    /// is never released: it caps every commit until a redelivery of the
+    /// same event is released or its queue generation ends. An event this
+    /// queue holds no pin for, such as one read back from the spill, has
+    /// nothing to release.
+    pub(crate) fn release_account_delivery(&self, id: &MessageId) {
+        self.delivery_overflow.release(self.delivery_epoch, id);
     }
 
     /// A sealed commit's save failed and `restored` is still the persisted

@@ -457,14 +457,19 @@ pub struct AppClient {
     /// lock: at a drain checkpoint or settled loss, or with a live ingest's
     /// own save once every subscription finished replaying stored history
     /// and the account has a settled cursor floor.
-    /// The seal never passes a queued delivery a restart would then no
-    /// longer fetch, and the router spills an arrival that falls below the
-    /// floor it raised: during the commit's save, and after a live one.
+    /// The seal never passes a delivery that is queued, or taken and not yet
+    /// durably ingested, when a restart would then no longer fetch it, and
+    /// the router spills an arrival that falls below the floor it raised:
+    /// during the commit's save, and after a live one.
     pub(crate) checkpointed_transport_timestamp: Option<u64>,
     /// Runs at every transport-cursor seal, before and after, so a test can
     /// land a delivery on either side of the decision.
     #[cfg(test)]
     pub(crate) cursor_seal_probe: std::sync::Mutex<Option<CursorSealProbe>>,
+    /// Fail the next ingest of this event before the engine sees it, as a
+    /// storage or engine error would.
+    #[cfg(test)]
+    pub(crate) fail_ingest_of: Option<cgka_traits::MessageId>,
     /// Durable account-wide marker set when the bounded relay-plane queue
     /// omits a delivery. While true, every subscription rebuild is unfloored
     /// and EOSE-gated recovery must complete before the cursor is trusted.
