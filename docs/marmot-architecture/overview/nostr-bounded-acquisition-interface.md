@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-09-27
+updated: 2026-09-28
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
@@ -108,6 +108,12 @@ updates cannot erase a gap. The scope is fixed and explicit: `SharedReceiver` or
 The production SDK gives each account its own receiver and `AccountReceiver` watermark. Its multi-account root returns
 `Unsupported` from `notification_loss`, because one coalescing watch cannot carry independent account watermarks.
 `notification_loss_for_account` returns that account's watch or rejects an unregistered account.
+
+Each account context also records the `since` of every REQ it issues, before the REQ goes out. A closed REQ keeps
+counting for one minute, because routing is by content and its buffered or in-flight notifications can still arrive.
+`notification_loss_floor` (on the root, `notification_loss_floor_for_account`) returns the lowest of these as a
+`NostrNotificationLossFloor`: no event whose notification a lag loses at that moment is older. An unfloored REQ, no
+REQ at all, or a shared receiver reads as `Unbounded`. Read it at the lag, before a subscription change moves it.
 
 The recovery consumer subscribes for each activated account and never infers a group from a receiver gap. The backend
 must update the watch without waiting for room in the event-delivery queue, so loss stays observable when event

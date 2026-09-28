@@ -1437,11 +1437,12 @@ impl AppClient {
         }
         if let Err(error) = self.sync_runtime_groups().await {
             if error.is_account_not_active() {
-                // A relay notification gap or overlapping account-adapter
-                // teardown can retire the activation between durable ingest
-                // and this background retry. Re-activation installs both the
-                // account inbox and the current complete group set, satisfying
-                // the same refresh intent without replaying the delivery.
+                // An unexpected notification consumer exit or overlapping
+                // account-adapter teardown can retire the activation between
+                // durable ingest and this background retry. Re-activation
+                // installs both the account inbox and the current complete
+                // group set, satisfying the same refresh intent without
+                // replaying the delivery.
                 self.prepare_transport().await?;
             } else {
                 return Err(error);
