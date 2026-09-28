@@ -66,6 +66,12 @@ for reconnect/backoff and relay status mechanics.
   payload-derived values.
 - Use tracing `target` plus `method` fields so crate/module/method are visible while diagnostic data stays
   aggregate-only.
+- Floor history REQs where the caller anchors them: a recovery maintenance session at the `since` it is installed
+  with, and a retained route at its `TransportGroupSubscription::retained_since`, never later than the activation's
+  `since`. A route with a retained floor is retained wherever it sits; among floorless routes the first per group is
+  the current one and a later distinct one is retained and backfilled in full. Reissue a live retained REQ only when
+  its floor widens (`AccountRoutes::group_since`): a reissue replaces the live REQ under the same id, so a narrower
+  one could cut off history it is still returning.
 
 ## Verification
 

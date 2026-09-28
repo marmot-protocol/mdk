@@ -57,10 +57,12 @@ The simulator comes first; Jeff validates on a phone.
      the lowest `since` among every REQ the account's SDK context issued, live or closed.
      Routing is by content, so a closed REQ's buffered or in-flight notifications still
      arrive, and nothing bounds when: a stalled consumer keeps them buffered, and a relay
-     with a deep outbound backlog keeps sending them. An unfloored REQ, such as post-join
-     maintenance, makes every later charge on that context unknown. A lag keeps the account route open
-     and forces no reconnect. The SDK client has already marked the lost events seen, so
-     only comparison and exact-ID acquisition recover them.
+     with a deep outbound backlog keeps sending them. Post-join maintenance and retained
+     routes carry floors (design section 5), so only an unfloored REQ, such as a retained
+     route recorded before switch times were kept, makes the charge unknown, and every
+     later charge on that context with it. A lag keeps the account route open and forces
+     no reconnect. The SDK client has already marked the lost events seen, so only
+     comparison and exact-ID acquisition recover them.
    - Loss with no known bound has an unbounded goal. That covers SDK notification lag while
      an unfloored REQ is in scope, an undecodable spill row, count-only rows written before
      step 2, and an epoch gap whose commit time is unknown. So does a goal that reaches below the retained-inventory floor. None of these can be certified by
@@ -230,6 +232,39 @@ explicit user-authorized retirement, recorded as its own outcome, never as cover
   parks on none but those routes and relays it retires again without a new notice. A route
   stuck on relays the user never dismissed raises a new one. Loss keeps its own notices.
 
+### 5. History REQs are floored at their anchors
+
+Decided with Jeff (2026-09-28). The two REQs that asked for full history now carry a
+`since`, so their floors bound a notification lag like every other REQ's.
+
+- **Post-join maintenance** is floored at the creation of the Welcome that installed the
+  copy (`Group::local_copy_welcome_created_at`, the Welcome rumor's `created_at`, which the
+  engine clamps to no later than the join), less the allowance. It is never floored at the
+  local join time: a member that was offline processes an old Welcome, and still needs the
+  commits made between that Welcome and its join. Anything older belongs to epochs before
+  the member's own, which it cannot open.
+- **A retained route** is floored at the moment this device saw it replaced as the group's
+  current route, less the allowance, and never later than the activation's own `since`.
+  The switch time is recorded inside the route JSON (`replaced_at`), so no migration is
+  needed. The routing table keeps each group's current route first, which is how the
+  adapter tells the two apart. A live REQ is reissued only to widen it, never to narrow it:
+  a reissue replaces the live REQ under the same id and could cut off history it is still
+  returning.
+- **The allowance** is `HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`, five minutes (ledger A14). An
+  event carries its sender's clock, while the anchor carries the inviter's or this device's.
+  Five minutes is the sender-clock tolerance the stack already assumes (A8), and it exceeds
+  the two-minute rebuild lookback (A7) that every reconnecting live REQ relies on, so a
+  sender slow enough to fall below it already loses events to ordinary catch-up. Too small
+  an allowance can miss a commit made after the Welcome, and the member's first self-update
+  then forks until the epoch gap is acquired; too large re-requests history the member
+  cannot open or already holds, and a retained route pays that again on every activation.
+  Anything a floor misses inside the retained-inventory window stays within reach of the
+  comparison, which covers current and retained routes alike.
+- **Still unfloored**: a copy with no Welcome time (created before the field existed), a
+  retained route recorded before switch times were kept (until it ages out, five epochs
+  after its last), and a locally deleted group's route replaced while the group was hidden,
+  which no projection observes. Explicit full-history repair stays unfloored by design.
+
 ## What gets deleted
 
 Deleted in step 2:
@@ -264,8 +299,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Per-account SDK clients (#2009) and directory isolation (#2005).
 - Worker-startup isolation (#1999).
 - Epoch-stall detector facts.
-- Post-join maintenance subscriptions. These are unchanged here and revisited later: they
-  are also a full-history request.
+- Post-join maintenance subscriptions, now floored at the Welcome that installed the copy
+  less a five-minute clock-skew allowance (design section 5), rather than a full-history
+  request. They still complete on EOSE, not on comparison.
 - The #1946 rule that recovery debt is never evicted. Spill rows are capped; unresolved loss
   is not. Every unresolved loss generation and every parked obligation stays, with no fixed
   row cap, until qualified completion (an explicit deep repair counts only when it achieves
@@ -287,6 +323,10 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   fresh token per lag.
 - Existing pending QueueLoss, notification-loss, epoch-gap, incremental and explicit rows
   run on the new path as unknown-scope comparisons.
+- The history floors need no migration. The Welcome time was already on the engine's group
+  record, and a retained route's `replaced_at` is an optional field inside the existing
+  route JSON (`prior_nostr_routes_json`, also in the local-deletion frontier). Routes
+  stored before it existed read as unfloored.
 - Tables that no code reads any more are dropped in a later migration, once their rows have
   been converted.
 
@@ -297,7 +337,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   - cursor safety while spill writes are pending;
   - reordered admission, for example a spilled commit followed by live messages;
   - completion tiers and parking;
-  - revision checks.
+  - revision checks;
+  - history floors: maintenance and retained-route REQs carry their anchored floors, a
+    live retained REQ is only ever widened, and a lag while either is live stays bounded.
 - **Real-relay, a handful:**
   - overflow of known history, which must produce zero network requests;
   - a missing commit fetched through comparison on two relays;
@@ -329,15 +371,19 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   certify the route. A set of at most 16,384 is complete, including a busy route that sits
   exactly on the cap, and can certify it. A per-relay truncation flag from the fork would
   replace this inference.
-- Notification-lag bounds (#2070). Two kinds of REQ still carry no `since`: post-join
-  maintenance, and a group's retained prior routes. Once either has been issued, every
-  later lag on that account's SDK context has unbounded loss and its goal parks, until the
-  context is replaced. A closed REQ's floor keeps counting for the context's life, so the
+- Notification-lag bounds (#2070). Post-join maintenance and retained prior routes now
+  carry floors (design section 5). A REQ still without one, listed there, leaves every
+  later lag on that account's SDK context unbounded until the context is replaced, and
+  its goal parks. A closed REQ's floor keeps counting for the context's life, so the
   floor only falls: every lag compares from the lowest `since` the context ever issued.
-  The inbox's two-day NIP-59 widening sets that floor at least two days back on every
-  route; per-route floors would need per-scope storage. An EOSE lost in a lag is not
-  recovered, so the next activation re-subscribes instead of reusing the live one. Relays
-  that ignore `since` are not detected.
+  The floors trade a five-minute clock-skew allowance against a missed commit: a sender
+  clock off by more than that, or a retained route observed long after its switch, can put
+  traffic below a floor, and only the comparison, or the epoch gap it causes, recovers it.
+  An old Welcome can floor maintenance below the retained-inventory window, and a goal
+  there cannot certify. The inbox's two-day NIP-59 widening sets that floor at least two
+  days back on every route; per-route floors would need per-scope storage. An EOSE lost
+  in a lag is not recovered, so the next activation re-subscribes instead of reusing the
+  live one. Relays that ignore `since` are not detected.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.
