@@ -17732,6 +17732,41 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
 /// disband tombstones. The removed group is still in `state.groups`, so the
 /// rebuild seeded its subscriptions back and handed them straight to the adapter.
 #[tokio::test]
+async fn key_package_publication_never_issues_a_full_history_subscription() {
+    // An unfloored activation replays every held event on every route and
+    // leaves a notification lag's loss unbounded. Publishing or rotating a
+    // KeyPackage reuses the live activation, or rebuilds it from the cursor.
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    client.create_group("floored", &[]).await.unwrap();
+    client.prepare_transport().await.unwrap();
+    let before = relay.accepted_subscriptions().len();
+    client.publish_key_package().await.unwrap();
+    client.rotate_key_package().await.unwrap();
+    let unfloored = relay.accepted_subscriptions()[before..]
+        .iter()
+        .filter(|subscription| {
+            matches!(
+                subscription,
+                NostrSubscription::AccountInbox { since: None, .. }
+                    | NostrSubscription::Group { since: None, .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        unfloored, 0,
+        "a KeyPackage publication replayed full history"
+    );
+}
+
+#[tokio::test]
 async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_group() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

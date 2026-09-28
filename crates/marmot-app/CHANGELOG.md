@@ -73,6 +73,11 @@
   still counted it as queued, so the loss generation could never clear and the transport
   cursor stayed fenced for the rest of the process. (#2070)
 
+- Publish and rotate KeyPackages without a full-history resubscription. Both used to
+  activate transport with no `since`, which replayed every held event on every inbox and
+  group route and left a notification lag during that replay unbounded. They now reuse the
+  live activation or rebuild it from the transport cursor, like reconnect. (#2070)
+
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay
   until a newer event replaces them. (#1973)

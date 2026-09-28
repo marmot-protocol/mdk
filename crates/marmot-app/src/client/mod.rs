@@ -773,7 +773,10 @@ impl AppClient {
             .ensure_local_account_relay_lists(&self.state.label)
             .await?;
         self.refresh_routing()?;
-        self.runtime.activate_transport(None).await?;
+        // Floored at the rebuild cursor like every other activation, and reused
+        // when it matches the live one. An unfloored activation would replay
+        // every held event on every route and leave a lag's loss unbounded.
+        self.prepare_transport().await?;
         self.publish_key_package_from_lifecycle().await
     }
 
@@ -1280,7 +1283,8 @@ impl AppClient {
             .ensure_local_account_relay_lists(&self.state.label)
             .await?;
         self.refresh_routing()?;
-        self.runtime.activate_transport(None).await?;
+        // Floored like publish_key_package's activation; never a full replay.
+        self.prepare_transport().await?;
         // SQLCipher lifecycle state is authoritative. On first rollout the
         // publisher imports only the legacy JSON `d` slot, then performs the
         // recorded upgrade replacement under that same slot.
