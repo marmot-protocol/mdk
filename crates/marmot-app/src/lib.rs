@@ -677,6 +677,9 @@ fn is_zero_u64(value: &u64) -> bool {
 pub struct AccountRelayListBootstrap {
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
+    /// Publication-only copies of public directory records. Never advertised
+    /// as NIP-65 write relays or used for KeyPackage publication.
+    pub indexer_relays: Vec<TransportEndpoint>,
 }
 
 impl AccountRelayListBootstrap {
@@ -692,7 +695,13 @@ impl AccountRelayListBootstrap {
         Self {
             default_relays,
             bootstrap_relays,
+            indexer_relays: Vec::new(),
         }
+    }
+
+    pub fn with_indexer_relays(mut self, indexer_relays: Vec<TransportEndpoint>) -> Self {
+        self.indexer_relays = indexer_relays;
+        self
     }
 }
 
@@ -1973,9 +1982,8 @@ impl MarmotApp {
     }
 
     /// Publish every generated-identity bootstrap record through one scoped
-    /// relay batch. The SDK connects the endpoint union once for the two relay
-    /// lists, empty follow list, and default profile, then returns one ordered
-    /// acknowledgement result per replaceable event.
+    /// operational relay batch. Once those records are acknowledged and cached,
+    /// copy the public relay lists and profile to indexers in a second batch.
     pub(crate) async fn publish_generated_account_bootstrap(
         &self,
         label: &str,
@@ -1989,16 +1997,16 @@ impl MarmotApp {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
-        // Relay-list records are discoverability maps and therefore go to the
-        // bootstrap route. Profiles and contact lists are outbox content: keep
-        // them on the declared write relays even though the mixed batch retains
-        // the union of both endpoint sets once.
+        // Relay lists and profile metadata are public directory records. Copy
+        // those to indexers without advertising indexers as write relays or
+        // routing the contact list and KeyPackage through them.
         let content_endpoints =
             self.outbox_endpoints(&account.account_id_hex, bootstrap.default_relays.clone());
         let endpoints = self.publish_route_including_requested(
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
+        let indexer_endpoints = self.public_indexer_publish_endpoints(&bootstrap.indexer_relays);
 
         let mut requests = Vec::with_capacity(4);
         for list_kind in [
@@ -2037,7 +2045,6 @@ impl MarmotApp {
             ),
             required_acks: 1,
         });
-
         let relay_client =
             self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer());
         let record_kinds = [
@@ -2050,18 +2057,18 @@ impl MarmotApp {
             .publish_events_for_account_with_timings(&account_id, &requests)
             .await;
         let outcomes = batch.outcomes;
-        if outcomes.len() != record_kinds.len() {
+        if outcomes.len() != requests.len() {
             return Err(AppError::Publish(format!(
                 "account bootstrap returned {} outcomes for {} records",
                 outcomes.len(),
-                record_kinds.len()
+                requests.len()
             )));
         }
-        if batch.request_durations.len() != record_kinds.len() {
+        if batch.request_durations.len() != requests.len() {
             return Err(AppError::Publish(format!(
                 "account bootstrap returned {} timings for {} records",
                 batch.request_durations.len(),
-                record_kinds.len()
+                requests.len()
             )));
         }
         let relay_and_follow_duration = batch.request_durations[..3]
@@ -2070,14 +2077,15 @@ impl MarmotApp {
             .max()
             .unwrap_or_default();
         let default_profile_duration = batch.request_durations[3];
-        for (record_kind, outcome) in record_kinds.into_iter().zip(outcomes) {
+        let mut outcomes = outcomes.into_iter();
+        for record_kind in record_kinds {
+            let outcome = outcomes.next().expect("checked bootstrap outcome count");
             if outcome?.accepted.is_empty() {
                 return Err(AppError::Publish(format!(
                     "relay acknowledged zero events for bootstrap record {record_kind}"
                 )));
             }
         }
-
         let relays = bootstrap
             .default_relays
             .iter()
@@ -2119,6 +2127,14 @@ impl MarmotApp {
             },
         )?;
         self.remember_directory_profile(&account.account_id_hex, profile)?;
+        let indexer_events = [0, 1, 3].map(|index| requests[index].event.clone());
+        publish_public_indexer_copies(
+            relay_client.as_ref(),
+            &account_id,
+            &indexer_events,
+            &indexer_endpoints,
+        )
+        .await;
         Ok(GeneratedAccountBootstrapPublication {
             status,
             relay_and_follow_duration,
@@ -2242,13 +2258,25 @@ impl MarmotApp {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_nip65_relays_with_indexers(label, relays, bootstrap_relays, Vec::new())
+            .await
+    }
+
+    pub async fn set_account_nip65_relays_with_indexers(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let current = self.account_relay_list_status(label)?.nip65;
         let relay_set = nip65_relay_set_preserving_roles(&current, relays);
-        self.publish_account_nip65_relay_set(
+        self.publish_account_nip65_relay_set_with_indexers(
             label,
             relay_set.read_relays,
             relay_set.write_relays,
             bootstrap_relays,
+            indexer_relays,
         )
         .await
     }
@@ -2262,13 +2290,32 @@ impl MarmotApp {
         write_relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.publish_account_nip65_relay_set_with_indexers(
+            label,
+            read_relays,
+            write_relays,
+            bootstrap_relays,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn publish_account_nip65_relay_set_with_indexers(
+        &self,
+        label: &str,
+        read_relays: Vec<TransportEndpoint>,
+        write_relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let relay_set = NostrNip65RelaySet {
             read_relays: unique_transport_endpoints(read_relays),
             write_relays: unique_transport_endpoints(write_relays),
         };
         self.publish_selected_account_relay_lists_with_nip65(
             label,
-            AccountRelayListBootstrap::new(relay_set.write_relays.clone(), bootstrap_relays),
+            AccountRelayListBootstrap::new(relay_set.write_relays.clone(), bootstrap_relays)
+                .with_indexer_relays(indexer_relays),
             &[NostrAccountRelayListKind::Nip65],
             Some(&relay_set),
         )
@@ -2281,11 +2328,23 @@ impl MarmotApp {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_inbox_relays_with_indexers(label, relays, bootstrap_relays, Vec::new())
+            .await
+    }
+
+    pub async fn set_account_inbox_relays_with_indexers(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         self.set_account_relay_list_kind(
             label,
             NostrAccountRelayListKind::Inbox,
             relays,
             bootstrap_relays,
+            indexer_relays,
         )
         .await
     }
@@ -2296,10 +2355,12 @@ impl MarmotApp {
         list_kind: NostrAccountRelayListKind,
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
         self.publish_selected_account_relay_lists(
             label,
-            AccountRelayListBootstrap::new(relays, bootstrap_relays),
+            AccountRelayListBootstrap::new(relays, bootstrap_relays)
+                .with_indexer_relays(indexer_relays),
             &[list_kind],
         )
         .await
@@ -2350,6 +2411,7 @@ impl MarmotApp {
             &account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
+        let indexer_endpoints = self.public_indexer_publish_endpoints(&bootstrap.indexer_relays);
         let relay_client =
             self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
         let mut requests = Vec::with_capacity(list_kinds.len());
@@ -2378,10 +2440,17 @@ impl MarmotApp {
                 required_acks: 1,
             });
         }
-        for outcome in relay_client
+        let outcomes = relay_client
             .publish_events_for_account(&account_id, &requests)
-            .await
-        {
+            .await;
+        if outcomes.len() != requests.len() {
+            return Err(AppError::Publish(
+                "relay-list publication returned incomplete outcomes".into(),
+            ));
+        }
+        let mut outcomes = outcomes.into_iter();
+        for _ in list_kinds {
+            let outcome = outcomes.next().expect("checked relay-list outcome count");
             if outcome?.accepted.is_empty() {
                 return Err(AppError::Publish(
                     "relay acknowledged zero account relay-list events".to_owned(),
@@ -2450,6 +2519,17 @@ impl MarmotApp {
         );
         status.refresh();
         self.remember_directory_relay_lists(&account_id_hex, &status)?;
+        let indexer_events = requests
+            .iter()
+            .map(|request| request.event.clone())
+            .collect::<Vec<_>>();
+        publish_public_indexer_copies(
+            relay_client.as_ref(),
+            &account_id,
+            &indexer_events,
+            &indexer_endpoints,
+        )
+        .await;
         Ok(status)
     }
 
@@ -2532,6 +2612,16 @@ impl MarmotApp {
             }
         }
         endpoints
+    }
+
+    fn public_indexer_publish_endpoints(
+        &self,
+        indexer_relays: &[TransportEndpoint],
+    ) -> Vec<TransportEndpoint> {
+        self.retain_safe_discovered_endpoints(
+            indexer_relays.to_vec(),
+            "public directory publication",
+        )
     }
 
     pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
@@ -7001,6 +7091,68 @@ fn unique_transport_endpoints(
         }
     }
     unique
+}
+
+async fn publish_public_indexer_copies(
+    relay_client: &dyn NostrRelayClient,
+    account_id: &MemberId,
+    events: &[NostrTransportEvent],
+    indexers: &[TransportEndpoint],
+) {
+    let mut requests = Vec::with_capacity(events.len() * indexers.len());
+    for indexer in indexers {
+        for event in events {
+            requests.push(NostrEventPublishRequest {
+                endpoints: vec![indexer.clone()],
+                event: event.clone(),
+                required_acks: 1,
+            });
+        }
+    }
+    if requests.is_empty() {
+        return;
+    }
+    let outcomes = relay_client
+        .publish_events_for_account(account_id, &requests)
+        .await;
+    if outcomes.len() != requests.len() {
+        tracing::warn!(
+            target: "marmot_app::directory",
+            method = "publish_public_indexer_copies",
+            expected = requests.len(),
+            actual = outcomes.len(),
+            "public directory indexer publication returned incomplete outcomes"
+        );
+    }
+    observe_public_indexer_outcomes(outcomes);
+}
+
+fn observe_public_indexer_outcomes(
+    outcomes: impl IntoIterator<
+        Item = Result<
+            transport_nostr_adapter::NostrPublishOutcome,
+            cgka_traits::TransportAdapterError,
+        >,
+    >,
+) {
+    let mut accepted = 0_usize;
+    let mut failed = 0_usize;
+    for outcome in outcomes {
+        if outcome.is_ok_and(|result| !result.accepted.is_empty()) {
+            accepted += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    if failed != 0 {
+        tracing::warn!(
+            target: "marmot_app::directory",
+            method = "observe_public_indexer_outcomes",
+            accepted,
+            failed,
+            "public directory indexer publication was incomplete"
+        );
+    }
 }
 
 fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterator<Item = String>) {

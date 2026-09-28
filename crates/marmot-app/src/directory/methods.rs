@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use cgka_traits::TransportEndpoint;
+use cgka_traits::{MemberId, TransportEndpoint};
 use marmot_account::AccountSummary;
 use nostr_sdk::prelude::PublicKey;
 #[cfg(test)]
@@ -48,7 +48,8 @@ use crate::{
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, DirectoryFreshness, FetchedKeyPackage,
     KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind, ReceivedMessage,
     SqlcipherDatabaseKind, USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED,
-    blocking_app_task, push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
+    blocking_app_task, publish_public_indexer_copies, push_unique_strings,
+    relay_list_state_from_event, remove_sqlite_file_set,
 };
 
 impl MarmotApp {
@@ -769,19 +770,25 @@ impl MarmotApp {
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
-        self.publish_user_profile_to_endpoints(&account.label, profile, endpoints)
-            .await
+        self.publish_user_profile_to_endpoints_and_indexers(
+            &account.label,
+            profile,
+            endpoints,
+            bootstrap.indexer_relays,
+        )
+        .await
     }
 
     /// Publish kind-0 metadata to an already-selected, account-scoped route.
     ///
     /// This is the action boundary used when the runtime has captured one
     /// coherent relay-list snapshot and must not re-read it before publishing.
-    pub(crate) async fn publish_user_profile_to_endpoints(
+    pub(crate) async fn publish_user_profile_to_endpoints_and_indexers(
         &self,
         label: &str,
         profile: UserProfileMetadata,
         endpoints: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
     ) -> Result<(), AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::Directory,
@@ -789,7 +796,7 @@ impl MarmotApp {
             crate::ProductUnit::Attempt,
         );
         let result = self
-            .publish_user_profile_to_endpoints_unobserved(label, profile, endpoints)
+            .publish_user_profile_to_endpoints_unobserved(label, profile, endpoints, indexer_relays)
             .await;
         if let Some(observation) = observation {
             observation.finish(if result.is_ok() { "success" } else { "failure" });
@@ -802,6 +809,7 @@ impl MarmotApp {
         label: &str,
         profile: UserProfileMetadata,
         endpoints: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
     ) -> Result<(), AppError> {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
@@ -812,9 +820,20 @@ impl MarmotApp {
             Vec::new(),
             content,
         );
-        self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer())
-            .publish_event(&endpoints, &event, 1)
-            .await?;
+        let indexers = self.public_indexer_publish_endpoints(&indexer_relays);
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let relay_client =
+            self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer());
+        let outcome = relay_client
+            .publish_event_for_account(&account_id, &endpoints, &event, 1)
+            .await;
+        if outcome?.accepted.is_empty() {
+            return Err(AppError::Publish(
+                "no account relay acknowledged profile metadata".into(),
+            ));
+        }
+        publish_public_indexer_copies(relay_client.as_ref(), &account_id, &[event], &indexers)
+            .await;
         Ok(())
     }
 

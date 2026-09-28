@@ -107,7 +107,9 @@ impl Marmot {
     /// This retains the historical terminal-success contract: relay lists and
     /// the initial KeyPackage are published when it returns. New callers may
     /// use `create_identity_with_profile` for the earlier local-ready boundary
-    /// and an explicit readiness state.
+    /// and an explicit readiness state. Public indexers receive best-effort
+    /// copies of both relay lists and kind-0 metadata; KeyPackages remain on
+    /// the advertised write relays.
     pub async fn create_identity(
         &self,
         default_relays: Vec<String>,
@@ -136,7 +138,8 @@ impl Marmot {
     /// Create a generated identity and return at durable local readiness with
     /// the exact locally persisted default profile. `readiness` remains the
     /// authority for whether relay publication has completed; `LocalReady`
-    /// must not be presented as invite-receivable.
+    /// must not be presented as invite-receivable. Account setup copies both
+    /// relay lists and the default kind-0 profile to public indexers.
     pub async fn create_identity_with_profile(
         &self,
         default_relays: Vec<String>,
@@ -340,7 +343,8 @@ impl Marmot {
     }
 
     /// Publish (or re-publish) the NIP-65 and inbox relay lists for
-    /// `account_ref`. Idempotent — safe to call on every launch.
+    /// `account_ref`. Idempotent — safe to call on every launch. The lists are
+    /// copied to public indexers without advertising them as account relays.
     pub async fn publish_relay_lists(
         &self,
         account_ref: String,
@@ -350,7 +354,8 @@ impl Marmot {
         let bootstrap = marmot_app::AccountRelayListBootstrap::new(
             endpoints(&default_relays),
             endpoints(&bootstrap_relays),
-        );
+        )
+        .with_indexer_relays(ffi_publication_indexers(&default_relays, &bootstrap_relays));
         self.app
             .publish_account_relay_lists(&account_ref, bootstrap)
             .await?;
@@ -467,6 +472,7 @@ impl Marmot {
             .await? as u64)
     }
 
+    /// Publish the new NIP-65 list to the account relays and public indexers.
     pub async fn set_account_nip65_relays(
         &self,
         account_ref: String,
@@ -475,15 +481,17 @@ impl Marmot {
     ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
         let status = self
             .runtime
-            .set_account_nip65_relays(
+            .set_account_nip65_relays_with_indexers(
                 &account_ref,
                 endpoints(&relays),
                 endpoints(&bootstrap_relays),
+                ffi_publication_indexers(&relays, &bootstrap_relays),
             )
             .await?;
         Ok(status.into())
     }
 
+    /// Publish the new inbox list to the account relays and public indexers.
     pub async fn set_account_inbox_relays(
         &self,
         account_ref: String,
@@ -492,10 +500,11 @@ impl Marmot {
     ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
         let status = self
             .runtime
-            .set_account_inbox_relays(
+            .set_account_inbox_relays_with_indexers(
                 &account_ref,
                 endpoints(&relays),
                 endpoints(&bootstrap_relays),
+                ffi_publication_indexers(&relays, &bootstrap_relays),
             )
             .await?;
         Ok(status.into())
@@ -611,7 +620,8 @@ impl Marmot {
     /// diagnostics, tests, and specialized clients.
     ///
     /// The returned metadata is what marmot-app actually published (including
-    /// preserved unknown fields and any merge defaults).
+    /// preserved unknown fields and any merge defaults). Public indexers also
+    /// receive a best-effort copy of the same event.
     pub async fn publish_user_profile(
         &self,
         account_ref: String,
@@ -622,7 +632,8 @@ impl Marmot {
         let bootstrap = marmot_app::AccountRelayListBootstrap::new(
             endpoints(&default_relays),
             endpoints(&bootstrap_relays),
-        );
+        )
+        .with_indexer_relays(ffi_publication_indexers(&default_relays, &bootstrap_relays));
         let pushed = self
             .runtime
             .publish_user_profile(&account_ref, UserProfileMetadata::from(profile), bootstrap)
@@ -631,7 +642,8 @@ impl Marmot {
     }
 
     /// Publish Nostr kind:0 metadata using one coherent snapshot of the
-    /// selected account's MDK-owned relay configuration.
+    /// selected account's MDK-owned relay configuration. Public indexers also
+    /// receive a best-effort copy of the same event.
     ///
     /// Published NIP-65 write relays are preferred. When that list is empty,
     /// remembered bootstrap relays are used; when bootstrap relays are absent,
@@ -644,11 +656,16 @@ impl Marmot {
         account_ref: String,
         profile: UserProfileMetadataFfi,
     ) -> Result<UserProfileMetadataFfi, MarmotKitError> {
+        let account = self.runtime.accounts().resolve(&account_ref)?;
+        let relay_lists = self.app.account_relay_list_status(&account.label)?;
+        let indexers =
+            ffi_publication_indexers(&relay_lists.nip65.relays, &relay_lists.bootstrap_relays);
         let pushed = self
             .runtime
-            .publish_user_profile_using_account_relays(
+            .publish_user_profile_using_account_relays_and_indexers(
                 &account_ref,
                 UserProfileMetadata::from(profile),
+                indexers,
             )
             .await?;
         Ok(pushed.into())
@@ -681,13 +698,29 @@ impl Marmot {
 }
 
 fn ffi_discovery_relays(bootstrap_relays: &[String]) -> Vec<TransportEndpoint> {
-    let mut relays = endpoints(bootstrap_relays);
-    for relay in default_directory_discovery_relays() {
-        if !relays.contains(&relay) {
-            relays.push(relay);
-        }
+    ffi_publication_indexers(bootstrap_relays, &[])
+}
+
+fn ffi_publication_indexers(
+    operational_relays: &[String],
+    bootstrap_relays: &[String],
+) -> Vec<TransportEndpoint> {
+    // Local development relays must not cause test identities and profiles to
+    // escape to public indexers. Production relay declarations remain public.
+    if operational_relays
+        .iter()
+        .chain(bootstrap_relays)
+        .any(|relay| {
+            url::Url::parse(relay).ok().is_some_and(|url| {
+                url.host()
+                    .is_some_and(cgka_traits::app_components::is_loopback_host)
+            })
+        })
+    {
+        Vec::new()
+    } else {
+        default_directory_discovery_relays()
     }
-    relays
 }
 
 #[cfg(test)]
@@ -699,6 +732,17 @@ mod tests {
     use nostr_relay_builder::MockRelay;
 
     use super::*;
+
+    #[test]
+    fn public_indexer_publication_skips_loopback_development_accounts() {
+        assert!(ffi_publication_indexers(&["ws://127.0.0.1:1234".into()], &[]).is_empty());
+        assert!(ffi_publication_indexers(&[], &["ws://127.0.0.1:1234".into()]).is_empty());
+        assert!(
+            ffi_publication_indexers(&["wss://relay.example".into()], &[])
+                .iter()
+                .any(|relay| relay.0 == "wss://purplepag.es")
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn generated_identity_result_returns_the_exact_local_profile_and_readiness() {

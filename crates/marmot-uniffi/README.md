@@ -287,6 +287,16 @@ requires no client-owned reaction map.
 
 ## Identity references and profile pseudonyms
 
+New generated identities publish kind `10002`, kind `10050`, and kind `0` to
+their account relays and send separate best-effort copies to the built-in public
+directory indexers. Later relay-list and profile edits through MarmotKit do the
+same. The indexers are never inserted into the advertised relay lists or used
+for KeyPackages, contact lists, or messaging. Acknowledgement from an account
+relay establishes setup success; an indexer outage is reported only as an
+aggregate warning. Existing identities are not automatically republished by
+this change and need a client-initiated backfill of their current lists and
+profile.
+
 `accountIdHex` / `normalizeMemberRef` now accept `nprofile` and
 `nostr:nprofile` mentions and QR scans in addition to hex, `npub`,
 `nostr:npub`, and `marmot://profile/` links. Relay hints inside an

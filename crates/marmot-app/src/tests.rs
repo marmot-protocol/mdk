@@ -501,6 +501,7 @@ pub(crate) struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
+    attempted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
@@ -1138,6 +1139,10 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         _required_acks: usize,
     ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
         self.attempted_events.lock().unwrap().push(event.clone());
+        self.attempted_publish_routes
+            .lock()
+            .unwrap()
+            .push((event.kind, endpoints.to_vec()));
         if self
             .fail_publish_unavailable
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -7058,7 +7063,7 @@ async fn push_registration_removal_retry_body() {
 }
 
 #[tokio::test]
-async fn generated_account_bootstrap_uses_one_batch_and_never_refetches_after_ack() {
+async fn generated_account_bootstrap_separates_operational_and_indexer_batches() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
@@ -7079,7 +7084,8 @@ async fn generated_account_bootstrap_uses_one_batch_and_never_refetches_after_ac
             AccountRelayListBootstrap::new(
                 vec![TransportEndpoint("wss://relay.example".into())],
                 vec![TransportEndpoint("wss://relay.example".into())],
-            ),
+            )
+            .with_indexer_relays(vec![TransportEndpoint("wss://index.example".into())]),
             &profile,
         )
         .await
@@ -7089,8 +7095,8 @@ async fn generated_account_bootstrap_uses_one_batch_and_never_refetches_after_ac
     assert!(status.complete);
     assert_eq!(
         relay.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "relay lists, follow list, and profile must share one connection-amortizing batch"
+        2,
+        "operational records and indexer copies must use separate batches"
     );
     let mut kinds = relay
         .published_events
@@ -7104,16 +7110,165 @@ async fn generated_account_bootstrap_uses_one_batch_and_never_refetches_after_ac
         kinds,
         vec![
             KIND_NOSTR_METADATA,
+            KIND_NOSTR_METADATA,
             KIND_NOSTR_CONTACT_LIST,
             KIND_NIP65_RELAY_LIST,
+            KIND_NIP65_RELAY_LIST,
+            KIND_MARMOT_INBOX_RELAY_LIST,
             KIND_MARMOT_INBOX_RELAY_LIST,
         ]
+    );
+    let routes = relay.attempted_publish_routes.lock().unwrap().clone();
+    assert_eq!(routes.len(), 7);
+    for kind in [
+        KIND_NIP65_RELAY_LIST,
+        KIND_MARMOT_INBOX_RELAY_LIST,
+        KIND_NOSTR_METADATA,
+    ] {
+        assert!(routes.contains(&(kind, vec![TransportEndpoint("wss://relay.example".into())])));
+        assert!(routes.contains(&(kind, vec![TransportEndpoint("wss://index.example".into())])));
+    }
+    assert!(routes.contains(&(
+        KIND_NOSTR_CONTACT_LIST,
+        vec![TransportEndpoint("wss://relay.example".into())],
+    )));
+    assert!(!routes.iter().any(|(kind, endpoints)| {
+        *kind == KIND_NOSTR_CONTACT_LIST
+            && endpoints.contains(&TransportEndpoint("wss://index.example".into()))
+    }));
+    assert!(
+        !status
+            .bootstrap_relays
+            .contains(&"wss://index.example".to_owned())
     );
     assert_eq!(
         app.account_relay_list_status(&account.label).unwrap(),
         status,
         "the acknowledged declaration must be the durable local projection"
     );
+}
+
+#[tokio::test]
+async fn profile_and_relay_list_updates_copy_to_indexers_without_adopting_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_nostr_account_for_setup()
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let own = TransportEndpoint("wss://relay.example".into());
+    let indexer = TransportEndpoint("wss://index.example".into());
+    app.publish_generated_account_bootstrap(
+        &account.label,
+        AccountRelayListBootstrap::new(vec![own.clone()], vec![own.clone()]),
+        &UserProfileMetadata::default(),
+    )
+    .await
+    .unwrap();
+    relay.attempted_publish_routes.lock().unwrap().clear();
+
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            display_name: Some("Public Profile".into()),
+            ..Default::default()
+        },
+        AccountRelayListBootstrap::new(vec![own.clone()], vec![own.clone()])
+            .with_indexer_relays(vec![indexer.clone()]),
+    )
+    .await
+    .unwrap();
+    app.set_account_nip65_relays_with_indexers(
+        &account.label,
+        vec![own.clone()],
+        vec![own.clone()],
+        vec![indexer.clone()],
+    )
+    .await
+    .unwrap();
+    app.set_account_inbox_relays_with_indexers(
+        &account.label,
+        vec![own.clone()],
+        vec![own.clone()],
+        vec![indexer.clone()],
+    )
+    .await
+    .unwrap();
+
+    let routes = relay.attempted_publish_routes.lock().unwrap().clone();
+    for kind in [
+        KIND_NOSTR_METADATA,
+        KIND_NIP65_RELAY_LIST,
+        KIND_MARMOT_INBOX_RELAY_LIST,
+    ] {
+        assert!(routes.contains(&(kind, vec![own.clone()])));
+        assert!(routes.contains(&(kind, vec![indexer.clone()])));
+    }
+    let status = app.account_relay_list_status(&account.label).unwrap();
+    assert_eq!(status.nip65.relays, vec![own.0.clone()]);
+    assert_eq!(status.inbox.relays, vec![own.0.clone()]);
+    assert!(!status.bootstrap_relays.contains(&indexer.0));
+}
+
+#[tokio::test]
+async fn unavailable_indexer_does_not_undo_acknowledged_account_bootstrap() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_nostr_account_for_setup()
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay
+        .publish_results
+        .lock()
+        .unwrap()
+        .extend([true, true, true, true, false, false, false]);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay);
+    let status = app
+        .publish_generated_account_bootstrap(
+            &account.label,
+            AccountRelayListBootstrap::new(
+                vec![TransportEndpoint("wss://relay.example".into())],
+                vec![TransportEndpoint("wss://relay.example".into())],
+            )
+            .with_indexer_relays(vec![TransportEndpoint("wss://index.example".into())]),
+            &UserProfileMetadata::default(),
+        )
+        .await
+        .unwrap()
+        .status;
+    assert!(status.complete);
+    assert_eq!(
+        app.account_relay_list_status(&account.label).unwrap(),
+        status
+    );
+}
+
+#[tokio::test]
+async fn unsafe_indexer_is_skipped_without_blocking_account_bootstrap() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_nostr_account_for_setup()
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let status = app
+        .publish_generated_account_bootstrap(
+            &account.label,
+            AccountRelayListBootstrap::new(
+                vec![TransportEndpoint("wss://relay.example".into())],
+                vec![TransportEndpoint("wss://relay.example".into())],
+            )
+            .with_indexer_relays(vec![TransportEndpoint("ws://10.0.0.1:1234".into())]),
+            &UserProfileMetadata::default(),
+        )
+        .await
+        .unwrap()
+        .status;
+    assert!(status.complete);
+    assert_eq!(relay.attempted_publish_routes.lock().unwrap().len(), 4);
 }
 
 #[tokio::test]

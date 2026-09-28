@@ -1251,6 +1251,8 @@ pub struct AccountSetupRequest {
     pub import_nsec: Option<Zeroizing<String>>,
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
+    /// Public directory indexers. Existing accounts use them for reads;
+    /// generated accounts also copy relay lists and kind-0 metadata to them.
     pub discovery_relays: Vec<TransportEndpoint>,
     pub publish_missing_relay_lists: bool,
     pub publish_initial_key_package: bool,
@@ -4224,6 +4226,7 @@ impl MarmotAppRuntime {
             profile,
             &merge_source_relays,
             publish_endpoints,
+            bootstrap.indexer_relays,
         )
         .await
     }
@@ -4236,6 +4239,20 @@ impl MarmotAppRuntime {
         &self,
         account_ref: &str,
         profile: UserProfileMetadata,
+    ) -> Result<UserProfileMetadata, AppError> {
+        self.publish_user_profile_using_account_relays_and_indexers(
+            account_ref,
+            profile,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn publish_user_profile_using_account_relays_and_indexers(
+        &self,
+        account_ref: &str,
+        profile: UserProfileMetadata,
+        indexer_relays: Vec<TransportEndpoint>,
     ) -> Result<UserProfileMetadata, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
@@ -4255,6 +4272,7 @@ impl MarmotAppRuntime {
             profile,
             &endpoints,
             endpoints.clone(),
+            indexer_relays,
         )
         .await
     }
@@ -4265,6 +4283,7 @@ impl MarmotAppRuntime {
         mut profile: UserProfileMetadata,
         merge_source_relays: &[TransportEndpoint],
         publish_endpoints: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
     ) -> Result<UserProfileMetadata, AppError> {
         if let Some(current) = self
             .latest_known_user_profile_for_publish(&account.account_id_hex, merge_source_relays)
@@ -4285,7 +4304,12 @@ impl MarmotAppRuntime {
         stamp_published_profile_created_at(&mut profile, unix_now_seconds());
         self.accounts
             .app
-            .publish_user_profile_to_endpoints(&account.label, profile.clone(), publish_endpoints)
+            .publish_user_profile_to_endpoints_and_indexers(
+                &account.label,
+                profile.clone(),
+                publish_endpoints,
+                indexer_relays,
+            )
             .await?;
         self.accounts
             .app
@@ -4593,10 +4617,31 @@ impl MarmotAppRuntime {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_nip65_relays_with_indexers(
+            account_ref,
+            relays,
+            bootstrap_relays,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn set_account_nip65_relays_with_indexers(
+        &self,
+        account_ref: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts
             .app
-            .set_account_nip65_relays(&account.label, relays, bootstrap_relays)
+            .set_account_nip65_relays_with_indexers(
+                &account.label,
+                relays,
+                bootstrap_relays,
+                indexer_relays,
+            )
             .await
     }
 
@@ -4606,10 +4651,31 @@ impl MarmotAppRuntime {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_inbox_relays_with_indexers(
+            account_ref,
+            relays,
+            bootstrap_relays,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn set_account_inbox_relays_with_indexers(
+        &self,
+        account_ref: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts
             .app
-            .set_account_inbox_relays(&account.label, relays, bootstrap_relays)
+            .set_account_inbox_relays_with_indexers(
+                &account.label,
+                relays,
+                bootstrap_relays,
+                indexer_relays,
+            )
             .await
     }
 
@@ -7647,7 +7713,8 @@ impl AccountManager {
         let bootstrap = AccountRelayListBootstrap::new(
             request.default_relays.clone(),
             request.bootstrap_relays.clone(),
-        );
+        )
+        .with_indexer_relays(request.discovery_relays.clone());
         // Validate before advancing the durable publication phase. The
         // publisher validates again at its own action boundary because it is
         // also called directly outside this setup orchestrator.
@@ -8321,8 +8388,8 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
     }
 }
 
-/// Public indexer relays used to resolve a pre-existing identity's outbox
-/// metadata during setup.
+/// Public indexer relays used to resolve existing identities and spread newly
+/// generated accounts' public relay lists and profile metadata.
 ///
 /// A brand-new external-signer account (or an imported nsec) keeps its NIP-65
 /// relay list (kind:10002) and profile (kind:0) on public indexers, not on the
@@ -8330,8 +8397,7 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
 /// app's relays therefore finds nothing and the display name never resolves —
 /// the exact bug the external-signer work exists to fix. These indexers give
 /// the directory preflight a discovery set distinct from the operational
-/// messaging relays. They are used only to read the outbox list and profile,
-/// they are never adopted as the account's messaging relays.
+/// messaging relays. They are never adopted as the account's messaging relays.
 pub(crate) const VERTEX_DIRECTORY_RELAY: &str = "wss://relay.vertexlab.io";
 
 const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[

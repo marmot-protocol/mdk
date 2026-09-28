@@ -217,7 +217,9 @@ pub struct OnboardingSnapshot {
     pub cancellation_pending: bool,
 }
 /// Hosts pass the same default relay set used by account creation. Discovery
-/// relays are independent indexers and are never implicitly published.
+/// relays are independent indexers. They are not advertised as account relays;
+/// generated-account setup may send public relay lists and profile metadata
+/// to them for discovery.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingOptions {
     pub default_relays: Vec<String>,
