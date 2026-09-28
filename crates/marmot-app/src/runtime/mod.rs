@@ -388,7 +388,13 @@ pub struct RuntimeSharedServices {
     next_startup_sync_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
     #[cfg(any(test, feature = "test-policy-overrides"))]
     next_scheduled_convergence_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    next_catch_up_barrier: Arc<StdMutex<Option<AccountCatchUpBarrier>>>,
 }
+
+/// One account's held catch-up: its account id and the rendezvous barrier.
+#[cfg(any(test, feature = "test-policy-overrides"))]
+type AccountCatchUpBarrier = (String, Arc<tokio::sync::Barrier>);
 
 const MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT: usize = MAX_SEEN_EVENT_IDS;
 
@@ -494,12 +500,14 @@ impl Default for RuntimeSharedServices {
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_scheduled_convergence_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_catch_up_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 }
 
 impl RuntimeSharedServices {
-    pub(in crate::runtime) fn recovery_credit_pool(
+    pub(crate) fn recovery_credit_pool(
         &self,
     ) -> Arc<account_worker::recovery_credits::RecoveryCreditPool> {
         self.recovery_credits.lock().unwrap().clone()
@@ -584,6 +592,8 @@ impl RuntimeSharedServices {
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_scheduled_convergence_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_catch_up_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -640,6 +650,35 @@ impl RuntimeSharedServices {
             .lock()
             .unwrap()
             .take()
+    }
+
+    /// Test-only hook: hold one account's next explicit catch-up between two
+    /// rendezvous, while its command owns the account client, so the commands
+    /// it answers meanwhile can be checked deterministically.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub fn set_next_catch_up_barrier(
+        &self,
+        account_id_hex: &str,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) {
+        *self.next_catch_up_barrier.lock().unwrap() = Some((account_id_hex.to_owned(), barrier));
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    fn take_next_catch_up_barrier(
+        &self,
+        account_id_hex: &str,
+    ) -> Option<Arc<tokio::sync::Barrier>> {
+        let mut slot = self.next_catch_up_barrier.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|(account, _)| account == account_id_hex)
+        {
+            slot.take().map(|(_, barrier)| barrier)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn lifecycle(&self) -> RuntimeLifecycle {

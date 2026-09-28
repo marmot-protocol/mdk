@@ -1332,40 +1332,6 @@ impl MarmotRelayPlane {
         }
     }
 
-    /// Queue a delivery past the router's placement, as an adapter/engine
-    /// disagreement would. It still counts in the queue's restart floor.
-    #[cfg(all(test, feature = "test-policy-overrides"))]
-    pub(crate) async fn inject_delivery_for_test(&self, delivery: TransportDelivery) -> bool {
-        let sender = account_deliveries_read(&self.inner.transport.account_deliveries)
-            .get(&delivery.account_id)
-            .cloned();
-        match sender {
-            Some(route) => {
-                let key = account_delivery_restart_key(&delivery);
-                {
-                    let mut state = route
-                        .overflow
-                        .inner
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    if state.admission.epoch == route.epoch {
-                        *state.admission.queued.entry(key).or_default() += 1;
-                    }
-                }
-                let sent = route
-                    .sender
-                    .send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
-                    .await
-                    .is_ok();
-                if !sent {
-                    route.overflow.unqueue(route.epoch, key);
-                }
-                sent
-            }
-            None => false,
-        }
-    }
-
     /// Place one delivery exactly as the router does, synchronously, so a
     /// test can land it at a chosen point inside a cursor commit.
     #[cfg(test)]
@@ -2105,7 +2071,7 @@ impl MarmotRelayPlane {
     /// Report end-of-stored-events for one subscription on one endpoint, the
     /// way [`handle_relay_notification`] does for an SDK-backed plane. An
     /// injected relay client produces no relay messages of its own, so tests
-    /// that need an EOSE-gated drain to complete drive this seam instead.
+    /// that need a subscription's end of stored events drive this seam.
     #[cfg(test)]
     pub(crate) async fn handle_relay_eose_for_test(
         &self,
@@ -3080,20 +3046,6 @@ impl MarmotRelayPlaneAccountAdapter {
         Ok(Some(result?))
     }
 
-    /// Submit an owned comparison event to this account's delivery queue.
-    /// Durable admission happens in the caller's subsequent drain.
-    pub(crate) async fn queue_reconciled_event(
-        &self,
-        event: transport_nostr_adapter::NostrRelayEvent,
-    ) -> Result<usize, TransportAdapterError> {
-        self.relay_plane
-            .inner
-            .transport
-            .adapter
-            .handle_reconciled_event(&self.account_id, event)
-            .await
-    }
-
     /// This account's deliveries for one owned comparison event. The worker
     /// admits them directly, never through the live queue.
     pub(crate) async fn recovered_deliveries(
@@ -3354,8 +3306,8 @@ impl MarmotRelayPlaneAccountAdapter {
         self.delivery_overflow.pending_snapshot()
     }
 
-    /// Begin (or resume after process restart) the unfloored replay required by
-    /// a durable account-delivery overflow marker.
+    /// Begin (or resume after process restart) the recovery job required by a
+    /// durable account-delivery loss marker.
     pub(crate) fn start_delivery_overflow_recovery(
         &self,
         durable_marker_token: u64,

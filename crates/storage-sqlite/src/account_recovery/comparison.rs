@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct RecoveryComparisonPlan {
     pub fence: RecoveryRevisionFence,
+    /// The activation floor the retired inline executor re-subscribed at.
+    /// Kept for the stored plan format; recovery no longer reads it.
     pub live_since_seconds: Option<u64>,
     pub routes: Vec<RecoveryScopePlan>,
     /// Only transiently failed selected routes survive settlement. Empty after

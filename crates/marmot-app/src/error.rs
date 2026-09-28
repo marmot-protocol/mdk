@@ -46,7 +46,9 @@ impl std::fmt::Display for AccountCatchUpFailure {
 }
 
 /// Why an explicit repair stopped without qualified history completion.
-/// These bounded codes contain no relay, account or event identities.
+/// These bounded codes contain no relay, account or event identities. The
+/// comparison job reports `CoverageUnproven`, `Cancelled` and `Deadline`; the
+/// drain-era codes remain so existing matches keep compiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FullHistoryRepairIncompleteReason {
     #[error("full_history_coverage_unproven")]

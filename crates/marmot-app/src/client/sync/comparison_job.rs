@@ -165,10 +165,18 @@ impl ComparisonNetworkJob {
         let _ = (&mut self.handle).await;
     }
 
+    /// The deadline of an automatic pass: one account-wide quantum.
+    pub(crate) fn automatic_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM
+    }
+
+    /// Start the grant's comparison off the worker. A route the pass has not
+    /// reached by `deadline` is skipped and keeps its debt.
     pub(crate) fn start(
         client: &AppClient,
         grant: &AttemptGrant,
         credit: OwnedSemaphorePermit,
+        deadline: tokio::time::Instant,
         #[cfg(test)] witness: Option<TestComparisonActivityWitness>,
     ) -> Result<Self, AppError> {
         let storage = client.app.account_storage(&client.state.label)?;
@@ -199,7 +207,6 @@ impl ComparisonNetworkJob {
                     .store(attempt_serial, Ordering::SeqCst);
                 ActiveCounter::new(witness.active_jobs.clone())
             });
-            let deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
             let mut results = Vec::with_capacity(routes.len());
             for frozen in routes {
                 let FrozenRoute {
@@ -228,9 +235,7 @@ impl ComparisonNetworkJob {
                         if let Some(delay) = scripted_delay {
                             tokio::time::sleep(delay).await;
                         }
-                        return scripted
-                            .pop()
-                            .expect("one scripted result per selected comparison route");
+                        return scripted.answer(&inventory.route);
                     }
                     match inventory.work {
                         TransportReconciliationWork::Inbox(endpoints) => {
@@ -299,9 +304,9 @@ impl ComparisonNetworkJob {
 }
 
 impl AppClient {
-    /// Whether recovery has any work a grant could select. The worker asks
-    /// only when the shared credit pool is empty: it then waits for a credit
-    /// instead of spending a reservation it cannot use.
+    /// Whether recovery has any work a grant could select, asked without
+    /// spending a reservation: a direct caller asks before it waits for a
+    /// credit, and the worker asks when none is free.
     pub(crate) fn recovery_pending(&self) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         Ok(!self.pending_recovery_arm_writes.is_empty()
@@ -320,20 +325,21 @@ impl AppClient {
         let mut execution = self
             .begin_recovery_execution(grant)
             .map_err(|failure| failure.source)?;
-        execution.activation = marmot_forensics::EpochBackfillActivationOutcome::Succeeded;
         // A maintenance boundary is its own REQ's end of stored events. It is
         // installed here, under this grant's scope tokens, and observed later.
+        // Installing it is the job's only activation.
         if let Err(error) = self.install_granted_post_join_subscriptions(grant).await {
             let failure = ClassifiedSyncFailure::at_stage(
                 SyncSummary::default(),
                 error,
                 SyncFailureStage::GroupSubscriptionSync,
             );
-            return match self.finish_recovery_execution(grant, execution, Err(failure), false) {
+            return match self.finish_recovery_execution(grant, execution, Err(failure)) {
                 Ok(_) => unreachable!("a failed installation cannot complete"),
                 Err(failure) => Err(failure.source),
             };
         }
+        execution.activation = marmot_forensics::EpochBackfillActivationOutcome::Succeeded;
         Ok(ComparisonExecution {
             attempt: self.adapter.account_subscription_attempt().await,
             execution: Box::new(execution),
@@ -495,8 +501,58 @@ impl AppClient {
         Ok(admission.pending.is_empty())
     }
 
-    /// Run one selected grant through the job and wait for it, as a caller
-    /// with its own process credit would.
+    /// Run one selected grant through the job and wait for it: the path of an
+    /// explicit caller or a directly owned client, which has no worker loop to
+    /// interleave. The comparison still runs in its own task under `credit`,
+    /// and admission takes the same bounded turns. An explicit repair's
+    /// `control` bounds the network pass by its budget; its cancellation also
+    /// stops admission, keeping the admitted prefix and certifying nothing.
+    pub(crate) async fn run_recovery_job(
+        &mut self,
+        grant: AttemptGrant,
+        credit: OwnedSemaphorePermit,
+        control: Option<&FullHistoryRepairControl<'_>>,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        let execution = self.begin_comparison_grant(&grant).await?;
+        let deadline = control.map_or_else(
+            ComparisonNetworkJob::automatic_deadline,
+            FullHistoryRepairControl::deadline,
+        );
+        let mut network = match ComparisonNetworkJob::start(
+            self,
+            &grant,
+            credit,
+            deadline,
+            #[cfg(test)]
+            None,
+        ) {
+            Ok(network) => network,
+            Err(error) => {
+                let _ = self.abandon_comparison_grant(grant, execution);
+                return Err(error);
+            }
+        };
+        let completed = loop {
+            tokio::select! {
+                completed = network.wait() => break completed.ok(),
+                () = tokio::time::sleep(RECOVERY_JOB_CANCEL_POLL),
+                    if control.is_some() =>
+                {
+                    if control.is_some_and(FullHistoryRepairControl::cancelled) {
+                        network.abort_and_wait().await;
+                        break None;
+                    }
+                }
+            }
+        };
+        let Some((_credit, result)) = completed else {
+            return self.abandon_comparison_grant(grant, execution);
+        };
+        self.admit_comparison_until(grant, execution, result, control)
+            .await
+    }
+
+    /// Run one selected grant through the job with a private credit.
     #[cfg(test)]
     pub(crate) async fn run_recovery_grant_for_test(
         &mut self,
@@ -505,18 +561,7 @@ impl AppClient {
         let credit = Arc::new(tokio::sync::Semaphore::new(1))
             .try_acquire_owned()
             .expect("a private test credit");
-        let execution = self.begin_comparison_grant(&grant).await?;
-        let mut network = match ComparisonNetworkJob::start(self, &grant, credit, None) {
-            Ok(network) => network,
-            Err(error) => {
-                let _ = self.abandon_comparison_grant(grant, execution);
-                return Err(error);
-            }
-        };
-        match network.wait().await {
-            Ok((_credit, result)) => self.admit_comparison_inline(grant, execution, result).await,
-            Err(_) => self.abandon_comparison_grant(grant, execution),
-        }
+        self.run_recovery_job(grant, credit, None).await
     }
 
     /// Admit a finished pass in bounded turns, yielding between them, then
@@ -525,8 +570,19 @@ impl AppClient {
     pub(crate) async fn admit_comparison_inline(
         &mut self,
         grant: AttemptGrant,
+        execution: ComparisonExecution,
+        network: ComparisonNetworkResult,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        self.admit_comparison_until(grant, execution, network, None)
+            .await
+    }
+
+    async fn admit_comparison_until(
+        &mut self,
+        grant: AttemptGrant,
         mut execution: ComparisonExecution,
         network: ComparisonNetworkResult,
+        control: Option<&FullHistoryRepairControl<'_>>,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         let mut admission = match self
             .accept_comparison_network(&grant, &execution, network)
@@ -537,6 +593,13 @@ impl AppClient {
         };
         if let Some(admission) = admission.as_mut() {
             loop {
+                if control.is_some_and(FullHistoryRepairControl::cancelled) {
+                    // The admitted prefix stays durable; the pass certifies
+                    // nothing, so the debt waits for a later grant.
+                    admission.invalid = true;
+                    admission.pending.clear();
+                    break;
+                }
                 match self
                     .admit_comparison_turn(&grant, &mut execution, admission)
                     .await
@@ -552,7 +615,7 @@ impl AppClient {
     }
 
     /// Settle the execution bracket after admission: checkpoints, loss
-    /// acknowledgment and audit rows, as the inline executor does.
+    /// acknowledgment and audit rows.
     pub(crate) async fn finish_comparison_grant(
         &mut self,
         grant: AttemptGrant,
@@ -575,12 +638,7 @@ impl AppClient {
         };
         let deferred = matches!(settled, Ok(None));
         let summary = self
-            .finish_recovery_execution(
-                &grant,
-                execution,
-                settled.map(Option::unwrap_or_default),
-                false,
-            )
+            .finish_recovery_execution(&grant, execution, settled.map(Option::unwrap_or_default))
             .map_err(|failure| {
                 self.pending_failed_sync_summary
                     .merge(failure.partial_summary);
@@ -610,13 +668,8 @@ impl AppClient {
         grant: AttemptGrant,
         execution: ComparisonExecution,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
-        self.finish_recovery_execution(
-            &grant,
-            *execution.execution,
-            Ok(SyncSummary::default()),
-            false,
-        )
-        .map_err(|failure| failure.source)?;
+        self.finish_recovery_execution(&grant, *execution.execution, Ok(SyncSummary::default()))
+            .map_err(|failure| failure.source)?;
         Ok(EpochBackfillRunOutcome::Deferred)
     }
 
@@ -632,7 +685,6 @@ impl AppClient {
             &grant,
             *execution.execution,
             Err(comparison_failure(error)),
-            false,
         ) {
             Ok(_) => unreachable!("a failed recovery cannot complete"),
             Err(failure) => {
@@ -671,21 +723,13 @@ impl AppClient {
                 },
                 certified: route.certified && route.admitted,
                 fetched: route.fetched,
-                queued: None,
                 // Incomplete admission withholds the certificate and retries
                 // the route, but the relays still answered.
                 answered: route.answered,
             });
         }
-        self.finish_recovery_grant_after_drain(
-            grant,
-            &mut execution.counts,
-            &mut execution.drain_verdict,
-            outcomes,
-            admission.summary,
-            DrainVerdict::Complete,
-        )
-        .await
+        self.settle_recovery_grant(grant, &mut execution.counts, outcomes, admission.summary)
+            .await
     }
 }
 
@@ -851,7 +895,7 @@ mod tests {
             .unwrap();
         fixture
             .client
-            .execute_pending_epoch_backfill_grant(baseline)
+            .run_recovery_grant_for_test(baseline)
             .await
             .unwrap();
         let epoch = fixture

@@ -603,7 +603,14 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .unwrap();
     let execution = client.begin_comparison_grant(&grant).await.unwrap();
     let credit = recovery_credits::try_acquire_recovery_credit(&pool).unwrap();
-    let mut job = ComparisonNetworkJob::start(&client, &grant, credit, None).unwrap();
+    let mut job = ComparisonNetworkJob::start(
+        &client,
+        &grant,
+        credit,
+        ComparisonNetworkJob::automatic_deadline(),
+        None,
+    )
+    .unwrap();
     let (credit, network) = timeout(Duration::from_secs(12), job.wait())
         .await
         .unwrap()

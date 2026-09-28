@@ -1,6 +1,6 @@
 //! The owned comparison result stays outside account admission until the
-//! serialized worker explicitly submits it. The off-worker scheduler is a
-//! separate follow-up; this exercises its current inline consumer boundary.
+//! serialized worker admits it through ordinary ingest, never through the
+//! live delivery queue.
 
 use super::*;
 use cgka_traits::{TransportEndpoint, TransportGroupSubscription};
@@ -185,18 +185,11 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             .unwrap()
     );
 
-    assert_eq!(
-        client.adapter.queue_reconciled_event(event).await.unwrap(),
-        1
-    );
-    let delivery = timeout(Duration::from_secs(2), client.receive_next_delivery())
-        .await
-        .expect("explicit submission reaches the account")
-        .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = delivery else {
-        panic!("expected the submitted event, not an overflow signal");
-    };
-    client.ingest_received_delivery(*delivery).await.unwrap();
+    let deliveries = client.adapter.recovered_deliveries(event).await.unwrap();
+    assert_eq!(deliveries.len(), 1, "the event routes to this account once");
+    for delivery in deliveries {
+        client.admit_recovered_delivery(delivery).await.unwrap();
+    }
     assert!(
         storage
             .retained_recovery_event(&route, &event_id, None, crate::unix_now_seconds())
@@ -206,7 +199,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
         timeout(Duration::from_millis(100), client.receive_next_delivery())
             .await
             .is_err(),
-        "one worker submission must not queue duplicate copies"
+        "worker admission never queues the event for live delivery"
     );
     drop(client);
     runtime.shutdown_and_close().await.unwrap();

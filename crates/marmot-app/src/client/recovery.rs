@@ -125,39 +125,6 @@ impl Drop for RecoveryLossAttemptGuard {
     }
 }
 
-/// An acquisition observation changes eligibility, never the completion predicate.
-/// Unknown history gets one bounded investigation per qualified demand revision;
-/// missing epoch/event input remains useful to retry unless incapability is known.
-pub(super) fn eligibility_after_observation(
-    cause: storage_sqlite::RecoveryCause,
-    outcome: storage_sqlite::RecoveryScopeOutcome,
-    investigation_ended: bool,
-    admission_refused: bool,
-) -> storage_sqlite::RecoveryEligibility {
-    use storage_sqlite::{
-        RecoveryCause as Cause, RecoveryEligibility as Eligibility, RecoveryScopeOutcome as Outcome,
-    };
-    if admission_refused {
-        return Eligibility::WaitingCapacity;
-    }
-    match outcome {
-        Outcome::Unsupported | Outcome::Excluded => Eligibility::WaitingCapability,
-        Outcome::Unknown | Outcome::BudgetExhausted
-            if investigation_ended
-                && matches!(
-                    cause,
-                    Cause::QueueLoss
-                        | Cause::NotificationLoss
-                        | Cause::ExplicitHistory
-                        | Cause::IncrementalHistory
-                ) =>
-        {
-            Eligibility::NeedsDeepRepair
-        }
-        _ => Eligibility::Retry,
-    }
-}
-
 fn loss_cause(cause: storage_sqlite::RecoveryCause) -> Option<storage_sqlite::RecoveryLossCause> {
     match cause {
         storage_sqlite::RecoveryCause::QueueLoss => Some(storage_sqlite::RecoveryLossCause::Queue),
@@ -208,11 +175,13 @@ fn scope_is_certified(
 #[cfg(test)]
 const RECOVERY_PARK_AFTER_ATTEMPTS: u64 = storage_sqlite::RECOVERY_PARK_AFTER_QUIET_PASSES;
 
+/// A job's outcome changes eligibility, never the completion predicate.
 /// Comparison-owned recovery keeps retrying while passes certify new
 /// coverage. Storage parks an obligation after its own quiet passes in a row
 /// (`RecoveryPassProgress::Quiet`) until new evidence or an explicit repair.
 /// A pass whose required relays failed or timed out does not count:
-/// unreachable relays are waited out with pacing.
+/// unreachable relays are waited out with pacing. Refused admission waits for
+/// capacity, and a proven incapability waits for a capability change.
 pub(super) fn eligibility_after_comparison(
     outcome: storage_sqlite::RecoveryScopeOutcome,
     admission_refused: bool,
@@ -1342,7 +1311,6 @@ impl AppClient {
             .map(|timestamp| timestamp.0);
         let mut goals = Vec::new();
         let mut certified_scopes = std::collections::HashSet::new();
-        let mut independent_broad_acquisition = false;
         for (id, revision) in &grant.fence.obligations {
             let demand = demands
                 .iter()
@@ -1357,22 +1325,6 @@ impl AppClient {
                     .filter(|scope| scope_is_certified(scope, *revision, &grant.fence))
                     .map(|scope| (*id, scope.plan.scope_id)),
             );
-            if !matches!(
-                demand.cause,
-                storage_sqlite::RecoveryCause::IncrementalHistory
-                    | storage_sqlite::RecoveryCause::Maintenance
-            ) {
-                // Startup comparison alone cannot reissue an old broad goal.
-                // Independently new loss/missing-input/route evidence, or a
-                // live explicit caller, still owns its supported wider pass.
-                independent_broad_acquisition |= explicit.is_some()
-                    || stored.is_empty()
-                    || stored.iter().any(|scope| {
-                        scope.obligation_revision != *revision
-                            || scope.route_revision != grant.fence.route_revision
-                            || scope.loss_revision != grant.fence.loss_revision
-                    });
-            }
             // Cold start compares the retained-inventory window, as the
             // startup comparison does. A checkpoint narrows the goal to the
             // gap below the live floor.
@@ -1574,10 +1526,16 @@ impl AppClient {
                 comparison_goals = retrying;
             }
         }
+        // An explicit full-history repair awaits one pass, so that pass
+        // compares every route; automatic passes rotate through the rest.
+        let every_route = explicit
+            .as_ref()
+            .is_some_and(|permit| permit.full_history_requested);
         let (inventory, rotation_claim) = if grant.comparison_revision.is_some() {
             self.freeze_recovery_inventory(
                 &mut [([0; 16], comparison_goals.clone())],
                 &std::collections::HashSet::new(),
+                every_route,
             )?
         } else {
             // A maintenance boundary is its own REQ's end of stored events,
@@ -1593,7 +1551,7 @@ impl AppClient {
                 .flat_map(|(id, scopes)| scopes.iter().map(move |scope| (*id, scope.scope_id)))
                 .chain(certified_scopes.iter().copied())
                 .collect();
-            self.freeze_recovery_inventory(&mut goals, &uncompared)?
+            self.freeze_recovery_inventory(&mut goals, &uncompared, every_route)?
         };
         grant.rotation_claim = rotation_claim;
         if grant.comparison_revision.is_some() {
@@ -1615,28 +1573,9 @@ impl AppClient {
             routes.sort_by_key(|r| r.scope_id);
             grant.comparison_plan = Some(storage_sqlite::RecoveryComparisonPlan {
                 fence: grant.fence.clone(),
-                // History is acquired by comparison, never by an unfloored
-                // replay. Only explicit full-history repair keeps a wider pass.
-                live_since_seconds: if independent_broad_acquisition
-                    && explicit
-                        .as_ref()
-                        .is_some_and(|permit| permit.full_history_requested)
-                {
-                    goals
-                        .iter()
-                        .filter(|(id, _)| {
-                            demands.iter().any(|d| {
-                                d.ticket.id == *id
-                                    && d.cause != storage_sqlite::RecoveryCause::Maintenance
-                            })
-                        })
-                        .flat_map(|(_, scopes)| scopes)
-                        .map(|scope| scope.since_seconds)
-                        .collect::<Option<Vec<_>>>()
-                        .and_then(|bounds| bounds.into_iter().min())
-                } else {
-                    self.subscription_rebuild_since()?.map(|t| t.0)
-                },
+                // History is acquired by comparison; no pass installs a live
+                // subscription, so there is no activation floor to freeze.
+                live_since_seconds: None,
                 routes,
                 retry_routes: Vec::new(),
             });
@@ -3010,6 +2949,8 @@ mod tests {
             .unwrap();
         client.run_recovery_grant_for_test(grant).await.unwrap();
         assert_eq!(client.post_join_maintenance_subscriptions.len(), 1);
+        // The boundary is the installed REQ's own end of stored events.
+        crate::tests::report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -3131,40 +3072,24 @@ mod tests {
     }
     #[test]
     fn outcome_policy_distinguishes_unknown_input_from_proven_incapability() {
-        use storage_sqlite::{
-            RecoveryCause as C, RecoveryEligibility as E, RecoveryScopeOutcome as O,
-        };
+        use storage_sqlite::{RecoveryEligibility as E, RecoveryScopeOutcome as O};
+        // Parking is the per-scope quiet streak's decision, never one pass's.
+        assert_eq!(eligibility_after_comparison(O::Unknown, false), E::Retry);
         assert_eq!(
-            eligibility_after_observation(C::EpochGap, O::Unknown, true, false),
+            eligibility_after_comparison(O::BudgetExhausted, false),
             E::Retry
         );
         assert_eq!(
-            eligibility_after_observation(C::KnownEvent, O::BudgetExhausted, true, false),
-            E::Retry
-        );
-        assert_eq!(
-            eligibility_after_observation(C::EpochGap, O::Unsupported, true, false),
+            eligibility_after_comparison(O::Unsupported, false),
             E::WaitingCapability
         );
         assert_eq!(
-            eligibility_after_observation(C::QueueLoss, O::Unknown, false, false),
-            E::Retry
+            eligibility_after_comparison(O::Excluded, false),
+            E::WaitingCapability
         );
         assert_eq!(
-            eligibility_after_observation(C::NotificationLoss, O::BudgetExhausted, true, false),
-            E::NeedsDeepRepair
-        );
-        assert_eq!(
-            eligibility_after_observation(C::QueueLoss, O::Unavailable, true, false),
-            E::Retry
-        );
-        assert_eq!(
-            eligibility_after_observation(C::QueueLoss, O::Unknown, true, true),
+            eligibility_after_comparison(O::Unknown, true),
             E::WaitingCapacity
-        );
-        assert_eq!(
-            eligibility_after_observation(C::Maintenance, O::Unknown, true, false),
-            E::Retry
         );
     }
 
@@ -3205,10 +3130,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        client
-            .execute_recovery_grant(grant, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
         let eligibility = |cause| {
             storage
                 .pending_recovery_demands()
@@ -3242,10 +3164,7 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap();
-            client
-                .execute_recovery_grant(grant, None, None)
-                .await
-                .unwrap();
+            client.run_recovery_grant_for_test(grant).await.unwrap();
         }
         assert_eq!(
             eligibility(RecoveryCause::QueueLoss),
@@ -3989,10 +3908,7 @@ mod tests {
             .expect("a retryable pass is selected");
         let routes = grant.inventory.len();
         client.test_comparison_results = Some(script(&grant));
-        client
-            .execute_recovery_grant(grant, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
         client.recovery_owner.test_advance_to_retry(storage);
         routes
     }
@@ -4024,10 +3940,7 @@ mod tests {
             "inbox and group routes are compared"
         );
         client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
-        client
-            .execute_recovery_grant(grant, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
 
         assert_eq!(
             queue_loss(&storage),
@@ -4066,10 +3979,7 @@ mod tests {
             .unwrap()
             .unwrap();
         client.test_comparison_results = Some(scripted_routes(&grant, group));
-        client
-            .execute_recovery_grant(grant, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
         assert_eq!(
             queue_loss(&storage),
             Some(storage_sqlite::RecoveryEligibility::Retry),
@@ -4088,10 +3998,7 @@ mod tests {
             .unwrap()
             .unwrap();
         client.test_comparison_results = Some(scripted_routes(&retry, |route| !group(route)));
-        client
-            .execute_recovery_grant(retry, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(retry).await.unwrap();
         assert_eq!(queue_loss(&storage), None);
     }
 
@@ -4109,10 +4016,7 @@ mod tests {
                 .unwrap()
                 .unwrap_or_else(|| panic!("pass {pass} is selected"));
             client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
-            client
-                .execute_recovery_grant(grant, None, None)
-                .await
-                .unwrap();
+            client.run_recovery_grant_for_test(grant).await.unwrap();
             client.recovery_owner.test_advance_to_retry(&storage);
         }
         assert_eq!(
@@ -4145,10 +4049,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("pass {pass} is selected"));
             // Every required relay fails or times out.
             client.test_comparison_results = Some(scripted_routes(&grant, |_| true));
-            client
-                .execute_recovery_grant(grant, None, None)
-                .await
-                .unwrap();
+            client.run_recovery_grant_for_test(grant).await.unwrap();
             assert_eq!(
                 queue_loss(&storage),
                 Some(storage_sqlite::RecoveryEligibility::Retry),
@@ -4166,10 +4067,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
-            client
-                .execute_recovery_grant(grant, None, None)
-                .await
-                .unwrap();
+            client.run_recovery_grant_for_test(grant).await.unwrap();
             client.recovery_owner.test_advance_to_retry(&storage);
         }
         assert_eq!(
@@ -4406,10 +4304,7 @@ mod tests {
                 })
                 .collect(),
         );
-        client
-            .execute_recovery_grant(grant, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
         assert!(
             !storage.recovery_comparison().unwrap().pending(),
             "a best-effort failure schedules no retry"
@@ -4468,10 +4363,7 @@ mod tests {
                 })
                 .collect(),
         );
-        client
-            .execute_recovery_grant(grant, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
         assert!(client.test_comparison_results.as_ref().unwrap().is_empty());
         let pending = storage.recovery_comparison().unwrap();
         assert!(pending.pending());
@@ -4523,10 +4415,7 @@ mod tests {
             )))]
             .into(),
         );
-        client
-            .execute_recovery_grant(retry, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(retry).await.unwrap();
         assert!(!storage.recovery_comparison().unwrap().pending());
         assert!(
             !storage
@@ -4582,12 +4471,14 @@ mod tests {
             .unwrap();
         let cost = storage.recovery_retry_state().unwrap();
         let revision = grant.comparison_revision.unwrap();
-        relay.block_next_subscribe();
-        let mut execution = Box::pin(client.execute_recovery_grant(grant, None, None));
+        // Hold the comparison in flight, then drop the job mid-pass.
+        client.test_comparison_results =
+            Some(crate::client::ScriptedComparisons::by_route(|_| Ok(None)));
+        client.test_comparison_delay = Some(Duration::from_secs(30));
+        let mut execution = Box::pin(client.run_recovery_grant_for_test(grant));
         tokio::select! {
-            _ = relay.wait_for_blocked_subscribe() => {},
-            result = &mut execution => panic!("executor completed before cancellation: {}", result.is_ok()),
-            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("activation did not reach cancellation boundary"),
+            result = &mut execution => panic!("the job completed before cancellation: {}", result.is_ok()),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {},
         }
         drop(execution);
         assert!(client.recovery_owner.active.upgrade().is_none());
@@ -4636,10 +4527,7 @@ mod tests {
             .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
             .unwrap()
             .unwrap();
-        client
-            .execute_recovery_grant(grant, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
         assert!(
             storage
                 .recovery_comparison()
@@ -4702,7 +4590,7 @@ mod tests {
         client.test_comparison_delay = Some(Duration::from_secs(60));
         tokio::time::timeout(
             Duration::from_secs(15),
-            client.execute_recovery_grant(grant, None, None),
+            client.run_recovery_grant_for_test(grant),
         )
         .await
         .unwrap()

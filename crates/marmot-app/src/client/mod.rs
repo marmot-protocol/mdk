@@ -83,6 +83,8 @@ mod sync;
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 #[cfg(test)]
+pub(crate) use sync::ScriptedComparisons;
+#[cfg(test)]
 pub(crate) use sync::TestComparisonActivityWitness;
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
@@ -359,10 +361,14 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_evidence: Option<recovery::TestRecoveryEvidence>,
     #[cfg(test)]
-    pub(super) test_comparison_results: Option<sync::ScriptedComparisons>,
+    pub(crate) test_comparison_results: Option<sync::ScriptedComparisons>,
     #[cfg(test)]
-    pub(super) test_comparison_delay: Option<std::time::Duration>,
+    pub(crate) test_comparison_delay: Option<std::time::Duration>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
+    /// The process credits recovery jobs share. A managed worker installs
+    /// its runtime's pool; a directly owned client uses the process pool.
+    pub(crate) recovery_credits:
+        Arc<crate::runtime::account_worker::recovery_credits::RecoveryCreditPool>,
     pub(super) comparison_startup_requested: bool,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,
@@ -470,8 +476,8 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) fail_ingest_of: Option<cgka_traits::MessageId>,
     /// Durable account-wide marker set when the bounded relay-plane queue
-    /// omits a delivery. While true, every subscription rebuild is unfloored
-    /// and EOSE-gated recovery must complete before the cursor is trusted.
+    /// omits a delivery. While true, the comparison job must settle that loss
+    /// before the cursor is trusted.
     pub(crate) delivery_overflow_recovery_pending: bool,
     pub(crate) delivery_overflow_recovery_marker_token: Option<u64>,
     /// Durable overflow rows awaiting admission through the live ingest path.
