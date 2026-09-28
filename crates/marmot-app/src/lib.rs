@@ -613,6 +613,44 @@ pub(crate) struct GeneratedAccountBootstrapPublication {
     pub status: AccountRelayListStatus,
     pub relay_and_follow_duration: Duration,
     pub default_profile_duration: Duration,
+    pub indexer_copy: Option<PublicIndexerCopy>,
+}
+
+pub(crate) struct PublicIndexerCopy {
+    relay_client: Arc<dyn NostrRelayClient>,
+    account_id: MemberId,
+    events: Vec<NostrTransportEvent>,
+    indexers: Vec<TransportEndpoint>,
+}
+
+impl PublicIndexerCopy {
+    fn new(
+        relay_client: Arc<dyn NostrRelayClient>,
+        account_id: MemberId,
+        events: Vec<NostrTransportEvent>,
+        indexers: Vec<TransportEndpoint>,
+    ) -> Option<Self> {
+        (!events.is_empty() && !indexers.is_empty()).then_some(Self {
+            relay_client,
+            account_id,
+            events,
+            indexers,
+        })
+    }
+
+    pub(crate) async fn run(self) {
+        publish_public_indexer_copies(
+            self.relay_client.as_ref(),
+            &self.account_id,
+            &self.events,
+            &self.indexers,
+        )
+        .await;
+    }
+
+    pub(crate) fn spawn(self) {
+        tokio::spawn(self.run());
+    }
 }
 
 /// A relay list the account is missing. Typed so FFI clients can localize
@@ -2006,7 +2044,8 @@ impl MarmotApp {
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
-        let indexer_endpoints = self.public_indexer_publish_endpoints(&bootstrap.indexer_relays);
+        let indexer_endpoints =
+            self.public_indexer_publish_endpoints(&bootstrap.indexer_relays, &endpoints);
 
         let mut requests = Vec::with_capacity(4);
         for list_kind in [
@@ -2045,8 +2084,17 @@ impl MarmotApp {
             ),
             required_acks: 1,
         });
-        let relay_client =
-            self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer());
+        let nostr_signer = signer.as_nostr_signer();
+        if !indexer_endpoints.is_empty() {
+            for request in requests
+                .iter_mut()
+                .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
+            {
+                request.event =
+                    sign_account_publication_event(nostr_signer.as_ref(), &request.event).await?;
+            }
+        }
+        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let record_kinds = [
             "NIP-65 relay list",
             "inbox relay list",
@@ -2127,18 +2175,21 @@ impl MarmotApp {
             },
         )?;
         self.remember_directory_profile(&account.account_id_hex, profile)?;
-        let indexer_events = [0, 1, 3].map(|index| requests[index].event.clone());
-        publish_public_indexer_copies(
-            relay_client.as_ref(),
-            &account_id,
-            &indexer_events,
-            &indexer_endpoints,
-        )
-        .await;
+        let indexer_events = requests
+            .into_iter()
+            .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
+            .map(|request| request.event)
+            .collect();
         Ok(GeneratedAccountBootstrapPublication {
             status,
             relay_and_follow_duration,
             default_profile_duration,
+            indexer_copy: PublicIndexerCopy::new(
+                relay_client,
+                account_id,
+                indexer_events,
+                indexer_endpoints,
+            ),
         })
     }
 
@@ -2411,9 +2462,10 @@ impl MarmotApp {
             &account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
-        let indexer_endpoints = self.public_indexer_publish_endpoints(&bootstrap.indexer_relays);
-        let relay_client =
-            self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
+        let indexer_endpoints =
+            self.public_indexer_publish_endpoints(&bootstrap.indexer_relays, &endpoints);
+        let nostr_signer = signer.as_nostr_signer();
+        let relay_client = self.relay_client_for_account_id(&account_id_hex, nostr_signer.clone());
         let mut requests = Vec::with_capacity(list_kinds.len());
         for list_kind in list_kinds {
             let event = if *list_kind == NostrAccountRelayListKind::Nip65
@@ -2439,6 +2491,12 @@ impl MarmotApp {
                 event,
                 required_acks: 1,
             });
+        }
+        if !indexer_endpoints.is_empty() {
+            for request in &mut requests {
+                request.event =
+                    sign_account_publication_event(nostr_signer.as_ref(), &request.event).await?;
+            }
         }
         let outcomes = relay_client
             .publish_events_for_account(&account_id, &requests)
@@ -2523,13 +2581,11 @@ impl MarmotApp {
             .iter()
             .map(|request| request.event.clone())
             .collect::<Vec<_>>();
-        publish_public_indexer_copies(
-            relay_client.as_ref(),
-            &account_id,
-            &indexer_events,
-            &indexer_endpoints,
-        )
-        .await;
+        if let Some(copy) =
+            PublicIndexerCopy::new(relay_client, account_id, indexer_events, indexer_endpoints)
+        {
+            copy.spawn();
+        }
         Ok(status)
     }
 
@@ -2617,11 +2673,28 @@ impl MarmotApp {
     fn public_indexer_publish_endpoints(
         &self,
         indexer_relays: &[TransportEndpoint],
+        operational_relays: &[TransportEndpoint],
     ) -> Vec<TransportEndpoint> {
-        self.retain_safe_discovered_endpoints(
+        // Development identities may intentionally use loopback relays. Keep
+        // their public discovery reads, but never export their records.
+        if operational_relays.iter().any(|endpoint| {
+            url::Url::parse(endpoint.as_str()).ok().is_some_and(|url| {
+                url.host()
+                    .is_some_and(cgka_traits::app_components::is_loopback_host)
+            })
+        }) {
+            return Vec::new();
+        }
+        let operational = self.retain_safe_discovered_endpoints(
+            operational_relays.to_vec(),
+            "public directory operational route",
+        );
+        let mut indexers = self.retain_safe_discovered_endpoints(
             indexer_relays.to_vec(),
             "public directory publication",
-        )
+        );
+        indexers.retain(|endpoint| !operational.contains(endpoint));
+        indexers
     }
 
     pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
@@ -7091,6 +7164,46 @@ fn unique_transport_endpoints(
         }
     }
     unique
+}
+
+async fn sign_account_publication_event(
+    signer: &dyn transport_nostr_peeler::MarmotNostrSigner,
+    event: &NostrTransportEvent,
+) -> Result<NostrTransportEvent, AppError> {
+    if event.sig.is_some() {
+        return Ok(event.clone());
+    }
+    let kind = u16::try_from(event.kind)
+        .map(Kind::from)
+        .map_err(|_| AppError::Publish("unsupported public directory event kind".into()))?;
+    let tags = event
+        .tags
+        .iter()
+        .cloned()
+        .map(Tag::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| AppError::Publish("invalid public directory event tags".into()))?;
+    let public_key = signer
+        .get_public_key()
+        .await
+        .map_err(|_| AppError::Publish("could not read account signing key".into()))?;
+    let mut unsigned = EventBuilder::new(kind, event.content.clone())
+        .tags(tags)
+        .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+        .finalize_unsigned(public_key);
+    unsigned.ensure_id();
+    let signed = signer
+        .sign_event(unsigned)
+        .await
+        .map_err(|_| AppError::Publish("could not sign public directory event".into()))?;
+    let signed = NostrTransportEvent::from_nostr_event(&signed)
+        .map_err(|_| AppError::Publish("invalid signed public directory event".into()))?;
+    if !signed.id.eq_ignore_ascii_case(&event.id) || signed.pubkey != event.pubkey {
+        return Err(AppError::Publish(
+            "signed public directory event changed identity".into(),
+        ));
+    }
+    Ok(signed)
 }
 
 async fn publish_public_indexer_copies(

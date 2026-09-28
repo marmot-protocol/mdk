@@ -120,7 +120,7 @@ impl Marmot {
             import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
-            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -150,7 +150,7 @@ impl Marmot {
             import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
-            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -199,7 +199,7 @@ impl Marmot {
             import_nsec,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
-            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -251,7 +251,7 @@ impl Marmot {
             import_nsec: Some(Zeroizing::new(nsec)),
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
-            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -288,7 +288,7 @@ impl Marmot {
             import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
-            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -697,8 +697,10 @@ impl Marmot {
     }
 }
 
-fn ffi_discovery_relays(bootstrap_relays: &[String]) -> Vec<TransportEndpoint> {
-    ffi_publication_indexers(bootstrap_relays, &[])
+fn ffi_discovery_relays() -> Vec<TransportEndpoint> {
+    // Directory reads remain available for imported and external-signer
+    // accounts even when local development relays suppress public writes.
+    default_directory_discovery_relays()
 }
 
 fn ffi_publication_indexers(
@@ -737,6 +739,7 @@ mod tests {
     fn public_indexer_publication_skips_loopback_development_accounts() {
         assert!(ffi_publication_indexers(&["ws://127.0.0.1:1234".into()], &[]).is_empty());
         assert!(ffi_publication_indexers(&[], &["ws://127.0.0.1:1234".into()]).is_empty());
+        assert!(!ffi_discovery_relays().is_empty());
         assert!(
             ffi_publication_indexers(&["wss://relay.example".into()], &[])
                 .iter()

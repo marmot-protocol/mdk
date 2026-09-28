@@ -7256,51 +7256,52 @@ impl AccountManager {
                 None
             };
 
-        let (relay_lists, profile) = if creates_new_private_key && account.local_signing {
-            match self
-                .setup_generated_account_bootstrap(&account, &request)
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                        return self.rollback_import_after_setup_failure(
-                            &account,
-                            private_key_import.as_ref(),
-                            err,
-                        );
+        let (relay_lists, profile, indexer_copy) =
+            if creates_new_private_key && account.local_signing {
+                match self
+                    .setup_generated_account_bootstrap(&account, &request)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
+                            return self.rollback_import_after_setup_failure(
+                                &account,
+                                private_key_import.as_ref(),
+                                err,
+                            );
+                        }
+                        // Once the helper records publication intent, a relay may
+                        // hold one replaceable bootstrap record. Retain the
+                        // journaled identity and retry instead of deleting it.
+                        return Err(err);
                     }
-                    // Once the helper records publication intent, a relay may
-                    // hold one replaceable bootstrap record. Retain the
-                    // journaled identity and retry instead of deleting it.
-                    return Err(err);
                 }
-            }
-        } else {
-            let relay_lists = match self
-                .setup_relay_lists_for_account(
-                    &account,
-                    &request,
-                    imports_private_key,
-                    creates_new_private_key,
-                    recent_relay_lists,
-                )
-                .await
-            {
-                Ok(relay_lists) => relay_lists,
-                Err(err) => {
-                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                        return self.rollback_import_after_setup_failure(
-                            &account,
-                            private_key_import.as_ref(),
-                            err,
-                        );
+            } else {
+                let relay_lists = match self
+                    .setup_relay_lists_for_account(
+                        &account,
+                        &request,
+                        imports_private_key,
+                        creates_new_private_key,
+                        recent_relay_lists,
+                    )
+                    .await
+                {
+                    Ok(relay_lists) => relay_lists,
+                    Err(err) => {
+                        if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
+                            return self.rollback_import_after_setup_failure(
+                                &account,
+                                private_key_import.as_ref(),
+                                err,
+                            );
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
-                }
+                };
+                (relay_lists, None, None)
             };
-            (relay_lists, None)
-        };
 
         let key_package_bytes = if request.publish_initial_key_package && account.local_signing {
             let setup_phase = self
@@ -7400,6 +7401,11 @@ impl AccountManager {
         self.app
             .account_home()
             .complete_account_setup(&account.label)?;
+        // A slow directory indexer must not delay bootstrap confirmation,
+        // initial KeyPackage publication, or the NetworkReady result.
+        if let Some(copy) = indexer_copy {
+            copy.spawn();
+        }
 
         Ok(AccountSetupResult {
             account,
@@ -7694,7 +7700,14 @@ impl AccountManager {
         &self,
         account: &AccountSummary,
         request: &AccountSetupRequest,
-    ) -> Result<(AccountRelayListStatus, Option<UserProfileMetadata>), AppError> {
+    ) -> Result<
+        (
+            AccountRelayListStatus,
+            Option<UserProfileMetadata>,
+            Option<crate::PublicIndexerCopy>,
+        ),
+        AppError,
+    > {
         let mut profile = if let Some(cached) = self
             .app
             .directory_entry_for_account_id(&account.account_id_hex)?
@@ -7744,7 +7757,7 @@ impl AccountManager {
                 profile = cached;
             }
             if status.complete {
-                return Ok((status, Some(profile)));
+                return Ok((status, Some(profile), None));
             }
             // The durable publication phase is authoritative, but the local
             // directory projection can still be lost independently. These are
@@ -7796,7 +7809,7 @@ impl AccountManager {
             }
         };
         self.mark_bootstrap_publication_confirmed(&account.label)?;
-        Ok((publication.status, Some(profile)))
+        Ok((publication.status, Some(profile), publication.indexer_copy))
     }
 
     fn setup_failure_can_roll_back(

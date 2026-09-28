@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- Generated identities and later relay-list or profile edits schedule
+  best-effort copies of kind 10002, kind 10050, and kind 0 to the built-in
+  public directory indexers. Development accounts using loopback relays skip
+  these writes while retaining public indexer reads for existing identities.
+
 ### Fixed
 
 - Fetched kind:0 `about` text keeps normalized line breaks. Other known profile strings

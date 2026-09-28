@@ -48,8 +48,7 @@ use crate::{
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, DirectoryFreshness, FetchedKeyPackage,
     KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind, ReceivedMessage,
     SqlcipherDatabaseKind, USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED,
-    blocking_app_task, publish_public_indexer_copies, push_unique_strings,
-    relay_list_state_from_event, remove_sqlite_file_set,
+    blocking_app_task, push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
 };
 
 impl MarmotApp {
@@ -814,16 +813,19 @@ impl MarmotApp {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let content = serde_json::to_string(&profile_content_json(&profile))?;
-        let event = NostrTransportEvent::new_unsigned(
+        let mut event = NostrTransportEvent::new_unsigned(
             account.account_id_hex.clone(),
             KIND_NOSTR_METADATA,
             Vec::new(),
             content,
         );
-        let indexers = self.public_indexer_publish_endpoints(&indexer_relays);
+        let indexers = self.public_indexer_publish_endpoints(&indexer_relays, &endpoints);
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
-        let relay_client =
-            self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer());
+        let nostr_signer = signer.as_nostr_signer();
+        if !indexers.is_empty() {
+            event = crate::sign_account_publication_event(nostr_signer.as_ref(), &event).await?;
+        }
+        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let outcome = relay_client
             .publish_event_for_account(&account_id, &endpoints, &event, 1)
             .await;
@@ -832,8 +834,11 @@ impl MarmotApp {
                 "no account relay acknowledged profile metadata".into(),
             ));
         }
-        publish_public_indexer_copies(relay_client.as_ref(), &account_id, &[event], &indexers)
-            .await;
+        if let Some(copy) =
+            crate::PublicIndexerCopy::new(relay_client, account_id, vec![event], indexers)
+        {
+            copy.spawn();
+        }
         Ok(())
     }
 

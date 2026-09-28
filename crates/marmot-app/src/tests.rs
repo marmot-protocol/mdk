@@ -502,6 +502,9 @@ pub(crate) struct ScriptedPushRelayClient {
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
+    block_indexer_publish: std::sync::atomic::AtomicBool,
+    indexer_publish_started: tokio::sync::Notify,
+    indexer_publish_release: tokio::sync::Notify,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
@@ -1143,6 +1146,16 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .lock()
             .unwrap()
             .push((event.kind, endpoints.to_vec()));
+        if self
+            .block_indexer_publish
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && endpoints
+                .iter()
+                .any(|endpoint| endpoint.0 == "wss://index.example")
+        {
+            self.indexer_publish_started.notify_one();
+            self.indexer_publish_release.notified().await;
+        }
         if self
             .fail_publish_unavailable
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -7078,7 +7091,7 @@ async fn generated_account_bootstrap_separates_operational_and_indexer_batches()
         ..UserProfileMetadata::default()
     };
 
-    let publication = app
+    let mut publication = app
         .publish_generated_account_bootstrap(
             &account.label,
             AccountRelayListBootstrap::new(
@@ -7090,6 +7103,7 @@ async fn generated_account_bootstrap_separates_operational_and_indexer_batches()
         )
         .await
         .expect("acknowledged bootstrap must not depend on a relay refetch");
+    publication.indexer_copy.take().unwrap().run().await;
     let status = publication.status;
 
     assert!(status.complete);
@@ -7136,6 +7150,26 @@ async fn generated_account_bootstrap_separates_operational_and_indexer_batches()
         *kind == KIND_NOSTR_CONTACT_LIST
             && endpoints.contains(&TransportEndpoint("wss://index.example".into()))
     }));
+    let attempted = relay.attempted_events.lock().unwrap();
+    for kind in [
+        KIND_NIP65_RELAY_LIST,
+        KIND_MARMOT_INBOX_RELAY_LIST,
+        KIND_NOSTR_METADATA,
+    ] {
+        let events = attempted
+            .iter()
+            .filter(|event| event.kind == kind)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].sig.is_some());
+        events[0]
+            .to_verified_nostr_event()
+            .expect("the shared event must verify before SDK publication");
+        assert_eq!(
+            events[0], events[1],
+            "account and indexer use one signed event"
+        );
+    }
     assert!(
         !status
             .bootstrap_relays
@@ -7196,6 +7230,16 @@ async fn profile_and_relay_list_updates_copy_to_indexers_without_adopting_them()
     .await
     .unwrap();
 
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if relay.attempted_publish_routes.lock().unwrap().len() >= 6 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background indexer copies must be attempted");
     let routes = relay.attempted_publish_routes.lock().unwrap().clone();
     for kind in [
         KIND_NOSTR_METADATA,
@@ -7225,7 +7269,7 @@ async fn unavailable_indexer_does_not_undo_acknowledged_account_bootstrap() {
         .extend([true, true, true, true, false, false, false]);
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
         .with_test_relay_client(relay);
-    let status = app
+    let mut publication = app
         .publish_generated_account_bootstrap(
             &account.label,
             AccountRelayListBootstrap::new(
@@ -7236,9 +7280,10 @@ async fn unavailable_indexer_does_not_undo_acknowledged_account_bootstrap() {
             &UserProfileMetadata::default(),
         )
         .await
-        .unwrap()
-        .status;
+        .unwrap();
+    let status = publication.status.clone();
     assert!(status.complete);
+    publication.indexer_copy.take().unwrap().run().await;
     assert_eq!(
         app.account_relay_list_status(&account.label).unwrap(),
         status
@@ -7254,7 +7299,7 @@ async fn unsafe_indexer_is_skipped_without_blocking_account_bootstrap() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
-    let status = app
+    let publication = app
         .publish_generated_account_bootstrap(
             &account.label,
             AccountRelayListBootstrap::new(
@@ -7265,10 +7310,117 @@ async fn unsafe_indexer_is_skipped_without_blocking_account_bootstrap() {
             &UserProfileMetadata::default(),
         )
         .await
-        .unwrap()
-        .status;
-    assert!(status.complete);
+        .unwrap();
+    assert!(publication.status.complete);
+    assert!(publication.indexer_copy.is_none());
     assert_eq!(relay.attempted_publish_routes.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn loopback_account_relays_suppress_public_indexer_copies() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_nostr_account_for_setup()
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "ws://127.0.0.1:1234")
+        .with_test_relay_client(relay.clone());
+    let publication = app
+        .publish_generated_account_bootstrap(
+            &account.label,
+            AccountRelayListBootstrap::new(
+                vec![TransportEndpoint("ws://127.0.0.1:1234".into())],
+                Vec::new(),
+            )
+            .with_indexer_relays(default_directory_discovery_relays()),
+            &UserProfileMetadata::default(),
+        )
+        .await
+        .unwrap();
+    assert!(publication.status.complete);
+    assert!(publication.indexer_copy.is_none());
+    assert_eq!(relay.attempted_publish_routes.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn stalled_indexer_does_not_delay_generated_account_network_readiness() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay
+        .block_indexer_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    let created = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.create_identity(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        }),
+    )
+    .await
+    .expect("indexer must not hold account setup")
+    .unwrap();
+    assert_eq!(created.readiness, AccountSetupReadiness::NetworkReady);
+    assert!(created.key_package_bytes.is_some());
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.indexer_publish_started.notified(),
+    )
+    .await
+    .expect("indexer copy must start after setup");
+    relay
+        .block_indexer_publish
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    relay.indexer_publish_release.notify_waiters();
+}
+
+#[tokio::test]
+async fn stalled_indexer_does_not_delay_profile_publish_return() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_nostr_account_for_setup()
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let own = TransportEndpoint("wss://relay.example".into());
+    app.publish_generated_account_bootstrap(
+        &account.label,
+        AccountRelayListBootstrap::new(vec![own.clone()], vec![own.clone()]),
+        &UserProfileMetadata::default(),
+    )
+    .await
+    .unwrap();
+    relay
+        .block_indexer_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        app.publish_user_profile(
+            &account.label,
+            UserProfileMetadata::default(),
+            AccountRelayListBootstrap::new(vec![own.clone()], vec![own])
+                .with_indexer_relays(vec![TransportEndpoint("wss://index.example".into())]),
+        ),
+    )
+    .await
+    .expect("indexer must not hold profile return")
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.indexer_publish_started.notified(),
+    )
+    .await
+    .expect("indexer copy must start after profile return");
+    relay
+        .block_indexer_publish
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    relay.indexer_publish_release.notify_waiters();
 }
 
 #[tokio::test]
