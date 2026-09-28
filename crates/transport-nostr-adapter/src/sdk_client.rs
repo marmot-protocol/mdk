@@ -1198,46 +1198,7 @@ impl NostrSdkRelayClient {
         &self,
         event: &NostrTransportEvent,
     ) -> Result<Event, TransportAdapterError> {
-        if event.sig.is_some() {
-            return event
-                .to_verified_nostr_event()
-                .map_err(|e| TransportAdapterError::Publish(format!("invalid signed event: {e}")));
-        }
-
-        // spec/transports/nostr.md:64-66 — a kind-445 group event's pubkey MUST
-        // be a fresh per-event ephemeral key and MUST NOT be the sender's
-        // account identity. The peeler signs every outbound 445 ephemerally at
-        // wrap time, so a 445 that reaches publish without a sig is a caller
-        // error. Fail closed rather than fall through to the account signer
-        // below, which would stamp the account pubkey into the routing-visible
-        // envelope (metadata/correlation leak).
-        if event.kind == KIND_MARMOT_GROUP_MESSAGE {
-            return Err(TransportAdapterError::Publish(
-                "refusing to sign unsigned kind-445 group event with the account identity: \
-                 kind-445 events must arrive pre-signed by the peeler's per-event ephemeral key"
-                    .to_owned(),
-            ));
-        }
-
-        let signer = self.signer.as_ref().ok_or_else(|| {
-            TransportAdapterError::Publish(
-                "unsigned event requires an explicit account signer".to_owned(),
-            )
-        })?;
-        let kind = u16::try_from(event.kind).map(Kind::from).map_err(|_| {
-            TransportAdapterError::Publish(format!("unsupported kind {}", event.kind))
-        })?;
-        let tags = event
-            .tags
-            .iter()
-            .map(|tag| nostr_tag_from_vec(tag))
-            .collect::<Result<Vec<_>, _>>()?;
-        EventBuilder::new(kind, event.content.clone())
-            .tags(tags)
-            .custom_created_at(NostrTimestamp::from_secs(event.created_at))
-            .finalize_async(signer)
-            .await
-            .map_err(|_| TransportAdapterError::Publish("sign event failed".to_owned()))
+        event_for_publish_with_signer(self.signer.as_ref(), event).await
     }
 
     async fn connect_publish_relay(
@@ -2465,6 +2426,63 @@ impl NostrSdkRelayHealth {
             RelayStatus::Shutdown => self.terminated += 1,
         }
     }
+}
+
+/// Sign an account event with the same validation and tag conversion used by
+/// SDK publication, so callers can reuse one exact signed event on many relays.
+pub async fn sign_transport_event_for_publish(
+    signer: Arc<dyn MarmotNostrSigner>,
+    event: &NostrTransportEvent,
+) -> Result<NostrTransportEvent, TransportAdapterError> {
+    let signer = SdkSigner(signer);
+    let signed = event_for_publish_with_signer(Some(&signer), event).await?;
+    let signed = NostrTransportEvent::from_nostr_event(&signed)
+        .map_err(|_| TransportAdapterError::Publish("invalid signed event".to_owned()))?;
+    if !signed.id.eq_ignore_ascii_case(&event.id) || signed.pubkey != event.pubkey {
+        return Err(TransportAdapterError::Publish(
+            "signed event changed identity".to_owned(),
+        ));
+    }
+    Ok(signed)
+}
+
+async fn event_for_publish_with_signer(
+    signer: Option<&SdkSigner>,
+    event: &NostrTransportEvent,
+) -> Result<Event, TransportAdapterError> {
+    if event.sig.is_some() {
+        return event
+            .to_verified_nostr_event()
+            .map_err(|e| TransportAdapterError::Publish(format!("invalid signed event: {e}")));
+    }
+
+    // An unsigned kind-445 must never fall through to the account signer:
+    // group messages require a fresh per-event ephemeral key.
+    if event.kind == KIND_MARMOT_GROUP_MESSAGE {
+        return Err(TransportAdapterError::Publish(
+            "refusing to sign unsigned kind-445 group event with the account identity: \
+             kind-445 events must arrive pre-signed by the peeler's per-event ephemeral key"
+                .to_owned(),
+        ));
+    }
+
+    let signer = signer.ok_or_else(|| {
+        TransportAdapterError::Publish("unsigned event requires an explicit account signer".into())
+    })?;
+    let kind = u16::try_from(event.kind)
+        .map(Kind::from)
+        .map_err(|_| TransportAdapterError::Publish(format!("unsupported kind {}", event.kind)))?;
+    let tags = event
+        .tags
+        .iter()
+        .map(|tag| nostr_tag_from_vec(tag))
+        .collect::<Result<Vec<_>, _>>()?;
+    EventBuilder::new(kind, event.content.clone())
+        .tags(tags)
+        .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+        .finalize_async(signer)
+        .await
+        .map_err(|_| TransportAdapterError::Publish("sign event failed".to_owned()))
 }
 
 fn parse_endpoints(
@@ -4020,6 +4038,31 @@ mod tests {
 
         assert!(matches!(err, TransportAdapterError::Publish(_)));
         assert!(err.to_string().contains("kind-445"));
+        assert!(
+            sign_transport_event_for_publish(Arc::new(keys), &dto)
+                .await
+                .expect_err("shared signing path must reject unsigned kind-445")
+                .to_string()
+                .contains("kind-445")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_signing_path_produces_an_sdk_publishable_event() {
+        let keys = Keys::generate();
+        let sdk = signed_sdk(keys.clone());
+        let unsigned = NostrTransportEvent::new_unsigned(
+            keys.public_key().to_hex(),
+            10_002,
+            vec![vec!["r".into(), "wss://relay.example".into()]],
+            String::new(),
+        );
+        let signed = sign_transport_event_for_publish(Arc::new(keys), &unsigned)
+            .await
+            .expect("shared signer must produce one signed event");
+        let published = sdk.event_for_publish(&signed).await.unwrap();
+        assert_eq!(published, signed.to_verified_nostr_event().unwrap());
+        assert_eq!(signed.id, unsigned.id);
     }
 
     #[tokio::test]

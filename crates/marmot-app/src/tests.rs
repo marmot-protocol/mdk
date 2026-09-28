@@ -7542,6 +7542,103 @@ async fn stalled_indexer_does_not_delay_generated_account_network_readiness() {
 }
 
 #[tokio::test]
+async fn runtime_shutdown_cancels_pending_indexer_copies() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay
+        .block_indexer_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.indexer_publish_started.notified(),
+    )
+    .await
+    .expect("indexer batch must start");
+
+    tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+        .await
+        .expect("shutdown must cancel the stalled indexer batch");
+    assert!(
+        app.public_indexer_copy_tasks
+            .lock()
+            .unwrap()
+            .by_account
+            .is_empty()
+    );
+    let attempted = relay.attempted_publish_routes.lock().unwrap().len();
+    relay.indexer_publish_release.notify_waiters();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        relay.attempted_publish_routes.lock().unwrap().len(),
+        attempted
+    );
+}
+
+#[tokio::test]
+async fn account_removal_cancels_pending_indexer_copies() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay
+        .block_indexer_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        relay.indexer_publish_started.notified(),
+    )
+    .await
+    .expect("indexer batch must start");
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.accounts().remove_account(&created.account.label),
+    )
+    .await
+    .expect("removal must cancel the stalled indexer batch")
+    .unwrap();
+    assert!(
+        app.public_indexer_copy_tasks
+            .lock()
+            .unwrap()
+            .by_account
+            .is_empty()
+    );
+    let attempted = relay.attempted_publish_routes.lock().unwrap().len();
+    relay.indexer_publish_release.notify_waiters();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        relay.attempted_publish_routes.lock().unwrap().len(),
+        attempted
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn stalled_indexer_does_not_delay_profile_publish_return() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())

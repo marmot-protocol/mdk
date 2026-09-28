@@ -54,10 +54,11 @@ kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from
 published to (and fetched from) the account's NIP-65 relays; there is no dedicated KeyPackage relay list. Generated
 account setup can supply public indexers for copies of the relay lists and kind `0` metadata. Those indexers are
 publication-only: they are not declared in NIP-65, used for KeyPackages, or recorded as account bootstrap relays.
-Indexer copies are best-effort per endpoint and run after account setup; account setup requires acknowledgements from
-its operational relays. Import flows can check whether those lists are already present before writing local account
-state. The same status API can fetch
-those relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for deterministic
+Indexer copies are best-effort per endpoint and start after operational bootstrap confirmation, before initial
+KeyPackage publication. They do not delay account readiness and are cancelled on runtime shutdown or account removal;
+account setup requires acknowledgements from its operational relays. Import flows can check whether those lists are
+already present before writing local account state. The same status API can fetch those relay-list events from supplied
+bootstrap relays and store discovered user relay/KeyPackage data for deterministic
 CLI/TUI development. KeyPackage publication keeps a stable replaceable d-tag for the account and tracks the decoded
 KeyPackage ref separately; normal publish reuses only a cached current-profile last-resort package, while explicit
 rotate, a legacy cache entry, or lifetime-policy rejection creates a new current-profile package under the same slot.

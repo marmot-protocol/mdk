@@ -92,6 +92,7 @@ pub use relay_list::{
 pub use sdk_client::{
     NostrReconciliationItem, NostrReconciliationProgress, NostrReconciliationSummary,
     NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
+    sign_transport_event_for_publish,
 };
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,

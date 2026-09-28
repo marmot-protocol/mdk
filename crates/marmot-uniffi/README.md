@@ -292,10 +292,11 @@ their account relays and send separate best-effort copies to the built-in public
 directory indexers. Later relay-list and profile edits through MarmotKit do the
 same. The indexers are never inserted into the advertised relay lists or used
 for KeyPackages, contact lists, or messaging. Acknowledgement from an account
-relay establishes setup success; indexer copies are scheduled after setup and
-an outage is reported only as an aggregate warning. Existing identities are
-not automatically republished by this change and need a client-initiated
-backfill of their current lists and profile.
+relay establishes setup success; indexer copies are scheduled after bootstrap
+confirmation, before initial KeyPackage publication, and an outage is reported
+only as an aggregate warning. Shutdown or account removal cancels pending copies.
+Existing identities are not automatically republished by this change and need a
+client-initiated backfill of their current lists and profile.
 
 `accountIdHex` / `normalizeMemberRef` now accept `nprofile` and
 `nostr:nprofile` mentions and QR scans in addition to hex, `npub`,

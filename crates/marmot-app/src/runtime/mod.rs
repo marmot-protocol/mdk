@@ -5726,6 +5726,9 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        for task in self.accounts.app.abort_all_public_indexer_copies() {
+            let _ = task.await;
+        }
         self.shared.stop_relay_telemetry_exporter();
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::DirectorySync)
@@ -5833,6 +5836,7 @@ impl MarmotAppRuntime {
 
     async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
         self.shared.lifecycle().begin_shutdown();
+        let indexer_copies = self.accounts.app.abort_all_public_indexer_copies();
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::StorageClose)
             .await;
@@ -5847,6 +5851,9 @@ impl MarmotAppRuntime {
             crate::ProductUnit::Attempt,
         );
         let close_result = blocking_app_task(move || app.close_storage()).await;
+        for task in indexer_copies {
+            let _ = task.await;
+        }
         if let Some(observation) = close_observation {
             observation.finish(if close_result.is_ok() {
                 "success"
@@ -6243,6 +6250,12 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
+        for task in self
+            .app
+            .abort_public_indexer_copies_for_account(&account.account_id_hex)
+        {
+            let _ = task.await;
+        }
         let audit_export = self.app.audit_export_lifecycle.clone();
         let account_id = account.account_id_hex.clone();
         let _audit_export_mutation =
@@ -6268,6 +6281,12 @@ impl AccountManager {
             self.app
                 .remove_account_key_package_artifacts(&account.label)?;
             self.app.account_home().remove_account(&account.label)?;
+            for task in self
+                .app
+                .abort_public_indexer_copies_for_account(&account.account_id_hex)
+            {
+                let _ = task.await;
+            }
             self.clear_startup_retry(&account.account_id_hex);
             // The account no longer exists on this device, so the host callback
             // handle it registered must not outlive it. This runs only after
@@ -7774,7 +7793,7 @@ impl AccountManager {
                     )
                     .await
                 {
-                    Ok(Some(copy)) => copy.spawn(),
+                    Ok(Some(copy)) => self.app.spawn_public_indexer_copy(copy),
                     Ok(None) => {}
                     Err(err) => tracing::warn!(
                         target: "marmot_app::runtime",
@@ -7838,7 +7857,7 @@ impl AccountManager {
         // The copy must be scheduled before any later KeyPackage or reconcile
         // failure can drop it. Indexer publication itself stays off this path.
         if let Some(copy) = publication.indexer_copy {
-            copy.spawn();
+            self.app.spawn_public_indexer_copy(copy);
         }
         Ok((publication.status, Some(profile)))
     }
@@ -8296,6 +8315,9 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        for task in self.app.abort_all_public_indexer_copies() {
+            let _ = task.await;
+        }
         self.onboarding_updates
             .lock()
             .unwrap_or_else(|p| p.into_inner())

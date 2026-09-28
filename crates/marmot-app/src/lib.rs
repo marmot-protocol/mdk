@@ -541,6 +541,7 @@ pub struct MarmotApp {
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
+    public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -623,6 +624,12 @@ pub(crate) struct PublicIndexerCopy {
     indexers: Vec<TransportEndpoint>,
 }
 
+#[derive(Default)]
+struct PublicIndexerCopyTasks {
+    stopped: bool,
+    by_account: HashMap<String, Vec<tokio::task::JoinHandle<()>>>,
+}
+
 impl PublicIndexerCopy {
     fn new(
         relay_client: Arc<dyn NostrRelayClient>,
@@ -646,10 +653,6 @@ impl PublicIndexerCopy {
             &self.indexers,
         )
         .await;
-    }
-
-    pub(crate) fn spawn(self) {
-        tokio::spawn(self.run());
     }
 }
 
@@ -1528,6 +1531,7 @@ impl MarmotApp {
             product_analytics,
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
         }
     }
 
@@ -1616,6 +1620,7 @@ impl MarmotApp {
             product_analytics,
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
         }
     }
 
@@ -2094,7 +2099,7 @@ impl MarmotApp {
                 .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
             {
                 request.event =
-                    sign_account_publication_event(nostr_signer.as_ref(), &request.event).await?;
+                    sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
             }
         }
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
@@ -2238,7 +2243,7 @@ impl MarmotApp {
             publish_endpoints: operational.clone(),
         }
         .to_event()?;
-        events.push(sign_account_publication_event(nostr_signer.as_ref(), &nip65_event).await?);
+        events.push(sign_account_publication_event(nostr_signer.clone(), &nip65_event).await?);
         let inbox_event = NostrAccountRelayListPublication {
             account_id: account_id.clone(),
             list_kind: NostrAccountRelayListKind::Inbox,
@@ -2252,14 +2257,14 @@ impl MarmotApp {
             publish_endpoints: operational,
         }
         .to_event()?;
-        events.push(sign_account_publication_event(nostr_signer.as_ref(), &inbox_event).await?);
+        events.push(sign_account_publication_event(nostr_signer.clone(), &inbox_event).await?);
         let profile_event = NostrTransportEvent::new_unsigned(
             account.account_id_hex.clone(),
             KIND_NOSTR_METADATA,
             Vec::new(),
             serde_json::to_string(&directory::records::profile_content_json(profile))?,
         );
-        events.push(sign_account_publication_event(nostr_signer.as_ref(), &profile_event).await?);
+        events.push(sign_account_publication_event(nostr_signer.clone(), &profile_event).await?);
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         Ok(PublicIndexerCopy::new(
             relay_client,
@@ -2585,7 +2590,7 @@ impl MarmotApp {
         if !indexer_endpoints.is_empty() {
             for request in &mut requests {
                 request.event =
-                    sign_account_publication_event(nostr_signer.as_ref(), &request.event).await?;
+                    sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
             }
         }
         let outcomes = relay_client
@@ -2674,7 +2679,7 @@ impl MarmotApp {
         if let Some(copy) =
             PublicIndexerCopy::new(relay_client, account_id, indexer_events, indexer_endpoints)
         {
-            copy.spawn();
+            self.spawn_public_indexer_copy(copy);
         }
         Ok(status)
     }
@@ -2790,6 +2795,59 @@ impl MarmotApp {
         );
         indexers.retain(|endpoint| !operational.contains(endpoint));
         indexers
+    }
+
+    pub(crate) fn spawn_public_indexer_copy(&self, copy: PublicIndexerCopy) {
+        let account_id_hex = hex::encode(copy.account_id.as_slice());
+        let mut tasks = self
+            .public_indexer_copy_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tasks.stopped
+            || self.storage_closed.load(Ordering::Acquire)
+            || self.account_home().account(&account_id_hex).is_err()
+        {
+            return;
+        }
+        let handles = tasks.by_account.entry(account_id_hex).or_default();
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(tokio::spawn(copy.run()));
+    }
+
+    pub(crate) fn abort_public_indexer_copies_for_account(
+        &self,
+        account_id_hex: &str,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let handles = self
+            .public_indexer_copy_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .by_account
+            .remove(account_id_hex)
+            .unwrap_or_default();
+        for handle in &handles {
+            handle.abort();
+        }
+        handles
+    }
+
+    pub(crate) fn abort_all_public_indexer_copies(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let handles = {
+            let mut tasks = self
+                .public_indexer_copy_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tasks.stopped = true;
+            tasks
+                .by_account
+                .drain()
+                .flat_map(|(_, handles)| handles)
+                .collect::<Vec<_>>()
+        };
+        for handle in &handles {
+            handle.abort();
+        }
+        handles
     }
 
     pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
@@ -5691,6 +5749,7 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
+        let _ = self.abort_all_public_indexer_copies();
         self.presentation_signals.catalog_changed();
         let mut first_error = None;
         let mut closed = 0usize;
@@ -6441,6 +6500,7 @@ impl MarmotApp {
             .account_resets
             .send(label.to_owned());
         if let Ok(account) = self.account_home().account(label) {
+            let _ = self.abort_public_indexer_copies_for_account(&account.account_id_hex);
             self.account_publish_clients
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -7262,43 +7322,12 @@ fn unique_transport_endpoints(
 }
 
 async fn sign_account_publication_event(
-    signer: &dyn transport_nostr_peeler::MarmotNostrSigner,
+    signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     event: &NostrTransportEvent,
 ) -> Result<NostrTransportEvent, AppError> {
-    if event.sig.is_some() {
-        return Ok(event.clone());
-    }
-    let kind = u16::try_from(event.kind)
-        .map(Kind::from)
-        .map_err(|_| AppError::Publish("unsupported public directory event kind".into()))?;
-    let tags = event
-        .tags
-        .iter()
-        .cloned()
-        .map(Tag::parse)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| AppError::Publish("invalid public directory event tags".into()))?;
-    let public_key = signer
-        .get_public_key()
+    transport_nostr_adapter::sign_transport_event_for_publish(signer, event)
         .await
-        .map_err(|_| AppError::Publish("could not read account signing key".into()))?;
-    let mut unsigned = EventBuilder::new(kind, event.content.clone())
-        .tags(tags)
-        .custom_created_at(NostrTimestamp::from_secs(event.created_at))
-        .finalize_unsigned(public_key);
-    unsigned.ensure_id();
-    let signed = signer
-        .sign_event(unsigned)
-        .await
-        .map_err(|_| AppError::Publish("could not sign public directory event".into()))?;
-    let signed = NostrTransportEvent::from_nostr_event(&signed)
-        .map_err(|_| AppError::Publish("invalid signed public directory event".into()))?;
-    if !signed.id.eq_ignore_ascii_case(&event.id) || signed.pubkey != event.pubkey {
-        return Err(AppError::Publish(
-            "signed public directory event changed identity".into(),
-        ));
-    }
-    Ok(signed)
+        .map_err(|_| AppError::Publish("could not sign public directory event".into()))
 }
 
 async fn publish_public_indexer_copies(

@@ -837,7 +837,7 @@ impl MarmotApp {
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
         if !indexers.is_empty() {
-            event = crate::sign_account_publication_event(nostr_signer.as_ref(), &event).await?;
+            event = crate::sign_account_publication_event(nostr_signer.clone(), &event).await?;
         }
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let outcome = relay_client
@@ -851,7 +851,7 @@ impl MarmotApp {
         if let Some(copy) =
             crate::PublicIndexerCopy::new(relay_client, account_id, vec![event], indexers)
         {
-            copy.spawn();
+            self.spawn_public_indexer_copy(copy);
         }
         Ok(())
     }

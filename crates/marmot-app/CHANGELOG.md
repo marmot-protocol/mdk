@@ -5,9 +5,10 @@
 ### Changed
 
 - Generated accounts can copy signed kind 10002, kind 10050, and kind 0 records
-  to separate public indexers after operational setup completes. Relay-list and
+  to separate public indexers after bootstrap confirmation. Relay-list and
   profile edits also schedule indexer copies after account-relay acknowledgement;
-  indexer latency does not delay account readiness or edit returns.
+  indexer latency does not delay account readiness or edit returns. Pending
+  copies are cancelled on runtime shutdown or account removal.
 
 - A full account delivery queue now spills deliveries into the account database instead of
   dropping them. The worker admits spilled deliveries through the ordinary ingest path,
