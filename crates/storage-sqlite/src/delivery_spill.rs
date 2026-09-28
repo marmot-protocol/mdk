@@ -269,26 +269,40 @@ impl SqliteAccountStorage {
     ) -> StorageResult<()> {
         retry_on_busy(|| {
             self.connection.with_transaction(|| {
-                let removed = {
+                let (removed, earliest_created_at) = {
                     let conn = self.lock()?;
                     let mut removed = 0_u64;
+                    // The earliest wire created_at among the removed
+                    // deliveries, or unknown once any row does not decode.
+                    let mut earliest = Some(u64::MAX);
                     for seq in seqs {
-                        removed += conn
-                            .execute_cached(
-                                "DELETE FROM account_delivery_spill WHERE seq=?1",
+                        let Some(metadata) = conn
+                            .query_row_cached(
+                                "DELETE FROM account_delivery_spill WHERE seq=?1 RETURNING metadata",
                                 [seq],
+                                |row| row.get::<_, Vec<u8>>(0),
                             )
-                            .storage()? as u64;
+                            .optional()
+                            .storage()?
+                        else {
+                            continue;
+                        };
+                        removed += 1;
+                        let created_at = crate::codec::deserialize::<TransportDelivery>(&metadata)
+                            .ok()
+                            .map(|delivery| delivery.message.timestamp.0);
+                        earliest = earliest.zip(created_at).map(|(a, b)| a.min(b));
                     }
-                    removed
+                    (removed, earliest)
                 };
                 if removed > 0 {
-                    self.record_account_recovery_loss(
+                    self.record_account_recovery_loss_bounded(
                         account_label,
                         crate::RecoveryLossCause::Queue,
                         loss_token,
                         removed,
                         now_secs,
+                        earliest_created_at,
                     )?;
                     self.synchronize_account_delivery_loss(account_label)?;
                 }
@@ -473,12 +487,44 @@ mod tests {
             loss_evidence(&store),
             vec![(RecoveryLossCause::Queue as i64, 1)]
         );
+        assert_eq!(
+            store
+                .recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
+                .unwrap(),
+            None,
+            "an undecodable row's time is unknown, so the loss is unbounded"
+        );
         let rest: Vec<_> = due(&store, 9)
             .deliveries
             .iter()
             .map(|row| row.delivery.clone())
             .collect();
         assert_eq!(rest, vec![delivery(2), delivery(3)]);
+    }
+
+    #[test]
+    fn discarded_rows_bound_the_loss_goal_by_their_created_at() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("alice").unwrap();
+        store
+            .spill_account_deliveries(&[delivery(5), delivery(3), delivery(9)], LIMITS, 9)
+            .unwrap();
+        let seqs: Vec<_> = due(&store, 9)
+            .deliveries
+            .iter()
+            .filter(|row| row.delivery != delivery(9))
+            .map(|row| row.seq)
+            .collect();
+        store
+            .discard_spilled_account_deliveries(&seqs, "alice", 78, 9)
+            .unwrap();
+        assert_eq!(
+            store
+                .recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
+                .unwrap(),
+            Some(3),
+            "the goal starts at the earliest removed delivery"
+        );
     }
 
     #[test]
