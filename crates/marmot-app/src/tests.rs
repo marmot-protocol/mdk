@@ -7565,8 +7565,11 @@ async fn stalled_indexer_does_not_delay_generated_account_network_readiness() {
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let runtime = MarmotAppRuntime::new(app);
+    // Account creation includes KeyPackage generation and can exceed five
+    // seconds under the shared CI test load. A blocked indexer never returns,
+    // so the longer bound still detects an accidental await on its copy.
     let created = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         runtime.create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
