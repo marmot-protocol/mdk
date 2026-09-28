@@ -158,6 +158,39 @@ pub(super) fn eligibility_after_observation(
     }
 }
 
+/// Queue and notification loss drops deliveries from floored live
+/// subscriptions, and pending loss holds the cursor fence, so the current
+/// checkpoint floor bounds every lost delivery. The inbox floor also covers the
+/// NIP-59 timestamp tweak. Without a checkpoint the live subscription was
+/// unfloored and the goal stays unbounded. Other causes keep their goals.
+fn bound_loss_goals(
+    cause: storage_sqlite::RecoveryCause,
+    mut scopes: Vec<storage_sqlite::RecoveryScopePlan>,
+    floor: Option<u64>,
+) -> Vec<storage_sqlite::RecoveryScopePlan> {
+    if !matches!(
+        cause,
+        storage_sqlite::RecoveryCause::QueueLoss | storage_sqlite::RecoveryCause::NotificationLoss
+    ) {
+        return scopes;
+    }
+    for scope in &mut scopes {
+        let floor = floor.map(|since| {
+            if scope.route_kind == 0 {
+                since.saturating_sub(transport_nostr_adapter::NIP59_TIMESTAMP_TWEAK_SECS)
+            } else {
+                since
+            }
+        });
+        // A goal frozen before goals were bounded has no lower bound yet.
+        scope.since_seconds = match (scope.since_seconds, floor) {
+            (Some(old), Some(floor)) => Some(old.min(floor)),
+            (_, floor) => floor,
+        };
+    }
+    scopes
+}
+
 /// A stored scope whose certificates survive this grant's freeze: its goal is
 /// unchanged and every required endpoint is covered and admitted.
 fn scope_is_certified(
@@ -185,7 +218,8 @@ const RECOVERY_PARK_AFTER_ATTEMPTS: u64 = 3;
 
 /// Comparison-owned recovery keeps retrying while passes certify new
 /// coverage. After several passes in a row without progress it parks until new
-/// evidence or an explicit repair, instead of retrying forever.
+/// evidence or an explicit repair, instead of retrying forever. A pass no relay
+/// served does not count: unreachable relays are waited out with pacing.
 pub(super) fn eligibility_after_comparison(
     outcome: storage_sqlite::RecoveryScopeOutcome,
     admission_refused: bool,
@@ -197,7 +231,7 @@ pub(super) fn eligibility_after_comparison(
         Eligibility::WaitingCapacity
     } else if matches!(outcome, Outcome::Unsupported | Outcome::Excluded) {
         Eligibility::WaitingCapability
-    } else if !progressed && ordinal >= RECOVERY_PARK_AFTER_ATTEMPTS {
+    } else if !progressed && outcome != Outcome::Unavailable && ordinal >= RECOVERY_PARK_AFTER_ATTEMPTS {
         Eligibility::NeedsDeepRepair
     } else {
         Eligibility::Retry
@@ -1481,6 +1515,7 @@ impl AppClient {
                 }
                 scopes
             };
+            let scopes = bound_loss_goals(demand.cause, scopes, incremental_since);
             goals.push((*id, scopes));
         }
         let mut loss = Vec::new();
@@ -1563,9 +1598,13 @@ impl AppClient {
             routes.sort_by_key(|r| r.scope_id);
             grant.comparison_plan = Some(storage_sqlite::RecoveryComparisonPlan {
                 fence: grant.fence.clone(),
-                // Automatic history is acquired by comparison, never by an
-                // unfloored replay. Only an explicit caller keeps a wider pass.
-                live_since_seconds: if independent_broad_acquisition && explicit.is_some() {
+                // History is acquired by comparison, never by an unfloored
+                // replay. Only explicit full-history repair keeps a wider pass.
+                live_since_seconds: if independent_broad_acquisition
+                    && explicit
+                        .as_ref()
+                        .is_some_and(|permit| permit.full_history_requested)
+                {
                     goals
                         .iter()
                         .filter(|(id, _)| {
@@ -3027,7 +3066,8 @@ mod tests {
         client.state.last_transport_timestamp = Some(cursor);
         app.save_state(&client.state).unwrap();
         let expected = client.subscription_rebuild_since().unwrap();
-        // Park the initial no-cursor investigation through its honest outcome.
+        // Settle the initial no-cursor investigation through its honest
+        // outcome: every route it compares is certified.
         let initial = client
             .authorize_account_recovery(
                 None,
@@ -3035,10 +3075,12 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        client.test_comparison_results = Some(scripted_routes(&initial, |_| false));
         client
             .execute_recovery_grant(initial, None, None)
             .await
             .unwrap();
+        client.test_comparison_results = None;
         if incremental {
             storage
                 .request_recovery(
@@ -3072,6 +3114,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(grant.plan().unwrap().len(), if incremental { 2 } else { 1 });
+        // No route certifies, so only the maintenance boundary can complete.
+        client.test_comparison_results = Some(scripted_routes(&grant, |_| true));
         client
             .execute_recovery_grant(grant, None, None)
             .await
@@ -3132,10 +3176,11 @@ mod tests {
                 .all(|d| d.cause != storage_sqlite::RecoveryCause::Maintenance)
         );
         // EOSE satisfies only the maintenance boundary, never exhaustive history.
-        assert!(
+        assert_eq!(
             pending
                 .iter()
-                .any(|d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+                .any(|d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory),
+            incremental
         );
     }
 
@@ -3455,27 +3500,29 @@ mod tests {
             .execute_recovery_grant(grant, None, None)
             .await
             .unwrap();
-        let pending = storage.pending_recovery_demands().unwrap();
-        assert_eq!(
-            pending
-                .iter()
-                .find(|d| d.cause == RecoveryCause::EpochGap)
+        let eligibility = |cause| {
+            storage
+                .pending_recovery_demands()
                 .unwrap()
-                .eligibility,
+                .into_iter()
+                .find(|d| d.cause == cause)
+                .unwrap()
+                .eligibility
+        };
+        assert_eq!(
+            eligibility(RecoveryCause::EpochGap),
             RecoveryEligibility::Retry,
             "EOSE without a coverage certificate does not prove missing-epoch acquisition unsupported"
         );
         assert_eq!(
-            pending
-                .iter()
-                .find(|d| d.cause == RecoveryCause::QueueLoss)
-                .unwrap()
-                .eligibility,
-            RecoveryEligibility::NeedsDeepRepair
+            eligibility(RecoveryCause::QueueLoss),
+            RecoveryEligibility::Retry,
+            "one uncertified pass does not park unknown history"
         );
         assert!(client.delivery_overflow_recovery_pending);
         let attempts = storage.recovery_retry_state().unwrap().attempt_serial;
-        for _ in 0..3 {
+        // Passes that certify nothing park both causes after the same budget.
+        for _ in 1..RECOVERY_PARK_AFTER_ATTEMPTS {
             client
                 .recovery_owner
                 .test_advance_clock(Duration::from_secs(300));
@@ -3486,21 +3533,21 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap();
-            assert!(
-                grant
-                    .plan()
-                    .unwrap()
-                    .iter()
-                    .all(|o| o.cause == RecoveryCause::EpochGap),
-                "expired cooldown cannot rearm unknown account-history debt"
-            );
             client
                 .execute_recovery_grant(grant, None, None)
                 .await
                 .unwrap();
         }
+        assert_eq!(
+            eligibility(RecoveryCause::QueueLoss),
+            RecoveryEligibility::NeedsDeepRepair
+        );
+        assert_eq!(
+            eligibility(RecoveryCause::EpochGap),
+            RecoveryEligibility::NeedsDeepRepair
+        );
         let retry = storage.recovery_retry_state().unwrap();
-        assert_eq!(retry.attempt_serial, attempts + 3);
+        assert_eq!(retry.attempt_serial, attempts + RECOVERY_PARK_AFTER_ATTEMPTS - 1);
         let now = Instant::now();
         let wall = client.recovery_owner.logical_now_ms(now).unwrap();
         client.recovery_owner = AccountRecoveryOwner::open(&storage, wall, now, policy()).unwrap();
@@ -4251,6 +4298,158 @@ mod tests {
         assert_eq!(storage.recovery_scope_snapshots(id).unwrap().len(), before);
         assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
         assert!(storage.recovery_comparison().unwrap().pending());
+    }
+
+    async fn certified_loss_fixture() -> (
+        tempfile::TempDir,
+        Arc<crate::tests::ScriptedPushRelayClient>,
+        crate::MarmotApp,
+        AppClient,
+        crate::tests::ScriptedEosePump,
+    ) {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.create_group("certified loss", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        storage.mark_account_delivery_recovery("alice", 41, 3).unwrap();
+        storage.synchronize_account_delivery_loss("alice").unwrap();
+        client.delivery_overflow_recovery_pending = true;
+        client.delivery_overflow_recovery_marker_token = Some(41);
+        (dir, relay, app, client, pump)
+    }
+
+    fn scripted_routes(
+        grant: &AttemptGrant,
+        failed: impl Fn(&storage_sqlite::TransportReconciliationRoute) -> bool,
+    ) -> std::collections::VecDeque<
+        Result<
+            Option<(
+                transport_nostr_adapter::NostrReconciliationSummary,
+                Vec<transport_nostr_adapter::NostrRelayEvent>,
+            )>,
+            cgka_traits::TransportAdapterError,
+        >,
+    > {
+        grant
+            .inventory
+            .iter()
+            .map(|inventory| {
+                Ok(Some((
+                    transport_nostr_adapter::NostrReconciliationSummary {
+                        relays_succeeded: usize::from(!failed(&inventory.route)),
+                        relays_failed: usize::from(failed(&inventory.route)),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )))
+            })
+            .collect()
+    }
+
+    fn queue_loss(storage: &SqliteAccountStorage) -> Option<storage_sqlite::RecoveryEligibility> {
+        storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+            .map(|demand| demand.eligibility)
+    }
+
+    #[tokio::test]
+    async fn automatic_loss_completes_on_certified_comparisons_without_unfloored_replay() {
+        let (_dir, relay, app, mut client, _pump) = certified_loss_fixture().await;
+        let storage = app.account_storage("alice").unwrap();
+        let unfloored = relay.unfloored_account_subscription_count();
+        let grant = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .expect("loss selects a grant");
+        assert_eq!(grant.inventory.len(), 2, "inbox and group routes are compared");
+        client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
+        client.execute_recovery_grant(grant, None, None).await.unwrap();
+
+        assert_eq!(queue_loss(&storage), None, "certified routes complete the loss");
+        assert!(storage.account_delivery_recovery("alice").unwrap().is_none());
+        assert!(!client.delivery_overflow_recovery_pending);
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            unfloored,
+            "automatic recovery never replays unfloored history"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_passes_compare_only_uncertified_routes() {
+        let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
+        let storage = app.account_storage("alice").unwrap();
+        let group = |route: &storage_sqlite::TransportReconciliationRoute| {
+            matches!(route, storage_sqlite::TransportReconciliationRoute::Group(_))
+        };
+        let grant = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        client.test_comparison_results = Some(scripted_routes(&grant, group));
+        client.execute_recovery_grant(grant, None, None).await.unwrap();
+        assert_eq!(
+            queue_loss(&storage),
+            Some(storage_sqlite::RecoveryEligibility::Retry),
+            "an uncertified route keeps the loss pending"
+        );
+
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let retry = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.inventory.len(), 1, "the certified inbox is not compared again");
+        assert!(group(&retry.inventory[0].route));
+        client.test_comparison_results = Some(scripted_routes(&retry, |_| false));
+        client.execute_recovery_grant(retry, None, None).await.unwrap();
+        assert_eq!(queue_loss(&storage), None);
+    }
+
+    #[tokio::test]
+    async fn passes_that_certify_nothing_park_the_obligation() {
+        let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
+        let storage = app.account_storage("alice").unwrap();
+        for pass in 1..=RECOVERY_PARK_AFTER_ATTEMPTS {
+            let grant = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("pass {pass} is selected"));
+            client.test_comparison_results = Some(scripted_routes(&grant, |_| true));
+            client.execute_recovery_grant(grant, None, None).await.unwrap();
+            client.recovery_owner.test_advance_to_retry(&storage);
+        }
+        assert_eq!(
+            queue_loss(&storage),
+            Some(storage_sqlite::RecoveryEligibility::NeedsDeepRepair)
+        );
+        assert!(
+            client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                )
+                .unwrap()
+                .is_none(),
+            "a parked obligation waits for new evidence or explicit repair"
+        );
     }
 
     #[tokio::test]

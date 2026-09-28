@@ -85,9 +85,11 @@ const SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT: usize = 128 * 1024;
 // may return one such object, then stops. This is an MDK acquisition ceiling,
 // not a Nostr protocol maximum or a bound for custom SDK clients.
 const SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES: usize = 5 * 1024 * 1024;
-/// Must match the storage inventory ceiling. The relay applies the same limit,
-/// bounding the dry-run result even on first boot with an empty inventory.
-const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384;
+/// One more than the storage inventory ceiling (16,384). The relay applies the
+/// same limit, bounding the dry-run result even on first boot with an empty
+/// inventory. A relay set that fills it may be truncated; a set within the
+/// ceiling, including one sitting exactly on it, is the whole window.
+const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384 + 1;
 
 /// Account-owned advisory replay progress, independent of admitted event inventory.
 /// The host must preserve this across routine subscription rebuilds and serialize
@@ -704,7 +706,7 @@ impl NostrSdkRelayClient {
             match result {
                 Some(Ok(summary)) => {
                     // The relay compares at most the filter limit. A matching
-                    // set that reaches it may hide older remote events, so the
+                    // set that fills it may hide older remote events, so the
                     // endpoint cannot vouch for the whole window.
                     let relay_set =
                         items.len().saturating_sub(summary.local.len()) + summary.remote.len();

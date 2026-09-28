@@ -375,25 +375,12 @@ async fn run_online_epoch_gap_fixture(bounded_probe: bool, queue_panic: bool) {
         !storage.recovery_comparison().unwrap().pending(),
         "Alice must finish startup comparison before the induced gap"
     );
-    let baseline_demands = storage.pending_recovery_demands().unwrap();
-    assert_eq!(baseline_demands.len(), 1);
-    assert_eq!(
-        baseline_demands[0].cause,
-        storage_sqlite::RecoveryCause::IncrementalHistory
-    );
-    assert_eq!(
-        baseline_demands[0].eligibility,
-        storage_sqlite::RecoveryEligibility::NeedsDeepRepair
-    );
+    // The certified startup comparison completed the incremental obligation,
+    // so the induced gap becomes the account's only recovery debt.
     assert!(
-        storage
-            .recovery_eligible_revision_fence(false)
-            .unwrap()
-            .obligations
-            .is_empty(),
-        "startup has no automatically eligible grant, while deep-repair debt remains durable"
+        storage.pending_recovery_demands().unwrap().is_empty(),
+        "a certified startup comparison leaves no recovery debt"
     );
-    let baseline_ticket = baseline_demands[0].ticket.id;
     selections.lock().unwrap().clear();
     runtime
         .accounts()
@@ -632,11 +619,7 @@ async fn run_online_epoch_gap_fixture(bounded_probe: bool, queue_panic: bool) {
         && !comparison_at_hold
         && !missing_before_gap
         && epoch_before_gap == initial_epoch
-        && demands_at_hold.iter().any(|demand| {
-            demand.ticket.id == baseline_ticket
-                && demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory
-                && demand.eligibility == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
-        })
+        && demands_at_hold.len() == 1
         && eligible_at_hold.obligations.len() == 1
         && demands_at_hold.iter().any(|demand| {
             demand.cause == storage_sqlite::RecoveryCause::EpochGap

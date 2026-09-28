@@ -35,7 +35,8 @@ use super::{
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::recovery::AttemptGrant;
 use crate::client::{
-    ComparisonNetworkJob, ComparisonNetworkResult, CompletedWelcomeDeliveryRecovery,
+    ComparisonActivation, ComparisonNetworkJob, ComparisonNetworkResult,
+    CompletedWelcomeDeliveryRecovery,
     EncryptedMediaUploadFinish, EpochGapQueueJob, OnlineEpochGapRecovery,
     PreparedGroupImageUploadStart, RouteSubmission,
 };
@@ -55,7 +56,6 @@ use crate::{
     SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
-use transport_nostr_adapter::SubscriptionAttempt;
 
 enum ComparisonRecoveryOrigin {
     PeriodicMaintenance,
@@ -70,7 +70,7 @@ enum ComparisonRecoveryOrigin {
 
 struct ComparisonRecoveryJob {
     grant: AttemptGrant,
-    subscription_attempt: SubscriptionAttempt,
+    activation: ComparisonActivation,
     network: ComparisonNetworkJob,
     observation: Option<crate::product_analytics::ProductObservation>,
     backfill_armed: bool,
@@ -122,7 +122,7 @@ enum StartupSyncStep {
     Complete(SyncSummary),
     Network {
         grant: Box<AttemptGrant>,
-        subscription_attempt: SubscriptionAttempt,
+        activation: ComparisonActivation,
         network: ComparisonNetworkJob,
     },
 }
@@ -133,7 +133,7 @@ type StartupSyncContinuation<'a> =
 enum PendingComparisonExecution {
     Offloaded {
         grant: Box<AttemptGrant>,
-        subscription_attempt: SubscriptionAttempt,
+        activation: ComparisonActivation,
         network: ComparisonNetworkJob,
     },
     OnlineEpochGap {
@@ -1082,7 +1082,7 @@ async fn run_app_runtime_account_worker(
                 // Surface that first failure as the old inline startup did;
                 // falling through would issue a second subscription attempt
                 // and could publish local-ready sends before recovery.
-                let subscription_attempt = client
+                let activation = client
                     .activate_comparison_grant(selected, Some(&startup_stage_telemetry))
                     .await
                     .map_err(|error| {
@@ -1098,17 +1098,22 @@ async fn run_app_runtime_account_worker(
                     credit,
                     #[cfg(test)]
                     activity_witness,
-                )
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::Unknown,
-                    )
-                })?;
+                );
+                let grant = grant.take().expect("selected startup grant");
+                let network = match network {
+                    Ok(network) => network,
+                    Err(error) => {
+                        let _ = client.abandon_comparison_grant(grant, activation);
+                        return Err(ClassifiedSyncFailure::at_stage(
+                            SyncSummary::default(),
+                            error,
+                            SyncFailureStage::Unknown,
+                        ));
+                    }
+                };
                 return Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Network {
-                    grant: Box::new(grant.take().expect("selected startup grant")),
-                    subscription_attempt,
+                    grant: Box::new(grant),
+                    activation,
                     network,
                 });
             }
@@ -1163,7 +1168,7 @@ async fn run_app_runtime_account_worker(
                 Ok(StartupSyncStep::Complete(summary)) => Ok(summary),
                 Ok(StartupSyncStep::Network {
                     grant,
-                    subscription_attempt,
+                    activation,
                     mut network,
                 }) => {
                     let completed = loop {
@@ -1312,7 +1317,7 @@ async fn run_app_runtime_account_worker(
                             client
                                 .finish_comparison_grant(
                                     *grant,
-                                    subscription_attempt,
+                                    activation,
                                     network_result,
                                 )
                                 .await
@@ -1324,7 +1329,10 @@ async fn run_app_runtime_account_worker(
                                     )
                                 })
                         }
-                        Err(failure) => Err(failure),
+                        Err(failure) => {
+                            let _ = client.abandon_comparison_grant(*grant, activation);
+                            Err(failure)
+                        }
                     };
                     let result = match result {
                         Ok(
@@ -1872,7 +1880,7 @@ async fn run_app_runtime_account_worker(
                         // ended; keep it through owner admission/checkpoint.
                         let _credit = credit;
                         client.finish_comparison_grant(
-                            job.grant, job.subscription_attempt, network,
+                            job.grant, job.activation, network,
                         ).await
                     }
                     Err(error) => {
@@ -1888,7 +1896,7 @@ async fn run_app_runtime_account_worker(
                             error_kind = if error.is_panic() { "panic" } else { "cancelled" },
                             "comparison task ended before worker admission"
                         );
-                        Ok(EpochBackfillRunOutcome::Deferred)
+                        client.abandon_comparison_grant(job.grant, job.activation)
                     }
                 };
                 let _ = report_pending_epoch_backfill_result(
@@ -2213,11 +2221,11 @@ async fn run_app_runtime_account_worker(
                                                 EpochBackfillExecutionSeam::Maintenance,
                                             ).await {
                                                 PendingComparisonExecution::Offloaded {
-                                                    grant, subscription_attempt, network,
+                                                    grant, activation, network,
                                                 } => {
                                                     comparison_recovery = Some(ComparisonRecoveryJob {
                                                         grant: *grant,
-                                                        subscription_attempt,
+                                                        activation,
                                                         network,
                                                         observation,
                                                         backfill_armed,
@@ -2463,11 +2471,11 @@ async fn run_app_runtime_account_worker(
                                 };
                                 match backfill_result {
                                     PendingComparisonExecution::Offloaded {
-                                        grant, subscription_attempt, network,
+                                        grant, activation, network,
                                     } => {
                                         comparison_recovery = Some(ComparisonRecoveryJob {
                                             grant: *grant,
-                                            subscription_attempt,
+                                            activation,
                                             network,
                                             observation,
                                             backfill_armed,
@@ -2966,12 +2974,12 @@ async fn run_app_runtime_account_worker(
                 {
                     PendingComparisonExecution::Offloaded {
                         grant,
-                        subscription_attempt,
+                        activation,
                         network,
                     } => {
                         comparison_recovery = Some(ComparisonRecoveryJob {
                             grant: *grant,
-                            subscription_attempt,
+                            activation,
                             network,
                             observation,
                             backfill_armed,
@@ -3043,11 +3051,14 @@ async fn execute_pending_comparison_or_inline(
     match selection {
         Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
             let grant = *grant;
-            let eligible =
-                credit.is_some() && client.comparison_offload_eligible(&grant).unwrap_or(false);
+            // A Receive-seam EpochGap keeps its sliced online drain; every
+            // other automatic grant uses the owned comparison job.
             let online_epoch_gap = seam == EpochBackfillExecutionSeam::Receive
                 && credit.is_some()
                 && client.epoch_gap_offload_eligible(&grant).unwrap_or(false);
+            let eligible = credit.is_some()
+                && !online_epoch_gap
+                && client.comparison_offload_eligible(&grant).unwrap_or(false);
             #[cfg(test)]
             shared
                 .comparison_test_trace
@@ -3060,7 +3071,7 @@ async fn execute_pending_comparison_or_inline(
                 });
             if eligible {
                 match client.activate_comparison_grant(&grant, None).await {
-                    Ok(subscription_attempt) => match ComparisonNetworkJob::start(
+                    Ok(activation) => match ComparisonNetworkJob::start(
                         client,
                         &grant,
                         credit.take().expect("offloaded grant owns credit"),
@@ -3083,7 +3094,7 @@ async fn execute_pending_comparison_or_inline(
                                 .push("task_started");
                             PendingComparisonExecution::Offloaded {
                                 grant: Box::new(grant),
-                                subscription_attempt,
+                                activation,
                                 network,
                             }
                         }
@@ -3094,6 +3105,7 @@ async fn execute_pending_comparison_or_inline(
                                 .lock()
                                 .unwrap()
                                 .push("task_start_error");
+                            let _ = client.abandon_comparison_grant(grant, activation);
                             PendingComparisonExecution::Inline(Err(error))
                         }
                     },
@@ -9918,15 +9930,13 @@ mod tests {
             .sync_with_stage_telemetry(&shared.app_performance_telemetry(), false)
             .await
             .unwrap();
-        for (seam, expected_activations, reason) in [
+        for (seam, reason) in [
             (
                 EpochBackfillExecutionSeam::Maintenance,
-                1,
-                "startup joined compatible epoch, incremental and overflow demand in one activation",
+                "startup joined compatible epoch, incremental and overflow demand in one attempt",
             ),
             (
                 EpochBackfillExecutionSeam::Receive,
-                1,
                 "receive cannot bypass the account owner cooldown",
             ),
         ] {
@@ -9945,12 +9955,12 @@ mod tests {
                 .unwrap()
                 .recovery_retry_state()
                 .unwrap();
-            assert_eq!(retry.attempt_serial, 1);
+            assert_eq!(retry.attempt_serial, 1, "{reason}");
             assert_eq!(retry.not_before_ms - retry.recorded_at_ms, 300_000);
             assert_eq!(
-                relay.unfloored_account_subscription_count() - before,
-                expected_activations,
-                "{reason}",
+                relay.unfloored_account_subscription_count(),
+                before,
+                "automatic recovery restores only the live tail"
             );
         }
         let retry = app
@@ -9979,7 +9989,7 @@ mod tests {
                 .unwrap(),
             retry
         );
-        assert_eq!(relay.unfloored_account_subscription_count() - before, 1);
+        assert_eq!(relay.unfloored_account_subscription_count(), before);
         client
             .sync_with_classified_partial_progress()
             .await
@@ -9993,9 +10003,9 @@ mod tests {
             2
         );
         assert_eq!(
-            relay.unfloored_account_subscription_count() - before,
-            2,
-            "one genuine explicit caller spends one override without a nested overflow replay"
+            relay.unfloored_account_subscription_count(),
+            before,
+            "an explicit catch-up spends one override and still restores only the live tail"
         );
         assert!(client.has_pending_epoch_backfill());
         assert!(client.delivery_overflow_recovery_pending);

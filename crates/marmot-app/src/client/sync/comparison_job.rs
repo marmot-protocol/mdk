@@ -13,6 +13,18 @@ use transport_nostr_adapter::{NostrReconciliationProgress, SubscriptionAttempt};
 /// executor with its complete endpoint set.
 pub(crate) const MAX_COMPARISON_ENDPOINTS_PER_ROUTE: usize = 4;
 
+/// What the worker keeps while a comparison runs off the worker: the live
+/// subscription attempt admission must still own, and the inline executor's
+/// execution bracket (loss attempt and audit rows).
+pub(crate) struct ComparisonActivation {
+    attempt: SubscriptionAttempt,
+    execution: RecoveryExecutionState,
+}
+
+fn comparison_failure(error: AppError) -> ClassifiedSyncFailure {
+    ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, SyncFailureStage::Unknown)
+}
+
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct TestComparisonActivityWitness {
@@ -469,8 +481,8 @@ impl AppClient {
     }
 
     /// Every automatic grant runs its network wait off the worker, except
-    /// maintenance boundaries and explicit repair, which keep their own
-    /// executor. Per-pass route and endpoint caps still apply. The frozen grant
+    /// maintenance boundaries, explicit repair and known-event demand, which
+    /// keep their own executors. Per-pass route and endpoint caps still apply. The frozen grant
     /// is the authority; an earlier pending-demand probe never decides this.
     pub(crate) fn comparison_offload_eligible(
         &self,
@@ -484,10 +496,12 @@ impl AppClient {
                 && admitted <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE
         };
         Ok(plan.iter().all(|obligation| {
+            // Known-event demand belongs to the exact-ID worker.
             !matches!(
                 obligation.cause,
                 storage_sqlite::RecoveryCause::Maintenance
                     | storage_sqlite::RecoveryCause::ExplicitHistory
+                    | storage_sqlite::RecoveryCause::KnownEvent
             ) && obligation.scopes.iter().all(|scope| {
                 within_cap(
                     scope.goal.required_endpoints.len(),
@@ -514,40 +528,126 @@ impl AppClient {
             }))
     }
 
+    /// Open the same execution bracket as the inline executor, then activate
+    /// the grant's floored live subscriptions. The network wait runs off the
+    /// worker; the returned activation must be finished or abandoned.
     pub(crate) async fn activate_comparison_grant(
         &mut self,
         grant: &AttemptGrant,
         telemetry: Option<&AppPerformanceTelemetry>,
-    ) -> Result<SubscriptionAttempt, AppError> {
-        let mut activation = EpochBackfillActivationOutcome::Failed;
-        self.activate_recovery_grant_inner(grant, telemetry, &mut activation)
-            .await
+    ) -> Result<ComparisonActivation, AppError> {
+        let mut execution = self
+            .begin_recovery_execution(grant)
             .map_err(|failure| failure.source)?;
-        self.adapter
-            .account_subscription_attempt()
+        let attempt = match self
+            .activate_recovery_grant_inner(grant, telemetry, &mut execution.activation)
             .await
-            .ok_or_else(|| {
-                cgka_traits::TransportAdapterError::Subscription(
-                    "activated comparison subscription disappeared".into(),
-                )
-                .into()
-            })
+        {
+            Ok(()) => self
+                .adapter
+                .account_subscription_attempt()
+                .await
+                .ok_or_else(|| {
+                    comparison_failure(
+                        cgka_traits::TransportAdapterError::Subscription(
+                            "activated comparison subscription disappeared".into(),
+                        )
+                        .into(),
+                    )
+                }),
+            Err(failure) => Err(failure),
+        };
+        match attempt {
+            Ok(attempt) => Ok(ComparisonActivation { attempt, execution }),
+            Err(failure) => {
+                match self.finish_recovery_execution(grant, execution, Err(failure), false) {
+                    Ok(_) => unreachable!("a failed activation cannot complete"),
+                    Err(failure) => Err(failure.source),
+                }
+            }
+        }
     }
 
+    /// Admit the owned comparison result and settle the execution bracket:
+    /// checkpoints, loss acknowledgment and audit rows, as the inline
+    /// executor does.
     pub(crate) async fn finish_comparison_grant(
         &mut self,
         grant: AttemptGrant,
-        attempt: SubscriptionAttempt,
+        activation: ComparisonActivation,
         network: ComparisonNetworkResult,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
-        let storage = self.app.account_storage(&self.state.label)?;
-        storage.synchronize_account_delivery_loss(&self.state.label)?;
-        drop(self.transport_receipts()?);
-        self.observe_recovery_route_policy()?;
-        let current = storage.recovery_revision_fence()?;
+        let ComparisonActivation {
+            attempt,
+            mut execution,
+        } = activation;
+        let admitted = self
+            .admit_comparison_grant(&grant, attempt, network, &mut execution)
+            .await;
+        let deferred = matches!(admitted, Ok(None));
+        let summary = self
+            .finish_recovery_execution(
+                &grant,
+                execution,
+                admitted.map(Option::unwrap_or_default),
+                false,
+            )
+            .map_err(|failure| {
+                self.pending_failed_sync_summary
+                    .merge(failure.partial_summary);
+                failure.source
+            })?;
+        Ok(if deferred {
+            EpochBackfillRunOutcome::Deferred
+        } else {
+            EpochBackfillRunOutcome::Incomplete(summary)
+        })
+    }
+
+    /// The network task ended without a result. Settle the bracket like an
+    /// attempt that admitted nothing; the durable debt waits for a later grant.
+    pub(crate) fn abandon_comparison_grant(
+        &mut self,
+        grant: AttemptGrant,
+        activation: ComparisonActivation,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        self.finish_recovery_execution(
+            &grant,
+            activation.execution,
+            Ok(SyncSummary::default()),
+            false,
+        )
+        .map_err(|failure| failure.source)?;
+        Ok(EpochBackfillRunOutcome::Deferred)
+    }
+
+    /// `None` means the grant changed while the network task ran, so nothing
+    /// was admitted.
+    async fn admit_comparison_grant(
+        &mut self,
+        grant: &AttemptGrant,
+        attempt: SubscriptionAttempt,
+        network: ComparisonNetworkResult,
+        execution: &mut RecoveryExecutionState,
+    ) -> Result<Option<SyncSummary>, ClassifiedSyncFailure> {
+        let storage = self
+            .app
+            .account_storage(&self.state.label)
+            .map_err(comparison_failure)?;
+        storage
+            .synchronize_account_delivery_loss(&self.state.label)
+            .map_err(|error| comparison_failure(error.into()))?;
+        drop(self.transport_receipts().map_err(comparison_failure)?);
+        self.observe_recovery_route_policy()
+            .map_err(comparison_failure)?;
+        let current = storage
+            .recovery_revision_fence()
+            .map_err(|error| comparison_failure(error.into()))?;
         let slot_stable = match grant.comparison_revision {
             Some(revision) => {
-                let slot = storage.recovery_comparison()?;
+                let slot = storage
+                    .recovery_comparison()
+                    .map_err(|error| comparison_failure(error.into()))?;
                 slot.pending()
                     && slot.revision == revision
                     && slot.attempt_serial == grant.reservation.attempt_serial
@@ -569,7 +669,7 @@ impl AppClient {
             // The network task never wrote to SQLCipher or the delivery queue.
             // A changed grant or activation discards every proposed byte and
             // leaves durable comparison and coverage debt for the next owner.
-            return Ok(EpochBackfillRunOutcome::Deferred);
+            return Ok(None);
         }
         // Acquisition may have consumed its entire quantum before the worker
         // joins. Give delivery of the already owned batch a separate bounded
@@ -579,20 +679,19 @@ impl AppClient {
         for route in network.routes {
             outcomes.push(
                 self.admit_comparison_route(&storage, route, admission_deadline)
-                    .await?,
+                    .await
+                    .map_err(comparison_failure)?,
             );
         }
-        let mut counts = DrainCounts::default();
-        let mut verdict = None;
-        let summary = self
-            .complete_recovery_grant_inner(&grant, None, &mut counts, &mut verdict, outcomes)
-            .await
-            .map_err(|failure| {
-                self.pending_failed_sync_summary
-                    .merge(failure.partial_summary);
-                failure.source
-            })?;
-        Ok(EpochBackfillRunOutcome::Incomplete(summary))
+        self.complete_recovery_grant_inner(
+            grant,
+            None,
+            &mut execution.counts,
+            &mut execution.drain_verdict,
+            outcomes,
+        )
+        .await
+        .map(Some)
     }
 
     async fn admit_comparison_route(
@@ -1172,7 +1271,7 @@ mod tests {
             .unwrap();
         assert_ne!(
             fixture.client.adapter.account_subscription_attempt().await,
-            Some(attempt)
+            Some(attempt.attempt)
         );
         let result = fixture
             .client

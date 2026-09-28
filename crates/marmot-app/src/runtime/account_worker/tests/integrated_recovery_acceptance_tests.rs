@@ -705,8 +705,8 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         .await
         .expect("startup joins after release")
         .unwrap();
-    assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 0);
-    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 0);
+    // The gap may start its own comparison straight away; the held job
+    // itself is gone.
     timeout(Duration::from_secs(45), async {
         loop {
             if reopened
@@ -730,6 +730,15 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     })
     .await
     .expect("natural worker recovery admits and decrypts genuine MLS history");
+    timeout(Duration::from_secs(20), async {
+        while activity.active_jobs.load(Ordering::SeqCst) != 0
+            || activity.active_requests.load(Ordering::SeqCst) != 0
+        {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("no comparison job outlives recovery");
     assert!(
         storage
             .retained_recovery_event(

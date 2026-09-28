@@ -1627,8 +1627,8 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
         runtime.drain_in_flight_work().await.unwrap();
         assert_eq!(
             relay.unfloored_account_subscription_count(),
-            unfloored_before + 1,
-            "the owner-issued replay has no nested follow-up"
+            unfloored_before,
+            "owner-issued automatic recovery never replays unfloored history"
         );
         let final_local_epoch = runtime
             .group_mls_state("alice", &group_id)
@@ -3512,7 +3512,8 @@ fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
         );
         assert_eq!(
             relay.unfloored_account_subscription_count(),
-            subscriptions + 1
+            subscriptions,
+            "automatic recovery restores only the live tail"
         );
         let pending = storage
             .pending_recovery_demands()
@@ -3631,7 +3632,8 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
         );
         assert_eq!(
             relay.unfloored_account_subscription_count(),
-            subscriptions + 1
+            subscriptions,
+            "automatic recovery restores only the live tail"
         );
         // A separate caller operation may override the new cooldown once. Its
         // executor cannot spend another reservation on a follow-up replay.
@@ -3647,7 +3649,8 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
         );
         assert_eq!(
             relay.unfloored_account_subscription_count(),
-            subscriptions + 2
+            subscriptions,
+            "an explicit catch-up of automatic debt restores only the live tail"
         );
     });
 }

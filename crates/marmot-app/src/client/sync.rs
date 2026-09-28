@@ -180,7 +180,8 @@ mod comparison_job;
 #[cfg(test)]
 pub(crate) use comparison_job::TestComparisonActivityWitness;
 pub(crate) use comparison_job::{
-    ComparisonNetworkJob, ComparisonNetworkResult, EpochGapQueueJob, RouteSubmission,
+    ComparisonActivation, ComparisonNetworkJob, ComparisonNetworkResult, EpochGapQueueJob,
+    RouteSubmission,
 };
 
 pub(crate) enum PendingRecoverySelection {
@@ -4744,23 +4745,17 @@ impl AppClient {
             .await?;
         #[cfg(test)]
         drop(_phase);
-        // Routine below-live-cutoff discovery runs only with a frozen owner
-        // comparison request. The retained-inventory floor still bounds it.
-        // Neither a quiet completion nor subscription installation certifies
-        // the still-pending maintenance/history predicate.
-        let quiet_prerequisites =
-            grant
+        // Every cause except a maintenance boundary completes on comparison
+        // certificates, so each pass compares its uncertified routes within
+        // the retained-inventory floor. Subscription installation never
+        // certifies a maintenance predicate.
+        let compares = grant.comparison_revision.is_some()
+            || grant
                 .plan()
                 .expect("validated executor grant")
                 .iter()
-                .all(|obligation| {
-                    matches!(
-                        obligation.cause,
-                        storage_sqlite::RecoveryCause::IncrementalHistory
-                            | storage_sqlite::RecoveryCause::Maintenance
-                    )
-                });
-        let comparison_outcomes = if grant.comparison_revision.is_some() || !quiet_prerequisites {
+                .any(|obligation| obligation.cause != storage_sqlite::RecoveryCause::Maintenance);
+        let comparison_outcomes = if compares {
             #[cfg(test)]
             let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Reconciliation);
             self.reconcile_transport_history(&grant.inventory)
@@ -5089,13 +5084,14 @@ impl AppClient {
                     .map_or(counts.refused > 0, |group| {
                         counts.refused_groups.contains(group)
                     });
-                // Maintenance boundaries and explicit repair keep their own
-                // evidence. Every other cause completes on comparison
-                // certificates over the retained-inventory window.
+                // Maintenance boundaries, explicit repair and known-event
+                // demand keep their own evidence. Every other cause completes
+                // on comparison certificates over the retained-inventory window.
                 let comparison_owned = !matches!(
                     obligation.cause,
                     storage_sqlite::RecoveryCause::Maintenance
                         | storage_sqlite::RecoveryCause::ExplicitHistory
+                        | storage_sqlite::RecoveryCause::KnownEvent
                 );
                 let mut certified = false;
                 let mut checkpoints = Vec::with_capacity(obligation.scopes.len());
@@ -5117,9 +5113,20 @@ impl AppClient {
                     {
                         continue;
                     }
+                    // A comparison proves only the window it compared. A goal
+                    // that reaches below the retained-inventory floor, or has
+                    // no lower bound, keeps its debt.
+                    let covers_goal = route.as_ref().is_some_and(|route| {
+                        grant.inventory.iter().any(|window| {
+                            &window.route == route
+                                && scope.goal.since_seconds.is_some_and(|since| since >= window.since)
+                                && scope.goal.until_seconds <= window.until
+                        })
+                    });
                     let scope_certified = comparison_owned
                         && drained
                         && !refused
+                        && covers_goal
                         && compared.is_some_and(|compared| compared.certified);
                     certified |= scope_certified;
                     let retained_known_event = match (&route, scope.goal.known_event_id) {

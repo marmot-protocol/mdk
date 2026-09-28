@@ -90,7 +90,7 @@ pub(crate) use sync::TestRecoveryPhaseWitness;
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
-    ComparisonNetworkJob, ComparisonNetworkResult, ConvergenceScheduleState,
+    ComparisonActivation, ComparisonNetworkJob, ComparisonNetworkResult, ConvergenceScheduleState,
     DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome, EpochGapQueueJob,
     OnlineEpochGapRecovery, PendingRecoverySelection, RouteSubmission,
 };
