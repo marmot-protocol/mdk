@@ -211,7 +211,9 @@ every cause and every caller runs it:
   request at a 50 ms poll and stops admission at a turn boundary, keeping the admitted
   prefix. Explicit history has no lower bound, so no window certifies it: a pass whose
   every route's window certified returns `BelowRetentionWindow`, naming the unsearched older
-  history, and the debt stays open.
+  history, and closes its request (decided with Jeff, 2026-09-28): no explicit-history debt
+  remains to park into a notice, and nothing is recorded as coverage. An uncertified,
+  cancelled or expired pass keeps the debt open for the owner's ordinary retries.
 
 Rules kept from the current design: complete coverage with a still-stuck engine means no
 replay; the blocked reason is recorded; the existing one-shot wedge report still escalates
@@ -519,8 +521,10 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Explicit repair compares the retained window only. A goal with no lower bound, or one
   below the inventory floor, cannot be certified by it, so explicit repair never reports
   complete, and it no longer fetches history older than the window: the unfloored replay
-  it replaced fetched that history but never certified it. Each pass also fetches at most 16 missing events per
-  relay. A wider window needs acquisition below the inventory floor.
+  it replaced fetched that history but never certified it. A certified window closes the
+  request instead of parking it, so history older than the window is simply not searched.
+  Each pass also fetches at most 16 missing events per relay. A wider window needs
+  acquisition below the inventory floor.
 - Explicit catch-up no longer re-subscribes, so a maintenance boundary whose EOSE a lag
   lost waits for the next activation, at reconnect or restart.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.

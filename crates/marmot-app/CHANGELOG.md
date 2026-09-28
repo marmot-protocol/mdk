@@ -37,10 +37,12 @@
   refreshes them. `repair_full_history` compares every route over the retained-inventory
   window in one pass inside its 60-second budget and installs no unfloored replay, so it
   no longer fetches history older than the retained window. Full history has no lower
-  bound, so the repair never reports complete: it returns `BelowRetentionWindow` when
-  every route's window certified, and `CoverageUnproven`, `Cancelled` or `Deadline`
-  otherwise. The deadline also stops admission at a turn boundary, keeping what was
-  already admitted.
+  bound, so the repair never reports complete. When every route's window certified it
+  returns `BelowRetentionWindow` and closes its request: no explicit-history debt is left
+  to park into a "history may be incomplete" notice, and nothing is recorded as coverage.
+  Otherwise it returns `CoverageUnproven`, `Cancelled` or `Deadline`, and the debt stays
+  open for the owner's ordinary retries. The deadline also stops admission at a turn
+  boundary, keeping what was already admitted.
 - Account recovery certifies a route on its operated relays only.
   `MarmotAppConfig::recovery_operated_relays` names them and defaults to
   `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`. A route that lists
@@ -154,7 +156,8 @@
 
 - `FullHistoryRepairIncompleteReason` gains `BelowRetentionWindow`
   (`full_history_below_retention_window`): an explicit repair certified every route's
-  retained window, but history below that window was never searched. Exhaustive Rust
+  retained window, but history below that window was never searched, and the request
+  closed without leaving debt or a notice. Exhaustive Rust
   matches must handle it; bindings see only the existing error code.
 - Remove `MarmotAppConfig::dev_epoch_backfill_eose_wait_ms` and
   `dev_epoch_backfill_execution_quantum_ms` with their `with_*` builders. Recovery no

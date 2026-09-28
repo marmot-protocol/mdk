@@ -64,9 +64,10 @@ fn control<'a>(
 
 /// A relay may still hold an event older than the retained-inventory window.
 /// No comparison searched below that floor, so a certified window must not
-/// report full history: the repair names the unsearched history instead.
+/// report full history: the repair names the unsearched history instead, and
+/// closes its request rather than leaving debt that parks into a notice.
 #[tokio::test]
-async fn certified_window_reports_history_below_it_as_unsearched() {
+async fn certified_window_closes_the_request_and_names_the_history_below_it() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let group = client.create_group("older history", &[]).await.unwrap();
@@ -91,17 +92,34 @@ async fn certified_window_reports_history_below_it_as_unsearched() {
             Vec::new(),
         )))
     }));
-    let failure = client.repair_full_history().await.unwrap_err();
-    assert_eq!(
-        failure.source.full_history_repair_incomplete(),
-        Some((
-            crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
-            false
-        ))
+    // The notice baseline: the first read only records it.
+    assert!(client.take_history_notice_changes().is_none());
+    // Three finished passes would park open explicit debt into a notice.
+    for _ in 0..3 {
+        let failure = client.repair_full_history().await.unwrap_err();
+        assert_eq!(
+            failure.source.full_history_repair_incomplete(),
+            Some((
+                crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
+                false
+            ))
+        );
+        assert!(
+            !explicit_pending(&app),
+            "the finished pass closes its explicit request"
+        );
+    }
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .parked_recovery_obligations()
+            .unwrap()
+            .is_empty(),
+        "a closed request never parks"
     );
     assert!(
-        explicit_pending(&app),
-        "history below the window stays explicit debt"
+        client.take_history_notice_changes().is_none(),
+        "and publishes no notice"
     );
     assert!(
         !client.state.seen_events.contains(&older.id),
@@ -515,8 +533,19 @@ async fn qualified_repair_requires_every_endpoint_and_complete_admission() {
         let before = relay.subscription_count();
         let result = client.repair_full_history().await;
         assert_eq!(result.is_ok(), qualifies, "{result:?}");
+        if let Err(failure) = result {
+            // Every route answered, so the unqualified pass names what it
+            // could not search and closes its request.
+            assert_eq!(
+                failure.source.full_history_repair_incomplete(),
+                Some((
+                    crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
+                    false
+                ))
+            );
+        }
         assert_eq!(relay.subscription_count(), before);
-        assert_eq!(explicit_pending(&app), !qualifies);
+        assert!(!explicit_pending(&app));
     }
 }
 

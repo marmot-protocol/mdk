@@ -208,9 +208,10 @@ account's one recovery job for it in place: a NIP-77 comparison of every route o
 then bounded admission of what it fetched through ordinary ingest. It installs and replays no subscription.
 It never reports complete: full history has no lower bound, and no comparison searches below the inventory
 floor. When every required relay certified its route's window and every difference was durably admitted, the
-repair returns `BelowRetentionWindow`, naming the unsearched older history; otherwise `CoverageUnproven`. Its
-explicit-history debt stays open either way. Each pass fetches at most 16 missing events per relay, so a large
-gap can take further repairs or automatic passes.
+repair returns `BelowRetentionWindow`, naming the unsearched older history, and closes its request: it leaves no
+explicit-history debt, raises no "history may be incomplete" notice and records no coverage. Otherwise it returns
+`CoverageUnproven` and its debt stays open for the owner's ordinary retries. Each pass fetches at most 16 missing
+events per relay, so a large gap can take further repairs or automatic passes.
 Known-event recovery can instead complete from a validated retained copy. Maintenance uses its separately fenced
 boundary.
 

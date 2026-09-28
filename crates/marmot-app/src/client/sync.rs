@@ -4354,6 +4354,25 @@ impl AppClient {
         let qualified = storage
             .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
             .map_err(|error| state_persist(summary.clone(), error.into()))?;
+        let reason = control
+            .stopped()
+            .unwrap_or(if self.explicit_history_window_certified {
+                crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow
+            } else {
+                crate::FullHistoryRepairIncompleteReason::CoverageUnproven
+            });
+        if result.is_ok()
+            && !qualified
+            && reason == crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow
+        {
+            // The pass finished with every route's window certified. What is
+            // left lies below the window, where no pass can search, so the
+            // request closes: it would otherwise only park into a notice. It
+            // is recorded as neither coverage nor a dismissal.
+            storage
+                .close_explicit_history_request(ticket)
+                .map_err(|error| state_persist(summary.clone(), error.into()))?;
+        }
         waiter
             .detach()
             .map_err(|error| state_persist(summary.clone(), error.into()))?;
@@ -4361,13 +4380,7 @@ impl AppClient {
             Ok(_) if qualified => Ok(summary),
             Ok(_) => Err(incomplete_full_history_repair(
                 summary,
-                control
-                    .stopped()
-                    .unwrap_or(if self.explicit_history_window_certified {
-                        crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow
-                    } else {
-                        crate::FullHistoryRepairIncompleteReason::CoverageUnproven
-                    }),
+                reason,
                 self.delivery_loss_blocks_cursor(),
             )),
             Err(error) => Err(ClassifiedSyncFailure::at_stage(

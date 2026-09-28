@@ -219,6 +219,27 @@ impl SqliteAccountStorage {
         ).storage()
     }
 
+    /// Close an explicit full-history request whose pass finished: its goal
+    /// has no lower bound, so nothing can complete it, and leaving it pending
+    /// would only park it into a notice. Closing records neither coverage nor
+    /// a retirement notice. Each request has its own operation identity, so
+    /// closing it never touches another caller's. Returns whether a row was
+    /// closed.
+    pub fn close_explicit_history_request(
+        &self,
+        ticket: RecoveryDemandTicket,
+    ) -> StorageResult<bool> {
+        let closed = self
+            .lock()?
+            .execute_cached(
+                "DELETE FROM account_recovery_obligations
+                 WHERE id=?1 AND cause=?2 AND state=0",
+                params![ticket.id.as_slice(), RecoveryCause::ExplicitHistory as i64],
+            )
+            .storage()?;
+        Ok(closed > 0)
+    }
+
     /// A cancelled last foreground waiter loses urgency, not durable work.
     /// System demand and other callers have independent identities/predicates.
     pub fn detach_recovery_waiter(&self, ticket: RecoveryDemandTicket) -> StorageResult<()> {
