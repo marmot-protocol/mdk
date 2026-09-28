@@ -343,8 +343,10 @@ impl Marmot {
     }
 
     /// Publish (or re-publish) the NIP-65 and inbox relay lists for
-    /// `account_ref`. Idempotent — safe to call on every launch. The lists are
-    /// copied to public indexers without advertising them as account relays.
+    /// `account_ref`. Each call writes fresh replaceable events to the account
+    /// relays and schedules public indexer copies when eligible, so call when
+    /// the relay lists need publication rather than on every launch. Indexers
+    /// are not advertised as account relays.
     pub async fn publish_relay_lists(
         &self,
         account_ref: String,

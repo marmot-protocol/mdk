@@ -2052,6 +2052,7 @@ impl MarmotApp {
         let indexer_endpoints = self.public_indexer_publish_endpoints(
             &bootstrap.indexer_relays,
             &endpoints,
+            &endpoints,
             &bootstrap.default_relays,
         );
 
@@ -2227,8 +2228,12 @@ impl MarmotApp {
             .cloned()
             .map(TransportEndpoint)
             .collect::<Vec<_>>();
-        let indexers =
-            self.public_indexer_publish_endpoints(indexer_relays, &operational, &declared);
+        let indexers = self.public_indexer_publish_endpoints(
+            indexer_relays,
+            &operational,
+            &operational,
+            &declared,
+        );
         if indexers.is_empty() {
             return Ok(None);
         }
@@ -2539,10 +2544,9 @@ impl MarmotApp {
         // ever lands on the relays you were already on. Unioning means an
         // explicit republish reaches both your old relays (so they update) and
         // the newly-declared ones (so they learn about you for the first time).
-        let endpoints = self.publish_route_including_requested(
-            &account_id_hex,
-            publish_endpoints_from_bootstrap(&bootstrap),
-        );
+        let requested_endpoints = publish_endpoints_from_bootstrap(&bootstrap);
+        let endpoints =
+            self.publish_route_including_requested(&account_id_hex, requested_endpoints.clone());
         let declared_relays = if let Some(relays) = nip65_relay_set {
             bootstrap
                 .default_relays
@@ -2557,6 +2561,7 @@ impl MarmotApp {
         let indexer_endpoints = self.public_indexer_publish_endpoints(
             &bootstrap.indexer_relays,
             &endpoints,
+            &requested_endpoints,
             &declared_relays,
         );
         let nostr_signer = signer.as_nostr_signer();
@@ -2769,11 +2774,15 @@ impl MarmotApp {
         &self,
         indexer_relays: &[TransportEndpoint],
         operational_relays: &[TransportEndpoint],
+        publication_relays: &[TransportEndpoint],
         declared_relays: &[TransportEndpoint],
     ) -> Vec<TransportEndpoint> {
         // Development identities may intentionally use loopback relays. Keep
-        // their public discovery reads, but never export their records.
-        if operational_relays
+        // their public discovery reads, but never export their records. A
+        // previous outbox can remain on the delivery route during a relay-list
+        // edit; only this publication's requested route and declaration decide
+        // whether the replacement record is public.
+        if publication_relays
             .iter()
             .chain(declared_relays)
             .any(|endpoint| {

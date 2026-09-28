@@ -832,8 +832,12 @@ impl MarmotApp {
             Vec::new(),
             content,
         );
-        let indexers =
-            self.public_indexer_publish_endpoints(&indexer_relays, &endpoints, &declared_relays);
+        let indexers = self.public_indexer_publish_endpoints(
+            &indexer_relays,
+            &endpoints,
+            &endpoints,
+            &declared_relays,
+        );
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
         if !indexers.is_empty() {

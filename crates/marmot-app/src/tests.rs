@@ -7391,6 +7391,57 @@ async fn mixed_loopback_declarations_suppress_profile_and_relay_list_indexer_cop
 }
 
 #[tokio::test]
+async fn replacing_loopback_outbox_copies_new_public_relay_lists_to_indexer() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_nostr_account_for_setup()
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "ws://127.0.0.1:1234")
+        .with_test_relay_client(relay.clone());
+    let loopback = TransportEndpoint("ws://127.0.0.1:1234".into());
+    let public = TransportEndpoint("wss://relay.example".into());
+    let indexer = TransportEndpoint("wss://index.example".into());
+    app.publish_generated_account_bootstrap(
+        &account.label,
+        AccountRelayListBootstrap::new(vec![loopback.clone()], vec![loopback.clone()]),
+        &UserProfileMetadata::default(),
+    )
+    .await
+    .unwrap();
+    relay.attempted_publish_routes.lock().unwrap().clear();
+
+    let status = app
+        .publish_account_relay_lists(
+            &account.label,
+            AccountRelayListBootstrap::new(vec![public.clone()], vec![public.clone()])
+                .with_indexer_relays(vec![indexer.clone()]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.nip65.relays, vec![public.0.clone()]);
+    assert_eq!(status.inbox.relays, vec![public.0.clone()]);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let routes = relay.attempted_publish_routes.lock().unwrap().clone();
+            if [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
+                .iter()
+                .all(|kind| routes.contains(&(*kind, vec![indexer.clone()])))
+            {
+                for kind in [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST] {
+                    assert!(routes.contains(&(kind, vec![loopback.clone(), public.clone()],)));
+                }
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement public lists must reach the indexer on the first edit");
+}
+
+#[tokio::test]
 async fn confirmed_bootstrap_retry_republishes_public_indexer_copies() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
