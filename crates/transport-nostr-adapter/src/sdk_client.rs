@@ -752,10 +752,13 @@ impl NostrSdkRelayClient {
         let mut spent_bytes = 0usize;
         let mut returned_ids = HashSet::new();
         let mut requests = 0usize;
-        // A pass that stops early leaves the unreturned IDs' claimants failed;
-        // an endpoint that claimed nothing left behind still succeeds.
+        // A pass that stops early leaves the unreturned IDs' claimants
+        // incomplete, or failed when it ran out of time; an endpoint that
+        // claimed nothing left behind still succeeds.
+        let mut out_of_time = false;
         for event_id in remote_ids {
             if tokio::time::Instant::now() >= deadline {
+                out_of_time = true;
                 break;
             }
             if let Some(event) = self
@@ -824,6 +827,7 @@ impl NostrSdkRelayClient {
             let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
             let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining_items == 0 || remaining_bytes == 0 || remaining_time.is_zero() {
+                out_of_time |= remaining_time.is_zero();
                 break;
             }
             // Do not advance past an ID merely because this pass ran out of
@@ -949,7 +953,13 @@ impl NostrSdkRelayClient {
             .collect::<HashSet<_>>();
         for (endpoint, ids) in &remote_by_endpoint {
             if ids.iter().any(|id| !returned.contains(id)) {
-                incomplete_endpoints.insert(endpoint.clone());
+                // A pass cut short by its deadline did not hear the endpoint
+                // out: that is a timeout, not an answer.
+                if out_of_time {
+                    failed_endpoints.insert(endpoint.clone());
+                } else {
+                    incomplete_endpoints.insert(endpoint.clone());
+                }
             }
         }
         incomplete_endpoints.retain(|endpoint| !failed_endpoints.contains(endpoint));

@@ -4753,16 +4753,23 @@ impl AppClient {
                                 scope.transport_group_id.expect("frozen comparison route"),
                             )
                         };
+                        // The slot retries only a route whose required relays did
+                        // not answer. An answered route that could not certify, or
+                        // whose admission was incomplete or refused, is serviced:
+                        // its obligation's own quiet streak retries it until the
+                        // obligation parks, and parking ends automatic passes.
                         let observed = comparison_outcomes
                             .iter()
                             .find(|compared| compared.route == route)
-                            .map_or(Comparison::ServicedPartial, |compared| compared.outcome);
-                        let observed = if counts.refused > 0 && observed != Comparison::Unsupported
-                        {
-                            Comparison::TransientFailure
-                        } else {
-                            observed
-                        };
+                            .map_or(Comparison::ServicedPartial, |compared| {
+                                if compared.answered
+                                    && compared.outcome == Comparison::TransientFailure
+                                {
+                                    Comparison::ServicedUnknown
+                                } else {
+                                    compared.outcome
+                                }
+                            });
                         (scope.scope_id, observed)
                     })
                     .collect::<Vec<_>>();

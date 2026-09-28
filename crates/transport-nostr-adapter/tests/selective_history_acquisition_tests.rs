@@ -823,6 +823,10 @@ async fn silent_and_fast_withholding_endpoint_resume_two_ids_across_paced_passes
                 assert!(!events.is_empty());
                 if seen.len() + events.len() < 2 {
                     assert_eq!(summary.relays_failed, 2);
+                    assert!(
+                        summary.incomplete_endpoints.is_empty(),
+                        "a pass cut short by its deadline is a timeout, not an answer"
+                    );
                 }
             } else {
                 assert_eq!(summary.relays_succeeded, 1);

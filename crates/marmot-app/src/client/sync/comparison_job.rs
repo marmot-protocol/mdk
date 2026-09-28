@@ -524,8 +524,17 @@ impl AppClient {
                 break;
             };
             let route = &mut admission.routes[index];
-            let deliveries = self.adapter.recovered_deliveries(event).await?;
-            // An event that no longer routes to this account was not admitted.
+            // An event that no longer routes to this account, or that cannot be
+            // read as a transport message, was not admitted. It withholds the
+            // route's certificate without failing the rest of the batch.
+            let deliveries = match self.adapter.recovered_deliveries(event).await {
+                Ok(deliveries) => deliveries,
+                Err(
+                    cgka_traits::TransportAdapterError::InvalidInboundEncoding
+                    | cgka_traits::TransportAdapterError::InvalidInboundSignature,
+                ) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
             route.admitted &= !deliveries.is_empty();
             for delivery in deliveries {
                 let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
@@ -751,6 +760,19 @@ mod tests {
 
     fn candidate() -> transport_nostr_adapter::NostrRelayEvent {
         candidate_for_route([7; 32])
+    }
+
+    /// A signed event of a kind no transport message can carry.
+    fn unreadable_for_route(route: [u8; 32]) -> transport_nostr_adapter::NostrRelayEvent {
+        let signed = EventBuilder::new(Kind::TextNote, "not a transport message")
+            .tags([Tag::custom("h", [hex::encode(route)])])
+            .finalize(&Keys::generate())
+            .unwrap();
+        transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&signed).unwrap(),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1201,6 +1223,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unreadable_event_withholds_the_route_without_failing_the_batch() {
+        let mut fixture = fixture().await;
+        let (grant, execution, route, group_route) = group_route_grant(&mut fixture).await;
+        let result = fixture
+            .client
+            .admit_comparison_inline(
+                grant,
+                execution,
+                fetched(
+                    route.clone(),
+                    vec![
+                        unreadable_for_route(group_route),
+                        candidate_for_route(group_route),
+                    ],
+                ),
+            )
+            .await;
+        assert!(
+            matches!(result, Ok(EpochBackfillRunOutcome::Incomplete(_))),
+            "one unreadable event must not fail the whole pass"
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .transport_reconciliation_replay_cursor(&route)
+                .unwrap(),
+            None,
+            "a route with an unadmitted event keeps its pre-pass cursor"
+        );
+    }
+
+    #[tokio::test]
     async fn comparison_admits_owned_events_directly_without_the_delivery_queue() {
         let mut fixture = fixture().await;
         let (grant, execution, route, group_route) = group_route_grant(&mut fixture).await;
@@ -1342,9 +1396,10 @@ mod tests {
                 .unwrap(),
             None,
         );
-        assert!(fixture.storage.recovery_comparison().unwrap().pending());
         // The relays answered; only admission fell short. That withholds the
-        // certificate but is a quiet comparison, not an outage.
+        // certificate but is a quiet comparison, not an outage, so the slot is
+        // serviced and the debt itself carries the retry.
+        assert!(!fixture.storage.recovery_comparison().unwrap().pending());
         let history = fixture
             .storage
             .pending_recovery_demands()

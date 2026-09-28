@@ -32,7 +32,8 @@
 - Account recovery certifies a route on its operated relays only.
   `MarmotAppConfig::recovery_operated_relays` names them and defaults to
   `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`. A route that lists
-  none of them still certifies on all of its relays. The route's other relays are still
+  none of them still certifies on all of the relays recovery can dial; a retired, unsafe or
+  over-cap relay is never required. The route's other relays are still
   compared and their events admitted, but their failures never withhold completion or
   schedule a retry. Changing the operated set rebuilds pending recovery scopes. (#2068)
 

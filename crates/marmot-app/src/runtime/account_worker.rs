@@ -2499,6 +2499,12 @@ async fn run_app_runtime_account_worker(
                     }
                 };
             }
+            // A comparison batch still being admitted takes its next turn as
+            // soon as commands and live input have had theirs, instead of
+            // waiting for unrelated input while it holds its recovery credit.
+            _ = tokio::task::yield_now(), if comparison_recovery.as_ref().is_some_and(|job| job.network.is_none()) => {
+                continue 'worker;
+            }
             _ = maintenance_tick.tick() => {
                 local_submission_due = true;
                 attachment_due = true;

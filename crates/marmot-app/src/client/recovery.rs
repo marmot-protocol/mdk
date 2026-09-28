@@ -846,8 +846,9 @@ impl AppClient {
         let mut push = |group_id: Option<Vec<u8>>,
                         transport_group_id: Option<[u8; 32]>,
                         endpoints: &[cgka_traits::TransportEndpoint]| {
+            let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
             let required = crate::relay_plane::recovery_required_endpoints(
-                endpoints,
+                &admitted,
                 &self.app.config.recovery_operated_relays,
             );
             goals.push(RecoveryScopePlan {
@@ -865,7 +866,7 @@ impl AppClient {
                 known_event_id: None,
                 inventory_floor: None,
                 required_endpoints: required,
-                admitted_endpoints: self.adapter.recovery_admitted_endpoints(endpoints),
+                admitted_endpoints: admitted,
             });
         };
         push(None, None, &routing.local_inbox_endpoints);
@@ -1480,8 +1481,11 @@ impl AppClient {
             } else {
                 let mut scopes = Vec::new();
                 if demand.group_id.is_none() {
+                    let admitted = self
+                        .adapter
+                        .recovery_admitted_endpoints(&routing.local_inbox_endpoints);
                     let endpoints = crate::relay_plane::recovery_required_endpoints(
-                        &routing.local_inbox_endpoints,
+                        &admitted,
                         &self.app.config.recovery_operated_relays,
                     );
                     scopes.push(RecoveryScopePlan {
@@ -1495,9 +1499,7 @@ impl AppClient {
                         known_event_id: demand.known_event_id,
                         inventory_floor: None,
                         required_endpoints: endpoints,
-                        admitted_endpoints: self
-                            .adapter
-                            .recovery_admitted_endpoints(&routing.local_inbox_endpoints),
+                        admitted_endpoints: admitted,
                     });
                 }
                 let mut routes = routing
@@ -1527,8 +1529,9 @@ impl AppClient {
                         .map_err(|_| {
                             StorageError::Serialization("invalid recovery transport route".into())
                         })?;
+                    let admitted = self.adapter.recovery_admitted_endpoints(&route.endpoints);
                     let endpoints = crate::relay_plane::recovery_required_endpoints(
-                        &route.endpoints,
+                        &admitted,
                         &self.app.config.recovery_operated_relays,
                     );
                     scopes.push(RecoveryScopePlan {
@@ -1542,9 +1545,7 @@ impl AppClient {
                         known_event_id: demand.known_event_id,
                         inventory_floor: None,
                         required_endpoints: endpoints,
-                        admitted_endpoints: self
-                            .adapter
-                            .recovery_admitted_endpoints(&route.endpoints),
+                        admitted_endpoints: admitted,
                     });
                 }
                 if scopes.is_empty() {
@@ -4231,6 +4232,62 @@ mod tests {
             queue_loss(&storage),
             Some(storage_sqlite::RecoveryEligibility::NeedsDeepRepair),
             "answered passes that admit nothing park instead of retrying forever"
+        );
+        assert!(
+            client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                )
+                .unwrap()
+                .is_none(),
+            "parking ends automatic passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_history_debt_leaves_no_comparison_slot_retrying() {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.create_group("withheld history", &[]).await.unwrap();
+        client.request_bounded_comparison().unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let history = || {
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+                .map(|d| d.eligibility)
+        };
+        // Every relay answers but withholds an ID, so no pass certifies or admits.
+        for _ in 0..RECOVERY_PARK_AFTER_ATTEMPTS {
+            run_loss_pass(&mut client, &storage, scripted_withheld_routes).await;
+        }
+        assert_eq!(
+            history(),
+            Some(storage_sqlite::RecoveryEligibility::NeedsDeepRepair)
+        );
+        assert!(
+            client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                )
+                .unwrap()
+                .is_none(),
+            "an answered route is serviced, so no comparison slot keeps passes running"
         );
     }
 

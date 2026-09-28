@@ -284,32 +284,28 @@ pub(crate) fn same_relay(left: &str, right: &str) -> bool {
         )
 }
 
-/// The endpoints whose comparison certifies a recovery scope: the route's
-/// operated relays. Any other relay is best effort and never blocks
-/// completion. A route with no operated relay requires all of its relays, so
-/// its history can still certify.
-pub(crate) fn recovery_required_endpoints(
-    endpoints: &[TransportEndpoint],
-    operated: &[String],
-) -> Vec<String> {
+/// The endpoints whose comparison certifies a recovery scope, chosen from the
+/// ones recovery may contact (`admitted`): the route's operated relays. Any
+/// other relay is best effort and never blocks completion. A route with no
+/// operated relay requires all of its admitted relays, so its history can
+/// still certify. A relay the plane refuses, such as a retired or unsafe
+/// host, or one past the per-route cap, is never compared and never required.
+pub(crate) fn recovery_required_endpoints(admitted: &[String], operated: &[String]) -> Vec<String> {
     let operated = operated
         .iter()
         .filter_map(|relay| RelayUrl::parse(relay.trim()).ok())
         .collect::<std::collections::HashSet<_>>();
-    let is_operated = |endpoint: &&TransportEndpoint| {
-        RelayUrl::parse(endpoint.as_str().trim()).is_ok_and(|url| operated.contains(&url))
+    let is_operated = |endpoint: &&String| {
+        RelayUrl::parse(endpoint.trim()).is_ok_and(|url| operated.contains(&url))
     };
-    let mut required = if endpoints.iter().any(|endpoint| is_operated(&endpoint)) {
-        endpoints
+    let mut required = if admitted.iter().any(|endpoint| is_operated(&endpoint)) {
+        admitted
             .iter()
             .filter(is_operated)
-            .map(|endpoint| endpoint.0.clone())
+            .cloned()
             .collect::<Vec<_>>()
     } else {
-        endpoints
-            .iter()
-            .map(|endpoint| endpoint.0.clone())
-            .collect()
+        admitted.to_vec()
     };
     required.sort();
     required.dedup();
@@ -410,6 +406,10 @@ fn is_retired_relay_host(host: &Host<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(urls: &[&str]) -> Vec<String> {
+        urls.iter().map(|url| (*url).to_owned()).collect()
+    }
 
     fn endpoints(urls: &[&str]) -> Vec<TransportEndpoint> {
         urls.iter()
@@ -661,8 +661,8 @@ mod tests {
         ];
         assert_eq!(
             recovery_required_endpoints(
-                &endpoints(&[
-                    "wss://relay.damus.io",
+                &strings(&[
+                    "wss://relay.primal.net",
                     "wss://relay.us.whitenoise.chat",
                     "wss://nos.lol",
                 ]),
@@ -673,7 +673,7 @@ mod tests {
         );
         assert_eq!(
             recovery_required_endpoints(
-                &endpoints(&[
+                &strings(&[
                     "wss://relay.us.whitenoise.chat",
                     "wss://relay.eu.whitenoise.chat"
                 ]),
@@ -686,16 +686,32 @@ mod tests {
         );
         assert_eq!(
             recovery_required_endpoints(
-                &endpoints(&["wss://nos.lol", "wss://relay.damus.io"]),
+                &strings(&["wss://nos.lol", "wss://relay.primal.net"]),
                 &operated,
             ),
             vec![
                 "wss://nos.lol".to_owned(),
-                "wss://relay.damus.io".to_owned()
+                "wss://relay.primal.net".to_owned()
             ],
             "a route with no operated relay still certifies on all of its relays"
         );
         assert!(recovery_required_endpoints(&[], &operated).is_empty());
+    }
+
+    #[test]
+    fn a_relay_the_plane_refuses_is_never_required() {
+        // Required relays are chosen from the admitted ones, so a route with
+        // no operated relay can still certify on the relays recovery dials.
+        let policy = RelaySafetyPolicy::default();
+        let admitted = policy
+            .usable_group_endpoints(endpoints(&["wss://nos.lol", "wss://10.0.0.1"]), "test")
+            .into_iter()
+            .map(|endpoint| endpoint.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovery_required_endpoints(&admitted, &[]),
+            vec!["wss://nos.lol".to_owned()]
+        );
     }
 
     #[test]
