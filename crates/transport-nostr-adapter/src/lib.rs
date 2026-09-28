@@ -571,13 +571,16 @@ pub trait NostrRelayClient: Send + Sync {
     }
 
     /// Send a live REQ again to `endpoints`, unchanged and under its own id,
-    /// so that each relay replaces it, replays its stored events and reports
+    /// so that each relay replays its stored events and reports
     /// end-of-stored-events again. Returns how many relays it went to; a
-    /// relay on which the REQ is not live is skipped.
+    /// relay on which the REQ is not live, or that is not connected, is
+    /// skipped.
     ///
     /// The REQ must keep the filter it was issued with, so its `since` still
-    /// bounds a later lag's loss, and a closed REQ must never be reopened. An
-    /// implementation that cannot guarantee both refuses. Unsupported by
+    /// bounds a later lag's loss. A closed REQ must never be reopened. And no
+    /// relay may see the id repeated while it is live there: a relay may
+    /// refuse the repeat instead of replacing the subscription. An
+    /// implementation that cannot guarantee all three refuses. Unsupported by
     /// default.
     async fn reissue_subscription(
         &self,

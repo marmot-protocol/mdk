@@ -2438,11 +2438,19 @@ impl NostrRelayClient for NostrSdkRelayClient {
         Ok(())
     }
 
-    /// Re-send the filters the SDK retained for this REQ, as a raw REQ under
-    /// the same id, to each relay that still holds it. The SDK refuses to
-    /// register a live id twice, and its registry must keep the REQ it will
-    /// restore on reconnect, so the REQ bypasses registration. A relay then
-    /// replaces its subscription and replays from the same `since`.
+    /// Close this REQ on each connected relay that holds it, then send the
+    /// filters the SDK retained for it again under the same id, as two raw
+    /// frames. The relay replays from the same `since` and reports EOSE again.
+    ///
+    /// Raw frames leave the SDK's registry untouched, so it still restores the
+    /// REQ on reconnect. A relay-level unsubscribe and subscribe would not:
+    /// each drops the registry entry when its send fails. The CLOSE goes first
+    /// and a relay reads a connection in order, so no relay sees a repeated
+    /// live id. The SDK would drop the REQ from its registry if a relay
+    /// refused a repeat with `CLOSED duplicate:` rather than replacing the
+    /// subscription as NIP-01 says. A relay that is not connected is skipped:
+    /// it sends the REQ again itself when it reconnects, and reports EOSE for
+    /// it then.
     async fn reissue_subscription(
         &self,
         account_id: &MemberId,
@@ -2463,6 +2471,9 @@ impl NostrRelayClient for NostrSdkRelayClient {
             let Ok(Some(relay)) = self.client.relay(&endpoint).await else {
                 continue;
             };
+            if !relay.status().is_connected() {
+                continue;
+            }
             let Some(filters) = relay
                 .subscription(&id)
                 .await
@@ -2480,6 +2491,17 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 }
                 floors.open(&id, req_since(&filters));
             }
+            // An unsent CLOSE changed nothing, so the REQ must not follow it.
+            if relay
+                .send_msg(ClientMessage::close(id.clone()))
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            // This fails only if the relay stopped being operational or its
+            // outbound queue is full. The intact registry then restores the
+            // REQ when the relay reconnects.
             if relay
                 .send_msg(ClientMessage::req(id.clone(), filters))
                 .await
@@ -3704,6 +3726,196 @@ mod tests {
         consumer.abort();
         root.shutdown_accounts().await;
         relay.shutdown();
+    }
+
+    /// A relay that holds one subscription per id on each connection and
+    /// refuses a REQ whose id is still live with `CLOSED duplicate:`, keeping
+    /// the live one, where NIP-01 says to replace it. It answers every other
+    /// REQ with EOSE, and logs each REQ, CLOSE and refusal with its connection
+    /// number. Notifying the returned handle closes the current connection.
+    async fn duplicate_refusing_relay()
+    -> (String, Arc<Mutex<Vec<String>>>, Arc<tokio::sync::Notify>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let drop_connection = Arc::new(tokio::sync::Notify::new());
+        let (server_log, server_drop) = (log.clone(), drop_connection.clone());
+        tokio::spawn(async move {
+            let mut connection = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                connection += 1;
+                let (log, drop_connection) = (server_log.clone(), server_drop.clone());
+                tokio::spawn(async move {
+                    let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let mut live = HashSet::new();
+                    loop {
+                        let message = tokio::select! {
+                            () = drop_connection.notified() => return,
+                            message = websocket.next() => message,
+                        };
+                        let Some(Ok(message)) = message else {
+                            return;
+                        };
+                        let Ok(text) = message.into_text() else {
+                            continue;
+                        };
+                        let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        let (Some(verb), Some(id)) = (
+                            frame.get(0).and_then(serde_json::Value::as_str),
+                            frame.get(1).and_then(serde_json::Value::as_str),
+                        ) else {
+                            continue;
+                        };
+                        log.lock().await.push(format!("{connection} {verb} {id}"));
+                        let reply = match verb {
+                            "REQ" if live.insert(id.to_owned()) => {
+                                serde_json::json!(["EOSE", id])
+                            }
+                            "REQ" => {
+                                log.lock().await.push(format!("{connection} CLOSED {id}"));
+                                serde_json::json!(["CLOSED", id, "duplicate: subscription is live"])
+                            }
+                            "CLOSE" => {
+                                live.remove(id);
+                                continue;
+                            }
+                            _ => continue,
+                        };
+                        if websocket.send(reply.to_string().into()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("ws://{addr}"), log, drop_connection)
+    }
+
+    /// A relay that refuses a repeated live id with `CLOSED duplicate:` makes
+    /// the SDK drop that REQ from its registry, so a reconnect would not
+    /// restore it. The re-issue closes the REQ first, so that relay answers it
+    /// with EOSE instead, and the SDK still restores the REQ on reconnect.
+    #[tokio::test]
+    async fn reissue_keeps_the_req_on_a_relay_that_refuses_repeated_ids() {
+        use NostrNotificationLossFloor::Since;
+        let (url, log, drop_connection) = duplicate_refusing_relay().await;
+        let endpoints = vec![TransportEndpoint(url.clone())];
+        let relay_url = RelayUrl::parse(&url).unwrap();
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let group = NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: cgka_traits::GroupId::new(vec![0xC3; 16]),
+            transport_group_id: vec![0xD4; 32],
+            endpoints: endpoints.clone(),
+            since: Some(Timestamp(2_000)),
+            attempt: SubscriptionAttempt::INITIAL.next(),
+        };
+        let wire_id = group.subscription_id();
+        let id = SubscriptionId::new(wire_id.clone());
+        let entry = |connection: u8, verb: &str| format!("{connection} {verb} {wire_id}");
+        let mut notifications = account.client().notifications();
+        root.subscribe(group).await.unwrap();
+        replay_until_eose(&mut notifications, &id).await;
+
+        assert_eq!(
+            root.reissue_subscription(&account_id, &wire_id, &endpoints)
+                .await
+                .unwrap(),
+            1
+        );
+        replay_until_eose(&mut notifications, &id).await;
+        assert_eq!(
+            *log.lock().await,
+            vec![entry(1, "REQ"), entry(1, "CLOSE"), entry(1, "REQ")],
+            "the relay never saw a repeated live id"
+        );
+        let relay = account.client().relay(&relay_url).await.unwrap().unwrap();
+        let filters = relay
+            .subscription(&id)
+            .await
+            .expect("the SDK registry still holds the REQ for this relay");
+        assert_eq!(req_since(&filters), Some(2_000));
+        assert_eq!(account.notification_loss_floor(), Since(2_000));
+
+        // The registry restores the REQ on the SDK's next reconnect.
+        drop_connection.notify_one();
+        timeout(Duration::from_secs(20), async {
+            while !log.lock().await.contains(&entry(2, "REQ")) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the SDK restores the REQ when the relay reconnects");
+
+        // The hazard: the same REQ repeated without a CLOSE is refused, and the
+        // SDK drops it from the registry.
+        relay
+            .send_msg(ClientMessage::req(id.clone(), filters))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while let Some(notification) = notifications.next().await {
+                if let ClientNotification::Message { message, .. } = notification
+                    && let RelayMessage::Closed {
+                        subscription_id, ..
+                    } = *message
+                    && subscription_id.as_ref() == &id
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the relay refuses the repeated id");
+        assert!(log.lock().await.contains(&entry(2, "CLOSED")));
+        assert!(
+            relay.subscription(&id).await.is_none(),
+            "a refused repeat drops the REQ from the SDK registry"
+        );
+        root.shutdown_accounts().await;
+    }
+
+    /// A relay that is not connected is left alone: when it reconnects, the
+    /// SDK sends the REQ again itself and the relay reports EOSE for it then.
+    #[tokio::test]
+    async fn reissue_skips_a_relay_that_is_not_connected() {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoints = vec![TransportEndpoint(format!(
+            "ws://{}",
+            reservation.local_addr().unwrap()
+        ))];
+        drop(reservation);
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        root.register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let inbox = NostrSubscription::AccountInbox {
+            account_id: account_id.clone(),
+            endpoints: endpoints.clone(),
+            since: Some(Timestamp(2_000)),
+            attempt: SubscriptionAttempt::INITIAL.next(),
+        };
+        let wire_id = inbox.subscription_id();
+        root.subscribe(inbox).await.unwrap();
+        assert_eq!(
+            root.reissue_subscription(&account_id, &wire_id, &endpoints)
+                .await
+                .unwrap(),
+            0
+        );
+        root.shutdown_accounts().await;
     }
 
     #[tokio::test]
