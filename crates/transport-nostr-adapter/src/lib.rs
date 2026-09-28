@@ -492,8 +492,20 @@ pub struct EoseReissueSummary {
     pub awaiting_relays: usize,
     /// Of those, how many the relay client re-sent the REQ to.
     pub reissued_relays: usize,
-    /// REQs whose re-issue the relay client refused or failed.
-    pub failed_subscriptions: usize,
+    /// Of those, how many the relay client could not re-send the REQ to,
+    /// including every relay of a REQ whose re-issue it refused. The rest were
+    /// skipped: not connected, or no longer holding the REQ.
+    pub failed_relays: usize,
+}
+
+/// What one [`NostrRelayClient::reissue_subscription`] did, counted in relays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionReissue {
+    /// Relays the REQ was sent to again.
+    pub reissued: usize,
+    /// Relays where the REQ was closed but could not be sent again. Each was
+    /// made to restore it some other way, such as a reconnect.
+    pub failed: usize,
 }
 
 /// Boundary between this adapter and the actual Nostr relay implementation.
@@ -572,22 +584,23 @@ pub trait NostrRelayClient: Send + Sync {
 
     /// Send a live REQ again to `endpoints`, unchanged and under its own id,
     /// so that each relay replays its stored events and reports
-    /// end-of-stored-events again. Returns how many relays it went to; a
-    /// relay on which the REQ is not live, or that is not connected, is
-    /// skipped.
+    /// end-of-stored-events again. Reports, in relays, where it went out
+    /// again and where it failed. A relay on which the REQ is not live, or
+    /// that is not connected, is skipped.
     ///
     /// The REQ must keep the filter it was issued with, so its `since` still
-    /// bounds a later lag's loss. A closed REQ must never be reopened. And no
+    /// bounds a later lag's loss. A closed REQ must never be reopened. No
     /// relay may see the id repeated while it is live there: a relay may
-    /// refuse the repeat instead of replacing the subscription. An
-    /// implementation that cannot guarantee all three refuses. Unsupported by
-    /// default.
+    /// refuse the repeat instead of replacing the subscription. And no relay
+    /// may be left with the REQ closed: one where it cannot go out again must
+    /// get it back some other way. An implementation that cannot guarantee
+    /// all four refuses. Unsupported by default.
     async fn reissue_subscription(
         &self,
         _account_id: &MemberId,
         _subscription_id: &str,
         _endpoints: &[TransportEndpoint],
-    ) -> Result<usize, TransportAdapterError> {
+    ) -> Result<SubscriptionReissue, TransportAdapterError> {
         Err(TransportAdapterError::Subscription(
             "subscription reissue unsupported".to_owned(),
         ))
@@ -1087,8 +1100,11 @@ impl NostrTransportAdapter {
                 .reissue_subscription(&account_id, &subscription_id, &endpoints)
                 .await
             {
-                Ok(reissued) => summary.reissued_relays += reissued,
-                Err(_) => summary.failed_subscriptions += 1,
+                Ok(reissue) => {
+                    summary.reissued_relays += reissue.reissued;
+                    summary.failed_relays += reissue.failed;
+                }
+                Err(_) => summary.failed_relays += endpoints.len(),
             }
         }
         tracing::debug!(
@@ -1096,7 +1112,7 @@ impl NostrTransportAdapter {
             method = "reissue_subscriptions_awaiting_eose",
             awaiting_relays = summary.awaiting_relays,
             reissued_relays = summary.reissued_relays,
-            failed_subscriptions = summary.failed_subscriptions,
+            failed_relays = summary.failed_relays,
             "re-issued subscriptions awaiting end-of-stored-events after a notification lag"
         );
         summary

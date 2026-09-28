@@ -1137,12 +1137,16 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         _account_id: &cgka_traits::MemberId,
         subscription_id: &str,
         endpoints: &[TransportEndpoint],
-    ) -> Result<usize, cgka_traits::TransportAdapterError> {
+    ) -> Result<transport_nostr_adapter::SubscriptionReissue, cgka_traits::TransportAdapterError>
+    {
         self.reissued_subscriptions
             .lock()
             .unwrap()
             .push((subscription_id.to_owned(), endpoints.to_vec()));
-        Ok(endpoints.len())
+        Ok(transport_nostr_adapter::SubscriptionReissue {
+            reissued: endpoints.len(),
+            failed: 0,
+        })
     }
 
     async fn publish_event(

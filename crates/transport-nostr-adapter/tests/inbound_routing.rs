@@ -303,6 +303,8 @@ struct FakeRelayClient {
     published: Mutex<Vec<(Vec<TransportEndpoint>, NostrTransportEvent, usize)>>,
     reissued: Mutex<Vec<(MemberId, String, Vec<TransportEndpoint>)>>,
     refuse_reissue: AtomicBool,
+    /// Close each REQ but fail to send it again, on every relay.
+    fail_reissue: AtomicBool,
 }
 
 impl FakeRelayClient {
@@ -368,18 +370,28 @@ impl NostrRelayClient for FakeRelayClient {
         account_id: &MemberId,
         subscription_id: &str,
         endpoints: &[TransportEndpoint],
-    ) -> Result<usize, cgka_traits::TransportAdapterError> {
+    ) -> Result<transport_nostr_adapter::SubscriptionReissue, cgka_traits::TransportAdapterError>
+    {
         if self.refuse_reissue.load(Ordering::SeqCst) {
             return Err(cgka_traits::TransportAdapterError::Subscription(
                 "injected reissue refusal".into(),
             ));
+        }
+        if self.fail_reissue.load(Ordering::SeqCst) {
+            return Ok(transport_nostr_adapter::SubscriptionReissue {
+                reissued: 0,
+                failed: endpoints.len(),
+            });
         }
         self.reissued.lock().unwrap().push((
             account_id.clone(),
             subscription_id.to_owned(),
             endpoints.to_vec(),
         ));
-        Ok(endpoints.len())
+        Ok(transport_nostr_adapter::SubscriptionReissue {
+            reissued: endpoints.len(),
+            failed: 0,
+        })
     }
 
     async fn subscribe(
@@ -3775,7 +3787,7 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
         transport_nostr_adapter::EoseReissueSummary {
             awaiting_relays: 2,
             reissued_relays: 2,
-            failed_subscriptions: 0,
+            failed_relays: 0,
         }
     );
     let mut expected = vec![
@@ -3837,8 +3849,9 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
 }
 
 /// A lag on a receiver shared across accounts repairs every active account,
-/// but not one deactivated before the repair. A relay client that refuses a
-/// re-issue is counted, and its claim stays spent.
+/// but not one deactivated before the repair. A relay the client could not
+/// re-send a REQ to, or every relay of a REQ whose re-issue it refused, counts
+/// as failed, and its claim stays spent.
 #[tokio::test]
 async fn shared_receiver_lag_repair_covers_every_active_account() {
     let relay = Arc::new(FakeRelayClient::default());
@@ -3892,7 +3905,7 @@ async fn shared_receiver_lag_repair_covers_every_active_account() {
         transport_nostr_adapter::EoseReissueSummary {
             awaiting_relays: 1,
             reissued_relays: 0,
-            failed_subscriptions: 1,
+            failed_relays: 1,
         }
     );
     relay.refuse_reissue.store(false, Ordering::SeqCst);
@@ -3904,6 +3917,34 @@ async fn shared_receiver_lag_repair_covers_every_active_account() {
         "every claim is spent"
     );
     assert!(relay.take_reissued().is_empty());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account(0xE5),
+            inbox_endpoints: vec![
+                TransportEndpoint("wss://first.example".to_owned()),
+                TransportEndpoint("wss://second.example".to_owned()),
+            ],
+            group_subscriptions: Vec::new(),
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .expect("activation succeeds");
+    relay.fail_reissue.store(true, Ordering::SeqCst);
+    assert_eq!(
+        adapter
+            .reissue_subscriptions_awaiting_eose(
+                Some(&account(0xE5)),
+                adapter.notification_lag_mark()
+            )
+            .await,
+        transport_nostr_adapter::EoseReissueSummary {
+            awaiting_relays: 2,
+            reissued_relays: 0,
+            failed_relays: 2,
+        },
+        "a REQ closed but not sent again is a failure, not a re-issue"
+    );
 }
 
 /// A superseded activation's end-of-stored-events report must not satisfy the

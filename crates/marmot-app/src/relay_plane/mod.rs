@@ -3055,7 +3055,7 @@ async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<Mem
         method = "repair_lag_lost_eose",
         awaiting_relays = summary.awaiting_relays,
         reissued_relays = summary.reissued_relays,
-        failed_subscriptions = summary.failed_subscriptions,
+        failed_relays = summary.failed_relays,
         "re-issued subscriptions whose end-of-stored-events a notification lag may have lost",
     );
 }

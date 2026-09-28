@@ -126,10 +126,13 @@
   seconds without another lag, each REQ issued before the lag is re-issued, unchanged and
   under its own id, to each connected relay that has not answered it, and the relay replays
   from the same `since` before a fresh EOSE. The REQ is closed on that relay first, so no
-  relay sees a repeated id, and the SDK keeps the REQ it restores on reconnect. A relay gets
-  each REQ again at most once, and the notification-loss floor does not move.
-  `NostrRelayClient` gains `reissue_subscription`, unsupported by default, and
-  `NostrTransportAdapter` gains `reissue_subscriptions_awaiting_eose`. (#2070)
+  relay sees a repeated id, and the SDK keeps the REQ it restores on reconnect. A REQ that
+  cannot be queued behind its CLOSE is retried briefly, and a relay still connected without
+  it is reconnected so the SDK re-sends every REQ it holds; that relay counts as a failed
+  re-issue. A relay gets each REQ again at most once, and the notification-loss floor does
+  not move. `NostrRelayClient` gains `reissue_subscription`, unsupported by default, which
+  reports a `SubscriptionReissue`, and `NostrTransportAdapter` gains
+  `reissue_subscriptions_awaiting_eose`. (#2070)
 
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay

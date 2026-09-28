@@ -1703,12 +1703,15 @@ impl NostrRelayClient for RecordingRelayClient {
         _account_id: &MemberId,
         subscription_id: &str,
         endpoints: &[TransportEndpoint],
-    ) -> Result<usize, TransportAdapterError> {
+    ) -> Result<transport_nostr_adapter::SubscriptionReissue, TransportAdapterError> {
         self.reissued
             .lock()
             .unwrap()
             .push((subscription_id.to_owned(), endpoints.to_vec()));
-        Ok(endpoints.len())
+        Ok(transport_nostr_adapter::SubscriptionReissue {
+            reissued: endpoints.len(),
+            failed: 0,
+        })
     }
 
     async fn unsubscribe_account(
