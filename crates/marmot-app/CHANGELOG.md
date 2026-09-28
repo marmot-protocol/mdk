@@ -9,6 +9,24 @@
   profile edits also schedule indexer copies after account-relay acknowledgement;
   indexer latency does not delay account readiness or edit returns. Pending
   copies are cancelled on runtime shutdown or account removal.
+- Account recovery completes loss of unknown scope on NIP-77 comparison certificates. A
+  scope certifies when every required relay finished an untruncated comparison over a
+  window that covers the scope's whole goal and every difference was admitted. A queue-loss
+  goal starts at the earliest wire `created_at` among the deliveries it lost. A goal with no
+  known lower bound never certifies. Cold-start and incremental history compare the
+  retained 30-day inventory window. An epoch gap also completes once its group's local
+  epoch passes the stalled one. A relay whose compared set fills the request limit counts
+  as truncated and cannot certify. (#2068)
+- A recovery obligation parks after three completed passes in a row that fetch nothing new
+  and certify nothing, and waits for new evidence or explicit repair. Passes that fail only
+  because relays were unreachable do not count, and a pass that fetches anything resets
+  the streak. (#2068)
+- Every automatic recovery cause except maintenance boundaries, explicit repair and
+  known-event demand compares off the account worker. The worker then admits what the
+  comparison fetched a few events per turn, between commands and live input, and never
+  through the live delivery queue. Automatic recovery reuses the live subscriptions
+  instead of re-subscribing, so it no longer replays history the account already holds.
+  The separate online epoch-gap job is removed. (#2068)
 - Account recovery certifies a route on its operated relays only.
   `MarmotAppConfig::recovery_operated_relays` names them and defaults to
   `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`. A route that lists

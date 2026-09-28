@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-09-27
+updated: 2026-09-28
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -34,7 +34,7 @@ shipped) and against the new code.
 
 The simulator comes first; Jeff validates on a phone.
 
-## Decisions (agreed with Jeff, 2026-09-27)
+## Decisions (agreed with Jeff, 2026-09-27; revised 2026-09-28)
 
 1. **Completion is tiered.**
    - Known-event loss completes when that exact event is durably stored, or has a durable
@@ -59,6 +59,10 @@ The simulator comes first; Jeff validates on a phone.
      comparison, although the comparison still fetches every difference inside the window.
      Such an obligation completes only on its own evidence, for example the missing epoch
      arriving, or it parks for explicit deep repair.
+   - Cold-start and incremental history have no lost delivery to bound them. Their goal is
+     the retained inventory window, the last 30 days, and a comparison over that window
+     certifies them. The earlier rule that an unresolved placeholder had no proven lower
+     bound, and so could never certify, is gone.
    - Otherwise, after **3 completed attempts in a row that admit nothing new and certify
      nothing**, the obligation parks.
      It shows "history may be incomplete" and offers an explicit deep repair, which can
@@ -67,11 +71,16 @@ The simulator comes first; Jeff validates on a phone.
    - Attempts that fail only because relays were unreachable do not count toward the budget.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
-3. **Required relays are per route.** A group route requires its group relays. Today those
-   are the whitenoise.chat relays we operate, and NIP-77 is a hard requirement for group
-   relays from now on. The account inbox route requires the account's inbox relays. An
-   empty required set never certifies a scope. A required relay that does not support NIP-77
-   cannot certify its scope, so the scope never completes on the relays that do.
+3. **Required relays are the relays we operate.** `MarmotAppConfig::recovery_operated_relays`
+   names them; the default is `wss://relay.eu.whitenoise.chat` and
+   `wss://relay.us.whitenoise.chat`, and NIP-77 is a hard requirement for them. A route that
+   lists any operated relay requires exactly those. A route that lists none requires all of
+   its relays, so its history can still certify. Every other relay is best effort: it is
+   still compared and its events are admitted, but its failure, truncation or missing NIP-77
+   support never withholds a certificate or schedules a retry. The operated set is part of
+   the route policy, so changing it rebuilds every pending scope. An empty required set
+   never certifies a scope. A required relay that does not support NIP-77 cannot certify its
+   scope, so the scope never completes on the relays that do.
    Acquisition keeps admitting what the supporting relays still hold. The decision 1
    budget applies unchanged: the obligation parks after three completed attempts in a row
    that admit nothing new and certify nothing, and an attempt that admits a batch resets
@@ -81,8 +90,6 @@ The simulator comes first; Jeff validates on a phone.
    account never admitted, and an unreachable required relay proves nothing. The only
    other way out is an explicit, user-authorized retirement. It is recorded as a distinct
    outcome ("history may be incomplete"), never as coverage.
-   Treating relays we do not operate as best-effort needs a configured set of operated
-   relays. Until one exists, every relay on a route is required.
 4. Both implementation steps land before the next MarmotKit release.
 
 ## Design
@@ -158,13 +165,18 @@ Every cause runs the same job:
    unsupported.
 3. **Admit** (worker, bounded turns). A few events per turn go straight into the normal
    ingest path, never through the live queue. The worker yields between turns, so commands
-   and live input interleave. The admission loop from `bounded_recovery.rs` is the starting
-   point.
+   and live input interleave. A turn admits at most four events.
 4. **Settle** (worker, short turn). Checkpoint, then complete, retry or park according to
    the tier rules, using the existing revision checks. Old attempts still cannot clear newer
    demand.
 
 The worker never awaits the network. There is one recovery job per account.
+
+After step 2 the inline executor remains for maintenance boundaries, explicit repair,
+known-event demand and routes with more than four relays. It activates transport floored at
+the cursor, compares on the worker, and feeds what it fetched back through the live queue.
+The startup grant activates the session's first live subscriptions before its off-worker
+comparison.
 
 Rules kept from the current design: complete coverage with a still-stuck engine means no
 replay; the blocked reason is recorded; the existing one-shot wedge report still escalates
@@ -177,17 +189,24 @@ window is cheap once we are caught up.
 
 ## What gets deleted
 
-- `client/sync/comparison_job.rs`: per-trigger offload, its eligibility rules, and the
-  online epoch-gap job.
-- The inline broad executor inside `execute_recovery_grant`: activation, broad replay, and
-  drain-based completion (`DrainVerdict` mapping). The same goes for
-  `recover_delivery_overflow*`, the QueueLoss control-token deferral, and the
-  `queue_reconciled_event` → `handle_reconciled_event` path back into the live queue.
-- Conservative mode (`RecoveryExecutorMode`). It is internal to `marmot-app` and not in the
+Deleted in step 2:
+
+- The per-trigger offload rules in `client/sync/comparison_job.rs`, the online epoch-gap
+  job and the test-only bounded exact-ID path. That file is now the one comparison job for
+  every automatic cause.
+- Activation and broad replay in automatic recovery. Only explicit repair widens.
+- Conservative mode (`RecoveryExecutorMode`). It was internal to `marmot-app` and not in the
   bindings.
-- Three recovery job slots and their yield flags in the worker loop, replaced by one.
+- The recovery job slots, replaced by one comparison job and one admission loop.
 - The 22 recovery notes, replaced by this one. The bounded-acquisition interface contract
   stays in its own document.
+
+Still to delete:
+
+- The inline executor inside `execute_recovery_grant` that the causes above still use: its
+  activation, drain-based completion (`DrainVerdict` mapping), `recover_delivery_overflow*`,
+  and the `queue_reconciled_event` → `handle_reconciled_event` path back into the live
+  queue.
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
 Each PR reports exact before/after line counts. The goal is a large net reduction across
@@ -248,9 +267,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 | Step | Contents | Status |
 | --- | --- | --- |
-| 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Nightly and #2060 done; docs in review; scorecard in progress |
-| 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | In review |
-| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | In progress |
+| 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Done (#2063, #2064, #2069) |
+| 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | Merged |
+| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | In review (#2068). Notification lag follows in #2070. The inline executor for maintenance, explicit repair, known events and routes over four relays remains. |
 
 ## Risks and open items
 

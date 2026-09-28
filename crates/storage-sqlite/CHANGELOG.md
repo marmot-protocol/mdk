@@ -11,6 +11,12 @@
 
 ### Added
 
+- Add schema 0097 `bound_state` and `bound_seconds` on `account_delivery_loss_evidence`: a
+  running minimum of the wire `created_at` charged to each loss generation, which becomes
+  unknown for good after any charge without one. Rows written before 0097 are unknown.
+  `record_account_recovery_loss_bounded` and the other `*_bounded` writers maintain it, and
+  `recovery_loss_goal_floor` reads it. (#2068)
+
 - Add schema 0096 `account_delivery_spill`, the durable overflow tail of the in-memory account
   delivery queue, with `spill_account_deliveries`, `spilled_account_deliveries` and
   `remove_spilled_account_delivery`. Spilling skips deliveries already recorded in
