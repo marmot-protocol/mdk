@@ -169,6 +169,16 @@ App runtime bridge for the first real Marmot app surfaces.
   loss with the REQ floor its SDK context reported at the lag, and enqueue the generation's control record. Only an
   unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
   notification loss before waiting for its control record.
+- Move `checkpointed_transport_timestamp` only to what the relay plane's seal (`seal_transport_cursor`) returns,
+  never straight to `state.last_transport_timestamp`. The seal runs under the lock the router places each delivery
+  under, so it is the commit's one decision point: it returns nothing while loss or a spill hand-off is pending, and
+  caps the commit at the lowest queued delivery a restart still fetches. A live ingest promotes with its own save only
+  after every account subscription reported EOSE; its seal raises the restart floor before that save, and the router
+  spills any later delivery that falls between the settled floor and that live floor. Settled commits confirm what
+  their seal reached with `settle_transport_cursor` after their save, and a failed live save undoes its seal with
+  `unseal_transport_cursor`. Keep every condition cursor safety relies on inside the seal: anything read before an
+  `.await` or a save is stale by the time that save commits. See
+  `docs/marmot-architecture/further-context/account-recovery.md` section 5.
 - Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; relay filtering may affect
   connections, but must not rewrite signed routing state. Relay endpoints pass through the `RelaySafetyPolicy`
   host-safety chokepoint (`src/relay_plane/safety.rs`), and agent-stream broker candidates through

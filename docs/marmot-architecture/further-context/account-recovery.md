@@ -138,6 +138,8 @@ NIP-77 comparison covers what remains.
   already holds therefore fills neither the spill nor the network.
 - A delivery that misses the hand-off or spill limits becomes queue loss, as today: the
   cursor stays fenced until recovery settles that loss, and live input keeps flowing.
+- A delivery that a restart would no longer fetch only because a live ingest promoted the
+  cursor goes to the spill even when the queue has room (design section 5).
 - The cursor fence stays up while a hand-off is in flight or queue loss is pending. It
   releases when that hand-off settles as already seen, when its spill write is durable, or
   when recovery settles the pending loss. Deliveries already in hand keep flowing, because
@@ -230,6 +232,57 @@ explicit user-authorized retirement, recorded as its own outcome, never as cover
   parks on none but those routes and relays it retires again without a new notice. A route
   stuck on relays the user never dismissed raises a new one. Loss keeps its own notices.
 
+### 5. The cursor follows live ingest
+
+A restart re-subscribes 120 seconds below the persisted cursor (the rebuild lookback,
+ledger A7, which stays). The cursor used to advance only at a drain checkpoint or when loss
+settled, so an account served by live deliveries re-downloaded everything it had received
+since its last drain. On the #2069 scorecard that was about 11,474 held-history frames per
+relay, and three notification lags during the replay.
+
+A live ingest's own save now promotes the cursor to what the account ingested, when:
+
+- every account subscription reported end-of-stored-events (relays replay newest-first, so
+  promoting mid-replay would put the rest of the replay below the new floor);
+- no loss or spill hand-off is pending, as for any other checkpoint;
+- the cursor advances (not a frozen wake pass) and restarts rebuild from it.
+
+The rule it keeps: the account queue never holds a delivery that a restart would no longer
+fetch only because a live ingest promoted the cursor. A delivery's key is the lowest
+restart `since` that still fetches it: its `created_at`, or for an inbox wrap its
+`created_at` plus the two-day NIP-59 widening the inbox REQ adds. Two mechanisms keep the
+rule, and both run under the lock the router already holds when it places a delivery in
+the queue, the spill or loss:
+
+- **The seal.** Every cursor commit decides its value there, at one point just before its
+  save. It keeps the persisted cursor while loss or a hand-off is pending. Otherwise it is
+  capped at the lowest queued key the persisted cursor still covers, plus the lookback.
+  Nothing it relies on can go stale before the decision, which is what broke the first
+  attempt: it read an empty queue, then awaited the EOSE read and the save while the
+  router could queue an older delivery.
+- **The live floor.** A live seal raises the restart floor before its save. From then on
+  the router sends a delivery whose key falls between the settled floor and the live floor
+  to the durable spill instead of the queue, or to queue loss bounded by its `created_at`
+  when the spill cannot take it. The settled floor is what drain checkpoints, settled loss
+  and the cursor the account opened with reached; a delivery below it is exposed exactly as
+  before live promotion existed, and one above the live floor is still fetched.
+
+So a delivery that arrives during the EOSE read caps the promotion, and one that arrives
+during the save is spilled. Drain checkpoints and settled loss are capped the same way and
+never divert. Once their save succeeds they raise the settled floor to what they reached
+themselves, never to a cursor an earlier live promotion left persisted, so a fenced drain
+checkpoint cannot stop the spilling that promotion needs. A failed live save lowers the
+floor again. A replaced adapter cannot promote: the queue it drains is not the one the
+router tracks.
+
+One window stays open. A spilled delivery is volatile until its spill write commits, which
+is usually right after the promoting save, because both use the account database. No
+design with a router that never blocks can close it: a delivery can arrive at the instant
+the promoted cursor commits, and making it durable takes its own write. It is the same
+hand-off window the overflow tier has. The fence holds every later commit until the write
+settles, and the startup comparison over the retained window still finds what a stop there
+would lose.
+
 ## What gets deleted
 
 Deleted in step 2:
@@ -313,7 +366,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 | --- | --- | --- |
 | 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Done (#2063, #2064, #2069) |
 | 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | Merged |
-| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | In review (#2068). The fix for the notification-lag issue (#2070) follows in a PR stacked on it. The inline executor for maintenance, explicit repair, known events and routes over four relays remains. |
+| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | Merged (#2068), with the notification-lag fix (#2070, #2074). Live cursor promotion (design section 5) follows. The inline executor for maintenance, explicit repair, known events and routes over four relays remains. |
 
 ## Risks and open items
 
@@ -338,6 +391,14 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   route; per-route floors would need per-scope storage. An EOSE lost in a lag is not
   recovered, so the next activation re-subscribes instead of reusing the live one. Relays
   that ignore `since` are not detected.
+- Live cursor promotion (design section 5). A delivery the live floor sends to the spill is
+  volatile until its spill write commits; a stop in that window loses it until the startup
+  comparison. Routing is by content, so the router cannot tell an unfloored maintenance or
+  prior-route replay from a floored REQ: such a replay's events above the settled floor go
+  to the spill too, which costs spill writes (seen events are discarded before they use
+  capacity) but loses nothing. EOSE covers the activation's snapshot, not a group added
+  since, so a new group's replay may still be arriving when a promotion seals; what falls
+  below the floor is spilled, not lost.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.
