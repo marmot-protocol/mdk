@@ -17,10 +17,12 @@
   retained 30-day inventory window. An epoch gap also completes once its group's local
   epoch passes the stalled one. A relay whose compared set fills the request limit counts
   as truncated and cannot certify. (#2068)
-- A recovery obligation parks after three of its own completed passes in a row that admit
-  nothing new and certify nothing, and waits for new evidence or explicit repair. Passes
-  whose required relays failed or timed out do not count. New evidence, or a pass that
-  durably admits anything, starts the count over. (#2068)
+- A recovery obligation parks once every route it still cannot certify has been compared
+  three times in a row for its goal with its required relays answering, and nothing was
+  admitted or certified. It then waits for new evidence or explicit repair. A comparison whose
+  required relay failed or timed out does not count; one that answered but could not fetch a
+  claimed event, or whose events were not durably admitted, does. New evidence, or durable
+  admission on a route, starts that route's count over. (#2068)
 - Every automatic recovery cause except maintenance boundaries, explicit repair and
   known-event demand compares off the account worker. The worker then admits what the
   comparison fetched a few events per turn, between commands and live input, and never
@@ -97,8 +99,10 @@
   exactly that occurrence as its own outcome, never as coverage, returning false for a stale id.
   Retiring the last pending loss obligation releases the transport-cursor fence without recording
   a recovery success, and a late observation of retired loss releases it too instead of
-  re-raising it. `HistoryNoticesChanged` announces parking, un-parking and dismissal; a group
-  whose own notices changed also gets `GroupStateUpdated`. (#2068)
+  re-raising it. A dismissed incremental-history notice stays dismissed: later startups still
+  compare, but parking again on the same routes and required relays raises no new notice.
+  `HistoryNoticesChanged` announces parking, un-parking and dismissal; a group whose own notices
+  changed also gets `GroupStateUpdated`. (#2068)
 
 ## 0.10.4 - 2026-09-20
 

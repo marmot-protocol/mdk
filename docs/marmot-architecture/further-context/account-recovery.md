@@ -63,13 +63,17 @@ The simulator comes first; Jeff validates on a phone.
      the retained inventory window, the last 30 days, and a comparison over that window
      certifies them. The earlier rule that an unresolved placeholder had no proven lower
      bound, and so could never certify, is gone.
-   - Otherwise, after **3 of its own completed attempts in a row that admit nothing new and
-     certify nothing**, the obligation parks. New evidence starts the count over.
+   - Otherwise, once **every route the obligation still cannot certify has been compared 3
+     times in a row without admitting or certifying anything**, the obligation parks. Each
+     route counts its own comparisons, so a pass that compares a slice of routes cannot park
+     the rest. New evidence, or durable admission on a route, starts that route's count over.
      It shows "history may be incomplete" and offers an explicit deep repair, which can
      still complete it with qualified coverage, or an explicit retirement. There are no
      further automatic retries.
-   - Attempts whose required relays failed or timed out do not count toward the budget. A
-     backend that cannot compare a route gives a finished answer, so it does count.
+   - Comparisons whose required relays failed or timed out do not count toward the budget. A
+     relay that answered but could not hand over a claimed event, an event that was not
+     durably admitted, and a backend that cannot compare a route all give a finished answer,
+     so they do count.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
 3. **Required relays are the relays we operate.** `MarmotAppConfig::recovery_operated_relays`
@@ -212,6 +216,11 @@ explicit user-authorized retirement, recorded as its own outcome, never as cover
 - New demand for the same key reopens a retired row as fresh debt: new loss or a count
   above the watermark, a higher missing epoch, a new explicit repair, or a later startup's
   incremental comparison.
+- A dismissed incremental-history notice stays dismissed while nothing changes (decided with
+  Jeff, 2026-09-28). Dismissal records the routes and required relays it could not certify.
+  Each later startup still runs its comparison, which fetches what it finds, but when it
+  parks on none but those routes and relays it retires again without a new notice. A route
+  stuck on relays the user never dismissed raises a new one. Loss keeps its own notices.
 
 ## What gets deleted
 
@@ -295,7 +304,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 | --- | --- | --- |
 | 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Done (#2063, #2064, #2069) |
 | 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | Merged |
-| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | In review (#2068). Notification lag follows in #2070. The inline executor for maintenance, explicit repair, known events and routes over four relays remains. |
+| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | In review (#2068). The fix for the notification-lag issue (#2070) follows in a PR stacked on it. The inline executor for maintenance, explicit repair, known events and routes over four relays remains. |
 
 ## Risks and open items
 

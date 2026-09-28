@@ -200,8 +200,6 @@ mod migration_0096_account_delivery_spill;
 mod migration_0097_loss_created_at_bound;
 #[path = "migrations/0098_recovery_history_notices.rs"]
 mod migration_0098_recovery_history_notices;
-#[path = "migrations/0099_recovery_quiet_passes.rs"]
-mod migration_0099_recovery_quiet_passes;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -707,11 +705,6 @@ const MIGRATIONS: &[Migration] = &[
         version: 98,
         name: "0098_recovery_history_notices",
         apply: migration_0098_recovery_history_notices::apply,
-    },
-    Migration {
-        version: 99,
-        name: "0099_recovery_quiet_passes",
-        apply: migration_0099_recovery_quiet_passes::apply,
     },
 ];
 
@@ -1268,10 +1261,9 @@ mod tests {
                 }
             }
             if *table == "account_recovery_obligations" {
-                // No existing row has a known parking time or a quiet streak.
+                // No existing row has a known parking time or a dismissal.
                 for row in &mut upgraded {
-                    use rusqlite::types::Value::{Integer, Null};
-                    row.extend([Null, Integer(0), Null]);
+                    row.extend([rusqlite::types::Value::Null, rusqlite::types::Value::Null]);
                 }
             }
             assert_eq!(
@@ -1298,7 +1290,7 @@ mod tests {
                 .iter()
                 .cloned()
                 .map(|mut row| {
-                    row.extend([Null, Integer(0), Null]);
+                    row.extend([Null, Null]);
                     row
                 })
                 .collect::<Vec<_>>()
@@ -1504,52 +1496,6 @@ mod tests {
     }
 
     #[test]
-    fn quiet_pass_migration_starts_every_obligation_without_a_streak() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("quiet-passes.db");
-        let mut conn = keyed_connection(&path);
-        run(&mut conn, &MIGRATIONS[..98]).unwrap();
-        conn.execute_batch(
-            "INSERT INTO account_state(label,updated_at) VALUES ('alice',100);
-            INSERT INTO account_recovery_obligations
-                (demand_key,cause,account_label,marker_token,pending_since,dropped_count,
-                 created_at_ms,updated_at_ms,eligibility)
-                VALUES ('overflow:alice',0,'alice',42,124,9,124000,124000,1);",
-        )
-        .unwrap();
-        let before = recovery_completion_rows(&conn, "account_recovery_obligations");
-        run_all(&mut conn).unwrap();
-        let upgraded: Vec<_> = before
-            .into_iter()
-            .map(|mut row| {
-                row.push(rusqlite::types::Value::Integer(0));
-                row.push(rusqlite::types::Value::Null);
-                row
-            })
-            .collect();
-        assert_eq!(
-            recovery_completion_rows(&conn, "account_recovery_obligations"),
-            upgraded
-        );
-        assert!(
-            conn.execute(
-                "UPDATE account_recovery_obligations SET quiet_passes=-1",
-                []
-            )
-            .is_err(),
-            "a streak is never negative"
-        );
-        assert!(
-            conn.execute(
-                "UPDATE account_recovery_obligations SET quiet_revision=0",
-                []
-            )
-            .is_err(),
-            "a streak's revision is a real revision"
-        );
-    }
-
-    #[test]
     fn history_notice_migration_preserves_parked_debt_and_reopens() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history-notices.db");
@@ -1576,7 +1522,7 @@ mod tests {
             recovery_completion_rows(&conn, "account_recovery_obligations"),
             recovery_completion_rows(&conn, "account_delivery_loss_evidence"),
         ];
-        run(&mut conn, &MIGRATIONS[..98]).unwrap();
+        run_all(&mut conn).unwrap();
         for (table, expected) in [
             "account_recovery_obligations",
             "account_delivery_loss_evidence",
@@ -1584,11 +1530,17 @@ mod tests {
         .iter()
         .zip(before)
         {
-            // Existing rows gain an unknown parking time and no retirement.
+            // Existing rows gain an unknown parking time, no dismissal and no
+            // retirement.
+            let added = if *table == "account_recovery_obligations" {
+                2
+            } else {
+                1
+            };
             let upgraded: Vec<_> = expected
                 .into_iter()
                 .map(|mut row| {
-                    row.push(rusqlite::types::Value::Null);
+                    row.extend(std::iter::repeat_n(rusqlite::types::Value::Null, added));
                     row
                 })
                 .collect();
@@ -1615,7 +1567,7 @@ mod tests {
         );
         drop(conn);
         let mut conn = keyed_connection(&path);
-        assert_eq!(run_with_summary(&mut conn, &MIGRATIONS[..98]).unwrap(), 0);
+        assert_eq!(run_with_summary(&mut conn, MIGRATIONS).unwrap(), 0);
         assert_eq!(
             conn.query_row(
                 "SELECT count(*) FROM account_recovery_obligations

@@ -11,11 +11,12 @@
 
 ### Added
 
-- Add schema 0099 `quiet_passes` and `quiet_revision` on `account_recovery_obligations`: each
-  obligation's own streak of completed comparison passes without progress at one revision.
-  `checkpoint_recovery_comparison` takes a `RecoveryPassProgress` and, in the checkpoint's
-  transaction, restarts the streak on progress, keeps it on an unserved pass, and parks a
-  retryable obligation after `RECOVERY_PARK_AFTER_QUIET_PASSES` quiet passes. (#2068)
+- Add `checkpoint_recovery_comparison`, which takes each compared scope's
+  `RecoveryPassProgress` and keeps that scope's quiet streak in its checkpoint payload for its
+  goal: progress restarts it and an unserved comparison leaves it alone. A retryable obligation
+  parks, in the same transaction, once every scope it still cannot certify has
+  `RECOVERY_PARK_AFTER_QUIET_PASSES` quiet comparisons in a row, so a pass that compares a slice
+  of routes cannot park the rest. `StoredRecoveryScope::quiet_passes` reports the streak. (#2068)
 
 - Add schema 0098 for "history may be incomplete" notices. `parked_recovery_obligations` and
   `parked_group_recovery_obligations` list each pending obligation parked for deep repair as a
@@ -25,7 +26,9 @@
   `state = 2` with a documented `incomplete_reason`, never coverage. For queue or notification loss
   it retires every evidence generation of that cause at its imported count (new `retired_count`)
   and refuses while newer evidence is unimported; for incremental history it settles the comparison
-  slot that served only that debt. Retired watermarks no longer bound loss goals or legacy
+  slot that served only that debt, and records the routes and required relays it could not
+  certify (new `dismissed_scopes`); parking again on none but those retires it again silently.
+  Retired watermarks no longer bound loss goals or legacy
   restoration, and a delayed duplicate observation cannot reopen them. New loss above a watermark,
   a new generation, a higher epoch, a comparison join or a new known-event, incremental or explicit
   request reopens the row as fresh pending debt. (#2068)

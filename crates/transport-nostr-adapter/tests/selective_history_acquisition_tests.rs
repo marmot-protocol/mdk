@@ -524,6 +524,11 @@ async fn cached_id_over_single_object_ceiling_keeps_smaller_id_reachable() {
     assert_eq!(events.len(), 1);
     assert!(returned_json_bytes(&events) < 128 * 1024);
     assert_eq!(summary.relays_failed, 2);
+    assert_eq!(
+        summary.incomplete_endpoints.len(),
+        2,
+        "a relay that answered with an unfetchable ID is incomplete, not failed"
+    );
     assert_eq!(left_counts.requests.load(Ordering::SeqCst), 0);
     assert_eq!(right_counts.requests.load(Ordering::SeqCst), 0);
     sdk.client().shutdown().await;
@@ -778,6 +783,10 @@ async fn silent_endpoint_deadline_keeps_healthy_partial_event_and_incomplete_sum
         .unwrap();
     assert_eq!(summary.relays_succeeded, 1);
     assert_eq!(summary.relays_failed, 1);
+    assert!(
+        summary.incomplete_endpoints.is_empty(),
+        "a relay that timed out did not answer"
+    );
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event.id, event_id);
     assert!(left_counts.requests.load(Ordering::SeqCst) >= 1);
@@ -859,6 +868,10 @@ async fn comparison_claim_without_exact_id_bytes_remains_incomplete() {
         .unwrap();
     assert_eq!(summary.relays_succeeded, 1);
     assert_eq!(summary.relays_failed, 1);
+    assert_eq!(
+        summary.incomplete_endpoints, summary.failed_endpoints,
+        "a relay that answered without the claimed bytes is incomplete"
+    );
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event.id, event_id);
     assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > 0);

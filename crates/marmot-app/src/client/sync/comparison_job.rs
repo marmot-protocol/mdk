@@ -46,6 +46,8 @@ struct AdmissionRoute {
     outcome: Outcome,
     /// Every endpoint finished an untruncated comparison.
     certified: bool,
+    /// Every required relay answered, whatever admission later did.
+    answered: bool,
     /// Every event this route fetched was durably admitted.
     admitted: bool,
     /// Events durably admitted: progress, even without a certificate.
@@ -461,21 +463,23 @@ impl AppClient {
                 .inventory
                 .iter()
                 .find(|inventory| inventory.route == route.route);
-            let (outcome, certified, events) = match route.result {
-                ComparisonRouteWorkResult::Skipped => (Outcome::ServicedPartial, false, Vec::new()),
+            let (outcome, certified, answered, events) = match route.result {
+                ComparisonRouteWorkResult::Skipped => {
+                    (Outcome::ServicedPartial, false, false, Vec::new())
+                }
                 ComparisonRouteWorkResult::TimedOut
                 | ComparisonRouteWorkResult::Returned(Err(_)) => {
-                    (Outcome::TransientFailure, false, Vec::new())
+                    (Outcome::TransientFailure, false, false, Vec::new())
                 }
                 ComparisonRouteWorkResult::Returned(Ok(None)) => {
-                    (Outcome::Unsupported, false, Vec::new())
+                    (Outcome::Unsupported, false, true, Vec::new())
                 }
                 ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
-                    let (outcome, certified) = inventory
-                        .map_or((Outcome::TransientFailure, false), |inventory| {
+                    let (outcome, certified, answered) = inventory
+                        .map_or((Outcome::TransientFailure, false, false), |inventory| {
                             inventory.judge(&summary)
                         });
-                    (outcome, certified, events)
+                    (outcome, certified, answered, events)
                 }
             };
             admission
@@ -487,6 +491,7 @@ impl AppClient {
                 cursor: route.cursor,
                 outcome,
                 certified,
+                answered,
                 admitted: true,
                 fetched: 0,
             });
@@ -692,7 +697,10 @@ impl AppClient {
                 },
                 certified: route.certified && route.admitted,
                 fetched: route.fetched,
-                queued: Vec::new(),
+                queued: None,
+                // Incomplete admission withholds the certificate and retries
+                // the route, but the relays still answered.
+                answered: route.answered,
             });
         }
         self.finish_recovery_grant_after_drain(
@@ -1335,6 +1343,28 @@ mod tests {
             None,
         );
         assert!(fixture.storage.recovery_comparison().unwrap().pending());
+        // The relays answered; only admission fell short. That withholds the
+        // certificate but is a quiet comparison, not an outage.
+        let history = fixture
+            .storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+            .expect("the comparison debt stays pending")
+            .ticket
+            .id;
+        let TransportReconciliationRoute::Group(group_route) = route else {
+            panic!("the fixture compares a group route");
+        };
+        let scope = fixture
+            .storage
+            .recovery_scope_snapshots(history)
+            .unwrap()
+            .into_iter()
+            .find(|scope| scope.plan.transport_group_id == Some(group_route))
+            .expect("the group route has a scope");
+        assert_eq!(scope.quiet_passes, 1);
     }
 
     #[tokio::test]

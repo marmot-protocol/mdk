@@ -143,6 +143,11 @@ pub struct NostrReconciliationSummary {
     /// never depends on another endpoint's gaps, so callers can certify a
     /// subset. Account-private: never log them.
     pub failed_endpoints: Vec<TransportEndpoint>,
+    /// The subset of `failed_endpoints` that answered: it finished the
+    /// comparison and served its exact-ID requests, but this pass did not
+    /// return every ID it claimed, for example one over the single-event
+    /// ceiling or one it withholds. The rest timed out, errored or truncated.
+    pub incomplete_endpoints: Vec<TransportEndpoint>,
     pub remote_items: usize,
     pub received_items: usize,
 }
@@ -711,6 +716,7 @@ impl NostrSdkRelayClient {
         let mut remote = HashSet::new();
         let mut remote_by_endpoint = HashMap::new();
         let mut failed_endpoints = HashSet::new();
+        let mut incomplete_endpoints = HashSet::new();
         for (endpoint, result) in outcomes {
             match result {
                 Some(Ok(summary)) => {
@@ -880,9 +886,22 @@ impl NostrSdkRelayClient {
                 request_bytes = request_bytes.max(outcome.stats.serialized_event_bytes);
                 byte_limited |= outcome.end == NostrAcquisitionEnd::ByteLimitReached;
                 let claimed_id_missing = !outcome.events.iter().any(|event| event.id == wanted_id);
-                if outcome.end != NostrAcquisitionEnd::RequestPolicySatisfied || claimed_id_missing
-                {
+                // A relay that served the request to EOSE or to our limits
+                // answered. It stays incomplete unless it reached EOSE with
+                // the ID it claimed: a request our limits cut short proves
+                // nothing about what that relay still had to send.
+                let answered = matches!(
+                    outcome.end,
+                    NostrAcquisitionEnd::RequestPolicySatisfied
+                        | NostrAcquisitionEnd::ItemLimitReached
+                        | NostrAcquisitionEnd::ByteLimitReached
+                );
+                if !answered {
                     failed_endpoints.insert(endpoint.clone());
+                } else if claimed_id_missing
+                    || outcome.end != NostrAcquisitionEnd::RequestPolicySatisfied
+                {
+                    incomplete_endpoints.insert(endpoint.clone());
                 }
                 for event in outcome.events {
                     if event.id != wanted_id {
@@ -930,9 +949,11 @@ impl NostrSdkRelayClient {
             .collect::<HashSet<_>>();
         for (endpoint, ids) in &remote_by_endpoint {
             if ids.iter().any(|id| !returned.contains(id)) {
-                failed_endpoints.insert(endpoint.clone());
+                incomplete_endpoints.insert(endpoint.clone());
             }
         }
+        incomplete_endpoints.retain(|endpoint| !failed_endpoints.contains(endpoint));
+        failed_endpoints.extend(incomplete_endpoints.iter().cloned());
         // Negentropy reports a set. MLS input is sequential, so replay the
         // materialized difference in the same authored-time/id order used by
         // stored-event catch-up instead of HashSet iteration order.
@@ -948,15 +969,19 @@ impl NostrSdkRelayClient {
                 event,
             });
         }
-        let mut failed = failed_endpoints
-            .iter()
-            .map(|endpoint| TransportEndpoint(endpoint.to_string()))
-            .collect::<Vec<_>>();
-        failed.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        let sorted = |endpoints: &HashSet<RelayUrl>| {
+            let mut sorted = endpoints
+                .iter()
+                .map(|endpoint| TransportEndpoint(endpoint.to_string()))
+                .collect::<Vec<_>>();
+            sorted.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+            sorted
+        };
         let summary = NostrReconciliationSummary {
             relays_succeeded: endpoints.len().saturating_sub(failed_endpoints.len()),
             relays_failed: failed_endpoints.len(),
-            failed_endpoints: failed,
+            failed_endpoints: sorted(&failed_endpoints),
+            incomplete_endpoints: sorted(&incomplete_endpoints),
             remote_items: remote_item_count,
             received_items: remote_events.len(),
         };

@@ -161,22 +161,57 @@ impl SqliteAccountStorage {
                 .storage()?;
             }
             if cause == RecoveryCause::IncrementalHistory as i64 {
+                // The dismissal covers the routes it could not certify. A
+                // later parking on none but these is the same condition.
+                let predicate: i64 = conn
+                    .query_row_cached(
+                        "SELECT predicate FROM account_recovery_obligations WHERE id=?1",
+                        [id.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .storage()?;
+                let dismissed = plan::uncertified_scope_keys(&conn, &id, predicate)?;
                 conn.execute_cached(
-                    "UPDATE account_recovery_comparison SET settled_revision=revision WHERE singleton=1",
-                    [],
+                    "UPDATE account_recovery_obligations SET dismissed_scopes=?2 WHERE id=?1",
+                    params![
+                        id.as_slice(),
+                        serde_json::to_vec(&dismissed).map_err(|_| demand::invalid_demand())?
+                    ],
                 )
                 .storage()?;
             }
-            conn.execute_cached(
-                "UPDATE account_recovery_obligations SET state=2,incomplete_reason=?2,urgency=0,
-                     revision=revision+1,updated_at_ms=MAX(updated_at_ms,?3)
-                 WHERE id=?1",
-                params![id.as_slice(), RETIRED_HISTORY_MAY_BE_INCOMPLETE, now],
-            )
-            .storage()?;
+            retire_obligation_tx(&conn, &id, now)?;
             Ok(true)
         })
     }
+}
+
+/// Record a user-authorized retirement: its own outcome, never coverage. For
+/// incremental history, the comparison slot that served only this debt is
+/// settled with it.
+pub(super) fn retire_obligation_tx(conn: &Connection, id: &[u8], now_ms: i64) -> StorageResult<()> {
+    let cause: i64 = conn
+        .query_row_cached(
+            "SELECT cause FROM account_recovery_obligations WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if cause == RecoveryCause::IncrementalHistory as i64 {
+        conn.execute_cached(
+            "UPDATE account_recovery_comparison SET settled_revision=revision WHERE singleton=1",
+            [],
+        )
+        .storage()?;
+    }
+    conn.execute_cached(
+        "UPDATE account_recovery_obligations SET state=2,incomplete_reason=?2,urgency=0,
+             revision=revision+1,updated_at_ms=MAX(updated_at_ms,?3)
+         WHERE id=?1",
+        params![id, RETIRED_HISTORY_MAY_BE_INCOMPLETE, now_ms],
+    )
+    .storage()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -252,6 +287,105 @@ mod tests {
             .find(|notice| notice.ticket.id == id)
             .expect("parked occurrence");
         notice.ticket
+    }
+
+    /// One attempt that certifies nothing and parks `id` with these scopes.
+    /// Returns the notice it raised, if any.
+    fn try_park(
+        store: &SqliteAccountStorage,
+        id: [u8; 16],
+        scopes: &[RecoveryScopePlan],
+    ) -> Option<RecoveryDemandTicket> {
+        let mut fence = store.recovery_revision_fence().unwrap();
+        fence.obligations.retain(|(candidate, _)| *candidate == id);
+        let attempt = store
+            .reserve_recovery_attempt(&fence, 1_000, 15_000, true)
+            .unwrap()
+            .unwrap()
+            .attempt_serial;
+        let tokens = store
+            .install_recovery_scope_plan(&fence, attempt, id, scopes)
+            .unwrap()
+            .unwrap();
+        let checkpoints = tokens
+            .into_iter()
+            .map(|token| RecoveryScopeCheckpoint {
+                token,
+                endpoints: Vec::new(),
+                retained_known_event: false,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt,
+                    id,
+                    &checkpoints,
+                    RecoveryEligibility::NeedsDeepRepair,
+                )
+                .unwrap()
+        );
+        store
+            .parked_recovery_obligations()
+            .unwrap()
+            .into_iter()
+            .find(|notice| notice.ticket.id == id)
+            .map(|notice| notice.ticket)
+    }
+
+    #[test]
+    fn a_dismissed_incremental_notice_returns_only_for_a_new_stuck_route() {
+        let store = fixture();
+        let incremental = store
+            .request_recovery(RecoveryRequest::IncrementalHistory, 1)
+            .unwrap();
+        let ticket = try_park(&store, incremental.id, &[scope()]).expect("first notice");
+        assert!(
+            store
+                .retire_parked_recovery_obligation(incremental.id, ticket.revision, 2_000)
+                .unwrap()
+        );
+        // The next start's comparison still runs against the dismissed debt.
+        store
+            .join_recovery_comparison(&[1; 16], 3_000, &[scope()])
+            .unwrap();
+        assert!(
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == incremental.id),
+            "dismissal never stops the comparison"
+        );
+        assert!(
+            try_park(&store, incremental.id, &[scope()]).is_none(),
+            "the same stuck route is the condition the user dismissed"
+        );
+        assert!(
+            !store
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.ticket.id == incremental.id),
+            "it is retired again, never counted as coverage"
+        );
+        assert!(
+            !store
+                .recovery_obligation_is_satisfied(incremental.id, ticket.revision)
+                .unwrap()
+        );
+        // A route whose required relays changed is a new condition.
+        let mut moved = scope();
+        moved.required_endpoints = vec!["b".into()];
+        moved.admitted_endpoints = vec!["b".into()];
+        store
+            .join_recovery_comparison(&[2; 16], 4_000, &[moved.clone()])
+            .unwrap();
+        assert!(
+            try_park(&store, incremental.id, &[moved]).is_some(),
+            "a route stuck on relays the user never dismissed raises a new notice"
+        );
     }
 
     fn loss_obligation(store: &SqliteAccountStorage) -> [u8; 16] {

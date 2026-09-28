@@ -645,14 +645,22 @@ pub(crate) struct RouteComparison {
     /// Events the comparison fetched for admission. Any is progress, even
     /// while an unsupported required relay withholds the certificate.
     pub(crate) fetched: usize,
-    /// Events the inline executor handed to the live queue for its drain to
-    /// admit. Empty when the comparison admitted what it fetched itself.
-    pub(crate) queued: Vec<String>,
+    /// Events the account did not hold that the inline executor handed to
+    /// the live queue for its drain to admit. `None` when the comparison
+    /// admitted what it fetched itself, so `fetched` already counts only
+    /// durable admissions.
+    pub(crate) queued: Option<Vec<String>>,
+    /// Every required relay answered: it finished the comparison, or the
+    /// backend cannot compare the route. A pass that answered and neither
+    /// certified nor admitted anything is quiet. A failed or timed-out relay,
+    /// or a route this pass skipped, did not answer.
+    pub(crate) answered: bool,
 }
 
-/// The drain admitted what an inline comparison queued. Only events it
-/// durably ingested are progress, and a route certifies only when all of them
-/// were, as off-worker admission requires.
+/// The drain admitted what an inline comparison queued. Only events the
+/// account did not already hold and the drain durably ingested are progress,
+/// and a route certifies only when all of them were, as off-worker admission
+/// requires.
 fn settle_queued_comparisons(
     outcomes: Vec<RouteComparison>,
     durable: impl Fn(&str) -> bool,
@@ -660,9 +668,9 @@ fn settle_queued_comparisons(
     outcomes
         .into_iter()
         .map(|mut compared| {
-            if !compared.queued.is_empty() {
-                let admitted = compared.queued.iter().filter(|id| durable(id)).count();
-                compared.certified &= admitted == compared.queued.len();
+            if let Some(queued) = &compared.queued {
+                let admitted = queued.iter().filter(|id| durable(id)).count();
+                compared.certified &= admitted == queued.len();
                 compared.fetched = admitted;
             }
             compared
@@ -1262,7 +1270,8 @@ impl AppClient {
                     outcome: Outcome::ServicedPartial,
                     certified: false,
                     fetched: 0,
-                    queued: Vec::new(),
+                    queued: None,
+                    answered: false,
                 });
                 continue;
             }
@@ -1338,30 +1347,39 @@ impl AppClient {
                         }
                     }
                     let id = event.event.id.clone();
+                    let held = self
+                        .transport_receipts()
+                        .is_ok_and(|receipts| receipts.contains(&id));
                     self.adapter.queue_reconciled_event(event).await?;
-                    queued.push(id);
+                    if !held {
+                        queued.push(id);
+                    }
                 }
                 Ok(Some((summary, queued)))
             })
             .await;
             let mut certified = false;
             let mut fetched = 0;
-            let mut queued = Vec::new();
+            let mut queued = None;
+            let mut answered = false;
             let outcome = match result {
                 Ok(Ok(Some((summary, handed)))) => {
-                    queued = handed;
+                    queued = Some(handed);
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
                     remote_items += summary.remote_items;
                     received_items += summary.received_items;
                     fetched = summary.received_items;
                     let judged;
-                    (judged, certified) = inventory.judge(&summary);
+                    (judged, certified, answered) = inventory.judge(&summary);
                     judged
                 }
                 // The plane returns None only when no SDK reconciliation
                 // backend exists. Missing exhaustive proof returns Some, not None.
-                Ok(Ok(None)) => Outcome::Unsupported,
+                Ok(Ok(None)) => {
+                    answered = true;
+                    Outcome::Unsupported
+                }
                 Ok(Err(_)) if progress.retired.load(Ordering::Relaxed) => {
                     routes_retired += 1;
                     Outcome::ServicedPartial
@@ -1377,6 +1395,7 @@ impl AppClient {
                 certified,
                 fetched,
                 queued,
+                answered,
             });
         }
 
@@ -4782,19 +4801,6 @@ impl AppClient {
                     };
                     comparison_outcomes.iter().find(|c| c.route == route)
                 });
-                // A pass counts toward parking only when every route it compared
-                // for this obligation gave a finished answer: its required relays
-                // completed the comparison, or the backend cannot compare it. A
-                // failed, timed-out or skipped route leaves the pass unserved.
-                let served = drained
-                    && compared.clone().next().is_some()
-                    && compared.clone().all(|c| {
-                        matches!(
-                            c.outcome,
-                            storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown
-                                | storage_sqlite::RecoveryComparisonOutcome::Unsupported
-                        )
-                    });
                 let unsupported = obligation.cause
                     == storage_sqlite::RecoveryCause::IncrementalHistory
                     && compared.clone().next().is_some()
@@ -4832,6 +4838,9 @@ impl AppClient {
                 let mut certified = false;
                 let mut fetched = false;
                 let mut checkpoints = Vec::with_capacity(obligation.scopes.len());
+                // Each compared scope's own pass: quiet only when its required
+                // relays answered and it neither certified nor admitted anything.
+                let mut progress = Vec::with_capacity(obligation.scopes.len());
                 for scope in &obligation.scopes {
                     let route = match (scope.goal.route_kind, scope.goal.transport_group_id) {
                         (0, _) => Some(TransportReconciliationRoute::Inbox),
@@ -4878,6 +4887,20 @@ impl AppClient {
                         && covers_goal
                         && compared.is_some_and(|compared| compared.certified);
                     certified |= scope_certified;
+                    progress.push((
+                        scope.goal.scope_id,
+                        if scope_certified || compared.is_some_and(|compared| compared.fetched > 0)
+                        {
+                            storage_sqlite::RecoveryPassProgress::Progressed
+                        } else if drained
+                            && !refused
+                            && compared.is_some_and(|compared| compared.answered)
+                        {
+                            storage_sqlite::RecoveryPassProgress::Quiet
+                        } else {
+                            storage_sqlite::RecoveryPassProgress::Unserved
+                        },
+                    ));
                     let retained_known_event = match (&route, scope.goal.known_event_id) {
                         (Some(route), Some(event)) => storage.retained_recovery_event(
                             route,
@@ -4924,20 +4947,13 @@ impl AppClient {
                 }
                 progressed_any |= certified || fetched;
                 if comparison_owned {
-                    let progress = if certified || fetched {
-                        storage_sqlite::RecoveryPassProgress::Progressed
-                    } else if served && !refused {
-                        storage_sqlite::RecoveryPassProgress::Quiet
-                    } else {
-                        storage_sqlite::RecoveryPassProgress::Unserved
-                    };
                     storage.checkpoint_recovery_comparison(
                         &grant.fence,
                         grant.reservation.attempt_serial,
                         obligation.id,
                         &checkpoints,
                         super::recovery::eligibility_after_comparison(outcome, refused),
-                        progress,
+                        &progress,
                     )?;
                 } else {
                     let eligibility = super::recovery::eligibility_after_observation(
@@ -6698,15 +6714,21 @@ mod tests {
     #[test]
     fn inline_comparison_counts_only_durably_admitted_events() {
         use storage_sqlite::{RecoveryComparisonOutcome, TransportReconciliationRoute};
-        let route = |id: u8, queued: &[&str]| RouteComparison {
+        let route = |id: u8, fetched: usize, queued: Option<&[&str]>| RouteComparison {
             route: TransportReconciliationRoute::Group([id; 32]),
             outcome: RecoveryComparisonOutcome::ServicedUnknown,
             certified: true,
-            fetched: queued.len(),
-            queued: queued.iter().map(|id| (*id).to_owned()).collect(),
+            fetched,
+            queued: queued.map(|queued| queued.iter().map(|id| (*id).to_owned()).collect()),
+            answered: true,
         };
         let settled = settle_queued_comparisons(
-            vec![route(1, &["a", "b"]), route(2, &["a"]), route(3, &[])],
+            vec![
+                route(1, 2, Some(&["a", "b"])),
+                route(2, 1, Some(&["a"])),
+                route(3, 5, Some(&[])),
+                route(4, 3, None),
+            ],
             |id| id == "a",
         );
         assert!(
@@ -6718,9 +6740,13 @@ mod tests {
         assert_eq!(settled[1].fetched, 1);
         assert!(
             settled[2].certified,
-            "a route that queued nothing keeps its certificate"
+            "events the account already held are admitted"
         );
-        assert_eq!(settled[2].fetched, 0);
+        assert_eq!(settled[2].fetched, 0, "but they are not new progress");
+        assert_eq!(
+            settled[3].fetched, 3,
+            "off-worker admission already counted durably"
+        );
     }
 
     #[test]

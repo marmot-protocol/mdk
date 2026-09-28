@@ -123,7 +123,9 @@ consume most of the two-second deadline for the IDs it claimed. A byte/item/dead
 retains partial events but leaves incomplete every endpoint whose claimed IDs the pass did not
 return. An endpoint that claimed nothing left behind still succeeds, and
 `NostrReconciliationSummary::failed_endpoints` names the ones that failed, so a caller can
-certify a subset of a route's relays. These are returned-result and SDK-received budgets, not
+certify a subset of a route's relays. `incomplete_endpoints` names the failed ones that still
+answered: they finished the comparison and served their exact-ID requests, but this pass did
+not return every ID they claimed. The rest timed out, errored or truncated. These are returned-result and SDK-received budgets, not
 complete wire or memory ceilings.
 
 Replay position is advisory, separate from admitted event inventory. A cancelled fetch retains its

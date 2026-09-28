@@ -299,33 +299,43 @@ pub(super) struct FrozenRecoveryInventory {
 }
 
 impl FrozenRecoveryInventory {
-    /// The route's comparison as its required relays saw it. A best-effort
-    /// relay's failure neither withholds the certificate nor schedules a
-    /// retry. A failure the backend did not attribute to one of the compared
-    /// relays counts against every relay.
+    /// The route's comparison as its required relays saw it: its settlement
+    /// outcome, whether it certifies the route, and whether every required
+    /// relay answered. A relay that answered but left a claimed ID unreturned
+    /// withholds the certificate and keeps the route retrying, yet still
+    /// answered. A best-effort relay's failure neither withholds the
+    /// certificate nor schedules a retry. A failure the backend did not
+    /// attribute to one of the compared relays counts against every relay.
     pub(super) fn judge(
         &self,
         summary: &transport_nostr_adapter::NostrReconciliationSummary,
-    ) -> (storage_sqlite::RecoveryComparisonOutcome, bool) {
+    ) -> (storage_sqlite::RecoveryComparisonOutcome, bool, bool) {
         use crate::relay_plane::same_relay;
         let compared = self.work.endpoints();
+        let named = |list: &[cgka_traits::TransportEndpoint], endpoint: &str| {
+            list.iter()
+                .any(|listed| same_relay(listed.as_str(), endpoint))
+        };
         let unattributed = summary.failed_endpoints.len() < summary.relays_failed
             || summary.failed_endpoints.iter().any(|failed| {
                 !compared
                     .iter()
                     .any(|endpoint| same_relay(endpoint.as_str(), failed.as_str()))
             });
-        let required_failed = self.required.iter().any(|endpoint| {
-            unattributed
-                || summary
-                    .failed_endpoints
-                    .iter()
-                    .any(|failed| same_relay(failed.as_str(), endpoint))
-        });
+        let required_failed = self
+            .required
+            .iter()
+            .any(|endpoint| unattributed || named(&summary.failed_endpoints, endpoint));
         if required_failed {
+            let answered = !unattributed
+                && self.required.iter().all(|endpoint| {
+                    !named(&summary.failed_endpoints, endpoint)
+                        || named(&summary.incomplete_endpoints, endpoint)
+                });
             return (
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 false,
+                answered,
             );
         }
         let certified = summary.relays_succeeded > 0
@@ -338,6 +348,7 @@ impl FrozenRecoveryInventory {
         (
             storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown,
             certified,
+            true,
         )
     }
 }
@@ -3973,6 +3984,54 @@ mod tests {
             .collect()
     }
 
+    /// Every compared relay answers but withholds an ID it claimed.
+    fn scripted_withheld_routes(
+        grant: &AttemptGrant,
+    ) -> std::collections::VecDeque<crate::client::sync::TestComparisonResult> {
+        grant
+            .inventory
+            .iter()
+            .map(|inventory| {
+                let endpoints = inventory.work.endpoints().to_vec();
+                Ok(Some((
+                    transport_nostr_adapter::NostrReconciliationSummary {
+                        relays_failed: endpoints.len(),
+                        failed_endpoints: endpoints.clone(),
+                        incomplete_endpoints: endpoints,
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )))
+            })
+            .collect()
+    }
+
+    /// One pass over whatever routes the owner selects, each scripted by `script`.
+    async fn run_loss_pass(
+        client: &mut AppClient,
+        storage: &SqliteAccountStorage,
+        script: fn(
+            &AttemptGrant,
+        )
+            -> std::collections::VecDeque<crate::client::sync::TestComparisonResult>,
+    ) -> usize {
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .expect("a retryable pass is selected");
+        let routes = grant.inventory.len();
+        client.test_comparison_results = Some(script(&grant));
+        client
+            .execute_recovery_grant(grant, None, None)
+            .await
+            .unwrap();
+        client.recovery_owner.test_advance_to_retry(storage);
+        routes
+    }
+
     fn queue_loss(storage: &SqliteAccountStorage) -> Option<storage_sqlite::RecoveryEligibility> {
         storage
             .pending_recovery_demands()
@@ -4155,6 +4214,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_permanently_unfetchable_id_parks_after_quiet_passes() {
+        // The relays finish every comparison, but one ID they claim can never
+        // be fetched: over the single-event ceiling, or always withheld.
+        let (_dir, _relay, app, mut client, _pump) = loss_fixture(Some(unix_now_seconds())).await;
+        let storage = app.account_storage("alice").unwrap();
+        for pass in 1..=RECOVERY_PARK_AFTER_ATTEMPTS {
+            assert_ne!(
+                queue_loss(&storage),
+                Some(storage_sqlite::RecoveryEligibility::NeedsDeepRepair),
+                "pass {pass} is still selectable"
+            );
+            run_loss_pass(&mut client, &storage, scripted_withheld_routes).await;
+        }
+        assert_eq!(
+            queue_loss(&storage),
+            Some(storage_sqlite::RecoveryEligibility::NeedsDeepRepair),
+            "answered passes that admit nothing park instead of retrying forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_slices_park_only_after_every_route_was_compared() {
+        let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
+        for index in 0..4 {
+            client
+                .create_group(&format!("slice {index}"), &[])
+                .await
+                .unwrap();
+        }
+        let storage = app.account_storage("alice").unwrap();
+        let quiet = |grant: &AttemptGrant| scripted_routes(grant, |_| false);
+        let mut compared = 0;
+        for _ in 0..RECOVERY_PARK_AFTER_ATTEMPTS {
+            let routes = run_loss_pass(&mut client, &storage, quiet).await;
+            assert!(routes < 6, "a pass compares a slice of the six routes");
+            compared += routes;
+        }
+        assert_eq!(
+            queue_loss(&storage),
+            Some(storage_sqlite::RecoveryEligibility::Retry),
+            "three quiet slices never park routes they did not compare"
+        );
+        let mut passes = RECOVERY_PARK_AFTER_ATTEMPTS;
+        while queue_loss(&storage) == Some(storage_sqlite::RecoveryEligibility::Retry) {
+            compared += run_loss_pass(&mut client, &storage, quiet).await;
+            passes += 1;
+            assert!(passes <= 8, "rotation reaches every route");
+        }
+        assert_eq!(
+            queue_loss(&storage),
+            Some(storage_sqlite::RecoveryEligibility::NeedsDeepRepair)
+        );
+        assert!(
+            compared >= 6 * RECOVERY_PARK_AFTER_ATTEMPTS as usize,
+            "every route had its own quiet comparisons before parking"
+        );
+    }
+
+    #[tokio::test]
     async fn best_effort_relay_failure_completes_on_the_operated_relay() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -4218,15 +4336,22 @@ mod tests {
             failed_endpoints: vec![cgka_traits::TransportEndpoint(endpoint.into())],
             ..Default::default()
         };
-        assert!(group.judge(&failing(BEST_EFFORT)) == (Outcome::ServicedUnknown, true));
-        assert!(group.judge(&failing(OPERATED)) == (Outcome::TransientFailure, false));
+        assert!(group.judge(&failing(BEST_EFFORT)) == (Outcome::ServicedUnknown, true, true));
+        assert!(group.judge(&failing(OPERATED)) == (Outcome::TransientFailure, false, false));
+        let mut withheld = failing(OPERATED);
+        withheld.incomplete_endpoints = withheld.failed_endpoints.clone();
+        assert!(
+            group.judge(&withheld) == (Outcome::TransientFailure, false, true),
+            "an operated relay that answered but withheld an ID retries without certifying"
+        );
         assert!(
             group.judge(&failing("wss://Operated.Example:443/"))
-                == (Outcome::TransientFailure, false),
+                == (Outcome::TransientFailure, false, false),
             "the adapter's normalized spelling still names the operated relay"
         );
         assert!(
-            group.judge(&failing("wss://elsewhere.example")) == (Outcome::TransientFailure, false),
+            group.judge(&failing("wss://elsewhere.example"))
+                == (Outcome::TransientFailure, false, false),
             "a failure on no compared relay counts against every relay"
         );
         assert!(
@@ -4234,7 +4359,7 @@ mod tests {
                 relays_succeeded: 1,
                 relays_failed: 1,
                 ..Default::default()
-            }) == (Outcome::TransientFailure, false),
+            }) == (Outcome::TransientFailure, false, false),
             "an unattributed failure counts against the operated relay too"
         );
         client.test_comparison_results = Some(
