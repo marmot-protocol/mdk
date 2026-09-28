@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-09-25
+updated: 2026-09-28
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -29,6 +29,9 @@ On a hydrated account open or a live audit enable, at most 64 stored groups rece
 `group_baseline` rows. The account-scoped `group_baseline_inventory` row reports how many were
 eligible, selected, omitted by that cap, and unreadable; these are read counts, not durable-write
 claims. A failed group enumeration leaves all four counts unknown.
+
+Account recovery and transport-cursor rows exist only in v5 (see
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only)); a v4 recorder drops them.
 
 The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
 `MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
@@ -238,7 +241,8 @@ This catalogue is not yet complete. These event kinds have no section here yet â
 `epoch_stall_backfill_deferred`, `epoch_stall_backfill_failed`, `epoch_stall_backfill_started`,
 `group_hydration_quarantined`, `group_hydration_recovered`,
 `pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`,
-`sync_drain`, and `transport_received`.
+`sync_drain`, and `transport_received`. The v5-only recovery kinds are written up under
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only).
 
 The authoritative catalogue is the `AuditEventKind` enum together with
 [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json); the
@@ -936,6 +940,194 @@ Metadata notes:
   complete a run too. The row stays true as stated (this device could not read this group's traffic); whether a re-sync
   is the right answer is a separate judgement.
 
+### Account recovery owner rows (v5 only)
+
+The account recovery owner ([`account-recovery.md`](./further-context/account-recovery.md)) records its decisions in
+five kinds that exist only in audit v5. A v4 recorder drops them, so v4 files stay valid against the frozen v4 schema.
+They follow the recovery evidence model agreed for v5: need and eligibility changes, attempt start, acquisition and
+processing outcomes, and the owner's reassessment. Rows are transitions at the seam that made them durable, never
+scheduler polls, and recording never blocks or fails a recovery step: an audit-only storage read that fails skips the
+row.
+
+Producers live in [`client/audit_recovery.rs`](../../crates/marmot-app/src/client/audit_recovery.rs); storage reports
+the transitions ([`account_recovery/observe.rs`](../../crates/storage-sqlite/src/account_recovery/observe.rs)).
+
+Shared conventions:
+
+- `obligation_ref` / `obligation_refs` are one-way v5 hashes (domain `obligation`) of the owner's durable 16-byte
+  obligation id. The same obligation hashes to the same reference in every row, across restarts, so rows about one
+  obligation join. The source rows carry `obligation_id(s)`; v5 never writes them.
+- `obligation_revision` is the owner's revision for that obligation: a new revision means new evidence changed its goal.
+- `record_context.operation_ref` is the hash of `recovery-<attempt_serial>`, shared by an attempt's start, finish and
+  reassessment rows and by the epoch-gap backfill rows of the same attempt. `attempt_serial` is also carried as a plain
+  number, the owner's durable reservation ordinal.
+- `endpoint_refs` are v5 endpoint hashes of relay URLs. No relay URL, account, group or message id reaches a row;
+  group-scoped rows carry the ordinary hashed `group_ref`.
+- Reference lists are bounded to 16 entries. The exact count sits beside each list, and a `*_truncated` flag says
+  when the list omits some; the strict decoder rejects a list that disagrees with its count or flag.
+- Units follow the rest of the schema: Nostr `_secs` for event and cursor times, true wall-clock `_ms` for durations.
+
+#### `recovery_need_changed`
+
+Recovery need changed for one obligation.
+
+| Field | Meaning |
+| --- | --- |
+| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, or `incremental_history` (the code's `RecoveryCause`). |
+| `change` | `recorded` (new debt), `joined` (charged to pending work), `resumed` (new evidence reopened a parked or retired obligation), `notice_shown` (it parked; its "history may be incomplete" notice is now shown), `notice_dismissed` (the user retired it), `closed` (a parked obligation completed with qualified coverage), or `closed_below_window` (an explicit full-history request closed because its whole retained window was certified and what remains lies below it; neither coverage nor a dismissal). |
+| `obligation_ref` | Hashed obligation id. |
+| `obligation_revision` | Revision the change left. |
+| `bound` | For `recorded` / `joined` / `resumed`: `floor`, `unbounded`, or `retained_window`, the goal's lower bound as the comparison will use it. |
+| `floor_secs` | Present exactly when `bound` is `floor`: the goal's floor after the change, the lowest bound charged by any unresolved generation of the cause. That is the earliest dropped wire `created_at` (queue loss) or the lowest REQ `since` read at a lag (notification loss). |
+| `charged` | Loss causes only: deliveries (queue loss) or lagged notifications (notification loss) newly charged by this change. A notification count is an observation count, not a count of missed events. |
+
+Where it is recorded:
+
+- Loss import, wherever the owner imports delivery loss: authorization, admission checks, settlement, dismissal, and the
+  worker's overflow observation (`synchronize_recovery_loss`, `observe_delivery_overflow`). An account open imports
+  earlier loss and records it once the client exists. One import coalesces every generation of a cause into one row.
+  Each notification lag mints its own generation with the floor read at the lag, so a lag that lowers the floor
+  shows as a lower `floor_secs`; a lag with an unknown floor makes the goal `unbounded`.
+- Startup incremental history (`retained_window`) and explicit full-history repair (`unbounded`, by design) requests.
+- The notice publication seam (`take_history_notice_changes`): `notice_shown` for each newly parked occurrence, and
+  `closed` for a withdrawn occurrence whose obligation is now satisfied. Parked obligations get no automatic retries,
+  so `closed` means an explicit deep repair completed it. The first call after open only takes the baseline.
+- Dismissal (`dismiss_history_notice`): `notice_dismissed`.
+- Explicit full-history repair's own close after a `BelowRetentionWindow` pass: `closed_below_window`, only when
+  that seam closed the request. Settlement usually closes it first, and then the reassessment verdict
+  `closed_below_window` records it instead, so each close has one row.
+
+Notes:
+
+- Unchanged writes record nothing: a duplicate request, or late loss the dismissal already retired.
+- Epoch-gap arms keep their [`epoch_stall_backfill_armed`](#epoch_stall_backfill_armed) row; an epoch gap's goal is
+  unbounded because the missing commit's time is unknown. Maintenance boundaries and known events have no request
+  row; their obligations appear on attempt and reassessment rows.
+- Waiting for capacity or capability and parking are owner verdicts on an attempt, recorded by
+  [`recovery_obligation_reassessed`](#recovery_obligation_reassessed); pacing cooldown is not a transition and writes no
+  row.
+
+#### `recovery_attempt_started`
+
+The owner started one reserved attempt with a frozen plan. Account-scoped.
+
+| Field | Meaning |
+| --- | --- |
+| `attempt_serial` | The owner's reservation ordinal; its hash is the attempt's `operation_ref`. |
+| `retry_ordinal` | Automatic attempts since the last progress (0 for the first). |
+| `seam` | Worker seam that ran it: `startup`, `receive`, `explicit_catch_up`, or `maintenance`. |
+| `scope` | `history`, `exact_event`, `maintenance_boundary`, or `mixed`. |
+| `causes` | Distinct causes among the selected obligations, in catalogue order. |
+| `obligation_count` / `obligation_refs` / `obligations_truncated` | The selected obligations. Several obligations share one attempt; a comparison-only attempt may select none. |
+| `route_count` | Routes whose inventory the attempt froze. |
+| `endpoint_count` / `endpoint_refs` / `endpoints_truncated` | Distinct relays the frozen plan admits. |
+| `window_since_secs` / `window_until_secs` | Frozen comparison window over every route. |
+| `route_cap`, `admission_per_turn`, `quantum_ms`, `park_after_quiet_passes` | Budgets in force in this build: routes per pass, events admitted per worker turn, the automatic pass's network quantum, and quiet passes before an obligation parks. |
+
+Recorded at `begin_recovery_execution`, the bracket every comparison-job pass opens, whatever its cause or caller.
+
+#### `recovery_attempt_finished`
+
+One finished pass of a started attempt. Account-scoped; recorded on every exit of the bracket
+(`finish_recovery_execution`), before loss and cursor settlement, which have their own rows.
+
+| Field | Meaning |
+| --- | --- |
+| `attempt_serial` | As on the start row. |
+| `duration_ms` | Monotonic time from start to finish. |
+| `outcome` | `progressed`, `quiet`, `unserved`, `deadline`, `cancelled`, `superseded`, or `failed`. |
+| `error_kind` | Present exactly when `outcome` is `failed`: the error's privacy-safe class. |
+| `obligation_count` | Selected obligations. |
+| `routes_compared` / `routes_certified` / `routes_uncertified` | Routes compared, and how many carry a comparison certificate for the frozen window (every required relay finished an untruncated comparison and every difference was admitted). Certified and uncertified partition compared. |
+| `events_retrieved` | Events the comparison's relays handed over. |
+| `events_duplicate` | Deliveries already held. |
+| `events_rejected` | Handed-over events that could not be read as a transport message or no longer routed to this account. |
+| `events_retained` | Deliveries durably retained. |
+| `events_refused` | Deliveries refused under a local resource bound (counted among ingested deliveries, not among retained). |
+| `relays_required` / `relays_admitted` | Distinct required and admitted relays over the frozen plan. |
+| `relays_failed` / `relays_incomplete` | Failed relays summed per compared route, and those among them that answered but withheld a claimed event. |
+
+Outcomes:
+
+| Outcome | Meaning |
+| --- | --- |
+| `progressed` | Some compared scope certified or durably admitted history (the code's `RecoveryPassProgress::Progressed`), certified the retained window of an explicit goal that reaches below it (`WindowCertified`: searched, never quiet), or the pass retained deliveries. |
+| `quiet` | Required relays answered; nothing certified or admitted (`Quiet`). Counts toward parking. A pass that compared nothing, such as a maintenance boundary alone, is also `quiet`. |
+| `unserved` | A required relay failed, timed out or was skipped, or admission was refused (`Unserved`). Says nothing about history and never counts toward parking. |
+| `deadline` | An explicit repair spent its whole budget and stopped admission at a turn boundary. A network cutoff that skipped routes still settles, and shows as those routes being unserved. |
+| `cancelled` | Explicit repair was cancelled, or the comparison's network task ended without a result. |
+| `superseded` | The grant changed before or during admission, for example new loss imported by the job's stability check; nothing was certified and newer demand owns the debt. |
+| `failed` | The pass failed; see `error_kind`. |
+
+Notes:
+
+- A route that finished comparing is not proof of complete history, and a certified route is not a satisfied
+  obligation: an unbounded goal can never be certified, however many routes certify. The obligation's verdict is on
+  its reassessment row.
+- Engine application is not counted here. The engine's own `ingest_outcome` rows record what each retained input did.
+- An attempt with a start row and no finish row was interrupted (a stop mid-pass). Its outcome is unknown, not failure.
+
+#### `recovery_obligation_reassessed`
+
+The owner's verdict on one obligation after a pass it settled, read back from storage after the checkpoint committed.
+Group-scoped demand carries `group_ref`. At most 16 rows per pass; the finished row's `obligation_count` is exact. A
+pass that stopped before settlement writes none.
+
+| Field | Meaning |
+| --- | --- |
+| `attempt_serial` | The pass. |
+| `cause` / `obligation_ref` | The obligation. |
+| `obligation_revision` | The revision the pass selected. |
+| `verdict` | `satisfied`, `deferred`, `waiting_capacity`, `waiting_capability`, `parked`, `retired`, `superseded`, or `closed_below_window`. |
+| `next_attempt` | `not_needed`, `paced_retry`, `after_capacity`, `after_capability_change`, `explicit_repair_only`, or `newer_revision`: why another automatic attempt is, or is not, permitted. |
+| `progress` | This obligation's compared scopes, aggregated: `progressed`, `window_certified`, `quiet`, or `unserved` (in that precedence). Absent when the pass compared none of them. |
+| `scopes_total` / `scopes_certified` | The obligation's scopes, and how many hold a certificate valid for this goal after the pass. |
+| `quiet_passes` | Comparison-owned causes only: the longest quiet streak among its scopes after the pass. |
+| `park_after_quiet_passes` | The parking budget in this build. |
+
+Verdicts:
+
+| Verdict | `next_attempt` | Meaning |
+| --- | --- | --- |
+| `satisfied` | `not_needed` | Qualified completion. |
+| `deferred` | `paced_retry` | Still pending; the shared retry schedule runs it again. |
+| `waiting_capacity` | `after_capacity` | Admission was refused under a local bound. |
+| `waiting_capability` | `after_capability_change` | No eligible route, or no comparison backend. |
+| `parked` | `explicit_repair_only` | Parked after its quiet budget; its notice follows as `notice_shown`. |
+| `retired` | `not_needed` | Parked again on routes and relays the user already dismissed, so it retired without a new notice. |
+| `superseded` | `newer_revision` | New evidence moved it to a newer revision, or it was reclaimed, during the pass. |
+| `closed_below_window` | `not_needed` | An explicit request whose every scope's retained window is certified closed: what remains lies below the window, where no pass can search. Not coverage; the repair reports `BelowRetentionWindow`. |
+
+#### `transport_cursor_advanced`
+
+The persisted transport cursor advanced (design section 6 of the recovery note). Account-scoped.
+
+| Field | Meaning |
+| --- | --- |
+| `trigger` | `drain_checkpoint`, `loss_settled`, `notice_retired`, or `live_promotion`. |
+| `cursor_before_secs` / `cursor_after_secs` | The persisted cursor before and after. |
+| `lookback_secs` | The rebuild lookback (120 s in production); absent for a full-history plane. |
+| `spilled_below_floor` | Deliveries sent to the durable spill because a cursor commit had raised the restart floor past them, since this client's previous cursor row or its open. |
+| `spilled_queue_full` | Deliveries sent to the spill because the account queue was full. |
+| `spill_already_seen` | Spilled deliveries discarded as already held before using capacity. |
+| `queue_dropped` | Deliveries omitted into queue loss. |
+
+Notes:
+
+- Settled commits (`drain_checkpoint`, `loss_settled`, `notice_retired`) record every advance. A live ingest's own save
+  records only a promotion that moves the cursor by more than the lookback, so ordinary live traffic writes no rows.
+  A save that failed restores the old cursor and writes nothing.
+- The placement counters are differences of the queue's cumulative counters, read at the row. The router never
+  records a row; it only counts.
+- `sync_drain` keeps its own before/after cursor per drain; this row names what committed each advance.
+
+#### Lost-EOSE repair (pending #2076)
+
+The lost-EOSE repair in the relay plane and transport adapter is not on master yet, so no row kind exists for it. The
+hook point is marked `TODO(#2076)` at `MarmotRelayPlaneAccountAdapter::account_subscription_eose`. When it lands, it
+should record one account-scoped row per repair pass at its owner seam, with counts only: relays still awaiting EOSE,
+relays repaired through the SDK flag, REQs re-issued, and repairs that failed.
+
 ### `auto_commit_decision`
 
 Emitted after `LowestIndexAutoCommitter::decide` returns a decision for a queued proposal.
@@ -1065,6 +1257,15 @@ metadata keys for indexing.
 | `new_state` | `sent`, `created`, `processed`, `failed`, `retryable`, `peel_deferred`, `epoch_invalidated` |
 | `ForkWinner` | `candidate`, `incumbent`, `missing_snapshot` |
 | `PeelerOutcomeKind` | `success`, `decrypt_failed`, `stale_epoch`, `malformed`, `other` |
+| `RecoveryObligationCause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history` |
+| `RecoveryNeedChange` | `recorded`, `joined`, `resumed`, `notice_shown`, `notice_dismissed`, `closed`, `closed_below_window` |
+| `RecoveryGoalBound` | `floor`, `unbounded`, `retained_window` |
+| `RecoveryAttemptScope` | `history`, `exact_event`, `maintenance_boundary`, `mixed` |
+| `RecoveryPassOutcome` | `progressed`, `quiet`, `unserved`, `deadline`, `cancelled`, `superseded`, `failed` |
+| `RecoveryScopeProgress` | `progressed`, `quiet`, `unserved`, `window_certified` |
+| `RecoveryObligationVerdict` | `satisfied`, `deferred`, `waiting_capacity`, `waiting_capability`, `parked`, `retired`, `superseded`, `closed_below_window` |
+| `RecoveryNextAttempt` | `not_needed`, `paced_retry`, `after_capacity`, `after_capability_change`, `explicit_repair_only`, `newer_revision` |
+| `TransportCursorTrigger` | `drain_checkpoint`, `live_promotion`, `loss_settled`, `notice_retired` |
 
 ## Upload and tracker path
 
@@ -1363,6 +1564,12 @@ let server-side tooling collate multiple devices into group-level analytics.
 | How did MLS-authenticated group state change? | `group_state_changed` rows for membership, self-leave, admin, rename, avatar, and message-retention deltas, including epoch and origin commit id when attributable. |
 | Why did a fork/convergence decision happen? | `snapshot_created`, `fork_resolution`, `convergence_decision`, `peeler_outcome`, `auto_commit_decision`, and message-state invalidation rows. |
 | Which app-level state changed outside core membership/profile/admin deltas? | Observed/local `human_action` rows cover message retention, encrypted-media endpoints, avatar URL/image updates, and profile/admin projection deltas. |
+| What recovery debt did this device take on, and how bounded was it? | `recovery_need_changed` rows: cause, `recorded` / `joined` / `resumed`, goal `bound` and `floor_secs`, and the count charged. Epoch gaps keep `epoch_stall_backfill_armed`. |
+| Which obligations did one recovery attempt serve, over which relays, within which budgets? | `recovery_attempt_started`, joined to its other rows by `record_context.operation_ref`. |
+| What did the relays return, and what did processing keep? | `recovery_attempt_finished`: routes compared and certified, events retrieved / duplicate / rejected / retained / refused, relay counts, and the pass `outcome`. Engine application stays on `ingest_outcome`. |
+| Why did recovery stop, retry, wait or park, and is another attempt permitted? | `recovery_obligation_reassessed` per settled obligation: `verdict`, `next_attempt`, progress, certified scopes and the quiet streak against the parking budget. |
+| When was "history may be incomplete" shown, dismissed or resolved? | `recovery_need_changed` with `notice_shown`, `notice_dismissed`, `resumed`, or `closed`, joined by `obligation_ref`. |
+| Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
 | Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or Goggles classification. |
 
 Intentional non-goals / limits:
@@ -1393,6 +1600,8 @@ Audit JSONL can include:
 - group-state change kinds, stable actor/subject member refs, origin commit ids, affected fields/components, and
   value digests/lengths for value-bearing changes;
 - epoch-state transition rows, including pending refs and stable transition reasons;
+- v5 recovery rows: hashed obligation and endpoint references, obligation revisions, attempt ordinals, recovery causes
+  and verdicts, goal floors as Nostr timestamps, and aggregate event, route, relay and spill counts;
 - human-action labels, changed-field labels, touched app component ids, target counts, and linked message ids;
 - peeler error strings in `peeler_outcome.detail`;
 - local wall-clock timestamps.

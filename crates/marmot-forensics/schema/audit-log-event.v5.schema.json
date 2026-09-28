@@ -2555,6 +2555,21 @@
         },
         {
           "$ref": "#/$defs/OperationalEvent_convergence_pass_discarded"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recovery_need_changed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recovery_attempt_started"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recovery_attempt_finished"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recovery_obligation_reassessed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_transport_cursor_advanced"
         }
       ]
     },
@@ -3130,6 +3145,92 @@
     "Operational_epochBackfillDeferredReason": {
       "enum": [
         "group_epoch_unavailable"
+      ]
+    },
+    "Operational_recoveryObligationCause": {
+      "enum": [
+        "queue_loss",
+        "notification_loss",
+        "epoch_gap",
+        "maintenance",
+        "explicit_history",
+        "known_event",
+        "incremental_history"
+      ]
+    },
+    "Operational_recoveryNeedChange": {
+      "enum": [
+        "recorded",
+        "joined",
+        "resumed",
+        "notice_shown",
+        "notice_dismissed",
+        "closed",
+        "closed_below_window"
+      ]
+    },
+    "Operational_recoveryGoalBound": {
+      "enum": [
+        "floor",
+        "unbounded",
+        "retained_window"
+      ]
+    },
+    "Operational_recoveryAttemptScope": {
+      "enum": [
+        "history",
+        "exact_event",
+        "maintenance_boundary",
+        "mixed"
+      ]
+    },
+    "Operational_recoveryPassOutcome": {
+      "enum": [
+        "progressed",
+        "quiet",
+        "unserved",
+        "deadline",
+        "cancelled",
+        "superseded",
+        "failed"
+      ]
+    },
+    "Operational_recoveryScopeProgress": {
+      "enum": [
+        "progressed",
+        "quiet",
+        "unserved",
+        "window_certified"
+      ]
+    },
+    "Operational_recoveryObligationVerdict": {
+      "enum": [
+        "satisfied",
+        "deferred",
+        "waiting_capacity",
+        "waiting_capability",
+        "parked",
+        "retired",
+        "superseded",
+        "closed_below_window"
+      ]
+    },
+    "Operational_recoveryNextAttempt": {
+      "enum": [
+        "not_needed",
+        "paced_retry",
+        "after_capacity",
+        "after_capability_change",
+        "explicit_repair_only",
+        "newer_revision"
+      ]
+    },
+    "Operational_transportCursorTrigger": {
+      "enum": [
+        "drain_checkpoint",
+        "live_promotion",
+        "loss_settled",
+        "notice_retired"
       ]
     },
     "OperationalDiagnosticRef": {
@@ -4516,6 +4617,328 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "generation": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_recovery_need_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "cause",
+        "change",
+        "obligation_ref",
+        "obligation_revision"
+      ],
+      "properties": {
+        "type": {
+          "const": "recovery_need_changed"
+        },
+        "cause": {
+          "$ref": "#/$defs/Operational_recoveryObligationCause"
+        },
+        "change": {
+          "$ref": "#/$defs/Operational_recoveryNeedChange"
+        },
+        "obligation_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "obligation_revision": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "bound": {
+          "$ref": "#/$defs/Operational_recoveryGoalBound"
+        },
+        "floor_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "charged": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_recovery_attempt_started": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "attempt_serial",
+        "retry_ordinal",
+        "seam",
+        "scope",
+        "causes",
+        "obligation_count",
+        "obligation_refs",
+        "obligations_truncated",
+        "route_count",
+        "endpoint_count",
+        "endpoints_truncated",
+        "route_cap",
+        "admission_per_turn",
+        "quantum_ms",
+        "park_after_quiet_passes"
+      ],
+      "properties": {
+        "type": {
+          "const": "recovery_attempt_started"
+        },
+        "attempt_serial": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "retry_ordinal": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "seam": {
+          "$ref": "#/$defs/Operational_epochBackfillExecutionSeam"
+        },
+        "scope": {
+          "$ref": "#/$defs/Operational_recoveryAttemptScope"
+        },
+        "causes": {
+          "type": "array",
+          "maxItems": 7,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/Operational_recoveryObligationCause"
+          }
+        },
+        "obligation_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "obligation_refs": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/OperationalDiagnosticRef"
+          }
+        },
+        "obligations_truncated": {
+          "type": "boolean"
+        },
+        "route_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "endpoint_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "endpoint_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/EndpointRef"
+          }
+        },
+        "endpoints_truncated": {
+          "type": "boolean"
+        },
+        "window_since_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "window_until_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "route_cap": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "admission_per_turn": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "quantum_ms": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "park_after_quiet_passes": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_recovery_attempt_finished": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "outcome",
+        "attempt_serial",
+        "duration_ms",
+        "obligation_count",
+        "routes_compared",
+        "routes_certified",
+        "routes_uncertified",
+        "events_retrieved",
+        "events_duplicate",
+        "events_rejected",
+        "events_retained",
+        "events_refused",
+        "relays_required",
+        "relays_admitted",
+        "relays_failed",
+        "relays_incomplete"
+      ],
+      "properties": {
+        "type": {
+          "const": "recovery_attempt_finished"
+        },
+        "attempt_serial": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "duration_ms": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Operational_recoveryPassOutcome"
+        },
+        "error_kind": {
+          "$ref": "#/$defs/Operational_safeText"
+        },
+        "obligation_count": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "routes_compared": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "routes_certified": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "routes_uncertified": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "events_retrieved": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "events_duplicate": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "events_rejected": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "events_retained": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "events_refused": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "relays_required": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "relays_admitted": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "relays_failed": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "relays_incomplete": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_recovery_obligation_reassessed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "attempt_serial",
+        "cause",
+        "obligation_ref",
+        "obligation_revision",
+        "verdict",
+        "next_attempt",
+        "scopes_total",
+        "scopes_certified",
+        "park_after_quiet_passes"
+      ],
+      "properties": {
+        "type": {
+          "const": "recovery_obligation_reassessed"
+        },
+        "attempt_serial": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "cause": {
+          "$ref": "#/$defs/Operational_recoveryObligationCause"
+        },
+        "obligation_ref": {
+          "$ref": "#/$defs/OperationalDiagnosticRef"
+        },
+        "obligation_revision": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "verdict": {
+          "$ref": "#/$defs/Operational_recoveryObligationVerdict"
+        },
+        "next_attempt": {
+          "$ref": "#/$defs/Operational_recoveryNextAttempt"
+        },
+        "progress": {
+          "$ref": "#/$defs/Operational_recoveryScopeProgress"
+        },
+        "scopes_total": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "scopes_certified": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "quiet_passes": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "park_after_quiet_passes": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_transport_cursor_advanced": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "trigger",
+        "cursor_after_secs",
+        "spilled_below_floor",
+        "spilled_queue_full",
+        "spill_already_seen",
+        "queue_dropped"
+      ],
+      "properties": {
+        "type": {
+          "const": "transport_cursor_advanced"
+        },
+        "trigger": {
+          "$ref": "#/$defs/Operational_transportCursorTrigger"
+        },
+        "cursor_before_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "cursor_after_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "lookback_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "spilled_below_floor": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "spilled_queue_full": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "spill_already_seen": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "queue_dropped": {
           "$ref": "#/$defs/Operational_u64"
         },
         "record_context": {

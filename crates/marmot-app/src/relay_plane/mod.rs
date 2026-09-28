@@ -239,6 +239,15 @@ pub(crate) struct AccountDeliveryOverflow {
     pub(crate) elapsed_ms: u64,
 }
 
+/// Cumulative placements one account queue made, as counts only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccountDeliveryPlacementCounts {
+    pub(crate) spilled_below_floor: u64,
+    pub(crate) spilled_queue_full: u64,
+    pub(crate) spill_already_seen: u64,
+    pub(crate) queue_dropped: u64,
+}
+
 #[derive(Debug)]
 pub(crate) enum AccountDeliveryReceive {
     Delivery(Box<TransportDelivery>),
@@ -388,6 +397,11 @@ struct AccountDeliveryMetrics {
     dropped: AtomicU64,
     spilled: AtomicU64,
     spill_already_seen: AtomicU64,
+    /// Deliveries `place` sent to the spill because a cursor commit had
+    /// raised the restart floor past them, and because the queue was full.
+    /// Counted at placement; `spilled` counts what the writer stored.
+    spill_diverted_below_floor: AtomicU64,
+    spill_diverted_queue_full: AtomicU64,
     recovery_attempts: AtomicU64,
     recovery_successes: AtomicU64,
     recovery_failures: AtomicU64,
@@ -470,6 +484,14 @@ impl AccountDeliveryOverflowState {
         }
         if spill {
             state.spill_in_flight = state.spill_in_flight.saturating_add(1);
+            RelayNotificationForwarderHealth::increment(
+                if queue_full {
+                    &self.metrics.spill_diverted_queue_full
+                } else {
+                    &self.metrics.spill_diverted_below_floor
+                },
+                1,
+            );
             AccountDeliveryPlacement::Spill
         } else {
             AccountDeliveryPlacement::Omit
@@ -3292,6 +3314,13 @@ impl MarmotRelayPlaneAccountAdapter {
     ///
     /// The epoch-gap backfill drain reads this to tell a relay that has
     /// finished replaying stored history from one that has simply gone quiet.
+    ///
+    /// TODO(#2076): the lost-EOSE repair lands in this plane and the transport
+    /// adapter. When it merges, record one account-scoped audit v5 row per
+    /// repair pass at its owner seam (not per poll): relays still awaiting
+    /// EOSE, relays repaired through the SDK flag, REQs re-issued, and repairs
+    /// that failed, as counts only. No row kind exists for it yet; see
+    /// `docs/marmot-architecture/audit-logging.md` ("Lost-EOSE repair").
     pub(crate) async fn account_subscription_eose(&self) -> AccountSubscriptionEose {
         let mut eose = self
             .relay_plane
@@ -3420,6 +3449,19 @@ impl MarmotRelayPlaneAccountAdapter {
             .admission
             .settled_since
             .is_some()
+    }
+
+    /// Cumulative account-queue placement counts for the transport-cursor
+    /// audit row. Relaxed counters: a reader sees a recent value, never a
+    /// torn one, and the row reports differences between two reads.
+    pub(crate) fn delivery_placement_counts(&self) -> AccountDeliveryPlacementCounts {
+        let metrics = &self.delivery_overflow.metrics;
+        AccountDeliveryPlacementCounts {
+            spilled_below_floor: metrics.spill_diverted_below_floor.load(Ordering::Relaxed),
+            spilled_queue_full: metrics.spill_diverted_queue_full.load(Ordering::Relaxed),
+            spill_already_seen: metrics.spill_already_seen.load(Ordering::Relaxed),
+            queue_dropped: metrics.dropped.load(Ordering::Relaxed),
+        }
     }
 
     /// Process-local overflow evidence becomes visible at the exact omission,

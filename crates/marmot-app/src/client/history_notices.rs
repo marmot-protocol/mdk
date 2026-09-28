@@ -49,12 +49,12 @@ impl AppClient {
         let storage = self.app.account_storage(&self.state.label)?;
         // Newer loss joins first. It re-arms the obligation under a new
         // revision, so a dismissal of the older occurrence becomes stale.
-        storage.synchronize_account_delivery_loss(&self.state.label)?;
-        let Some(cause) = storage
+        self.synchronize_recovery_loss(&storage)?;
+        let Some((cause, group)) = storage
             .parked_recovery_obligations()?
             .into_iter()
             .find(|parked| parked.ticket == ticket)
-            .map(|parked| parked.cause)
+            .map(|parked| (parked.cause, parked.group_id))
         else {
             tracing::debug!(
                 target: "marmot_app::recovery",
@@ -80,6 +80,15 @@ impl AppClient {
         }
         // The retirement is durable from here on; the dismissal succeeded
         // even if the in-memory fence cannot be released right now.
+        self.record_need_changed(
+            group.map(GroupId::new).as_ref(),
+            super::audit_recovery::obligation_cause(cause),
+            marmot_forensics::RecoveryNeedChange::NoticeDismissed,
+            ticket,
+            None,
+            None,
+            None,
+        );
         let loss = matches!(
             cause,
             storage_sqlite::RecoveryCause::QueueLoss
@@ -114,7 +123,10 @@ impl AppClient {
                     "cursor advances at the next checkpoint instead",
                 );
             } else {
-                self.settle_transport_cursor(sealed);
+                self.settle_transport_cursor(
+                    sealed,
+                    marmot_forensics::TransportCursorTrigger::NoticeRetired,
+                );
             }
         }
         tracing::info!(
@@ -135,6 +147,7 @@ impl AppClient {
     /// call only records the baseline. A failed read keeps the old baseline,
     /// so the next publication seam retries.
     pub(crate) fn take_history_notice_changes(&mut self) -> Option<Vec<GroupId>> {
+        let mut causes = Vec::new();
         let current: HistoryNoticeBaseline = match self
             .app
             .account_storage(&self.state.label)
@@ -142,7 +155,10 @@ impl AppClient {
         {
             Ok(parked) => parked
                 .into_iter()
-                .map(|parked| (parked.ticket.id, parked.ticket.revision, parked.group_id))
+                .map(|parked| {
+                    causes.push((parked.ticket.id, parked.cause));
+                    (parked.ticket.id, parked.ticket.revision, parked.group_id)
+                })
                 .collect(),
             Err(_) => {
                 tracing::debug!(
@@ -158,6 +174,8 @@ impl AppClient {
         if previous == *current {
             return None;
         }
+        self.record_history_notice_changes(&previous, &causes);
+        let current = self.history_notice_baseline.as_ref()?;
         let mut groups = previous
             .iter()
             .filter(|entry| !current.contains(entry))
@@ -167,6 +185,65 @@ impl AppClient {
         groups.sort();
         groups.dedup();
         Some(groups.into_iter().map(GroupId::new).collect())
+    }
+}
+
+impl AppClient {
+    /// Audit the notice set's transitions: each newly parked occurrence is a
+    /// shown notice, and a withdrawn one whose obligation is now satisfied
+    /// was closed with qualified coverage. Other withdrawals are recorded
+    /// where they happen: a dismissal, or new evidence resuming the demand.
+    fn record_history_notice_changes(
+        &self,
+        previous: &HistoryNoticeBaseline,
+        causes: &[([u8; 16], storage_sqlite::RecoveryCause)],
+    ) {
+        if !self.audit_v5_enabled() {
+            return;
+        }
+        let Some(current) = self.history_notice_baseline.as_ref() else {
+            return;
+        };
+        for (id, revision, group) in current.iter().filter(|entry| !previous.contains(entry)) {
+            let Some((_, cause)) = causes.iter().find(|(parked, _)| parked == id) else {
+                continue;
+            };
+            self.record_need_changed(
+                group.clone().map(GroupId::new).as_ref(),
+                super::audit_recovery::obligation_cause(*cause),
+                marmot_forensics::RecoveryNeedChange::NoticeShown,
+                storage_sqlite::RecoveryDemandTicket {
+                    id: *id,
+                    revision: *revision,
+                },
+                None,
+                None,
+                None,
+            );
+        }
+        let Ok(storage) = self.app.account_storage(&self.state.label) else {
+            return;
+        };
+        for (id, revision, group) in previous.iter().filter(|entry| !current.contains(entry)) {
+            let Ok(Some(status)) = storage.recovery_obligation_status(*id) else {
+                continue;
+            };
+            if status.state != storage_sqlite::RecoveryObligationState::Satisfied {
+                continue;
+            }
+            self.record_need_changed(
+                group.clone().map(GroupId::new).as_ref(),
+                super::audit_recovery::obligation_cause(status.cause),
+                marmot_forensics::RecoveryNeedChange::Closed,
+                storage_sqlite::RecoveryDemandTicket {
+                    id: *id,
+                    revision: status.revision.max(*revision),
+                },
+                None,
+                None,
+                None,
+            );
+        }
     }
 }
 

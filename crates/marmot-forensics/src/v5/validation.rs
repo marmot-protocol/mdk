@@ -15,7 +15,7 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
     require(record.seq.get() > 0, "sequence must be positive")?;
     let has_group = record.group_ref.is_some();
     match &record.event {
-        Event::Operational(_) => {}
+        Event::Operational(e) => validate_operational(&e.kind)?,
         Event::AppUpdateOutcome(e) => {
             require(
                 e.failure_stage.is_some() == e.failure_reason.is_some(),
@@ -464,4 +464,94 @@ pub(super) fn validate(record: &RecordFields) -> Result<(), ContractError> {
         }
     }
     Ok(())
+}
+
+/// Cross-field rules for the v5-only recovery kinds that JSON Schema cannot
+/// express: bounded reference lists agree with their exact counts and
+/// truncation flags, and partitioned counters add up.
+fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), ContractError> {
+    use crate::audit::{
+        AuditEventKind, RECOVERY_AUDIT_MAX_ENDPOINTS, RECOVERY_AUDIT_MAX_OBLIGATIONS,
+        RecoveryGoalBound, RecoveryPassOutcome,
+    };
+    let listed = |len: usize, count: u64, truncated: bool, max: usize| {
+        let len = len as u64;
+        len <= max as u64 && len <= count && truncated == (len < count)
+    };
+    match kind {
+        AuditEventKind::RecoveryNeedChanged {
+            bound, floor_secs, ..
+        } => require(
+            floor_secs.is_some() == (*bound == Some(RecoveryGoalBound::Floor)),
+            "recovery goal floor must accompany a floor bound",
+        ),
+        AuditEventKind::RecoveryAttemptStarted {
+            causes,
+            obligation_count,
+            obligation_ids,
+            obligations_truncated,
+            endpoint_count,
+            relay_urls,
+            endpoints_truncated,
+            window_since_secs,
+            window_until_secs,
+            ..
+        } => {
+            require(
+                ordered_unique(causes),
+                "recovery causes must be sorted and unique",
+            )?;
+            require(
+                listed(
+                    obligation_ids.len(),
+                    *obligation_count,
+                    *obligations_truncated,
+                    RECOVERY_AUDIT_MAX_OBLIGATIONS,
+                ),
+                "recovery obligation list must match its count and truncation",
+            )?;
+            require(
+                listed(
+                    relay_urls.len(),
+                    *endpoint_count,
+                    *endpoints_truncated,
+                    RECOVERY_AUDIT_MAX_ENDPOINTS,
+                ),
+                "recovery endpoint list must match its count and truncation",
+            )?;
+            require(
+                match (window_since_secs, window_until_secs) {
+                    (Some(since), Some(until)) => since <= until,
+                    _ => true,
+                },
+                "recovery window must not be inverted",
+            )
+        }
+        AuditEventKind::RecoveryAttemptFinished {
+            outcome,
+            error_kind,
+            routes_compared,
+            routes_certified,
+            routes_uncertified,
+            ..
+        } => {
+            require(
+                routes_certified.checked_add(*routes_uncertified) == Some(*routes_compared),
+                "certified and uncertified routes must partition compared routes",
+            )?;
+            require(
+                error_kind.is_some() == (*outcome == RecoveryPassOutcome::Failed),
+                "only a failed recovery pass carries an error kind",
+            )
+        }
+        AuditEventKind::RecoveryObligationReassessed {
+            scopes_total,
+            scopes_certified,
+            ..
+        } => require(
+            scopes_certified <= scopes_total,
+            "certified scopes cannot exceed the obligation's scopes",
+        ),
+        _ => Ok(()),
+    }
 }

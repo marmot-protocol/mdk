@@ -657,17 +657,13 @@ impl SqliteAccountStorage {
         dropped_count: u64,
         earliest_created_at: Option<u64>,
     ) -> StorageResult<()> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            crate::account_recovery::arm_overflow_tx(
-                &conn,
-                label,
-                i64::try_from(marker_token).unwrap_or(i64::MAX),
-                i64::try_from(dropped_count).unwrap_or(i64::MAX),
-                unix_now_seconds_i64(),
-                earliest_created_at,
-            )
-        })
+        self.mark_account_delivery_recovery_observed(
+            label,
+            marker_token,
+            dropped_count,
+            earliest_created_at,
+        )
+        .map(|_| ())
     }
 
     /// Low-level legacy retirement. Recovery completion must use revision-fenced

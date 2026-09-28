@@ -83,6 +83,17 @@ impl SqliteAccountStorage {
         request: RecoveryRequest<'_>,
         now_ms: u64,
     ) -> StorageResult<RecoveryDemandTicket> {
+        self.request_recovery_observed(request, now_ms)
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// [`Self::request_recovery`], also reporting how the write changed the
+    /// obligation, for the owner's audit row.
+    pub fn request_recovery_observed(
+        &self,
+        request: RecoveryRequest<'_>,
+        now_ms: u64,
+    ) -> StorageResult<(RecoveryDemandTicket, super::RecoveryDemandTransition)> {
         let (key, cause, predicate, group, event, caller) = match request {
             RecoveryRequest::MaintenanceBoundary { job_id, group_id } => {
                 if job_id.is_empty() || group_id.is_empty() {
@@ -126,6 +137,20 @@ impl SqliteAccountStorage {
         };
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            // Explicit history shares one obligation under the latest caller's
+            // key, so its prior row is the one explicit row, whatever its key.
+            let before = if cause == 3 {
+                conn.query_row_cached(
+                    "SELECT id, revision, state, eligibility FROM account_recovery_obligations
+                     WHERE cause = 3 LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .storage()?
+            } else {
+                super::observe::demand_row(&conn, &key)?
+            };
             if cause == 3 {
                 // Serialized foreground operations share one account-history
                 // obligation. A new caller expands its revision/goal without
@@ -152,15 +177,15 @@ impl SqliteAccountStorage {
                      AND account_recovery_obligations.cause IN (4,5)",
                 params![key,cause,predicate,group,sqlite_integer(now_ms)?,caller],
             ).storage()?;
-            let (id,revision): (Vec<u8>,i64) = conn.query_row_cached(
-                "SELECT id,revision FROM account_recovery_obligations WHERE demand_key=?1",
-                [&key], |row| Ok((row.get(0)?,row.get(1)?)),
-            ).storage()?;
+            let after = super::observe::demand_row(&conn, &key)?.ok_or_else(invalid_demand)?;
             conn.execute_cached(
                 "INSERT OR IGNORE INTO account_recovery_scopes(obligation_id,scope_id,group_id,known_event_id)
-                 VALUES (?1,0,?2,?3)", params![id,group,event],
+                 VALUES (?1,0,?2,?3)", params![after.0,group,event],
             ).storage()?;
-            Ok(RecoveryDemandTicket { id: id.try_into().map_err(|_| invalid_demand())?, revision: i64_to_u64(revision)? })
+            Ok((
+                super::observe::ticket(&after)?,
+                super::observe::transition(before.as_ref(), &after),
+            ))
         })
     }
 

@@ -564,6 +564,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   acquisition below the inventory floor.
 - Explicit catch-up no longer re-subscribes, so a maintenance boundary whose EOSE a lag
   lost waits for the next activation, at reconnect or restart.
-- Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
+- Recovery audit. The owner records its decisions in audit v5 only: need changes, attempt
+  start and finish, per-obligation reassessment, and transport-cursor advances
+  ([audit-logging.md](../audit-logging.md#account-recovery-owner-rows-v5-only)). The rows sit at
+  the comparison job's execution bracket and the owner's storage transitions. The lost-EOSE repair (#2076) has a marked hook point but no row yet.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.

@@ -67,6 +67,7 @@ use crate::{
 };
 
 mod audit;
+mod audit_recovery;
 mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 mod delivery_spill;
@@ -414,6 +415,10 @@ pub struct AppClient {
     /// incomplete"): one small entry per parked occurrence, compared at each
     /// publication seam so a change raises `HistoryNoticesChanged`.
     pub(crate) history_notice_baseline: Option<history_notices::HistoryNoticeBaseline>,
+    /// Account-queue placement counts at this client's previous
+    /// `transport_cursor_advanced` row (or its open), so each row reports
+    /// what changed since.
+    pub(crate) cursor_audit_placements: crate::relay_plane::AccountDeliveryPlacementCounts,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.

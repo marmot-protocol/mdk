@@ -962,6 +962,101 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             generation: 4,
         },
     ]
+    .into_iter()
+    .chain(sample_v5_only_kinds())
+    .collect()
+}
+
+/// Every v5-only kind, populating every optional field, so the v5 schema's
+/// closed property sets and the strict decoder see each field.
+fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
+    vec![
+        AuditEventKind::RecoveryNeedChanged {
+            cause: RecoveryObligationCause::NotificationLoss,
+            change: RecoveryNeedChange::Joined,
+            obligation_id: "0a".repeat(16),
+            obligation_revision: 3,
+            bound: Some(RecoveryGoalBound::Floor),
+            floor_secs: Some(1_700_000_000),
+            charged: Some(4),
+        },
+        AuditEventKind::RecoveryAttemptStarted {
+            attempt_serial: 9,
+            retry_ordinal: 2,
+            seam: EpochBackfillExecutionSeam::Receive,
+            scope: RecoveryAttemptScope::History,
+            causes: vec![
+                RecoveryObligationCause::QueueLoss,
+                RecoveryObligationCause::EpochGap,
+            ],
+            obligation_count: 2,
+            obligation_ids: vec!["0a".repeat(16), "0b".repeat(16)],
+            obligations_truncated: false,
+            route_count: 3,
+            endpoint_count: 2,
+            relay_urls: vec![
+                "wss://relay.one.example".into(),
+                "wss://relay.two.example".into(),
+            ],
+            endpoints_truncated: false,
+            window_since_secs: Some(1_697_408_000),
+            window_until_secs: Some(1_700_000_000),
+            route_cap: 8,
+            admission_per_turn: 4,
+            quantum_ms: 30_000,
+            park_after_quiet_passes: 3,
+        },
+        AuditEventKind::RecoveryAttemptFinished {
+            attempt_serial: 9,
+            duration_ms: 1_250,
+            outcome: RecoveryPassOutcome::Failed,
+            error_kind: Some("storage".into()),
+            obligation_count: 2,
+            routes_compared: 3,
+            routes_certified: 1,
+            routes_uncertified: 2,
+            events_retrieved: 5,
+            events_duplicate: 1,
+            events_rejected: 1,
+            events_retained: 3,
+            events_refused: 0,
+            relays_required: 2,
+            relays_admitted: 2,
+            relays_failed: 1,
+            relays_incomplete: 0,
+        },
+        AuditEventKind::RecoveryObligationReassessed {
+            attempt_serial: 9,
+            cause: RecoveryObligationCause::QueueLoss,
+            obligation_id: "0a".repeat(16),
+            obligation_revision: 3,
+            verdict: RecoveryObligationVerdict::Parked,
+            next_attempt: RecoveryNextAttempt::ExplicitRepairOnly,
+            progress: Some(RecoveryScopeProgress::Quiet),
+            scopes_total: 3,
+            scopes_certified: 1,
+            quiet_passes: Some(3),
+            park_after_quiet_passes: 3,
+        },
+        AuditEventKind::TransportCursorAdvanced {
+            trigger: TransportCursorTrigger::LivePromotion,
+            cursor_before_secs: Some(1_700_000_000),
+            cursor_after_secs: 1_700_000_500,
+            lookback_secs: Some(120),
+            spilled_below_floor: 2,
+            spilled_queue_full: 1,
+            spill_already_seen: 1,
+            queue_dropped: 0,
+        },
+    ]
+}
+
+/// Sample kinds the frozen v4 schema can express.
+fn sample_v4_audit_event_kinds() -> Vec<AuditEventKind> {
+    sample_audit_event_kinds()
+        .into_iter()
+        .filter(|kind| !kind.is_v5_only())
+        .collect()
 }
 
 #[test]
@@ -1009,7 +1104,7 @@ fn audit_log_event_schema_tracks_kind_catalog() {
         })
         .collect::<std::collections::BTreeSet<_>>();
 
-    let code_tags = sample_audit_event_kinds()
+    let code_tags = sample_v4_audit_event_kinds()
         .iter()
         .map(|kind| kind.type_tag().to_string())
         .collect::<std::collections::BTreeSet<_>>();
@@ -1231,7 +1326,7 @@ fn sample_events_serialize_within_schema_property_names() {
 
     // Every sample kind, wrapped in a full event, must serialize using only keys
     // the schema allows (recursively, including nested wire/candidate/value/etc.).
-    for kind in sample_audit_event_kinds() {
+    for kind in sample_v4_audit_event_kinds() {
         let event = AuditEvent {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
             seq: 0,
@@ -2405,7 +2500,7 @@ fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
         operational,
         expected.into_iter().map(str::to_owned).collect()
     );
-    assert_eq!(operational.len(), 44);
+    assert_eq!(operational.len(), 49);
 }
 
 #[test]

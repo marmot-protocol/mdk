@@ -31,6 +31,13 @@ use web_time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod recovery;
+pub use recovery::{
+    RECOVERY_AUDIT_MAX_ENDPOINTS, RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope,
+    RecoveryGoalBound, RecoveryNeedChange, RecoveryNextAttempt, RecoveryObligationCause,
+    RecoveryObligationVerdict, RecoveryPassOutcome, RecoveryScopeProgress, TransportCursorTrigger,
+};
+
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 
 /// Size at which [`JsonlRecorder`] seals the active file into an immutable
@@ -1171,6 +1178,161 @@ pub enum AuditEventKind {
         current_tip_epoch: u64,
         generation: u64,
     },
+    /// Recovery need changed: loss or demand charged to an obligation, a
+    /// parked obligation's notice shown or dismissed, or a parked obligation
+    /// closed. Recorded by the account recovery owner at the durable write
+    /// that made the change, never per scheduler evaluation. Group-scoped
+    /// demand carries the enclosing `group_ref`; account-wide demand has none.
+    ///
+    /// `obligation_id` is the owner's durable 16-byte obligation id (hex); v5
+    /// writes it as the one-way `obligation_ref`, stable across the
+    /// obligation's life so later rows join it. `obligation_revision` is the
+    /// revision the change left. `bound`/`floor_secs` describe the goal's
+    /// lower bound after the change, and `charged` counts the deliveries
+    /// (queue loss) or lagged notifications (notification loss) this change
+    /// newly charged. A notification count is an observation count, never a
+    /// claim about how many events were missed.
+    ///
+    /// v5 only. Epoch-gap arms keep their `epoch_stall_backfill_armed` row.
+    RecoveryNeedChanged {
+        cause: RecoveryObligationCause,
+        change: RecoveryNeedChange,
+        obligation_id: String,
+        obligation_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bound: Option<RecoveryGoalBound>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floor_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        charged: Option<u64>,
+    },
+    /// The recovery owner started one reserved, frozen attempt. Account-scoped;
+    /// `context.operation_id` is `recovery-<attempt_serial>`, shared with the
+    /// attempt's other rows. Several obligations may share one attempt:
+    /// `obligation_count` is exact and `obligation_ids` lists at most
+    /// [`RECOVERY_AUDIT_MAX_OBLIGATIONS`] of them, with `obligations_truncated`
+    /// set when it omits any. `relay_urls` lists the distinct endpoints the
+    /// frozen plan admits, bounded the same way by
+    /// [`RECOVERY_AUDIT_MAX_ENDPOINTS`]; v5 writes them as hashed
+    /// `endpoint_refs`. The window is the frozen comparison window over every
+    /// route. The trailing fields are the budgets in force in this build.
+    ///
+    /// v5 only.
+    RecoveryAttemptStarted {
+        attempt_serial: u64,
+        retry_ordinal: u64,
+        seam: EpochBackfillExecutionSeam,
+        scope: RecoveryAttemptScope,
+        causes: Vec<RecoveryObligationCause>,
+        obligation_count: u64,
+        obligation_ids: Vec<String>,
+        obligations_truncated: bool,
+        route_count: u64,
+        endpoint_count: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        relay_urls: Vec<String>,
+        endpoints_truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_since_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_until_secs: Option<u64>,
+        route_cap: u64,
+        admission_per_turn: u64,
+        quantum_ms: u64,
+        park_after_quiet_passes: u64,
+    },
+    /// One finished pass of a started attempt: what the relays returned and
+    /// what processing made of it. Account-scoped; same `operation_id` as the
+    /// start row. Recorded on every exit of the execution bracket, including
+    /// failure, cancellation and supersession.
+    ///
+    /// Counters keep distinct meanings. `events_retrieved` counts events the
+    /// comparison's relays handed over. Of what reached ingest,
+    /// `events_duplicate` were already held, `events_retained` were durably
+    /// retained, and `events_refused` were refused under a local resource
+    /// bound (a subset of what was ingested, not of `events_retained`).
+    /// `events_rejected` could not be read as a transport message or no
+    /// longer routed to this account. Engine application is not counted here:
+    /// the engine's own rows record it. A route that finished comparing is
+    /// not proof of complete history: only `routes_certified` routes carry a
+    /// comparison certificate for the frozen window.
+    ///
+    /// Relay counts are distinct endpoints over the frozen plan
+    /// (`relays_required`, `relays_admitted`) and summed per compared route
+    /// (`relays_failed`, `relays_incomplete`: answered but withheld a claimed
+    /// event). v5 only.
+    RecoveryAttemptFinished {
+        attempt_serial: u64,
+        duration_ms: u64,
+        outcome: RecoveryPassOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
+        obligation_count: u64,
+        routes_compared: u64,
+        routes_certified: u64,
+        routes_uncertified: u64,
+        events_retrieved: u64,
+        events_duplicate: u64,
+        events_rejected: u64,
+        events_retained: u64,
+        events_refused: u64,
+        relays_required: u64,
+        relays_admitted: u64,
+        relays_failed: u64,
+        relays_incomplete: u64,
+    },
+    /// The owner's verdict on one obligation after a pass it settled, read
+    /// back from storage after the checkpoint committed. Group-scoped demand
+    /// carries `group_ref`. One row per settled obligation, at most
+    /// [`RECOVERY_AUDIT_MAX_OBLIGATIONS`] per pass (the finished row's
+    /// `obligation_count` is exact). A pass that stopped before settlement
+    /// writes no reassessment: its obligations stand as they were.
+    ///
+    /// `scopes_certified` counts scopes with a certificate valid for this
+    /// goal after the pass, `quiet_passes` the longest quiet streak among the
+    /// rest, against `park_after_quiet_passes`. `progress` aggregates this
+    /// obligation's compared scopes; absent when the pass compared none.
+    /// v5 only.
+    RecoveryObligationReassessed {
+        attempt_serial: u64,
+        cause: RecoveryObligationCause,
+        obligation_id: String,
+        obligation_revision: u64,
+        verdict: RecoveryObligationVerdict,
+        next_attempt: RecoveryNextAttempt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<RecoveryScopeProgress>,
+        scopes_total: u64,
+        scopes_certified: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quiet_passes: Option<u64>,
+        park_after_quiet_passes: u64,
+    },
+    /// The persisted transport cursor advanced. Account-scoped. A drain
+    /// checkpoint, settled loss or retired notice records every advance; a
+    /// live ingest's own promotion only when it moves the cursor by more than
+    /// the rebuild lookback, so ordinary live traffic writes no rows.
+    ///
+    /// The four counters are account-queue placements since this client's
+    /// previous cursor row (or its open): deliveries sent to the durable
+    /// spill because the cursor floor had moved past them
+    /// (`spilled_below_floor`) or because the queue was full
+    /// (`spilled_queue_full`), spilled deliveries discarded as already held
+    /// before using capacity (`spill_already_seen`), and deliveries omitted
+    /// into queue loss (`queue_dropped`). Units: Nostr seconds for the
+    /// cursor. v5 only.
+    TransportCursorAdvanced {
+        trigger: TransportCursorTrigger,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_before_secs: Option<u64>,
+        cursor_after_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lookback_secs: Option<u64>,
+        spilled_below_floor: u64,
+        spilled_queue_full: u64,
+        spill_already_seen: u64,
+        queue_dropped: u64,
+    },
 }
 
 impl AuditEventKind {
@@ -1226,7 +1388,25 @@ impl AuditEventKind {
             AuditEventKind::EpochStallBackfillDeferred { .. } => "epoch_stall_backfill_deferred",
             AuditEventKind::EpochStallBackfillEscalated { .. } => "epoch_stall_backfill_escalated",
             AuditEventKind::ConvergencePassDiscarded { .. } => "convergence_pass_discarded",
+            AuditEventKind::RecoveryNeedChanged { .. } => "recovery_need_changed",
+            AuditEventKind::RecoveryAttemptStarted { .. } => "recovery_attempt_started",
+            AuditEventKind::RecoveryAttemptFinished { .. } => "recovery_attempt_finished",
+            AuditEventKind::RecoveryObligationReassessed { .. } => "recovery_obligation_reassessed",
+            AuditEventKind::TransportCursorAdvanced { .. } => "transport_cursor_advanced",
         }
+    }
+
+    /// Kinds that exist only in audit v5. The frozen v4 schema cannot express
+    /// them, so a v4 recorder drops them instead of writing an invalid row.
+    pub fn is_v5_only(&self) -> bool {
+        matches!(
+            self,
+            AuditEventKind::RecoveryNeedChanged { .. }
+                | AuditEventKind::RecoveryAttemptStarted { .. }
+                | AuditEventKind::RecoveryAttemptFinished { .. }
+                | AuditEventKind::RecoveryObligationReassessed { .. }
+                | AuditEventKind::TransportCursorAdvanced { .. }
+        )
     }
 }
 
@@ -1663,6 +1843,11 @@ impl ForensicRecorder for JsonlRecorder {
             Err(poisoned) => poisoned.into_inner(),
         };
         if inner.recording_finished {
+            return;
+        }
+        // The frozen v4 schema cannot express v5-only kinds; dropping them
+        // keeps a v4 file valid. Nothing was attempted, so health is untouched.
+        if matches!(inner.format, RecorderFormat::V4) && record.kind.is_v5_only() {
             return;
         }
         if self.ensure_safe_writer(&mut inner).is_err() {

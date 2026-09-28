@@ -14,6 +14,9 @@ pub use audit::{
     EpochBackfillReplayScope, EpochStallBackfillTrigger, ForensicRecorder, ForkWinner, GroupRefHex,
     GroupStateValue, JsonlRecorder, MemberRefHex, MembershipChangeSource, MessageArtifactKind,
     MessageRefHex, NoopRecorder, OutboundMessage, PeelerOutcomeKind, PublishRelayFailure,
-    RecipientExpectation, RecipientScope, RelayRegistration, default_jsonl_path,
+    RECOVERY_AUDIT_MAX_ENDPOINTS, RECOVERY_AUDIT_MAX_OBLIGATIONS, RecipientExpectation,
+    RecipientScope, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
+    RecoveryNextAttempt, RecoveryObligationCause, RecoveryObligationVerdict, RecoveryPassOutcome,
+    RecoveryScopeProgress, RelayRegistration, TransportCursorTrigger, default_jsonl_path,
     default_v5_jsonl_path, member_ref_hex,
 };

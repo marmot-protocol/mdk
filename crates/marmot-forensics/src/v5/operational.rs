@@ -113,6 +113,7 @@ fn diagnostic_ref(kind: &str, input: &str) -> String {
     let namespace = match kind {
         "branch_id" | "selected_branch_id" | "losing_branch_ids" => "branch",
         "snapshot_name" | "fallback_snapshot_name" => "snapshot",
+        "obligation_id" | "obligation_ids" => "obligation",
         other => other,
     };
     let mut hash = Sha256::new();
@@ -496,6 +497,8 @@ fn renamed(key: &str) -> &str {
         "snapshot_name" => "snapshot_ref",
         "fallback_snapshot_name" => "fallback_snapshot_ref",
         "device_id" => "device_ref",
+        "obligation_id" => "obligation_ref",
+        "obligation_ids" => "obligation_refs",
         other => other,
     }
 }
@@ -530,6 +533,8 @@ fn old_name(key: &str) -> &str {
         "snapshot_ref" => "snapshot_name",
         "fallback_snapshot_ref" => "fallback_snapshot_name",
         "device_ref" => "device_id",
+        "obligation_ref" => "obligation_id",
+        "obligation_refs" => "obligation_ids",
         other => other,
     }
 }
@@ -590,7 +595,9 @@ fn protect(value: &mut Value) -> Result<(), ContractError> {
                     | "operation_id"
                     | "snapshot_name"
                     | "fallback_snapshot_name"
-                    | "device_id" => {
+                    | "device_id"
+                    | "obligation_id"
+                    | "obligation_ids" => {
                         map_strings(&mut child, |s| Ok(diagnostic_ref(&key, s)))?;
                     }
                     "hardware_model" => map_strings(&mut child, |s| Ok(safe_metadata(s, b",._-")))?,
@@ -649,7 +656,15 @@ fn protect(value: &mut Value) -> Result<(), ContractError> {
                     | "seam"
                     | "replay_scope"
                     | "activation_outcome"
-                    | "completion_kind" => {
+                    | "completion_kind"
+                    | "cause"
+                    | "causes"
+                    | "change"
+                    | "bound"
+                    | "scope"
+                    | "verdict"
+                    | "next_attempt"
+                    | "progress" => {
                         if matches!(child, Value::String(_) | Value::Array(_)) {
                             map_strings(&mut child, |s| Ok(safe_category(s)))?;
                         }
@@ -763,6 +778,8 @@ fn validate_protected(value: &Value) -> Result<(), ContractError> {
                         | "snapshot_ref"
                         | "fallback_snapshot_ref"
                         | "device_ref"
+                        | "obligation_ref"
+                        | "obligation_refs"
                 );
                 if hashed {
                     let valid = |s: &str| {

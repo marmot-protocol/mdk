@@ -12318,7 +12318,14 @@ pub(crate) struct LiveCursorFixture {
 
 impl LiveCursorFixture {
     pub(crate) async fn open() -> Self {
-        let fixture = Self::open_with_cursor(true).await;
+        let fixture = Self::open_with_cursor(true, false).await;
+        assert_eq!(fixture.persisted(), Some(fixture.cursor_before));
+        fixture
+    }
+
+    /// [`Self::open`] with v5 audit recording enabled before the account opens.
+    pub(crate) async fn open_audited() -> Self {
+        let fixture = Self::open_with_cursor(true, true).await;
         assert_eq!(fixture.persisted(), Some(fixture.cursor_before));
         fixture
     }
@@ -12326,12 +12333,12 @@ impl LiveCursorFixture {
     /// The same account before it has ever persisted a transport cursor.
     /// `cursor_before` is then only a reference time for probes.
     pub(crate) async fn open_without_cursor() -> Self {
-        let fixture = Self::open_with_cursor(false).await;
+        let fixture = Self::open_with_cursor(false, false).await;
         assert_eq!(fixture.persisted(), None);
         fixture
     }
 
-    async fn open_with_cursor(seed_cursor: bool) -> Self {
+    async fn open_with_cursor(seed_cursor: bool, audited: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
@@ -12344,6 +12351,10 @@ impl LiveCursorFixture {
             relay.clone(),
             true,
         );
+        if audited {
+            app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+                .unwrap();
+        }
         let cursor_before = crate::unix_now_seconds().saturating_sub(10_000);
         app.ensure_account_state("alice").unwrap();
         if seed_cursor {

@@ -48,6 +48,8 @@ struct AdmissionRoute {
     admitted: bool,
     /// Events durably admitted: progress, even without a certificate.
     fetched: usize,
+    /// What the relays returned, for the attempt's audit row only.
+    acquisition: super::super::audit_recovery::RouteAcquisition,
 }
 
 fn comparison_failure(error: AppError) -> ClassifiedSyncFailure {
@@ -363,7 +365,7 @@ impl AppClient {
         compare_inventory: bool,
     ) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
-        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        self.synchronize_recovery_loss(&storage)?;
         drop(self.transport_receipts()?);
         self.observe_recovery_route_policy()?;
         let current = storage.recovery_revision_fence()?;
@@ -414,6 +416,7 @@ impl AppClient {
                 route.result,
                 ComparisonRouteWorkResult::TimedOut | ComparisonRouteWorkResult::Returned(Err(_))
             );
+            let mut acquisition = super::super::audit_recovery::RouteAcquisition::default();
             let (outcome, certified, answered, events) = match route.result {
                 ComparisonRouteWorkResult::Skipped => {
                     (Outcome::ServicedPartial, false, false, Vec::new())
@@ -426,6 +429,9 @@ impl AppClient {
                     (Outcome::Unsupported, false, true, Vec::new())
                 }
                 ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
+                    acquisition =
+                        super::super::audit_recovery::RouteAcquisition::from_summary(&summary);
+                    acquisition.retrieved = events.len();
                     let (outcome, certified, answered) = inventory
                         .map_or((Outcome::TransientFailure, false, false), |inventory| {
                             inventory.judge(&summary)
@@ -445,6 +451,7 @@ impl AppClient {
                 answered,
                 admitted,
                 fetched: 0,
+                acquisition,
             });
         }
         Ok(Some(admission))
@@ -487,6 +494,9 @@ impl AppClient {
                 Err(error) => return Err(error.into()),
             };
             route.admitted &= !deliveries.is_empty();
+            if deliveries.is_empty() {
+                route.acquisition.rejected = route.acquisition.rejected.saturating_add(1);
+            }
             for delivery in deliveries {
                 let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
                 admission.summary.merge(summary);
@@ -636,6 +646,13 @@ impl AppClient {
                 if let Some(reason) = control.and_then(FullHistoryRepairControl::stopped) {
                     self.recovery_job_admission_expired |=
                         reason == crate::FullHistoryRepairIncompleteReason::Deadline;
+                    execution.execution.interruption = Some(
+                        if reason == crate::FullHistoryRepairIncompleteReason::Deadline {
+                            marmot_forensics::RecoveryPassOutcome::Deadline
+                        } else {
+                            marmot_forensics::RecoveryPassOutcome::Cancelled
+                        },
+                    );
                     admission.invalid = true;
                     admission.pending.clear();
                     break;
@@ -667,10 +684,19 @@ impl AppClient {
         let comparison_selected = grant.comparison_revision.is_some();
         let settled = match admission {
             // The grant changed before admission; nothing was admitted.
-            None => Ok(None),
+            None => {
+                execution.interruption = Some(marmot_forensics::RecoveryPassOutcome::Superseded);
+                Ok(None)
+            }
             // A change during admission keeps the durable prefix but certifies
             // nothing; the debt waits for a later grant.
-            Some(admission) if admission.invalid => Ok(Some(admission.summary)),
+            Some(admission) if admission.invalid => {
+                // A repair stopped at a turn boundary already named why.
+                execution.interruption = execution
+                    .interruption
+                    .or(Some(marmot_forensics::RecoveryPassOutcome::Superseded));
+                Ok(Some(admission.summary))
+            }
             Some(admission) => self
                 .checkpoint_comparison_admission(&grant, &mut execution, admission)
                 .await
@@ -708,7 +734,9 @@ impl AppClient {
         grant: AttemptGrant,
         execution: ComparisonExecution,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
-        self.finish_recovery_execution(&grant, *execution.execution, Ok(SyncSummary::default()))
+        let mut execution = *execution.execution;
+        execution.interruption = Some(marmot_forensics::RecoveryPassOutcome::Cancelled);
+        self.finish_recovery_execution(&grant, execution, Ok(SyncSummary::default()))
             .map_err(|failure| failure.source)?;
         Ok(EpochBackfillRunOutcome::Deferred)
     }
@@ -766,10 +794,17 @@ impl AppClient {
                 // Incomplete admission withholds the certificate and retries
                 // the route, but the relays still answered.
                 answered: route.answered,
+                acquisition: route.acquisition,
             });
         }
-        self.settle_recovery_grant(grant, &mut execution.counts, outcomes, admission.summary)
-            .await
+        self.settle_recovery_grant(
+            grant,
+            &mut execution.counts,
+            &mut execution.tally,
+            outcomes,
+            admission.summary,
+        )
+        .await
     }
 }
 
@@ -888,6 +923,19 @@ mod tests {
         relays: Option<Vec<String>>,
         comparison: bool,
     ) -> Fixture {
+        fixture_with_options(relays, comparison, false).await
+    }
+
+    /// The default fixture, recording audit v5 from before the account opens.
+    async fn audited_fixture() -> Fixture {
+        fixture_with_options(None, true, true).await
+    }
+
+    async fn fixture_with_options(
+        relays: Option<Vec<String>>,
+        comparison: bool,
+        audited: bool,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -895,6 +943,10 @@ mod tests {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        if audited {
+            app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+                .unwrap();
+        }
         let pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
@@ -1498,5 +1550,124 @@ mod tests {
         let slot = fixture.storage.recovery_comparison().unwrap();
         assert!(slot.pending());
         assert!(!slot.plan.unwrap().retry_routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn comparison_pass_records_acquisition_counts_and_verdicts() {
+        use crate::client::audit_recovery::recorded_v5_rows;
+        let mut fixture = audited_fixture().await;
+        let (grant, execution, route, group_route) = group_route_grant(&mut fixture).await;
+        let serial = grant.reservation.attempt_serial;
+        let obligations = grant.fence.obligations.len();
+        fixture
+            .client
+            .admit_comparison_inline(
+                grant,
+                execution,
+                fetched(
+                    route,
+                    vec![
+                        unreadable_for_route(group_route),
+                        candidate_for_route(group_route),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        let app = fixture.client.app.clone();
+        let started = recorded_v5_rows(&app, "recovery_attempt_started");
+        assert_eq!(started.len(), 1);
+        let started = &started[0]["event"];
+        assert_eq!(started["attempt_serial"], serial);
+        assert_eq!(started["scope"], "history");
+        assert_eq!(
+            started["route_cap"],
+            TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
+        );
+        assert_eq!(
+            started["admission_per_turn"],
+            MAX_COMPARISON_ADMISSION_PER_TURN
+        );
+        assert_eq!(
+            started["quantum_ms"],
+            TRANSPORT_RECONCILIATION_QUANTUM.as_millis() as u64
+        );
+
+        let finished = recorded_v5_rows(&app, "recovery_attempt_finished");
+        assert_eq!(finished.len(), 1);
+        let finished = &finished[0]["event"];
+        assert_eq!(finished["attempt_serial"], serial);
+        assert_eq!(finished["obligation_count"], obligations);
+        assert_eq!(finished["events_retrieved"], 2, "both handed-over events");
+        assert_eq!(finished["events_rejected"], 1, "the unreadable one");
+        assert_eq!(finished["routes_compared"], 1);
+        // An unadmitted event withholds the route's certificate.
+        assert_eq!(finished["routes_certified"], 0);
+        assert_eq!(finished["routes_uncertified"], 1);
+        assert!(finished.get("error_kind").is_none());
+
+        let reassessed = recorded_v5_rows(&app, "recovery_obligation_reassessed");
+        assert_eq!(reassessed.len(), obligations);
+        for row in &reassessed {
+            assert_eq!(row["event"]["attempt_serial"], serial);
+            assert_eq!(
+                row["event"]["record_context"]["operation_ref"],
+                finished["record_context"]["operation_ref"]
+            );
+            assert!(
+                row["event"]["scopes_certified"].as_u64() <= row["event"]["scopes_total"].as_u64()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_changed_before_admission_records_a_superseded_pass() {
+        use crate::client::audit_recovery::recorded_v5_rows;
+        let mut fixture = audited_fixture().await;
+        let grant = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        let route = grant.inventory.first().unwrap().route.clone();
+        let attempt = fixture.client.begin_comparison_grant(&grant).await.unwrap();
+        fixture.client.adapter.require_fresh_activation().await;
+        fixture
+            .client
+            .runtime
+            .activate_transport(None)
+            .await
+            .unwrap();
+        let result = fixture
+            .client
+            .admit_comparison_inline(grant, attempt, network_result(route, Some([8; 32])))
+            .await
+            .unwrap();
+        assert!(matches!(result, EpochBackfillRunOutcome::Deferred));
+        let app = fixture.client.app.clone();
+        let finished = recorded_v5_rows(&app, "recovery_attempt_finished");
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0]["event"]["outcome"], "superseded");
+        assert!(
+            recorded_v5_rows(&app, "recovery_obligation_reassessed").is_empty(),
+            "a pass that settled nothing records no verdicts"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_network_pass_records_a_cancelled_pass() {
+        use crate::client::audit_recovery::recorded_v5_rows;
+        let mut fixture = audited_fixture().await;
+        let (grant, execution, _, _) = group_route_grant(&mut fixture).await;
+        let result = fixture
+            .client
+            .abandon_comparison_grant(grant, execution)
+            .unwrap();
+        assert!(matches!(result, EpochBackfillRunOutcome::Deferred));
+        let app = fixture.client.app.clone();
+        let finished = recorded_v5_rows(&app, "recovery_attempt_finished");
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0]["event"]["outcome"], "cancelled");
+        assert_eq!(finished[0]["event"]["routes_compared"], 0);
     }
 }

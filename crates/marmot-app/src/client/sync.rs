@@ -40,7 +40,7 @@ use super::epoch_stall::BackfillDecision;
 use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
 use crate::config::CursorPersistence;
 
-mod comparison_job;
+pub(super) mod comparison_job;
 #[cfg(test)]
 pub(crate) use comparison_job::TestComparisonActivityWitness;
 pub(crate) use comparison_job::{ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob};
@@ -55,12 +55,12 @@ pub(crate) enum PendingRecoverySelection {
 /// Partial progress is durable, so a slow or non-NIP-77 relay cannot hold the
 /// account worker indefinitely and the next sync can resume from a smaller
 /// difference.
-const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
+pub(super) const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
 /// Four two-second route passes leave margin inside the account-wide quantum.
 /// The durable cursor starts the next pass after the rotation prefix the last
 /// pass covered, so it must hold at least two routes: see
 /// [`order_reconciliation_pass`].
-const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
+pub(super) const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
 
 // ponytail: EOSE crosses a separate router task; retain a short quiet window
 // until delivery and EOSE can share an ordered receive lane.
@@ -416,6 +416,12 @@ pub(crate) struct RecoveryExecutionState {
     started: Instant,
     counts: DrainCounts,
     activation: EpochBackfillActivationOutcome,
+    /// How the pass stopped when it ended without settling: cancelled, cut
+    /// at its deadline, or superseded by a grant change. `None` once it
+    /// settled or failed.
+    interruption: Option<marmot_forensics::RecoveryPassOutcome>,
+    /// What settlement saw, for the `recovery_attempt_finished` row.
+    tally: super::audit_recovery::RecoveryPassTally,
 }
 
 /// The public outcome of an explicit full-history repair that did not
@@ -492,6 +498,9 @@ fn epoch_backfill_terminal_rows(
         .collect()
 }
 
+/// One obligation a settled pass reassessed, for its audit row.
+type Reassessed = super::audit_recovery::ReassessedObligation;
+
 /// The cursor a commit chose, from [`AppClient::seal_transport_cursor`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SealedTransportCursor {
@@ -499,6 +508,13 @@ pub(crate) struct SealedTransportCursor {
     previous: Option<u64>,
     /// What the commit reached on its own; `None` when a fence held it.
     reached: Option<u64>,
+}
+
+impl SealedTransportCursor {
+    /// The cursor the commit replaced.
+    pub(crate) fn previous(&self) -> Option<u64> {
+        self.previous
+    }
 }
 
 /// What one delivery's ingest settled, for the two seams that decide whether the
@@ -552,6 +568,9 @@ pub(crate) struct RouteComparison {
     /// certified nor admitted anything is quiet. A failed or timed-out relay,
     /// or a route this pass skipped, did not answer.
     pub(crate) answered: bool,
+    /// What the route's relays returned, for the attempt's audit row only.
+    /// Settlement never reads it.
+    pub(crate) acquisition: super::audit_recovery::RouteAcquisition,
 }
 
 /// What one drain loop saw on the wire.
@@ -609,7 +628,7 @@ pub(crate) enum ConvergenceScheduleState {
     PendingOutbound { retry_after_ms: Option<u64> },
 }
 
-enum SyncCheckpointError {
+pub(super) enum SyncCheckpointError {
     BeforePersistence(AppError),
     AfterPersistence(AppError),
 }
@@ -1008,8 +1027,13 @@ impl AppClient {
     /// cursor an earlier live promotion left persisted must not, or the router
     /// would stop spilling what only that promotion exposed. A live ingest's
     /// save never settles.
-    pub(crate) fn settle_transport_cursor(&self, sealed: SealedTransportCursor) {
+    pub(crate) fn settle_transport_cursor(
+        &mut self,
+        sealed: SealedTransportCursor,
+        trigger: marmot_forensics::TransportCursorTrigger,
+    ) {
         self.adapter.settle_transport_cursor(sealed.reached);
+        self.record_transport_cursor_advanced(trigger, &sealed);
     }
 
     #[cfg(test)]
@@ -1032,14 +1056,15 @@ impl AppClient {
         // the omission. Re-observe the same token here so the queued signal is
         // also an idempotent storage boundary before recovery starts.
         let storage = self.app.account_storage(&self.state.label)?;
-        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        self.synchronize_recovery_loss(&storage)?;
         if overflow.dropped > 0 {
-            storage.mark_account_delivery_recovery_bounded(
+            let marked = storage.mark_account_delivery_recovery_observed(
                 &self.state.label,
                 overflow.marker_token,
                 overflow.dropped,
                 overflow.earliest_dropped,
             )?;
+            self.record_recovery_loss_imports(&storage, marked.into_iter().collect());
         }
         if overflow.notification_losses > 0 {
             // The lag's REQ floors bound the loss from below. Each lag mints a
@@ -1053,7 +1078,7 @@ impl AppClient {
                 unix_now_seconds(),
                 overflow.notification_floor,
             )?;
-            storage.synchronize_account_delivery_loss(&self.state.label)?;
+            self.synchronize_recovery_loss(&storage)?;
             self.adapter.notification_loss_persisted(overflow);
         }
         // A late observation of loss the user already retired rearms nothing.
@@ -2225,6 +2250,12 @@ impl AppClient {
                     SyncFailureStage::StatePersist,
                 ));
             }
+            if let Some(sealed) = sealed {
+                self.record_transport_cursor_advanced(
+                    marmot_forensics::TransportCursorTrigger::LivePromotion,
+                    &sealed,
+                );
+            }
         }
         let refresh = match self.refresh_group_routes() {
             Ok(refresh) => refresh,
@@ -2258,6 +2289,12 @@ impl AppClient {
                     error,
                     SyncFailureStage::StatePersist,
                 ));
+            }
+            if let Some(sealed) = sealed {
+                self.record_transport_cursor_advanced(
+                    marmot_forensics::TransportCursorTrigger::LivePromotion,
+                    &sealed,
+                );
             }
         }
         self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
@@ -2574,7 +2611,7 @@ impl AppClient {
         ClassifiedSyncFailure::at_stage(summary, source, stage)
     }
 
-    async fn checkpoint_sync_prefix(
+    pub(super) async fn checkpoint_sync_prefix(
         &mut self,
         summary: &mut SyncSummary,
         routes_dirty: bool,
@@ -2619,7 +2656,10 @@ impl AppClient {
             return Err(SyncCheckpointError::BeforePersistence(error));
         }
         if let Some(sealed) = sealed {
-            self.settle_transport_cursor(sealed);
+            self.settle_transport_cursor(
+                sealed,
+                marmot_forensics::TransportCursorTrigger::DrainCheckpoint,
+            );
         }
 
         summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
@@ -3892,6 +3932,7 @@ impl AppClient {
             ..AuditEventContext::default()
         };
         let started = Instant::now();
+        self.record_recovery_attempt_started(grant, &context);
         if !audit_groups.is_empty() {
             self.record_epoch_stall_backfill_started(
                 grant.seam,
@@ -3907,6 +3948,8 @@ impl AppClient {
             started,
             counts: DrainCounts::default(),
             activation: EpochBackfillActivationOutcome::Failed,
+            interruption: None,
+            tally: Default::default(),
         })
     }
 
@@ -3918,6 +3961,28 @@ impl AppClient {
         mut execution: RecoveryExecutionState,
         result: Result<SyncSummary, ClassifiedSyncFailure>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        // The pass itself is over; what follows settles loss and the cursor,
+        // which have their own rows.
+        self.record_recovery_attempt_finished(
+            grant,
+            &execution.context,
+            u64::try_from(execution.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            super::audit_recovery::pass_outcome(
+                result.is_err(),
+                execution.interruption,
+                &execution.tally,
+                execution
+                    .counts
+                    .deliveries
+                    .saturating_sub(execution.counts.unpersisted),
+            ),
+            result
+                .as_ref()
+                .err()
+                .map(|failure| failure.source.privacy_safe_kind()),
+            &execution.counts,
+            &execution.tally,
+        );
         if result.is_err() {
             self.abandon_loss_completion().map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
@@ -4001,7 +4066,10 @@ impl AppClient {
                         SyncFailureStage::StatePersist,
                     ));
                 }
-                self.settle_transport_cursor(sealed);
+                self.settle_transport_cursor(
+                    sealed,
+                    marmot_forensics::TransportCursorTrigger::LossSettled,
+                );
             }
         }
         if let Some(guard) = execution.overflow_guard.as_mut() {
@@ -4017,9 +4085,11 @@ impl AppClient {
         &mut self,
         grant: &AttemptGrant,
         counts: &mut DrainCounts,
+        tally: &mut super::audit_recovery::RecoveryPassTally,
         comparison_outcomes: Vec<RouteComparison>,
         mut summary: SyncSummary,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        tally.observe_routes(&comparison_outcomes);
         let local = self.drain_pending_session_events().await.map_err(|error| {
             ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::Unknown)
         })?;
@@ -4034,8 +4104,8 @@ impl AppClient {
                     SyncFailureStage::StatePersist,
                 )
             })?;
-        let checkpoint = (|| -> Result<(), AppError> {
-            storage.synchronize_account_delivery_loss(&self.state.label)?;
+        let checkpoint = (|| -> Result<Vec<Reassessed>, AppError> {
+            self.synchronize_recovery_loss(&storage)?;
             drop(self.transport_receipts()?);
             self.observe_recovery_route_policy()?;
             // An uncertified endpoint's outcome stays Unknown, distinct from
@@ -4088,6 +4158,7 @@ impl AppClient {
             }
             let mut progressed_any = false;
             let mut explicit_window_certified = false;
+            let mut reassessed = Vec::new();
             for obligation in grant.plan().expect("validated executor grant") {
                 // A selected group can lack any executable route even though
                 // another obligation made the account ready. Preserve that
@@ -4145,6 +4216,11 @@ impl AppClient {
                 );
                 let mut certified = false;
                 let mut fetched = false;
+                // Audit only: scopes certified for this goal after the pass,
+                // and this obligation's own pass progress.
+                let mut scopes_certified = 0_u64;
+                let mut obligation_progress = None;
+                let mut closed_below_window = false;
                 let mut checkpoints = Vec::with_capacity(obligation.scopes.len());
                 // Each compared scope's own pass: quiet only when its required
                 // relays answered and it neither certified nor admitted anything.
@@ -4174,14 +4250,15 @@ impl AppClient {
                         });
                     // A scope this pass did not compare, or already certified
                     // for this goal, keeps the certificates it has.
+                    let kept_certificate = grant
+                        .certified_scopes
+                        .contains(&(obligation.id, scope.goal.scope_id));
                     if comparison_owned
                         && !unroutable
                         && scope.goal.known_event_id.is_none()
-                        && (compared.is_none()
-                            || grant
-                                .certified_scopes
-                                .contains(&(obligation.id, scope.goal.scope_id)))
+                        && (compared.is_none() || kept_certificate)
                     {
+                        scopes_certified += u64::from(kept_certificate);
                         continue;
                     }
                     // A comparison proves only the window it compared. A goal
@@ -4209,20 +4286,26 @@ impl AppClient {
                         && covers_goal
                         && compared.is_some_and(|compared| compared.certified);
                     certified |= scope_certified;
-                    progress.push((
-                        scope.goal.scope_id,
-                        if window_searched {
-                            storage_sqlite::RecoveryPassProgress::WindowCertified
-                        } else if scope_certified
-                            || compared.is_some_and(|compared| compared.fetched > 0)
-                        {
-                            storage_sqlite::RecoveryPassProgress::Progressed
-                        } else if !refused && compared.is_some_and(|compared| compared.answered) {
-                            storage_sqlite::RecoveryPassProgress::Quiet
-                        } else {
-                            storage_sqlite::RecoveryPassProgress::Unserved
-                        },
-                    ));
+                    scopes_certified += u64::from(scope_certified);
+                    let scope_progress = if window_searched {
+                        storage_sqlite::RecoveryPassProgress::WindowCertified
+                    } else if scope_certified
+                        || compared.is_some_and(|compared| compared.fetched > 0)
+                    {
+                        storage_sqlite::RecoveryPassProgress::Progressed
+                    } else if !refused && compared.is_some_and(|compared| compared.answered) {
+                        storage_sqlite::RecoveryPassProgress::Quiet
+                    } else {
+                        storage_sqlite::RecoveryPassProgress::Unserved
+                    };
+                    if compared.is_some() {
+                        tally.observe_progress(scope_progress);
+                        obligation_progress = Some(super::audit_recovery::merge_progress(
+                            obligation_progress,
+                            scope_progress,
+                        ));
+                    }
+                    progress.push((scope.goal.scope_id, scope_progress));
                     let retained_known_event = match (&route, scope.goal.known_event_id) {
                         (Some(route), Some(event)) => storage.retained_recovery_event(
                             route,
@@ -4296,7 +4379,7 @@ impl AppClient {
                                 .iter()
                                 .find(|(id, _)| *id == obligation.id)
                             {
-                                storage.close_explicit_history_request(
+                                closed_below_window = storage.close_explicit_history_request(
                                     storage_sqlite::RecoveryDemandTicket {
                                         id: obligation.id,
                                         revision: *revision,
@@ -4314,6 +4397,13 @@ impl AppClient {
                         eligibility,
                     )?;
                 }
+                reassessed.push(super::audit_recovery::ReassessedObligation {
+                    id: obligation.id,
+                    progress: obligation_progress,
+                    scopes_certified,
+                    comparison_owned,
+                    closed_below_window,
+                });
             }
             self.explicit_history_window_certified = explicit_window_certified;
             if progressed_any {
@@ -4322,11 +4412,20 @@ impl AppClient {
                 self.recovery_owner
                     .observe_certified_progress(&storage, grant)?;
             }
-            Ok(())
+            Ok(reassessed)
         })();
-        checkpoint.map_err(|error| {
+        let reassessed = checkpoint.map_err(|error| {
             ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::StatePersist)
         })?;
+        self.record_recovery_reassessments(
+            &storage,
+            grant,
+            &AuditEventContext {
+                operation_id: Some(format!("recovery-{}", grant.reservation.attempt_serial)),
+                ..AuditEventContext::default()
+            },
+            reassessed,
+        );
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
@@ -4386,14 +4485,19 @@ impl AppClient {
             .account_storage(&self.state.label)
             .map_err(|error| state_persist(SyncSummary::default(), error))?;
         let operation = rand::random::<[u8; 16]>();
-        let ticket = storage
-            .request_recovery(
+        let (ticket, transition) = storage
+            .request_recovery_observed(
                 storage_sqlite::RecoveryRequest::ExplicitHistory {
                     operation_id: &operation,
                 },
                 unix_now_seconds().saturating_mul(1000),
             )
             .map_err(|error| state_persist(SyncSummary::default(), error.into()))?;
+        self.record_recovery_request(
+            storage_sqlite::RecoveryCause::ExplicitHistory,
+            ticket,
+            transition,
+        );
         let mut waiter = super::recovery::RecoveryCallerGuard::new(storage.clone(), ticket);
         // An explicit caller waits for its process credit, but never past its
         // own cancellation or budget.
@@ -4470,9 +4574,22 @@ impl AppClient {
             // left lies below the window, where no pass can search, so the
             // request closes: it would otherwise only park into a notice. It
             // is recorded as neither coverage nor a dismissal.
-            storage
+            let closed = storage
                 .close_explicit_history_request(ticket)
                 .map_err(|error| state_persist(summary.clone(), error.into()))?;
+            // Settlement usually closed it already and recorded that verdict;
+            // record only a close this seam made.
+            if closed {
+                self.record_need_changed(
+                    None,
+                    marmot_forensics::RecoveryObligationCause::ExplicitHistory,
+                    marmot_forensics::RecoveryNeedChange::ClosedBelowWindow,
+                    ticket,
+                    None,
+                    None,
+                    None,
+                );
+            }
         }
         waiter
             .detach()

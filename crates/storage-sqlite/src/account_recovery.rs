@@ -8,10 +8,14 @@ pub use demand::{
 };
 mod loss;
 mod notice;
+mod observe;
 mod plan;
 mod stall;
 pub use loss::{RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
 pub use notice::ParkedRecoveryObligation;
+pub use observe::{
+    RecoveryDemandTransition, RecoveryLossImport, RecoveryObligationState, RecoveryObligationStatus,
+};
 pub use plan::{
     RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility, RecoveryEndpointCheckpoint,
     RecoveryPassProgress, RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan,
@@ -370,6 +374,20 @@ pub(crate) fn loss_bound_values(
     })
 }
 
+/// The one obligation every generation of a loss cause joins.
+fn loss_demand_key(cause: i64, label: &str) -> StorageResult<String> {
+    let prefix = match cause {
+        0 => "overflow",
+        1 => "notification",
+        _ => {
+            return Err(StorageError::Serialization(
+                "unsupported recovery loss cause".into(),
+            ));
+        }
+    };
+    Ok(format!("{prefix}:{label}"))
+}
+
 fn join_loss_tx(
     conn: &Connection,
     label: &str,
@@ -379,16 +397,16 @@ fn join_loss_tx(
     now: i64,
     adopt_token: bool,
 ) -> StorageResult<()> {
-    let (prefix, demand_cause) = match cause {
-        0 => ("overflow", 0),
-        1 => ("notification", 6),
+    let demand_cause = match cause {
+        0 => 0,
+        1 => 6,
         _ => {
             return Err(StorageError::Serialization(
                 "unsupported recovery loss cause".into(),
             ));
         }
     };
-    let key = format!("{prefix}:{label}");
+    let key = loss_demand_key(cause, label)?;
     // A retired obligation reopens only for loss its retirement did not
     // cover: a generation it never saw, or a count above that generation's
     // retired watermark. A delayed duplicate of retired loss changes nothing.
@@ -687,7 +705,14 @@ impl SqliteAccountStorage {
 
     /// Called only at the account mutation boundary. Evidence acknowledgment and
     /// demand creation share a transaction, so cancellation cannot lose either.
-    pub fn synchronize_account_delivery_loss(&self, label: &str) -> StorageResult<()> {
+    ///
+    /// Returns what the import charged, at most one entry per loss cause, so
+    /// the owner can record the change. Loss that changed no obligation
+    /// revision reports nothing.
+    pub fn synchronize_account_delivery_loss(
+        &self,
+        label: &str,
+    ) -> StorageResult<Vec<RecoveryLossImport>> {
         let pending: bool = self
             .lock()?
             .query_row_cached(
@@ -698,32 +723,143 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         if !pending {
-            return Ok(());
+            return Ok(Vec::new());
         }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             // Import one row at a time in this transaction. The unresolved
             // evidence set is deliberately not disk-capped; do not mirror it
-            // into an unbounded temporary Vec on reopen.
+            // into an unbounded temporary Vec on reopen. The audit summary is
+            // constant-size: one accumulator per cause.
+            let mut imports: [Option<(Option<observe::DemandRow>, u64)>; 2] = [None, None];
             let mut cursor = (-1_i64, -1_i64);
             loop {
-                let row = conn.query_row_cached(
-                    "SELECT cause,marker_token,pending_since,dropped_count FROM account_delivery_loss_evidence
+                let row = conn
+                    .query_row_cached(
+                        "SELECT cause,marker_token,pending_since,dropped_count,imported_count
+                     FROM account_delivery_loss_evidence
                      WHERE account_label=?1 AND (cause,marker_token)>(?2,?3)
                      AND (imported_count IS NULL OR dropped_count>imported_count)
-                     ORDER BY cause,marker_token LIMIT 1", params![label,cursor.0,cursor.1],
-                    |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))
-                ).optional().storage()?;
-                let Some((cause, token, observed_at, dropped)) = row else { break; };
+                     ORDER BY cause,marker_token LIMIT 1",
+                        params![label, cursor.0, cursor.1],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, Option<i64>>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .storage()?;
+                let Some((cause, token, observed_at, dropped, imported)) = row else {
+                    break;
+                };
                 cursor = (cause, token);
+                if let Some(slot) = usize::try_from(cause)
+                    .ok()
+                    .and_then(|cause| imports.get_mut(cause))
+                {
+                    let charged = i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?;
+                    match slot {
+                        Some((_, total)) => *total = total.saturating_add(charged),
+                        None => {
+                            let before =
+                                observe::demand_row(&conn, &loss_demand_key(cause, label)?)?;
+                            *slot = Some((before, charged));
+                        }
+                    }
+                }
                 join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
                 conn.execute_cached(
                     "UPDATE account_delivery_loss_evidence SET imported_count = ?3
                      WHERE account_label = ?1 AND cause = ?4 AND marker_token = ?2",
                     params![label, token, dropped, cause],
-                ).storage()?;
+                )
+                .storage()?;
             }
-            Ok(())
+            let mut changes = Vec::new();
+            for (cause, slot) in imports.into_iter().enumerate() {
+                let Some((before, charged)) = slot else {
+                    continue;
+                };
+                let cause_value = i64::try_from(cause).map_err(|_| {
+                    StorageError::Serialization("unsupported recovery loss cause".into())
+                })?;
+                let Some(after) =
+                    observe::demand_row(&conn, &loss_demand_key(cause_value, label)?)?
+                else {
+                    continue;
+                };
+                let transition = observe::transition(before.as_ref(), &after);
+                if transition == RecoveryDemandTransition::Unchanged {
+                    continue;
+                }
+                changes.push(RecoveryLossImport {
+                    cause: if cause == 0 {
+                        RecoveryLossCause::Queue
+                    } else {
+                        RecoveryLossCause::NotificationConsumer
+                    },
+                    obligation: observe::ticket(&after)?,
+                    transition,
+                    charged,
+                });
+            }
+            Ok(changes)
+        })
+    }
+
+    /// [`Self::mark_account_delivery_recovery_bounded`], also reporting how the
+    /// worker's observation changed the queue-loss obligation, when it did.
+    /// The marker writer usually imported the generation first, so this is
+    /// most often `None`.
+    pub fn mark_account_delivery_recovery_observed(
+        &self,
+        label: &str,
+        marker_token: u64,
+        dropped_count: u64,
+        earliest_created_at: Option<u64>,
+    ) -> StorageResult<Option<RecoveryLossImport>> {
+        let token = i64::try_from(marker_token).unwrap_or(i64::MAX);
+        let dropped = i64::try_from(dropped_count).unwrap_or(i64::MAX);
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let key = loss_demand_key(0, label)?;
+            let before = observe::demand_row(&conn, &key)?;
+            let imported: Option<i64> = conn
+                .query_row_cached(
+                    "SELECT imported_count FROM account_delivery_loss_evidence
+                     WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
+                    params![label, token],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?
+                .flatten();
+            arm_overflow_tx(
+                &conn,
+                label,
+                token,
+                dropped,
+                crate::codec::unix_now_seconds_i64(),
+                earliest_created_at,
+            )?;
+            let Some(after) = observe::demand_row(&conn, &key)? else {
+                return Ok(None);
+            };
+            let transition = observe::transition(before.as_ref(), &after);
+            if transition == RecoveryDemandTransition::Unchanged {
+                return Ok(None);
+            }
+            Ok(Some(RecoveryLossImport {
+                cause: RecoveryLossCause::Queue,
+                obligation: observe::ticket(&after)?,
+                transition,
+                charged: i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?,
+            }))
         })
     }
 

@@ -71,6 +71,16 @@ App runtime bridge for the first real Marmot app surfaces.
   preparation, receipt/peel, app join/checkpoint, and bounded stored-group snapshots through the installed recorder;
   tests retain an in-memory probe for focused product-boundary assertions. Do not infer ACKs, recipient joins, or
   durable writes from another boundary. See `tests/audit-v5-welcome-probe.md` for historical subset measurements.
+- Keep the v5-only recovery-owner and transport-cursor audit rows in `src/client/audit_recovery.rs`
+  (`recovery_need_changed`, `recovery_attempt_started`, `recovery_attempt_finished`,
+  `recovery_obligation_reassessed`, `transport_cursor_advanced`). Record at owner seams only: loss import through
+  `synchronize_recovery_loss` (never call the storage import directly from client code), the shared execution
+  bracket (`begin_recovery_execution` / `finish_recovery_execution`, which the comparison job uses), settlement after
+  the checkpoint commits, the notice publication seam and dismissal, and cursor commits after their save succeeds.
+  Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
+  placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
+  lost-EOSE repair (#2076) has a `TODO(#2076)` hook point and no row yet. Scenario tests live in
+  `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown

@@ -17,6 +17,15 @@
 
 ### Added
 
+- Report recovery demand transitions for the owner's audit rows.
+  `synchronize_account_delivery_loss` now returns one `RecoveryLossImport` per loss cause it
+  changed (its obligation, a `RecoveryDemandTransition` and the newly charged count) instead
+  of `()`; callers that ignored the unit result compile unchanged.
+  `request_recovery_observed` and `mark_account_delivery_recovery_observed` report the same
+  transition for a request and for the worker's overflow observation, and
+  `recovery_obligation_status` reads one obligation's revision, cause, state and
+  eligibility. None of these changes demand.
+
 - Add `stamp_unrecorded_prior_route_switches(now_secs)`, which stamps each retained route in
   `account_groups` that has no `replaced_at` with `now_secs` and persists the stamp in one
   transaction, so a route stored before switch times were kept gets one fixed floor

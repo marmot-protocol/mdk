@@ -21,8 +21,11 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   digests, lengths, counts, and typed outcomes only. Never add decrypted content, cleartext group values, full account
   or member identities, bearer/upload tokens, auth headers, private keys, ciphertext, or raw MLS bytes.
 - New opt-in app audit sessions record v5 into separate files. Keep `schema/audit-log-event.v5.schema.json`, the Rust
-  types/semantic validator, and `tests/audit_v5.rs` in lockstep, including the 44 typed operational kinds and Welcome
-  evidence. The v5 local-delivery path sends original validated bodies; v4 files and the v4-only whole-file Goggles
+  types/semantic validator, and `tests/audit_v5.rs` in lockstep, including the 49 typed operational kinds and Welcome
+  evidence. Five of those kinds are v5-only (`AuditEventKind::is_v5_only`: the recovery-owner and transport-cursor
+  rows in `src/audit/recovery.rs`); a v4 recorder drops them, and the frozen v4 schema and its catalog tests exclude
+  them. A new string field on an operational kind needs an explicit `protect` classification in
+  `src/v5/operational.rs` (category, diagnostic reference, or hash), or v5 refuses to write the row. The v5 local-delivery path sends original validated bodies; v4 files and the v4-only whole-file Goggles
   contract remain separate. Rust validation remains authoritative for rules JSON Schema cannot express. Coordinate
   any v5 wire changes with the strict receiver before deployment.
 - Keep the schema (`schema/audit-log-event.v4.schema.json`) and the Rust kind catalog in lockstep. Two tests enforce

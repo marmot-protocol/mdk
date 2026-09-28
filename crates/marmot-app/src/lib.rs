@@ -1305,6 +1305,8 @@ struct OpenAppAccount {
     state: AccountState,
     delivery_overflow_recovery_pending: bool,
     delivery_overflow_recovery_marker_token: Option<u64>,
+    /// Loss the open imported, recorded once the client exists.
+    recovery_loss_imports: Vec<storage_sqlite::RecoveryLossImport>,
     signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
 }
 
@@ -1776,15 +1778,22 @@ impl MarmotApp {
             Instant::now(),
             recovery_policy,
         )?;
-        if relay_plane
+        let incremental_request = if relay_plane
             .subscription_rebuild_since(open.state.last_transport_timestamp)
             .is_none()
         {
-            self.account_storage(&open.state.label)?.request_recovery(
-                storage_sqlite::RecoveryRequest::IncrementalHistory,
-                client::recovery::wall_now_ms()?,
-            )?;
-        }
+            Some(
+                self.account_storage(&open.state.label)?
+                    .request_recovery_observed(
+                        storage_sqlite::RecoveryRequest::IncrementalHistory,
+                        client::recovery::wall_now_ms()?,
+                    )?,
+            )
+        } else {
+            None
+        };
+        let cursor_audit_placements = open.adapter.delivery_placement_counts();
+        let recovery_loss_imports = open.recovery_loss_imports;
         let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
         let mut client = AppClient {
             #[cfg(test)]
@@ -1828,6 +1837,7 @@ impl MarmotApp {
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_recovery_status_updates: std::collections::HashSet::new(),
             history_notice_baseline: None,
+            cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_failed_sync_summary: SyncSummary::default(),
@@ -1871,6 +1881,18 @@ impl MarmotApp {
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
         };
+        // Loss the open imported, and the startup history request, become
+        // audit rows once the client that records them exists.
+        if let Ok(storage) = self.account_storage(&client.state.label) {
+            client.record_recovery_loss_imports(&storage, recovery_loss_imports);
+        }
+        if let Some((ticket, transition)) = incremental_request {
+            client.record_recovery_request(
+                storage_sqlite::RecoveryCause::IncrementalHistory,
+                ticket,
+                transition,
+            );
+        }
         // Initial access also restores durable backfill work, with or without
         // new releases, so open does not read the intent table twice.
         client.transport_receipts()?;
@@ -4046,7 +4068,7 @@ impl MarmotApp {
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;
         recovery_storage.restore_unacknowledged_recovery_loss()?;
-        recovery_storage.synchronize_account_delivery_loss(label)?;
+        let recovery_loss_imports = recovery_storage.synchronize_account_delivery_loss(label)?;
         let delivery_overflow_recovery = recovery_storage.account_delivery_recovery(label)?;
         let notification_loss = recovery_storage
             .pending_recovery_demands()?
@@ -4213,6 +4235,7 @@ impl MarmotApp {
             state,
             delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token,
+            recovery_loss_imports,
             signer: nostr_signer,
         })
     }
