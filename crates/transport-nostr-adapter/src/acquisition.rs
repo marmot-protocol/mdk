@@ -178,3 +178,41 @@ pub struct NostrNotificationLoss {
     pub receiver_generation: u64,
     pub cumulative_skipped: u64,
 }
+
+/// Lower bound on the wire `created_at` of the events whose notifications a
+/// receiver lost in one gap.
+///
+/// A relay answers a REQ only with events at or after its `since`, so a lost
+/// event is no older than the lowest `since` among the REQs that could still
+/// deliver to that receiver. [`Self::Unbounded`] means no bound is known: one
+/// of those REQs had no `since`, or the receiver has no floor evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NostrNotificationLossFloor {
+    Unbounded,
+    /// Unix seconds.
+    Since(u64),
+}
+
+impl NostrNotificationLossFloor {
+    /// A REQ filter's `since`; `None` is an unfloored REQ.
+    pub fn from_since(since: Option<u64>) -> Self {
+        since.map_or(Self::Unbounded, Self::Since)
+    }
+
+    /// The lower of two floors, and unbounded when either is.
+    #[must_use]
+    pub fn lowest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Since(left), Self::Since(right)) => Self::Since(left.min(right)),
+            _ => Self::Unbounded,
+        }
+    }
+
+    /// The bound in Unix seconds, or `None` when it is unknown.
+    pub fn since_seconds(self) -> Option<u64> {
+        match self {
+            Self::Unbounded => None,
+            Self::Since(seconds) => Some(seconds),
+        }
+    }
+}

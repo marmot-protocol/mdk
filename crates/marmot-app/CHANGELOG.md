@@ -56,6 +56,18 @@
   zeros. Only local signing-key files are still zeroed, and their reader now re-reads
   instead of parsing a replaced key file.
 
+- Keep an account's delivery route open when its relay notification consumer lags. A lag
+  used to close the route and send the account worker through reconnect. The reopened
+  session replayed the backlog from the loss-fenced cursor, which overflowed again, so large
+  accounts looped in reconnect backoff and commands failed with `transport_closed`. The
+  consumer now resumes on the same receiver and the worker keeps serving commands. It
+  records the loss durably, bounded below by the lowest `since` among the account's live
+  REQs and those closed within the last minute, or unbounded when any of them has no
+  `since`, and recovers it by comparison. `RelayPlaneHealth` still counts each lag in
+  `notification_forwarder_lag_incidents`, `notification_forwarder_lagged_notifications`
+  and `notification_forwarder_restarts`. Only an unexpected consumer exit
+  (`notification_forwarder_unexpected_exits`) still closes delivery and reconnects. (#2070)
+
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay
   until a newer event replaces them. (#1973)

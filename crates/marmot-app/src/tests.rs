@@ -13921,7 +13921,7 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
             runtime
                 .shared_services()
                 .relay_plane()
-                .simulate_notification_recovery_for_test(1);
+                .simulate_notification_consumer_exit_for_test();
             let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
             loop {
                 match runtime.unhydrated_group_count_for_test(ACCOUNT).await {
@@ -13947,7 +13947,7 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
         runtime
             .shared_services()
             .relay_plane()
-            .simulate_notification_recovery_for_test(1);
+            .simulate_notification_consumer_exit_for_test();
         let max_backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             match runtime.unhydrated_group_count_for_test(ACCOUNT).await {
@@ -14094,7 +14094,7 @@ async fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups_b
     runtime
         .shared_services()
         .relay_plane()
-        .simulate_notification_recovery_for_test(3);
+        .simulate_notification_consumer_exit_for_test();
 
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
@@ -14110,7 +14110,7 @@ async fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups_b
         }
     })
     .await
-    .expect("notification recovery should reconnect and drain deferred hydration");
+    .expect("a consumer exit should reconnect and drain deferred hydration");
 
     assert_eq!(
         runtime
@@ -21260,15 +21260,15 @@ async fn connectivity_restored_wakes_a_retained_send_before_the_retry_timer() {
 
 #[tokio::test]
 async fn connectivity_restored_during_reconnect_wakes_the_retained_send() {
-    retained_send_recovers_after_notification_gap(true).await;
+    retained_send_recovers_after_reconnect(true).await;
 }
 
 #[tokio::test]
-async fn notification_gap_automatically_reactivates_and_retries_the_retained_send() {
-    retained_send_recovers_after_notification_gap(false).await;
+async fn consumer_exit_automatically_reactivates_and_retries_the_retained_send() {
+    retained_send_recovers_after_reconnect(false).await;
 }
 
-async fn retained_send_recovers_after_notification_gap(host_wake: bool) {
+async fn retained_send_recovers_after_reconnect(host_wake: bool) {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("sender")
@@ -21301,7 +21301,7 @@ async fn retained_send_recovers_after_notification_gap(host_wake: bool) {
     runtime
         .shared_services()
         .relay_plane()
-        .simulate_notification_recovery_for_test(1);
+        .simulate_notification_consumer_exit_for_test();
     let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         match runtime.unhydrated_group_count_for_test("sender").await {

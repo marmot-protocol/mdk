@@ -888,7 +888,7 @@ async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
     f.runtime
         .shared_services()
         .relay_plane()
-        .simulate_notification_recovery_for_test(1);
+        .simulate_notification_consumer_exit_for_test();
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         match f.runtime.unhydrated_group_count_for_test("alice").await {

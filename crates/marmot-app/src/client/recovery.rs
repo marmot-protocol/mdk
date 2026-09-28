@@ -168,11 +168,12 @@ fn loss_cause(cause: storage_sqlite::RecoveryCause) -> Option<storage_sqlite::Re
     }
 }
 
-/// A loss goal starts at the earliest wire `created_at` among the deliveries
-/// charged to its unresolved generations; acknowledged generations no longer
-/// count. Neither the checkpoint nor a live subscription floor bounds them: a
-/// subscription keeps the `since` it was built with. Without a known floor the
-/// goal stays unbounded and no comparison can certify it.
+/// A loss goal starts at the lowest bound charged to its unresolved
+/// generations; acknowledged generations no longer count. A queue drop charges
+/// the delivery's wire `created_at`, and a notification lag the lowest `since`
+/// among the REQs that could still deliver at the lag. The checkpoint is no
+/// bound: a subscription keeps the `since` it was built with. Without a known
+/// floor the goal stays unbounded and no comparison can certify it.
 fn bound_loss_goals(
     mut scopes: Vec<storage_sqlite::RecoveryScopePlan>,
     floor: Option<u64>,

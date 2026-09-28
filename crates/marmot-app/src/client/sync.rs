@@ -1099,12 +1099,16 @@ impl AppClient {
             )?;
         }
         if overflow.notification_losses > 0 {
-            storage.record_account_recovery_loss(
+            // The lag's REQ floors bound the loss from below. Each lag mints a
+            // fresh token, so a lower floor always imports as new loss with a
+            // new obligation revision rather than rewriting a frozen goal.
+            storage.record_account_recovery_loss_bounded(
                 &self.state.label,
                 storage_sqlite::RecoveryLossCause::NotificationConsumer,
                 overflow.notification_token,
                 0,
                 unix_now_seconds(),
+                overflow.notification_floor,
             )?;
             storage.synchronize_account_delivery_loss(&self.state.label)?;
             self.adapter.notification_loss_persisted(overflow);
@@ -1126,8 +1130,11 @@ impl AppClient {
             method = "observe_delivery_overflow",
             queue_depth = overflow.queue_depth,
             dropped = overflow.dropped,
+            dropped_bounded = overflow.earliest_dropped.is_some(),
+            notification_losses = overflow.notification_losses,
+            notification_bounded = overflow.notification_floor.is_some(),
             elapsed_ms = overflow.elapsed_ms,
-            "account delivery queue overflow requires unfloored recovery",
+            "account delivery loss requires comparison recovery",
         );
         Ok(())
     }
@@ -2087,6 +2094,19 @@ impl AppClient {
     ) -> Result<crate::relay_plane::AccountDeliveryReceive, AppError> {
         use crate::relay_plane::AccountDeliveryWait;
         loop {
+            // A consumer lag charges notification loss before any control
+            // record reaches this queue, and a record may never come: its
+            // queue can close during a reopen. Persist the loss now. Without
+            // an outstanding record, report the overflow here, like spilled
+            // loss below. With one, that record starts recovery once the
+            // deliveries queued ahead of it drain, so no attempt starts that
+            // could not clear the loss.
+            if let Some(loss) = self.adapter.unpersisted_notification_loss() {
+                self.observe_delivery_overflow(loss)?;
+                if !self.adapter.delivery_overflow_signal_outstanding() {
+                    return Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(loss));
+                }
+            }
             // Spilled rows that became queue loss are already durable and
             // fence the cursor. Report them as an overflow, so every caller
             // starts the same recovery it runs for a router omission.

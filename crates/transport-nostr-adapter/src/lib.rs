@@ -78,7 +78,7 @@ pub use acquisition::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
     NostrAcquisitionScope, NostrAcquisitionStats, NostrNotificationLoss,
-    NostrNotificationLossScope,
+    NostrNotificationLossFloor, NostrNotificationLossScope,
 };
 pub use key_package::{
     CLIENT_TAG, KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication, NostrKeyPackagePublisher,
