@@ -52,6 +52,11 @@ for reconnect/backoff and relay status mechanics.
   and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be lost in a lag. Do
   not add a time-based expiry. Read `notification_loss_floor` at the lag; an unfloored REQ or missing evidence is
   `Unbounded`, never "no loss".
+- Recover a lag-lost end-of-stored-events only by re-issuing the live REQ unchanged, under its own id
+  (`reissue_subscriptions_awaiting_eose`): only REQs issued by the lag's `NotificationLagMark`, only on relays that
+  have not reported EOSE, at most once per relay, under the subscription lifecycle lock. The SDK client re-sends a
+  REQ only while its floor record holds it live, and records it with `open` first. Never infer EOSE at a lag, change
+  a re-issued REQ's filter, or reopen a closed REQ.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`
