@@ -749,12 +749,16 @@ impl AppRuntimeHarness {
     /// Execute repair and retain unproven coverage in local diagnostics. Success
     /// here means the scenario may evaluate its independent public-state oracle;
     /// it does not certify transport history. Other incomplete reasons fail.
+    /// The repaired history then gets one settlement window before anything
+    /// observes it; see [`full_history_settlement_window`].
     pub async fn repair_full_history(&mut self, clients: &[String]) -> Result<(), SubjectError> {
+        let mut repaired = false;
         for label in clients {
             let participant = self.participant_mut(label)?;
             if !participant.online {
                 continue;
             }
+            repaired = true;
             participant.catch_up_attempts = participant.catch_up_attempts.saturating_add(1);
             let account_id = participant.account_id.clone();
             match participant
@@ -773,6 +777,12 @@ impl AppRuntimeHarness {
                     return Err(app_error(error));
                 }
             }
+        }
+        if repaired {
+            tokio::time::sleep(full_history_settlement_window(
+                self.settlement_quiescence_ms,
+            ))
+            .await;
         }
         self.refresh_cached_members(clients).await
     }
@@ -2478,6 +2488,21 @@ fn public_group_states_match(
                     && state.group_description == description
             })
     })
+}
+
+/// Margin past the settlement quiescence window for an account worker's
+/// convergence timer to fire and apply what settled.
+const FULL_HISTORY_SETTLEMENT_MARGIN: Duration = Duration::from_millis(250);
+
+/// Real time a full-history sync gives the protocol to settle what it admitted.
+/// A repair compares history, admits what it fetched and returns; admitted
+/// commits then converge on the settlement timer. The retained-engine subject
+/// settles synchronously, so real-time adapters wait the window out before a
+/// scenario observes the repaired state.
+pub(crate) fn full_history_settlement_window(quiescence_ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        quiescence_ms.unwrap_or(cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS),
+    ) + FULL_HISTORY_SETTLEMENT_MARGIN
 }
 
 fn app_for_root(

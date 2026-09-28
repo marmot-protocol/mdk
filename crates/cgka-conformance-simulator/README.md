@@ -742,10 +742,11 @@ See [the public app scenario inventory](APP_SCENARIO_INVENTORY.md) for the proce
 ### Public runtime history-repair observations
 
 The app/process adapter records a repair that stops only because exhaustive coverage
-is unproven in `local.history_repairs_without_coverage`. The standalone node adapter uses the
+is unproven in `local.history_repairs_without_coverage`; a repair whose comparison certified
+its routes completes and is not counted. The standalone node adapter uses the
 same classifier and records `progress.history_repairs_without_coverage`. Its scenario action can then
-continue to the independent delivery, membership, and public-state assertions; it
-never certifies history or clears runtime debt. The private process RPC preserves
-this typed outcome. Delivery loss, cancellation, deadline, unavailable EOSE, and
+continue to the independent delivery, membership, and public-state assertions; the
+counter never certifies history or clears runtime debt. The private process RPC preserves
+this typed outcome. Delivery loss, cancellation, deadline, and
 other failures remain scenario failures. This differs from the retained-relay model,
 which can provide its own explicit completeness evidence for a finite query.
