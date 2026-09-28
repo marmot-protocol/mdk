@@ -754,6 +754,16 @@ fn print_table(report: &Value) {
 }
 
 pub(super) async fn run() {
+    // Opt-in tracing for the in-process subject, for example
+    // `MDK_SCORECARD_TRACE=marmot_app::relay_plane=warn`. Other participants
+    // run in their own processes and are not traced.
+    if let Some(filter) = std::env::var_os("MDK_SCORECARD_TRACE") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter.to_string_lossy().as_ref())
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let artifacts = journey_artifacts("scorecard");
     let clients = clients();
     let mut subject = AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2])
