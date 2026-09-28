@@ -27,7 +27,9 @@ adds a `nostr-sdk` backed `NostrSdkRelayClient`.
 ## Recovery maintenance sessions
 
 `install_group_maintenance_recovery_subscription` accepts the account recovery owner's durable attempt serial and
-returns an opaque wire id. A replacement session must use a fresh serial, including after cancellation or reopen.
+a history floor, and returns an opaque wire id. The app floors the session at the Welcome that installed the joined
+copy, less a clock-skew allowance, so a notification lag while it is live stays bounded; `None` requests the
+group's full history. A replacement session must use a fresh serial, including after cancellation or reopen.
 Reusing a serial joins only a live session without resetting its EOSE. After failure, cancellation or removal, the adapter
 requires a strictly greater serial for that account/group, even across account activation. Its lifetime high-water map
 retains one scalar per account/group that used this API. Remove the session with

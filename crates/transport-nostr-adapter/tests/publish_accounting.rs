@@ -159,6 +159,7 @@ async fn activated(
                 group_id: GroupId::new(vec![0xB2; 16]),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: vec![endpoint.clone()],
+                retained_since: None,
             }],
             since: None,
         })

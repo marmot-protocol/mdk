@@ -170,6 +170,7 @@ fn snapshot_transport_adapter_boundary_types() {
                 group_id: gid(),
                 transport_group_id: vec![0xCC; 4],
                 endpoints: vec![TransportEndpoint("wss://group.example".into())],
+                retained_since: None,
             }],
             since: Some(Timestamp(1717171717)),
         }

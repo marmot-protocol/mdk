@@ -17781,6 +17781,7 @@ fn transport_group_route_replacement_installs_current_and_prior_routes() {
         group_id: group_id.clone(),
         transport_group_id: vec![0x41; 32],
         endpoints: vec![TransportEndpoint("wss://x.example".to_owned())],
+        retained_since: None,
     };
     assert!(routing.replace_group_routes(&group_id, vec![sub_x.clone()]));
     assert!(!routing.replace_group_routes(&group_id, vec![sub_x.clone()]));
@@ -17789,18 +17790,26 @@ fn transport_group_route_replacement_installs_current_and_prior_routes() {
         group_id: group_id.clone(),
         transport_group_id: vec![0x59; 32],
         endpoints: vec![TransportEndpoint("wss://y.example".to_owned())],
+        retained_since: None,
     };
     assert!(routing.replace_group_routes(&group_id, vec![sub_y.clone(), sub_x.clone()]));
 
-    let snapshot = routing.snapshot();
-    let routes: Vec<_> = snapshot
-        .group_routes
-        .iter()
-        .filter(|route| route.group_id == group_id)
-        .collect();
-    assert_eq!(routes.len(), 2);
-    assert!(routes.contains(&&sub_x));
-    assert!(routes.contains(&&sub_y));
+    // The current route leads, although its id sorts after the retained one:
+    // the transport adapter reads the lead as the route that keeps the cursor.
+    let installed = |routing: &AppTransportRouting| {
+        routing
+            .snapshot()
+            .group_routes
+            .into_iter()
+            .filter(|route| route.group_id == group_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(installed(&routing), vec![sub_y.clone(), sub_x.clone()]);
+    assert!(!routing.replace_group_routes(&group_id, vec![sub_y.clone(), sub_x.clone()]));
+
+    // The same set under a new lead is a change.
+    assert!(routing.replace_group_routes(&group_id, vec![sub_x.clone(), sub_y.clone()]));
+    assert_eq!(installed(&routing), vec![sub_x, sub_y]);
 }
 
 #[test]
@@ -17827,6 +17836,7 @@ fn reopening_account_restores_current_and_prior_group_routes() {
         nostr_group_id_hex: hex::encode([0x11; 32]),
         relays: vec!["wss://prior.example".to_owned()],
         last_epoch: 7,
+        replaced_at: None,
     }];
     group.nostr_routing_last_epoch = 8;
     app.save_state(&AccountState {
@@ -17854,6 +17864,79 @@ fn reopening_account_restores_current_and_prior_group_routes() {
             .map(|route| route.transport_group_id.clone())
             .collect::<HashSet<_>>(),
         HashSet::from([vec![0x11; 32], vec![0x22; 32]])
+    );
+}
+
+/// A retained route stored before switch times were kept is stamped with the
+/// time of the first load that finds it. The stamp is persisted at once, so
+/// later loads and restarts keep it instead of moving the floor forward.
+#[test]
+fn a_legacy_retained_route_is_stamped_at_first_load_and_keeps_that_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://account.example");
+    let mut group = AppGroupRecord::new(
+        "aa".repeat(16),
+        AppGroupNostrRoutingComponent::new(
+            NostrRoutingV1::new([0x22; 32], vec!["wss://current.example".to_owned()]).unwrap(),
+        )
+        .unwrap(),
+        "routed".to_owned(),
+        String::new(),
+        AppGroupImageInput::default(),
+        AppGroupAdminPolicyComponent::new(Vec::new()),
+        AppGroupMessageRetentionComponent::disabled(),
+    );
+    group.prior_nostr_routes = vec![AppPriorNostrRoute {
+        nostr_group_id_hex: hex::encode([0x11; 32]),
+        relays: vec!["wss://prior.example".to_owned()],
+        last_epoch: 7,
+        replaced_at: None,
+    }];
+    app.save_state(&AccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: Some(1_800_000_000),
+        groups: vec![group],
+    })
+    .unwrap();
+    let replaced_at = |app: &MarmotApp| {
+        app.load_state("alice").unwrap().groups[0].prior_nostr_routes[0].replaced_at
+    };
+
+    let before = crate::unix_now_seconds();
+    let stamp = replaced_at(&app).expect("the first load stamps the legacy route");
+    assert!(stamp >= before);
+    assert_eq!(
+        app.account_storage("alice")
+            .unwrap()
+            .account_groups(None)
+            .unwrap()[0]
+            .prior_nostr_routes[0]
+            .replaced_at,
+        Some(stamp),
+        "the stamp is persisted by the load that made it"
+    );
+
+    std::thread::sleep(Duration::from_millis(1_100));
+    assert_eq!(replaced_at(&app), Some(stamp), "a later load keeps it");
+    drop(app);
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://account.example");
+    assert_eq!(replaced_at(&reopened), Some(stamp), "so does a restart");
+    let routes = reopened
+        .routing_for(&reopened.load_state("alice").unwrap())
+        .unwrap()
+        .snapshot()
+        .group_routes;
+    assert_eq!(
+        routes
+            .iter()
+            .map(|route| (route.transport_group_id[0], route.retained_since))
+            .collect::<Vec<_>>(),
+        vec![(0x22, None), (0x11, Some(crate::history_floor(stamp)))],
+        "the stamped route is floored at its first load"
     );
 }
 
@@ -18637,6 +18720,21 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
         ]),
         "a hidden group must keep each retained route paired with its authenticated relay set",
     );
+    // The current route leads, once, and resumes from the account cursor. The
+    // route replaced before the group was hidden keeps its switch floor; the
+    // one replaced while it was hidden has no recorded switch.
+    let floors = reopened
+        .routing
+        .snapshot()
+        .group_routes
+        .into_iter()
+        .filter(|route| route.group_id == group_id)
+        .map(|route| (route.transport_group_id, route.retained_since.is_some()))
+        .collect::<Vec<_>>();
+    assert_eq!(floors.len(), 3, "no route is listed twice: {floors:?}");
+    assert_eq!(floors[0], (vec![0x33; 32], false));
+    assert!(floors.contains(&(hex::decode(&old_route.nostr_group_id_hex).unwrap(), true)));
+    assert!(floors.contains(&(vec![0x22; 32], false)));
 
     let sender = app.account_home().account("alice").unwrap().account_id_hex;
     let fresh_payload = crate::messages::encode_inner_event(

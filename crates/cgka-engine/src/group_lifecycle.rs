@@ -89,8 +89,8 @@ fn persist_new_group_maintenance<S: StorageProvider>(
                     .saturating_add(POST_JOIN_OPERATIONAL_TARGET_SECS),
             )),
             overdue: false,
-            // Starts when the temporary full-history subscription is actually
-            // installed, not merely when the Welcome transaction commits.
+            // Starts when the temporary post-join history subscription is
+            // actually installed, not merely when the Welcome transaction commits.
             eose_deadline_at: None,
             grace_until: None,
             quiet_since: None,

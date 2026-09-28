@@ -907,6 +907,26 @@ impl AppClient {
         Ok(())
     }
 
+    /// Floor of a joined group's post-join maintenance REQ: the creation of the
+    /// Welcome that installed this copy, less the clock-skew allowance.
+    ///
+    /// The member cannot open anything older than its join epoch, and the
+    /// commits it must see before its first self-update were made after that
+    /// Welcome, however late the member processed it. So the anchor is the
+    /// Welcome, which the engine clamps to no later than the join, and never
+    /// the local join time. `None`, a full-history request, when the copy has
+    /// no Welcome time.
+    pub(crate) fn post_join_maintenance_since(
+        &self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Option<cgka_traits::transport::Timestamp> {
+        self.runtime
+            .group_record(group_id)
+            .ok()?
+            .local_copy_welcome_created_at
+            .map(|created_at| crate::history_floor(created_at.0))
+    }
+
     pub(super) async fn install_granted_post_join_subscriptions(
         &mut self,
         grant: &AttemptGrant,
@@ -953,6 +973,7 @@ impl AppClient {
                     .cloned()
                     .map(cgka_traits::TransportEndpoint)
                     .collect(),
+                retained_since: None,
             };
             if route.endpoints.is_empty() {
                 continue;
@@ -962,6 +983,7 @@ impl AppClient {
                 .install_group_maintenance_subscription(
                     route.clone(),
                     grant.reservation.attempt_serial,
+                    self.post_join_maintenance_since(&group_id),
                 )
                 .await?;
             if let Err(error) = self
@@ -2989,6 +3011,94 @@ mod tests {
     async fn maintenance_activation_preserves_incremental_and_live_tail_floors() {
         verify_maintenance_activation_floor(true).await;
         verify_maintenance_activation_floor(false).await;
+    }
+
+    /// The post-join maintenance REQ is floored at the Welcome that installed
+    /// the copy, less the clock-skew allowance, and never at the local join. A
+    /// member that was offline joins from an old Welcome; the commits it must
+    /// see before its first self-update were made after that Welcome.
+    #[tokio::test]
+    async fn post_join_maintenance_req_is_floored_at_its_welcome_not_the_join() {
+        use crate::tests::{
+            ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
+            every_subscription, scripted_eose_pump,
+        };
+        use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
+        let directory = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(directory.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay_and_config(
+            directory.path(),
+            "wss://relay.example",
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
+        )
+        .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let joined = client.create_group("offline member", &[]).await.unwrap();
+        let created_here = client.create_group("created here", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        // Model a copy installed now from a Welcome created six hours earlier.
+        let joined_at = unix_now_seconds();
+        let welcome_at = joined_at - 6 * 60 * 60;
+        let mut record = storage.get_group(&joined).unwrap();
+        record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+        storage.put_group(&record).unwrap();
+        for (seed, group) in [(55, &joined), (56, &created_here)] {
+            storage
+                .put_maintenance_obligation(&cgka_traits::MaintenanceObligation {
+                    id: cgka_traits::MessageId::new(vec![seed; 32]),
+                    group_id: group.clone(),
+                    trigger: cgka_traits::MaintenanceTrigger::PostJoin,
+                    phase: cgka_traits::MaintenancePhase::CatchUp,
+                    // The engine records the local join time here.
+                    created_at: cgka_traits::Timestamp(joined_at),
+                    operational_target_at: None,
+                    overdue: false,
+                    eose_deadline_at: None,
+                    grace_until: None,
+                    quiet_since: None,
+                    own_leaf_baseline_hash: None,
+                    sampled_jitter_ms: 0,
+                    not_before: None,
+                    attempt_count: 0,
+                    semantic_rearm_count: 0,
+                    last_failure_code: None,
+                })
+                .unwrap();
+        }
+        let before = relay.accepted_subscriptions().len();
+
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+
+        assert_eq!(client.post_join_maintenance_subscriptions.len(), 2);
+        let floors = relay.accepted_subscriptions()[before..]
+            .iter()
+            .filter_map(|subscription| match subscription {
+                transport_nostr_adapter::NostrSubscription::GroupMaintenance {
+                    group_id,
+                    since,
+                    ..
+                } => Some((group_id.clone(), *since)),
+                _ => None,
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            floors.get(&joined),
+            Some(&Some(crate::history_floor(welcome_at))),
+            "anchored at the Welcome, less the clock-skew allowance"
+        );
+        assert!(crate::history_floor(welcome_at).0 < welcome_at);
+        assert_eq!(
+            floors.get(&created_here),
+            Some(&None),
+            "a copy with no Welcome time keeps its full-history request"
+        );
     }
 
     async fn verify_post_join_boundary_and_grace() {

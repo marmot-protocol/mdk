@@ -127,6 +127,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
         group_id: group.clone(),
         transport_group_id: route.to_vec(),
         endpoints: vec![TransportEndpoint(url)],
+        retained_since: None,
     };
     let (summary, mut events) = client
         .adapter

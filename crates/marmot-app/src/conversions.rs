@@ -86,6 +86,7 @@ pub(crate) fn stored_group_from_app_group(group: &AppGroupRecord) -> StoredAccou
                 nostr_group_id_hex: route.nostr_group_id_hex.clone(),
                 relays: route.relays.clone(),
                 last_epoch: route.last_epoch,
+                replaced_at: route.replaced_at,
             })
             .collect(),
         components: stored_components_from_app_group(group),
@@ -254,6 +255,7 @@ pub(crate) fn app_group_from_stored_group(
             nostr_group_id_hex: route.nostr_group_id_hex,
             relays: route.relays,
             last_epoch: route.last_epoch,
+            replaced_at: route.replaced_at,
         })
         .collect();
     group.unknown_components = unknown_components;

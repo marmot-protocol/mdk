@@ -96,6 +96,24 @@
   group route and left a notification lag during that replay unbounded. They now reuse the
   live activation or rebuild it from the transport cursor, like reconnect. (#2070)
 
+- Floor the post-join maintenance REQ and retained-route REQs, so a notification lag while
+  one is live charges a bounded loss. The maintenance REQ used to request the group's full
+  history, and a retained route was backfilled in full on every activation. Either made
+  the loss unbounded, which parks as "history may be incomplete" and keeps the transport
+  cursor fenced. Maintenance is now floored at the creation of the Welcome that installed
+  the copy, never the local join, so a member that was offline still sees the commits
+  made between that Welcome and its join. A retained route is floored at the moment the
+  device saw it replaced, and from no later than the account cursor. A retained route
+  stored before this release has no such moment, so the first account load after the
+  upgrade records one and keeps it: earlier sessions fetched its older traffic, and the
+  comparison covers the rest. Both floors sit fifteen minutes below their anchor
+  (`HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`) to absorb clock skew. The routing table now keeps
+  each group's current route first. It used to sort a group's routes by id after a route
+  change, so the adapter could resume a retained route from the cursor and backfill the
+  current one in full. A locally deleted group no longer lists its current route twice.
+  A hidden group's route replaced while it was hidden keeps a full backfill until the
+  group is restored. (#2070)
+
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay
   until a newer event replaces them. (#1973)
@@ -128,6 +146,8 @@
 - `MarmotAppEvent` gains `HistoryNoticesChanged { account_id_hex, account_label }`, and
   `GroupRecoveryStatus` gains `history_may_be_incomplete` and `history_notice_ids` (both
   serde-defaulted). Exhaustive Rust matches and struct literals must handle them. (#2068)
+- `AppPriorNostrRoute` gains `replaced_at` (serde-defaulted), when the device saw the route
+  replaced as its group's current route. Struct literals must set it. (#2070)
 
 ### Added
 

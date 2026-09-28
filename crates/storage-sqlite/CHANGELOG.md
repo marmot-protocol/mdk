@@ -8,8 +8,20 @@
   required relays, each of which must be admitted and covered. Checkpoints may name any
   required or admitted relay, and joining comparison debt replaces its required relays
   instead of accumulating them. (#2068)
+- `StoredNostrRoute` gains `replaced_at`, when the device saw the route replaced as its
+  group's current route, which anchors the retained route's relay history floor. It is an
+  optional field inside the existing route JSON (`account_groups` and the local-deletion
+  frontier), so there is no migration; routes stored before it read as `None` until
+  `stamp_unrecorded_prior_route_switches` stamps them. Retaining a frontier route keeps its
+  earliest known switch. (#2070)
 
 ### Added
+
+- Add `stamp_unrecorded_prior_route_switches(now_secs)`, which stamps each retained route in
+  `account_groups` that has no `replaced_at` with `now_secs` and persists the stamp in one
+  transaction, so a route stored before switch times were kept gets one fixed floor
+  anchor. It returns how many routes it stamped, and leaves the local-deletion frontier
+  alone. (#2070)
 
 - Add `checkpoint_recovery_comparison`, which takes each compared scope's
   `RecoveryPassProgress` and keeps that scope's quiet streak in its checkpoint payload for its

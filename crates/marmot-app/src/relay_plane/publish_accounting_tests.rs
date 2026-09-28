@@ -168,6 +168,7 @@ impl AccountPublishFixture {
                     group_id: GroupId::new(vec![0xC3; 32]),
                     transport_group_id: transport_group_id.clone(),
                     endpoints: vec![endpoint.clone()],
+                    retained_since: None,
                 }],
                 since: None,
             })
@@ -523,6 +524,7 @@ async fn successful_fanout_delivers_once_per_route_and_keeps_the_message_id() {
         group_id: group_id.clone(),
         transport_group_id: transport_group_id.clone(),
         endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+        retained_since: None,
     };
     for (adapter, account_id) in [(&alice, alice_id.clone()), (&bob, bob_id.clone())] {
         adapter
@@ -593,6 +595,7 @@ async fn rejected_and_failed_publishes_do_not_invent_local_delivery() {
             group_id: GroupId::new(vec![0xC3; 32]),
             transport_group_id: fixture.transport_group_id.clone(),
             endpoints: vec![fixture.endpoint.clone()],
+            retained_since: None,
         }],
         since: None,
     })
@@ -640,6 +643,7 @@ async fn account_and_direct_clones_share_one_counter() {
             group_id: GroupId::new(vec![0xC3; 32]),
             transport_group_id: fixture.transport_group_id.clone(),
             endpoints: vec![fixture.endpoint.clone()],
+            retained_since: None,
         }],
         since: None,
     })

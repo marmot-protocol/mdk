@@ -3108,10 +3108,14 @@ impl MarmotRelayPlaneAccountAdapter {
             .await
     }
 
+    /// Install a group's post-join maintenance REQ, floored at `since` so a
+    /// notification lag while it is live stays bounded. `None` requests the
+    /// group's full history.
     pub(crate) async fn install_group_maintenance_subscription(
         &self,
         group: TransportGroupSubscription,
         recovery_attempt: u64,
+        since: Option<Timestamp>,
     ) -> Result<String, TransportAdapterError> {
         let sync = self
             .relay_plane
@@ -3136,6 +3140,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 &self.account_id,
                 &group,
                 recovery_attempt,
+                since,
             )
             .await
     }

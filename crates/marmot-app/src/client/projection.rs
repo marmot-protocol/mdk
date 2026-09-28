@@ -301,6 +301,10 @@ impl AppClient {
     /// Build the current and retained-prior subscriptions for an intentionally
     /// hidden live group. The deletion frontier keeps each authenticated prior
     /// route paired with the relay set that carried it.
+    ///
+    /// The current route comes first, as it does for every group, so it
+    /// resumes from the account cursor; the frontier's copy of it is not
+    /// history. Each retained route carries the floor of its recorded switch.
     fn local_deleted_group_subscriptions(
         &self,
         group_id: &GroupId,
@@ -322,6 +326,11 @@ impl AppClient {
                         .group_record(group_id)
                         .map(|group| group.epoch.0)
                         .unwrap_or_default(),
+                    // Still current. A hidden group has no projection to see
+                    // its next switch, so the route that switch leaves keeps
+                    // no floor and is backfilled in full, until the first
+                    // account load after the group is restored stamps it.
+                    replaced_at: None,
                 }],
             )
             .is_err()
@@ -337,7 +346,7 @@ impl AppClient {
             .into_iter()
             .filter(|route| route.group_id == *group_id)
             .collect::<Vec<_>>();
-        let mut subscriptions = Vec::new();
+        let mut subscriptions = vec![current.clone()];
         for route in
             storage.local_group_deletion_prior_nostr_routes(&hex::encode(group_id.as_slice()))?
         {
@@ -345,12 +354,14 @@ impl AppClient {
                 nostr_group_id_hex: route.nostr_group_id_hex,
                 relays: route.relays,
                 last_epoch: route.last_epoch,
+                replaced_at: route.replaced_at,
             };
             match route.subscription(group_id) {
                 Ok(subscription)
-                    if indexed_routes.iter().any(|route| {
-                        route.transport_group_id == subscription.transport_group_id
-                    }) =>
+                    if !same_transport_route(&subscription, &current)
+                        && indexed_routes.iter().any(|route| {
+                            route.transport_group_id == subscription.transport_group_id
+                        }) =>
                 {
                     subscriptions.push(subscription);
                 }
@@ -363,7 +374,6 @@ impl AppClient {
                 ),
             }
         }
-        subscriptions.push(current.clone());
 
         // Legacy deletion markers have no exact prior-route payload. Keep the
         // old route-id coverage in that case by pairing only still-unrepresented
@@ -377,6 +387,7 @@ impl AppClient {
                     group_id: group_id.clone(),
                     transport_group_id: route.transport_group_id,
                     endpoints: current.endpoints.clone(),
+                    retained_since: None,
                 });
             }
         }
@@ -410,6 +421,7 @@ impl AppClient {
                 nostr_group_id_hex: route.nostr_group_id_hex,
                 relays: route.relays,
                 last_epoch: route.last_epoch,
+                replaced_at: route.replaced_at,
             })
             .collect::<Vec<_>>();
         let Some(group) = self
@@ -628,6 +640,7 @@ impl AppClient {
                     image_upload_key_hex: previous.image.image_upload_key_hex,
                     media_type: previous.image.media_type,
                 },
+                observed_at_secs: unix_now_seconds(),
             });
         }
         let protocol_profile = protocol_profile_of(group_metadata);
@@ -670,6 +683,7 @@ impl AppClient {
                 take(media_component_id),
             ),
             image: parse_image_component(take(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)),
+            observed_at_secs: unix_now_seconds(),
         })
     }
 
@@ -1043,6 +1057,21 @@ pub(crate) fn protocol_profile_of(
     group_metadata
         .map(|group| group.protocol_profile)
         .unwrap_or(ProtocolProfile::Legacy)
+}
+
+/// The same route id over the same relay set, the identity the transport
+/// adapter keys a group REQ by.
+fn same_transport_route(
+    left: &TransportGroupSubscription,
+    right: &TransportGroupSubscription,
+) -> bool {
+    let relays = |route: &TransportGroupSubscription| {
+        let mut endpoints = route.endpoints.clone();
+        endpoints.sort();
+        endpoints.dedup();
+        endpoints
+    };
+    left.transport_group_id == right.transport_group_id && relays(left) == relays(right)
 }
 
 fn parse_routing_component(

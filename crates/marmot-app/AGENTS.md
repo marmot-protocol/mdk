@@ -179,7 +179,7 @@ App runtime bridge for the first real Marmot app surfaces.
   checkpoint, settled loss or retired notice confirms what its seal reached with `settle_transport_cursor` once its save
   succeeds, which ends the spilling. Every failed save undoes its seal with `abandon_transport_cursor`. Keep every
   condition cursor safety relies on inside the seal: anything read before an `.await` or a save is stale by the time
-  that save commits. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
+  that save commits. See `docs/marmot-architecture/further-context/account-recovery.md` section 6.
 - Every path that takes a delivery from the account queue calls `release_account_delivery` once its ingest returns
   `Ok`, or when it skips the delivery as already held, and before the save that follows. Never release on an ingest
   error: the key must keep capping the checkpoint that failure runs, because newest-first replay has usually remembered
@@ -191,6 +191,15 @@ App runtime bridge for the first real Marmot app surfaces.
   `src/runtime/agent_stream_watch.rs`, before any connect; both follow the one dial discipline in
   `docs/marmot-architecture/overview/dial-safety.md` (validate + pin, trust from config, loopback only under an explicit
   dev flag). Do not add an outbound relay/broker path that bypasses them.
+- Floor every history REQ at an anchor, less `HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE` (`history_floor`, ledger A14): the
+  post-join maintenance REQ at the Welcome that installed the copy (`Group::local_copy_welcome_created_at`, never the
+  local join time, which an offline member reaches long after the Welcome), and a retained route at the moment
+  `refresh_from_group` saw it replaced (`AppPriorNostrRoute::replaced_at`). A retained route stored before switch times
+  were kept is stamped by the first `load_state` that finds it, and the stamp is persisted at once
+  (`stamp_unrecorded_prior_route_switches`) so later launches never move its floor forward. Keep each group's current
+  route first in the routing table (`replace_group_routes` preserves the caller's order; a new lead is a change): the
+  adapter reads the lead as the route that resumes from the cursor. A locally deleted group lists its current route
+  first too, never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker
   cleanup a bounded budget. The terminal operation must outlive cancellation of its caller. `shutdown` alone does not

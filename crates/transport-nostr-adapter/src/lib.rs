@@ -166,15 +166,20 @@ pub enum NostrSubscription {
         /// Activation attempt that issued this REQ; see [`SubscriptionAttempt`].
         attempt: SubscriptionAttempt,
     },
-    /// Temporary full-history subscription used only by post-join maintenance.
+    /// Temporary history subscription used only by post-join maintenance.
     ///
     /// Its distinct id keeps it independent from the normal incremental group
     /// subscription even though both route the same authenticated MLS events.
+    /// `since` is the caller's floor for the group history the joining member
+    /// must see: the Welcome that installed its copy, less a clock-skew
+    /// allowance. `None` asks for the group's full history. Like every other
+    /// kind, the id never carries `since`.
     GroupMaintenance {
         account_id: MemberId,
         group_id: GroupId,
         transport_group_id: Vec<u8>,
         endpoints: Vec<TransportEndpoint>,
+        since: Option<Timestamp>,
     },
 }
 
@@ -219,6 +224,7 @@ impl NostrSubscription {
                 group_id,
                 transport_group_id,
                 endpoints,
+                ..
             } => {
                 let h_tag = hex::encode(transport_group_id);
                 compact_subscription_id(
@@ -288,6 +294,7 @@ impl NostrSubscription {
                 group_id,
                 transport_group_id,
                 endpoints,
+                ..
             } => NostrSubscriptionRouteKey::GroupMaintenance {
                 account_id: account_id.clone(),
                 group_id: group_id.clone(),
@@ -995,20 +1002,25 @@ impl NostrTransportAdapter {
         account_id: &MemberId,
         group: &TransportGroupSubscription,
     ) -> Result<String, TransportAdapterError> {
-        self.install_maintenance_subscription(account_id, group, None)
+        self.install_maintenance_subscription(account_id, group, None, None)
             .await
     }
 
     /// Install a maintenance session fenced by the recovery owner's durable
     /// attempt. Reusing a live token joins that session. Once removed or failed,
     /// a strictly greater token is required, including across account activation.
+    ///
+    /// `since` floors the history it requests, and with it the notification
+    /// loss a lag can charge while it is live. `None` requests the group's full
+    /// history and leaves that loss unbounded.
     pub async fn install_group_maintenance_recovery_subscription(
         &self,
         account_id: &MemberId,
         group: &TransportGroupSubscription,
         attempt: u64,
+        since: Option<Timestamp>,
     ) -> Result<String, TransportAdapterError> {
-        self.install_maintenance_subscription(account_id, group, Some(attempt))
+        self.install_maintenance_subscription(account_id, group, Some(attempt), since)
             .await
     }
 
@@ -1017,6 +1029,7 @@ impl NostrTransportAdapter {
         account_id: &MemberId,
         group: &TransportGroupSubscription,
         attempt: Option<u64>,
+        since: Option<Timestamp>,
     ) -> Result<String, TransportAdapterError> {
         if attempt.is_some() && !self.relay_client.supports_scoped_subscriptions() {
             return Err(TransportAdapterError::Subscription(
@@ -1029,6 +1042,7 @@ impl NostrTransportAdapter {
             group_id: group.group_id.clone(),
             transport_group_id: group.transport_group_id.clone(),
             endpoints: group.endpoints.clone(),
+            since,
         };
         let subscription_id = match attempt {
             Some(attempt) => compact_subscription_id(
@@ -1389,12 +1403,7 @@ impl TransportAdapter for NostrTransportAdapter {
         ));
         let prior_route_keys = prior_group_route_keys(&account_id, &activation.group_subscriptions);
         for group in &activation.group_subscriptions {
-            let route_key = group_route_key(&account_id, group);
-            let since = if prior_route_keys.contains(&route_key) {
-                None
-            } else {
-                activation.since
-            };
+            let since = group_route_since(&account_id, group, &prior_route_keys, activation.since);
             issued.push(group_subscription(&account_id, group, since, attempt));
         }
         // Register routing/telemetry state BEFORE the relay REQs go out: a
@@ -1414,7 +1423,7 @@ impl TransportAdapter for NostrTransportAdapter {
             state.clear_pending_unsubscribes_for_account(&account_id);
             state.record_subscription_starts(&issued, now_ms);
             state.record_account_replay_start(&account_id, &issued);
-            state.activate(activation, replaced_count, attempt);
+            state.activate(activation, replaced_count, attempt, &issued);
         }
 
         if let Err(error) = self.subscribe_all("activate_account", &issued).await {
@@ -1490,10 +1499,10 @@ impl TransportAdapter for NostrTransportAdapter {
             // new attempt, so both sides of the diff carry the activation's own
             // attempt and the ids stay stable across it.
             let attempt = routes.attempt;
-            let current_groups = routes.groups.as_slice();
             diff_group_subscriptions(
                 &sync.account_id,
-                current_groups,
+                &routes.groups,
+                &routes.group_since,
                 &sync.group_subscriptions,
                 sync.since,
                 attempt,
@@ -1544,7 +1553,7 @@ impl TransportAdapter for NostrTransportAdapter {
             let mut state = self.state.write().await;
             state.commit_staged_subscription_starts();
             state.forget_subscription_starts(&to_remove);
-            state.sync_groups(sync, to_add.len());
+            state.sync_groups(sync, &to_add, &to_remove);
             state.queue_pending_unsubscribes(to_remove);
         };
 
@@ -1707,6 +1716,11 @@ struct AccountRoutes {
     /// arm's `by_transport_group` entries.
     inbox_endpoints: Vec<CanonicalEndpoint>,
     groups: Vec<TransportGroupSubscription>,
+    /// The `since` each live group REQ was issued with, by route. A group sync
+    /// reissues a live retained route only when that widens it: the new REQ
+    /// replaces the live one under the same id, so a narrower filter could cut
+    /// off history the live one is still returning. Ids never carry `since`.
+    group_since: HashMap<NostrSubscriptionRouteKey, Option<Timestamp>>,
     /// Attempt the live subscriptions for this account were issued under. Held
     /// here so `account_subscription_ids` can rebuild exactly the ids that went
     /// on the wire, and so a group sync reuses the activation's attempt rather
@@ -1899,6 +1913,7 @@ impl AdapterState {
                 group_id,
                 transport_group_id,
                 endpoints,
+                ..
             }) = subscription
             else {
                 continue;
@@ -1936,6 +1951,7 @@ impl AdapterState {
         activation: TransportAccountActivation,
         replaced: usize,
         attempt: SubscriptionAttempt,
+        issued: &[NostrSubscription],
     ) {
         self.metrics.subscriptions_created += 1 + activation.group_subscriptions.len();
         self.metrics.subscriptions_removed += replaced;
@@ -1954,16 +1970,26 @@ impl AdapterState {
                     .map(CanonicalEndpoint::new)
                     .collect(),
                 groups: activation.group_subscriptions,
+                group_since: issued_group_since(issued).collect(),
                 attempt,
             },
         );
         self.rebuild_transport_group_index();
     }
 
-    fn sync_groups(&mut self, sync: TransportGroupSync, created: usize) {
+    fn sync_groups(
+        &mut self,
+        sync: TransportGroupSync,
+        added: &[NostrSubscription],
+        removed: &[NostrSubscription],
+    ) {
         if let Some(account) = self.accounts.get_mut(&sync.account_id) {
             account.groups = sync.group_subscriptions;
-            self.metrics.subscriptions_created += created;
+            for subscription in removed {
+                account.group_since.remove(&subscription.route_key());
+            }
+            account.group_since.extend(issued_group_since(added));
+            self.metrics.subscriptions_created += added.len();
             self.rebuild_transport_group_index();
         }
     }
@@ -2360,9 +2386,67 @@ fn group_route_key(
     }
 }
 
+/// The `since` a group route's REQ is issued with.
+///
+/// A group's current route resumes from the account's `since`. A retained
+/// route resumes from its own floor, and never from later than the account's
+/// `since`: members that have not applied the route change still send to the
+/// old address, with timestamps the account cursor, which the current route
+/// drives, may already have passed. A retained route without a floor is
+/// backfilled in full.
+fn group_route_since(
+    account_id: &MemberId,
+    group: &TransportGroupSubscription,
+    prior_route_keys: &HashSet<NostrSubscriptionRouteKey>,
+    since: Option<Timestamp>,
+) -> Option<Timestamp> {
+    if !is_retained_route(account_id, group, prior_route_keys) {
+        return since;
+    }
+    group
+        .retained_since
+        .zip(since)
+        .map(|(floor, since)| floor.min(since))
+}
+
+/// A route that carries a retained floor is retained wherever it sits, so it
+/// never takes the current route's place, even where the relay-safety filter
+/// dropped that route. A floorless route after its group's first is a
+/// retained route whose switch time the caller does not know.
+fn is_retained_route(
+    account_id: &MemberId,
+    group: &TransportGroupSubscription,
+    prior_route_keys: &HashSet<NostrSubscriptionRouteKey>,
+) -> bool {
+    group.retained_since.is_some() || prior_route_keys.contains(&group_route_key(account_id, group))
+}
+
+/// Whether a REQ issued with `desired` reaches further back than one issued
+/// with `issued`. `None` is unfloored, the widest of all.
+fn floor_widens(desired: Option<Timestamp>, issued: Option<Timestamp>) -> bool {
+    match (desired, issued) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(desired), Some(issued)) => desired < issued,
+    }
+}
+
+/// The `since` of each group REQ in `subscriptions`, by route.
+fn issued_group_since(
+    subscriptions: &[NostrSubscription],
+) -> impl Iterator<Item = (NostrSubscriptionRouteKey, Option<Timestamp>)> + '_ {
+    subscriptions
+        .iter()
+        .filter_map(|subscription| match subscription {
+            NostrSubscription::Group { since, .. } => Some((subscription.route_key(), *since)),
+            _ => None,
+        })
+}
+
 fn diff_group_subscriptions(
     account_id: &MemberId,
     current: &[TransportGroupSubscription],
+    current_since: &HashMap<NostrSubscriptionRouteKey, Option<Timestamp>>,
     desired: &[TransportGroupSubscription],
     since: Option<Timestamp>,
     attempt: SubscriptionAttempt,
@@ -2371,18 +2455,17 @@ fn diff_group_subscriptions(
         .iter()
         .map(|group| group_subscription(account_id, group, None, attempt))
         .collect::<Vec<_>>();
-    let current_prior_keys = prior_group_route_keys(account_id, current);
     let desired_prior_keys = prior_group_route_keys(account_id, desired);
     let desired_subscriptions = desired
         .iter()
         .map(|group| {
-            let route_key = group_route_key(account_id, group);
-            let since = if desired_prior_keys.contains(&route_key) {
-                None
-            } else {
-                since
-            };
-            group_subscription(account_id, group, since, attempt)
+            let retained = is_retained_route(account_id, group, &desired_prior_keys);
+            let since = group_route_since(account_id, group, &desired_prior_keys, since);
+            (
+                retained,
+                since,
+                group_subscription(account_id, group, since, attempt),
+            )
         })
         .collect::<Vec<_>>();
     let current_keys = current_subscriptions
@@ -2391,17 +2474,24 @@ fn diff_group_subscriptions(
         .collect::<HashSet<_>>();
     let desired_keys = desired_subscriptions
         .iter()
-        .map(NostrSubscription::route_key)
+        .map(|(_, _, subscription)| subscription.route_key())
         .collect::<HashSet<_>>();
 
     let to_add = desired_subscriptions
         .into_iter()
-        .filter(|subscription| {
+        .filter(|(retained, since, subscription)| {
             let route_key = subscription.route_key();
+            // A live REQ is reissued only to widen a retained route, such as
+            // the current route a route change just displaced. The reissue
+            // replaces the live REQ under the same id, so a narrower filter
+            // could cut off history the live one is still returning.
             !current_keys.contains(&route_key)
-                || (desired_prior_keys.contains(&route_key)
-                    && !current_prior_keys.contains(&route_key))
+                || (*retained
+                    && current_since
+                        .get(&route_key)
+                        .is_some_and(|issued| floor_widens(*since, *issued)))
         })
+        .map(|(_, _, subscription)| subscription)
         .collect();
     let to_remove = current_subscriptions
         .into_iter()
@@ -2411,19 +2501,26 @@ fn diff_group_subscriptions(
     (to_add, to_remove)
 }
 
-/// Return route keys for retained prior addresses. App routing orders each
-/// group's current signed route first and its retained historical routes
-/// immediately afterward. Only those historical routes need an unbounded
-/// backfill; the current route keeps the account cursor.
+/// Return route keys for retained prior addresses that carry no floor. App
+/// routing orders each group's current signed route first and its retained
+/// historical routes immediately afterward. A floored retained route is
+/// recognized by its floor (see [`is_retained_route`]), so position decides
+/// only among floorless routes: the first is the current route, which keeps
+/// the account cursor, and a later distinct one is a retained route whose
+/// switch time the caller does not know.
 fn prior_group_route_keys(
     account_id: &MemberId,
     groups: &[TransportGroupSubscription],
 ) -> HashSet<NostrSubscriptionRouteKey> {
-    let mut seen_groups = HashSet::new();
+    let mut current_routes = HashMap::new();
     let mut prior_route_keys = HashSet::new();
-    for group in groups {
-        if !seen_groups.insert(group.group_id.clone()) {
-            prior_route_keys.insert(group_route_key(account_id, group));
+    for group in groups.iter().filter(|group| group.retained_since.is_none()) {
+        let route_key = group_route_key(account_id, group);
+        let current = current_routes
+            .entry(group.group_id.clone())
+            .or_insert_with(|| route_key.clone());
+        if *current != route_key {
+            prior_route_keys.insert(route_key);
         }
     }
     prior_route_keys
