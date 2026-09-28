@@ -307,6 +307,8 @@ struct FakeRelayClient {
     fail_reissue: AtomicBool,
     /// Report every relay as having already answered with EOSE.
     complete_reissue: AtomicBool,
+    /// Report every relay's EOSE record as holding an answer.
+    eose_received: AtomicBool,
 }
 
 impl FakeRelayClient {
@@ -365,6 +367,19 @@ impl NostrRelayClient for FakeRelayClient {
         }
         self.scoped_removed.lock().unwrap().push(id);
         Ok(())
+    }
+
+    async fn subscription_eose_received(
+        &self,
+        _account_id: &MemberId,
+        _subscription_id: &str,
+        endpoints: &[TransportEndpoint],
+    ) -> Result<Vec<(TransportEndpoint, bool)>, cgka_traits::TransportAdapterError> {
+        let received = self.eose_received.load(Ordering::SeqCst);
+        Ok(endpoints
+            .iter()
+            .map(|endpoint| (endpoint.clone(), received))
+            .collect())
     }
 
     async fn reissue_subscription(
@@ -3736,7 +3751,8 @@ fn issued_group_id(issued: &[NostrSubscription], group: &cgka_traits::GroupId) -
 /// relays that have not reported EOSE for it. It never re-issues a REQ a relay
 /// already answered, one issued after the lag, or the same REQ twice on one
 /// relay. The fresh EOSE then completes the activation's coverage and the
-/// post-join maintenance boundary.
+/// post-join maintenance boundary. A later lag that loses a re-issued REQ's
+/// fresh EOSE is repaired from the client's EOSE record, with no traffic.
 #[tokio::test]
 async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
     let relay = Arc::new(FakeRelayClient::default());
@@ -3795,6 +3811,7 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
         transport_nostr_adapter::EoseReissueSummary {
             awaiting_relays: 2,
             complete_relays: 0,
+            reissued_earlier_relays: 0,
             reissued_relays: 2,
             failed_relays: 0,
         }
@@ -3822,7 +3839,7 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
     );
     assert_eq!(
         relay.take_reissued(),
-        vec![(account_id.clone(), late_id, vec![a.clone()])]
+        vec![(account_id.clone(), late_id.clone(), vec![a.clone()])]
     );
 
     // The re-issued REQs' fresh EOSE completes the activation's coverage and
@@ -3855,11 +3872,46 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
             .await,
         Some(true)
     );
+    // The late REQ's replay overflows the consumer too: a third lag loses its
+    // fresh EOSE. Later repairs never re-issue it again, but they read the
+    // client's record, and an answer there completes it with no traffic.
+    let third = adapter.notification_lag_mark();
+    assert_eq!(
+        adapter
+            .reissue_subscriptions_awaiting_eose(Some(&account_id), third)
+            .await,
+        transport_nostr_adapter::EoseReissueSummary {
+            awaiting_relays: 1,
+            complete_relays: 0,
+            reissued_earlier_relays: 1,
+            reissued_relays: 0,
+            failed_relays: 0,
+        }
+    );
+    relay.eose_received.store(true, Ordering::SeqCst);
+    assert_eq!(
+        adapter
+            .reissue_subscriptions_awaiting_eose(Some(&account_id), third)
+            .await,
+        transport_nostr_adapter::EoseReissueSummary {
+            awaiting_relays: 1,
+            complete_relays: 1,
+            reissued_earlier_relays: 0,
+            reissued_relays: 0,
+            failed_relays: 0,
+        }
+    );
+    assert!(relay.take_reissued().is_empty(), "nothing more went out");
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&late_id, &a).await,
+        Some(true)
+    );
 }
 
 /// A lag on a receiver shared across accounts repairs every active account,
 /// but not one deactivated before the repair. A relay whose re-issue went out
-/// keeps its claim. One that got none, because the relay was unreachable or
+/// never gets the REQ again, but each later repair still checks the client's
+/// EOSE record for it, so an answer a second lag lost still completes. One that got none, because the relay was unreachable or
 /// the client refused the REQ, counts as failed, and a later repair may claim
 /// it again.
 #[tokio::test]
@@ -3896,11 +3948,45 @@ async fn shared_receiver_lag_repair_covers_every_active_account() {
         repaired,
         std::collections::HashSet::from([account(0xA1), account(0xB2)])
     );
+    let second_lag = adapter.notification_lag_mark();
     assert_eq!(
-        adapter.reissue_subscriptions_awaiting_eose(None, lag).await,
-        transport_nostr_adapter::EoseReissueSummary::default(),
-        "a re-issue that went out keeps its claim"
+        adapter
+            .reissue_subscriptions_awaiting_eose(None, second_lag)
+            .await,
+        transport_nostr_adapter::EoseReissueSummary {
+            awaiting_relays: 2,
+            complete_relays: 0,
+            reissued_earlier_relays: 2,
+            reissued_relays: 0,
+            failed_relays: 0,
+        },
+        "a re-issued relay with no recorded answer gets nothing more"
     );
+    assert!(relay.take_reissued().is_empty());
+    relay.eose_received.store(true, Ordering::SeqCst);
+    assert_eq!(
+        adapter
+            .reissue_subscriptions_awaiting_eose(None, second_lag)
+            .await,
+        transport_nostr_adapter::EoseReissueSummary {
+            awaiting_relays: 2,
+            complete_relays: 2,
+            reissued_earlier_relays: 0,
+            reissued_relays: 0,
+            failed_relays: 0,
+        },
+        "an answer the second lag lost completes from the client's record"
+    );
+    assert!(relay.take_reissued().is_empty());
+    for byte in [0xA1, 0xB2] {
+        assert!(
+            adapter
+                .account_subscription_eose(&account(byte))
+                .await
+                .complete()
+        );
+    }
+    relay.eose_received.store(false, Ordering::SeqCst);
 
     adapter
         .activate_account(TransportAccountActivation {
@@ -3926,6 +4012,7 @@ async fn shared_receiver_lag_repair_covers_every_active_account() {
             transport_nostr_adapter::EoseReissueSummary {
                 awaiting_relays: 2,
                 complete_relays: 0,
+                reissued_earlier_relays: 0,
                 reissued_relays: 0,
                 failed_relays: 2,
             },
@@ -3965,6 +4052,7 @@ async fn lag_repair_records_an_eose_the_client_already_saw() {
         transport_nostr_adapter::EoseReissueSummary {
             awaiting_relays: 1,
             complete_relays: 1,
+            reissued_earlier_relays: 0,
             reissued_relays: 0,
             failed_relays: 0,
         }

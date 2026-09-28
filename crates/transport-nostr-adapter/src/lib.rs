@@ -94,6 +94,7 @@ pub use sdk_client::{
     NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
     sign_transport_event_for_publish,
 };
+use telemetry::EoseRepairClaim;
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
     RelayDeliveryTelemetry, RelayExportConsent, RelayIndex, RelayIndexRegistry,
@@ -102,8 +103,9 @@ pub use telemetry::{
 
 const DELIVERY_BUFFER: usize = 1024;
 
-/// A REQ a lag repair claimed, with each relay it claimed and the claim.
-type ClaimedReq = (MemberId, String, Vec<TransportEndpoint>);
+/// A REQ a lag repair claimed, with each relay it claimed and what the repair
+/// may do there.
+type ClaimedReq = (MemberId, String, Vec<(TransportEndpoint, EoseRepairClaim)>);
 
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
@@ -490,18 +492,22 @@ pub struct NotificationLagMark(u64);
 /// [`NostrTransportAdapter::reissue_subscriptions_awaiting_eose`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EoseReissueSummary {
-    /// Relays, across REQs, that had not reported EOSE to the adapter and were
-    /// claimed for the repair.
+    /// Relays, across REQs issued by the lag, that had not reported EOSE to
+    /// the adapter.
     pub awaiting_relays: usize,
     /// Of those, how many the relay client had already seen answer the REQ
-    /// with EOSE, whose notification the lag lost. Their EOSE is recorded
-    /// with no network traffic.
+    /// with EOSE, whose notification a lag lost. Their EOSE is recorded with
+    /// no network traffic.
     pub complete_relays: usize,
+    /// Of those, how many an earlier repair re-issued the REQ to and the
+    /// relay client has seen no EOSE for yet. Each is re-issued only once, so
+    /// these get nothing more; their replay may still be arriving.
+    pub reissued_earlier_relays: usize,
     /// Of those, how many had the REQ's CLOSE and REQ queued again together.
     pub reissued_relays: usize,
     /// Of those, how many got nothing queued: the relay was not connected,
     /// had no room for both frames, or the client refused. The old REQ is
-    /// still live there. Each claim is released so a later repair tries
+    /// still live there. Each re-issue is released so a later repair tries
     /// again. The rest no longer hold the REQ.
     pub failed_relays: usize,
 }
@@ -625,6 +631,21 @@ pub trait NostrRelayClient: Send + Sync {
     ) -> Result<SubscriptionReissue, TransportAdapterError> {
         Err(TransportAdapterError::Subscription(
             "subscription reissue unsupported".to_owned(),
+        ))
+    }
+
+    /// Whether each relay in `endpoints` answered the live REQ's current send
+    /// with end-of-stored-events, as the client recorded it where a
+    /// notification lag cannot drop it. Sends nothing. A relay the client
+    /// does not hold the REQ on is left out. Unsupported by default.
+    async fn subscription_eose_received(
+        &self,
+        _account_id: &MemberId,
+        _subscription_id: &str,
+        _endpoints: &[TransportEndpoint],
+    ) -> Result<Vec<(TransportEndpoint, bool)>, TransportAdapterError> {
+        Err(TransportAdapterError::Subscription(
+            "subscription EOSE record unsupported".to_owned(),
         ))
     }
 
@@ -1098,11 +1119,13 @@ impl NostrTransportAdapter {
     /// filter, so it replays from the same `since` before a fresh EOSE, and
     /// the notification-loss floor does not move.
     ///
-    /// A relay whose re-issue went out keeps its claim, so it gets the REQ
-    /// again at most once and a replay that lags again cannot loop. One that
-    /// got nothing has its claim released and counts in
-    /// [`EoseReissueSummary::failed_relays`], so the caller can repair it again
-    /// later.
+    /// Every repair checks the client's EOSE record for each such relay,
+    /// which costs no traffic, so a re-issued replay whose fresh EOSE a later
+    /// lag lost still completes. Only the network re-issue is limited: a
+    /// relay gets the REQ again at most once, so a replay that lags again
+    /// cannot loop. A relay that got nothing has its re-issue released and
+    /// counts in [`EoseReissueSummary::failed_relays`], so the caller can
+    /// repair it again later.
     ///
     /// This holds the subscription lifecycle lock throughout, so no
     /// activation, group sync or teardown can close a REQ in between.
@@ -1123,7 +1146,38 @@ impl NostrTransportAdapter {
         };
         let mut complete = Vec::new();
         let mut unsent = Vec::new();
-        for (account_id, subscription_id, endpoints) in awaiting {
+        for (account_id, subscription_id, claims) in awaiting {
+            let (reissue, check): (Vec<_>, Vec<_>) = claims
+                .into_iter()
+                .partition(|(_, claim)| *claim == EoseRepairClaim::Reissue);
+            let check = check
+                .into_iter()
+                .map(|(endpoint, _)| endpoint)
+                .collect::<Vec<_>>();
+            if !check.is_empty() {
+                let received = self
+                    .relay_client
+                    .subscription_eose_received(&account_id, &subscription_id, &check)
+                    .await
+                    .unwrap_or_default();
+                for endpoint in check {
+                    if received
+                        .iter()
+                        .any(|(reported, eose)| *eose && *reported == endpoint)
+                    {
+                        complete.push((subscription_id.clone(), endpoint));
+                    } else {
+                        summary.reissued_earlier_relays += 1;
+                    }
+                }
+            }
+            let endpoints = reissue
+                .into_iter()
+                .map(|(endpoint, _)| endpoint)
+                .collect::<Vec<_>>();
+            if endpoints.is_empty() {
+                continue;
+            }
             let outcomes = match self
                 .relay_client
                 .reissue_subscription(&account_id, &subscription_id, &endpoints)
@@ -1165,6 +1219,7 @@ impl NostrTransportAdapter {
             method = "reissue_subscriptions_awaiting_eose",
             awaiting_relays = summary.awaiting_relays,
             complete_relays = summary.complete_relays,
+            reissued_earlier_relays = summary.reissued_earlier_relays,
             reissued_relays = summary.reissued_relays,
             failed_relays = summary.failed_relays,
             "repaired subscriptions awaiting end-of-stored-events after a notification lag"
@@ -2430,7 +2485,8 @@ impl AdapterState {
     /// reported EOSE for a live REQ started by `started_by_ms`. A live REQ is
     /// an account's inbox, one of its group routes, or post-join maintenance;
     /// `None` covers every account. Returns each REQ with the endpoints
-    /// claimed for it. A claimed relay is never returned again.
+    /// claimed for it and what the repair may do there: a relay is claimed
+    /// for a re-issue at most once, and only checked after that.
     fn claim_subscriptions_awaiting_eose(
         &mut self,
         account_id: Option<&MemberId>,
@@ -2480,9 +2536,8 @@ impl AdapterState {
                         if !claimed.insert(relay) {
                             return None;
                         }
-                        self.sync
-                            .claim_eose_reissue(&id, relay, started_by_ms)
-                            .then(|| endpoint.clone())
+                        let claim = self.sync.claim_eose_repair(&id, relay, started_by_ms)?;
+                        Some((endpoint.clone(), claim))
                     })
                     .collect::<Vec<_>>();
                 (!claims.is_empty()).then_some((account, id, claims))
