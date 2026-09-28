@@ -35,8 +35,9 @@ pub(crate) fn read_secret_json<T: for<'de> Deserialize<'de>>(
 ///
 /// Both zero the old inode after unlinking it, so a reader that opened it
 /// first can read zeros. A read counts only if its inode was still linked once
-/// the read finished, which puts it before that scrub. `after_open` lets tests
-/// replace the file inside that window.
+/// the read finished, which puts it before that scrub. A removal whose unlink
+/// fails zeroes the linked file in place; that read fails to parse instead of
+/// yielding a key. `after_open` lets tests replace the file inside that window.
 fn read_linked_secret(path: &Path, mut after_open: impl FnMut()) -> io::Result<Zeroizing<Vec<u8>>> {
     for _ in 0..SECRET_READ_ATTEMPTS {
         let mut file = File::open(path)?;

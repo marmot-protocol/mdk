@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn scrub_and_remove_local_secret_file_scrubs_then_unlinks() {
+    fn scrub_and_remove_local_secret_file_removes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secret.json");
         fs::write(&path, b"00112233445566778899aabbccddeeff").unwrap();
