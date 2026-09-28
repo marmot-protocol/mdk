@@ -110,10 +110,11 @@ The production SDK gives each account its own receiver and `AccountReceiver` wat
 `notification_loss_for_account` returns that account's watch or rejects an unregistered account.
 
 Each account context also records the `since` of every REQ it issues, before the REQ goes out. A closed REQ keeps
-counting for one minute, because routing is by content and its buffered or in-flight notifications can still arrive.
-`notification_loss_floor` (on the root, `notification_loss_floor_for_account`) returns the lowest of these as a
-`NostrNotificationLossFloor`: no event whose notification a lag loses at that moment is older. An unfloored REQ, no
-REQ at all, or a shared receiver reads as `Unbounded`. Read it at the lag, before a subscription change moves it.
+counting for the rest of the context's life. Routing is by content, so its buffered or in-flight notifications can
+still arrive, and nothing bounds when. `notification_loss_floor` (on the root, `notification_loss_floor_for_account`)
+returns the lowest of these as a `NostrNotificationLossFloor`: no event whose notification a lag loses at that moment
+is older. An unfloored REQ, no REQ at all, or a shared receiver reads as `Unbounded`. The floor only falls over the
+context's life, so reading it at the lag gives the tightest bound.
 
 The recovery consumer subscribes for each activated account and never infers a group from a receiver gap. The backend
 must update the watch without waiting for room in the event-delivery queue, so loss stays observable when event

@@ -54,10 +54,11 @@ The simulator comes first; Jeff validates on a phone.
      generation's bound in that same update, so a goal is bounded only when every delivery
      charged to it contributed a timestamp.
    - SDK notification lag loses notifications, not deliveries with known times. It charges
-     the lowest `since` among the account's REQs that could still deliver at the lag: the
-     live ones, and those closed within the last minute, whose buffered or in-flight
-     notifications still arrive because routing is by content. An unfloored REQ, such as
-     post-join maintenance, makes the charge unknown. A lag keeps the account route open
+     the lowest `since` among every REQ the account's SDK context issued, live or closed.
+     Routing is by content, so a closed REQ's buffered or in-flight notifications still
+     arrive, and nothing bounds when: a stalled consumer keeps them buffered, and a relay
+     with a deep outbound backlog keeps sending them. An unfloored REQ, such as post-join
+     maintenance, makes every later charge on that context unknown. A lag keeps the account route open
      and forces no reconnect. The SDK client has already marked the lost events seen, so
      only comparison and exact-ID acquisition recover them.
    - Loss with no known bound has an unbounded goal. That covers SDK notification lag while
@@ -329,13 +330,14 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   exactly on the cap, and can certify it. A per-relay truncation flag from the fork would
   replace this inference.
 - Notification-lag bounds (#2070). Two kinds of REQ still carry no `since`: post-join
-  maintenance, and a group's retained prior routes. While either is live, or closed less
-  than a minute ago, a lag's loss is unbounded and its goal parks. The inbox's two-day
-  NIP-59 widening sets the account-wide floor, so every lag compares at least two days on
-  every route; per-route floors would need per-scope storage. An EOSE lost in a lag is not
-  recovered, so the next activation re-subscribes instead of reusing the live one. The
-  one-minute grace assumes a consumer stalls for less than that, and relays that ignore
-  `since` are not detected.
+  maintenance, and a group's retained prior routes. Once either has been issued, every
+  later lag on that account's SDK context has unbounded loss and its goal parks, until the
+  context is replaced. A closed REQ's floor keeps counting for the context's life, so the
+  floor only falls: every lag compares from the lowest `since` the context ever issued.
+  The inbox's two-day NIP-59 widening sets that floor at least two days back on every
+  route; per-route floors would need per-scope storage. An EOSE lost in a lag is not
+  recovered, so the next activation re-subscribes instead of reusing the live one. Relays
+  that ignore `since` are not detected.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.

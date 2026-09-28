@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,7 @@ use nostr_sdk::prelude::{
 use nostr_sdk::relay::EventSendStatus;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{timeout, timeout_at};
 use transport_nostr_peeler::{
     KIND_MARMOT_GROUP_MESSAGE, MarmotNostrSigner, NostrTransportEvent, SdkSigner,
 };
@@ -312,117 +312,88 @@ pub struct RelayRegistrationOutcome {
     pub accepted: bool,
 }
 
-/// How long a closed REQ's `since` keeps bounding its receiver's notification
-/// loss.
+/// The `since` floors of the REQs one account context issued, which bound the
+/// events a lag on its notification receiver can lose.
 ///
 /// Deliveries are routed by message content, not by subscription id
 /// (`AdapterState::routes_for`), and the SDK does not verify subscription ids
 /// by default. So a REQ's notifications can still reach the account after it
-/// is closed: those already buffered in the SDK broadcast (4,096) or the app's
-/// consumer queue (4,096), and frames the relay sent before it processed the
-/// CLOSE. A lag can lose any of them, and a floor taken from the live REQs
-/// alone could sit above a lost event. A consumer that keeps up drains both
-/// buffers in seconds, and a CLOSE takes one relay round trip, so one minute
-/// leaves a wide margin before the closed REQ stops counting.
-const RETIRED_SUBSCRIPTION_FLOOR_GRACE: Duration = Duration::from_secs(60);
-
-/// The `since` floors of the REQs one account context issued, which bound the
-/// events a lag on its notification receiver can lose.
+/// is closed or replaced: those already buffered in the SDK broadcast or the
+/// app's consumer queue, and frames the relay sent before it processed the
+/// CLOSE. Neither has a deadline. A stalled consumer keeps them buffered, and
+/// a relay with a deep outbound backlog keeps sending them for as long as the
+/// backlog takes to drain. So a closed REQ's floor bounds the receiver's loss
+/// for the rest of the context's life. Only the lowest closed floor matters.
 #[derive(Debug, Default)]
 struct SubscriptionFloors {
     /// Filter `since` of each live REQ, in Unix seconds; `None` is unfloored.
     live: HashMap<SubscriptionId, Option<u64>>,
-    /// Floors of recently closed REQs, each with the instant it stops
-    /// counting. Instants ascend and floors strictly ascend from front to
-    /// back: a later, lower-or-equal floor outlasts every earlier one it
-    /// covers, so those are dropped when it is pushed, along with any that
-    /// expired.
-    retired: VecDeque<(Instant, NostrNotificationLossFloor)>,
+    /// The lowest floor among the REQs this context closed, replaced, or
+    /// abandoned.
+    retired: Option<NostrNotificationLossFloor>,
 }
 
 impl SubscriptionFloors {
     /// Record a REQ before it goes out, returning the floor it replaces under
-    /// the same id. A replaced filter's frames can still be in flight, so its
-    /// floor is retired rather than forgotten.
-    fn open(
-        &mut self,
-        id: &SubscriptionId,
-        since: Option<u64>,
-        now: Instant,
-    ) -> Option<Option<u64>> {
+    /// the same id. A replaced filter's frames can still arrive, so its floor
+    /// is retired rather than forgotten.
+    fn open(&mut self, id: &SubscriptionId, since: Option<u64>) -> Option<Option<u64>> {
         let replaced = self.live.insert(id.clone(), since);
         if let Some(previous) = replaced
             && previous != since
         {
-            self.retire(NostrNotificationLossFloor::from_since(previous), now);
+            self.retire(NostrNotificationLossFloor::from_since(previous));
         }
         replaced
     }
 
     /// A REQ that failed may still have reached a relay: retire its floor, and
     /// restore the floor of the REQ it would have replaced.
-    fn abandon(&mut self, id: &SubscriptionId, replaced: Option<Option<u64>>, now: Instant) {
+    fn abandon(&mut self, id: &SubscriptionId, replaced: Option<Option<u64>>) {
         let since = match replaced {
             Some(previous) => self.live.insert(id.clone(), previous),
             None => self.live.remove(id),
         };
         if let Some(since) = since {
-            self.retire(NostrNotificationLossFloor::from_since(since), now);
+            self.retire(NostrNotificationLossFloor::from_since(since));
         }
     }
 
     /// The REQ's CLOSE went out.
-    fn close(&mut self, id: &SubscriptionId, now: Instant) {
+    fn close(&mut self, id: &SubscriptionId) {
         if let Some(since) = self.live.remove(id) {
-            self.retire(NostrNotificationLossFloor::from_since(since), now);
+            self.retire(NostrNotificationLossFloor::from_since(since));
         }
     }
 
     /// Account-wide teardown: every REQ except those whose CLOSE failed. This
     /// includes a REQ whose subscribe failed or was cancelled after it was
     /// recorded, which the context never learned the relays accepted.
-    fn close_all_except(&mut self, still_live: &[SubscriptionId], now: Instant) {
+    fn close_all_except(&mut self, still_live: &[SubscriptionId]) {
         let closed = self
             .live
             .extract_if(|id, _| !still_live.contains(id))
             .map(|(_, since)| NostrNotificationLossFloor::from_since(since))
             .collect::<Vec<_>>();
         for floor in closed {
-            self.retire(floor, now);
+            self.retire(floor);
         }
     }
 
-    fn retire(&mut self, floor: NostrNotificationLossFloor, now: Instant) {
-        while self.retired.front().is_some_and(|(until, _)| *until <= now) {
-            self.retired.pop_front();
-        }
-        while self
-            .retired
-            .back()
-            .is_some_and(|(_, kept)| floor.lowest(*kept) == floor)
-        {
-            self.retired.pop_back();
-        }
-        self.retired
-            .push_back((now + RETIRED_SUBSCRIPTION_FLOOR_GRACE, floor));
+    fn retire(&mut self, floor: NostrNotificationLossFloor) {
+        self.retired = Some(self.retired.map_or(floor, |kept| kept.lowest(floor)));
     }
 
-    /// The lowest floor among live REQs and REQs closed within the grace
-    /// period. With neither, there is no REQ evidence at all. That reads as
+    /// The lowest floor among live REQs and every REQ this context closed.
+    /// With neither, there is no REQ evidence at all. That reads as
     /// unbounded, not as no loss: the lost notifications then came from a
     /// REQ this record never saw.
-    fn loss_floor(&self, now: Instant) -> NostrNotificationLossFloor {
-        // Floors ascend with expiry, so the first unexpired one is the lowest.
-        let retired = self
-            .retired
-            .iter()
-            .find(|(until, _)| *until > now)
-            .map(|(_, floor)| *floor);
+    fn loss_floor(&self) -> NostrNotificationLossFloor {
         self.live
             .values()
             .copied()
             .map(NostrNotificationLossFloor::from_since)
-            .chain(retired)
+            .chain(self.retired)
             .reduce(NostrNotificationLossFloor::lowest)
             .unwrap_or(NostrNotificationLossFloor::Unbounded)
     }
@@ -726,14 +697,17 @@ impl NostrSdkRelayClient {
 
     /// Lower bound on the wire `created_at` of any event whose notification
     /// this client's receiver loses if it lags now: the lowest `since` among
-    /// its live REQs and those closed within the last minute. Read it at the
-    /// lag, before a later subscription change moves it.
+    /// the REQs it issued, live or closed. It only falls over the context's
+    /// life, so reading it at the lag gives the tightest bound.
     ///
     /// Only an account context records floors. A shared or multi-account root
     /// reports [`NostrNotificationLossFloor::Unbounded`]: its receiver's loss
     /// cannot be attributed to one account's REQs.
     pub fn notification_loss_floor(&self) -> NostrNotificationLossFloor {
-        self.notification_loss_floor_at(Instant::now())
+        self.account_subscription_floors()
+            .map_or(NostrNotificationLossFloor::Unbounded, |floors| {
+                floors.loss_floor()
+            })
     }
 
     /// [`Self::notification_loss_floor`] of the account context a
@@ -758,13 +732,6 @@ impl NostrSdkRelayClient {
         } else {
             NostrNotificationLossFloor::Unbounded
         }
-    }
-
-    fn notification_loss_floor_at(&self, now: Instant) -> NostrNotificationLossFloor {
-        self.account_subscription_floors()
-            .map_or(NostrNotificationLossFloor::Unbounded, |floors| {
-                floors.loss_floor(now)
-            })
     }
 
     /// The REQ floor record, which only an account context keeps.
@@ -2410,14 +2377,14 @@ impl NostrRelayClient for NostrSdkRelayClient {
         let since = plan.filter.since.map(|since| since.as_secs());
         let replaced = self
             .account_subscription_floors()
-            .map(|mut floors| floors.open(&id, since, Instant::now()));
+            .map(|mut floors| floors.open(&id, since));
         let result = self.subscribe_planned(plan).await;
         if result.is_err()
             && let Some(replaced) = replaced
             && let Some(mut floors) = self.account_subscription_floors()
         {
             // The REQ may have reached a relay before the failure.
-            floors.abandon(&id, replaced, Instant::now());
+            floors.abandon(&id, replaced);
         }
         result
     }
@@ -2453,7 +2420,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
         // Look the floor up by id: callers may rebuild the subscription
         // without the `since` it was issued with.
         if let Some(mut floors) = self.account_subscription_floors() {
-            floors.close(&plan.subscription_id, Instant::now());
+            floors.close(&plan.subscription_id);
         }
         if let Some(ids) = self
             .account_subscriptions
@@ -2511,7 +2478,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
             }
         }
         if let Some(mut floors) = self.account_subscription_floors() {
-            floors.close_all_except(&failed, Instant::now());
+            floors.close_all_except(&failed);
         }
         if !failed.is_empty() {
             self.account_subscriptions
@@ -3269,104 +3236,69 @@ mod tests {
     }
 
     #[test]
-    fn notification_loss_floor_is_the_lowest_live_or_recently_closed_since() {
+    fn notification_loss_floor_is_the_lowest_live_or_closed_since() {
         use NostrNotificationLossFloor::{Since, Unbounded};
         let id = |name: &str| SubscriptionId::new(name);
-        let grace = RETIRED_SUBSCRIPTION_FLOOR_GRACE;
-        let start = Instant::now();
         let mut floors = SubscriptionFloors::default();
         assert_eq!(
-            floors.loss_floor(start),
+            floors.loss_floor(),
             Unbounded,
             "no REQ evidence is not a bound"
         );
 
-        assert_eq!(floors.open(&id("inbox"), Some(500), start), None);
-        floors.open(&id("group"), Some(300), start);
-        assert_eq!(floors.loss_floor(start), Since(300));
-        floors.open(&id("maintenance"), None, start);
-        assert_eq!(floors.loss_floor(start), Unbounded, "an unfloored REQ");
+        assert_eq!(floors.open(&id("inbox"), Some(500)), None);
+        floors.open(&id("group"), Some(300));
+        assert_eq!(floors.loss_floor(), Since(300));
 
-        // A closed REQ counts for the grace period, and no longer.
-        let closed = start + Duration::from_secs(1);
-        floors.close(&id("maintenance"), closed);
-        assert_eq!(
-            floors.loss_floor(closed + grace - Duration::from_millis(1)),
-            Unbounded
-        );
-        assert_eq!(floors.loss_floor(closed + grace), Since(300));
-        let later = closed + grace;
-        floors.close(&id("group"), later);
-        assert_eq!(floors.loss_floor(later), Since(300), "a lower closed REQ");
-        assert_eq!(floors.loss_floor(later + grace), Since(500));
+        // A closed REQ's frames can still arrive however long ago it closed,
+        // so its floor stays after later REQs open above it.
+        floors.close(&id("group"));
+        floors.open(&id("group"), Some(800));
+        floors.open(&id("other"), Some(900));
+        assert_eq!(floors.loss_floor(), Since(300), "a lower closed REQ");
 
         // A REQ replaced under its id keeps its earlier filter's floor too.
-        let replaced = later + grace;
-        assert_eq!(
-            floors.open(&id("inbox"), Some(900), replaced),
-            Some(Some(500))
-        );
-        assert_eq!(floors.loss_floor(replaced), Since(500));
-        assert_eq!(floors.loss_floor(replaced + grace), Since(900));
+        let mut replaced = SubscriptionFloors::default();
+        replaced.open(&id("inbox"), Some(500));
+        assert_eq!(replaced.open(&id("inbox"), Some(900)), Some(Some(500)));
+        assert_eq!(replaced.loss_floor(), Since(500));
 
         // A failed REQ may have reached a relay; the one it would have
         // replaced is still live.
-        let failed = replaced + grace;
-        let previous = floors.open(&id("inbox"), Some(700), failed);
-        floors.abandon(&id("inbox"), previous, failed);
-        let fresh = floors.open(&id("fresh"), None, failed);
-        floors.abandon(&id("fresh"), fresh, failed);
-        assert_eq!(floors.loss_floor(failed), Unbounded);
-        assert_eq!(floors.loss_floor(failed + grace), Since(900));
+        let mut failed = SubscriptionFloors::default();
+        failed.open(&id("inbox"), Some(900));
+        let previous = failed.open(&id("inbox"), Some(700));
+        failed.abandon(&id("inbox"), previous);
+        assert_eq!(failed.live.get(&id("inbox")), Some(&Some(900)));
+        assert_eq!(failed.loss_floor(), Since(700));
 
         // Account teardown retires everything but a REQ whose CLOSE failed.
-        let teardown = failed + grace;
-        floors.open(&id("kept"), Some(950), teardown);
-        floors.open(&id("orphan"), Some(100), teardown);
-        floors.close_all_except(&[id("kept")], teardown);
-        assert_eq!(floors.loss_floor(teardown), Since(100));
-        assert_eq!(floors.loss_floor(teardown + grace), Since(950));
-        floors.close(&id("kept"), teardown + grace);
-        assert_eq!(floors.loss_floor(teardown + grace * 2), Unbounded);
-    }
+        let mut teardown = SubscriptionFloors::default();
+        teardown.open(&id("kept"), Some(950));
+        teardown.open(&id("orphan"), Some(100));
+        teardown.close_all_except(&[id("kept")]);
+        assert_eq!(teardown.live.keys().collect::<Vec<_>>(), [&id("kept")]);
+        teardown.close(&id("kept"));
+        assert_eq!(teardown.loss_floor(), Since(100));
 
-    #[test]
-    fn retired_notification_floors_keep_only_entries_that_can_still_matter() {
-        use NostrNotificationLossFloor::{Since, Unbounded};
-        let grace = RETIRED_SUBSCRIPTION_FLOOR_GRACE;
-        let start = Instant::now();
-        let mut floors = SubscriptionFloors::default();
-        for (offset, floor) in [(0, Since(400)), (1, Since(200)), (2, Since(300))] {
-            floors.retire(floor, start + Duration::from_secs(offset));
-        }
-        // 200 outlasts the earlier 400, so only 200 and the later 300 remain.
-        assert_eq!(floors.retired.len(), 2);
-        assert_eq!(
-            floors.loss_floor(start + Duration::from_secs(2)),
-            Since(200)
-        );
-        assert_eq!(
-            floors.loss_floor(start + Duration::from_secs(1) + grace),
-            Since(300)
-        );
-        floors.retire(Unbounded, start + grace + Duration::from_secs(1));
-        assert_eq!(
-            floors.retired.len(),
-            1,
-            "unbounded covers every earlier floor"
-        );
-        assert_eq!(floors.loss_floor(start + grace * 2), Unbounded);
-        assert_eq!(
-            floors.loss_floor(start + grace * 2 + Duration::from_secs(1)),
-            Unbounded,
-            "no REQ evidence remains"
-        );
+        // An old unfloored REQ that closed while a floored one stays live
+        // leaves every later lag on its context unbounded: however long ago
+        // it closed, its frames may still be buffered or on their way.
+        let mut unfloored = SubscriptionFloors::default();
+        unfloored.open(&id("maintenance"), None);
+        unfloored.open(&id("group"), Some(900));
+        unfloored.close(&id("maintenance"));
+        unfloored.open(&id("inbox"), Some(950));
+        assert_eq!(unfloored.loss_floor(), Unbounded);
+        let fresh = unfloored.open(&id("fresh"), Some(50));
+        unfloored.abandon(&id("fresh"), fresh);
+        assert!(!unfloored.live.contains_key(&id("fresh")));
+        assert_eq!(unfloored.retired, Some(Unbounded), "no floor raises it");
     }
 
     #[tokio::test]
     async fn account_context_records_req_floors_from_subscribe_to_teardown() {
         use NostrNotificationLossFloor::{Since, Unbounded};
-        let grace = RETIRED_SUBSCRIPTION_FLOOR_GRACE;
         let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
         let endpoints = vec![TransportEndpoint(relay.url().await.to_string())];
         let root = NostrSdkRelayClient::multi_account();
@@ -3386,23 +3318,17 @@ mod tests {
             since,
             attempt,
         };
-        let maintenance = NostrSubscription::GroupMaintenance {
-            account_id: account_id.clone(),
-            group_id: group_id.clone(),
-            transport_group_id: vec![0xD4; 32],
-            endpoints: endpoints.clone(),
-        };
         assert_eq!(account.notification_loss_floor(), Unbounded);
 
         root.subscribe(NostrSubscription::AccountInbox {
             account_id: account_id.clone(),
             endpoints: endpoints.clone(),
-            since: Some(Timestamp(1_000)),
+            since: Some(Timestamp(2_000)),
             attempt,
         })
         .await
         .unwrap();
-        root.subscribe(group(Some(Timestamp(2_000)))).await.unwrap();
+        root.subscribe(group(Some(Timestamp(1_000)))).await.unwrap();
         assert_eq!(account.notification_loss_floor(), Since(1_000));
         assert_eq!(
             root.notification_loss_floor_for_account(&account_id).await,
@@ -3413,31 +3339,17 @@ mod tests {
                 .await,
             Unbounded
         );
-        root.subscribe(maintenance.clone()).await.unwrap();
-        assert_eq!(account.notification_loss_floor(), Unbounded);
         assert_eq!(
             root.notification_loss_floor(),
             Unbounded,
             "a multi-account root cannot attribute its receiver's loss"
         );
 
-        root.unsubscribe(maintenance).await.unwrap();
-        let closed = Instant::now();
-        assert_eq!(account.notification_loss_floor(), Unbounded);
-        assert_eq!(
-            account.notification_loss_floor_at(closed + grace),
-            Since(1_000)
-        );
-
         // Group sync rebuilds a removed REQ without its `since`; its floor is
-        // found by id.
+        // found by id, and it keeps counting once the REQ is closed.
         root.unsubscribe(group(None)).await.unwrap();
-        assert_eq!(
-            account.notification_loss_floor_at(closed + grace),
-            Since(1_000)
-        );
+        assert_eq!(account.notification_loss_floor(), Since(1_000));
         root.unsubscribe_account(&account_id).await.unwrap();
-        let torn_down = Instant::now();
         assert!(
             account
                 .account_subscription_floors()
@@ -3446,18 +3358,13 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            account.notification_loss_floor_at(closed + grace),
+            account.notification_loss_floor(),
             Since(1_000),
-            "closed REQs still count during the grace period"
-        );
-        assert_eq!(
-            account.notification_loss_floor_at(torn_down + grace),
-            Unbounded,
-            "no REQ evidence remains"
+            "closed REQs keep counting for the context's life"
         );
 
-        // A subscribe that fails after its floor was recorded keeps it for
-        // the grace period: the REQ may have reached a relay.
+        // A subscribe that fails after its floor was recorded keeps it: the
+        // REQ may have reached a relay.
         account.client().shutdown().await;
         let failed = root
             .subscribe(NostrSubscription::AccountInbox {
@@ -3468,7 +3375,6 @@ mod tests {
             })
             .await;
         assert!(failed.is_err());
-        let failed_at = Instant::now();
         assert!(
             account
                 .account_subscription_floors()
@@ -3476,14 +3382,7 @@ mod tests {
                 .live
                 .is_empty()
         );
-        assert_eq!(
-            account.notification_loss_floor_at(closed + grace),
-            Since(50)
-        );
-        assert_eq!(
-            account.notification_loss_floor_at(failed_at + grace),
-            Unbounded
-        );
+        assert_eq!(account.notification_loss_floor(), Since(50));
         root.shutdown_accounts().await;
     }
 
