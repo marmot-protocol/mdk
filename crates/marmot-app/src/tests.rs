@@ -1402,7 +1402,11 @@ fn cancelled_sync_keeps_profile() {
     });
 }
 
-fn epoch_gap_probe(nostr_group_id_hex: &str, created_at: u64, marker: &str) -> NostrTransportEvent {
+pub(crate) fn epoch_gap_probe(
+    nostr_group_id_hex: &str,
+    created_at: u64,
+    marker: &str,
+) -> NostrTransportEvent {
     let mut envelope = vec![0_u8; 12];
     envelope.extend_from_slice(format!("explicit-catch-up-probe:{marker}").as_bytes());
     assert!(envelope.len() >= NOSTR_GROUP_CONTENT_MIN_LEN);

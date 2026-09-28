@@ -206,9 +206,11 @@ See [`AGENTS.md`](AGENTS.md) for the module map and privacy-safe telemetry rules
 `MarmotAppRuntime::repair_full_history` requests one owner-authorized explicit-history obligation and runs the
 account's one recovery job for it in place: a NIP-77 comparison of every route over the retained-inventory window,
 then bounded admission of what it fetched through ordinary ingest. It installs and replays no subscription.
-Success requires that every required relay certified its route and every difference was durably admitted; an
-answer from only some required relays, or a goal below the inventory floor, cannot certify completion. Each pass
-fetches at most 16 missing events per relay, so a large gap can take further repairs or automatic passes.
+It never reports complete: full history has no lower bound, and no comparison searches below the inventory
+floor. When every required relay certified its route's window and every difference was durably admitted, the
+repair returns `BelowRetentionWindow`, naming the unsearched older history; otherwise `CoverageUnproven`. Its
+explicit-history debt stays open either way. Each pass fetches at most 16 missing events per relay, so a large
+gap can take further repairs or automatic passes.
 Known-event recovery can instead complete from a validated retained copy. Maintenance uses its separately fenced
 boundary.
 
@@ -222,7 +224,7 @@ including through `AccountCatchUp`. It never parses display strings. The API sha
 The explicit attempt has a 60-second overall cooperative budget, including setup and comparison. Cancellation or
 the deadline aborts the comparison request and stops admission at a turn boundary; a started ingest/checkpoint
 finishes first, so this is not a hard bound on an individual storage operation. The attempt then reports
-`Cancelled` or `Deadline`, and an uncertified pass reports `CoverageUnproven`. Partial progress remains durable,
+`Cancelled` or `Deadline`. Partial progress remains durable,
 outstanding loss survives reopen, and only qualified completion plus the exact live acknowledgment can reclaim
 captured loss evidence. The only other way to release its cursor fence is the user dismissing that loss's "history
 may be incomplete" notice (below), which is never coverage.

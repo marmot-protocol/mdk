@@ -286,6 +286,7 @@ fn safe_failure_category(input: &str) -> String {
         | "external_signer_rejected"
         | "external_signer_unavailable"
         | "follow_list_unavailable"
+        | "full_history_below_retention_window"
         | "full_history_coverage_unproven"
         | "full_history_repair_cancelled"
         | "full_history_repair_deadline"

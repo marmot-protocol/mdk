@@ -3078,6 +3078,14 @@ async fn handle_account_worker_catch_up(
     } else {
         TelemetryOutcome::Failure
     });
+    // A job that parked or reopened recovery debt announces it before the
+    // caller, who may re-read the notices at once, gets its answer.
+    publish_history_notice_changes(
+        client,
+        context.events,
+        context.account_id_hex,
+        context.account_label,
+    );
     for respond in catch_up_responders {
         let _ = respond.send(result.clone());
     }
@@ -4345,6 +4353,9 @@ fn account_worker_command_future<'a>(
                     .err()
                     .map(AccountCatchUpFailure::classification),
             );
+            // Announce a parked or reopened obligation before the caller
+            // re-reads the notices.
+            publish_history_notice_changes(client, events, account_id_hex, account_label);
             let _ = respond.send(result);
             true
         }),

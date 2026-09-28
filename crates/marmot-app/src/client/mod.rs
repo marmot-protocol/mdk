@@ -428,6 +428,10 @@ pub struct AppClient {
     /// successful checkpoint. A reopened client recovers the same outputs from
     /// the durable engine outbox instead.
     pub(crate) pending_failed_sync_summary: crate::SyncSummary,
+    /// Whether the last settled job certified the retained window of every
+    /// explicit-history scope it compared. Explicit history reaches below
+    /// that window, so this never completes it; it names why it stays open.
+    pub(crate) explicit_history_window_certified: bool,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
     ///

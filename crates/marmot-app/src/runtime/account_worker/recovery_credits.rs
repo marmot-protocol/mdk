@@ -50,12 +50,12 @@ pub(crate) async fn acquire_recovery_credit(
 }
 
 #[cfg(test)]
-pub(super) fn available_credits(pool: &Arc<RecoveryCreditPool>) -> usize {
+pub(crate) fn available_credits(pool: &Arc<RecoveryCreditPool>) -> usize {
     pool.semaphore.available_permits()
 }
 
 #[cfg(test)]
-pub(super) fn hold_all_credits_for_test(pool: &Arc<RecoveryCreditPool>) -> OwnedSemaphorePermit {
+pub(crate) fn hold_all_credits_for_test(pool: &Arc<RecoveryCreditPool>) -> OwnedSemaphorePermit {
     pool.semaphore
         .clone()
         .try_acquire_many_owned(MAX_CONCURRENT_JOBS as u32)

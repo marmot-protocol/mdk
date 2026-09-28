@@ -505,8 +505,9 @@ impl AppClient {
     /// explicit caller or a directly owned client, which has no worker loop to
     /// interleave. The comparison still runs in its own task under `credit`,
     /// and admission takes the same bounded turns. An explicit repair's
-    /// `control` bounds the network pass by its budget; its cancellation also
-    /// stops admission, keeping the admitted prefix and certifying nothing.
+    /// `control` bounds the network pass by its budget; cancellation or the
+    /// deadline also stops admission at a turn boundary, keeping the admitted
+    /// prefix and certifying nothing.
     pub(crate) async fn run_recovery_job(
         &mut self,
         grant: AttemptGrant,
@@ -538,18 +539,23 @@ impl AppClient {
                 () = tokio::time::sleep(RECOVERY_JOB_CANCEL_POLL),
                     if control.is_some() =>
                 {
-                    if control.is_some_and(FullHistoryRepairControl::cancelled) {
+                    if control.is_some_and(|control| control.stopped().is_some()) {
                         network.abort_and_wait().await;
                         break None;
                     }
                 }
             }
         };
-        let Some((_credit, result)) = completed else {
+        let Some((credit, result)) = completed else {
             return self.abandon_comparison_grant(grant, execution);
         };
-        self.admit_comparison_until(grant, execution, result, control)
-            .await
+        // The job counts against the process pool until admission and its
+        // checkpoint finish, not only while the network request runs.
+        let settled = self
+            .admit_comparison_until(grant, execution, result, control)
+            .await;
+        drop(credit);
+        settled
     }
 
     /// Run one selected grant through the job with a private credit.
@@ -593,7 +599,7 @@ impl AppClient {
         };
         if let Some(admission) = admission.as_mut() {
             loop {
-                if control.is_some_and(FullHistoryRepairControl::cancelled) {
+                if control.is_some_and(|control| control.stopped().is_some()) {
                     // The admitted prefix stays durable; the pass certifies
                     // nothing, so the debt waits for a later grant.
                     admission.invalid = true;

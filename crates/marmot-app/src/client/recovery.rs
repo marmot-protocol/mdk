@@ -1234,6 +1234,22 @@ impl AppClient {
         Ok(())
     }
 
+    /// Whether recovery may contact any relay of the account's routes. With
+    /// none, no grant can be selected, so no caller should wait for a credit.
+    pub(crate) fn recovery_endpoints_admitted(&self) -> bool {
+        let routing = self.routing.snapshot();
+        !self
+            .adapter
+            .recovery_admitted_endpoints(&routing.local_inbox_endpoints)
+            .is_empty()
+            || routing.group_routes.iter().any(|route| {
+                !self
+                    .adapter
+                    .recovery_admitted_endpoints(&route.endpoints)
+                    .is_empty()
+            })
+    }
+
     /// Worker-only boundary: import loss and synchronize the existing receipt
     /// consumer before selecting a revision-fenced immutable history plan.
     pub(crate) fn authorize_account_recovery(
@@ -1277,17 +1293,7 @@ impl AppClient {
         drop(self.transport_receipts()?);
         self.observe_recovery_route_policy()?;
         let routing = self.routing.snapshot();
-        let admitted = !self
-            .adapter
-            .recovery_admitted_endpoints(&routing.local_inbox_endpoints)
-            .is_empty()
-            || routing.group_routes.iter().any(|route| {
-                !self
-                    .adapter
-                    .recovery_admitted_endpoints(&route.endpoints)
-                    .is_empty()
-            });
-        let readiness = if admitted {
+        let readiness = if self.recovery_endpoints_admitted() {
             RecoveryReadiness::Unknown
         } else {
             RecoveryReadiness::Waiting

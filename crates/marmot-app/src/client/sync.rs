@@ -163,10 +163,6 @@ impl FullHistoryRepairControl<'_> {
         }
     }
 
-    pub(crate) fn cancelled(&self) -> bool {
-        (self.cancelled)()
-    }
-
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
         tokio::time::Instant::from_std(self.started) + self.timeout
     }
@@ -1298,10 +1294,11 @@ impl AppClient {
     /// live subscriptions, and a route change refreshes them; recovery never
     /// touches them. The live queue drains first, so the job's frozen
     /// inventory already holds what the live subscriptions delivered and
-    /// nothing is fetched twice. An explicit caller then waits for a process
-    /// credit and runs one job in place; startup takes a credit only if one is
-    /// free. Automatic catch-up, such as key-package maintenance, only drains:
-    /// the worker's own job serves its debt.
+    /// nothing is fetched twice. With recovery debt, an explicit caller then
+    /// waits for a process credit, drains once more and runs one job in
+    /// place; startup takes a credit only if one is free. Without debt no
+    /// credit is taken. Automatic catch-up, such as key-package maintenance,
+    /// only drains: the worker's own job serves its debt.
     async fn sync_inner(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
@@ -1328,24 +1325,45 @@ impl AppClient {
         // events. Receiving existing subscriptions is not a new acquisition.
         let mut summary = self.sync_sdk_relay().await?;
         use crate::runtime::account_worker::recovery_credits;
-        let credit = if self.app.cursor_persistence() != CursorPersistence::Advance {
+        let state_persist = |summary: SyncSummary, error| {
+            ClassifiedSyncFailure::at_stage(summary, error, SyncFailureStage::StatePersist)
+        };
+        // A sync with no recovery debt, or no relay recovery may contact,
+        // takes no credit: it would only hold one of the process's two, and
+        // the account with it, for a grant it cannot select.
+        let wants_job =
+            self.app.cursor_persistence() == CursorPersistence::Advance && (explicit || startup);
+        if wants_job && let Err(error) = self.request_sync_comparison(telemetry, explicit) {
+            return Err(state_persist(summary, error));
+        }
+        let pending = match self.recovery_pending() {
+            Ok(pending) => pending && self.recovery_endpoints_admitted(),
+            Err(error) => return Err(state_persist(summary, error)),
+        };
+        let credit = if !wants_job || !pending {
             None
         } else if explicit {
             Some(recovery_credits::acquire_recovery_credit(&self.recovery_credits).await)
-        } else if startup {
+        } else {
             recovery_credits::try_acquire_recovery_credit(&self.recovery_credits)
+        };
+        let grant = if credit.is_some() {
+            // Input that arrived while the credit was pending is ingested
+            // before the inventory freezes, so the job does not fetch it again.
+            match self.sync_sdk_relay().await {
+                Ok(drained) => summary.merge(drained),
+                Err(mut failure) => {
+                    summary.merge(std::mem::take(&mut failure.partial_summary));
+                    failure.partial_summary = summary;
+                    return Err(failure);
+                }
+            }
+            match self.select_sync_grant(telemetry, explicit) {
+                Ok(grant) => grant,
+                Err(error) => return Err(state_persist(summary, error)),
+            }
         } else {
             None
-        };
-        let grant = match self.prepare_sync_grant(telemetry, explicit, credit.is_some()) {
-            Ok(grant) => grant,
-            Err(error) => {
-                return Err(ClassifiedSyncFailure::at_stage(
-                    summary,
-                    error,
-                    SyncFailureStage::StatePersist,
-                ));
-            }
         };
         if let (Some(grant), Some(credit)) = (grant, credit) {
             match self.run_recovery_job(grant, credit, None).await {
@@ -1416,6 +1434,19 @@ impl AppClient {
         explicit: bool,
         credit_available: bool,
     ) -> Result<Option<AttemptGrant>, AppError> {
+        self.request_sync_comparison(telemetry, explicit)?;
+        if !credit_available {
+            return Ok(None);
+        }
+        self.select_sync_grant(telemetry, explicit)
+    }
+
+    /// Record a startup or explicit caller's comparison request.
+    fn request_sync_comparison(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        explicit: bool,
+    ) -> Result<(), AppError> {
         if self.app.cursor_persistence() == CursorPersistence::Advance
             && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
         {
@@ -1424,9 +1455,15 @@ impl AppClient {
                 self.comparison_startup_requested = true;
             }
         }
-        if !credit_available {
-            return Ok(None);
-        }
+        Ok(())
+    }
+
+    /// Select the grant a sync's job runs, under the credit it holds.
+    fn select_sync_grant(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        explicit: bool,
+    ) -> Result<Option<AttemptGrant>, AppError> {
         let mut caller = ExplicitRecoveryPermit::default();
         self.authorize_account_recovery(
             explicit.then_some(&mut caller),
@@ -3993,6 +4030,8 @@ impl AppClient {
                 )?;
             }
             let mut progressed_any = false;
+            let mut explicit_scopes = 0_usize;
+            let mut explicit_window_certified = true;
             for obligation in grant.plan().expect("validated executor grant") {
                 // A selected group can lack any executable route even though
                 // another obligation made the account ready. Preserve that
@@ -4078,14 +4117,24 @@ impl AppClient {
                     }
                     // A comparison proves only the window it compared. A goal
                     // that reaches below the retained-inventory floor, or has
-                    // no lower bound, keeps its debt. Cold-start, incremental
-                    // and explicit history is that window: its floor, raised
-                    // by retention or compaction, is the goal's lower bound.
-                    let window_bounded = matches!(
-                        obligation.cause,
-                        storage_sqlite::RecoveryCause::IncrementalHistory
-                            | storage_sqlite::RecoveryCause::ExplicitHistory
-                    );
+                    // no lower bound, keeps its debt. Cold-start and
+                    // incremental history is that window: its floor, raised by
+                    // retention or compaction, is the goal's lower bound.
+                    // Explicit history has no lower bound, so it never
+                    // certifies; a certified window only names what is left.
+                    let window_bounded =
+                        obligation.cause == storage_sqlite::RecoveryCause::IncrementalHistory;
+                    if obligation.cause == storage_sqlite::RecoveryCause::ExplicitHistory {
+                        explicit_scopes += 1;
+                        explicit_window_certified &= !refused
+                            && compared.is_some_and(|compared| compared.certified)
+                            && route.as_ref().is_some_and(|route| {
+                                grant.inventory.iter().any(|window| {
+                                    &window.route == route
+                                        && scope.goal.until_seconds <= window.until
+                                })
+                            });
+                    }
                     let covers_goal = route.as_ref().is_some_and(|route| {
                         grant.inventory.iter().any(|window| {
                             &window.route == route
@@ -4178,6 +4227,8 @@ impl AppClient {
                     )?;
                 }
             }
+            self.explicit_history_window_certified =
+                explicit_scopes > 0 && explicit_window_certified;
             if progressed_any {
                 // New coverage or newly fetched history is progress: the next
                 // pass runs at the base delay and the parking streak restarts.
@@ -4288,6 +4339,7 @@ impl AppClient {
                 EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
             .map_err(|error| state_persist(SyncSummary::default(), error))?;
+        self.explicit_history_window_certified = false;
         let result = match grant {
             Some(grant) => self.run_recovery_job(grant, credit, Some(control)).await,
             None => Ok(EpochBackfillRunOutcome::Deferred),
@@ -4311,7 +4363,11 @@ impl AppClient {
                 summary,
                 control
                     .stopped()
-                    .unwrap_or(crate::FullHistoryRepairIncompleteReason::CoverageUnproven),
+                    .unwrap_or(if self.explicit_history_window_certified {
+                        crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow
+                    } else {
+                        crate::FullHistoryRepairIncompleteReason::CoverageUnproven
+                    }),
                 self.delivery_loss_blocks_cursor(),
             )),
             Err(error) => Err(ClassifiedSyncFailure::at_stage(

@@ -35,9 +35,12 @@
   `next_event()` drain the live queue, then run one job in place, and no longer re-activate
   transport or re-issue live REQs once the session is active; a route change still
   refreshes them. `repair_full_history` compares every route over the retained-inventory
-  window in one pass inside its 60-second budget and installs no unfloored replay. It can
-  now complete on certified coverage, reports `CoverageUnproven`, `Cancelled` or
-  `Deadline` otherwise, and no longer fetches history older than the retained window.
+  window in one pass inside its 60-second budget and installs no unfloored replay, so it
+  no longer fetches history older than the retained window. Full history has no lower
+  bound, so the repair never reports complete: it returns `BelowRetentionWindow` when
+  every route's window certified, and `CoverageUnproven`, `Cancelled` or `Deadline`
+  otherwise. The deadline also stops admission at a turn boundary, keeping what was
+  already admitted.
 - Account recovery certifies a route on its operated relays only.
   `MarmotAppConfig::recovery_operated_relays` names them and defaults to
   `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`. A route that lists
@@ -149,6 +152,10 @@
 
 ### Breaking changes
 
+- `FullHistoryRepairIncompleteReason` gains `BelowRetentionWindow`
+  (`full_history_below_retention_window`): an explicit repair certified every route's
+  retained window, but history below that window was never searched. Exhaustive Rust
+  matches must handle it; bindings see only the existing error code.
 - Remove `MarmotAppConfig::dev_epoch_backfill_eose_wait_ms` and
   `dev_epoch_backfill_execution_quantum_ms` with their `with_*` builders. Recovery no
   longer drains toward an end-of-stored-events budget, so neither had an effect. The

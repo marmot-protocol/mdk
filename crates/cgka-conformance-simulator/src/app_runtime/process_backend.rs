@@ -46,11 +46,14 @@ pub(crate) fn history_repair_outcome(
     match result {
         Ok(()) => Ok(HistoryRepairOutcome::Complete),
         Err(error)
-            if error.full_history_repair_incomplete()
-                == Some((
-                    marmot_app::FullHistoryRepairIncompleteReason::CoverageUnproven,
+            if matches!(
+                error.full_history_repair_incomplete(),
+                Some((
+                    marmot_app::FullHistoryRepairIncompleteReason::CoverageUnproven
+                        | marmot_app::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
                     false,
-                )) =>
+                ))
+            ) =>
         {
             Ok(HistoryRepairOutcome::CoverageUnproven)
         }
@@ -701,13 +704,14 @@ mod repair_outcome_tests {
     use marmot_app::FullHistoryRepairIncompleteReason as Reason;
 
     #[test]
-    fn only_unproven_coverage_without_loss_can_continue_to_independent_oracles() {
+    fn only_unproven_or_window_only_coverage_without_loss_can_continue_to_independent_oracles() {
         assert_eq!(
             history_repair_outcome(Ok(())).unwrap(),
             HistoryRepairOutcome::Complete
         );
         for reason in [
             Reason::CoverageUnproven,
+            Reason::BelowRetentionWindow,
             Reason::Cancelled,
             Reason::Deadline,
             Reason::DeliveryLoss,
@@ -722,7 +726,11 @@ mod repair_outcome_tests {
                     reason,
                     delivery_loss_pending: loss,
                 }));
-                if reason == Reason::CoverageUnproven && !loss {
+                if matches!(
+                    reason,
+                    Reason::CoverageUnproven | Reason::BelowRetentionWindow
+                ) && !loss
+                {
                     let outcome = result.unwrap();
                     assert_eq!(outcome, HistoryRepairOutcome::CoverageUnproven);
                     let wire = serde_json::to_value(outcome).unwrap();

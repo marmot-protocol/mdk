@@ -62,19 +62,119 @@ fn control<'a>(
     }
 }
 
+/// A relay may still hold an event older than the retained-inventory window.
+/// No comparison searched below that floor, so a certified window must not
+/// report full history: the repair names the unsearched history instead.
 #[tokio::test]
-async fn certified_repair_completes_without_touching_subscriptions() {
+async fn certified_window_reports_history_below_it_as_unsearched() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("older history", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let floor = crate::unix_now_seconds()
+        .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+    // The relay's older event sits a day below the floor. The comparison's
+    // window starts at the floor, so its answer cannot name the event.
+    let older = crate::tests::epoch_gap_probe(&route, floor - 24 * 60 * 60, "below-window");
     let before = relay.subscription_count();
-    client.test_comparison_results = Some(answered(1));
-    client.repair_full_history().await.unwrap();
-    assert!(!explicit_pending(&app), "the certified window completes it");
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(|_| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )))
+    }));
+    let failure = client.repair_full_history().await.unwrap_err();
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((
+            crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
+            false
+        ))
+    );
+    assert!(
+        explicit_pending(&app),
+        "history below the window stays explicit debt"
+    );
+    assert!(
+        !client.state.seen_events.contains(&older.id),
+        "nothing fetched the older event"
+    );
     assert_eq!(
         relay.subscription_count(),
         before,
         "repair compares history; it never activates or replays"
     );
+}
+
+/// A comparison that returns just inside the budget can hand over a large
+/// batch. Admission stops at the first turn boundary past the deadline: the
+/// admitted prefix stays durable and the repair reports the deadline.
+#[tokio::test]
+async fn the_deadline_stops_admission_at_a_turn_boundary() {
+    const FETCHED: usize = 200;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("large batch", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let route_id: [u8; 32] = hex::decode(&route).unwrap().try_into().unwrap();
+    let now = crate::unix_now_seconds();
+    let events = (0..FETCHED)
+        .map(|index| transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: crate::tests::epoch_gap_probe(&route, now - 60, &format!("batch-{index}")),
+        })
+        .collect::<Vec<_>>();
+    let ids = events
+        .iter()
+        .map(|event| event.event.id.clone())
+        .collect::<Vec<_>>();
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(move |compared| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            if *compared == TransportReconciliationRoute::Group(route_id) {
+                events.clone()
+            } else {
+                Vec::new()
+            },
+        )))
+    }));
+    // The budget outlives the instant comparison but not a whole batch of
+    // SQLCipher admissions.
+    let budget = Duration::from_millis(300);
+    let failure = client
+        .repair_full_history_with_control(&control(budget, &|| false))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((crate::FullHistoryRepairIncompleteReason::Deadline, false))
+    );
+    let admitted = ids
+        .iter()
+        .filter(|id| client.state.seen_events.contains(id))
+        .count();
+    assert!(
+        admitted < FETCHED,
+        "admission stopped before the whole batch ({admitted} admitted)"
+    );
+    assert!(explicit_pending(&app), "an expired repair keeps its debt");
 }
 
 #[tokio::test]
@@ -418,4 +518,100 @@ async fn qualified_repair_requires_every_endpoint_and_complete_admission() {
         assert_eq!(relay.subscription_count(), before);
         assert_eq!(explicit_pending(&app), !qualifies);
     }
+}
+
+/// A sync whose recovery debt no grant can select, here because the account
+/// has no relay recovery may contact, never waits for a process credit, so a
+/// busy pool cannot hold it behind another account's comparison.
+#[tokio::test]
+async fn a_sync_with_nothing_to_select_takes_no_recovery_credit() {
+    use crate::runtime::account_worker::recovery_credits;
+    let (_dir, app, _relay) = fixture_with_relays(Vec::new());
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let _held = recovery_credits::hold_all_credits_for_test(&client.recovery_credits);
+    assert!(
+        client.recovery_pending().unwrap(),
+        "startup history is debt"
+    );
+    tokio::time::timeout(Duration::from_secs(10), client.sync())
+        .await
+        .expect("the sync must not wait for a credit")
+        .unwrap();
+    assert_eq!(
+        app.account_storage("alice")
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial,
+        0,
+        "no job ran"
+    );
+}
+
+/// An in-place job counts against the process pool until its admission and
+/// checkpoint finish, not only while its network request runs.
+#[tokio::test]
+async fn the_in_place_job_holds_its_credit_through_admission() {
+    use crate::runtime::account_worker::recovery_credits;
+    const FETCHED: usize = 12;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("held credit", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let route_id: [u8; 32] = hex::decode(&route).unwrap().try_into().unwrap();
+    let now = crate::unix_now_seconds();
+    let events = (0..FETCHED)
+        .map(|index| transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: crate::tests::epoch_gap_probe(&route, now - 60, &format!("held-{index}")),
+        })
+        .collect::<Vec<_>>();
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(move |compared| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            if *compared == TransportReconciliationRoute::Group(route_id) {
+                events.clone()
+            } else {
+                Vec::new()
+            },
+        )))
+    }));
+    let pool = client.recovery_credits.clone();
+    let available = std::sync::Mutex::new(Vec::new());
+    // The repair's stop check runs at every admission turn boundary.
+    let observe = || {
+        available
+            .lock()
+            .unwrap()
+            .push(recovery_credits::available_credits(&pool));
+        false
+    };
+    let _ = client
+        .repair_full_history_with_control(&control(Duration::from_secs(60), &observe))
+        .await;
+    let seen = available.into_inner().unwrap();
+    assert!(
+        seen.len() > FETCHED / 4,
+        "the stop check ran at each admission turn: {seen:?}"
+    );
+    // The final entry is the repair's own verdict check, after settlement.
+    let during_job = &seen[..seen.len() - 1];
+    assert!(
+        during_job
+            .iter()
+            .rev()
+            .take(FETCHED / 4)
+            .all(|&free| free == 1),
+        "every admission turn still held the job's credit: {seen:?}"
+    );
+    assert_eq!(recovery_credits::available_credits(&pool), 2);
 }

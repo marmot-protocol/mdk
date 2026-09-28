@@ -200,14 +200,18 @@ every cause and every caller runs it:
 - A route compares all of its relays in one request, each under its own deadline, however
   many relays it lists.
 - Explicit catch-up, `sync()` and a directly owned client's `next_event()` drain the live
-  queue first, so the frozen inventory holds what the live subscriptions delivered, then
-  wait for a credit and run one job in place. The worker keeps serving snapshot reads while
+  queue first, so the frozen inventory holds what the live subscriptions delivered. With
+  debt a grant could select, they then wait for a credit, drain once more and run one job
+  in place, holding the credit through admission and checkpoint; without it they take no
+  credit. The worker keeps serving snapshot reads while
   an explicit caller's job runs. Startup runs its job only when a credit is free. Without a
   credit nothing is selected, so no reservation is spent.
 - Explicit repair runs the job in place too. Its one pass compares every route of the grant
   inside the 60-second repair budget. Cancellation or the deadline aborts the network
   request at a 50 ms poll and stops admission at a turn boundary, keeping the admitted
-  prefix. It succeeds only when its explicit-history obligation certifies.
+  prefix. Explicit history has no lower bound, so no window certifies it: a pass whose
+  every route's window certified returns `BelowRetentionWindow`, naming the unsearched older
+  history, and the debt stays open.
 
 Rules kept from the current design: complete coverage with a still-stuck engine means no
 replay; the blocked reason is recorded; the existing one-shot wedge report still escalates
@@ -513,9 +517,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   arrives while it saves; an older delivery that arrives after it is queued below its floor,
   exposed to a stop as it always was.
 - Explicit repair compares the retained window only. A goal with no lower bound, or one
-  below the inventory floor, cannot be certified by it, and explicit repair no longer
-  fetches history older than the window: the unfloored replay it replaced fetched that
-  history but never certified it. Each pass also fetches at most 16 missing events per
+  below the inventory floor, cannot be certified by it, so explicit repair never reports
+  complete, and it no longer fetches history older than the window: the unfloored replay
+  it replaced fetched that history but never certified it. Each pass also fetches at most 16 missing events per
   relay. A wider window needs acquisition below the inventory floor.
 - Explicit catch-up no longer re-subscribes, so a maintenance boundary whose EOSE a lag
   lost waits for the next activation, at reconnect or restart.

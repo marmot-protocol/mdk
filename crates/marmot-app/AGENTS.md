@@ -158,7 +158,9 @@ App runtime bridge for the first real Marmot app surfaces.
   no inline executor. Explicit catch-up and `sync()` drain the live queue, then run one job in place; nothing
   re-subscribes to recover history, and only startup, a frozen wake or an unactivated client installs live
   subscriptions. Explicit full-history repair runs the job in place: one comparison pass over every route of its
-  grant inside the repair budget, succeeding only on certified coverage. Keep cancellation and deadline checks
+  grant inside the repair budget. It never reports complete: history below the retained window is unsearched
+  (`BelowRetentionWindow` when the window certified), so never certify explicit history from a window. Keep
+  cancellation and deadline checks (`FullHistoryRepairControl::stopped`, at the network poll and every turn)
   cooperative (abort the network request, stop admission at a turn boundary, keep the admitted prefix), and
   preserve generation-checked overflow marker clearing. The account worker can serve committed snapshot reads
   while repair waits; mutations retain FIFO order, and explicit catch-up and repair wait while a worker-owned job
