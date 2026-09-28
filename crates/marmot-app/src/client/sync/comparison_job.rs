@@ -195,9 +195,10 @@ impl ComparisonNetworkJob {
         #[cfg(test)]
         let attempt_serial = grant.reservation.attempt_serial;
         #[cfg(test)]
-        let (scripted, scripted_delay) = (
+        let (scripted, scripted_delay, scripted_cursor) = (
             client.test_comparison_results.clone(),
             client.test_comparison_delay,
+            client.test_comparison_saved_cursor,
         );
         let handle = tokio::spawn(async move {
             #[cfg(test)]
@@ -236,6 +237,9 @@ impl ComparisonNetworkJob {
                             Some((delay, answer)) => (delay, Some(answer)),
                             None => (None, None),
                         };
+                        if let Some(cursor) = scripted_cursor {
+                            progress.save_cursor(Some(cursor))?;
+                        }
                         if let Some(delay) = delay.or(scripted_delay) {
                             tokio::time::sleep(delay).await;
                         }
@@ -402,6 +406,14 @@ impl AppClient {
                 .inventory
                 .iter()
                 .find(|inventory| inventory.route == route.route);
+            // A route the cutoff timed out, or whose request failed, lost the
+            // events it collected with its future, though the adapter may
+            // already have saved a cursor past them. It admitted nothing, so
+            // its replay cursor must not move.
+            let admitted = !matches!(
+                route.result,
+                ComparisonRouteWorkResult::TimedOut | ComparisonRouteWorkResult::Returned(Err(_))
+            );
             let (outcome, certified, answered, events) = match route.result {
                 ComparisonRouteWorkResult::Skipped => {
                     (Outcome::ServicedPartial, false, false, Vec::new())
@@ -431,7 +443,7 @@ impl AppClient {
                 outcome,
                 certified,
                 answered,
-                admitted: true,
+                admitted,
                 fetched: 0,
             });
         }

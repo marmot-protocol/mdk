@@ -945,3 +945,37 @@ async fn owner_passes_close_a_certified_explicit_request_without_a_notice() {
         "no notice was raised"
     );
 }
+
+/// A route the network cutoff times out lost what it collected with its
+/// future, even though the adapter already saved a cursor past it. It
+/// admitted nothing, so its stored replay cursor must not move.
+#[tokio::test]
+async fn a_route_the_cutoff_timed_out_keeps_its_replay_cursor() {
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    client.test_comparison_results = Some(answered(1));
+    client.test_comparison_saved_cursor = Some([0x5a; 32]);
+    client.test_comparison_delay = Some(Duration::from_secs(600));
+    let storage = app.account_storage("alice").unwrap();
+    // A route never compared has no stored cursor yet.
+    let cursor = || {
+        storage
+            .transport_reconciliation_replay_cursor(&TransportReconciliationRoute::Inbox)
+            .ok()
+            .flatten()
+    };
+    let before = cursor();
+    let failure = client
+        .repair_full_history_with_control(&control(Duration::from_millis(600), &|| false))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((crate::FullHistoryRepairIncompleteReason::Deadline, false))
+    );
+    assert_eq!(
+        cursor(),
+        before,
+        "the timed-out route's saved cursor is not persisted"
+    );
+}

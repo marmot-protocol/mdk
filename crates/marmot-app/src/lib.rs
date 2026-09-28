@@ -1797,6 +1797,8 @@ impl MarmotApp {
             test_comparison_results: None,
             #[cfg(test)]
             test_comparison_delay: None,
+            #[cfg(test)]
+            test_comparison_saved_cursor: None,
             recovery_owner,
             // Unit tests run many directly owned clients in one process; each
             // gets its own pool so one test's held job cannot stall another.

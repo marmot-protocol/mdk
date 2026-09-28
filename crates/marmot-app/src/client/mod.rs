@@ -364,6 +364,10 @@ pub struct AppClient {
     pub(crate) test_comparison_results: Option<sync::ScriptedComparisons>,
     #[cfg(test)]
     pub(crate) test_comparison_delay: Option<std::time::Duration>,
+    /// A cursor a scripted comparison saves before its delay, as the adapter
+    /// does before each exact-ID fetch.
+    #[cfg(test)]
+    pub(crate) test_comparison_saved_cursor: Option<[u8; 32]>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
     /// The process credits recovery jobs share. A managed worker installs
     /// its runtime's pool; a directly owned client uses the process pool.
