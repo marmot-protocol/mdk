@@ -294,7 +294,8 @@ Decided with Jeff (2026-09-28). The two REQs that asked for full history now car
   a locally deleted group's routes that no projection has seen replaced: those stored in
   its frontier before this change, and one replaced while the group was hidden. They are
   backfilled in full while the group stays hidden, and stamped at the first account load
-  after it is restored. Explicit full-history repair stays unfloored by design.
+  after it is restored. Explicit full-history repair issues no REQ: it compares the
+  retained-inventory window (section 3).
 
 ### 6. The cursor follows live ingest
 
@@ -478,7 +479,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 | 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Done (#2063, #2064, #2069) |
 | 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | Merged |
 | 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | Merged (#2068), with the notification-lag fix (#2070, #2074). History floors (#2077, design section 5) and live cursor promotion (#2075, design section 6) merged. |
-| 2, follow-up | Retire the inline executor: maintenance boundaries, explicit repair, known events, routes over four relays and explicit callers run the one job | Implemented; PR pending |
+| 2, follow-up | Retire the inline executor: maintenance boundaries, explicit repair, known events, routes over four relays and explicit callers run the one job | In review (#2079) |
 
 ## Risks and open items
 
