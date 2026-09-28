@@ -426,7 +426,10 @@ fn quiet_scopes_exhausted(
             return Ok(false);
         };
         let payload = decode_scope(format, &bytes)?;
-        if payload_is_qualified(&payload, predicate, known_event) {
+        // A qualified scope, or one whose retained window a comparison
+        // certified, has nothing left that a pass could search; only the
+        // scopes still unsearched decide parking.
+        if payload.window_certified || payload_is_qualified(&payload, predicate, known_event) {
             continue;
         }
         if payload.quiet_passes < RECOVERY_PARK_AFTER_QUIET_PASSES {
@@ -1016,6 +1019,83 @@ mod tests {
         assert_eq!(eligibility(loss), RecoveryEligibility::Retry);
         pass(&[(loss, &[(0, Quiet), (1, Quiet)])]);
         assert_eq!(eligibility(loss), RecoveryEligibility::NeedsDeepRepair);
+    }
+
+    /// A certified explicit window has nothing left to search, so it neither
+    /// counts toward parking nor holds it back: a route still unsearched
+    /// parks the request after its own three quiet comparisons.
+    #[test]
+    fn a_certified_explicit_window_leaves_parking_to_the_unsearched_routes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let explicit = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[3; 16],
+                },
+                1,
+            )
+            .unwrap()
+            .id;
+        let mut group = plan(&["a"]);
+        group.scope_id = 1;
+        group.route_kind = 1;
+        group.group_id = Some(vec![7]);
+        group.transport_group_id = Some([7; 32]);
+        let scopes = [plan(&["a"]), group];
+        let now = std::cell::Cell::new(1_000_u64);
+        let pass = |progress: &[(u64, RecoveryPassProgress)]| {
+            let fence = store.recovery_revision_fence().unwrap();
+            now.set(now.get() + 100_000);
+            let attempt = store
+                .reserve_recovery_attempt(&fence, now.get(), 1_000, false)
+                .unwrap()
+                .expect("a retryable pass is reserved")
+                .attempt_serial;
+            let tokens = store
+                .install_recovery_scope_plan(&fence, attempt, explicit, &scopes)
+                .unwrap()
+                .unwrap();
+            let checkpoints = progress
+                .iter()
+                .map(|(scope, _)| checkpoint(&tokens[*scope as usize], Vec::new()))
+                .collect::<Vec<_>>();
+            store
+                .checkpoint_recovery_comparison(
+                    &fence,
+                    attempt,
+                    explicit,
+                    &checkpoints,
+                    RecoveryEligibility::Retry,
+                    progress,
+                )
+                .unwrap();
+        };
+        let eligibility = || {
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.ticket.id == explicit)
+                .unwrap()
+                .eligibility
+        };
+        use RecoveryPassProgress::{Quiet, WindowCertified};
+        pass(&[(0, WindowCertified), (1, Quiet)]);
+        pass(&[(1, Quiet)]);
+        assert_eq!(eligibility(), RecoveryEligibility::Retry);
+        pass(&[(1, Quiet)]);
+        assert_eq!(
+            eligibility(),
+            RecoveryEligibility::NeedsDeepRepair,
+            "the unsearched route parks the request after its three quiet passes"
+        );
+        let snapshots = store.recovery_scope_snapshots(explicit).unwrap();
+        assert!(snapshots[0].window_certified);
+        assert_eq!(
+            snapshots[0].quiet_passes, 0,
+            "the certified window never went quiet"
+        );
+        assert_eq!(snapshots[1].quiet_passes, 3);
     }
 
     #[test]
