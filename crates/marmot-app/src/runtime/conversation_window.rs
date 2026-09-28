@@ -960,8 +960,9 @@ fn command_position(
     position: &ConversationWindowQuery,
     viewport_sequence: u64,
 ) -> Result<ConversationWindowQuery, ConversationWindowError> {
-    // Background replacements never supersede a revision; only a published
-    // command viewport move or another generation does.
+    // Background replacements keep old revisions usable unless they drop the
+    // row named by set_visible_anchor. A published viewport move supersedes
+    // earlier revisions; another generation is always stale.
     let quoted = &command.revision;
     if quoted.generation != current.revision.generation
         || !(viewport_sequence..=current.revision.sequence).contains(&quoted.sequence)
