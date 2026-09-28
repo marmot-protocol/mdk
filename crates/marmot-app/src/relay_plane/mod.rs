@@ -21,7 +21,7 @@ use nostr_sdk::prelude::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
@@ -37,6 +37,7 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::DirectorySyncPlan;
 
+mod delivery_spill;
 mod directory;
 #[cfg(test)]
 pub(crate) mod publish_accounting_tests;
@@ -48,6 +49,7 @@ pub use telemetry::{
     EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
 };
 
+pub(crate) use delivery_spill::{ACCOUNT_DELIVERY_SPILL_LIMITS, AccountDeliverySpillStore};
 pub(crate) use directory::{
     DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryInspectionError,
     DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
@@ -74,6 +76,15 @@ const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
 const RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const RELAY_NOTIFICATION_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME: Duration = Duration::from_secs(5);
+/// Notifications a relay consumer may queue for its event worker before the
+/// backlog counts as receiver loss. A catch-up rebuild replays every stored
+/// event inside the lookback window as a raw relay copy, plus a deduplicated
+/// delivery for events the SDK client has not seen, so ordinary catch-ups
+/// queue far more than a few hundred. Loss closes the account delivery route
+/// and sends the account worker through reconnect, so match the pinned SDK
+/// client's per-receiver notification buffer, which bounded the inline
+/// consumer this queue replaced.
+const RELAY_NOTIFICATION_EVENT_QUEUE_CAPACITY: usize = 4096;
 
 #[derive(Clone)]
 pub struct MarmotRelayPlane {
@@ -106,6 +117,10 @@ struct RelayPlaneTransport {
     directory_client: Option<NostrSdkClient>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     account_deliveries: RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
+    /// Each account's overflow coordination, kept for the process lifetime. A
+    /// spill writer can outlive its route; every later adapter for the account
+    /// shares its fence, wakeup and pending loss instead of starting fresh.
+    account_overflow_states: std::sync::Mutex<HashMap<MemberId, Arc<AccountDeliveryOverflowState>>>,
     account_delivery_metrics: Arc<AccountDeliveryMetrics>,
     router: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder: Mutex<Option<JoinHandle<()>>>,
@@ -162,6 +177,7 @@ struct AccountDeliveryRoute {
     sender: mpsc::Sender<AccountDeliveryEvent>,
     overflow: Arc<AccountDeliveryOverflowState>,
     recovery_marker: Option<AccountDeliveryRecoveryMarker>,
+    spill: Option<Arc<delivery_spill::AccountDeliverySpill>>,
 }
 
 pub(crate) type AccountDeliveryRecoveryMarker =
@@ -199,10 +215,23 @@ pub(crate) enum AccountDeliveryReceive {
     Overflow(AccountDeliveryOverflow),
 }
 
+/// What woke a waiting account consumer.
+#[derive(Debug)]
+pub(crate) enum AccountDeliveryWait {
+    Received(AccountDeliveryReceive),
+    /// Spilled rows became durable while the queue was empty.
+    SpillReady,
+    Closed,
+}
+
 #[derive(Default)]
 struct AccountDeliveryOverflowState {
     inner: std::sync::Mutex<AccountDeliveryOverflowInner>,
     metrics: Arc<AccountDeliveryMetrics>,
+    /// Notified by the spill writer after spilled rows become durable. Lives
+    /// here, not on the adapter, so a replaced adapter still hears a writer
+    /// that started under its predecessor.
+    spill_ready: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -223,12 +252,19 @@ struct AccountDeliveryOverflowInner {
     marker_in_progress: bool,
     marker_durable: bool,
     marker_closed: bool,
+    /// Deliveries handed to the spill writer but not yet durable or lost.
+    spill_in_flight: u64,
+    /// A spill writer recorded loss after its route was retired, so no queue
+    /// has carried its signal yet.
+    retired_loss_unsignalled: bool,
 }
 
 #[derive(Default)]
 struct AccountDeliveryMetrics {
     max_queue_depth: AtomicU64,
     dropped: AtomicU64,
+    spilled: AtomicU64,
+    spill_already_seen: AtomicU64,
     recovery_attempts: AtomicU64,
     recovery_successes: AtomicU64,
     recovery_failures: AtomicU64,
@@ -240,6 +276,8 @@ struct AccountDeliveryMetricsSnapshot {
     queue_depth: usize,
     max_queue_depth: u64,
     dropped: u64,
+    spilled: u64,
+    spill_already_seen: u64,
     recovery_attempts: u64,
     recovery_successes: u64,
     recovery_failures: u64,
@@ -264,6 +302,8 @@ impl AccountDeliveryMetrics {
             queue_depth,
             max_queue_depth: self.max_queue_depth.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
+            spilled: self.spilled.load(Ordering::Relaxed),
+            spill_already_seen: self.spill_already_seen.load(Ordering::Relaxed),
             recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
             recovery_successes: self.recovery_successes.load(Ordering::Relaxed),
             recovery_failures: self.recovery_failures.load(Ordering::Relaxed),
@@ -278,6 +318,18 @@ impl AccountDeliveryOverflowState {
         self.metrics
             .max_queue_depth
             .fetch_max(depth, Ordering::Relaxed);
+    }
+
+    fn begin_spill(&self) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        state.spill_in_flight = state.spill_in_flight.saturating_add(1);
+    }
+
+    fn finish_spill(&self, settled: u64, stored: u64, already_seen: u64) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        state.spill_in_flight = state.spill_in_flight.saturating_sub(settled);
+        RelayNotificationForwarderHealth::increment(&self.metrics.spilled, stored);
+        RelayNotificationForwarderHealth::increment(&self.metrics.spill_already_seen, already_seen);
     }
 
     /// Record an omitted delivery and return the generation only when this
@@ -324,6 +376,29 @@ impl AccountDeliveryOverflowState {
             state.signal_queued = true;
             Some(state.generation)
         }
+    }
+
+    fn record_retired_drop(&self) {
+        self.record_drop(0);
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retired_loss_unsignalled = true;
+    }
+
+    /// Claim the signal for loss a retired writer recorded while no route
+    /// existed. Any other pending loss already had its route.
+    fn claim_retired_loss_signal(&self) -> Option<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !std::mem::take(&mut state.retired_loss_unsignalled) || !state.pending {
+            return None;
+        }
+        state.signal_queued = true;
+        state.marker_signal_pending = false;
+        Some(state.generation)
     }
 
     fn cancel_signal(&self, generation: u64) {
@@ -644,6 +719,13 @@ pub struct RelayPlaneHealth {
     /// explicit recovery generation.
     #[serde(default)]
     pub account_delivery_dropped: u64,
+    /// Deliveries a full queue stored in the durable account spill instead of
+    /// omitting.
+    #[serde(default)]
+    pub account_delivery_spilled: u64,
+    /// Spill candidates discarded because the account had already seen them.
+    #[serde(default)]
+    pub account_delivery_spill_already_seen: u64,
     #[serde(default)]
     pub account_delivery_recovery_attempts: u64,
     #[serde(default)]
@@ -763,6 +845,7 @@ impl MarmotRelayPlane {
             directory_client,
             directory_events: broadcast::channel(DIRECTORY_EVENT_BUFFER).0,
             account_deliveries: RwLock::new(HashMap::new()),
+            account_overflow_states: std::sync::Mutex::new(HashMap::new()),
             account_delivery_metrics: Arc::new(AccountDeliveryMetrics::default()),
             router: Mutex::new(None),
             notification_forwarder: Mutex::new(None),
@@ -794,7 +877,7 @@ impl MarmotRelayPlane {
         account_id: MemberId,
         publish_client: Arc<dyn NostrRelayClient>,
     ) -> MarmotRelayPlaneAccountAdapter {
-        self.account_adapter_with_recovery_marker(account_id, publish_client, None)
+        self.account_adapter_with_recovery_marker(account_id, publish_client, None, None)
     }
 
     pub(crate) fn account_adapter_with_recovery_marker(
@@ -802,6 +885,7 @@ impl MarmotRelayPlane {
         account_id: MemberId,
         publish_client: Arc<dyn NostrRelayClient>,
         recovery_marker: Option<AccountDeliveryRecoveryMarker>,
+        spill_store: Option<AccountDeliverySpillStore>,
     ) -> MarmotRelayPlaneAccountAdapter {
         self.spawn_router();
         // Keep one slot reserved for the overflow control record. Ordinary
@@ -809,24 +893,47 @@ impl MarmotRelayPlane {
         // can always carry the explicit recovery signal without awaiting the
         // slow consumer or blocking the shared router.
         let (delivery_tx, delivery_rx) = mpsc::channel(ACCOUNT_DELIVERY_BUFFER + 1);
+        let signal_tx = delivery_tx.clone();
         let mut routes = account_deliveries_write(&self.inner.transport.account_deliveries);
-        let delivery_overflow = routes
-            .get(&account_id)
-            .map(|route| route.overflow.clone())
-            .unwrap_or_else(|| {
+        let delivery_overflow = self
+            .inner
+            .transport
+            .account_overflow_states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(account_id.clone())
+            .or_insert_with(|| {
                 Arc::new(AccountDeliveryOverflowState {
                     inner: std::sync::Mutex::new(AccountDeliveryOverflowInner::default()),
                     metrics: self.inner.transport.account_delivery_metrics.clone(),
+                    spill_ready: Arc::default(),
                 })
-            });
+            })
+            .clone();
         routes.insert(
             account_id.clone(),
             AccountDeliveryRoute {
                 sender: delivery_tx,
                 overflow: delivery_overflow.clone(),
+                spill: spill_store.map(|store| {
+                    delivery_spill::AccountDeliverySpill::new(
+                        store,
+                        account_id.clone(),
+                        Arc::downgrade(&self.inner.transport),
+                        delivery_overflow.clone(),
+                        recovery_marker.clone(),
+                    )
+                }),
                 recovery_marker,
             },
         );
+        // Loss a retired writer recorded while no route existed has not been
+        // signalled to any consumer. The route lock orders this against that
+        // writer's own check for a route.
+        if let Some(generation) = delivery_overflow.claim_retired_loss_signal() {
+            enqueue_account_delivery_overflow_signal(&signal_tx, &delivery_overflow, generation);
+        }
+        drop(routes);
         MarmotRelayPlaneAccountAdapter {
             account_id,
             relay_plane: self.clone(),
@@ -1002,6 +1109,33 @@ impl MarmotRelayPlane {
             }
         }
         Ok(())
+    }
+
+    /// Retire one account session's immutable SDK authenticator and its
+    /// notification forwarder before the same worker reopens that account. The
+    /// reopened session registers a new signer, which the SDK refuses while
+    /// the previous context is live. Keep the delivery route so the
+    /// replacement adapter inherits unresolved loss evidence.
+    ///
+    /// This runs on the reopening worker and never outlives it. If the worker
+    /// is cancelled first, the reaper's `deactivate_account_context` retires
+    /// the same context before a replacement may register; detached work here
+    /// could instead remove that replacement's context.
+    pub(crate) async fn retire_account_session_transport(&self, account_id: &MemberId) {
+        let forwarder = self
+            .inner
+            .transport
+            .account_notification_forwarders
+            .lock()
+            .await
+            .remove(account_id);
+        if let Some(mut forwarder) = forwarder {
+            forwarder.abort();
+            let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut forwarder).await;
+        }
+        if let Some(sdk) = &self.inner.transport.sdk_relay_client {
+            let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, sdk.remove_account(account_id)).await;
+        }
     }
 
     /// Retire a stopped account worker's subscriptions and immutable SDK
@@ -1521,29 +1655,23 @@ impl MarmotRelayPlane {
                     // account whose receiver has stalled (full buffer) must not
                     // block this shared router and back-pressure delivery for
                     // every other account (and, upstream, the relay notification
-                    // pipeline). The extra channel slot is reserved for one
-                    // overflow record. Once ordinary capacity is exhausted,
-                    // every omitted delivery belongs to that explicit recovery
-                    // generation; the account cannot trust EOSE or its cursor
-                    // again until an unfloored replay resolves the generation.
+                    // pipeline). A full queue hands the delivery to the account's
+                    // durable spill. Only when that is full too does the delivery
+                    // join an explicit loss generation, using the one channel slot
+                    // reserved for its control record.
                     let queue_depth = route
                         .sender
                         .max_capacity()
                         .saturating_sub(route.sender.capacity());
                     route.overflow.observe_queue_depth(queue_depth);
                     if route.sender.capacity() <= 1 {
-                        let signal_generation = route.overflow.record_drop(queue_depth);
-                        if let Some(marker) = route.recovery_marker.clone() {
-                            persist_queue_loss(&route.sender, &route.overflow, marker, signal_generation);
-                        } else if let Some(generation) = signal_generation {
-                            enqueue_account_delivery_overflow_signal(&route.sender, &route.overflow, generation);
+                        let spilled = route
+                            .spill
+                            .as_ref()
+                            .is_some_and(|spill| spill.offer(delivery));
+                        if !spilled {
+                            omit_account_delivery(&route);
                         }
-                        tracing::warn!(
-                            target: "marmot_app::relay_plane",
-                            method = "spawn_router",
-                            queue_depth,
-                            "omitting transport delivery: account delivery queue overflow recovery required",
-                        );
                         continue;
                     }
                     match route
@@ -1603,6 +1731,16 @@ impl MarmotRelayPlane {
         true
     }
 
+    /// Exercise the loss tier directly: a full queue omits instead of spilling.
+    #[cfg(test)]
+    pub(crate) fn disable_account_delivery_spill_for_test(&self, account_id: &MemberId) -> bool {
+        let mut routes = account_deliveries_write(&self.inner.transport.account_deliveries);
+        routes
+            .get_mut(account_id)
+            .map(|route| route.spill = None)
+            .is_some()
+    }
+
     /// Report end-of-stored-events for one subscription on one endpoint, the
     /// way [`handle_relay_notification`] does for an SDK-backed plane. An
     /// injected relay client produces no relay messages of its own, so tests
@@ -1660,6 +1798,8 @@ impl RelayPlaneHealth {
             account_delivery_queue_depth: account_delivery.queue_depth,
             account_delivery_max_queue_depth: account_delivery.max_queue_depth,
             account_delivery_dropped: account_delivery.dropped,
+            account_delivery_spilled: account_delivery.spilled,
+            account_delivery_spill_already_seen: account_delivery.spill_already_seen,
             account_delivery_recovery_attempts: account_delivery.recovery_attempts,
             account_delivery_recovery_successes: account_delivery.recovery_successes,
             account_delivery_recovery_failures: account_delivery.recovery_failures,
@@ -1684,6 +1824,8 @@ impl RelayPlaneHealth {
             account_delivery_queue_depth: account_delivery.queue_depth,
             account_delivery_max_queue_depth: account_delivery.max_queue_depth,
             account_delivery_dropped: account_delivery.dropped,
+            account_delivery_spilled: account_delivery.spilled,
+            account_delivery_spill_already_seen: account_delivery.spill_already_seen,
             account_delivery_recovery_attempts: account_delivery.recovery_attempts,
             account_delivery_recovery_successes: account_delivery.recovery_successes,
             account_delivery_recovery_failures: account_delivery.recovery_failures,
@@ -1781,6 +1923,9 @@ struct NotificationWorkerFailureHook {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
     fail_once: AtomicBool,
+    /// Hold the first notification like `fail_once`, then handle it normally:
+    /// a busy, not failed, event worker.
+    stall_once: AtomicBool,
 }
 
 struct SdkRelayNotificationSource {
@@ -2080,8 +2225,7 @@ async fn run_relay_notification_consumer_scoped(
     account_id: Option<MemberId>,
     source: Arc<dyn RelayNotificationSource>,
 ) -> RelayNotificationConsumerOutcome {
-    const EVENT_QUEUE_CAPACITY: usize = 256;
-    let (sender, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    let (sender, mut event_rx) = mpsc::channel(RELAY_NOTIFICATION_EVENT_QUEUE_CAPACITY);
     // Channel capacity returns to its maximum when a panicked worker drops
     // the receiver, even though queued work was discarded. Count admitted
     // items independently until each worker operation actually finishes.
@@ -2092,12 +2236,15 @@ async fn run_relay_notification_consumer_scoped(
     let mut worker = tokio::spawn(async move {
         while let Some(notification) = event_rx.recv().await {
             #[cfg(test)]
-            if let Some(hook) = &worker_failure_hook
-                && hook.fail_once.swap(false, Ordering::SeqCst)
-            {
-                hook.entered.notify_one();
-                hook.release.notified().await;
-                panic!("injected relay notification worker failure");
+            if let Some(hook) = &worker_failure_hook {
+                let fail = hook.fail_once.swap(false, Ordering::SeqCst);
+                if fail || hook.stall_once.swap(false, Ordering::SeqCst) {
+                    hook.entered.notify_one();
+                    hook.release.notified().await;
+                    if fail {
+                        panic!("injected relay notification worker failure");
+                    }
+                }
             }
             if handle_relay_notification(notification, &adapter, account_id.as_ref()).await {
                 worker_pending.fetch_sub(1, Ordering::SeqCst);
@@ -2591,12 +2738,37 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
     ) -> Result<Option<AccountDeliveryReceive>, TransportAdapterError> {
         let event = self.delivery_rx.lock().await.recv().await;
-        Ok(event.map(|event| match event {
+        Ok(event.map(|event| self.account_delivery_receive(event)))
+    }
+
+    /// The next queued item, if one is ready now.
+    pub(crate) fn try_receive_account_delivery(&self) -> Option<AccountDeliveryReceive> {
+        let event = self.delivery_rx.try_lock().ok()?.try_recv().ok()?;
+        Some(self.account_delivery_receive(event))
+    }
+
+    /// Wait for a queued item, or for spilled rows to become durable. A
+    /// pending spill wakeup wins, so a continuously ready live queue cannot
+    /// hide it; it fires once per writer batch, so live input is not starved.
+    pub(crate) async fn receive_account_delivery_or_spill(&self) -> AccountDeliveryWait {
+        let mut delivery_rx = self.delivery_rx.lock().await;
+        tokio::select! {
+            biased;
+            () = self.delivery_overflow.spill_ready.notified() => AccountDeliveryWait::SpillReady,
+            event = delivery_rx.recv() => match event {
+                Some(event) => AccountDeliveryWait::Received(self.account_delivery_receive(event)),
+                None => AccountDeliveryWait::Closed,
+            },
+        }
+    }
+
+    fn account_delivery_receive(&self, event: AccountDeliveryEvent) -> AccountDeliveryReceive {
+        match event {
             AccountDeliveryEvent::Delivery(delivery) => AccountDeliveryReceive::Delivery(delivery),
             AccountDeliveryEvent::Overflow { generation } => {
                 AccountDeliveryReceive::Overflow(self.delivery_overflow.consume_signal(generation))
             }
-        }))
+        }
     }
 
     /// Process-local overflow evidence becomes visible at the exact omission,
@@ -2605,13 +2777,15 @@ impl MarmotRelayPlaneAccountAdapter {
         self.delivery_overflow.notification_persisted(observed);
     }
 
-    /// A running attempt has not acknowledged loss and cannot advance a cursor.
+    /// Unacknowledged loss, or a spilled delivery that is not yet durable,
+    /// keeps the transport cursor from advancing.
     pub(crate) fn delivery_loss_blocks_cursor(&self) -> bool {
-        self.delivery_overflow
+        let state = self
+            .delivery_overflow
             .inner
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pending
+            .unwrap_or_else(|p| p.into_inner());
+        state.pending || state.spill_in_flight > 0
     }
 
     pub(crate) fn unpersisted_notification_loss(&self) -> Option<AccountDeliveryOverflow> {
@@ -2815,6 +2989,27 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
     }
 }
 
+/// Omit one delivery from a full account queue into the current loss
+/// generation, persisting its evidence before the control record is queued.
+fn omit_account_delivery(route: &AccountDeliveryRoute) {
+    let queue_depth = route
+        .sender
+        .max_capacity()
+        .saturating_sub(route.sender.capacity());
+    let signal_generation = route.overflow.record_drop(queue_depth);
+    if let Some(marker) = route.recovery_marker.clone() {
+        persist_queue_loss(&route.sender, &route.overflow, marker, signal_generation);
+    } else if let Some(generation) = signal_generation {
+        enqueue_account_delivery_overflow_signal(&route.sender, &route.overflow, generation);
+    }
+    tracing::warn!(
+        target: "marmot_app::relay_plane",
+        method = "omit_account_delivery",
+        queue_depth,
+        "omitting transport delivery: account delivery queue overflow recovery required",
+    );
+}
+
 /// Count persistence is independent of whether a control record is already
 /// queued. The one writer takes any deferred signal only after its latest
 /// watermark is durable, including signals requested while that writer ran.
@@ -2843,6 +3038,18 @@ fn persist_queue_loss(
         });
     } else if overflow.take_durable_marker_signal(generation) {
         enqueue_account_delivery_overflow_signal(sender, overflow, generation);
+    }
+}
+
+/// Persist loss recorded after its route was retired. There is no queue for
+/// a signal; whichever session comes next recovers from the durable marker.
+fn persist_retired_queue_loss(
+    overflow: &Arc<AccountDeliveryOverflowState>,
+    marker: AccountDeliveryRecoveryMarker,
+) {
+    if overflow.start_marker_persistence() {
+        let overflow = overflow.clone();
+        tokio::spawn(async move { overflow.persist_marker_before_drop(marker).await });
     }
 }
 

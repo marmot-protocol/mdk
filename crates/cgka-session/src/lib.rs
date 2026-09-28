@@ -1409,6 +1409,22 @@ impl AccountDeviceSession {
         self.engine.audit_external(group_id, context, kind);
     }
 
+    pub fn record_v5_event(
+        &self,
+        group_ref: Option<marmot_forensics::v5::GroupRef>,
+        event: marmot_forensics::v5::Event,
+    ) {
+        self.engine.audit_v5_event(group_ref, event);
+    }
+
+    pub fn audit_v5_enabled(&self) -> bool {
+        self.engine.audit_v5_enabled()
+    }
+
+    pub fn finish_audit_v5_recording(&self, reason: marmot_forensics::v5::RecordingStopReason) {
+        self.engine.finish_audit_v5_recording(reason);
+    }
+
     pub fn record_audit_health(&self) {
         self.engine.audit_recorder_health();
     }

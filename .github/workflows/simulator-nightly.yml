@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       recovery_only:
-        description: Run only the production-policy 1024-message recovery journeys
+        description: Run only the production-policy recovery journeys and scorecard
         type: boolean
         default: false
 
@@ -192,7 +192,8 @@ jobs:
   public-app-catchup:
     name: Public app 1024-message recovery
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    # Step budgets (30 + 20 + 20 + 50) plus setup, evidence upload and cache save.
+    timeout-minutes: 125
     env:
       CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "false"
       MDK_APP_JOURNEY_ARTIFACTS: ${{ github.workspace }}/target/public-app-catchup-evidence
@@ -218,6 +219,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           key: public-app-catchup-release
+          # Save compiled dependencies even when a later step fails or times
+          # out; otherwise one cold timeout leaves every later run cold.
+          cache-on-failure: true
 
       - name: Record source provenance
         run: |
@@ -228,11 +232,15 @@ jobs:
 
       - name: Build public recovery tests with production policy
         id: build_catchup
-        timeout-minutes: 15
+        # Budget a cold build: the repository cache sits at its 10 GB cap, so
+        # this once-daily entry is usually evicted before the next run. Cold
+        # builds exceeded the former 15-minute cap from 2026-09-22 onward.
+        # --timings keeps a per-crate build profile for resizing this budget.
+        timeout-minutes: 30
         # Keep this separate from workspace test-policy feature unification.
         run: >-
           cargo test --release --locked -p cgka-conformance-simulator
-          --test app_runtime_journeys --no-run
+          --test app_runtime_journeys --no-run --timings
 
       - name: Recover the original 1024-message backlog
         if: ${{ !cancelled() && steps.build_catchup.outcome == 'success' }}
@@ -251,6 +259,18 @@ jobs:
           --test app_runtime_journeys public_app_1024_message_backlog_with_extra_epochs_recovers_completely
           -- --exact --ignored --test-threads=1 --nocapture
 
+      - name: Report the large-account recovery scorecard
+        if: ${{ !cancelled() && steps.build_catchup.outcome == 'success' }}
+        # Report-only: a failure never fails the job. scorecard.json records
+        # latency, relay traffic and recovery time, or where setup stopped.
+        # The test owns a 2700-second watchdog, then closes every runtime.
+        continue-on-error: true
+        timeout-minutes: 50
+        run: >-
+          cargo test --release --locked -p cgka-conformance-simulator
+          --test app_runtime_journeys public_app_large_account_recovery_scorecard
+          -- --exact --ignored --test-threads=1 --nocapture
+
       - name: Upload public recovery evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -259,6 +279,7 @@ jobs:
           path: |
             target/public-app-catchup-evidence/*.txt
             target/public-app-catchup-evidence/app-journey-*/*.json
+            target/cargo-timings/cargo-timing.html
           retention-days: 14
           if-no-files-found: warn
 

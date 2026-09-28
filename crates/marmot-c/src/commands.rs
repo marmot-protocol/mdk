@@ -35,7 +35,7 @@ use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
     MarmotAuditLogDeleteResult, MarmotAuditLogFileList, MarmotAuditLogSettings,
     MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
-    MarmotAuditLogUploadResult,
+    MarmotAuditLogTrackerUpdateResultV5, MarmotAuditLogUploadResult, MarmotAuditOtlpConfigV5,
 };
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
@@ -806,6 +806,8 @@ c_cmd! {
     async fn marmot_send_text(account_ref: str, group_id_hex: str, text: str) -> rec(MarmotSendSummary) = send_text;
     /// Return durable local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
     async fn marmot_send_text_with_client_token(account_ref: str, group_id_hex: str, text: str, client_token: str) -> rec(MarmotLocalSendAcceptance) = send_text_with_client_token;
+    /// Durably queue a revision of a token-aware local send. Free with `marmot_local_send_acceptance_free`.
+    async fn marmot_edit_local_message_with_client_token(account_ref: str, group_id_hex: str, original_client_token: str, content: str, edit_client_token: str) -> rec(MarmotLocalSendAcceptance) = edit_local_message_with_client_token;
     /// Return durable local reply acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
     async fn marmot_reply_to_message_with_client_token(account_ref: str, group_id_hex: str, target_message_id: str, text: str, client_token: str) -> rec(MarmotLocalSendAcceptance) = reply_to_message_with_client_token;
     /// Look up the retained local attempt status; completion may still await delivery. Free with `marmot_local_send_status_free`.
@@ -899,6 +901,9 @@ c_cmd! {
     /// Run one tracker-driven upload pass with the configured tracker.
     /// Free with `marmot_audit_log_tracker_update_result_free`.
     async fn marmot_post_audit_log_tracker_update() -> rec(MarmotAuditLogTrackerUpdateResult) = post_audit_log_tracker_update;
+
+    /// Run the same tracker pass with independent v4/v5 outcomes.
+    async fn marmot_post_audit_log_tracker_update_v5() -> rec(MarmotAuditLogTrackerUpdateResultV5) = post_audit_log_tracker_update_v5;
 
     /// The account's chat list rows. Free with
     /// `marmot_chat_list_row_list_free`.
@@ -1431,6 +1436,28 @@ pub unsafe extern "C" fn marmot_set_audit_log_tracker_config_v4(
         let config = try_arg!(unsafe { borrowed(config) });
         let config = try_arg!(unsafe { config.to_ffi() });
         unsafe { deliver(client.marmot.set_audit_log_tracker_config(config), out) }
+    })
+}
+
+/// Configure or disable the dedicated v5 OTLP audit sender. The returned
+/// config never contains the bearer token. Free it with
+/// `marmot_audit_otlp_config_v5_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `config` a valid borrowed struct;
+/// `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_audit_otlp_config_v5(
+    client: *const MarmotClient,
+    config: *const MarmotAuditOtlpConfigV5,
+    out: *mut *mut MarmotAuditOtlpConfigV5,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let config = try_arg!(unsafe { borrowed(config) });
+        let config = try_arg!(unsafe { config.to_ffi() });
+        unsafe { deliver(client.marmot.set_audit_otlp_config_v5(config), out) }
     })
 }
 

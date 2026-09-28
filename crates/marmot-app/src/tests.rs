@@ -1626,21 +1626,25 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
                 std::fs::read_to_string(file.path)
                     .unwrap()
                     .lines()
-                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .map(|line| {
+                        marmot_forensics::v5::Record::from_json(line.as_bytes())
+                            .expect("real v5 recovery row");
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let armed_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_armed")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_armed")
             .collect();
         let started_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_started")
             .collect();
         let failed_rows: Vec<_> = audit_rows
             .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
             .collect();
         assert_eq!(armed_rows.len(), 1);
         assert_eq!(
@@ -1651,17 +1655,21 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
         let completed_rows: Vec<_> = failed_rows
             .into_iter()
             .filter(|row| {
-                row["context"]["operation_id"] == started_rows[0]["context"]["operation_id"]
+                row["event"]["record_context"]["operation_ref"]
+                    == started_rows[0]["event"]["record_context"]["operation_ref"]
             })
             .collect();
         assert_eq!(completed_rows.len(), 1);
         assert_eq!(
-            completed_rows[0]["kind"]["error_kind"],
+            completed_rows[0]["event"]["error_kind"],
             "history_coverage_unproven"
         );
-        assert_eq!(started_rows[0]["kind"]["seam"], "maintenance");
-        assert_eq!(completed_rows[0]["kind"]["activation_outcome"], "succeeded");
-        assert!(completed_rows[0]["kind"]["deliveries"].as_u64().unwrap() >= 1);
+        assert_eq!(started_rows[0]["event"]["seam"], "maintenance");
+        assert_eq!(
+            completed_rows[0]["event"]["activation_outcome"],
+            "succeeded"
+        );
+        assert!(completed_rows[0]["event"]["deliveries"].as_u64().unwrap() >= 1);
         assert!(
             storage
                 .pending_recovery_demands()
@@ -1669,16 +1677,16 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
         );
-        let audited_epoch_before = completed_rows[0]["kind"]["local_epoch_before"]
+        let audited_epoch_before = completed_rows[0]["event"]["local_epoch_before"]
             .as_u64()
             .expect("completed row local epoch before");
         assert_eq!(
-            completed_rows[0]["kind"]["local_epoch_after"].as_u64(),
+            completed_rows[0]["event"]["local_epoch_after"].as_u64(),
             Some(final_local_epoch),
             "the terminal row must report the observed final local epoch"
         );
         assert_eq!(
-            completed_rows[0]["kind"]["group_advanced"].as_bool(),
+            completed_rows[0]["event"]["group_advanced"].as_bool(),
             Some(final_local_epoch > audited_epoch_before),
             "activation success and group epoch recovery must remain distinct"
         );
@@ -1758,25 +1766,29 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
                 std::fs::read_to_string(file.path)
                     .unwrap()
                     .lines()
-                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .map(|line| {
+                        marmot_forensics::v5::Record::from_json(line.as_bytes())
+                            .expect("real v5 recovery row");
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let rows_of_kind = |kind: &str| {
             audit_rows
                 .iter()
-                .filter(|row| row["kind"]["type"] == kind)
+                .filter(|row| row["event"]["type"] == kind)
                 .collect::<Vec<_>>()
         };
         let armed = rows_of_kind("epoch_stall_backfill_armed");
         let started = rows_of_kind("epoch_stall_backfill_started");
         let failed = rows_of_kind("epoch_stall_backfill_failed")
             .into_iter()
-            .filter(|row| row["kind"]["activation_outcome"] == "failed")
+            .filter(|row| row["event"]["activation_outcome"] == "failed")
             .collect::<Vec<_>>();
         let completed = rows_of_kind("epoch_stall_backfill_failed")
             .into_iter()
-            .filter(|row| row["kind"]["error_kind"] == "history_coverage_unproven")
+            .filter(|row| row["event"]["error_kind"] == "history_coverage_unproven")
             .collect::<Vec<_>>();
         assert_eq!(armed.len(), 1, "one recovery intent must arm once");
         assert_eq!(started.len(), 2, "failure plus retry must start twice");
@@ -1791,32 +1803,33 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             "retry must have one honest incomplete terminal"
         );
         assert_eq!(
-            started[0]["context"]["operation_id"],
-            failed[0]["context"]["operation_id"]
+            started[0]["event"]["record_context"]["operation_ref"],
+            failed[0]["event"]["record_context"]["operation_ref"]
         );
         assert_eq!(
-            started[1]["context"]["operation_id"],
-            completed[0]["context"]["operation_id"]
+            started[1]["event"]["record_context"]["operation_ref"],
+            completed[0]["event"]["record_context"]["operation_ref"]
         );
         assert_ne!(
-            started[0]["context"]["operation_id"], started[1]["context"]["operation_id"],
+            started[0]["event"]["record_context"]["operation_ref"],
+            started[1]["event"]["record_context"]["operation_ref"],
             "each actual owner attempt has its own durable serial"
         );
-        assert_eq!(started[0]["kind"]["retry_ordinal"], 0);
-        assert_eq!(failed[0]["kind"]["retry_ordinal"], 0);
-        assert_eq!(started[1]["kind"]["retry_ordinal"], 1);
-        assert_eq!(completed[0]["kind"]["retry_ordinal"], 1);
+        assert_eq!(started[0]["event"]["retry_ordinal"], 0);
+        assert_eq!(failed[0]["event"]["retry_ordinal"], 0);
+        assert_eq!(started[1]["event"]["retry_ordinal"], 1);
+        assert_eq!(completed[0]["event"]["retry_ordinal"], 1);
         assert_eq!(
-            failed[0]["kind"]["activation_outcome"].as_str(),
+            failed[0]["event"]["activation_outcome"].as_str(),
             Some("failed")
         );
-        assert_eq!(failed[0]["kind"]["deliveries"], 0);
-        assert_eq!(failed[0]["kind"]["group_advanced"], false);
+        assert_eq!(failed[0]["event"]["deliveries"], 0);
+        assert_eq!(failed[0]["event"]["group_advanced"], false);
         // This run did read the group's post-replay epoch, so `group_advanced:
         // false` here is a measurement and the row says so. Without the
         // companion flag a reader cannot separate this row from one whose
         // after-read failed and defaulted to the before-epoch.
-        assert_eq!(failed[0]["kind"]["group_advanced_observed"], true);
+        assert_eq!(failed[0]["event"]["group_advanced_observed"], true);
     });
 }
 
@@ -1867,7 +1880,9 @@ async fn armed_epoch_backfill(
     (app, client, group_id)
 }
 
-/// Every audit row this app has recorded so far.
+/// Every v5 audit row this app has recorded so far. Keep the old `kind` key in
+/// this test-only view so the recovery assertions below continue to examine
+/// their original numeric and categorical facts, after strict v5 admission.
 fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
     app.audit_log_files()
         .unwrap()
@@ -1877,10 +1892,10 @@ fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
                 .unwrap()
                 .lines()
                 .map(|line| {
-                    let row = serde_json::from_str::<serde_json::Value>(line).unwrap();
-                    crate::audit_log::AUDIT_UPLOAD_SCHEMA
-                        .validate(&row)
-                        .expect("real recorder output must satisfy the upload schema");
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real recorder output must satisfy the v5 contract");
+                    let mut row = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                    row["kind"] = row["event"].clone();
                     row
                 })
                 .collect::<Vec<_>>()
@@ -12509,6 +12524,10 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
         let cursor = crate::unix_now_seconds();
         client.state.last_transport_timestamp = Some(cursor);
         app.save_state(&client.state).unwrap();
+        assert!(
+            app.relay_plane
+                .disable_account_delivery_spill_for_test(client.adapter.account_id())
+        );
         const HISTORY: usize = crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + 16;
         for index in 0..HISTORY {
             let event = epoch_gap_probe(
@@ -12781,6 +12800,128 @@ fn reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment
 }
 
 #[test]
+fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
+    run_composed_app_runtime_test("delivery-overflow-spill", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = client.create_group("overflow spill", &[]).await.unwrap();
+        let nostr_group_id_hex = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection")
+            .nostr_routing
+            .nostr_group_id_hex;
+        let now = crate::unix_now_seconds();
+        let probe = |index: usize| {
+            epoch_gap_probe(
+                &nostr_group_id_hex,
+                now.saturating_sub(10_000 + index as u64),
+                &format!("spill-{index}"),
+            )
+        };
+
+        // A replay of history the account already holds overflows for free.
+        const KNOWN: usize = 8;
+        const NEW: usize = 24;
+        let known: Vec<_> = (0..KNOWN).map(|index| probe(100_000 + index)).collect();
+        for event in &known {
+            client.remember_seen_event(event.id.clone());
+        }
+        app.save_state(&client.state).unwrap();
+        let mut expected = Vec::new();
+        for index in 0..crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + NEW {
+            let event = probe(index);
+            expected.push(event.id.clone());
+            inject_epoch_gap_probe(&app, event).await;
+        }
+        for event in known {
+            inject_epoch_gap_probe(&app, event).await;
+        }
+        let health = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let health = app.relay_plane.relay_health().await;
+                if health.account_delivery_spilled + health.account_delivery_spill_already_seen
+                    >= (NEW + KNOWN) as u64
+                {
+                    break health;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the spill writer settles every overflowed delivery");
+        assert_eq!(health.account_delivery_spilled, NEW as u64);
+        assert_eq!(health.account_delivery_spill_already_seen, KNOWN as u64);
+        assert_eq!(health.account_delivery_dropped, 0);
+        assert!(!client.adapter.delivery_loss_blocks_cursor());
+        let storage = app.account_storage("alice").unwrap();
+        assert!(
+            storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .spilled_account_deliveries(1_000, crate::unix_now_seconds())
+                .unwrap()
+                .deliveries
+                .len(),
+            NEW
+        );
+
+        // Keep only a few live deliveries, then reopen as a restarted process
+        // would. The in-memory queue is gone; the durable spill is not.
+        for _ in 0..4 {
+            let received = client.receive_next_delivery().await.unwrap();
+            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+                panic!("a spill never creates a loss generation");
+            };
+            client.ingest_received_delivery(*delivery).await.unwrap();
+        }
+        let spilled_before_reopen = storage
+            .spilled_account_deliveries(1_000, crate::unix_now_seconds())
+            .unwrap()
+            .deliveries
+            .len();
+        drop(client);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        for _ in 0..spilled_before_reopen {
+            let received =
+                tokio::time::timeout(Duration::from_secs(5), client.receive_next_delivery())
+                    .await
+                    .expect("spilled rows are admitted after reopen")
+                    .unwrap();
+            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+                panic!("a spill never creates a loss generation");
+            };
+            client.ingest_received_delivery(*delivery).await.unwrap();
+        }
+        assert!(
+            storage
+                .spilled_account_deliveries(1_000, crate::unix_now_seconds())
+                .unwrap()
+                .deliveries
+                .is_empty()
+        );
+        // The queue kept the oldest injections; every later one was spilled.
+        let receipts = client.transport_receipts().unwrap();
+        for id in &expected[crate::relay_plane::ACCOUNT_DELIVERY_BUFFER..] {
+            assert!(receipts.contains(id), "a spilled delivery was admitted");
+        }
+        assert!(!client.delivery_overflow_recovery_pending);
+    });
+}
+
+#[test]
 fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
     run_composed_app_runtime_test("delivery-overflow-cursor-fence", || async {
         let dir = tempfile::tempdir().unwrap();
@@ -12836,12 +12977,14 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
                         }
                     })
             });
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
         assert!(
             app.relay_plane
-                .set_account_delivery_recovery_marker_for_test(
-                    &MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
-                    marker,
-                )
+                .set_account_delivery_recovery_marker_for_test(&account_id, marker)
+        );
+        assert!(
+            app.relay_plane
+                .disable_account_delivery_spill_for_test(&account_id)
         );
 
         // Model the dangerous lead-in: several newest events are processed by
@@ -17890,10 +18033,14 @@ fn audit_rows_of_kind(app: &MarmotApp, kind: &str) -> usize {
             std::fs::read_to_string(&file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    marmot_forensics::v5::Record::from_json(line.as_bytes())
+                        .expect("real v5 recovery row");
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
                 .collect::<Vec<_>>()
         })
-        .filter(|row| row["kind"]["type"] == kind)
+        .filter(|row| row["event"]["type"] == kind)
         .count()
 }
 
@@ -19334,12 +19481,15 @@ pub(crate) async fn undecryptable_probe_route(
     (app, client, route)
 }
 
-/// Every `ingest_outcome` audit row the engine recorded for `msg_id`.
+/// Every `ingest_outcome` audit row the engine recorded for raw `msg_id`.
 fn recorded_ingest_outcomes(app: &MarmotApp, msg_id: &str) -> Vec<String> {
+    let raw = hex::decode(msg_id).expect("transport message id is hex");
+    let message_ref = marmot_forensics::v5::EngineMessageRef::from_message_id(&raw)
+        .expect("transport message id has the engine reference shape");
     recorded_audit_rows(app)
         .iter()
         .filter(|row| row["kind"]["type"] == "ingest_outcome")
-        .filter(|row| row["kind"]["msg_id"].as_str() == Some(msg_id))
+        .filter(|row| row["kind"]["message_ref"].as_str() == Some(message_ref.as_str()))
         .filter_map(|row| row["kind"]["outcome_kind"].as_str().map(ToOwned::to_owned))
         .collect()
 }

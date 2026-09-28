@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{
-    GroupId, MessageId, TransportDeliveryPlane, TransportEndpoint, TransportEndpointFailure,
-    TransportEndpointReceipt, TransportGroupSubscription,
+    GroupId, MessageId, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
+    TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSubscription,
 };
 use tokio::sync::Notify;
 use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
@@ -183,6 +183,7 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
             sender: delivery_tx,
             overflow: Arc::new(AccountDeliveryOverflowState::default()),
             recovery_marker: None,
+            spill: None,
         },
     );
 
@@ -440,15 +441,26 @@ struct QueuedWorkerFailureSource {
 
 impl QueuedWorkerFailureSource {
     fn new(loss: NostrSdkRelayClient) -> Self {
+        Self::with_hook(loss, 8, true)
+    }
+
+    /// The worker holds its first notification, then keeps working. The
+    /// receiver buffer matches the SDK client's per-receiver notifications.
+    fn busy(loss: NostrSdkRelayClient) -> Self {
+        Self::with_hook(loss, 4096, false)
+    }
+
+    fn with_hook(loss: NostrSdkRelayClient, capacity: usize, fail_once: bool) -> Self {
         Self {
-            sender: broadcast::channel(8).0,
+            sender: broadcast::channel(capacity).0,
             subscriptions: AtomicUsize::new(0),
             notifications_queued: AtomicUsize::new(0),
             loss,
             hook: Arc::new(NotificationWorkerFailureHook {
                 entered: Notify::new(),
                 release: Notify::new(),
-                fail_once: AtomicBool::new(true),
+                fail_once: AtomicBool::new(fail_once),
+                stall_once: AtomicBool::new(!fail_once),
             }),
         }
     }
@@ -582,6 +594,102 @@ async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
         .await
         .expect("supervisor stops after the replacement observes shutdown")
         .unwrap();
+    sdk.shutdown_accounts().await;
+}
+
+/// A catch-up rebuild replays every stored event inside the lookback window:
+/// a raw relay copy of each one, plus a deduplicated delivery for events this
+/// SDK client has not seen. A busy event worker must absorb that replay.
+/// Declaring it notification loss closes the account's delivery route and
+/// sends the account worker through reconnect, whose rejected commands fail
+/// with `transport_closed` (the nightly 1024-message backlog journeys).
+#[tokio::test]
+async fn busy_notification_worker_absorbs_rebuild_replay_without_loss() {
+    use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
+
+    // Unseen replay of a 1024-message backlog: delivery plus raw copy each.
+    const REPLAYED_NOTIFICATIONS: usize = 2 * 1024;
+    let sdk = NostrSdkRelayClient::multi_account();
+    let alice_keys = Keys::generate();
+    let alice = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+    let alice_client = sdk
+        .register_account(alice.clone(), Arc::new(alice_keys))
+        .await
+        .unwrap();
+    let alice_loss = sdk.notification_loss_for_account(&alice).await.unwrap();
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice_adapter = plane.account_adapter(alice.clone(), relay);
+    let source = Arc::new(QueuedWorkerFailureSource::busy(alice_client));
+    let supervisor = spawn_relay_notification_supervisor_scoped(
+        source.clone(),
+        plane.inner.transport.clone(),
+        Some(alice),
+    );
+    timeout(Duration::from_secs(2), async {
+        while source.subscriptions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the supervised consumer subscribes");
+    source.send_notice();
+    timeout(Duration::from_secs(2), source.hook.entered.notified())
+        .await
+        .expect("the event worker is busy with its first notification");
+
+    let stored = EventBuilder::new(Kind::MlsGroupMessage, "stored group message")
+        .tags([Tag::custom("h", [hex::encode([0xD4; 32])])])
+        .finalize(&Keys::generate())
+        .expect("sign stored group event");
+    let relay_url = RelayUrl::parse("wss://relay.example").unwrap();
+    let subscription_id = SubscriptionId::new("rebuilt-group-subscription");
+    for _ in 0..REPLAYED_NOTIFICATIONS {
+        source
+            .sender
+            .send(RelayPoolNotification::Message {
+                relay_url: relay_url.clone(),
+                message: Box::new(RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(subscription_id.clone()),
+                    event: std::borrow::Cow::Owned(stored.clone()),
+                }),
+            })
+            .expect("supervisor has an active receiver");
+    }
+    source
+        .sender
+        .send(RelayPoolNotification::Message {
+            relay_url,
+            message: Box::new(RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                subscription_id,
+            ))),
+        })
+        .expect("supervisor has an active receiver");
+
+    let health = &plane.inner.transport.notification_forwarder_health;
+    timeout(Duration::from_secs(10), async {
+        while health.snapshot().lag_incidents == 0
+            && source.notifications_queued.load(Ordering::SeqCst) < REPLAYED_NOTIFICATIONS + 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the consumer admits the replay or reports loss");
+    assert_eq!(
+        health.snapshot().lag_incidents,
+        0,
+        "an ordinary rebuild replay is not notification loss"
+    );
+    assert!(alice_loss.borrow().is_none());
+    assert!(
+        alice_adapter.pending_delivery_overflow().is_none(),
+        "the account delivery route stays open"
+    );
+
+    source.hook.release.notify_one();
+    supervisor.abort();
+    let _ = supervisor.await;
     sdk.shutdown_accounts().await;
 }
 
@@ -1938,6 +2046,438 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
 }
 
 #[tokio::test]
+async fn full_account_queue_spills_before_it_omits() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let transport_group_id = vec![0xD3; 32];
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    // The durable spill keeps two deliveries and reports every later one full.
+    let kept = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spill = kept.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        let mut spill = spill.lock().unwrap();
+        Ok(deliveries
+            .iter()
+            .map(|delivery| {
+                if spill.len() < 2 {
+                    spill.push(delivery.clone());
+                    storage_sqlite::DeliverySpillDisposition::Stored
+                } else {
+                    storage_sqlite::DeliverySpillDisposition::Full
+                }
+            })
+            .collect())
+    });
+    let adapter = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store),
+    );
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: alice.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_699_999_900)),
+        })
+        .await
+        .unwrap();
+
+    for index in 0..ACCOUNT_DELIVERY_BUFFER + 3 {
+        let mut event = group_event(&format!("alice-{index}"), &transport_group_id);
+        event.created_at = 1_700_100_000_u64.saturating_sub(index as u64);
+        event.id = event.computed_id();
+        relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("alice-group".into()),
+                event,
+            })
+            .await
+            .unwrap();
+    }
+
+    let settled = timeout(Duration::from_secs(5), async {
+        loop {
+            let health = relay_plane.relay_health().await;
+            if health.account_delivery_spilled == 2 && health.account_delivery_dropped == 1 {
+                break health;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let health = match settled {
+        Ok(health) => health,
+        Err(_) => {
+            let health = relay_plane.relay_health().await;
+            panic!(
+                "spill did not settle: spilled={} dropped={} depth={} max_depth={}",
+                health.account_delivery_spilled,
+                health.account_delivery_dropped,
+                health.account_delivery_queue_depth,
+                health.account_delivery_max_queue_depth
+            );
+        }
+    };
+    assert_eq!(health.account_delivery_spill_already_seen, 0);
+    assert_eq!(kept.lock().unwrap().len(), 2);
+    assert!(
+        adapter.delivery_loss_blocks_cursor(),
+        "only the delivery the full spill could not keep becomes loss"
+    );
+}
+
+async fn fill_account_queue(
+    relay_plane: &MarmotRelayPlane,
+    adapter: &MarmotRelayPlaneAccountAdapter,
+    account: &MemberId,
+    extra: usize,
+) {
+    let transport_group_id = vec![0xD3; 32];
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_699_999_900)),
+        })
+        .await
+        .unwrap();
+    for index in 0..ACCOUNT_DELIVERY_BUFFER + extra {
+        let mut event = group_event(&format!("fill-{index}"), &transport_group_id);
+        event.created_at = 1_700_100_000_u64.saturating_sub(index as u64);
+        event.id = event.computed_id();
+        relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("fill-group".into()),
+                event,
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn transient_spill_store_failures_are_retried_instead_of_lost() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let attempts = calls.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+            return Err(AccountDeliveryRecoveryMarkerError::Retryable);
+        }
+        Ok(vec![
+            storage_sqlite::DeliverySpillDisposition::Stored;
+            deliveries.len()
+        ])
+    });
+    let adapter = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store),
+    );
+    fill_account_queue(&relay_plane, &adapter, &alice, 1).await;
+
+    let health = timeout(Duration::from_secs(5), async {
+        loop {
+            let health = relay_plane.relay_health().await;
+            if health.account_delivery_spilled == 1 {
+                break health;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retried write stores the delivery");
+    assert_eq!(health.account_delivery_dropped, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(!adapter.delivery_loss_blocks_cursor());
+}
+
+#[tokio::test]
+async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    // The first writer's store waits until the adapter has been replaced.
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        while !gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(vec![
+            storage_sqlite::DeliverySpillDisposition::Stored;
+            deliveries.len()
+        ])
+    });
+    let first = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store.clone()),
+    );
+    fill_account_queue(&relay_plane, &first, &alice, 1).await;
+    timeout(Duration::from_secs(5), async {
+        while !first.delivery_loss_blocks_cursor() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the overflowed delivery is handed to the spill writer");
+
+    let replacement = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store),
+    );
+    release.store(true, Ordering::SeqCst);
+    let woke = timeout(
+        Duration::from_secs(5),
+        replacement.receive_account_delivery_or_spill(),
+    )
+    .await
+    .expect("the replacement hears the earlier writer");
+    assert!(matches!(woke, AccountDeliveryWait::SpillReady));
+}
+
+/// A spill write can outlive its route: retirement removes the route while
+/// the writer still holds a batch, however long the store takes. A replacement
+/// adapter shares that writer's coordination, so it stays fenced until the
+/// batch settles, wakes when it commits, and is told to recover when it fails,
+/// whether the replacement registered before or after the failure.
+#[tokio::test]
+async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Outcome {
+        Commit,
+        FailAfterReplacement,
+        FailBeforeReplacement,
+    }
+    for outcome in [
+        Outcome::Commit,
+        Outcome::FailAfterReplacement,
+        Outcome::FailBeforeReplacement,
+    ] {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let alice = MemberId::new(vec![0xA1; 32]);
+        let release = Arc::new(AtomicBool::new(false));
+        // A failed assertion must still free the blocked store thread, or the
+        // runtime cannot shut down.
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release_on_exit = ReleaseOnDrop(release.clone());
+        let gate = release.clone();
+        let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+            while !gate.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if outcome == Outcome::Commit {
+                Ok(vec![
+                    storage_sqlite::DeliverySpillDisposition::Stored;
+                    deliveries.len()
+                ])
+            } else {
+                Err(AccountDeliveryRecoveryMarkerError::Closed)
+            }
+        });
+        let marked = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = marked.clone();
+        let marker: AccountDeliveryRecoveryMarker = Arc::new(move |token, dropped| {
+            recorded.lock().unwrap().push((token, dropped));
+            Ok(())
+        });
+        let adapter = relay_plane.account_adapter_with_recovery_marker(
+            alice.clone(),
+            relay.clone(),
+            Some(marker.clone()),
+            Some(store.clone()),
+        );
+        fill_account_queue(&relay_plane, &adapter, &alice, 1).await;
+        timeout(Duration::from_secs(5), async {
+            while !adapter.delivery_loss_blocks_cursor() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the overflowed delivery is handed to the spill writer");
+
+        // Retirement does not wait for the held write.
+        timeout(
+            Duration::from_secs(5),
+            relay_plane.deactivate_account_context(&alice),
+        )
+        .await
+        .expect("retirement does not wait for the writer")
+        .unwrap();
+        drop(adapter);
+        let durable = || async {
+            timeout(Duration::from_secs(5), async {
+                while marked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, dropped)| *dropped == 0)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the lost batch is durable although its route was retired");
+        };
+        if outcome == Outcome::FailBeforeReplacement {
+            // The write fails while no route exists.
+            release.store(true, Ordering::SeqCst);
+            durable().await;
+        }
+        let replacement = relay_plane.account_adapter_with_recovery_marker(
+            alice.clone(),
+            relay.clone(),
+            Some(marker),
+            Some(store),
+        );
+        assert!(
+            replacement.delivery_loss_blocks_cursor(),
+            "{outcome:?}: the replacement is fenced by the retired writer's batch"
+        );
+        release.store(true, Ordering::SeqCst);
+        let woke = timeout(
+            Duration::from_secs(5),
+            replacement.receive_account_delivery_or_spill(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{outcome:?}: the replacement hears the retired writer"));
+        if outcome == Outcome::Commit {
+            assert!(matches!(woke, AccountDeliveryWait::SpillReady));
+            assert!(!replacement.delivery_loss_blocks_cursor());
+            assert!(marked.lock().unwrap().is_empty());
+        } else {
+            // Recovery starts on the replacement with no further relay
+            // traffic, and the loss keeps its cursor fenced until then.
+            assert!(
+                matches!(
+                    woke,
+                    AccountDeliveryWait::Received(AccountDeliveryReceive::Overflow(_))
+                ),
+                "{outcome:?}: the replacement is told to recover"
+            );
+            durable().await;
+            assert!(replacement.delivery_loss_blocks_cursor());
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_spill_wakeup_wins_over_a_ready_live_queue() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let store: AccountDeliverySpillStore = Arc::new(|deliveries| {
+        Ok(vec![
+            storage_sqlite::DeliverySpillDisposition::Stored;
+            deliveries.len()
+        ])
+    });
+    let adapter = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store),
+    );
+    // Live input is queued and ready when a spill write commits.
+    fill_account_queue(&relay_plane, &adapter, &alice, 0).await;
+    adapter.delivery_overflow.spill_ready.notify_one();
+    assert!(matches!(
+        adapter.receive_account_delivery_or_spill().await,
+        AccountDeliveryWait::SpillReady
+    ));
+    assert!(matches!(
+        adapter.receive_account_delivery_or_spill().await,
+        AccountDeliveryWait::Received(AccountDeliveryReceive::Delivery(_))
+    ));
+}
+
+#[tokio::test]
+async fn spill_hand_off_bounds_deliveries_with_empty_payloads() {
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        while !gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(vec![
+            storage_sqlite::DeliverySpillDisposition::Stored;
+            deliveries.len()
+        ])
+    });
+    let spill = delivery_spill::AccountDeliverySpill::new(
+        store,
+        MemberId::new(vec![0xA1; 32]),
+        std::sync::Weak::new(),
+        Arc::new(AccountDeliveryOverflowState::default()),
+        None,
+    );
+    let empty = |index: u32| TransportDelivery {
+        account_id: MemberId::new(vec![0xA1; 32]),
+        group_id_hint: None,
+        message: TransportMessage {
+            id: MessageId::new(index.to_be_bytes().to_vec()),
+            payload: Vec::new(),
+            timestamp: Timestamp(1),
+            causal_deps: Vec::new(),
+            source: TransportSource(NOSTR_SOURCE.to_owned()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![0xD3; 32],
+            },
+        },
+        received_at: Timestamp(1),
+        source: TransportDeliverySource {
+            transport: TransportSource(NOSTR_SOURCE.to_owned()),
+            plane: TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    };
+    // The writer takes its first batch and blocks; the hand-off then fills.
+    let mut accepted = 0_u32;
+    while spill.offer(empty(accepted)) {
+        accepted += 1;
+        assert!(
+            accepted < 10_000,
+            "the hand-off must refuse at a finite count"
+        );
+    }
+    assert!(
+        accepted <= 4_096 + 128,
+        "accepted {accepted} empty deliveries"
+    );
+    release.store(true, Ordering::SeqCst);
+}
+
+#[tokio::test]
 async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -1963,6 +2503,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
         alice.clone(),
         relay.clone(),
         Some(recovery_marker),
+        None,
     );
     let bob_adapter = relay_plane.account_adapter(bob.clone(), relay.clone());
 
@@ -3203,8 +3744,12 @@ async fn loss_authority_persists_count_growth_after_the_first_queue_write() {
 async fn loss_authority_normal_close_does_not_invent_notification_loss() {
     let relay = Arc::new(RecordingRelayClient::default());
     let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
-    let adapter =
-        plane.account_adapter_with_recovery_marker(MemberId::new(vec![0xA2; 32]), relay, None);
+    let adapter = plane.account_adapter_with_recovery_marker(
+        MemberId::new(vec![0xA2; 32]),
+        relay,
+        None,
+        None,
+    );
     recover_relay_notification_forwarder(
         &plane.inner.transport,
         RelayNotificationConsumerExit::Closed,
@@ -3250,4 +3795,112 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
         receiver.try_recv().is_err(),
         "count updates do not enqueue duplicate controls"
     );
+}
+
+/// Notification loss closes the account delivery route and the managed
+/// worker reopens its session. The reopened session registers a new signer
+/// with the SDK, which refuses while the previous immutable account context is
+/// live, so the worker must retire that context first. Otherwise every reopen
+/// fails and the account stays in reconnect backoff, where commands fail with
+/// `transport_closed`.
+#[tokio::test]
+async fn sdk_account_worker_reopens_after_notification_loss() {
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let alice = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = crate::MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(30), runtime.catch_up_accounts())
+        .await
+        .expect("initial catch-up finishes")
+        .unwrap();
+    let group = runtime
+        .create_group_with_options(
+            &alice.label,
+            "notification loss",
+            &[],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![url]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    runtime.group_members(&alice.label, &group).await.unwrap();
+
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_recovery_for_test(1);
+    // The first reconnect waits two seconds plus jitter; later ones double.
+    timeout(Duration::from_secs(20), async {
+        let mut reconnecting = false;
+        loop {
+            match runtime.group_members(&alice.label, &group).await {
+                Ok(_) if reconnecting => break,
+                Ok(_) => {}
+                Err(crate::AppError::TransportClosed) => reconnecting = true,
+                Err(error) => panic!("unexpected group read error: {error:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the reopened worker serves reads again");
+    timeout(Duration::from_secs(30), runtime.catch_up_accounts())
+        .await
+        .expect("the reopened worker catches up")
+        .unwrap();
+    runtime.shutdown().await;
+}
+
+/// A reopen cancelled mid-retirement leaves nothing running. The reaper
+/// retires the context, and a replacement registered afterwards keeps its
+/// SDK context.
+#[tokio::test]
+async fn cancelled_reopen_retirement_cannot_remove_a_replacement_context() {
+    use futures::FutureExt;
+    use nostr_sdk::prelude::Keys;
+
+    let plane = MarmotRelayPlane::from_sdk(None, true);
+    let sdk = plane.inner.transport.sdk_relay_client.clone().unwrap();
+    let keys = Keys::generate();
+    let alice = MemberId::new(keys.public_key().to_bytes().to_vec());
+    sdk.register_account(alice.clone(), Arc::new(keys.clone()))
+        .await
+        .unwrap();
+    plane
+        .inner
+        .transport
+        .account_notification_forwarders
+        .lock()
+        .await
+        .insert(alice.clone(), tokio::spawn(std::future::pending::<()>()));
+
+    // The reopening worker is cancelled after its first poll.
+    assert!(
+        plane
+            .retire_account_session_transport(&alice)
+            .now_or_never()
+            .is_none()
+    );
+    plane.deactivate_account_context(&alice).await.unwrap();
+    // The reopened session brings a new signer handle for the same identity.
+    sdk.register_account(alice.clone(), Arc::new(keys))
+        .await
+        .expect("the reaper retired the old context");
+    tokio::time::sleep(RELAY_PLANE_TASK_ABORT_WAIT * 2).await;
+    assert!(
+        sdk.notification_loss_for_account(&alice).await.is_ok(),
+        "no retirement outlives the cancelled worker"
+    );
+    sdk.shutdown_accounts().await;
 }

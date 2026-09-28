@@ -1114,6 +1114,11 @@ it is not a passing catch-up result. Its companion
 `public_app_1024_message_backlog_with_extra_epochs_recovers_completely` prepends two public profile updates
 while the recipient is offline, pinning the workload that exposed released transport objects being suppressed
 by app deduplication (#1721). Both run in the required public recovery CI job.
+`public_app_large_account_recovery_scorecard` is the report-only #1945 companion. It uses one account in 36 groups
+(one with 51 members), about 11,000 retained kind-445 events on two relay endpoints, and one hidden-then-restored older
+commit. After a cold restart it records latency, traffic and recovery time under live traffic, and asserts only that,
+within 600 seconds, the commit is applied and the later messages decrypt, and that every gap chat message is present
+exactly once.
 Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
 

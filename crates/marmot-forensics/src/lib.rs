@@ -14,5 +14,6 @@ pub use audit::{
     EpochBackfillReplayScope, EpochStallBackfillTrigger, ForensicRecorder, ForkWinner, GroupRefHex,
     GroupStateValue, JsonlRecorder, MemberRefHex, MembershipChangeSource, MessageArtifactKind,
     MessageRefHex, NoopRecorder, OutboundMessage, PeelerOutcomeKind, PublishRelayFailure,
-    RecipientExpectation, RecipientScope, RelayRegistration, default_jsonl_path, member_ref_hex,
+    RecipientExpectation, RecipientScope, RelayRegistration, default_jsonl_path,
+    default_v5_jsonl_path, member_ref_hex,
 };

@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-09-19
+updated: 2026-09-28
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -40,8 +40,12 @@ mdk#357, mdk#367, mdk#396).
 
 **Coverage rule:** new code that creates a local file, socket, or database calls these helpers (or proves equivalent
 restrictive-by-construction posture with an on-disk mode test) instead of re-deriving umask/chmod/PRAGMA ordering.
-`crates/marmot-account/src/io.rs` (`write_file_atomically` with `FileMode::Private`) is a compliant-equivalent
-implementation that predates the shared crate.
+`crates/marmot-account/src/io.rs` (`write_file_atomically` with `FileMode::Private` or `FileMode::Secret`) is a
+compliant-equivalent implementation that predates the shared crate. Both modes rename a synced 0600 temp file over
+the target, so a reader sees the whole previous file or the whole new one. Only `FileMode::Secret` (signing keys)
+zeroes the replaced inode. It does so after the rename unlinks it, and `read_secret_json` re-reads when it finds its
+inode unlinked. Private account state such as the setup journal is never zeroed, because readiness polls read it
+while background setup rewrites it.
 
 ## Initializing encrypted account databases
 

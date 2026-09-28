@@ -38,6 +38,7 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
         .as_array()
         .unwrap()
         .iter()
+        .filter(|r| !r["$ref"].as_str().unwrap().contains("OperationalEvent_"))
         .map(|r| {
             let name = r["$ref"].as_str().unwrap().rsplit('/').next().unwrap();
             schema["$defs"][name]["properties"]["type"]["const"]
@@ -47,7 +48,11 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
         })
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(kinds, catalog);
-    assert_eq!(kinds.len(), 9);
+    assert_eq!(kinds.len(), 15);
+    assert_eq!(
+        schema["$defs"]["Event"]["oneOf"].as_array().unwrap().len(),
+        59
+    );
 }
 
 #[test]
@@ -355,6 +360,67 @@ fn semantic_count_and_identity_rules_supplement_json_schema() {
 }
 
 #[test]
+fn incomplete_publication_keeps_discarded_ack_counts_unknown() {
+    let schema = validator();
+    let mut body = fixture("publish_finished");
+    body["event"]["results_complete"] = json!(false);
+    body["event"]["accepted_this_attempt_count"] = Value::Null;
+    body["event"]["accepted_total_count"] = Value::Null;
+    body["event"]["policy"] = json!("unknown");
+    body["event"]["retained_state"] = json!("pending");
+    assert!(schema.is_valid(&body));
+    assert!(decode(&body).is_ok());
+    let mut false_success = body.clone();
+    false_success["event"]["policy"] = json!("met");
+    assert!(!schema.is_valid(&false_success));
+    assert!(decode(&false_success).is_err());
+    let mut false_unmet = body.clone();
+    false_unmet["event"]["policy"] = json!("unmet");
+    assert!(!schema.is_valid(&false_unmet));
+    assert!(decode(&false_unmet).is_err());
+    let mut false_complete = body;
+    false_complete["event"]["results_complete"] = json!(true);
+    assert!(decode(&false_complete).is_err());
+}
+
+#[test]
+fn opened_baseline_inventory_reports_the_actual_64_group_selection() {
+    let schema = validator();
+    let body = fixture("baseline_inventory");
+    assert!(schema.is_valid(&body));
+    assert!(decode(&body).is_ok());
+    let mut enabled = body.clone();
+    enabled["event"]["reason"] = json!("audit_enabled");
+    assert!(schema.is_valid(&enabled));
+    assert!(decode(&enabled).is_ok());
+
+    let mut wrong_reason = body.clone();
+    wrong_reason["event"]["reason"] = json!("created");
+    assert!(!schema.is_valid(&wrong_reason));
+    assert!(decode(&wrong_reason).is_err());
+
+    let mut wrong_scope = body.clone();
+    wrong_scope["group_ref"] = fixture("baseline")["group_ref"].clone();
+    assert!(!schema.is_valid(&wrong_scope));
+    assert!(decode(&wrong_scope).is_err());
+
+    let mut false_selection = body.clone();
+    false_selection["event"]["selected_group_count"] = json!(63);
+    false_selection["event"]["omitted_by_limit_count"] = json!(2);
+    assert!(decode(&false_selection).is_err());
+
+    let mut partial_unknown = body.clone();
+    partial_unknown["event"]["eligible_group_count"] = Value::Null;
+    assert!(!schema.is_valid(&partial_unknown));
+    assert!(decode(&partial_unknown).is_err());
+
+    let mut failed_read_overflow = body;
+    failed_read_overflow["event"]["failed_read_count"] = json!(65);
+    assert!(!schema.is_valid(&failed_read_overflow));
+    assert!(decode(&failed_read_overflow).is_err());
+}
+
+#[test]
 fn canonical_integer_strings_and_strict_json_boundaries() {
     let schema = validator();
     for text in [
@@ -608,6 +674,64 @@ fn publication_endpoint_classifications_match_nostr_owner_contract() {
                     "Rust: {status}/{kind:?}/{category:?}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn lifecycle_and_app_outcome_shapes_reject_false_scope_and_counts() {
+    let schema = validator();
+    let mut unknown_partial_count = fixture("app_update_outcome");
+    unknown_partial_count["event"]["compute"] = json!("failed");
+    unknown_partial_count["event"]["transaction"] = json!("unknown");
+    unknown_partial_count["event"]["failure_stage"] = json!("projection");
+    unknown_partial_count["event"]["failure_reason"] = json!("projection");
+    unknown_partial_count["event"]["affected_group_count"] = Value::Null;
+    assert!(schema.is_valid(&unknown_partial_count));
+    assert!(decode(&unknown_partial_count).is_ok());
+    let mut computed_but_not_committed = fixture("app_update_outcome");
+    computed_but_not_committed["event"]["transaction"] = json!("not_committed");
+    computed_but_not_committed["event"]["failure_stage"] = json!("transaction");
+    computed_but_not_committed["event"]["failure_reason"] = json!("storage");
+    assert!(schema.is_valid(&computed_but_not_committed));
+    assert!(decode(&computed_but_not_committed).is_ok());
+    let mut cases = Vec::new();
+    let mut group_scoped_start = fixture("recording_started");
+    group_scoped_start["group_ref"] =
+        json!("1e50a718a6a13c6bac32359e1bdadfacb0a3e41845081b0dfdeb197bfb648b10");
+    cases.push(group_scoped_start);
+    let mut missing_limitation = fixture("recording_started");
+    missing_limitation["event"]["limitations"] = json!(["best_effort_local_writes"]);
+    cases.push(missing_limitation);
+    let mut zero_loss = fixture("capture_loss");
+    zero_loss["event"]["write_failed_attempts"] = json!("0");
+    cases.push(zero_loss);
+    let mut app_failure_pair = fixture("app_update_outcome");
+    app_failure_pair["event"]["failure_stage"] = json!("projection");
+    cases.push(app_failure_pair);
+    let mut committed_failure = fixture("app_update_outcome");
+    committed_failure["event"]["compute"] = json!("failed");
+    committed_failure["event"]["failure_stage"] = json!("transaction");
+    committed_failure["event"]["failure_reason"] = json!("storage");
+    cases.push(committed_failure);
+    let mut invented_broadcast = fixture("runtime_publication_outcome");
+    invented_broadcast["event"]["accepted_by_broadcast"] = json!("2");
+    cases.push(invented_broadcast);
+    let mut group_scoped_publication = fixture("runtime_publication_outcome");
+    group_scoped_publication["group_ref"] =
+        json!("1e50a718a6a13c6bac32359e1bdadfacb0a3e41845081b0dfdeb197bfb648b10");
+    cases.push(group_scoped_publication);
+    let mut raw_identifier = fixture("app_update_outcome");
+    raw_identifier["event"]["message_ref"] = json!("wss://private.example");
+    cases.push(raw_identifier);
+    for body in cases {
+        assert!(decode(&body).is_err(), "Rust accepted invalid {body}");
+        // JSON Schema cannot express addition of independent decimal-string
+        // counts; the Rust and receiver semantic parsers enforce that case.
+        if body["event"]["type"] != "runtime_publication_outcome"
+            || body["event"]["accepted_by_broadcast"] != "2"
+        {
+            assert!(!schema.is_valid(&body), "schema accepted invalid {body}");
         }
     }
 }

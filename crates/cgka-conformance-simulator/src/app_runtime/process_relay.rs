@@ -91,6 +91,39 @@ impl RelayBackend {
             Self::Local(_) => None,
         }
     }
+    /// Every endpoint of the relay process; both proxy the same retained store.
+    pub async fn relay_urls(&self) -> Result<Vec<String>, SubjectError> {
+        self.remote("relay_urls", json!([])).await
+    }
+    pub async fn traffic(
+        &self,
+        since: &[u64],
+        events: bool,
+    ) -> Result<Vec<crate::relay_fault_proxy::RelayTrafficV1>, SubjectError> {
+        self.remote("traffic", json!([since, events])).await
+    }
+    /// Admitted event ids and kinds in admission order.
+    pub async fn publication_ids(&self) -> Result<Vec<(String, u16)>, SubjectError> {
+        self.remote("publication_ids", json!([])).await
+    }
+    async fn remote<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        method: &str,
+        args: Value,
+    ) -> Result<T, SubjectError> {
+        match self {
+            Self::Remote(p) => p
+                .client
+                .call_async(method, args)
+                .await
+                .map_err(|e| e.subject()),
+            Self::Local(_) => Err(SubjectError::classified(
+                crate::SubjectFailureCategory::ExpectedRefusal,
+                "relay_topology_unsupported",
+                "relay endpoints, traffic and publication ids need the relay process",
+            )),
+        }
+    }
     pub async fn publication_cursor(&self) -> Result<usize, SubjectError> {
         match self {
             Self::Local(c) => Ok(c.publication_cursor().await),
@@ -238,7 +271,9 @@ impl ProxyBackend {
 }
 pub(super) struct RelayServer {
     _relay: LocalRelay,
-    proxy: crate::relay_fault_proxy::RelayFaultProxy,
+    // Two endpoints over one retained store: every event is held by both.
+    // The first is the default endpoint and the only one interrupted.
+    proxies: [crate::relay_fault_proxy::RelayFaultProxy; 2],
     control: RelayControl,
     events: RelayActionEvents,
 }
@@ -255,12 +290,14 @@ impl RelayServer {
             .strip_prefix("ws://")
             .and_then(|s| s.trim_end_matches('/').parse().ok())
             .ok_or_else(|| WireError::environment("app_relay_address_invalid"))?;
-        let proxy = crate::relay_fault_proxy::RelayFaultProxy::start(upstream)
-            .await
-            .map_err(|_| WireError::environment("app_relay_proxy_failed"))?;
+        let proxy = move || async move {
+            crate::relay_fault_proxy::RelayFaultProxy::start(upstream)
+                .await
+                .map_err(|_| WireError::environment("app_relay_proxy_failed"))
+        };
         Ok(Self {
             _relay: relay,
-            proxy,
+            proxies: [proxy().await?, proxy().await?],
             control,
             events: Default::default(),
         })
@@ -274,10 +311,26 @@ impl RelayServer {
             serde_json::to_value(v).map_err(|_| WireError::environment("app_process_result_encode"))
         }
         match method {
-            "initialize" => encode(self.proxy.url()),
+            "initialize" => encode(self.proxies[0].url()),
+            "relay_urls" => encode(self.proxies.each_ref().map(|proxy| proxy.url())),
+            "traffic" => {
+                let (since, events): (Vec<u64>, bool) = decode(args)?;
+                let first = |index: usize| since.get(index).copied().unwrap_or(0);
+                let traffic =
+                    |index: usize| self.proxies[index].traffic_since(first(index), events);
+                encode([0, 1].map(traffic))
+            }
             "close" => encode(()),
             "cursor" => encode(self.control.publication_cursor().await),
             "publications" => encode(self.control.diagnostic_publications().await),
+            "publication_ids" => encode(
+                self.control
+                    .diagnostic_publications()
+                    .await
+                    .iter()
+                    .map(|event| (event.id.to_hex(), event.kind.as_u16()))
+                    .collect::<Vec<_>>(),
+            ),
             "wait" => {
                 let (
                     mode,
@@ -335,7 +388,7 @@ impl RelayServer {
                     return Err(WireError::environment("app_relay_outage_invalid"));
                 }
                 encode(
-                    self.proxy
+                    self.proxies[0]
                         .interrupt(Duration::from_millis(millis))
                         .await
                         .map_err(|_| WireError::environment("app_relay_interrupt_failed"))?,

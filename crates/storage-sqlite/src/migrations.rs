@@ -194,6 +194,8 @@ mod migration_0093_recovery_route_snapshot;
 mod migration_0094_qualified_stall_observations;
 #[path = "migrations/0095_recovery_comparison.rs"]
 mod migration_0095_recovery_comparison;
+#[path = "migrations/0096_account_delivery_spill.rs"]
+mod migration_0096_account_delivery_spill;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -684,6 +686,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 95,
         name: "0095_recovery_comparison",
         apply: migration_0095_recovery_comparison::apply,
+    },
+    Migration {
+        version: 96,
+        name: "0096_account_delivery_spill",
+        apply: migration_0096_account_delivery_spill::apply,
     },
 ];
 

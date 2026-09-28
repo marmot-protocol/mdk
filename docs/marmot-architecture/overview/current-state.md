@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-25
+updated: 2026-09-27
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -19,15 +19,15 @@ status: overview
 
 # Current State — Implementations & Spec
 
-The Nostr relay-client boundary declares owned bounded acquisition and
-receiver-scoped notification-loss evidence. The production SDK client now uses
-the qualified rust-nostr fork for bounded history requests and account-scoped
-loss watches; the recovery owner and account worker still use their existing
-production execution path. A controlled exact-ID group-recovery path now
-acquires history outside the account worker and admits it through that worker,
-but its private activation switch defaults off pending integrated SDK-session
-qualification.
-See [the interface contract](nostr-bounded-acquisition-interface.md).
+On master, one durable recovery owner (#1946) authorizes account-history acquisition for startup, receive,
+maintenance, convergence and explicit repair; its coalesced demand and retry pacing survive reopen, and EOSE alone never
+counts as coverage. NIP-77 route comparison keeps a durable per-route replay cursor and fetches missing IDs under fixed
+budgets. Eligible comparisons for startup, maintenance, scheduled convergence, ordinary receive and a selected online
+EpochGap run their SDK request off the account worker under two process-wide credits; the worker keeps activation,
+admission and settlement. Explicit catch-up and account-wide overflow still wait inline. The exact-ID worker path over
+the [bounded acquisition interface](nostr-bounded-acquisition-interface.md) stays behind a private switch that defaults
+off. A v2 redesign is in progress: a durable overflow spill, one execution path for every cause and tiered completion.
+See [account history recovery](../further-context/account-recovery.md).
 
 C6a resolves accepted kind-1009 edits in the durable timeline once, sharing effective text with reply and chat-list
 previews. Compact metadata is part of native conversation rows; accepted edit history is a separate paged query.
@@ -112,19 +112,6 @@ Legacy permanent markers migrate to a cutoff at migration time. Ordinary `delete
 membership and permits fresh messages to recreate the chat. The Rust runtime, UniFFI (`forgetGroupLocal` in Swift), and C expose forgetting; hosts
 must close group views/subscriptions and clear host-owned media caches. Existing published or already in-flight
 network traffic cannot be recalled. Transport cleanup failures retry without undoing the committed local deletion.
-
-One durable owner now authorizes account-history acquisition from startup, receive, maintenance, convergence and
-explicit repair. Coalesced demand keeps independent completion predicates and shared retry eligibility across reopen.
-Full-history repair retains one activation across checkpointed work quanta, with a 60-second cooperative overall
-budget and safe-boundary cancellation. EOSE alone is not qualified history coverage; the current SDK reports honest
-incomplete outcomes. Loss retirement requires qualified admission and an exact live acknowledgment, with cursor
-safety and durable debt preserved on failure. Snapshot reads can run during the wait; mutations retain account FIFO
-ordering. Eligible owner-selected comparisons from periodic maintenance, scheduled convergence
-and ordinary receive suspend only the SDK request in the shared worker job; startup, explicit
-catch-up, account-wide overflow and other waits retain their separate inline paths. The broader
-nonblocking acquisition and scheduling program belongs to #1947.
-See the [owner integration ledger](../further-context/account-recovery-integration.md) for the acceptance matrix,
-same-schema conservative mode, coordinated migration landing and approved unresolved-watermark retention exception.
 
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must
@@ -220,17 +207,6 @@ MDK now persists a per-group frozen convergence pass around that selector. The p
 one-second selection-relevant quiescence window and five-second absolute cap, resumes safely across restart, resolves
 only its digest-bound membership set, and uses independent runtime deadlines so traffic in one group cannot postpone
 another group.
-
-Relay reconciliation replay progress is owned by each account's encrypted route state. It survives
-subscription rebuilds and empty or failed comparisons, and advances before fetch I/O independently
-of admitted event inventory. Retired routes are counted separately from reconciliation failures.
-The SDK requires a route-scoped progress store instead of evicting cursors from a shared cache;
-see [reconciliation progress ownership](../../../crates/transport-nostr-adapter/README.md#reconciliation-progress-ownership).
-The account worker can resume its command loop while an eligible scheduled post-convergence
-comparison waits on the relay; it joins and settles the same owner grant after the SDK request.
-See [post-convergence comparison resume](../further-context/recovery-post-convergence-comparison-resume.md).
-The ordinary receive tail can use the same job after its claimed delivery is durable and visible;
-see [receive comparison resume](../further-context/recovery-receive-comparison-resume.md).
 
 ## Protocol implementations
 

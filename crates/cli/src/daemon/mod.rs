@@ -245,7 +245,12 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
                 let subscription_limiter = subscription_limiter.clone();
                 worker_tasks.push(tokio::spawn(async move {
                     let _permit = permit;
-                    handle_daemon_connection(
+                    // Bound the spawned future's layout at the connection
+                    // handler; test-codegen otherwise exceeds rustc's query
+                    // depth while laying out this daemon accept-loop branch.
+                    let connection: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = ()> + Send>,
+                    > = Box::pin(handle_daemon_connection(
                         stream,
                         defaults,
                         state,
@@ -253,8 +258,8 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
                         workers,
                         shutdown_tx,
                         subscription_limiter,
-                    )
-                    .await;
+                    ));
+                    connection.await;
                 }));
             }
             _ = shutdown_rx.recv() => {

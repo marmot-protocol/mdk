@@ -30,13 +30,14 @@ use super::conversation_window::{
 use super::{
     MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
-    wait_for_runtime_shutdown,
+    runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::recovery::AttemptGrant;
 use crate::client::{
-    ComparisonNetworkJob, CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish,
-    PreparedGroupImageUploadStart,
+    ComparisonNetworkJob, ComparisonNetworkResult, CompletedWelcomeDeliveryRecovery,
+    EncryptedMediaUploadFinish, EpochGapQueueJob, OnlineEpochGapRecovery,
+    PreparedGroupImageUploadStart, RouteSubmission,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -77,10 +78,66 @@ struct ComparisonRecoveryJob {
     origin: ComparisonRecoveryOrigin,
 }
 
+struct OnlineEpochGapJob {
+    recovery: Option<OnlineEpochGapRecovery>,
+    network: Option<ComparisonNetworkJob>,
+    queue: Option<EpochGapQueueJob>,
+    credit: Option<Arc<OwnedSemaphorePermit>>,
+    submissions: Vec<RouteSubmission>,
+    observation: Option<crate::product_analytics::ProductObservation>,
+    backfill_armed: bool,
+    audit_tracker_update: bool,
+    retry_push_registration: bool,
+}
+
+enum OnlineEpochGapIoCompletion {
+    Network(Result<(OwnedSemaphorePermit, ComparisonNetworkResult), tokio::task::JoinError>),
+    Queue(Result<Vec<RouteSubmission>, tokio::task::JoinError>),
+}
+
+impl OnlineEpochGapJob {
+    fn waiting(&self) -> bool {
+        self.network.is_some() || self.queue.is_some()
+    }
+
+    async fn wait_io(&mut self) -> OnlineEpochGapIoCompletion {
+        if let Some(network) = self.network.as_mut() {
+            OnlineEpochGapIoCompletion::Network(network.wait().await)
+        } else {
+            OnlineEpochGapIoCompletion::Queue(
+                self.queue
+                    .as_mut()
+                    .expect("online queue exists")
+                    .wait()
+                    .await,
+            )
+        }
+    }
+}
+
+/// The initial sync can return the same frozen comparison grant to its worker
+/// while the immutable SDK request runs. The live client stays with the worker
+/// until the bounded result is admitted and the startup summary is finished.
+enum StartupSyncStep {
+    Complete(SyncSummary),
+    Network {
+        grant: Box<AttemptGrant>,
+        subscription_attempt: SubscriptionAttempt,
+        network: ComparisonNetworkJob,
+    },
+}
+
+type StartupSyncContinuation<'a> =
+    Pin<Box<dyn Future<Output = Option<Result<SyncSummary, ClassifiedSyncFailure>>> + Send + 'a>>;
+
 enum PendingComparisonExecution {
     Offloaded {
         grant: Box<AttemptGrant>,
         subscription_attempt: SubscriptionAttempt,
+        network: ComparisonNetworkJob,
+    },
+    OnlineEpochGap {
+        recovery: Box<OnlineEpochGapRecovery>,
         network: ComparisonNetworkJob,
     },
     Inline(Result<EpochBackfillRunOutcome, AppError>),
@@ -540,6 +597,10 @@ impl AccountWorkerCommand {
         )
     }
 
+    fn allowed_during_online_epoch_gap(&self) -> bool {
+        self.readable_during_comparison_catch_up() || matches!(self, Self::SendMessage { .. })
+    }
+
     fn needs_media_slot(&self) -> bool {
         match self {
             Self::UploadPreparedGroupImage { .. }
@@ -578,6 +639,108 @@ enum DeferredStartupCommand {
     /// A `CatchUp` coalesced onto the initial catch-up, fulfilled with its
     /// result at this position in the sequence.
     CatchUp(oneshot::Sender<Result<(), AccountCatchUpFailure>>),
+}
+
+/// The original startup command policy applies during both the initial sync
+/// future and its off-worker comparison wait. Snapshot reads remain available;
+/// mutations and catch-up keep their arrival order in `deferred`. If snapshot
+/// capture failed after readiness, reads join that FIFO and use live state
+/// after catch-up rather than guessing from an incomplete snapshot.
+fn handle_startup_sync_command(
+    command: AccountWorkerCommand,
+    read_snapshot: Option<&crate::client::GroupReadSnapshot>,
+    deferred: &mut Vec<DeferredStartupCommand>,
+    setup_key_package_result: &mut Option<Result<usize, AppError>>,
+    app: &MarmotApp,
+    account_label: &str,
+) {
+    match command {
+        AccountWorkerCommand::Members { group_id, respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(snapshot.members(&group_id));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::Members { group_id, respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(snapshot.member_ids_page(&group_ids));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::MemberIdsPage { group_ids, respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::CaptureConversation {
+            respond, queued, ..
+        } => {
+            if let Some(queued) = queued {
+                queued.finish(TelemetryOutcome::NotReady);
+            }
+            let _ = respond.send(Err(ConversationWindowError::NotReady));
+        }
+        AccountWorkerCommand::GroupMlsState { group_id, respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(snapshot.group_mls_state(&group_id));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::GroupMlsState { group_id, respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::GroupRoster { group_id, respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(group_roster_from_snapshot(
+                    app,
+                    account_label,
+                    snapshot,
+                    &group_id,
+                ));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::GroupRoster { group_id, respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::QuarantinedGroups { respond } => {
+            if let Some(snapshot) = read_snapshot {
+                let _ = respond.send(Ok(snapshot.quarantined_groups()));
+            } else {
+                deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::QuarantinedGroups { respond },
+                )));
+            }
+        }
+        AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
+            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+        }
+        AccountWorkerCommand::DeclineGroupRejoin { respond, .. } => {
+            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+        }
+        AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
+            // Invite acceptance needs live group state and cannot run from a
+            // frozen snapshot while initial sync is still pending.
+            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+        }
+        AccountWorkerCommand::CatchUp { respond } => {
+            // Join the initial catch-up at this FIFO position; do not start a
+            // second acquisition while the startup grant is still owned.
+            deferred.push(DeferredStartupCommand::CatchUp(respond));
+        }
+        AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
+            match setup_key_package_result.take() {
+                Some(result) => {
+                    let _ = respond.send(result);
+                }
+                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
+                ))),
+            }
+        }
+        other => deferred.push(DeferredStartupCommand::Command(Box::new(other))),
+    }
 }
 
 /// Relay-only startup Welcome work. Dropping the worker aborts the task so no
@@ -705,6 +868,12 @@ async fn run_app_runtime_account_worker(
             .and_then(|target| {
                 (target.account_label == account_label).then(|| target.sink.clone())
             });
+        client.test_recovery_phase_witness = shared
+            .recovery_phase_witness
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(label, witness)| (label == &account_label).then(|| witness.clone()));
     }
     let mut scheduled_convergence = ScheduledConvergence::with_test_delay(
         convergence_settlement_delay(&app),
@@ -822,7 +991,12 @@ async fn run_app_runtime_account_worker(
     .await
     {
         StartupHydrationOutcome::Completed => {}
-        StartupHydrationOutcome::Shutdown => return,
+        StartupHydrationOutcome::Shutdown { explicit } => {
+            if explicit {
+                client.finish_audit_recording();
+            }
+            return;
+        }
     }
 
     // The snapshot answers read commands while the initial sync holds
@@ -860,17 +1034,19 @@ async fn run_app_runtime_account_worker(
 
     // Start signer installation, transport activation, group-subscription
     // registration, and initial catch-up only after local readiness has been
-    // signalled. The sync future holds `&mut client` for its whole lifetime, so
-    // while it is in flight the command loop must not touch the live session:
-    // read commands are answered from `read_snapshot`, invite acceptance gets
-    // a typed definitely-not-started busy response, and every other command is
-    // deferred and replayed on live state once catch-up lands, in arrival
-    // order. `CatchUp` requests that arrive during the initial sync are
-    // coalesced onto it.
+    // signalled. Until a comparison network job is selected, the sync future
+    // holds `&mut client`: read commands use `read_snapshot`, invite acceptance
+    // gets a typed definitely-not-started busy response, and other commands
+    // join the startup FIFO. During an off-worker comparison the worker can
+    // serve eligible live commands without passing ownership of `client` to
+    // the network job. Deferred commands replay in arrival order after catch-up.
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
+    let mut startup_explicit_shutdown = false;
     let startup_sync_result = {
-        let mut initial_sync = std::pin::pin!(async {
+        let mut initial_sync: Pin<
+            Box<dyn Future<Output = Result<StartupSyncStep, ClassifiedSyncFailure>> + Send + '_>,
+        > = Box::pin(async {
             #[cfg(any(test, feature = "test-policy-overrides"))]
             if let Some(barrier) = shared.take_next_startup_sync_barrier() {
                 // First acknowledge entry, then hold sync until the test has
@@ -878,121 +1054,306 @@ async fn run_app_runtime_account_worker(
                 barrier.wait().await;
                 barrier.wait().await;
             }
+            let mut credit =
+                bounded_recovery::try_acquire_recovery_credit(&shared.recovery_credit_pool());
+            let mut grant = client
+                .prepare_sync_grant(Some(&startup_stage_telemetry), false, credit.is_none())
+                .map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::StatePersist,
+                    )
+                })?;
+            #[cfg(test)]
+            let activity_witness = shared
+                .comparison_activity_witness
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|(label, witness)| (label == &account_label).then(|| witness.clone()));
+            if let Some(selected) = grant.as_ref()
+                && client
+                    .comparison_offload_eligible(selected)
+                    .unwrap_or(false)
+                && let Some(credit) = credit.take()
+            {
+                // An attempted activation has side effects even when it fails.
+                // Surface that first failure as the old inline startup did;
+                // falling through would issue a second subscription attempt
+                // and could publish local-ready sends before recovery.
+                let subscription_attempt = client
+                    .activate_comparison_grant(selected, Some(&startup_stage_telemetry))
+                    .await
+                    .map_err(|error| {
+                        ClassifiedSyncFailure::at_stage(
+                            SyncSummary::default(),
+                            error,
+                            SyncFailureStage::TransportActivation,
+                        )
+                    })?;
+                let network = ComparisonNetworkJob::start(
+                    &client,
+                    selected,
+                    credit,
+                    #[cfg(test)]
+                    activity_witness,
+                )
+                .map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::Unknown,
+                    )
+                })?;
+                return Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Network {
+                    grant: Box::new(grant.take().expect("selected startup grant")),
+                    subscription_attempt,
+                    network,
+                });
+            }
+            // A grant with no off-worker request keeps the same inline path,
+            // but must not hold a speculative process credit across its wait.
+            drop(credit.take());
             let summary = client
-                .sync_with_stage_telemetry(&startup_stage_telemetry, false)
+                .execute_prepared_sync(grant, Some(&startup_stage_telemetry), false)
                 .await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
-            Ok::<_, ClassifiedSyncFailure>(summary)
+            Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Complete(summary))
         });
         loop {
             tokio::select! {
-                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                _ = &mut shutdown => return,
-                result = &mut initial_sync => break result,
+                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                    startup_explicit_shutdown = runtime_shutdown_requested(&lifecycle_shutdown);
+                    break None;
+                }
+                stop = &mut shutdown => {
+                    startup_explicit_shutdown = stop.is_ok();
+                    break None;
+                }
+                result = &mut initial_sync => break Some(result),
                 command = commands.recv() => {
                     match command {
-                        None => return,
-                        Some(AccountWorkerCommand::Members { group_id, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(snapshot.members(&group_id));
-                                }
-                                // Degraded (capture failed): answer from live
-                                // state after catch-up instead of guessing.
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::Members { group_id, respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::MemberIdsPage { group_ids, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(snapshot.member_ids_page(&group_ids));
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::MemberIdsPage { group_ids, respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::CaptureConversation { respond, queued, .. }) => {
-                            // Frozen startup facts cannot be composed with newer account rows.
-                            if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
-                            let _ = respond.send(Err(ConversationWindowError::NotReady));
-                        }
-                        Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(snapshot.group_mls_state(&group_id));
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::GroupMlsState { group_id, respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::GroupRoster { group_id, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let result = group_roster_from_snapshot(
-                                        &app,
-                                        &account_label,
-                                        snapshot,
-                                        &group_id,
-                                    );
-                                    let _ = respond.send(result);
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::GroupRoster { group_id, respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::QuarantinedGroups { respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(Ok(snapshot.quarantined_groups()));
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::QuarantinedGroups { respond },
-                                ))),
-                            }
-                        }
-                        Some(AccountWorkerCommand::ConfirmGroupRejoin { respond, .. }) => {
-                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
-                        }
-                        Some(AccountWorkerCommand::DeclineGroupRejoin { respond, .. }) => {
-                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
-                        }
-                        Some(AccountWorkerCommand::AcceptGroupInvite { respond, .. }) => {
-                            // `initial_sync` owns `&mut client`, so the command
-                            // cannot start here. Report that fact explicitly
-                            // instead of retaining the oneshot behind an
-                            // unbounded catch-up.
-                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
-                        }
-                        Some(AccountWorkerCommand::CatchUp { respond }) => {
-                            // Coalesce onto the in-flight initial catch-up rather
-                            // than starting a second sync; fulfilled in arrival
-                            // order below when it completes.
-                            deferred.push(DeferredStartupCommand::CatchUp(respond));
-                        }
-                        Some(AccountWorkerCommand::PublishSetupKeyPackage { respond }) => {
-                            match setup_key_package_result.take() {
-                                Some(result) => {
-                                    let _ = respond.send(result);
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
-                                ))),
-                            }
-                        }
-                        Some(other) => {
-                            deferred.push(DeferredStartupCommand::Command(Box::new(other)))
-                        }
+                        None => break None,
+                        Some(command) => handle_startup_sync_command(
+                            command,
+                            read_snapshot.as_ref(),
+                            &mut deferred,
+                            &mut setup_key_package_result,
+                            &app,
+                            &account_label,
+                        ),
                     }
                 }
             }
         }
     };
+    let Some(startup_sync_result) = startup_sync_result else {
+        if startup_explicit_shutdown {
+            client.finish_audit_recording();
+        }
+        return;
+    };
+    // Keep the large command/receive continuation out of the enclosing
+    // worker's async state while the frozen network request is active.
+    let mut startup_sync_result = {
+        let continuation: StartupSyncContinuation<'_> = Box::pin(async {
+            Some(match startup_sync_result {
+                Ok(StartupSyncStep::Complete(summary)) => Ok(summary),
+                Ok(StartupSyncStep::Network {
+                    grant,
+                    subscription_attempt,
+                    mut network,
+                }) => {
+                    let completed = loop {
+                        tokio::select! {
+                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                                network.abort_and_wait().await;
+                                startup_explicit_shutdown = runtime_shutdown_requested(&lifecycle_shutdown);
+                                return None;
+                            }
+                            stop = &mut shutdown => {
+                                network.abort_and_wait().await;
+                                startup_explicit_shutdown = stop.is_ok();
+                                return None;
+                            }
+                            result = network.wait() => match result {
+                                Ok(value) => break Ok(value),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        target: "marmot_app::account_worker",
+                                        method = "startup_comparison",
+                                        error_kind = if error.is_panic() { "panic" } else { "cancelled" },
+                                        "comparison task ended before startup admission"
+                                    );
+                                    break Err(ClassifiedSyncFailure::at_stage(
+                                        SyncSummary::default(),
+                                        AppError::BlockingTask("startup comparison task failed".into()),
+                                        SyncFailureStage::Unknown,
+                                    ));
+                                }
+                            },
+                            received = client.receive_next_delivery() => {
+                                match received {
+                                    Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
+                                        // Once claimed, finish engine ingest and projection
+                                        // without cancellation by the network completion.
+                                        let delivery_started = Instant::now();
+                                        let receive_observation = shared.app_performance_telemetry()
+                                            .observe(RuntimeOp::WorkerReceive);
+                                        match client.ingest_received_delivery_with_partial(*delivery).await {
+                                            Ok(summary) => {
+                                                receive_observation.finish(TelemetryOutcome::Success);
+                                                shared.app_performance_telemetry().record(
+                                                    AppPerformanceOperation::InboundDeliveryProjection,
+                                                    delivery_started.elapsed(), true,
+                                                );
+                                                publish_app_runtime_summary_with_v5(&client,
+                                                    &events, &account_id_hex, &account_label, &summary,
+                                                );
+                                                publish_client_pending_projection_updates(
+                                                    &mut client, &events, &account_id_hex, &account_label,
+                                                );
+                                                start_post_join_history_after_visibility(
+                                                    &mut client, &summary, &events,
+                                                    &account_id_hex, &account_label,
+                                                ).await;
+                                                scheduled_runtime_group_subscription_refresh.observe_pending(
+                                                    client.has_pending_runtime_group_subscription_refresh(),
+                                                    &command_tx,
+                                                );
+                                                schedule_pending_convergence_groups(
+                                                    &mut scheduled_convergence, &mut client,
+                                                );
+                                                finish_receive_after_recovery(
+                                                    &mut client,
+                                                    ReceiveTailContext {
+                                                        events: &events,
+                                                        account_id_hex: &account_id_hex,
+                                                        account_label: &account_label,
+                                                        shared: &shared,
+                                                        scheduled_push_retry: &mut scheduled_push_retry,
+                                                        command_tx: &command_tx,
+                                                    },
+                                                    sync_summary_triggers_audit_tracker_update(&summary),
+                                                    !summary.joined_groups.is_empty(),
+                                                ).await;
+                                            }
+                                            Err(failure) => {
+                                                receive_observation.finish(TelemetryOutcome::Failure);
+                                                shared.app_performance_telemetry().record(
+                                                    AppPerformanceOperation::InboundDeliveryProjection,
+                                                    delivery_started.elapsed(), false,
+                                                );
+                                                network.abort_and_wait().await;
+                                                break Err(failure);
+                                            }
+                                        }
+                                    }
+                                    Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(_)) => {
+                                        // receive_next_delivery persisted the loss marker.
+                                        // This in-flight comparison cannot certify it;
+                                        // the fence check below will retain the debt.
+                                        publish_app_runtime_account_error(
+                                            &events, &account_id_hex, &account_label,
+                                            "account delivery overflow recovery incomplete".to_owned(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        network.abort_and_wait().await;
+                                        break Err(ClassifiedSyncFailure::at_stage(
+                                            SyncSummary::default(), error, SyncFailureStage::Unknown,
+                                        ));
+                                    }
+                                }
+                            }
+                            command = commands.recv() => {
+                                let Some(command) = command else {
+                                    network.abort_and_wait().await;
+                                    return None;
+                                };
+                                // Preserve the startup snapshot-read and busy-response
+                                // policy during the off-worker request. Mutations still
+                                // obey the deferred FIFO; only its head may use the
+                                // live client while the immutable network request runs.
+                                match command {
+                                    AccountWorkerCommand::GroupRecoveryStatus { group_id, respond }
+                                        if deferred.is_empty() => {
+                                        let _ = respond.send(group_recovery_after_hydration(&mut client, &group_id));
+                                    }
+                                    AccountWorkerCommand::SendMessage {
+                                        enqueued_at, queued, group_id, payload, respond,
+                                    } if deferred.is_empty() => {
+                                        send_message_on_worker(
+                                            &mut client, enqueued_at, queued, group_id, payload, respond,
+                                            &events, &account_id_hex, &account_label, &shared,
+                                            shared.product_analytics.permit(),
+                                        ).await;
+                                        publish_client_pending_applied_summary(
+                                            &mut client, &events, &account_id_hex, &account_label,
+                                        );
+                                    }
+                                    other => handle_startup_sync_command(
+                                        other,
+                                        read_snapshot.as_ref(),
+                                        &mut deferred,
+                                        &mut setup_key_package_result,
+                                        &app,
+                                        &account_label,
+                                    ),
+                                }
+                            }
+                        }
+                    };
+                    let result = match completed {
+                        Ok((credit, network_result)) => {
+                            let _credit = credit;
+                            client
+                                .finish_comparison_grant(
+                                    *grant,
+                                    subscription_attempt,
+                                    network_result,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    ClassifiedSyncFailure::at_stage(
+                                        std::mem::take(&mut client.pending_failed_sync_summary),
+                                        error,
+                                        SyncFailureStage::Unknown,
+                                    )
+                                })
+                        }
+                        Err(failure) => Err(failure),
+                    };
+                    let result = match result {
+                        Ok(
+                            EpochBackfillRunOutcome::Completed(summary)
+                            | EpochBackfillRunOutcome::Incomplete(summary),
+                        ) => client.finish_prepared_sync_summary(summary).await,
+                        Ok(
+                            EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending,
+                        ) => client.finish_deferred_comparison_sync().await,
+                        Err(failure) => Err(failure),
+                    };
+                    app.finish_client_open_network_maintenance(&mut client)
+                        .await;
+                    result
+                }
+                Err(failure) => Err(failure),
+            })
+        });
+        let Some(result) = continuation.await else {
+            if startup_explicit_shutdown {
+                client.finish_audit_recording();
+            }
+            return;
+        };
+        result
+    };
+    if let Err(failure) = &mut startup_sync_result {
+        client.drain_epoch_stall_escalations(&mut failure.partial_summary);
+    }
     shared.app_performance_telemetry().record_classified_result(
         AppPerformanceOperation::AccountSync,
         sync_started_at.elapsed(),
@@ -1003,7 +1364,13 @@ async fn run_app_runtime_account_worker(
     );
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
-            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+            publish_app_runtime_summary_with_v5(
+                &client,
+                &events,
+                &account_id_hex,
+                &account_label,
+                &summary,
+            );
             start_post_join_history_after_visibility(
                 &mut client,
                 &summary,
@@ -1020,6 +1387,7 @@ async fn run_app_runtime_account_worker(
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
+                &client,
                 &events,
                 &account_id_hex,
                 &account_label,
@@ -1052,7 +1420,13 @@ async fn run_app_runtime_account_worker(
             // failure remains retryable and is reported separately.
             match client.drain_pending_session_events().await {
                 Ok(summary) => {
-                    publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                    publish_app_runtime_summary_with_v5(
+                        &client,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &summary,
+                    );
                     start_post_join_history_after_visibility(
                         &mut client,
                         &summary,
@@ -1107,7 +1481,7 @@ async fn run_app_runtime_account_worker(
         })
         .collect::<VecDeque<_>>();
     // Skip only media waiting for capacity; retain FIFO order among the rest.
-    while let Some(index) = ready_command_index(&pending, &media_http, false) {
+    while let Some(index) = ready_command_index(&pending, &media_http, false, false) {
         let command = pending
             .remove(index)
             .expect("selected pending command exists");
@@ -1127,6 +1501,18 @@ async fn run_app_runtime_account_worker(
                     },
                 )
                 .await;
+            }
+            AccountWorkerCommand::PublishSetupKeyPackage { respond }
+                if setup_key_package_result.is_some() =>
+            {
+                // The durable setup lane may publish before background setup
+                // sends its worker command. Return that exact result even if
+                // the initial catch-up has already finished.
+                let _ = respond.send(
+                    setup_key_package_result
+                        .take()
+                        .expect("cached setup result"),
+                );
             }
             command => {
                 handle_account_worker_command(
@@ -1206,6 +1592,7 @@ async fn run_app_runtime_account_worker(
     let mut yield_to_convergence = false;
     let mut bounded_recovery: Option<bounded_recovery::Job> = None;
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
+    let mut online_epoch_gap: Option<OnlineEpochGapJob> = None;
     let mut yield_to_bounded_admission = false;
     let mut bounded_probe_at = TokioInstant::now();
     let mut bounded_prepare_error_reported = false;
@@ -1217,7 +1604,10 @@ async fn run_app_runtime_account_worker(
         let bounded_enabled = shared
             .bounded_group_recovery_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
-        if bounded_enabled && bounded_recovery.is_none() && TokioInstant::now() >= bounded_probe_at
+        if bounded_enabled
+            && bounded_recovery.is_none()
+            && online_epoch_gap.is_none()
+            && TokioInstant::now() >= bounded_probe_at
         {
             let now = TokioInstant::now();
             bounded_probe_at = now + bounded_recovery::PROBE_INTERVAL;
@@ -1259,17 +1649,213 @@ async fn run_app_runtime_account_worker(
                 }
             }
         }
-        let ready_command =
-            ready_command_index(&pending, &media_http, comparison_recovery.is_some());
+        if let Some(job) = online_epoch_gap.as_mut()
+            && job.network.is_none()
+        {
+            #[cfg(test)]
+            shared
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .push("online_drain_slice");
+            let admission_complete = job.queue.is_none();
+            let drained = client
+                .online_epoch_gap_drain_slice(
+                    job.recovery.as_mut().expect("online grant exists"),
+                    admission_complete,
+                )
+                .await;
+            if !matches!(drained, Ok(None)) {
+                let mut job = online_epoch_gap.take().expect("online drain exists");
+                if let Some(queue) = job.queue.take() {
+                    job.credit = Some(queue.abort_and_wait().await);
+                }
+                let recovery = job.recovery.take().expect("online grant exists");
+                let result = client
+                    .finish_online_epoch_gap(
+                        recovery,
+                        drained.map(|done| done.expect("terminal drain result")),
+                        std::mem::take(&mut job.submissions),
+                    )
+                    .await;
+                #[cfg(test)]
+                shared
+                    .comparison_test_trace
+                    .lock()
+                    .unwrap()
+                    .push("online_terminal");
+                finish_online_epoch_gap_receive(
+                    &mut client,
+                    job,
+                    result,
+                    ReceiveTailContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                        scheduled_push_retry: &mut scheduled_push_retry,
+                        command_tx: &command_tx,
+                    },
+                )
+                .await;
+                continue 'worker;
+            }
+        }
+        let ready_command = ready_command_index(
+            &pending,
+            &media_http,
+            comparison_recovery.is_some(),
+            online_epoch_gap.is_some(),
+        );
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                client.finish_audit_recording();
                 break 'worker;
             }
-            _ = &mut shutdown => {
+            stop = &mut shutdown => {
+                if stop.is_ok() {
+                    client.finish_audit_recording();
+                }
                 break 'worker;
             }
-            _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
+            _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() && online_epoch_gap.is_none() => {}
+            completed = async {
+                online_epoch_gap.as_mut().expect("online recovery exists").wait_io().await
+            }, if online_epoch_gap.as_ref().is_some_and(OnlineEpochGapJob::waiting) => {
+                match completed {
+                    OnlineEpochGapIoCompletion::Network(Ok((credit, network))) => {
+                        #[cfg(test)]
+                        shared
+                            .comparison_test_trace
+                            .lock()
+                            .unwrap()
+                            .extend(network.outcome_kinds_for_test());
+                        let job = online_epoch_gap.as_mut().expect("online network exists");
+                        job.network.take();
+                        match client
+                            .online_epoch_gap_network_stable(
+                                job.recovery.as_ref().expect("online grant exists"),
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                client.online_epoch_gap_start_drain(
+                                    job.recovery.as_mut().expect("online grant exists"),
+                                );
+                                job.queue = Some(EpochGapQueueJob::start(
+                                    &client,
+                                    network,
+                                    credit,
+                                    #[cfg(test)]
+                                    shared
+                                        .comparison_activity_witness
+                                        .lock()
+                                        .unwrap()
+                                        .as_ref()
+                                        .and_then(|(label, witness)| {
+                                            (label == &client.state.label).then(|| witness.clone())
+                                        }),
+                                ));
+                                #[cfg(test)]
+                                shared.comparison_test_trace.lock().unwrap().push("online_queue_started");
+                            }
+                            stable => {
+                                let mut job = online_epoch_gap.take().expect("online network exists");
+                                job.credit = Some(Arc::new(credit));
+                                let recovery = job.recovery.take().expect("online grant exists");
+                                let result = match stable {
+                                    Ok(false) => client.abandon_online_epoch_gap(recovery),
+                                    Err(error) => client.fail_online_epoch_gap(recovery, error).await,
+                                    Ok(true) => unreachable!(),
+                                };
+                                finish_online_epoch_gap_receive(
+                                    &mut client, job, result,
+                                    ReceiveTailContext {
+                                        events: &events, account_id_hex: &account_id_hex,
+                                        account_label: &account_label, shared: &shared,
+                                        scheduled_push_retry: &mut scheduled_push_retry,
+                                        command_tx: &command_tx,
+                                    },
+                                ).await;
+                            }
+                        }
+                    }
+                    OnlineEpochGapIoCompletion::Network(Err(error)) => {
+                        let mut job = online_epoch_gap.take().expect("online network exists");
+                        job.network.take();
+                        let recovery = job.recovery.take().expect("online grant exists");
+                        let result = client.fail_online_epoch_gap(
+                            recovery,
+                            AppError::BlockingTask(format!(
+                                "online recovery network task {}",
+                                if error.is_panic() { "panicked" } else { "cancelled" },
+                            )),
+                        ).await;
+                        finish_online_epoch_gap_receive(
+                            &mut client, job, result,
+                            ReceiveTailContext {
+                                events: &events, account_id_hex: &account_id_hex,
+                                account_label: &account_label, shared: &shared,
+                                scheduled_push_retry: &mut scheduled_push_retry,
+                                command_tx: &command_tx,
+                            },
+                        ).await;
+                    }
+                    OnlineEpochGapIoCompletion::Queue(Ok(submissions)) => {
+                        #[cfg(test)]
+                        {
+                            let (attempted, delivered) = submissions.iter().fold(
+                                (0usize, 0usize),
+                                |(attempted, delivered), route| {
+                                    let (route_attempted, route_delivered) =
+                                        route.delivery_counts_for_test();
+                                    (attempted + route_attempted, delivered + route_delivered)
+                                },
+                            );
+                            shared.comparison_test_trace.lock().unwrap().push(
+                                if attempted == 0 {
+                                    "online_queue_no_items"
+                                } else if delivered == 0 {
+                                    "online_queue_no_account_route"
+                                } else {
+                                    "online_queue_delivered"
+                                },
+                            );
+                        }
+                        let job = online_epoch_gap.as_mut().expect("online queue exists");
+                        job.credit = Some(job.queue.take().expect("online queue exists").into_credit());
+                        job.submissions = submissions;
+                    }
+                    OnlineEpochGapIoCompletion::Queue(Err(error)) => {
+                        let mut job = online_epoch_gap.take().expect("online queue exists");
+                        // wait_io already consumed this JoinHandle's result. The
+                        // owner still holds the credit after a failed task.
+                        job.credit = Some(job.queue.take().expect("online queue exists").into_credit());
+                        let recovery = job.recovery.take().expect("online grant exists");
+                        let result = client.fail_online_epoch_gap(
+                            recovery,
+                            AppError::BlockingTask(format!(
+                                "online recovery queue task {}",
+                                if error.is_panic() { "panicked" } else { "cancelled" },
+                            )),
+                        ).await;
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push("online_terminal");
+                        finish_online_epoch_gap_receive(
+                            &mut client, job, result,
+                            ReceiveTailContext {
+                                events: &events, account_id_hex: &account_id_hex,
+                                account_label: &account_label, shared: &shared,
+                                scheduled_push_retry: &mut scheduled_push_retry,
+                                command_tx: &command_tx,
+                            },
+                        ).await;
+                    }
+                }
+                continue 'worker;
+            }
+            _ = sleep(bounded_recovery::ADMISSION_YIELD_DELAY), if online_epoch_gap.as_ref().is_some_and(|job| job.network.is_none()) => {}
             completed = async {
                 comparison_recovery.as_mut().expect("comparison task exists").network.wait().await
             }, if comparison_recovery.is_some() => {
@@ -1306,8 +1892,14 @@ async fn run_app_runtime_account_worker(
                     }
                 };
                 let _ = report_pending_epoch_backfill_result(
+                    &client,
                     result, job.backfill_armed, job.observation,
-                    &events, &account_id_hex, &account_label, &shared,
+                    EpochBackfillReportContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
                 );
                 match job.origin {
                     ComparisonRecoveryOrigin::PeriodicMaintenance => {
@@ -1416,7 +2008,7 @@ async fn run_app_runtime_account_worker(
                     Some(command) => Some((command, true)),
                     None => commands.recv().await.map(|command| (command, false)),
                 }
-            }, if (!yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
+            }, if (online_epoch_gap.is_some() || !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
                 && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
                 yield_to_bounded_admission = true;
@@ -1430,6 +2022,16 @@ async fn run_app_runtime_account_worker(
                             && (matches!(command, AccountWorkerCommand::CatchUp { .. })
                                 || (pending.iter().any(|queued| {
                                     matches!(queued, AccountWorkerCommand::CatchUp { .. })
+                                }) && !command.readable_during_comparison_catch_up()))
+                        {
+                            pending.push_back(command);
+                            continue;
+                        }
+                        if online_epoch_gap.is_some()
+                            && !approved_pending
+                            && (!command.allowed_during_online_epoch_gap()
+                                || (pending.iter().any(|queued| {
+                                    !queued.allowed_during_online_epoch_gap()
                                 }) && !command.readable_during_comparison_catch_up()))
                         {
                             pending.push_back(command);
@@ -1464,6 +2066,13 @@ async fn run_app_runtime_account_worker(
                                     },
                                 )
                                 .await;
+                            }
+                            AccountWorkerCommand::PublishSetupKeyPackage { respond }
+                                if setup_key_package_result.is_some() =>
+                            {
+                                let _ = respond.send(
+                                    setup_key_package_result.take().expect("cached setup result"),
+                                );
                             }
                             command => {
                                 handle_account_worker_command(
@@ -1504,10 +2113,22 @@ async fn run_app_runtime_account_worker(
             }
             _ = scheduled_convergence.timer.as_mut(), if (!yield_to_bounded_admission
                 || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready))
+                && online_epoch_gap.is_none()
                 && !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
                 yield_to_bounded_admission = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
+                #[cfg(test)]
+                let target_epoch_before = shared
+                    .recovery_phase_witness
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|(label, witness)| {
+                        (label == &client.state.label && witness.is_target_group(&group_id))
+                            .then(|| client.local_epoch_for_group(&group_id))
+                            .flatten()
+                    });
                 let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
@@ -1533,7 +2154,13 @@ async fn run_app_runtime_account_worker(
                                 if lifecycle.is_stopping() { return; }
                                 match client.advance_convergence_after_runtime_sync(&group_id).await {
                                     Ok(summary) => {
-                                        publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                                        #[cfg(test)]
+                                        if let Some(before) = target_epoch_before
+                                            && client.local_epoch_for_group(&group_id).is_some_and(|after| after > before)
+                                        {
+                                            shared.comparison_test_trace.lock().unwrap().push("scheduled_target_epoch_advanced");
+                                        }
+                                        publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                                         // A pass that superseded one of this
                                         // device's own commits reports it
                                         // through the client's pending
@@ -1577,7 +2204,7 @@ async fn run_app_runtime_account_worker(
                                         let observation = backfill_armed.then(|| shared.product_analytics.begin(
                                             crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                                         )).flatten();
-                                        let backfill_result = if comparison_recovery.is_some() {
+                                        let backfill_result = if comparison_recovery.is_some() || online_epoch_gap.is_some() {
                                             Ok(EpochBackfillRunOutcome::Deferred)
                                         } else {
                                             match execute_pending_comparison_or_inline(
@@ -1602,16 +2229,20 @@ async fn run_app_runtime_account_worker(
                                                     return;
                                                 }
                                                 PendingComparisonExecution::Inline(result) => result,
+                                                PendingComparisonExecution::OnlineEpochGap { .. } => unreachable!("maintenance does not offload an online Receive grant"),
                                             }
                                         };
                                         let _ = report_pending_epoch_backfill_result(
+                                            &client,
                                             backfill_result,
                                             backfill_armed,
                                             observation,
-                                            &events,
-                                            &account_id_hex,
-                                            &account_label,
-                                            &shared,
+                                            EpochBackfillReportContext {
+                                                events: &events,
+                                                account_id_hex: &account_id_hex,
+                                                account_label: &account_label,
+                                                shared: &shared,
+                                            },
                                         );
                                         if audit_tracker_update {
                                             shared.schedule_audit_log_tracker_update("scheduled_convergence");
@@ -1661,7 +2292,7 @@ async fn run_app_runtime_account_worker(
                     let had_input = job.has_input();
                     match job.admit_one(&mut client).await {
                         Ok(summary) => {
-                            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                            publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                             publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
                             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
                             #[cfg(test)]
@@ -1702,7 +2333,7 @@ async fn run_app_runtime_account_worker(
                 && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready) => {
                 yield_to_bounded_admission = true;
             }
-            received = client.receive_next_delivery() => {
+            received = client.receive_next_delivery(), if online_epoch_gap.as_ref().is_none_or(|job| job.network.is_some()) => {
                 yield_to_bounded_admission = true;
                 #[cfg(test)]
                 if let Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) = &received
@@ -1755,7 +2386,7 @@ async fn run_app_runtime_account_worker(
                                 (Ok(summary), true)
                             }
                             Err(failure) => {
-                                publish_app_runtime_summary(
+                                publish_app_runtime_summary_with_v5(&client,
                                     &events,
                                     &account_id_hex,
                                     &account_label,
@@ -1778,7 +2409,7 @@ async fn run_app_runtime_account_worker(
                 match result {
                     Ok(summary) => {
                         reconnect_backoff.reset();
-                        publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                        publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                         // An inline convergence pass on a delivered rival can
                         // supersede one of this device's own commits; the
                         // report waits in the client's pending buffer and this
@@ -1823,7 +2454,7 @@ async fn run_app_runtime_account_worker(
                                 // A live job already owns this account's grant.
                                 // Keep this delivered message complete and let
                                 // that job settle the still-durable recovery debt.
-                                let backfill_result = if comparison_recovery.is_some() {
+                                let backfill_result = if comparison_recovery.is_some() || online_epoch_gap.is_some() {
                                     PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
                                 } else {
                                     execute_pending_comparison_or_inline(
@@ -1848,10 +2479,33 @@ async fn run_app_runtime_account_worker(
                                         });
                                         continue 'worker;
                                     }
+                                    PendingComparisonExecution::OnlineEpochGap {
+                                        recovery,
+                                        network,
+                                    } => {
+                                        online_epoch_gap = Some(OnlineEpochGapJob {
+                                            recovery: Some(*recovery),
+                                            network: Some(network),
+                                            queue: None,
+                                            credit: None,
+                                            submissions: Vec::new(),
+                                            observation,
+                                            backfill_armed,
+                                            audit_tracker_update,
+                                            retry_push_registration,
+                                        });
+                                        continue 'worker;
+                                    }
                                     PendingComparisonExecution::Inline(result) => {
                                         let _ = report_pending_epoch_backfill_result(
+                                            &client,
                                             result, backfill_armed, observation,
-                                            &events, &account_id_hex, &account_label, &shared,
+                                            EpochBackfillReportContext {
+                                                events: &events,
+                                                account_id_hex: &account_id_hex,
+                                                account_label: &account_label,
+                                                shared: &shared,
+                                            },
                                         );
                                     }
                                 }
@@ -1890,6 +2544,7 @@ async fn run_app_runtime_account_worker(
                         // backoff as well as before hydrating its replacement;
                         // this leaves room for a one-shot client during a
                         // prolonged transport outage.
+                        let transport_account = client.adapter.account_id().clone();
                         drop(client);
                         client = loop {
                             let reconnect_wait = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReconnectWait);
@@ -1969,7 +2624,12 @@ async fn run_app_runtime_account_worker(
                             let reopened_result = tokio::select! {
                                 _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
                                 _ = &mut shutdown => break 'worker,
-                                result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
+                                result = async {
+                                    // The reopened session registers a new signer,
+                                    // so retire the previous session's SDK context.
+                                    relay_plane.retire_account_session_transport(&transport_account).await;
+                                    app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()).await
+                                } => result,
                             };
                             reopen.finish_app(&reopened_result);
                             match reopened_result {
@@ -1986,6 +2646,14 @@ async fn run_app_runtime_account_worker(
                                             .and_then(|target| {
                                                 (target.account_label == account_label)
                                                     .then(|| target.sink.clone())
+                                            });
+                                        reopened.test_recovery_phase_witness = shared
+                                            .recovery_phase_witness
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .and_then(|(label, witness)| {
+                                                (label == &account_label).then(|| witness.clone())
                                             });
                                     }
                                     // A reconnect open is deferred like the
@@ -2016,8 +2684,16 @@ async fn run_app_runtime_account_worker(
                                     // required.
                                     let telemetry = shared.app_performance_telemetry();
                                     let prepare_transport = tokio::select! {
-                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
-                                        _ = &mut shutdown => break 'worker,
+                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                                            reopened.finish_audit_recording();
+                                            break 'worker;
+                                        }
+                                        stop = &mut shutdown => {
+                                            if stop.is_ok() {
+                                                reopened.finish_audit_recording();
+                                            }
+                                            break 'worker;
+                                        }
                                         result = reopened.prepare_transport_with_telemetry(Some(&telemetry)) => result,
                                     };
                                     if let Err(transport_err) = prepare_transport {
@@ -2037,7 +2713,7 @@ async fn run_app_runtime_account_worker(
                                         .await;
                                     match reopened.drain_pending_session_events().await {
                                         Ok(summary) => {
-                                            publish_app_runtime_summary(
+                                            publish_app_runtime_summary_with_v5(&reopened,
                                                 &events,
                                                 &account_id_hex,
                                                 &account_label,
@@ -2107,7 +2783,7 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
-            _ = tokio::time::sleep_until(local_submission_retry_at), if local_submission_due => {
+            _ = tokio::time::sleep_until(local_submission_retry_at), if local_submission_due && online_epoch_gap.is_none() => {
                 local_submission_due = false;
                 if let Ok(storage) = app.account_storage(&account_label)
                     && let Ok(Some(submission)) = storage.next_local_submission()
@@ -2180,7 +2856,7 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
-                if comparison_recovery.is_some() {
+                if comparison_recovery.is_some() || online_epoch_gap.is_some() {
                     continue 'worker;
                 }
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
@@ -2212,7 +2888,7 @@ async fn run_app_runtime_account_worker(
                     }
                     match catch_up {
                         Ok(Ok(summary)) => {
-                            publish_app_runtime_summary(
+                            publish_app_runtime_summary_with_v5(&client,
                                 &events,
                                 &account_id_hex,
                                 &account_label,
@@ -2238,7 +2914,7 @@ async fn run_app_runtime_account_worker(
                             );
                         }
                         Ok(Err(failure)) => {
-                            publish_sync_summary_with_audit(
+                            publish_sync_summary_with_audit(&client,
                                 &events,
                                 &account_id_hex,
                                 &account_label,
@@ -2305,10 +2981,18 @@ async fn run_app_runtime_account_worker(
                         continue 'worker;
                     }
                     PendingComparisonExecution::Inline(result) => result,
+                    PendingComparisonExecution::OnlineEpochGap { .. } => unreachable!("maintenance does not offload an online Receive grant"),
                 };
                 let _ = report_pending_epoch_backfill_result(
+                    &client,
                     backfill_result, backfill_armed,
-                    observation, &events, &account_id_hex, &account_label, &shared,
+                    observation,
+                    EpochBackfillReportContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
                 );
                 finish_periodic_maintenance_after_recovery(
                     &mut client,
@@ -2328,6 +3012,14 @@ async fn run_app_runtime_account_worker(
     if let Some(job) = comparison_recovery {
         job.network.abort_and_wait().await;
     }
+    if let Some(mut job) = online_epoch_gap {
+        if let Some(network) = job.network.take() {
+            network.abort_and_wait().await;
+        }
+        if let Some(queue) = job.queue.take() {
+            let _credit = queue.abort_and_wait().await;
+        }
+    }
 }
 
 /// Select one existing owner grant, then move only an eligible comparison's
@@ -2339,33 +3031,48 @@ async fn execute_pending_comparison_or_inline(
     seam: EpochBackfillExecutionSeam,
 ) -> PendingComparisonExecution {
     let mut credit = bounded_recovery::try_acquire_recovery_credit(&shared.recovery_credit_pool());
-    let selection =
-        if credit.is_none() && client.comparison_only_waiting_for_credit().unwrap_or(false) {
-            Ok(crate::client::PendingRecoverySelection::Deferred)
-        } else {
-            client.select_pending_epoch_backfill(seam)
-        };
+    let selection = if credit.is_none()
+        && (client.comparison_only_waiting_for_credit().unwrap_or(false)
+            || (seam == EpochBackfillExecutionSeam::Receive
+                && client.epoch_gap_only_waiting_for_credit().unwrap_or(false)))
+    {
+        Ok(crate::client::PendingRecoverySelection::Deferred)
+    } else {
+        client.select_pending_epoch_backfill(seam)
+    };
     match selection {
         Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
             let grant = *grant;
             let eligible =
                 credit.is_some() && client.comparison_offload_eligible(&grant).unwrap_or(false);
+            let online_epoch_gap = seam == EpochBackfillExecutionSeam::Receive
+                && credit.is_some()
+                && client.epoch_gap_offload_eligible(&grant).unwrap_or(false);
             #[cfg(test)]
             shared
                 .comparison_test_trace
                 .lock()
                 .unwrap()
-                .push(if eligible {
+                .push(if eligible || online_epoch_gap {
                     "grant_eligible"
                 } else {
                     "grant_inline"
                 });
             if eligible {
-                match client.activate_comparison_grant(&grant).await {
+                match client.activate_comparison_grant(&grant, None).await {
                     Ok(subscription_attempt) => match ComparisonNetworkJob::start(
                         client,
                         &grant,
                         credit.take().expect("offloaded grant owns credit"),
+                        #[cfg(test)]
+                        shared
+                            .comparison_activity_witness
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|(label, witness)| {
+                                (label == &client.state.label).then(|| witness.clone())
+                            }),
                     ) {
                         Ok(network) => {
                             #[cfg(test)]
@@ -2399,6 +3106,44 @@ async fn execute_pending_comparison_or_inline(
                             .push("activation_error");
                         PendingComparisonExecution::Inline(Err(error))
                     }
+                }
+            } else if online_epoch_gap {
+                match client.begin_online_epoch_gap(grant).await {
+                    Ok(recovery) => {
+                        #[cfg(test)]
+                        let activity_witness = shared
+                            .comparison_activity_witness
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|(label, witness)| {
+                                (label == &client.state.label).then(|| witness.clone())
+                            });
+                        match ComparisonNetworkJob::start(
+                            client,
+                            recovery.grant(),
+                            credit.take().expect("online grant owns credit"),
+                            #[cfg(test)]
+                            activity_witness,
+                        ) {
+                            Ok(network) => {
+                                #[cfg(test)]
+                                shared
+                                    .comparison_test_trace
+                                    .lock()
+                                    .unwrap()
+                                    .push("online_network_started");
+                                PendingComparisonExecution::OnlineEpochGap {
+                                    recovery: Box::new(recovery),
+                                    network,
+                                }
+                            }
+                            Err(error) => PendingComparisonExecution::Inline(
+                                client.fail_online_epoch_gap(recovery, error).await,
+                            ),
+                        }
+                    }
+                    Err(error) => PendingComparisonExecution::Inline(Err(error)),
                 }
             } else {
                 drop(credit.take());
@@ -2676,7 +3421,8 @@ async fn handle_account_worker_catch_up(
     };
     let result = match sync_result {
         Ok(summary) => {
-            publish_app_runtime_summary(
+            publish_app_runtime_summary_with_v5(
+                client,
                 context.events,
                 context.account_id_hex,
                 context.account_label,
@@ -2697,6 +3443,7 @@ async fn handle_account_worker_catch_up(
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
+                client,
                 context.events,
                 context.account_id_hex,
                 context.account_label,
@@ -2797,7 +3544,7 @@ const STARTUP_HYDRATION_COMMAND_BUDGET: usize = 8;
 
 enum StartupHydrationOutcome {
     Completed,
-    Shutdown,
+    Shutdown { explicit: bool },
 }
 
 /// Run one storage-only promotion transaction after account readiness.
@@ -2934,9 +3681,13 @@ async fn run_startup_hydration_pipeline(
                 tokio::select! {
                     _ = tokio::time::sleep_until(hold_until) => break,
                     _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-                        return StartupHydrationOutcome::Shutdown;
+                        return StartupHydrationOutcome::Shutdown {
+                            explicit: runtime_shutdown_requested(&lifecycle_shutdown),
+                        };
                     }
-                    _ = &mut *shutdown => return StartupHydrationOutcome::Shutdown,
+                    stop = &mut *shutdown => {
+                        return StartupHydrationOutcome::Shutdown { explicit: stop.is_ok() };
+                    }
                     command = commands.recv() => match command {
                         Some(command) => {
                             handle_startup_hydration_command(
@@ -2950,7 +3701,7 @@ async fn run_startup_hydration_pipeline(
                             )
                             .await;
                         }
-                        None => return StartupHydrationOutcome::Shutdown,
+                        None => return StartupHydrationOutcome::Shutdown { explicit: false },
                     },
                 }
             }
@@ -2973,16 +3724,21 @@ async fn run_startup_hydration_pipeline(
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return StartupHydrationOutcome::Shutdown;
+                    return StartupHydrationOutcome::Shutdown { explicit: false };
                 }
             }
         }
-        if !matches!(
-            shutdown.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ) || lifecycle.ensure_running().is_err()
-        {
-            return StartupHydrationOutcome::Shutdown;
+        match shutdown.try_recv() {
+            Ok(()) => return StartupHydrationOutcome::Shutdown { explicit: true },
+            Err(oneshot::error::TryRecvError::Closed) => {
+                return StartupHydrationOutcome::Shutdown { explicit: false };
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+        if lifecycle.ensure_running().is_err() {
+            return StartupHydrationOutcome::Shutdown {
+                explicit: runtime_shutdown_requested(&lifecycle_shutdown),
+            };
         }
         let progress = match client
             .runtime
@@ -3004,7 +3760,13 @@ async fn run_startup_hydration_pipeline(
         // hydration quarantines, restored leave requests) exactly as a live
         // drain would, so the projection updates incrementally.
         if let Ok(summary) = client.drain_pending_session_events().await {
-            publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+            publish_app_runtime_summary_with_v5(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &summary,
+            );
         }
         if progress.remaining == 0 {
             break;
@@ -3028,6 +3790,7 @@ async fn run_startup_hydration_pipeline(
 }
 
 fn finish_deferred_hydration_reconciliation(client: &mut AppClient) {
+    client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
     if let Err(err) = client.reconcile_hydrated_account_state() {
         tracing::warn!(
             target: "marmot_app::runtime",
@@ -3047,6 +3810,7 @@ pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(
             .session_mut()
             .hydrate_next_groups(&[], STARTUP_HYDRATION_BATCH_SIZE)?;
         if progress.remaining == 0 {
+            client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
             return client.reconcile_hydrated_account_state();
         }
         tokio::task::yield_now().await;
@@ -3362,6 +4126,7 @@ fn ready_command_index(
     pending: &VecDeque<AccountWorkerCommand>,
     media_http: &MediaHttpContext,
     comparison_waiting: bool,
+    online_epoch_gap_waiting: bool,
 ) -> Option<usize> {
     let has_capacity =
         !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
@@ -3372,10 +4137,21 @@ fn ready_command_index(
                 .position(|command| matches!(command, AccountWorkerCommand::CatchUp { .. }))
         })
         .flatten();
+    let online_barrier = online_epoch_gap_waiting
+        .then(|| {
+            pending
+                .iter()
+                .position(|command| !command.allowed_during_online_epoch_gap())
+        })
+        .flatten();
     pending.iter().enumerate().position(|(index, command)| {
-        (!comparison_waiting
-            || (deferred_catch_up.is_none_or(|barrier| index < barrier)
-                || command.readable_during_comparison_catch_up()))
+        (!online_epoch_gap_waiting
+            || (command.allowed_during_online_epoch_gap()
+                && (online_barrier.is_none_or(|barrier| index < barrier)
+                    || command.readable_during_comparison_catch_up())))
+            && (!comparison_waiting
+                || (deferred_catch_up.is_none_or(|barrier| index < barrier)
+                    || command.readable_during_comparison_catch_up()))
             && (has_capacity || !command.needs_media_slot())
     })
 }
@@ -3863,7 +4639,13 @@ fn account_worker_command_future<'a>(
             let sync_started_at = Instant::now();
             let result = match client.sync_with_classified_partial_progress().await {
                 Ok(summary) => {
-                    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    publish_app_runtime_summary_with_v5(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &summary,
+                    );
                     publish_client_pending_projection_updates(
                         client,
                         events,
@@ -3877,6 +4659,7 @@ fn account_worker_command_future<'a>(
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
+                        client,
                         events,
                         account_id_hex,
                         account_label,
@@ -3937,7 +4720,13 @@ fn account_worker_command_future<'a>(
             .await;
             let result = match repaired {
                 Ok(summary) => {
-                    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    publish_app_runtime_summary_with_v5(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &summary,
+                    );
                     publish_client_pending_projection_updates(
                         client,
                         events,
@@ -3951,6 +4740,7 @@ fn account_worker_command_future<'a>(
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
+                        client,
                         events,
                         account_id_hex,
                         account_label,
@@ -4289,7 +5079,8 @@ fn account_worker_command_future<'a>(
                     // consumers refresh and the group leaves the recovery
                     // surface and reappears as a normal chat.
                     match client.drain_pending_session_events().await {
-                        Ok(summary) => publish_app_runtime_summary(
+                        Ok(summary) => publish_app_runtime_summary_with_v5(
+                            client,
                             events,
                             account_id_hex,
                             account_label,
@@ -4852,46 +5643,20 @@ fn account_worker_command_future<'a>(
             payload,
             respond,
         } => Box::pin(async move {
-            if let Some(queued) = queued {
-                queued.finish(TelemetryOutcome::Success);
-            }
-            let execution = shared
-                .app_performance_telemetry()
-                .observe(RuntimeOp::SendExecution);
-            let send_started_at = Instant::now();
-            shared.app_performance_telemetry().record(
-                AppPerformanceOperation::OutboundMessageQueueWait,
-                enqueued_at.elapsed(),
-                true,
-            );
-            let mut first_projection = true;
-            client.send_telemetry = Some(shared.app_performance_telemetry());
-            let result = client
-                .send_with_local_projection(&group_id, &payload, |update| {
-                    if first_projection {
-                        shared.app_performance_telemetry().record(
-                            AppPerformanceOperation::OutboundMessageLocalProjection,
-                            enqueued_at.elapsed(),
-                            true,
-                        );
-                        first_projection = false;
-                    }
-                    publish_app_runtime_projection_update(
-                        events,
-                        account_id_hex,
-                        account_label,
-                        update,
-                    );
-                })
-                .await;
-            client.send_telemetry = None;
-            execution.finish_app(&result);
-            shared.app_performance_telemetry().record(
-                AppPerformanceOperation::OutboundMessageSend,
-                send_started_at.elapsed(),
-                result.is_ok(),
-            );
-            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            send_message_on_worker(
+                client,
+                enqueued_at,
+                queued,
+                group_id,
+                payload,
+                respond,
+                events,
+                account_id_hex,
+                account_label,
+                shared,
+                storage_permit,
+            )
+            .await;
             true
         }),
         AccountWorkerCommand::SendAppEvent {
@@ -5342,6 +6107,57 @@ fn group_recovery_after_hydration(
         .session_mut()
         .ensure_group_hydrated(group_id)?;
     client.group_recovery_status(group_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_message_on_worker(
+    client: &mut AppClient,
+    enqueued_at: Instant,
+    queued: Option<Observation>,
+    group_id: GroupId,
+    payload: Vec<u8>,
+    respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+    storage_permit: Option<crate::DiagnosticsPermit>,
+) {
+    if let Some(queued) = queued {
+        queued.finish(TelemetryOutcome::Success);
+    }
+    let execution = shared
+        .app_performance_telemetry()
+        .observe(RuntimeOp::SendExecution);
+    let send_started_at = Instant::now();
+    shared.app_performance_telemetry().record(
+        AppPerformanceOperation::OutboundMessageQueueWait,
+        enqueued_at.elapsed(),
+        true,
+    );
+    let mut first_projection = true;
+    client.send_telemetry = Some(shared.app_performance_telemetry());
+    let result = client
+        .send_with_local_projection(&group_id, &payload, |update| {
+            if first_projection {
+                shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::OutboundMessageLocalProjection,
+                    enqueued_at.elapsed(),
+                    true,
+                );
+                first_projection = false;
+            }
+            publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+        })
+        .await;
+    client.send_telemetry = None;
+    execution.finish_app(&result);
+    shared.app_performance_telemetry().record(
+        AppPerformanceOperation::OutboundMessageSend,
+        send_started_at.elapsed(),
+        result.is_ok(),
+    );
+    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
 }
 
 pub(super) fn group_roster_after_hydration(
@@ -5970,6 +6786,36 @@ async fn finish_receive_after_recovery(
     }
 }
 
+async fn finish_online_epoch_gap_receive(
+    client: &mut AppClient,
+    job: OnlineEpochGapJob,
+    result: Result<EpochBackfillRunOutcome, AppError>,
+    context: ReceiveTailContext<'_>,
+) {
+    // The job keeps its shared credit until reporting and the Receive tail
+    // have finished. No other account owner can adopt this grant meanwhile.
+    let _credit = job.credit;
+    let _ = report_pending_epoch_backfill_result(
+        client,
+        result,
+        job.backfill_armed,
+        job.observation,
+        EpochBackfillReportContext {
+            events: context.events,
+            account_id_hex: context.account_id_hex,
+            account_label: context.account_label,
+            shared: context.shared,
+        },
+    );
+    finish_receive_after_recovery(
+        client,
+        context,
+        job.audit_tracker_update,
+        job.retry_push_registration,
+    )
+    .await;
+}
+
 fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
     !summary.joined_groups.is_empty()
         || !summary.messages.is_empty()
@@ -6023,6 +6869,7 @@ async fn start_post_join_history_after_visibility(
 }
 
 fn publish_sync_summary_with_audit(
+    client: &AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
@@ -6030,7 +6877,7 @@ fn publish_sync_summary_with_audit(
     shared: &RuntimeSharedServices,
     audit_trigger: &'static str,
 ) {
-    publish_app_runtime_summary(events, account_id_hex, account_label, summary);
+    publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, summary);
     if sync_summary_triggers_audit_tracker_update(summary) {
         shared.schedule_audit_log_tracker_update(audit_trigger);
     }
@@ -6086,27 +6933,41 @@ async fn run_pending_epoch_backfill_reporting_arm(
         .flatten();
     let backfill_result = client.run_pending_epoch_backfill(seam).await;
     report_pending_epoch_backfill_result(
+        client,
         backfill_result,
         backfill_armed,
         observation,
-        events,
-        account_id_hex,
-        account_label,
-        shared,
+        EpochBackfillReportContext {
+            events,
+            account_id_hex,
+            account_label,
+            shared,
+        },
     )
+}
+
+struct EpochBackfillReportContext<'a> {
+    events: &'a broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &'a str,
+    account_label: &'a str,
+    shared: &'a RuntimeSharedServices,
 }
 
 /// A suspended comparison reports through the same product/runtime boundary
 /// after the worker has admitted its owned result and checkpointed the grant.
 fn report_pending_epoch_backfill_result(
+    client: &AppClient,
     backfill_result: Result<EpochBackfillRunOutcome, AppError>,
     backfill_armed: bool,
     observation: Option<crate::product_analytics::ProductObservation>,
-    events: &broadcast::Sender<MarmotAppEvent>,
-    account_id_hex: &str,
-    account_label: &str,
-    shared: &RuntimeSharedServices,
+    context: EpochBackfillReportContext<'_>,
 ) -> Result<(), AccountCatchUpFailure> {
+    let EpochBackfillReportContext {
+        events,
+        account_id_hex,
+        account_label,
+        shared,
+    } = context;
     if let Some(observation) = observation {
         observation.finish(match &backfill_result {
             Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
@@ -6125,7 +6986,13 @@ fn report_pending_epoch_backfill_result(
             EpochBackfillRunOutcome::Completed(summary)
             | EpochBackfillRunOutcome::Incomplete(summary),
         ) => {
-            publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+            publish_app_runtime_summary_with_v5(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &summary,
+            );
             Ok(())
         }
         Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending) => Ok(()),
@@ -6153,14 +7020,30 @@ fn report_pending_epoch_backfill_result(
     result
 }
 
+#[derive(Default)]
+struct RuntimeSummaryPublication {
+    attempted: u64,
+    accepted: u64,
+    no_subscribers: u64,
+}
+
 fn publish_app_runtime_summary(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
     summary: &SyncSummary,
-) {
+) -> RuntimeSummaryPublication {
+    let mut publication = RuntimeSummaryPublication::default();
+    let mut send = |event| {
+        publication.attempted += 1;
+        if events.send(event).is_ok() {
+            publication.accepted += 1;
+        } else {
+            publication.no_subscribers += 1;
+        }
+    };
     for group_id in &summary.joined_groups {
-        let _ = events.send(MarmotAppEvent::GroupJoined {
+        send(MarmotAppEvent::GroupJoined {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
             group_id: group_id.clone(),
@@ -6172,9 +7055,9 @@ fn publish_app_runtime_summary(
         // kind-1200 timeline row so timeline-only subscribers can discover and
         // watch the live stream.
         if let Some(event) = agent_stream_runtime_event(account_id_hex, account_label, message) {
-            let _ = events.send(event);
+            send(event);
         } else {
-            let _ = events.send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
                 account_id_hex: account_id_hex.to_owned(),
                 account_label: account_label.to_owned(),
                 message: message.clone(),
@@ -6182,21 +7065,21 @@ fn publish_app_runtime_summary(
         }
     }
     for update in &summary.projection_updates {
-        let _ = events.send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+        send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
             update: update.clone(),
         }));
     }
     for event in &summary.events {
-        let _ = events.send(MarmotAppEvent::GroupEvent(RuntimeGroupEvent {
+        send(MarmotAppEvent::GroupEvent(RuntimeGroupEvent {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
             event: event.clone(),
         }));
     }
     for escalation in &summary.epoch_stall_escalations {
-        let _ = events.send(MarmotAppEvent::EpochStallEscalated {
+        send(MarmotAppEvent::EpochStallEscalated {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
             group_id: escalation.group_id.clone(),
@@ -6204,6 +7087,68 @@ fn publish_app_runtime_summary(
             arms: escalation.arms,
         });
     }
+    publication
+}
+
+fn runtime_summary_message_ref(
+    summary: &SyncSummary,
+) -> Option<marmot_forensics::v5::EngineMessageRef> {
+    if summary.messages.len() == 1
+        && summary.joined_groups.is_empty()
+        && summary.epoch_stall_escalations.is_empty()
+    {
+        match summary.events.as_slice() {
+            [cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. }]
+                if hex::encode(message_id.as_slice())
+                    == summary.messages[0].source_message_id_hex =>
+            {
+                marmot_forensics::v5::EngineMessageRef::from_message_id(message_id.as_slice()).ok()
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn record_runtime_publication(
+    client: &AppClient,
+    category: marmot_forensics::v5::RuntimePublicationCategory,
+    message_ref: Option<marmot_forensics::v5::EngineMessageRef>,
+    publication: RuntimeSummaryPublication,
+) {
+    if publication.attempted == 0 || !client.audit_v5_enabled() {
+        return;
+    }
+    client.runtime.session().record_v5_event(
+        None,
+        marmot_forensics::v5::Event::RuntimePublicationOutcome(
+            marmot_forensics::v5::RuntimePublicationOutcome {
+                operation_ref: None,
+                message_ref,
+                category,
+                attempted: publication.attempted.into(),
+                accepted_by_broadcast: publication.accepted.into(),
+                no_subscribers: publication.no_subscribers.into(),
+            },
+        ),
+    );
+}
+
+fn publish_app_runtime_summary_with_v5(
+    client: &AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    summary: &SyncSummary,
+) {
+    let publication = publish_app_runtime_summary(events, account_id_hex, account_label, summary);
+    record_runtime_publication(
+        client,
+        marmot_forensics::v5::RuntimePublicationCategory::SyncSummary,
+        runtime_summary_message_ref(summary),
+        publication,
+    );
 }
 
 pub(super) fn publish_app_runtime_projection_update(
@@ -6211,12 +7156,14 @@ pub(super) fn publish_app_runtime_projection_update(
     account_id_hex: &str,
     account_label: &str,
     update: AppProjectionUpdate,
-) {
-    let _ = events.send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
-        account_id_hex: account_id_hex.to_owned(),
-        account_label: account_label.to_owned(),
-        update,
-    }));
+) -> bool {
+    events
+        .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            update,
+        }))
+        .is_ok()
 }
 
 fn publish_client_pending_projection_updates(
@@ -6225,9 +7172,21 @@ fn publish_client_pending_projection_updates(
     account_id_hex: &str,
     account_label: &str,
 ) {
+    let mut publication = RuntimeSummaryPublication::default();
     for update in client.take_pending_projection_updates() {
-        publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+        publication.attempted += 1;
+        if publish_app_runtime_projection_update(events, account_id_hex, account_label, update) {
+            publication.accepted += 1;
+        } else {
+            publication.no_subscribers += 1;
+        }
     }
+    record_runtime_publication(
+        client,
+        marmot_forensics::v5::RuntimePublicationCategory::ProjectionUpdate,
+        None,
+        publication,
+    );
     for group_id in client.pending_recovery_status_updates.drain() {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
     }
@@ -6259,7 +7218,7 @@ fn publish_client_pending_applied_summary(
     account_label: &str,
 ) {
     let summary = client.take_pending_applied_sync_summary();
-    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+    publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, &summary);
 }
 
 pub(crate) fn publish_app_runtime_group_state_updated(
@@ -6403,6 +7362,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[cfg(feature = "test-policy-overrides")]
+    mod integrated_recovery_acceptance_tests;
+    #[cfg(feature = "test-policy-overrides")]
+    mod online_epoch_gap_recovery_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod post_convergence_comparison_resume_tests;
     mod real_sdk_bounded_tests;
@@ -8753,42 +9716,46 @@ mod tests {
                     std::fs::read_to_string(file.path)
                         .unwrap()
                         .lines()
-                        .map(|line| serde_json::from_str(line).unwrap())
+                        .map(|line| {
+                            marmot_forensics::v5::Record::from_json(line.as_bytes())
+                                .expect("real v5 recovery row");
+                            serde_json::from_str(line).unwrap()
+                        })
                         .collect::<Vec<_>>()
                 })
                 .collect();
             let attempt_id = rows
                 .iter()
-                .find(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
-                .and_then(|row| row["context"]["operation_id"].as_str())
-                .expect("owner attempt must carry operation_id");
+                .find(|row| row["event"]["type"] == "epoch_stall_backfill_started")
+                .and_then(|row| row["event"]["record_context"]["operation_ref"].as_str())
+                .expect("owner attempt must carry operation_ref");
             assert_eq!(
                 rows.iter()
-                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_started")
+                    .filter(|row| row["event"]["type"] == "epoch_stall_backfill_started")
                     .count(),
                 1
             );
             assert_eq!(
                 rows.iter()
-                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_completed")
+                    .filter(|row| row["event"]["type"] == "epoch_stall_backfill_completed")
                     .count(),
                 usize::from(qualified)
             );
             assert!(
                 rows.iter()
-                    .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+                    .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
                     .count()
                     == usize::from(!qualified)
             );
             assert!(rows.iter().all(|row| {
                 !matches!(
-                    row["kind"]["type"].as_str(),
+                    row["event"]["type"].as_str(),
                     Some(
                         "epoch_stall_backfill_started"
                             | "epoch_stall_backfill_completed"
                             | "epoch_stall_backfill_failed"
                     )
-                ) || row["context"]["operation_id"].as_str() == Some(attempt_id)
+                ) || row["event"]["record_context"]["operation_ref"].as_str() == Some(attempt_id)
             }));
         }
     }
@@ -8849,14 +9816,18 @@ mod tests {
                 std::fs::read_to_string(file.path)
                     .unwrap()
                     .lines()
-                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .map(|line| {
+                        marmot_forensics::v5::Record::from_json(line.as_bytes())
+                            .expect("real v5 recovery row");
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()
+                    })
                     .collect::<Vec<_>>()
             })
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_failed")
+            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
             .collect();
         assert_eq!(failed_rows.len(), 1);
         assert_eq!(
-            failed_rows[0]["kind"]["activation_outcome"].as_str(),
+            failed_rows[0]["event"]["activation_outcome"].as_str(),
             Some("failed")
         );
         assert!(matches!(
@@ -9558,7 +10529,10 @@ mod tests {
             ..SyncSummary::default()
         };
 
-        publish_app_runtime_summary(&events, "account-id", "label", &summary);
+        let publication = publish_app_runtime_summary(&events, "account-id", "label", &summary);
+        assert_eq!(publication.attempted, 1);
+        assert_eq!(publication.accepted, 1);
+        assert_eq!(publication.no_subscribers, 0);
 
         assert_eq!(
             subscriber.try_recv().unwrap(),
@@ -9574,6 +10548,66 @@ mod tests {
             subscriber.try_recv().is_err(),
             "one escalation must publish exactly one event"
         );
+    }
+
+    #[test]
+    fn summary_publication_reports_no_subscriber_without_relabeling_app_commit() {
+        let (events, receiver) = broadcast::channel(4);
+        drop(receiver);
+        let summary = SyncSummary {
+            epoch_stall_escalations: vec![crate::EpochStallEscalation {
+                group_id: test_group_id(3),
+                stalled_epoch: 12,
+                arms: 3,
+            }],
+            ..SyncSummary::default()
+        };
+        let publication = publish_app_runtime_summary(&events, "account-id", "label", &summary);
+        assert_eq!(publication.attempted, 1);
+        assert_eq!(publication.accepted, 0);
+        assert_eq!(publication.no_subscribers, 1);
+    }
+
+    #[test]
+    fn runtime_summary_message_ref_requires_a_matching_typed_engine_event() {
+        let group_id = test_group_id(3);
+        let message_id = cgka_traits::MessageId::new(vec![0xabu8; 32]);
+        let mut summary = SyncSummary {
+            messages: vec![crate::ReceivedMessage {
+                authority: None,
+                message_id_hex: "cc".repeat(32),
+                source_message_id_hex: hex::encode(message_id.as_slice()),
+                sender: "sender".into(),
+                sender_display_name: None,
+                group_id: group_id.clone(),
+                source_epoch: 1,
+                retention: None,
+                plaintext: "test".into(),
+                kind: 1,
+                tags: Vec::new(),
+                recorded_at: 1,
+                received_at: 2,
+            }],
+            ..SyncSummary::default()
+        };
+        assert!(runtime_summary_message_ref(&summary).is_none());
+        summary
+            .events
+            .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                group_id,
+                message_id: message_id.clone(),
+                sender: cgka_traits::MemberId::new(vec![0x11; 32]),
+                epoch: cgka_traits::EpochId(1),
+                payload: Vec::new(),
+                retention: None,
+                authority: None,
+            });
+        assert_eq!(
+            runtime_summary_message_ref(&summary),
+            marmot_forensics::v5::EngineMessageRef::from_message_id(message_id.as_slice()).ok()
+        );
+        summary.messages[0].source_message_id_hex = "dd".repeat(32);
+        assert!(runtime_summary_message_ref(&summary).is_none());
     }
 
     #[test]

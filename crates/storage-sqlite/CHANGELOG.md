@@ -4,6 +4,11 @@
 
 ### Added
 
+- Add schema 0096 `account_delivery_spill`, the durable overflow tail of the in-memory account
+  delivery queue, with `spill_account_deliveries`, `spilled_account_deliveries` and
+  `remove_spilled_account_delivery`. Spilling skips deliveries already recorded in
+  `seen_events` unless their receipt was released for redelivery. (#1947)
+
 - Add qualified recovery scope checkpoints, independent completion predicates, exact loss
   acknowledgment guards and atomic inventory invalidation. Schema 0093 preserves existing
   demand/retry evidence and bounds serialized explicit-history callers to one row. This

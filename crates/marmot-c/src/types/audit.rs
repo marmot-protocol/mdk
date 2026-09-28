@@ -2,7 +2,8 @@
 
 use marmot_uniffi::conversions::{
     AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
-    AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi, AuditLogUploadSourceV4Ffi,
+    AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi, AuditLogUploadResultFfi,
+    AuditLogUploadSourceV4Ffi, AuditOtlpConfigV5Ffi, AuditOtlpTrackerResultV5Ffi,
 };
 
 use crate::MarmotStatus;
@@ -175,6 +176,55 @@ c_mirror! {
         copy enabled: bool,
         vec uploaded/uploaded_len: MarmotAuditLogUploadResult,
         opt_str skipped_reason,
+    }
+}
+
+c_mirror! {
+    /// Write-only v5 OTLP delivery configuration. Credentials are redacted in
+    /// the returned copy; the host owns the borrowed input strings.
+    MarmotAuditOtlpConfigV5 from AuditOtlpConfigV5Ffi,
+    free marmot_audit_otlp_config_v5_free {
+        copy enabled: bool,
+        opt_str destination,
+        opt_str endpoint,
+        opt_str authorization_bearer_token,
+        copy allow_loopback_dev: bool,
+    }
+}
+
+impl MarmotAuditOtlpConfigV5 {
+    /// # Safety
+    /// Optional fields must be valid NUL-terminated strings when non-NULL.
+    pub(crate) unsafe fn to_ffi(&self) -> Result<AuditOtlpConfigV5Ffi, MarmotStatus> {
+        Ok(AuditOtlpConfigV5Ffi {
+            enabled: c_bool(self.enabled as u8),
+            destination: unsafe { optional_str(self.destination) }?,
+            endpoint: unsafe { optional_str(self.endpoint) }?,
+            authorization_bearer_token: unsafe { optional_str(self.authorization_bearer_token) }?,
+            allow_loopback_dev: c_bool(self.allow_loopback_dev as u8),
+        })
+    }
+}
+
+c_mirror! {
+    /// Result of one v5 OTLP tracker pass.
+    MarmotAuditOtlpTrackerResultV5 from AuditOtlpTrackerResultV5Ffi {
+        copy accepted_batches: u64,
+        copy pending_accounts: u64,
+        copy blocked_accounts: u64,
+        copy idle_accounts: u64,
+        opt_str skipped_reason,
+    }
+}
+
+c_mirror! {
+    /// Additive tracker result with independent v4 and v5 outcomes.
+    MarmotAuditLogTrackerUpdateResultV5 from AuditLogTrackerUpdateResultV5Ffi,
+    free marmot_audit_log_tracker_update_result_v5_free {
+        copy enabled: bool,
+        vec v4_uploaded/v4_uploaded_len: MarmotAuditLogUploadResult,
+        opt_str v4_skipped_reason,
+        opt_rec v5: MarmotAuditOtlpTrackerResultV5,
     }
 }
 

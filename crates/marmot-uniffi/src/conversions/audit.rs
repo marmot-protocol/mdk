@@ -3,6 +3,7 @@
 use marmot_app::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, AuditLogUploadSource,
+    AuditOtlpTrackerResult,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -73,6 +74,82 @@ impl From<AuditLogTrackerUpdateResult> for AuditLogTrackerUpdateResultFfi {
             uploaded: value.uploaded.into_iter().map(Into::into).collect(),
             skipped_reason: value.skipped_reason,
         }
+    }
+}
+
+/// Additive result for v5-aware hosts; the historical result and C layout stay
+/// unchanged while the new result reports the OTLP path independently.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditLogTrackerUpdateResultV5Ffi {
+    pub enabled: bool,
+    pub v4_uploaded: Vec<AuditLogUploadResultFfi>,
+    pub v4_skipped_reason: Option<String>,
+    pub v5: Option<AuditOtlpTrackerResultV5Ffi>,
+}
+
+impl From<AuditLogTrackerUpdateResult> for AuditLogTrackerUpdateResultV5Ffi {
+    fn from(value: AuditLogTrackerUpdateResult) -> Self {
+        Self {
+            enabled: value.enabled,
+            v4_uploaded: value.uploaded.into_iter().map(Into::into).collect(),
+            v4_skipped_reason: value.skipped_reason,
+            v5: value.v5.map(Into::into),
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditOtlpTrackerResultV5Ffi {
+    pub accepted_batches: u64,
+    pub pending_accounts: u64,
+    pub blocked_accounts: u64,
+    pub idle_accounts: u64,
+    pub skipped_reason: Option<String>,
+}
+
+impl From<AuditOtlpTrackerResult> for AuditOtlpTrackerResultV5Ffi {
+    fn from(value: AuditOtlpTrackerResult) -> Self {
+        Self {
+            accepted_batches: value.accepted_batches,
+            pending_accounts: value.pending_accounts,
+            blocked_accounts: value.blocked_accounts,
+            idle_accounts: value.idle_accounts,
+            skipped_reason: value.skipped_reason,
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct AuditOtlpConfigV5Ffi {
+    pub enabled: bool,
+    pub destination: Option<String>,
+    pub endpoint: Option<String>,
+    pub authorization_bearer_token: Option<String>,
+    pub allow_loopback_dev: bool,
+}
+
+impl std::fmt::Debug for AuditOtlpConfigV5Ffi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditOtlpConfigV5Ffi")
+            .field("enabled", &self.enabled)
+            .field("destination", &self.destination)
+            .field("endpoint", &self.endpoint)
+            .field(
+                "authorization_bearer_token",
+                &self
+                    .authorization_bearer_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("allow_loopback_dev", &self.allow_loopback_dev)
+            .finish()
+    }
+}
+
+impl AuditOtlpConfigV5Ffi {
+    pub(crate) fn redacted(mut self) -> Self {
+        self.authorization_bearer_token = None;
+        self
     }
 }
 
@@ -212,5 +289,55 @@ mod tests {
             returned.endpoint.as_deref(),
             Some("https://goggles.example/upload")
         );
+    }
+
+    #[test]
+    fn v5_otlp_config_debug_and_result_never_echo_token() {
+        let config = AuditOtlpConfigV5Ffi {
+            enabled: true,
+            destination: Some("audit-gateway".to_owned()),
+            endpoint: Some("https://collector.example/v1/logs".to_owned()),
+            authorization_bearer_token: Some(TOKEN.to_owned()),
+            allow_loopback_dev: false,
+        };
+        assert!(!format!("{config:?}").contains(TOKEN));
+        let returned = config.redacted();
+        assert!(returned.authorization_bearer_token.is_none());
+        assert!(returned.enabled);
+    }
+
+    #[test]
+    fn legacy_tracker_result_keeps_v4_reason_regardless_of_v5_outcome() {
+        for v5 in [
+            AuditOtlpTrackerResult {
+                accepted_batches: 1,
+                ..Default::default()
+            },
+            AuditOtlpTrackerResult {
+                pending_accounts: 1,
+                ..Default::default()
+            },
+            AuditOtlpTrackerResult {
+                blocked_accounts: 1,
+                ..Default::default()
+            },
+        ] {
+            let result = AuditLogTrackerUpdateResult {
+                enabled: true,
+                uploaded: vec![],
+                skipped_reason: Some("audit log tracker authorization token missing".to_owned()),
+                v5: Some(v5.clone()),
+            };
+            let legacy: AuditLogTrackerUpdateResultFfi = result.clone().into();
+            assert_eq!(
+                legacy.skipped_reason.as_deref(),
+                Some("audit log tracker authorization token missing")
+            );
+            let versioned: AuditLogTrackerUpdateResultV5Ffi = result.into();
+            let versioned_v5 = versioned.v5.unwrap();
+            assert_eq!(versioned_v5.accepted_batches, v5.accepted_batches);
+            assert_eq!(versioned_v5.pending_accounts, v5.pending_accounts);
+            assert_eq!(versioned_v5.blocked_accounts, v5.blocked_accounts);
+        }
     }
 }

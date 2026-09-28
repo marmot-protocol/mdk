@@ -68,6 +68,9 @@ pub(super) struct EventSummary {
 pub(super) struct Init {
     pub root: std::path::PathBuf,
     pub relay_url: String,
+    /// Further endpoints of the same relay process.
+    #[serde(default)]
+    pub extra_relay_urls: Vec<String>,
     pub settlement_ms: Option<u64>,
     pub immediate_maintenance: bool,
     pub create_identity: bool,
@@ -229,7 +232,6 @@ impl ParticipantRuntime {
                 .map_err(WireError::app),
         }
     }
-    #[cfg(test)]
     pub async fn maintenance_status(
         &self,
         account: &str,
@@ -464,9 +466,12 @@ impl ParticipantServer {
         }
         fs_private::create_dir_all_private(&init.root)
             .map_err(|_| WireError::environment("app_process_root_failed"))?;
+        let relay_urls = std::iter::once(init.relay_url.clone())
+            .chain(init.extra_relay_urls.iter().cloned())
+            .collect::<Vec<_>>();
         let app = super::app_for_root(
             &init.root,
-            &init.relay_url,
+            &relay_urls,
             init.settlement_ms,
             init.immediate_maintenance
                 .then(marmot_account::MaintenanceTiming::immediate),
@@ -475,11 +480,11 @@ impl ParticipantServer {
         let setup: Result<String, WireError> = async {
             runtime.start().await?;
             let account = if init.create_identity {
-                let endpoint = cgka_traits::TransportEndpoint::from(init.relay_url);
+                let endpoints = super::relay_endpoints(&relay_urls);
                 runtime
                     .create_identity(marmot_app::AccountSetupRequest {
-                        default_relays: vec![endpoint.clone()],
-                        bootstrap_relays: vec![endpoint],
+                        default_relays: endpoints.clone(),
+                        bootstrap_relays: endpoints,
                         publish_missing_relay_lists: true,
                         publish_initial_key_package: true,
                         ..Default::default()

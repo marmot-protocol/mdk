@@ -26,6 +26,7 @@ mod process_backend;
 mod process_io;
 pub(crate) mod process_relay;
 mod process_server;
+pub use crate::relay_fault_proxy::{RelayEventDeliveryV1, RelayTrafficV1};
 pub(crate) use process_backend::{HistoryRepairOutcome, history_repair_outcome};
 use process_backend::{ParticipantApp, ParticipantRuntime};
 use process_relay::{ProxyBackend, RelayBackend};
@@ -162,6 +163,98 @@ pub struct ConcurrentMutationReport {
     pub admitted_publications: usize,
 }
 
+#[derive(Default)]
+struct Topology {
+    relay_pair: bool,
+    in_process: BTreeSet<String>,
+}
+
+/// Public runtime commands and committed projection reads for one
+/// participant, callable concurrently. It holds no private state.
+#[derive(Clone)]
+pub struct AppRuntimeProbe {
+    app: ParticipantApp,
+    runtime: ParticipantRuntime,
+    account_id: String,
+}
+
+impl AppRuntimeProbe {
+    /// Returns the number of relay publications the send reported.
+    pub async fn send_message(
+        &self,
+        group: &GroupId,
+        payload: &str,
+    ) -> Result<usize, SubjectError> {
+        let bytes = payload.as_bytes().to_vec();
+        let receipt = self
+            .runtime
+            .send_message(&self.account_id, group, bytes)
+            .await;
+        receipt.map(|receipt| receipt.published).map_err(app_error)
+    }
+
+    pub async fn group_recovery_status(
+        &self,
+        group: &GroupId,
+    ) -> Result<marmot_app::GroupRecoveryStatus, SubjectError> {
+        let status = self.runtime.group_recovery_status(&self.account_id, group);
+        status.await.map_err(app_error)
+    }
+
+    pub async fn epoch(&self, group: &GroupId) -> Result<u64, SubjectError> {
+        let state = self.runtime.group_mls_state(&self.account_id, group);
+        Ok(state.await.map_err(app_error)?.epoch)
+    }
+
+    /// Phases of the group's own-leaf maintenance obligations that may still
+    /// publish, as fixed labels; empty once maintenance has settled.
+    pub async fn open_maintenance(&self, group: &GroupId) -> Result<Vec<String>, SubjectError> {
+        use cgka_traits::maintenance::MaintenancePhase::{
+            Complete, Failed, SupersededByConvergence,
+        };
+        let status = self.runtime.maintenance_status(&self.account_id, group);
+        let obligations = status.await.map_err(app_error)?.obligations;
+        let open = obligations.iter().filter(|obligation| {
+            !matches!(
+                obligation.phase,
+                Complete | Failed | SupersededByConvergence
+            )
+        });
+        Ok(open
+            .map(|obligation| obligation.phase.as_str().to_owned())
+            .collect())
+    }
+
+    /// Group profile name and visible chat plaintexts (newest `limit`, in
+    /// timeline order), read from the committed projection.
+    pub async fn chat_view(
+        &self,
+        group: &GroupId,
+        limit: Option<usize>,
+    ) -> Result<(Option<String>, Vec<String>), SubjectError> {
+        let (app, account) = (self.app.clone(), self.account_id.clone());
+        let group_id_hex = hex::encode(group.as_slice());
+        let read = tokio::task::spawn_blocking(move || {
+            let name = app.group(&account, &group_id_hex)?.map(|g| g.profile.name);
+            let query = AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                kinds: None,
+                limit,
+            };
+            let chat = app
+                .messages_with_query(&account, query)?
+                .into_iter()
+                .filter(|m| {
+                    !m.invalidated && m.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                })
+                .map(|m| m.plaintext)
+                .collect();
+            Ok::<_, AppError>((name, chat))
+        });
+        read.await.map_err(environment_error)?.map_err(app_error)
+    }
+}
+
 struct Participant {
     app: ParticipantApp,
     runtime: Option<ParticipantRuntime>,
@@ -207,6 +300,10 @@ pub struct AppRuntimeHarness {
     stimulus_observations: Vec<crate::ScenarioStimulusObservation>,
     relay_control: RelayBackend,
     relay_url: String,
+    // Further endpoints of the same relay process, advertised to every participant.
+    extra_relay_urls: Vec<String>,
+    // Participants whose runtime lives in this process so probes can overlap.
+    in_process: BTreeSet<String>,
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
     active_scenario_group: Option<String>,
@@ -250,12 +347,34 @@ impl AppRuntimeHarness {
         settlement_quiescence_ms: Option<u64>,
         maintenance_timing: Option<MaintenanceTiming>,
     ) -> Result<Self, SubjectError> {
-        Self::new_with_execution(clients, settlement_quiescence_ms, maintenance_timing, true).await
+        Self::new_with_execution(
+            clients,
+            settlement_quiescence_ms,
+            maintenance_timing,
+            true,
+            Topology::default(),
+        )
+        .await
     }
 
     /// Explicit resource-contention/component diagnostic; acceptance defaults to processes.
     pub async fn new_in_process_stress(clients: &[String]) -> Result<Self, SubjectError> {
-        Self::new_with_execution(clients, None, None, false).await
+        Self::new_with_execution(clients, None, None, false, Topology::default()).await
+    }
+
+    /// Production-policy measurement layout: every participant uses both
+    /// endpoints of the relay process (one retained store, so each holds all
+    /// history), and `in_process` participants run in this process so
+    /// [`Self::probe`] calls can overlap. Everyone else keeps a process.
+    pub async fn new_with_relay_pair(
+        clients: &[String],
+        in_process: &[String],
+    ) -> Result<Self, SubjectError> {
+        let topology = Topology {
+            relay_pair: true,
+            in_process: in_process.iter().cloned().collect(),
+        };
+        Self::new_with_execution(clients, None, None, true, topology).await
     }
 
     async fn new_with_execution(
@@ -263,6 +382,7 @@ impl AppRuntimeHarness {
         settlement_quiescence_ms: Option<u64>,
         maintenance_timing: Option<MaintenanceTiming>,
         participant_processes: bool,
+        topology: Topology,
     ) -> Result<Self, SubjectError> {
         // Opt-in scheduling experiment; ordinary acceptance keeps its serial order.
         let catch_up_parallelism = match std::env::var("MDK_APP_CATCH_UP_PARALLELISM") {
@@ -278,6 +398,10 @@ impl AppRuntimeHarness {
         })?;
         let (relay_control, relay_fault_proxy, relay, relay_url) =
             RelayBackend::start(participant_processes).await?;
+        let mut relay_urls = vec![relay_url.clone()];
+        if topology.relay_pair {
+            relay_urls = relay_control.relay_urls().await?;
+        }
         let mut participants = BTreeMap::new();
         for client in clients {
             let root = tempfile::Builder::new()
@@ -287,10 +411,10 @@ impl AppRuntimeHarness {
             fs_private::create_dir_all_private(root.path()).map_err(environment_error)?;
             let (app, runtime, events, account_id) = make_participant(
                 root.path(),
-                &relay_url,
+                &relay_urls,
                 settlement_quiescence_ms,
                 maintenance_timing,
-                participant_processes,
+                participant_processes && !topology.in_process.contains(client),
                 true,
             )
             .await
@@ -323,7 +447,9 @@ impl AppRuntimeHarness {
             relay_fault_proxy,
             stimulus_observations: Vec::new(),
             relay_control,
+            extra_relay_urls: relay_urls.split_off(1),
             relay_url,
+            in_process: topology.in_process,
             participants,
             scenario_groups: BTreeMap::new(),
             active_scenario_group: None,
@@ -501,7 +627,45 @@ impl AppRuntimeHarness {
                 (label.clone(), pid)
             })
             .collect::<BTreeMap<_, _>>();
-        serde_json::json!({"schema_version":"1","execution":if self.participant_processes {"participant_processes"} else {"in_process_stress"},"coordinator_pid":std::process::id(),"relay_pid":self.relay_control.pid(),"participants":participants,"worker_threads_per_participant":if self.participant_processes {Some(4)} else {None},"catch_up_parallelism":self.catch_up_parallelism})
+        serde_json::json!({"schema_version":"1","execution":if self.participant_processes {"participant_processes"} else {"in_process_stress"},"coordinator_pid":std::process::id(),"relay_pid":self.relay_control.pid(),"participants":participants,"worker_threads_per_participant":if self.participant_processes {Some(4)} else {None},"catch_up_parallelism":self.catch_up_parallelism,"relay_endpoints":1 + self.extra_relay_urls.len(),"in_process_participants":self.in_process})
+    }
+
+    fn relay_urls(&self) -> Vec<String> {
+        std::iter::once(self.relay_url.clone())
+            .chain(self.extra_relay_urls.iter().cloned())
+            .collect()
+    }
+
+    /// Cloneable public-API handle for timing one participant's commands
+    /// alongside the scenario driver. Take a new probe after [`Self::reopen`].
+    pub fn probe(&self, client: &str) -> Result<AppRuntimeProbe, SubjectError> {
+        let participant = self.participant(client)?;
+        Ok(AppRuntimeProbe {
+            app: participant.app.clone(),
+            runtime: participant.runtime()?.clone(),
+            account_id: participant.account_id.clone(),
+        })
+    }
+
+    pub fn scenario_group_id(&self, label: &str) -> Result<GroupId, SubjectError> {
+        self.scenario_groups.get(label).cloned().ok_or_else(|| {
+            SubjectError::new("unknown_scenario_group", "scenario group was not created")
+        })
+    }
+
+    /// Per-endpoint wire traffic of connections from `since[i]` onward, with
+    /// the next connection index and, when `events`, per-event deliveries.
+    pub async fn relay_traffic(
+        &self,
+        since: &[u64],
+        events: bool,
+    ) -> Result<Vec<RelayTrafficV1>, SubjectError> {
+        self.relay_control.traffic(since, events).await
+    }
+
+    /// Admitted relay event ids and kinds, in admission order.
+    pub async fn relay_publication_ids(&self) -> Result<Vec<(String, u16)>, SubjectError> {
+        self.relay_control.publication_ids().await
     }
 
     pub async fn catch_up(&mut self, clients: &[String]) -> Result<(), SubjectError> {
@@ -692,10 +856,10 @@ impl AppRuntimeHarness {
     }
 
     pub async fn reopen(&mut self, client: &str) -> Result<(), SubjectError> {
-        let relay_url = self.relay_url.clone();
+        let relay_urls = self.relay_urls();
         let settlement_quiescence_ms = self.settlement_quiescence_ms;
         let maintenance_timing = self.maintenance_timing;
-        let participant_processes = self.participant_processes;
+        let participant_processes = self.participant_processes && !self.in_process.contains(client);
         let participant = self.participant_mut(client)?;
         if participant.online
             && let Some(runtime) = participant.runtime.take()
@@ -704,7 +868,7 @@ impl AppRuntimeHarness {
         }
         let (app, runtime, events, account_id) = make_participant(
             participant.root(),
-            &relay_url,
+            &relay_urls,
             settlement_quiescence_ms,
             maintenance_timing,
             participant_processes,
@@ -2318,7 +2482,7 @@ fn public_group_states_match(
 
 fn app_for_root(
     root: &Path,
-    relay_url: &str,
+    relay_urls: &[String],
     settlement_quiescence_ms: Option<u64>,
     maintenance_timing: Option<MaintenanceTiming>,
 ) -> MarmotApp {
@@ -2329,7 +2493,7 @@ fn app_for_root(
     if let Some(timing) = maintenance_timing {
         config = config.with_dev_maintenance_timing(timing);
     }
-    MarmotApp::with_relay_and_config(root, relay_url.to_owned(), config)
+    MarmotApp::with_relays_and_config(root, relay_urls.to_vec(), config)
 }
 
 pub(crate) fn public_protocol_projection(
@@ -2680,9 +2844,17 @@ fn walk_file_bytes(root: &Path) -> Vec<u64> {
     files
 }
 
+fn relay_endpoints(relay_urls: &[String]) -> Vec<TransportEndpoint> {
+    relay_urls
+        .iter()
+        .cloned()
+        .map(TransportEndpoint::from)
+        .collect()
+}
+
 async fn make_participant(
     root: &Path,
-    relay_url: &str,
+    relay_urls: &[String],
     settlement_ms: Option<u64>,
     maintenance: Option<MaintenanceTiming>,
     processes: bool,
@@ -2699,7 +2871,8 @@ async fn make_participant(
     if processes {
         let (app, runtime, account) = process_backend::remote_participant(process_backend::Init {
             root: root.to_path_buf(),
-            relay_url: relay_url.into(),
+            relay_url: relay_urls[0].clone(),
+            extra_relay_urls: relay_urls[1..].to_vec(),
             settlement_ms,
             immediate_maintenance: maintenance.is_some(),
             create_identity,
@@ -2707,15 +2880,15 @@ async fn make_participant(
         .await?;
         Ok((app, runtime, None, account))
     } else {
-        let app = app_for_root(root, relay_url, settlement_ms, maintenance);
+        let app = app_for_root(root, relay_urls, settlement_ms, maintenance);
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.start().await?;
         let account = if create_identity {
-            let endpoint = TransportEndpoint::from(relay_url.to_owned());
+            let endpoints = relay_endpoints(relay_urls);
             runtime
                 .create_identity(AccountSetupRequest {
-                    default_relays: vec![endpoint.clone()],
-                    bootstrap_relays: vec![endpoint],
+                    default_relays: endpoints.clone(),
+                    bootstrap_relays: endpoints,
                     publish_missing_relay_lists: true,
                     publish_initial_key_package: true,
                     ..Default::default()

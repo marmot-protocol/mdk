@@ -28,6 +28,11 @@ mod chat_list;
 mod chat_presentation;
 mod codec;
 mod connection;
+mod delivery_spill;
+pub use delivery_spill::{
+    DeliverySpillDisposition, DeliverySpillLimits, SpilledDelivery, SpilledDeliveryBatch,
+    SpilledDeliveryDeferral,
+};
 mod encrypted_media_secrets;
 mod local_submissions;
 mod message_drafts;

@@ -64,6 +64,47 @@ incomplete public runs. Investigation history and checkpoint provenance are reta
 unsafe diagnostic process exit while workers were writing. Maintained tests stop and join runtimes before asserting;
 no general production SQLCipher fix is claimed.
 
+## Large-account recovery scorecard
+
+`public_app_large_account_recovery_scorecard` (ignored, same file) measures recovery on the #1945 workload. It
+asserts only recovery correctness. One account, `bob`, belongs to 36 groups, one of them with 51 members; the other
+49 invitees only publish KeyPackages and stay offline. Alice owns four groups, and four senders own eight of the 32
+history groups each, so bob is the only account that holds all of about 11,000 kind-445 events. Bob retains them through
+live delivery.
+Every participant uses two endpoints of the relay process, and both serve one retained store, so each relay holds all
+history. One older profile commit in the `gap` group is hidden from both relays while bob retains the 40 later
+messages that need it. The commit is then restored, while both relays keep withholding those 40 messages for the
+rest of the run, so recovery can only use bob's retained copies. Bob cold-restarts while alice sends one message per
+second in a healthy group.
+
+The hard assertions: within 600 seconds the commit is applied and the later messages decrypt, and every gap chat
+message is present exactly once (presence, not order). `scorecard.json`
+under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
+
+- status command (`group_recovery_status`) and send latency p50/p95/max;
+- live-message visibility;
+- commit-applied and decrypted times;
+- per-relay bytes, and EVENT frames split into re-downloaded held history, novel events and the missing commit;
+- REQ/NEG-OPEN counts and public telemetry deltas;
+- a 60-second idle window.
+
+The public API exposes no recovery-attempt counter, so those counts are proxies. Targets (status and send p95 under
+500 ms, visibility p95 under 2 s, no held-history re-download, the commit fetched at most once per relay, no idle
+EVENTs) are evaluated but not enforced.
+
+Bob's runtime runs in the coordinator process so probes can overlap, because process RPC is serial. The relay and the
+other participants keep their own processes. Traffic comes from the relay proxy's WebSocket frames on connections
+opened after bob's restart. The nightly `public-app-catchup` job runs it as a report-only step.
+
+Every run also records its setup progress and whole-run relay totals, including failed runs. The totals cover
+connections, the side that closed each connection first, WebSocket close codes, and client/relay message verbs, with
+relay `OK` refusals counted separately. A setup that stalls still shows where it stopped and how the clients used the
+relays.
+
+Setup sends retry a `transport_closed` refusal, which happens while the sender's account worker reconnects, and only
+when the sender's own timeline lacks the message. The report counts those retries. The measured phase never retries:
+it counts failed status, send and live-send calls.
+
 ## First basic public journeys
 
 These tests use `AppRuntimeHarness`, which invokes `MarmotAppRuntime` over a real loopback Nostr relay and separate

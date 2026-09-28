@@ -31,6 +31,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     also selected by the dedicated required public recovery CI job with production policy.
     Real local relay, SQLCipher roots, exact public payload/state checks, post-change messaging, and restart
     persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.
+    `support/recovery_scorecard.rs` holds the report-only large-account recovery scorecard: it asserts
+    recovery correctness only and records latency, per-relay traffic and idle downloads in `scorecard.json`.
 
 - **File:** `app_runtime_interaction_journeys.rs`
   - **Owns:** Public app interaction journeys that the serialized generated families do not reach: two groups on

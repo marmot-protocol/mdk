@@ -27,7 +27,7 @@ relay auth, or transport-specific relay discovery.
 - `secret_store.rs` — `AccountSecretStore` trait with `LocalFileSecretStore` and `KeychainSecretStore`.
 - `keyring.rs` — platform keyring entry construction, iOS service versioning and secret writes, store init (per-OS
   `#[cfg]` cascade), and keyring-error mapping.
-- `io.rs` — JSON read/write helpers, private-file writes, and account-label validation.
+- `io.rs` — JSON read/write helpers, atomic private- and secret-file writes, and account-label validation.
 - `key_package.rs` — `KeyPackagePublisher` trait, `KeyPackagePublication`, and `NoopKeyPackagePublisher`.
 - `routing.rs` — `TransportRoutingPolicy` trait, `TransportRoutingError`, and `StaticTransportRouting`.
 - `runtime.rs` — `AccountDeviceRuntime` plus its effect aggregates (`AccountDeviceEffects`, `AccountIngestEffects`,
@@ -44,6 +44,11 @@ relay auth, or transport-specific relay discovery.
   transport adapter family rather than keeping it as a separate app-core-owned publisher.
 - Keep `AccountDeviceSession` as the owner of engine state.
 - Keep CLI account-selection ergonomics and relay-list repair out of this crate; those belong in `wn` and `marmot-app`.
+- Replace account-home files only through the `io.rs` writers, and never change a published file in place while a reader
+  can still open it. Owner-only files that hold no key material (setup journal and context, onboarding checkpoints) use
+  `write_private_json`/`write_private_bytes`. Only `write_secret_json` zeroes the inode it replaces, so read those files
+  with `read_secret_json`, which rejects a read of an unlinked inode. Readiness polls read the setup journal while
+  background setup rewrites it.
 - Confirm pending work only after the adapter reports enough acknowledgements.
 - Never let a durable maintenance record depend on an engine event alone. Engine events are in-memory, and this layer
   consumes them *after* awaiting the batch's relay publishes, so the loss window is network-wide. `GroupStateInvalidated`

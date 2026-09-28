@@ -84,7 +84,8 @@ successful decryption or engine readiness.
 **Merge gate:** this storage slice is stacked on #1983 and cannot ship independently.
 Runtime integration must replace competing dispatch/clear callers, provide qualified
 executor evidence and same-schema conservative handoff, and demonstrate bounded evidence
-reclamation under [the recovery design](../../docs/marmot-architecture/further-context/account-recovery-ownership.md).
+reclamation under the [#1946 ownership design](https://github.com/marmot-protocol/mdk/blob/9489bb091/docs/marmot-architecture/further-context/account-recovery-ownership.md)
+(in git history). The forward design is [account recovery](../../docs/marmot-architecture/further-context/account-recovery.md).
 That integration, runtime cancellation-by-drop, policy/stagnation migration 0094 and
 SDK/acquisition changes are outside this slice. Old binaries refuse the upgraded schema;
 binary downgrade requires a pre-upgrade backup. Storage tests do not claim that the

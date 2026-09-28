@@ -2,7 +2,7 @@
 //! file enumeration, HTTP upload, and audit-log path validation.
 //!
 //! The audit log is an opt-in, privacy-safe forensic measure recorded per
-//! account-device at `<account_dir>/audit-<engine_id>-v4.jsonl`. This module owns
+//! account-device at `<account_dir>/audit-<engine_id>-v5.jsonl`. This module owns
 //! the audit DTOs, the stable domain-separated hash identity derivation, the
 //! per-attempt pinned upload path, and the `MarmotApp` methods that drive
 //! recording, enumeration, validation, and upload.
@@ -33,6 +33,9 @@ mod legacy_cleanup;
 pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
 
 const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
+// The whole-file Goggles endpoint accepts the historical v4 contract only.
+// New v5 records use the separately configured, explicit OTLP delivery path.
+const GOGGLES_UPLOAD_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 /// Always-on, append-only per-account key-reveal audit log (mdk#543).
 /// The name matches the `audit-*.jsonl` glob so it is enumerable via
@@ -74,7 +77,19 @@ pub struct AuditLogUploadResult {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditLogTrackerUpdateResult {
     pub enabled: bool,
+    /// Historical whole-file v4 uploads to the Goggles endpoint.
     pub uploaded: Vec<AuditLogUploadResult>,
+    pub skipped_reason: Option<String>,
+    /// v5 OTLP delivery, present when a dedicated sender was configured.
+    pub v5: Option<AuditOtlpTrackerResult>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditOtlpTrackerResult {
+    pub accepted_batches: u64,
+    pub pending_accounts: u64,
+    pub blocked_accounts: u64,
+    pub idle_accounts: u64,
     pub skipped_reason: Option<String>,
 }
 
@@ -167,7 +182,7 @@ impl AuditUploadSnapshot {
             // before serde_json::Value could collapse duplicate object keys.
             let event = serde_json::from_slice::<marmot_forensics::AuditEvent>(line)
                 .map_err(|_| invalid_audit_upload())?;
-            if event.schema_version != marmot_forensics::AUDIT_LOG_SCHEMA_VERSION {
+            if event.schema_version != GOGGLES_UPLOAD_SCHEMA_VERSION {
                 return Err(invalid_audit_upload());
             }
             let value: serde_json::Value =
@@ -188,6 +203,38 @@ impl AuditUploadSnapshot {
 fn invalid_audit_upload() -> AppError {
     // Never expose schema validation errors: they can contain the rejected data.
     AppError::InvalidAuditLogFile("only valid v4 forensic audit records may be uploaded".into())
+}
+
+fn audit_v5_producer() -> marmot_forensics::v5::Producer {
+    use marmot_forensics::v5::{BuildProfile, Platform, Producer, Revision};
+    let platform = if cfg!(target_os = "ios") {
+        Platform::Ios
+    } else if cfg!(target_os = "macos") {
+        Platform::Macos
+    } else if cfg!(target_os = "android") {
+        Platform::Android
+    } else if cfg!(target_os = "linux") {
+        Platform::Linux
+    } else if cfg!(target_os = "windows") {
+        Platform::Windows
+    } else if cfg!(target_arch = "wasm32") {
+        Platform::Wasm
+    } else {
+        Platform::Other
+    };
+    Producer {
+        // Distribution builds may supply their exact source revision. Without
+        // one, record unknown rather than inventing a SHA-shaped value.
+        mdk_revision: option_env!("MDK_GIT_REVISION")
+            .and_then(|revision| Revision::try_from(revision.to_owned()).ok()),
+        build_profile: if cfg!(debug_assertions) {
+            BuildProfile::Debug
+        } else {
+            BuildProfile::Release
+        },
+        platform,
+        host_build: None,
+    }
 }
 
 /// What the tracker already did with one audit file.
@@ -546,7 +593,7 @@ impl MarmotApp {
         let account_dir = self.account_dir(label);
         let device_id = audit_device_id_hex(&account_dir)?;
         let engine_id = audit_engine_id_hex(&self.member_id(label)?, &device_id);
-        Ok(marmot_forensics::default_jsonl_path(
+        Ok(marmot_forensics::default_v5_jsonl_path(
             account_dir,
             &engine_id,
         ))
@@ -811,13 +858,14 @@ impl MarmotApp {
         // live-recorder match fail, so a delete would remove the visible file
         // while the recorder kept appending to the orphaned inode.
         let account_dir = fs::canonicalize(&account_dir).unwrap_or(account_dir);
-        // Start a distinct v4 file. Exclusive-root startup retires legacy files;
-        // any that survive cleanup still fail the upload gate.
-        let audit_path = marmot_forensics::default_jsonl_path(&account_dir, &engine_id_hex);
-        match marmot_forensics::JsonlRecorder::open_with_account_ref(
+        // Start a distinct v5 file. Exclusive-root startup retires v1-v3 files;
+        // historical v4 files remain available for explicit legacy upload.
+        let audit_path = marmot_forensics::default_v5_jsonl_path(&account_dir, &engine_id_hex);
+        match marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
             &audit_path,
             engine_id_hex,
             Some(account_ref_hex),
+            audit_v5_producer(),
         ) {
             Ok(recorder) => {
                 // Emit a source_context row identifying the producing account and
@@ -1556,12 +1604,12 @@ mod tests {
         let contents = std::fs::read_to_string(path).unwrap();
         let source_line = contents.lines().find_map(|line| {
             let event: serde_json::Value = serde_json::from_str(line).ok()?;
-            (event["kind"]["type"] == "source_context").then(|| line.to_owned())
+            (event["event"]["type"] == "source_context").then(|| line.to_owned())
         });
         let first_line = source_line.expect("source_context row");
         let event: serde_json::Value = serde_json::from_str(&first_line).unwrap();
-        assert_eq!(event["kind"]["type"], "source_context");
-        let source = &event["kind"]["source"];
+        assert_eq!(event["event"]["type"], "source_context");
+        let source = &event["event"]["source"];
         assert!(source.get("account_label").is_none());
         assert!(source.get("device_label").is_none());
         assert!(source.get("device_name").is_none());
@@ -1569,7 +1617,7 @@ mod tests {
         assert_eq!(source["platform"], "ios");
         assert_eq!(source["app_version"], "2026.6.8");
         assert!(
-            source["device_id"]
+            source["device_ref"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
@@ -1578,8 +1626,14 @@ mod tests {
             source["local_member_ref"],
             marmot_forensics::member_ref_hex(account_id.as_slice())
         );
-        assert_eq!(event["account_ref"], audit_account_ref_hex(&account_id));
-        assert_ne!(event["account_ref"], source["local_member_ref"]);
+        assert_eq!(
+            event["source_ref"],
+            audit_engine_id_hex(
+                &account_id,
+                &audit_device_id_hex(&app.account_dir("alice")).unwrap()
+            )
+        );
+        assert!(event.get("account_ref").is_none());
         assert!(!first_line.contains(&hex::encode(account_id.as_slice())));
         assert!(!first_line.contains("alice"));
     }
@@ -1615,8 +1669,8 @@ mod tests {
         assert!(files.len() >= 3);
         for file in files {
             let source = source_context_event(Path::new(&file.path));
-            assert_eq!(source["kind"]["source"], initial["kind"]["source"]);
-            for field in ["account_ref", "engine_id", "recorder_session_id"] {
+            assert_eq!(source["event"]["source"], initial["event"]["source"]);
+            for field in ["source_ref", "session_id"] {
                 assert_eq!(source[field], initial[field]);
             }
             let snapshot =
@@ -1624,7 +1678,13 @@ mod tests {
                     .await
                     .unwrap();
             assert!(snapshot.complete);
-            snapshot.validate().unwrap();
+            for line in snapshot
+                .body
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                marmot_forensics::v5::Record::from_json(line).unwrap();
+            }
         }
     }
 
@@ -1636,7 +1696,6 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let account_id = app.member_id("alice").unwrap();
         let expected_member = marmot_forensics::member_ref_hex(account_id.as_slice());
-        let expected_account = audit_account_ref_hex(&account_id);
 
         let first = app.build_audit_recorder("alice", true);
         let first_path = first.audit_log_path().expect("first recorder");
@@ -1647,20 +1706,20 @@ mod tests {
         let second_path = second.audit_log_path().expect("second recorder");
         let second_source = source_context_event(&second_path);
         assert_ne!(first_path, second_path);
-        assert_eq!(first_source["account_ref"], expected_account);
-        assert_eq!(second_source["account_ref"], expected_account);
+        assert!(first_source.get("account_ref").is_none());
+        assert!(second_source.get("account_ref").is_none());
         assert_eq!(
-            first_source["kind"]["source"]["local_member_ref"],
+            first_source["event"]["source"]["local_member_ref"],
             expected_member
         );
         assert_eq!(
-            second_source["kind"]["source"]["local_member_ref"],
+            second_source["event"]["source"]["local_member_ref"],
             expected_member
         );
-        assert_ne!(first_source["engine_id"], second_source["engine_id"]);
+        assert_ne!(first_source["source_ref"], second_source["source_ref"]);
         assert_ne!(
-            first_source["kind"]["source"]["device_id"],
-            second_source["kind"]["source"]["device_id"]
+            first_source["event"]["source"]["device_ref"],
+            second_source["event"]["source"]["device_ref"]
         );
     }
 
@@ -1678,10 +1737,12 @@ mod tests {
         let before = source_context_event(&path);
         recorder.rotate().unwrap();
         let after = source_context_event(&path);
-        assert_eq!(after["kind"]["source"]["local_member_ref"], expected_member);
-        assert_eq!(after["account_ref"], before["account_ref"]);
-        assert_eq!(after["engine_id"], before["engine_id"]);
-        assert_ne!(after["recorder_session_id"], before["recorder_session_id"]);
+        assert_eq!(
+            after["event"]["source"]["local_member_ref"],
+            expected_member
+        );
+        assert_eq!(after["source_ref"], before["source_ref"]);
+        assert_ne!(after["session_id"], before["session_id"]);
         drop(recorder);
         let lines_before_disable = fs::read_to_string(&path).unwrap().lines().count();
 
@@ -1698,7 +1759,7 @@ mod tests {
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|event| event["kind"]["type"] == "source_context")
+            .find(|event| event["event"]["type"] == "source_context")
             .expect("source_context row")
     }
 
@@ -1775,34 +1836,35 @@ mod tests {
     }
 
     #[test]
-    fn audit_recorder_writes_a_new_v4_file_and_leaves_legacy_files_untouched() {
+    fn audit_recorder_writes_a_new_v5_file_and_leaves_v4_files_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
-        // Open the live recorder; the backing file is a versioned v4 file.
+        // Open the live recorder; the backing file is a versioned v5 file.
         let recorder = app.build_audit_recorder("alice", true);
-        let v4_path = recorder
+        let v5_path = recorder
             .audit_log_path()
             .expect("file-backed recorder when enabled");
-        let v4_name = v4_path.file_name().unwrap().to_string_lossy().into_owned();
+        let v5_name = v5_path.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
-            v4_name.ends_with("-v4.jsonl"),
-            "v4 recorder must use a versioned filename, got {v4_name}"
+            v5_name.ends_with("-v5.jsonl"),
+            "v5 recorder must use a versioned filename, got {v5_name}"
         );
 
         // Earlier schema files are distinct and never read, migrated, or appended to.
-        let v1_path = v4_path.with_file_name(v4_name.replace("-v4.jsonl", ".jsonl"));
-        let v2_path = v4_path.with_file_name(v4_name.replace("-v4.jsonl", "-v2.jsonl"));
-        let v3_path = v4_path.with_file_name(v4_name.replace("-v4.jsonl", "-v3.jsonl"));
+        let v1_path = v5_path.with_file_name(v5_name.replace("-v5.jsonl", ".jsonl"));
+        let v2_path = v5_path.with_file_name(v5_name.replace("-v5.jsonl", "-v2.jsonl"));
+        let v3_path = v5_path.with_file_name(v5_name.replace("-v5.jsonl", "-v3.jsonl"));
+        let v4_path = v5_path.with_file_name(v5_name.replace("-v5.jsonl", "-v4.jsonl"));
         std::fs::write(
             &v3_path,
             b"{\"schema_version\":\"marmot-forensics-audit/v3\"}\n",
         )
         .unwrap();
-        assert_ne!(v1_path, v4_path);
-        assert_ne!(v2_path, v4_path);
+        assert_ne!(v1_path, v5_path);
+        assert_ne!(v2_path, v5_path);
         std::fs::write(
             &v1_path,
             b"{\"schema_version\":\"marmot-forensics-audit/v1\"}\n",
@@ -1814,12 +1876,16 @@ mod tests {
         )
         .unwrap();
 
-        // Reopening appends only to v4; legacy bytes are left exactly as they were.
+        let v4_bytes = b"{\"schema_version\":\"marmot-forensics-audit/v4\"}\n";
+        std::fs::write(&v4_path, v4_bytes).unwrap();
+
+        // Reopening appends only to v5; the v4 bytes stay intact.
         let reopened = app.build_audit_recorder("alice", true);
         assert_eq!(
             reopened.audit_log_path().as_deref(),
-            Some(v4_path.as_path())
+            Some(v5_path.as_path())
         );
+        assert_eq!(std::fs::read(&v4_path).unwrap(), v4_bytes);
         assert_eq!(
             std::fs::read_to_string(&v1_path).unwrap(),
             "{\"schema_version\":\"marmot-forensics-audit/v1\"}\n"
@@ -1841,7 +1907,12 @@ mod tests {
             .into_iter()
             .map(|file| file.file_name)
             .collect();
-        assert!(listed.iter().any(|name| name == &v4_name));
+        assert!(listed.iter().any(|name| name == &v5_name));
+        assert!(
+            listed
+                .iter()
+                .any(|name| name == v4_path.file_name().unwrap().to_string_lossy().as_ref())
+        );
         assert!(
             listed
                 .iter()

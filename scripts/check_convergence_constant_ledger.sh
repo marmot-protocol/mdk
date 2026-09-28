@@ -130,6 +130,7 @@ discover_constants \
     "crates/transport-nostr-adapter/src/sdk_client.rs" \
     "SDK_RECONCILIATION_MAX_[A-Z0-9_]+"
 discover_constants "crates/marmot-app/src/client/epoch_stall.rs" "EPOCH_STALL_[A-Z0-9_]+"
+discover_constants "crates/marmot-app/src/client/sync.rs" "ONLINE_EPOCH_GAP_DRAIN_SLICE"
 discover_constants \
     "crates/marmot-app/src/lib.rs" \
     "(APP_RUNTIME_RELAY_REBUILD_LOOKBACK|TRANSPORT_CURSOR_MAX_FUTURE_SKEW)"

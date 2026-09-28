@@ -67,8 +67,9 @@ use crate::{
 };
 
 mod audit;
-#[cfg(test)]
+mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
+mod delivery_spill;
 pub(crate) mod epoch_stall;
 mod invite_recovery;
 mod projection;
@@ -81,10 +82,17 @@ mod sync;
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 #[cfg(test)]
+pub(crate) use sync::TestComparisonActivityWitness;
+#[cfg(all(test, feature = "test-policy-overrides"))]
+pub(crate) use sync::TestRecoveryPhase;
+#[cfg(test)]
+pub(crate) use sync::TestRecoveryPhaseWitness;
+#[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
-    ComparisonNetworkJob, ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome,
-    EpochBackfillRunOutcome, PendingRecoverySelection,
+    ComparisonNetworkJob, ComparisonNetworkResult, ConvergenceScheduleState,
+    DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome, EpochGapQueueJob,
+    OnlineEpochGapRecovery, PendingRecoverySelection, RouteSubmission,
 };
 
 #[cfg(test)]
@@ -337,8 +345,8 @@ pub struct AppClient {
     pub(crate) test_recovery_selection_witness:
         Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
     #[cfg(test)]
+    pub(crate) test_recovery_phase_witness: Option<TestRecoveryPhaseWitness>,
     pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
-    #[cfg(test)]
     pub(crate) audit_v5_peel_slot:
         Option<std::sync::Arc<std::sync::Mutex<audit_v5_probe::PeelSlot>>>,
     /// Synthetic endpoint certificates for executor/completion contract tests.
@@ -445,6 +453,8 @@ pub struct AppClient {
     /// and EOSE-gated recovery must complete before the cursor is trusted.
     pub(crate) delivery_overflow_recovery_pending: bool,
     pub(crate) delivery_overflow_recovery_marker_token: Option<u64>,
+    /// Durable overflow rows awaiting admission through the live ingest path.
+    pub(crate) delivery_spill: delivery_spill::DeliverySpillReader,
     /// Unit-test fault injection for the account-open replay path. This keeps
     /// the live protocol group intact while exercising a missing best-effort
     /// app projection.
@@ -1666,7 +1676,6 @@ impl AppClient {
         // Reject an explicit creator before MLS mutation instead of surfacing
         // OpenMLS's opaque DuplicateSignatureKey error from add_members.
         let creator = self.app.account_home().account(&self.state.label)?;
-        #[cfg(test)]
         let mut founding_selections = Vec::with_capacity(members.len());
         for member in &members {
             let metadata = cgka_engine::key_package::key_package_metadata(member)
@@ -1674,7 +1683,6 @@ impl AppClient {
             if metadata.credential_identity_hex == creator.account_id_hex {
                 return Err(AppError::GroupCreateIncludesCreator);
             }
-            #[cfg(test)]
             founding_selections.push(audit_v5_probe::FoundingSelection {
                 recipient_hex: metadata.credential_identity_hex,
                 key_package_event_id: member.source.as_ref().map(|source| source.event_id.clone()),
@@ -1782,7 +1790,7 @@ impl AppClient {
         if !optional_app_components.is_empty() {
             changed_fields.push("image");
         }
-        let audit_context = Self::local_human_action_context(
+        let mut audit_context = Self::local_human_action_context(
             "create_group",
             changed_fields,
             touched_components,
@@ -1790,15 +1798,17 @@ impl AppClient {
         );
 
         request.members = members;
-        #[cfg(test)]
-        let founding_probe = (self.runtime.session().new_protocol_profile()
-            == ProtocolProfile::Current)
-            .then(|| {
-                self.audit_v5_probe
-                    .as_mut()
-                    .and_then(|probe| probe.begin_founding(founding_selections))
-            })
-            .flatten();
+        let founding_probe = (self.audit_v5_enabled() || cfg!(test))
+            .then_some(())
+            .and_then(|()| {
+                (self.runtime.session().new_protocol_profile() == ProtocolProfile::Current)
+                    .then(|| {
+                        self.audit_v5_probe
+                            .as_mut()
+                            .and_then(|probe| probe.begin_founding(founding_selections))
+                    })
+                    .flatten()
+            });
         let mls_started_at = Instant::now();
         let prepared = self
             .runtime
@@ -1842,10 +1852,22 @@ impl AppClient {
                 "confirmed group creation outpaced prepared-image consumption; retry will reconcile the engine component"
             );
         }
-        #[cfg(test)]
         if let (Some(probe), Some(pending)) = (&mut self.audit_v5_probe, founding_probe) {
             probe.founding_prepared(pending, &group_id, &prepared.effects);
+            audit_context.v5_welcome_refs = probe.take_validated_refs();
+            if self.runtime.session().audit_v5_enabled()
+                && let Ok(group) = self.runtime.group_record(&group_id)
+            {
+                let admins = self.runtime.admin_pubkeys(&group_id).ok();
+                probe.baseline(
+                    &group,
+                    admins.as_deref(),
+                    marmot_forensics::v5::BaselineReason::Created,
+                    None,
+                );
+            }
         }
+        self.flush_live_v5_events();
         // Current-profile founding creation is already canonical before
         // transport delivery: the engine transaction retained the exact
         // Welcome bytes and destinations. Derive only the in-memory ids used
@@ -3198,13 +3220,11 @@ impl AppClient {
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         *group = authoritative;
         let archived = group.archived;
-        #[cfg(test)]
         let audit_origin = self
             .audit_v5_probe
             .as_mut()
             .and_then(|probe| probe.begin_confirmation(group));
         let result = self.set_group_invite_confirmation(group_id, false, archived);
-        #[cfg(test)]
         if result.is_err()
             && let (Some(probe), Some(origin)) = (&mut self.audit_v5_probe, audit_origin)
         {
@@ -3730,11 +3750,32 @@ impl AppClient {
         let group = GroupId::new(hex::decode(&submission.group_id_hex).map_err(|_| {
             AppError::InvalidAppMessagePayload("invalid local submission group".into())
         })?);
-        let request = crate::local_submissions::LocalMessageRequest::decode_retained(
-            submission.request_json.as_deref().ok_or_else(|| {
-                AppError::InvalidAppMessagePayload("missing local submission request".into())
-            })?,
-        )?;
+        let (request, edit_of_client_token) =
+            crate::local_submissions::LocalMessageRequest::decode_retained(
+                submission.request_json.as_deref().ok_or_else(|| {
+                    AppError::InvalidAppMessagePayload("missing local submission request".into())
+                })?,
+            )?;
+        let intent = if let Some(original_token) = edit_of_client_token {
+            let original = self
+                .app
+                .account_storage(&self.state.label)?
+                .local_submission(&submission.group_id_hex, &original_token)?
+                .ok_or_else(|| {
+                    AppError::InvalidAppMessagePayload("original local send was not found".into())
+                })?;
+            if original.state != 1 {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "original local send was not accepted by the engine".into(),
+                ));
+            }
+            crate::messages::AppMessageIntent::Edit {
+                target_message_id: original.message_id_hex,
+                content: request.content.clone(),
+            }
+        } else {
+            request.intent()
+        };
         let (event, payload) = crate::local_submissions::retained_event(submission)?;
         if !request.attachments.is_empty() {
             self.sync_runtime_groups().await?;
@@ -3742,7 +3783,7 @@ impl AppClient {
         }
         self.send_app_event_with_context(
             &group,
-            request.intent(),
+            intent,
             on_projection,
             None,
             Some((event, payload)),

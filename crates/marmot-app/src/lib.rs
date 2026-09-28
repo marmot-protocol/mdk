@@ -135,11 +135,11 @@ pub use runtime::{
     AccountAttentionUnavailable, AccountManager, AccountSetupReadiness, AccountSetupRequest,
     AccountSetupResult, AgentPublisher, AgentPublisherOptions, AgentPublisherRecord,
     AgentPublisherRouting, AgentStreamWatchOptions, AgentTextStreamCryptoContext,
-    CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
-    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction, OnboardingDeviceDiscovery,
-    OnboardingDevicePackage, OnboardingFinding, OnboardingIssue, OnboardingOptions,
-    OnboardingRepairProposal, OnboardingSingleDeviceNotice, OnboardingSnapshot, OnboardingStatus,
-    OnboardingStep, OnboardingStepState, OnboardingSubscription, RelayFailure,
+    AuditOtlpAttemptOutcome, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
+    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
+    OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding, OnboardingIssue,
+    OnboardingOptions, OnboardingRepairProposal, OnboardingSingleDeviceNotice, OnboardingSnapshot,
+    OnboardingStatus, OnboardingStep, OnboardingStepState, OnboardingSubscription, RelayFailure,
     RuntimeAccountAttentionSubscription, RuntimeAccountError, RuntimeAgentStreamMessage,
     RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch, RuntimeChatListSubscription,
     RuntimeChatListUpdate, RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
@@ -182,7 +182,7 @@ pub use app_telemetry::{
 };
 pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
-    AuditLogUploadResult,
+    AuditLogUploadResult, AuditOtlpTrackerResult,
 };
 pub use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,
@@ -1271,6 +1271,7 @@ struct KeyPackageRecord {
 
 struct OpenAppAccount {
     runtime: AppRuntime,
+    audit_v5_peel_slot: Arc<Mutex<client::audit_v5_probe::PeelSlot>>,
     session_guard: AppAccountSessionGuard,
     adapter: MarmotRelayPlaneAccountAdapter,
     routing: AppTransportRouting,
@@ -1756,17 +1757,14 @@ impl MarmotApp {
                 client::recovery::wall_now_ms()?,
             )?;
         }
+        let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
         let mut client = AppClient {
             #[cfg(test)]
             test_recovery_selection_witness: None,
             #[cfg(test)]
-            audit_v5_probe: None,
-            #[cfg(test)]
-            audit_v5_peel_slot: self
-                .audit_v5_peel_slot
-                .as_ref()
-                .filter(|(label, _)| label == &open.state.label)
-                .map(|(_, slot)| slot.clone()),
+            test_recovery_phase_witness: None,
+            audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
+            audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
             #[cfg(test)]
             test_recovery_evidence: None,
             #[cfg(test)]
@@ -1810,6 +1808,7 @@ impl MarmotApp {
             checkpointed_transport_timestamp,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
+            delivery_spill: Default::default(),
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
@@ -1850,6 +1849,7 @@ impl MarmotApp {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
             client.reconcile_hydrated_account_state()?;
+            client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
         }
         Ok(client)
     }
@@ -3744,20 +3744,19 @@ impl MarmotApp {
         let nostr_signer = signer.as_nostr_signer();
         let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer.clone());
         #[cfg(test)]
-        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> = if let Some((_, slot)) = self
+        let audit_v5_peel_slot = self
             .audit_v5_peel_slot
             .as_ref()
             .filter(|(selected, _)| selected == label)
-        {
+            .map(|(_, slot)| slot.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default())));
+        #[cfg(not(test))]
+        let audit_v5_peel_slot = Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default()));
+        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> =
             Box::new(client::audit_v5_probe::ProbePeeler {
                 inner: peeler,
-                slot: slot.clone(),
-            })
-        } else {
-            Box::new(peeler)
-        };
-        #[cfg(not(test))]
-        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> = Box::new(peeler);
+                slot: audit_v5_peel_slot.clone(),
+            });
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // load_state/account_storage above completed the first database open.
         // Serialize any remaining key-migration probe with other openers.
@@ -3849,10 +3848,27 @@ impl MarmotApp {
                         }
                     })
             });
+        let spill_storage = self.account_storage(label)?;
+        let spill_store: relay_plane::AccountDeliverySpillStore = Arc::new(move |deliveries| {
+            spill_storage
+                .spill_account_deliveries(
+                    deliveries,
+                    relay_plane::ACCOUNT_DELIVERY_SPILL_LIMITS,
+                    unix_now_seconds(),
+                )
+                .map_err(|error| {
+                    if error.is_closed() {
+                        relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                    } else {
+                        relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                    }
+                })
+        });
         let adapter = relay_plane.account_adapter_with_recovery_marker(
             account_id.clone(),
             publish_client,
             Some(recovery_marker),
+            Some(spill_store),
         );
 
         let key_packages = AppKeyPackagePublisher {
@@ -3868,6 +3884,7 @@ impl MarmotApp {
         }
         Ok(OpenAppAccount {
             runtime,
+            audit_v5_peel_slot,
             session_guard,
             adapter,
             routing,

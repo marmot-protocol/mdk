@@ -42,7 +42,7 @@ impl Fixture {
         drop(recorder);
         let state = app
             .account_dir("alice")
-            .join("audit-otlp-delivery/local-delivery.json");
+            .join("audit-otlp-delivery-v5/local-delivery.json");
         let runtime = app.runtime();
         Self {
             _temp: temp,
@@ -139,11 +139,22 @@ async fn request_or_completed<T: std::fmt::Debug>(
 #[tokio::test]
 async fn real_recorder_exact_bodies_success_and_partial_block() {
     let f = Fixture::new();
+    assert!(
+        f.active
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-v5.jsonl")
+    );
     let original: Vec<String> = std::fs::read_to_string(&f.active)
         .unwrap()
         .lines()
         .map(ToOwned::to_owned)
         .collect();
+    assert!(original.iter().all(|line| {
+        serde_json::from_str::<serde_json::Value>(line).unwrap()["schema_version"]
+            == "marmot-forensics-audit/v5"
+    }));
     let (endpoint, observed, release, server) = held_receiver(200).await;
     let sender = test_sender(endpoint);
     let runtime = f.runtime.clone();
@@ -200,6 +211,108 @@ async fn real_recorder_exact_bodies_success_and_partial_block() {
         f.cursor()["journals"][0]["blocked"],
         "partial receiver acceptance"
     );
+}
+
+#[tokio::test]
+async fn configured_manual_tracker_delivers_real_v5_rows() {
+    let f = Fixture::new();
+    let original: Vec<String> = std::fs::read_to_string(&f.active)
+        .unwrap()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    let (endpoint, observed, release, server) = held_receiver(200).await;
+    f.runtime
+        .set_audit_otlp_sender(Some(
+            AuditOtlpSender::for_loopback_dev(DEST, endpoint, "test-token").unwrap(),
+        ))
+        .unwrap();
+    let runtime = f.runtime.clone();
+    let mut task =
+        tokio::spawn(async move { runtime.post_audit_log_tracker_update().await.unwrap() });
+    let wire = request_or_completed(observed, &mut task).await;
+    assert_eq!(sent_bodies(&wire), original);
+    release.send(()).unwrap();
+    let result = task.await.unwrap();
+    let v5 = result.v5.expect("configured v5 delivery result");
+    assert_eq!(v5.accepted_batches, 1);
+    assert_eq!(v5.pending_accounts, 0);
+    assert_eq!(v5.blocked_accounts, 0);
+    server.await.unwrap();
+    assert!(f.cursor()["journals"][0]["acknowledged"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn configured_activity_trigger_delivers_v5_rows() {
+    let f = Fixture::new();
+    let (endpoint, observed, release, server) = held_receiver(200).await;
+    f.runtime
+        .set_audit_otlp_sender(Some(
+            AuditOtlpSender::for_loopback_dev(DEST, endpoint, "test-token").unwrap(),
+        ))
+        .unwrap();
+    f.runtime
+        .set_audit_log_batch_window_for_test(std::time::Duration::ZERO);
+    f.runtime
+        .schedule_audit_log_tracker_update_for_test("audit_v5_test_activity");
+    let wire = tokio::time::timeout(std::time::Duration::from_secs(10), observed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!sent_bodies(&wire).is_empty());
+    release.send(()).unwrap();
+    server.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if f.state.exists()
+                && f.cursor()["journals"][0]["acknowledged"]
+                    .as_u64()
+                    .is_some_and(|value| value > 0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn reconfiguring_a_configured_tracker_fences_an_old_ack() {
+    let f = Fixture::new();
+    let (endpoint, observed, release, server) = held_receiver(200).await;
+    f.runtime
+        .set_audit_otlp_sender(Some(
+            AuditOtlpSender::for_loopback_dev(DEST, endpoint, "test-token").unwrap(),
+        ))
+        .unwrap();
+    let runtime = f.runtime.clone();
+    let mut pass =
+        tokio::spawn(async move { runtime.post_audit_log_tracker_update().await.unwrap() });
+    request_or_completed(observed, &mut pass).await;
+    let prepared = f.cursor();
+    f.runtime.set_audit_otlp_sender(None).unwrap();
+    release.send(()).unwrap();
+    let result = pass.await.unwrap();
+    assert_eq!(result.v5.unwrap().pending_accounts, 1);
+    server.await.unwrap();
+    assert_eq!(f.cursor(), prepared);
+
+    let (endpoint, observed, release, server) = held_receiver(200).await;
+    f.runtime
+        .set_audit_otlp_sender(Some(
+            AuditOtlpSender::for_loopback_dev(DEST, endpoint, "replacement-token").unwrap(),
+        ))
+        .unwrap();
+    let runtime = f.runtime.clone();
+    let mut pass =
+        tokio::spawn(async move { runtime.post_audit_log_tracker_update().await.unwrap() });
+    request_or_completed(observed, &mut pass).await;
+    release.send(()).unwrap();
+    assert_eq!(pass.await.unwrap().v5.unwrap().accepted_batches, 1);
+    server.await.unwrap();
 }
 
 #[tokio::test]
