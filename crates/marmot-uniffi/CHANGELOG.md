@@ -11,6 +11,10 @@
 
 ### Fixed
 
+- Keep native conversation-window paging usable during content-only refreshes.
+  An older visible-anchor quote whose row has left the retained window now
+  reports a stale window so hosts can reassess the visible row. (#2052)
+
 - Fetched kind:0 `about` text keeps normalized line breaks. Other known profile strings
   stay single-line, and unsafe controls are still removed. (#1973)
 

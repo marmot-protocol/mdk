@@ -374,11 +374,13 @@ pub(super) fn capture_conversation(
     }
 }
 
-/// Commands apply to the supplied snapshot revision. Every command can return
-/// `StaleWindow` if a replacement was published first; consume the latest snapshot
-/// and reassess the user's intent before retrying. In particular, paging is relative
-/// to that snapshot's retained viewport, not to a newer position changed concurrently.
-/// Commands from another handle generation are always rejected.
+/// Commands apply to the current retained viewport. Background replacements (new
+/// rows, delivery state, reactions, header, draft) do not supersede a revision;
+/// `set_visible_anchor` returns `StaleWindow` if a background replacement dropped
+/// its row. Once a replacement showing a command's viewport move is published,
+/// every earlier revision returns `StaleWindow`. Consume the latest snapshot and
+/// reassess the user's intent before retrying. Commands from another handle
+/// generation are always rejected.
 #[derive(Clone)]
 pub struct ConversationWindowHandle {
     commands: mpsc::Sender<Command>,
@@ -956,8 +958,15 @@ fn command_position(
     command: &Command,
     current: &ConversationWindowSnapshot,
     position: &ConversationWindowQuery,
+    viewport_sequence: u64,
 ) -> Result<ConversationWindowQuery, ConversationWindowError> {
-    if command.revision != current.revision {
+    // Background replacements keep old revisions usable unless they drop the
+    // row named by set_visible_anchor. A published viewport move supersedes
+    // earlier revisions; another generation is always stale.
+    let quoted = &command.revision;
+    if quoted.generation != current.revision.generation
+        || !(viewport_sequence..=current.revision.sequence).contains(&quoted.sequence)
+    {
         return Err(ConversationWindowError::StaleWindow);
     }
     let mut next = position.clone();
@@ -975,7 +984,11 @@ fn command_position(
                 .anchors
                 .iter()
                 .position(|a| a.message_id_hex().eq_ignore_ascii_case(id))
-                .ok_or(ConversationWindowError::AnchorOutsideWindow)?;
+                .ok_or(if quoted.sequence == current.revision.sequence {
+                    ConversationWindowError::AnchorOutsideWindow
+                } else {
+                    ConversationWindowError::StaleWindow
+                })?;
             next.opening.target = ConversationOpenTarget::Anchor(current.anchors[index].clone());
             next.before_anchor = Some(index);
         }
@@ -1073,6 +1086,9 @@ async fn run(
     let mut failed = false;
     let mut retry_delayed = false;
     let mut last_good_position = position.clone();
+    // First published sequence showing the viewport the latest command moved to.
+    // A move kept through a quiet failure takes effect when a retry publishes it.
+    let mut viewport_sequence = current.revision.sequence;
     let mut deferred_command = None;
     loop {
         let mut stopping = sources.stopping.clone();
@@ -1094,7 +1110,7 @@ async fn run(
         };
         let next = match command
             .as_ref()
-            .map(|c| command_position(c, &current, &position))
+            .map(|c| command_position(c, &current, &position, viewport_sequence))
             .transpose()
         {
             Ok(next) => next.unwrap_or_else(|| position.clone()),
@@ -1105,6 +1121,8 @@ async fn run(
                 continue;
             }
         };
+        // `last_good_position` is the viewport `current` shows.
+        let moves_viewport = next != last_good_position;
         sources.drain(); // only the queued prefix; mutations during capture remain queued
         // Following the tail may use the send's coherent pre-publication capture.
         // capture_live sets the requested query first, invalidating any capture
@@ -1145,6 +1163,9 @@ async fn run(
                 reader.send_capture.set_query(&position);
                 last_good_position = position.clone();
                 current = replacement;
+                if changed && moves_viewport {
+                    viewport_sequence = current.revision.sequence;
+                }
                 if current.presentation.header.epoch.is_some()
                     && let Some(observation) = reader.authority_ready.take()
                 {

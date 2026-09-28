@@ -56,6 +56,10 @@
   zeros. Only local signing-key files are still zeroed, and their reader now re-reads
   instead of parsing a replaced key file.
 
+- Keep conversation-window commands usable across content-only replacements
+  and report a stale window when an older visible-anchor quote names a row
+  dropped by a background replacement. (#2052)
+
 - Keep an account's delivery route open when its relay notification consumer lags. A lag
   used to close the route and send the account worker through reconnect. The reopened
   session replayed the backlog from the loss-fenced cursor, which overflowed again, so large
