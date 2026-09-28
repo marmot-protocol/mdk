@@ -1,10 +1,13 @@
 //! Immutable comparison I/O for a worker-owned recovery grant. The task has no
-//! account storage, engine, session, or event-queue authority.
+//! account storage, engine, session, or event-queue authority. The worker
+//! admits what it fetched a few events per turn, never through the live queue.
 
 use super::*;
+use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use storage_sqlite::RecoveryComparisonOutcome as Outcome;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{NostrReconciliationProgress, SubscriptionAttempt};
@@ -13,13 +16,40 @@ use transport_nostr_adapter::{NostrReconciliationProgress, SubscriptionAttempt};
 /// executor with its complete endpoint set.
 pub(crate) const MAX_COMPARISON_ENDPOINTS_PER_ROUTE: usize = 4;
 
+/// Owned events one worker turn admits before commands and live input run.
+pub(crate) const MAX_COMPARISON_ADMISSION_PER_TURN: usize = 4;
+
 /// What the worker keeps while a comparison runs off the worker: the live
 /// subscription attempt admission must still own, and the inline executor's
 /// execution bracket (loss attempt and audit rows). The bracket is boxed so
-/// worker enums that park an activation stay small.
-pub(crate) struct ComparisonActivation {
-    attempt: SubscriptionAttempt,
+/// worker enums that park a pass stay small.
+pub(crate) struct ComparisonExecution {
+    attempt: Option<SubscriptionAttempt>,
     execution: Box<RecoveryExecutionState>,
+}
+
+/// A finished network pass the worker is admitting.
+#[derive(Default)]
+pub(crate) struct ComparisonAdmission {
+    routes: Vec<AdmissionRoute>,
+    pending: VecDeque<(usize, transport_nostr_adapter::NostrRelayEvent)>,
+    summary: SyncSummary,
+    /// The grant changed mid-admission. The admitted prefix stays durable,
+    /// but the pass certifies nothing.
+    invalid: bool,
+}
+
+struct AdmissionRoute {
+    route: TransportReconciliationRoute,
+    initial_cursor: Option<[u8; 32]>,
+    cursor: Option<[u8; 32]>,
+    outcome: Outcome,
+    /// Every endpoint finished an untruncated comparison.
+    certified: bool,
+    /// Every event this route fetched was durably admitted.
+    admitted: bool,
+    /// Events durably admitted: progress, even without a certificate.
+    fetched: usize,
 }
 
 fn comparison_failure(error: AppError) -> ClassifiedSyncFailure {
@@ -35,8 +65,6 @@ pub(crate) struct TestComparisonActivityWitness {
     pub(crate) target_event_id: Arc<Mutex<Option<String>>>,
     pub(crate) returned_events: Arc<AtomicUsize>,
     pub(crate) matching_events: Arc<AtomicUsize>,
-    pub(crate) matching_queued_deliveries: Arc<AtomicUsize>,
-    pub(crate) panic_after_queue_submission: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(test)]
@@ -95,96 +123,6 @@ pub(crate) struct ComparisonRouteResult {
 
 pub(crate) struct ComparisonNetworkResult {
     routes: Vec<ComparisonRouteResult>,
-}
-
-pub(crate) struct RouteSubmission {
-    route: TransportReconciliationRoute,
-    initial_cursor: Option<[u8; 32]>,
-    cursor: Option<[u8; 32]>,
-    cursor_safe: bool,
-    outcome: storage_sqlite::RecoveryComparisonOutcome,
-    certified: bool,
-    fetched: usize,
-    #[cfg(test)]
-    attempted: usize,
-    #[cfg(test)]
-    delivered: usize,
-}
-
-#[cfg(test)]
-impl RouteSubmission {
-    pub(crate) fn delivery_counts_for_test(&self) -> (usize, usize) {
-        (self.attempted, self.delivered)
-    }
-}
-
-/// The queue producer owns no account engine or storage. The worker can drain
-/// the same adapter queue while this bounded producer waits for capacity.
-pub(crate) struct EpochGapQueueJob {
-    credit: Option<Arc<OwnedSemaphorePermit>>,
-    handle: JoinHandle<Vec<RouteSubmission>>,
-}
-
-impl Drop for EpochGapQueueJob {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
-impl EpochGapQueueJob {
-    pub(crate) fn start(
-        client: &AppClient,
-        network: ComparisonNetworkResult,
-        credit: OwnedSemaphorePermit,
-        #[cfg(test)] witness: Option<TestComparisonActivityWitness>,
-    ) -> Self {
-        let adapter = client.adapter.clone();
-        let credit = Arc::new(credit);
-        let task_credit = credit.clone();
-        let handle = tokio::spawn(async move {
-            let _credit = task_credit;
-            let deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
-            let mut submitted = Vec::with_capacity(network.routes.len());
-            for route in network.routes {
-                submitted.push(
-                    submit_reconciliation_route(
-                        &adapter,
-                        route,
-                        deadline,
-                        #[cfg(test)]
-                        witness.as_ref(),
-                    )
-                    .await,
-                );
-            }
-            #[cfg(test)]
-            if witness
-                .as_ref()
-                .is_some_and(|witness| witness.panic_after_queue_submission.load(Ordering::SeqCst))
-            {
-                panic!("injected online recovery queue panic after submission");
-            }
-            submitted
-        });
-        Self {
-            credit: Some(credit),
-            handle,
-        }
-    }
-
-    pub(crate) async fn wait(&mut self) -> Result<Vec<RouteSubmission>, tokio::task::JoinError> {
-        (&mut self.handle).await
-    }
-
-    pub(crate) async fn abort_and_wait(mut self) -> Arc<OwnedSemaphorePermit> {
-        self.handle.abort();
-        let _ = (&mut self.handle).await;
-        self.credit.take().expect("queue job owns credit")
-    }
-
-    pub(crate) fn into_credit(mut self) -> Arc<OwnedSemaphorePermit> {
-        self.credit.take().expect("queue job owns credit")
-    }
 }
 
 #[cfg(test)]
@@ -349,143 +287,30 @@ impl ComparisonNetworkJob {
 }
 
 impl AppClient {
-    /// Capacity preflight before the owner spends a retry reservation. This is
-    /// deliberately narrower than the post-selection grant check below.
-    pub(crate) fn epoch_gap_only_waiting_for_credit(&self) -> Result<bool, AppError> {
-        let storage = self.app.account_storage(&self.state.label)?;
-        let fence = storage.recovery_eligible_revision_fence(false)?;
-        if fence.obligations.len() != 1
-            || storage.recovery_comparison()?.pending()
-            || self.delivery_loss_blocks_cursor()
-            || !storage
-                .recovery_loss_snapshot(
-                    &self.state.label,
-                    storage_sqlite::RecoveryLossCause::Queue,
-                )?
-                .is_empty()
-            || !storage
-                .recovery_loss_snapshot(
-                    &self.state.label,
-                    storage_sqlite::RecoveryLossCause::NotificationConsumer,
-                )?
-                .is_empty()
-        {
-            return Ok(false);
-        }
-        // A zero-credit preflight may defer a grant only when its visible
-        // routing shape fits the off-worker cap. Otherwise preserve the
-        // inline executor even while another account holds both credits.
-        let routes = self.routing.snapshot();
-        let visible_routes =
-            routes.group_routes.len() + usize::from(!routes.local_inbox_endpoints.is_empty());
-        if visible_routes == 0
-            || visible_routes > TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
-            || routes.local_inbox_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-            || routes
-                .group_routes
-                .iter()
-                .any(|route| route.endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE)
-        {
-            return Ok(false);
-        }
-        let selected = fence.obligations[0];
-        if storage
-            .recovery_scope_snapshots(selected.0)?
-            .iter()
-            .any(|scope| {
-                scope.plan.required_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                    || scope.plan.admitted_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-            })
-        {
-            return Ok(false);
-        }
-        Ok(storage.pending_recovery_demands()?.iter().any(|demand| {
-            demand.ticket.id == selected.0
-                && demand.ticket.revision == selected.1
-                && demand.cause == storage_sqlite::RecoveryCause::EpochGap
-        }))
-    }
-
-    /// The one steady-state expansion of immutable comparison I/O. The
-    /// comparison slot remains ineligible and its completion path is unused.
-    pub(crate) fn epoch_gap_offload_eligible(
-        &self,
-        grant: &AttemptGrant,
-    ) -> Result<bool, AppError> {
-        let Some(plan) = grant.plan() else {
-            return Ok(false);
-        };
-        if grant.seam != marmot_forensics::EpochBackfillExecutionSeam::Receive
-            || grant.comparison_revision.is_some()
-            || plan.len() != 1
-            || plan[0].cause != storage_sqlite::RecoveryCause::EpochGap
-            || grant.fence.obligations.len() != 1
-            || grant.fence.obligations[0].0 != plan[0].id
-            || self.delivery_loss_blocks_cursor()
-            || grant.inventory.is_empty()
-            || grant.inventory.len() > TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
-            || plan[0].scopes.iter().any(|scope| {
-                scope.goal.admitted_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                    || scope.goal.required_endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-            })
-            || grant.inventory.iter().any(|route| match &route.work {
-                TransportReconciliationWork::Inbox(endpoints) => {
-                    endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                }
-                TransportReconciliationWork::Group(group) => {
-                    group.endpoints.len() > MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                }
-            })
-        {
-            return Ok(false);
-        }
-        let storage = self.app.account_storage(&self.state.label)?;
-        Ok(storage.pending_recovery_demands()?.iter().any(|demand| {
-            demand.ticket.id == grant.fence.obligations[0].0
-                && demand.ticket.revision == grant.fence.obligations[0].1
-                && demand.cause == storage_sqlite::RecoveryCause::EpochGap
-        }))
-    }
-
-    /// An advisory preflight used only when the shared credit pool is empty.
-    /// Independent debt still reaches the legacy executor. The actual frozen
-    /// grant is checked again after authorization when a credit exists.
+    /// An advisory preflight used only when the shared credit pool is empty:
+    /// every pending cause is one the off-worker job serves, so the owner
+    /// waits for a credit instead of running it inline. The frozen grant is
+    /// checked again after authorization when a credit exists.
     pub(crate) fn comparison_only_waiting_for_credit(&self) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
-        if !storage.recovery_comparison()?.pending()
-            || storage
-                .pending_recovery_demands()?
-                .iter()
-                .any(|demand| demand.cause != storage_sqlite::RecoveryCause::IncrementalHistory)
-            || !storage
-                .recovery_loss_snapshot(
-                    &self.state.label,
-                    storage_sqlite::RecoveryLossCause::Queue,
-                )?
-                .is_empty()
-            || !storage
-                .recovery_loss_snapshot(
-                    &self.state.label,
-                    storage_sqlite::RecoveryLossCause::NotificationConsumer,
-                )?
-                .is_empty()
-        {
+        let demands = storage.pending_recovery_demands()?;
+        if demands.is_empty() && !storage.recovery_comparison()?.pending() {
             return Ok(false);
         }
         let routes = self.routing.snapshot();
-        Ok(
-            routes.local_inbox_endpoints.len() <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE
-                && routes
-                    .group_routes
-                    .iter()
-                    .all(|route| route.endpoints.len() <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE),
-        )
+        Ok(demands.iter().all(|demand| offloaded_cause(demand.cause))
+            && routes.local_inbox_endpoints.len() <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE
+            && routes
+                .group_routes
+                .iter()
+                .all(|route| route.endpoints.len() <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE))
     }
 
     /// Every automatic grant runs its network wait off the worker, except
-    /// maintenance boundaries, explicit repair, known-event demand and epoch
-    /// gaps, which keep their own executors. Per-pass route and endpoint caps still apply. The frozen grant
-    /// is the authority; an earlier pending-demand probe never decides this.
+    /// maintenance boundaries, explicit repair and known-event demand, which
+    /// keep their own executors. Per-pass route and endpoint caps still apply.
+    /// The frozen grant is the authority; an earlier pending-demand probe
+    /// never decides this.
     pub(crate) fn comparison_offload_eligible(
         &self,
         grant: &AttemptGrant,
@@ -498,21 +323,13 @@ impl AppClient {
                 && admitted <= MAX_COMPARISON_ENDPOINTS_PER_ROUTE
         };
         Ok(plan.iter().all(|obligation| {
-            // Known-event demand belongs to the exact-ID worker. An epoch gap
-            // keeps its sliced online job at the receive seam until that
-            // admission loop serves every cause.
-            !matches!(
-                obligation.cause,
-                storage_sqlite::RecoveryCause::Maintenance
-                    | storage_sqlite::RecoveryCause::ExplicitHistory
-                    | storage_sqlite::RecoveryCause::KnownEvent
-                    | storage_sqlite::RecoveryCause::EpochGap
-            ) && obligation.scopes.iter().all(|scope| {
-                within_cap(
-                    scope.goal.required_endpoints.len(),
-                    scope.goal.admitted_endpoints.len(),
-                )
-            })
+            offloaded_cause(obligation.cause)
+                && obligation.scopes.iter().all(|scope| {
+                    within_cap(
+                        scope.goal.required_endpoints.len(),
+                        scope.goal.admitted_endpoints.len(),
+                    )
+                })
         }) && grant.inventory.len() <= TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
             && grant.inventory.iter().all(|route| match &route.work {
                 TransportReconciliationWork::Inbox(endpoints) => {
@@ -533,14 +350,30 @@ impl AppClient {
             }))
     }
 
-    /// Open the same execution bracket as the inline executor, then activate
-    /// the grant's floored live subscriptions. The network wait runs off the
-    /// worker; the returned activation must be finished or abandoned.
-    pub(crate) async fn activate_comparison_grant(
+    /// Open the inline executor's execution bracket for an off-worker pass. A
+    /// steady-state pass never touches live subscriptions: it reuses the live
+    /// tail, so it re-downloads no history the account already holds.
+    pub(crate) async fn begin_comparison_grant(
+        &mut self,
+        grant: &AttemptGrant,
+    ) -> Result<ComparisonExecution, AppError> {
+        let mut execution = self
+            .begin_recovery_execution(grant)
+            .map_err(|failure| failure.source)?;
+        execution.activation = marmot_forensics::EpochBackfillActivationOutcome::Succeeded;
+        Ok(ComparisonExecution {
+            attempt: self.adapter.account_subscription_attempt().await,
+            execution: Box::new(execution),
+        })
+    }
+
+    /// Startup's grant carries the session's first live subscriptions, floored
+    /// at the cursor, so it activates before its network wait.
+    pub(crate) async fn activate_startup_comparison_grant(
         &mut self,
         grant: &AttemptGrant,
         telemetry: Option<&AppPerformanceTelemetry>,
-    ) -> Result<ComparisonActivation, AppError> {
+    ) -> Result<ComparisonExecution, AppError> {
         let mut execution = self
             .begin_recovery_execution(grant)
             .map_err(|failure| failure.source)?;
@@ -563,8 +396,8 @@ impl AppClient {
             Err(failure) => Err(failure),
         };
         match attempt {
-            Ok(attempt) => Ok(ComparisonActivation {
-                attempt,
+            Ok(attempt) => Ok(ComparisonExecution {
+                attempt: Some(attempt),
                 execution: Box::new(execution),
             }),
             Err(failure) => {
@@ -576,28 +409,204 @@ impl AppClient {
         }
     }
 
-    /// Admit the owned comparison result and settle the execution bracket:
-    /// checkpoints, loss acknowledgment and audit rows, as the inline
-    /// executor does.
+    /// The grant still owns its frozen debt, its comparison slot and the live
+    /// subscription attempt it started under.
+    async fn comparison_grant_stable(
+        &mut self,
+        grant: &AttemptGrant,
+        execution: &ComparisonExecution,
+        compare_inventory: bool,
+    ) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        drop(self.transport_receipts()?);
+        self.observe_recovery_route_policy()?;
+        let current = storage.recovery_revision_fence()?;
+        let slot_stable = match grant.comparison_revision {
+            Some(revision) => {
+                let slot = storage.recovery_comparison()?;
+                slot.pending()
+                    && slot.revision == revision
+                    && slot.attempt_serial == grant.reservation.attempt_serial
+                    && slot.frozen_revision == slot.revision
+            }
+            None => true,
+        };
+        Ok(current.loss_revision == grant.fence.loss_revision
+            && current.route_revision == grant.fence.route_revision
+            && (!compare_inventory || current.inventory_revision == grant.fence.inventory_revision)
+            && grant
+                .fence
+                .obligations
+                .iter()
+                .all(|selected| current.obligations.contains(selected))
+            && slot_stable
+            && self.adapter.account_subscription_attempt().await == execution.attempt)
+    }
+
+    /// Take ownership of a finished network pass. `None` means the grant
+    /// changed while it ran, so none of its bytes may be admitted.
+    pub(crate) async fn accept_comparison_network(
+        &mut self,
+        grant: &AttemptGrant,
+        execution: &ComparisonExecution,
+        network: ComparisonNetworkResult,
+    ) -> Result<Option<ComparisonAdmission>, AppError> {
+        if !self.comparison_grant_stable(grant, execution, true).await? {
+            return Ok(None);
+        }
+        let mut admission = ComparisonAdmission::default();
+        for (index, route) in network.routes.into_iter().enumerate() {
+            let (outcome, certified, events) = match route.result {
+                ComparisonRouteWorkResult::Skipped => (Outcome::ServicedPartial, false, Vec::new()),
+                ComparisonRouteWorkResult::TimedOut
+                | ComparisonRouteWorkResult::Returned(Err(_)) => {
+                    (Outcome::TransientFailure, false, Vec::new())
+                }
+                ComparisonRouteWorkResult::Returned(Ok(None)) => {
+                    (Outcome::Unsupported, false, Vec::new())
+                }
+                ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
+                    if summary.relays_failed > 0 {
+                        (Outcome::TransientFailure, false, events)
+                    } else {
+                        let certified = super::route_comparison_certified(&summary);
+                        (Outcome::ServicedUnknown, certified, events)
+                    }
+                }
+            };
+            admission
+                .pending
+                .extend(events.into_iter().map(|event| (index, event)));
+            admission.routes.push(AdmissionRoute {
+                route: route.route,
+                initial_cursor: route.initial_cursor,
+                cursor: route.cursor,
+                outcome,
+                certified,
+                admitted: true,
+                fetched: 0,
+            });
+        }
+        Ok(Some(admission))
+    }
+
+    /// Admit at most a few owned events through the ordinary ingest path, then
+    /// return so the worker serves commands and live input before the next
+    /// turn. Returns true once nothing remains to admit.
+    pub(crate) async fn admit_comparison_turn(
+        &mut self,
+        grant: &AttemptGrant,
+        execution: &mut ComparisonExecution,
+        admission: &mut ComparisonAdmission,
+    ) -> Result<bool, AppError> {
+        if admission.pending.is_empty() {
+            return Ok(true);
+        }
+        if !self
+            .comparison_grant_stable(grant, execution, false)
+            .await?
+        {
+            admission.invalid = true;
+            admission.pending.clear();
+            return Ok(true);
+        }
+        for _ in 0..MAX_COMPARISON_ADMISSION_PER_TURN {
+            let Some((index, event)) = admission.pending.pop_front() else {
+                break;
+            };
+            let route = &mut admission.routes[index];
+            let deliveries = self.adapter.recovered_deliveries(event).await?;
+            // An event that no longer routes to this account was not admitted.
+            route.admitted &= !deliveries.is_empty();
+            for delivery in deliveries {
+                let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
+                admission.summary.merge(summary);
+                let counts = &mut execution.execution.counts;
+                match settled {
+                    super::RecoveredDelivery::AlreadyHeld => {
+                        counts.skipped = counts.skipped.saturating_add(1);
+                    }
+                    super::RecoveredDelivery::Ingested {
+                        unpersisted,
+                        refused_group,
+                    } => {
+                        counts.deliveries = counts.deliveries.saturating_add(1);
+                        if unpersisted {
+                            counts.unpersisted = counts.unpersisted.saturating_add(1);
+                            route.admitted = false;
+                        } else {
+                            route.fetched = route.fetched.saturating_add(1);
+                        }
+                        if let Some(group) = refused_group {
+                            counts.refused = counts.refused.saturating_add(1);
+                            counts.refused_groups.insert(group);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(admission.pending.is_empty())
+    }
+
+    /// Admit a finished pass in bounded turns, yielding between them, then
+    /// settle it. Startup uses this while its mutations are still deferred;
+    /// the steady-state worker runs one turn per loop instead.
+    pub(crate) async fn admit_comparison_inline(
+        &mut self,
+        grant: AttemptGrant,
+        mut execution: ComparisonExecution,
+        network: ComparisonNetworkResult,
+    ) -> Result<EpochBackfillRunOutcome, AppError> {
+        let mut admission = match self
+            .accept_comparison_network(&grant, &execution, network)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error) => return Err(self.fail_comparison_grant(grant, execution, error)),
+        };
+        if let Some(admission) = admission.as_mut() {
+            loop {
+                match self
+                    .admit_comparison_turn(&grant, &mut execution, admission)
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => tokio::task::yield_now().await,
+                    Err(error) => return Err(self.fail_comparison_grant(grant, execution, error)),
+                }
+            }
+        }
+        self.finish_comparison_grant(grant, execution, admission)
+            .await
+    }
+
+    /// Settle the execution bracket after admission: checkpoints, loss
+    /// acknowledgment and audit rows, as the inline executor does.
     pub(crate) async fn finish_comparison_grant(
         &mut self,
         grant: AttemptGrant,
-        activation: ComparisonActivation,
-        network: ComparisonNetworkResult,
+        execution: ComparisonExecution,
+        admission: Option<ComparisonAdmission>,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
-        let ComparisonActivation {
-            attempt,
-            mut execution,
-        } = activation;
-        let admitted = self
-            .admit_comparison_grant(&grant, attempt, network, &mut execution)
-            .await;
-        let deferred = matches!(admitted, Ok(None));
+        let mut execution = *execution.execution;
+        let settled = match admission {
+            // The grant changed before admission; nothing was admitted.
+            None => Ok(None),
+            // A change during admission keeps the durable prefix but certifies
+            // nothing; the debt waits for a later grant.
+            Some(admission) if admission.invalid => Ok(Some(admission.summary)),
+            Some(admission) => self
+                .checkpoint_comparison_admission(&grant, &mut execution, admission)
+                .await
+                .map(Some),
+        };
+        let deferred = matches!(settled, Ok(None));
         let summary = self
             .finish_recovery_execution(
                 &grant,
-                *execution,
-                admitted.map(Option::unwrap_or_default),
+                execution,
+                settled.map(Option::unwrap_or_default),
                 false,
             )
             .map_err(|failure| {
@@ -617,11 +626,11 @@ impl AppClient {
     pub(crate) fn abandon_comparison_grant(
         &mut self,
         grant: AttemptGrant,
-        activation: ComparisonActivation,
+        execution: ComparisonExecution,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         self.finish_recovery_execution(
             &grant,
-            *activation.execution,
+            *execution.execution,
             Ok(SyncSummary::default()),
             false,
         )
@@ -629,222 +638,80 @@ impl AppClient {
         Ok(EpochBackfillRunOutcome::Deferred)
     }
 
-    /// `None` means the grant changed while the network task ran, so nothing
-    /// was admitted.
-    async fn admit_comparison_grant(
+    /// Admission failed. Settle the bracket as a failed attempt; the durable
+    /// prefix stays and the debt waits for a later grant.
+    pub(crate) fn fail_comparison_grant(
+        &mut self,
+        grant: AttemptGrant,
+        execution: ComparisonExecution,
+        error: AppError,
+    ) -> AppError {
+        match self.finish_recovery_execution(
+            &grant,
+            *execution.execution,
+            Err(comparison_failure(error)),
+            false,
+        ) {
+            Ok(_) => unreachable!("a failed recovery cannot complete"),
+            Err(failure) => {
+                self.pending_failed_sync_summary
+                    .merge(failure.partial_summary);
+                failure.source
+            }
+        }
+    }
+
+    async fn checkpoint_comparison_admission(
         &mut self,
         grant: &AttemptGrant,
-        attempt: SubscriptionAttempt,
-        network: ComparisonNetworkResult,
         execution: &mut RecoveryExecutionState,
-    ) -> Result<Option<SyncSummary>, ClassifiedSyncFailure> {
+        admission: ComparisonAdmission,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let storage = self
             .app
             .account_storage(&self.state.label)
             .map_err(comparison_failure)?;
-        storage
-            .synchronize_account_delivery_loss(&self.state.label)
-            .map_err(|error| comparison_failure(error.into()))?;
-        drop(self.transport_receipts().map_err(comparison_failure)?);
-        self.observe_recovery_route_policy()
-            .map_err(comparison_failure)?;
-        let current = storage
-            .recovery_revision_fence()
-            .map_err(|error| comparison_failure(error.into()))?;
-        let slot_stable = match grant.comparison_revision {
-            Some(revision) => {
-                let slot = storage
-                    .recovery_comparison()
+        let mut outcomes = Vec::with_capacity(admission.routes.len());
+        for route in admission.routes {
+            // A route whose batch was not fully admitted keeps its old cursor,
+            // so the next pass fetches the unadmitted suffix again.
+            if route.admitted && route.cursor != route.initial_cursor {
+                storage
+                    .advance_transport_reconciliation_replay_cursor(&route.route, route.cursor)
                     .map_err(|error| comparison_failure(error.into()))?;
-                slot.pending()
-                    && slot.revision == revision
-                    && slot.attempt_serial == grant.reservation.attempt_serial
-                    && slot.frozen_revision == slot.revision
             }
-            None => true,
-        };
-        let stable = current.loss_revision == grant.fence.loss_revision
-            && current.route_revision == grant.fence.route_revision
-            && current.inventory_revision == grant.fence.inventory_revision
-            && grant
-                .fence
-                .obligations
-                .iter()
-                .all(|selected| current.obligations.contains(selected))
-            && slot_stable
-            && self.adapter.account_subscription_attempt().await == Some(attempt);
-        if !stable {
-            // The network task never wrote to SQLCipher or the delivery queue.
-            // A changed grant or activation discards every proposed byte and
-            // leaves durable comparison and coverage debt for the next owner.
-            return Ok(None);
+            outcomes.push(super::RouteComparison {
+                route: route.route,
+                outcome: if route.admitted {
+                    route.outcome
+                } else {
+                    Outcome::TransientFailure
+                },
+                certified: route.certified && route.admitted,
+                fetched: route.fetched,
+            });
         }
-        // Acquisition may have consumed its entire quantum before the worker
-        // joins. Give delivery of the already owned batch a separate bounded
-        // admission window.
-        let admission_deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
-        let mut outcomes = Vec::with_capacity(network.routes.len());
-        for route in network.routes {
-            outcomes.push(
-                self.admit_comparison_route(&storage, route, admission_deadline)
-                    .await
-                    .map_err(comparison_failure)?,
-            );
-        }
-        self.complete_recovery_grant_inner(
+        self.finish_recovery_grant_after_drain(
             grant,
-            None,
             &mut execution.counts,
             &mut execution.drain_verdict,
             outcomes,
+            admission.summary,
+            DrainVerdict::Complete,
         )
         .await
-        .map(Some)
-    }
-
-    async fn admit_comparison_route(
-        &self,
-        storage: &storage_sqlite::SqliteAccountStorage,
-        route: ComparisonRouteResult,
-        admission_deadline: tokio::time::Instant,
-    ) -> Result<super::RouteComparison, AppError> {
-        let submission = submit_reconciliation_route(
-            &self.adapter,
-            route,
-            admission_deadline,
-            #[cfg(test)]
-            None,
-        )
-        .await;
-        self.persist_reconciliation_submission(storage, submission)
-    }
-
-    pub(crate) fn persist_reconciliation_submission(
-        &self,
-        storage: &storage_sqlite::SqliteAccountStorage,
-        submission: RouteSubmission,
-    ) -> Result<super::RouteComparison, AppError> {
-        // A failed or timed-out queue step leaves an unqueued suffix whose
-        // IDs cannot be mapped back to individual cursor positions.
-        if submission.cursor_safe && submission.cursor != submission.initial_cursor {
-            storage.advance_transport_reconciliation_replay_cursor(
-                &submission.route,
-                submission.cursor,
-            )?;
-        }
-        Ok(super::RouteComparison {
-            route: submission.route,
-            outcome: submission.outcome,
-            certified: submission.certified,
-            fetched: submission.fetched,
-        })
     }
 }
 
-async fn submit_reconciliation_route(
-    adapter: &crate::relay_plane::MarmotRelayPlaneAccountAdapter,
-    route: ComparisonRouteResult,
-    admission_deadline: tokio::time::Instant,
-    #[cfg(test)] witness: Option<&TestComparisonActivityWitness>,
-) -> RouteSubmission {
-    let mut cursor_safe = true;
-    let mut certified = false;
-    let mut fetched = 0;
-    #[cfg(test)]
-    let mut attempted = 0usize;
-    #[cfg(test)]
-    let mut delivered = 0usize;
-    let outcome = match route.result {
-        ComparisonRouteWorkResult::Skipped => {
-            storage_sqlite::RecoveryComparisonOutcome::ServicedPartial
-        }
-        ComparisonRouteWorkResult::TimedOut => {
-            storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-        }
-        ComparisonRouteWorkResult::Returned(Ok(None)) => {
-            storage_sqlite::RecoveryComparisonOutcome::Unsupported
-        }
-        ComparisonRouteWorkResult::Returned(Err(_)) => {
-            storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-        }
-        ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
-            let mut submitted = true;
-            for event in events {
-                #[cfg(test)]
-                {
-                    attempted += 1;
-                }
-                #[cfg(test)]
-                let matches_target = witness.is_some_and(|witness| {
-                    witness
-                        .target_event_id
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|target| event.event.id.eq_ignore_ascii_case(target))
-                });
-                let queue = async {
-                    #[cfg(test)]
-                    if let Ok(Some(action)) = TEST_COMPARISON_QUEUE_ACTIONS
-                        .try_with(|actions| actions.borrow_mut().pop_front())
-                    {
-                        match action {
-                            TestComparisonQueueAction::Fail => {
-                                return Err(cgka_traits::TransportAdapterError::Subscription(
-                                    "injected comparison queue failure".into(),
-                                ));
-                            }
-                            TestComparisonQueueAction::Block => {
-                                std::future::pending::<()>().await;
-                            }
-                        }
-                    }
-                    adapter.queue_reconciled_event(event).await
-                };
-                match tokio::time::timeout_at(admission_deadline, queue).await {
-                    Ok(Ok(route_count)) => {
-                        #[cfg(test)]
-                        {
-                            delivered += route_count;
-                        }
-                        #[cfg(test)]
-                        if matches_target && let Some(witness) = witness {
-                            witness
-                                .matching_queued_deliveries
-                                .fetch_add(route_count, Ordering::SeqCst);
-                        }
-                        #[cfg(not(test))]
-                        let _ = route_count;
-                    }
-                    _ => {
-                        submitted = false;
-                        break;
-                    }
-                }
-            }
-            certified = submitted && super::route_comparison_certified(&summary);
-            fetched = summary.received_items;
-            if !submitted || summary.relays_failed > 0 {
-                cursor_safe = submitted;
-                storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-            } else {
-                storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown
-            }
-        }
-    };
-    RouteSubmission {
-        route: route.route,
-        initial_cursor: route.initial_cursor,
-        cursor: route.cursor,
-        cursor_safe,
-        outcome,
-        certified,
-        fetched,
-        #[cfg(test)]
-        attempted,
-        #[cfg(test)]
-        delivered,
-    }
+/// Every automatic cause except maintenance boundaries, explicit repair and
+/// known-event demand, which keep their own executors.
+fn offloaded_cause(cause: storage_sqlite::RecoveryCause) -> bool {
+    !matches!(
+        cause,
+        storage_sqlite::RecoveryCause::Maintenance
+            | storage_sqlite::RecoveryCause::ExplicitHistory
+            | storage_sqlite::RecoveryCause::KnownEvent
+    )
 }
 
 #[cfg(test)]
@@ -856,10 +723,7 @@ mod tests {
     };
     use cgka_traits::GroupStorage;
     use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
-    use std::cell::RefCell;
-    use std::future::Future as _;
     use std::sync::Arc;
-    use std::task::{Context, Poll, Waker};
 
     fn candidate_for_route(route: [u8; 32]) -> transport_nostr_adapter::NostrRelayEvent {
         let signed = EventBuilder::new(Kind::MlsGroupMessage, "queue boundary")
@@ -1017,7 +881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn epoch_gap_zero_credit_preflight_preserves_inline_fallback() {
+    async fn zero_credit_defers_an_offloadable_epoch_gap_but_not_an_over_cap_route() {
         let mut eligible = fixture_with_group_relays_and_comparison(None, false).await;
         arm_test_epoch_gap(&mut eligible).await;
         let serial = eligible
@@ -1025,32 +889,20 @@ mod tests {
             .recovery_retry_state()
             .unwrap()
             .attempt_serial;
-        assert!(eligible.client.epoch_gap_only_waiting_for_credit().unwrap());
+        assert!(
+            eligible
+                .client
+                .comparison_only_waiting_for_credit()
+                .unwrap()
+        );
         assert_eq!(
             eligible
                 .storage
                 .recovery_retry_state()
                 .unwrap()
                 .attempt_serial,
-            serial
-        );
-        eligible
-            .client
-            .recovery_owner
-            .test_advance_clock(Duration::from_secs(300));
-        let maintenance = eligible
-            .client
-            .authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )
-            .unwrap()
-            .unwrap();
-        assert!(
-            !eligible
-                .client
-                .epoch_gap_offload_eligible(&maintenance)
-                .unwrap()
+            serial,
+            "the preflight spends no reservation"
         );
 
         let relays = (0..5)
@@ -1058,30 +910,11 @@ mod tests {
             .collect();
         let mut over_cap = fixture_with_group_relays_and_comparison(Some(relays), false).await;
         arm_test_epoch_gap(&mut over_cap).await;
-        assert!(!over_cap.client.epoch_gap_only_waiting_for_credit().unwrap());
-        over_cap
-            .client
-            .recovery_owner
-            .test_advance_clock(Duration::from_secs(300));
-        let grant = over_cap
-            .client
-            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Receive)
-            .unwrap()
-            .unwrap();
-        assert!(!over_cap.client.epoch_gap_offload_eligible(&grant).unwrap());
-        let serial = grant.reservation.attempt_serial;
-        over_cap
-            .client
-            .execute_pending_epoch_backfill_grant(grant)
-            .await
-            .unwrap();
-        assert_eq!(
-            over_cap
-                .storage
-                .recovery_retry_state()
+        assert!(
+            !over_cap
+                .client
+                .comparison_only_waiting_for_credit()
                 .unwrap()
-                .attempt_serial,
-            serial
         );
     }
 
@@ -1148,11 +981,7 @@ mod tests {
             .unwrap();
         assert!(fixture.client.comparison_offload_eligible(&grant).unwrap());
         let route = grant.inventory.first().unwrap().route.clone();
-        let attempt = fixture
-            .client
-            .activate_comparison_grant(&grant, None)
-            .await
-            .unwrap();
+        let attempt = fixture.client.begin_comparison_grant(&grant).await.unwrap();
         let activated_subscription = fixture.client.adapter.account_subscription_attempt().await;
         let new_goals = fixture
             .client
@@ -1168,7 +997,7 @@ mod tests {
             .unwrap();
         let result = fixture
             .client
-            .finish_comparison_grant(grant, attempt, network_result(route.clone(), Some([8; 32])))
+            .admit_comparison_inline(grant, attempt, network_result(route.clone(), Some([8; 32])))
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Deferred));
@@ -1208,11 +1037,7 @@ mod tests {
                 TransportReconciliationRoute::Inbox => None,
             })
             .unwrap();
-        let attempt = fixture
-            .client
-            .activate_comparison_grant(&grant, None)
-            .await
-            .unwrap();
+        let attempt = fixture.client.begin_comparison_grant(&grant).await.unwrap();
         let before = fixture
             .storage
             .recovery_revision_fence()
@@ -1242,7 +1067,7 @@ mod tests {
         );
         let result = fixture
             .client
-            .finish_comparison_grant(
+            .admit_comparison_inline(
                 grant,
                 attempt,
                 network_result(TransportReconciliationRoute::Inbox, Some([8; 32])),
@@ -1269,11 +1094,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let route = grant.inventory.first().unwrap().route.clone();
-        let attempt = fixture
-            .client
-            .activate_comparison_grant(&grant, None)
-            .await
-            .unwrap();
+        let attempt = fixture.client.begin_comparison_grant(&grant).await.unwrap();
         fixture.client.adapter.require_fresh_activation().await;
         fixture
             .client
@@ -1283,11 +1104,11 @@ mod tests {
             .unwrap();
         assert_ne!(
             fixture.client.adapter.account_subscription_attempt().await,
-            Some(attempt.attempt)
+            attempt.attempt
         );
         let result = fixture
             .client
-            .finish_comparison_grant(grant, attempt, network_result(route.clone(), Some([8; 32])))
+            .admit_comparison_inline(grant, attempt, network_result(route.clone(), Some([8; 32])))
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Deferred));
@@ -1311,14 +1132,10 @@ mod tests {
             .unwrap();
         assert!(fixture.client.comparison_offload_eligible(&grant).unwrap());
         let route = grant.inventory.first().unwrap().route.clone();
-        let attempt = fixture
-            .client
-            .activate_comparison_grant(&grant, None)
-            .await
-            .unwrap();
+        let attempt = fixture.client.begin_comparison_grant(&grant).await.unwrap();
         let result = fixture
             .client
-            .finish_comparison_grant(grant, attempt, network_result(route.clone(), Some([8; 32])))
+            .admit_comparison_inline(grant, attempt, network_result(route.clone(), Some([8; 32])))
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
@@ -1331,9 +1148,14 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn comparison_join_admits_owned_event_after_real_delivery_backpressure() {
-        let mut fixture = fixture().await;
+    async fn group_route_grant(
+        fixture: &mut Fixture,
+    ) -> (
+        AttemptGrant,
+        ComparisonExecution,
+        TransportReconciliationRoute,
+        [u8; 32],
+    ) {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
@@ -1347,67 +1169,37 @@ mod tests {
                 TransportReconciliationRoute::Inbox => None,
             })
             .expect("fixture has a selected group route");
-        let attempt = fixture
-            .client
-            .activate_comparison_grant(&grant, None)
-            .await
-            .unwrap();
-        let event = candidate_for_route(group_route);
-        // Saturate the shared transport queue with another account's route.
-        // Its account queue can hold this prefix; Alice's queue stays empty
-        // until the comparison result is admitted and owner-drained.
-        crate::AccountHome::open(fixture._dir.path())
-            .create_account("bob")
-            .unwrap();
-        let mut bob = client_on_app_relay_plane(&fixture.client.app, "bob").await;
-        let bob_group = bob.create_group("backpressure source", &[]).await.unwrap();
-        let bob_record = fixture
-            .client
-            .app
-            .group("bob", &hex::encode(bob_group))
-            .unwrap()
-            .unwrap();
-        let bob_route: [u8; 32] = hex::decode(bob_record.nostr_routing.nostr_group_id_hex)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let bob_event = candidate_for_route(bob_route);
-        let adapter = bob.adapter.clone();
-        let mut context = Context::from_waker(Waker::noop());
-        tokio::task::unconstrained(async {
-            for _ in 0..1024 {
-                assert_eq!(
-                    adapter
-                        .queue_reconciled_event(bob_event.clone())
-                        .await
-                        .unwrap(),
-                    1
-                );
-            }
-            // Keep Tokio's cooperative yield from running the router during
-            // the fill. The next real adapter send must pend on its buffer.
-            let mut blocked = Box::pin(adapter.queue_reconciled_event(bob_event.clone()));
-            assert!(matches!(blocked.as_mut().poll(&mut context), Poll::Pending));
-        })
-        .await;
+        let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
+        (grant, execution, route, group_route)
+    }
 
-        let mut network = network_result(route.clone(), Some([8; 32]));
+    fn fetched(
+        route: TransportReconciliationRoute,
+        events: Vec<transport_nostr_adapter::NostrRelayEvent>,
+    ) -> ComparisonNetworkResult {
+        let mut network = network_result(route, Some([8; 32]));
         network.routes[0].result = ComparisonRouteWorkResult::Returned(Ok(Some((
             transport_nostr_adapter::NostrReconciliationSummary {
                 relays_succeeded: 1,
                 ..Default::default()
             },
-            vec![event],
+            events,
         ))));
-        let mut finish = Box::pin(
-            fixture
-                .client
-                .finish_comparison_grant(grant, attempt, network),
-        );
-        assert!(matches!(finish.as_mut().poll(&mut context), Poll::Pending));
-        let result = tokio::time::timeout(Duration::from_secs(15), finish)
+        network
+    }
+
+    #[tokio::test]
+    async fn comparison_admits_owned_events_directly_without_the_delivery_queue() {
+        let mut fixture = fixture().await;
+        let (grant, execution, route, group_route) = group_route_grant(&mut fixture).await;
+        let result = fixture
+            .client
+            .admit_comparison_inline(
+                grant,
+                execution,
+                fetched(route.clone(), vec![candidate_for_route(group_route)]),
+            )
             .await
-            .expect("the owner drains after its real queue send pends")
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
         assert_eq!(
@@ -1417,8 +1209,6 @@ mod tests {
                 .unwrap(),
             Some([8; 32]),
         );
-        assert!(fixture.client.adapter.pending_delivery_overflow().is_none());
-        assert!(bob.adapter.pending_delivery_overflow().is_none());
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(50),
@@ -1426,243 +1216,110 @@ mod tests {
             )
             .await
             .is_err(),
-            "owner continuation drained Alice's admitted event"
+            "nothing passed through the live delivery queue"
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn expired_online_quantum_keeps_receiving_pending_queue_admission() {
+    #[tokio::test]
+    async fn comparison_admission_runs_in_bounded_turns() {
         let mut fixture = fixture().await;
-        let group = fixture
+        let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
+        let events = (0..MAX_COMPARISON_ADMISSION_PER_TURN + 1)
+            .map(|_| candidate_for_route(group_route))
+            .collect();
+        let mut admission = fixture
             .client
-            .app
-            .group("alice", &hex::encode(fixture.group_id.as_slice()))
+            .accept_comparison_network(&grant, &execution, fetched(route, events))
+            .await
             .unwrap()
-            .unwrap();
-        let route: [u8; 32] = hex::decode(group.nostr_routing.nostr_group_id_hex)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let candidate = candidate_for_route(route);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !fixture
+            .expect("an unchanged grant owns its result");
+        assert!(
+            !fixture
                 .client
-                .adapter
-                .account_subscription_eose()
+                .admit_comparison_turn(&grant, &mut execution, &mut admission)
                 .await
-                .complete()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the scripted relay completes EOSE before queue admission");
-
-        // Fill the real shared adapter channel without scheduling its router.
-        // The selected account queue is empty; the next send must initially
-        // pend behind another account's routed deliveries.
-        crate::AccountHome::open(fixture._dir.path())
-            .create_account("bob")
-            .unwrap();
-        let mut bob = client_on_app_relay_plane(&fixture.client.app, "bob").await;
-        let bob_group = bob.create_group("backpressure source", &[]).await.unwrap();
-        let bob_record = fixture
-            .client
-            .app
-            .group("bob", &hex::encode(bob_group))
-            .unwrap()
-            .unwrap();
-        let bob_route: [u8; 32] = hex::decode(bob_record.nostr_routing.nostr_group_id_hex)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let bob_event = candidate_for_route(bob_route);
-        let bob_adapter = bob.adapter.clone();
-        let mut context = Context::from_waker(Waker::noop());
-        tokio::task::unconstrained(async {
-            for _ in 0..1024 {
-                assert_eq!(
-                    bob_adapter
-                        .queue_reconciled_event(bob_event.clone())
-                        .await
-                        .unwrap(),
-                    1
-                );
-            }
-        })
-        .await;
-        let adapter = fixture.client.adapter.clone();
-        let mut queued = Box::pin(adapter.queue_reconciled_event(candidate));
-        assert!(matches!(queued.as_mut().poll(&mut context), Poll::Pending));
-
-        let mut state = RecoveryDrainState::new(
-            DrainCompletion::EndOfStoredEvents {
-                silence_budget: Duration::from_secs(5),
-                execution_quantum: Duration::from_secs(5),
-            },
-            None,
+                .unwrap(),
+            "one turn admits at most its bound, then yields"
         );
-        state.drain_started = Instant::now() - Duration::from_secs(6);
-        let mut counts = DrainCounts::default();
-        let (queued_result, drain_result) = tokio::join!(
-            queued.as_mut(),
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    assert!(
-                        fixture
-                            .client
-                            .drain_sdk_relay_slice(
-                                &mut state,
-                                &mut counts,
-                                Some(ONLINE_EPOCH_GAP_DRAIN_SLICE),
-                                false,
-                            )
-                            .await
-                            .unwrap()
-                            .is_none(),
-                        "pending queue admission cannot end the owner drain"
-                    );
-                    if counts.deliveries + counts.skipped > 0 {
-                        break;
-                    }
-                }
-            })
+        assert_eq!(admission.pending.len(), 1);
+        assert!(
+            fixture
+                .client
+                .admit_comparison_turn(&grant, &mut execution, &mut admission)
+                .await
+                .unwrap()
         );
-        drain_result.expect("the owner keeps receiving after its quantum expires");
-        assert_eq!(queued_result.unwrap(), 1);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn comparison_join_timeout_keeps_cursor_and_retry_debt_after_real_queue_block() {
-        let mut fixture = fixture().await;
-        let grant = fixture
-            .client
-            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-            .unwrap()
-            .unwrap();
-        let (route, group_route) = grant
-            .inventory
-            .iter()
-            .find_map(|item| match item.route {
-                TransportReconciliationRoute::Group(id) => Some((item.route.clone(), id)),
-                TransportReconciliationRoute::Inbox => None,
-            })
-            .expect("fixture has a selected group route");
         fixture
             .client
-            .activate_comparison_grant(&grant, None)
+            .finish_comparison_grant(grant, execution, Some(admission))
             .await
             .unwrap();
-        let event = candidate_for_route(group_route);
-        let adapter = fixture.client.adapter.clone();
-        let router_pause = fixture.client.app.relay_plane.pause_router_for_test().await;
-        let mut context = Context::from_waker(Waker::noop());
-        tokio::task::unconstrained(async {
-            for _ in 0..1024 {
-                assert_eq!(
-                    adapter.queue_reconciled_event(event.clone()).await.unwrap(),
-                    1
-                );
-            }
-            let mut blocked = Box::pin(adapter.queue_reconciled_event(event.clone()));
-            assert!(matches!(blocked.as_mut().poll(&mut context), Poll::Pending));
-        })
-        .await;
-        let mut network = network_result(route.clone(), Some([8; 32]));
-        network.routes[0].result = ComparisonRouteWorkResult::Returned(Ok(Some((
-            transport_nostr_adapter::NostrReconciliationSummary {
-                relays_succeeded: 1,
-                ..Default::default()
-            },
-            vec![event],
-        ))));
-        let route_result = network.routes.remove(0);
-        let admission = fixture.client.admit_comparison_route(
-            &fixture.storage,
-            route_result,
-            tokio::time::Instant::now() - Duration::from_millis(1),
+    }
+
+    #[tokio::test]
+    async fn comparison_change_between_turns_keeps_the_prefix_and_certifies_nothing() {
+        let mut fixture = fixture().await;
+        let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
+        let events = (0..MAX_COMPARISON_ADMISSION_PER_TURN + 1)
+            .map(|_| candidate_for_route(group_route))
+            .collect();
+        let mut admission = fixture
+            .client
+            .accept_comparison_network(&grant, &execution, fetched(route.clone(), events))
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .client
+            .admit_comparison_turn(&grant, &mut execution, &mut admission)
+            .await
+            .unwrap();
+        // A newer join revises the comparison slot this grant froze.
+        let goals = fixture
+            .client
+            .comparison_route_goals(unix_now_seconds())
+            .unwrap();
+        fixture
+            .storage
+            .join_recovery_comparison(
+                &[9; 16],
+                crate::client::recovery::wall_now_ms().unwrap(),
+                &goals,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .client
+                .admit_comparison_turn(&grant, &mut execution, &mut admission)
+                .await
+                .unwrap()
         );
-        // The elapsed admission deadline meets the same genuinely pending
-        // production send while the test holds only the router task. Tokio's
-        // real timeout fires before that task is restarted.
-        let super::RouteComparison {
-            route: route_key,
-            outcome,
-            ..
-        } = tokio::time::timeout(Duration::from_secs(1), admission)
+        assert!(admission.invalid);
+        let result = fixture
+            .client
+            .finish_comparison_grant(grant, execution, Some(admission))
             .await
-            .expect("elapsed admission timeout fires on the real queue send")
             .unwrap();
-        assert!(matches!(
-            outcome,
-            storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-        ));
+        assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
         assert_eq!(
             fixture
                 .storage
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
-            None
+            None,
+            "an invalidated pass records no cursor progress"
         );
-        drop(router_pause);
-        let mut counts = DrainCounts::default();
-        let mut verdict = None;
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            fixture.client.complete_recovery_grant_inner(
-                &grant,
-                None,
-                &mut counts,
-                &mut verdict,
-                vec![super::RouteComparison {
-                    route: route_key,
-                    outcome,
-                    certified: false,
-                    fetched: 0,
-                }],
-            ),
-        )
-        .await
-        .expect("owner drains and checkpoints after timed-out admission")
-        .unwrap();
-        let slot = fixture.storage.recovery_comparison().unwrap();
-        assert!(slot.pending());
-        assert!(!slot.plan.unwrap().retry_routes.is_empty());
-        assert!(fixture.client.adapter.pending_delivery_overflow().is_none());
+        assert!(fixture.storage.recovery_comparison().unwrap().pending());
     }
 
     #[tokio::test]
-    async fn comparison_failed_queue_keeps_prepass_cursor_for_unqueued_suffix() {
+    async fn comparison_unadmitted_event_keeps_prepass_cursor() {
         let mut fixture = fixture().await;
-        let grant = fixture
+        let (grant, execution, route, _) = group_route_grant(&mut fixture).await;
+        // This event routes to no route of the account, so it is not admitted.
+        let result = fixture
             .client
-            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-            .unwrap()
-            .unwrap();
-        let route = grant.inventory.first().unwrap().route.clone();
-        let attempt = fixture
-            .client
-            .activate_comparison_grant(&grant, None)
-            .await
-            .unwrap();
-        let mut network = network_result(route.clone(), Some([8; 32]));
-        network.routes[0].result = ComparisonRouteWorkResult::Returned(Ok(Some((
-            transport_nostr_adapter::NostrReconciliationSummary {
-                relays_succeeded: 1,
-                ..Default::default()
-            },
-            vec![candidate()],
-        ))));
-        let result = TEST_COMPARISON_QUEUE_ACTIONS
-            .scope(
-                RefCell::new([TestComparisonQueueAction::Fail].into()),
-                async {
-                    fixture
-                        .client
-                        .finish_comparison_grant(grant, attempt, network)
-                        .await
-                },
-            )
+            .admit_comparison_inline(grant, execution, fetched(route.clone(), vec![candidate()]))
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
@@ -1685,11 +1342,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let route = grant.inventory.first().unwrap().route.clone();
-        let attempt = fixture
-            .client
-            .activate_comparison_grant(&grant, None)
-            .await
-            .unwrap();
+        let attempt = fixture.client.begin_comparison_grant(&grant).await.unwrap();
         let mut network = network_result(route.clone(), Some([8; 32]));
         network.routes[0].result = ComparisonRouteWorkResult::Returned(Ok(Some((
             transport_nostr_adapter::NostrReconciliationSummary {
@@ -1700,7 +1353,7 @@ mod tests {
         ))));
         fixture
             .client
-            .finish_comparison_grant(grant, attempt, network)
+            .admit_comparison_inline(grant, attempt, network)
             .await
             .unwrap();
         assert_eq!(

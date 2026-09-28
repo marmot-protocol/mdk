@@ -60,32 +60,26 @@ impl QueryPolicy for HeldComparisonId {
 
 #[tokio::test]
 async fn comparison_worker_held_sdk_request_keeps_status_command_ready() {
-    run_held_comparison(false, false, false, false).await;
+    run_held_comparison(false, false, false).await;
 }
 
 #[tokio::test]
 async fn explicit_catch_up_waits_for_held_comparison_before_revising_it() {
-    run_held_comparison(false, false, true, false).await;
+    run_held_comparison(false, true, false).await;
 }
 
 #[tokio::test]
 async fn prebarrier_media_runs_before_deferred_explicit_catch_up() {
-    run_held_comparison(false, false, true, true).await;
+    run_held_comparison(false, true, true).await;
 }
 
 #[tokio::test]
 async fn comparison_shutdown_reaps_task_and_releases_credit() {
-    run_held_comparison(true, false, false, false).await;
-}
-
-#[tokio::test]
-async fn comparison_and_known_worker_share_two_credits_during_shutdown() {
-    run_held_comparison(true, true, false, false).await;
+    run_held_comparison(true, false, false).await;
 }
 
 async fn run_held_comparison(
     shutdown_while_held: bool,
-    known_competes: bool,
     catch_up_while_held: bool,
     prebarrier_media: bool,
 ) {
@@ -169,11 +163,6 @@ async fn run_held_comparison(
         .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
         .await
         .unwrap();
-    let known_fixture = if known_competes {
-        Some(bounded_known_fixture_with_pool(pool.clone()).await)
-    } else {
-        None
-    };
     *gate.target.lock().unwrap() = Some(event.id.to_hex());
     assert!(
         !storage
@@ -226,7 +215,7 @@ async fn run_held_comparison(
                 .unwrap()
                 .attempt_serial
                 .saturating_sub(before_retry),
-            bounded_recovery::available_credits(&pool),
+            recovery_credits::available_credits(&pool),
             slot.attempt_serial,
             slot.frozen_revision,
             slot.plan.as_ref().map_or(0, |plan| plan.routes.len()),
@@ -240,8 +229,8 @@ async fn run_held_comparison(
         );
     }
     assert_eq!(
-        bounded_recovery::available_credits(&pool),
-        bounded_recovery::MAX_CONCURRENT_JOBS - 1
+        recovery_credits::available_credits(&pool),
+        recovery_credits::MAX_CONCURRENT_JOBS - 1
     );
     assert_eq!(
         storage.recovery_retry_state().unwrap().attempt_serial,
@@ -407,82 +396,15 @@ async fn run_held_comparison(
     } else {
         None
     };
-    if known_competes {
-        let fixture = known_fixture.as_ref().unwrap();
-        fixture
-            .relay
-            .acquisition_block
-            .store(true, Ordering::SeqCst);
-        let entered = fixture.relay.acquisition_entered.notified();
-        tokio::pin!(entered);
-        entered.as_mut().enable();
-        wake_bounded_fixture(fixture).await;
-        timeout(Duration::from_secs(5), entered)
-            .await
-            .expect("known-event worker holds the second shared credit");
-        assert_eq!(bounded_recovery::available_credits(&pool), 0);
-        assert!(bounded_recovery::try_acquire_recovery_credit(&pool).is_none());
-
-        // A separate ordinary runtime still receives the default process
-        // pool while this fixture owns its private two-credit pool.
-        let ordinary_dir = tempfile::tempdir().unwrap();
-        let ordinary_account = AccountHome::open(ordinary_dir.path())
-            .create_account("ordinary")
-            .unwrap();
-        let ordinary_app = MarmotApp::with_relay_and_config(
-            ordinary_dir.path(),
-            url.clone(),
-            crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
-        );
-        let ordinary = crate::MarmotAppRuntime::new(ordinary_app);
-        let another_dir = tempfile::tempdir().unwrap();
-        let another = crate::MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
-            another_dir.path(),
-            url.clone(),
-            crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
-        ));
-        let ordinary_pool = ordinary.shared_services().recovery_credit_pool();
-        assert!(Arc::ptr_eq(
-            &ordinary_pool,
-            &another.shared_services().recovery_credit_pool()
-        ));
-        assert!(Arc::ptr_eq(
-            &ordinary_pool,
-            &bounded_recovery::shared_recovery_credit_pool()
-        ));
-        assert!(!Arc::ptr_eq(&ordinary_pool, &pool));
-        ordinary.reconcile_accounts().await.unwrap();
-        let ordinary_commands = ordinary
-            .accounts()
-            .worker_commands(&ordinary_account.label)
-            .await
-            .unwrap();
-        let (respond, status) = oneshot::channel();
-        ordinary_commands
-            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
-                group_id: GroupId::new(vec![9; 16]),
-                respond,
-            })
-            .unwrap();
-        let _ = timeout(Duration::from_secs(2), status)
-            .await
-            .expect("ordinary runtime command remains serviceable")
-            .unwrap();
-        ordinary.shutdown_and_close().await.unwrap();
-        another.shutdown_and_close().await.unwrap();
-    }
     if shutdown_while_held {
         runtime.shutdown_and_close().await.unwrap();
-        if let Some(fixture) = known_fixture {
-            fixture.runtime.shutdown_and_close().await.unwrap();
-        }
     } else {
         gate.hold_exact.store(false, Ordering::SeqCst);
         gate.release.notify_waiters();
         timeout(Duration::from_secs(12), async {
             loop {
-                if bounded_recovery::available_credits(&pool)
-                    == bounded_recovery::MAX_CONCURRENT_JOBS
+                if recovery_credits::available_credits(&pool)
+                    == recovery_credits::MAX_CONCURRENT_JOBS
                 {
                     break;
                 }
@@ -519,8 +441,8 @@ async fn run_held_comparison(
     gate.hold_exact.store(false, Ordering::SeqCst);
     gate.release.notify_waiters();
     assert_eq!(
-        bounded_recovery::available_credits(&pool),
-        bounded_recovery::MAX_CONCURRENT_JOBS
+        recovery_credits::available_credits(&pool),
+        recovery_credits::MAX_CONCURRENT_JOBS
     );
 }
 
@@ -546,7 +468,7 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
     let storage = app.account_storage(&account.label).unwrap();
-    let credits = bounded_recovery::hold_all_credits_for_test(&pool);
+    let credits = recovery_credits::hold_all_credits_for_test(&pool);
     let commands = runtime
         .accounts()
         .worker_commands(&account.label)
@@ -680,11 +602,8 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .unwrap()
         .unwrap();
     assert!(client.comparison_offload_eligible(&grant).unwrap());
-    let attempt = client
-        .activate_comparison_grant(&grant, None)
-        .await
-        .unwrap();
-    let credit = bounded_recovery::try_acquire_recovery_credit(&pool).unwrap();
+    let execution = client.begin_comparison_grant(&grant).await.unwrap();
+    let credit = recovery_credits::try_acquire_recovery_credit(&pool).unwrap();
     let mut job = ComparisonNetworkJob::start(&client, &grant, credit, None).unwrap();
     let (credit, network) = timeout(Duration::from_secs(12), job.wait())
         .await
@@ -704,7 +623,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
             .is_err()
     );
     let result = client
-        .finish_comparison_grant(grant, attempt, network)
+        .admit_comparison_inline(grant, execution, network)
         .await
         .unwrap();
     drop(credit);

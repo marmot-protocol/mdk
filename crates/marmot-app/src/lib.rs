@@ -189,9 +189,7 @@ pub use cgka_traits::{
     PollProjection, PollType,
 };
 pub use client::AppClient;
-pub(crate) use client::{
-    ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
-};
+pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
     AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
@@ -1812,8 +1810,6 @@ impl MarmotApp {
         let mut client = AppClient {
             #[cfg(test)]
             test_recovery_selection_witness: None,
-            #[cfg(test)]
-            test_recovery_phase_witness: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
             audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
             #[cfg(test)]

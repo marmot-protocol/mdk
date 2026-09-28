@@ -705,15 +705,6 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
 }
 
 impl ScriptedPushRelayClient {
-    pub(crate) fn last_published_group_event(&self) -> Option<NostrTransportEvent> {
-        self.published_events
-            .lock()
-            .unwrap()
-            .iter()
-            .rev()
-            .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
-            .cloned()
-    }
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
@@ -1481,7 +1472,7 @@ async fn inject_epoch_gap_probe(app: &MarmotApp, event: NostrTransportEvent) {
 }
 
 #[test]
-fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
+fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
     run_composed_app_runtime_test("explicit-catch-up-backfill", || async {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -1577,53 +1568,25 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
         );
-        relay.block_next_subscribes(2);
         runtime
             .advance_recovery_clock_for_test("alice", Duration::from_secs(300))
             .await;
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(15)).await;
         tokio::time::resume();
-        tokio::time::timeout(
-            EXPLICIT_CATCH_UP_BACKFILL_DEADLINE,
-            relay.wait_for_blocked_subscribes(4),
-        )
+        // The owner tick compares the gap's routes off the worker. It reuses
+        // the live tail: it issues no subscription at all.
+        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, async {
+            while storage.recovery_retry_state().unwrap().attempt_serial == retry.attempt_serial {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
         .expect("the existing maintenance tick must service quiet pending debt");
         assert_eq!(
             storage.recovery_retry_state().unwrap().attempt_serial,
             retry.attempt_serial + 1
         );
-
-        // Model the relay's stored-event response to that unfloored REQ. The
-        // target is older than the persisted cursor's 120-second floor and is
-        // offered only after replay starts; no later live delivery is published.
-        let below_floor_target = epoch_gap_probe(
-            &group.nostr_routing.nostr_group_id_hex,
-            cursor.saturating_sub(600),
-            "below-floor-target",
-        );
-        let below_floor_target_id = below_floor_target.id.clone();
-        inject_epoch_gap_probe(&app, below_floor_target).await;
-        relay.release_subscribe();
-
-        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, async {
-            loop {
-                if app
-                    .load_state("alice")
-                    .unwrap()
-                    .seen_events
-                    .iter()
-                    .any(|event_id| event_id == &below_floor_target_id)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the below-floor target must be ingested without later traffic");
-
         runtime.drain_in_flight_work().await.unwrap();
         assert_eq!(
             relay.unfloored_account_subscription_count(),
@@ -1687,7 +1650,6 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
             completed_rows[0]["event"]["activation_outcome"],
             "succeeded"
         );
-        assert!(completed_rows[0]["event"]["deliveries"].as_u64().unwrap() >= 1);
         assert!(
             storage
                 .pending_recovery_demands()

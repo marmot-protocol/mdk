@@ -388,6 +388,7 @@ impl AccountRecoveryOwner {
 
     /// Wall clock is sampled only on open. Later wall-clock corrections cannot
     /// repeatedly reopen the authorization gate within this process.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
     pub(crate) fn retry_remaining(
         &self,
         storage: &SqliteAccountStorage,
@@ -1534,14 +1535,7 @@ impl AppClient {
         }
         let comparison = storage.recovery_comparison()?;
         let mut comparison_goals = if grant.comparison_revision.is_some() {
-            // The frozen window must reach every selected goal, or debt newer
-            // than the comparison request could never certify on this pass.
-            let until = goals
-                .iter()
-                .flat_map(|(_, scopes)| scopes)
-                .map(|scope| scope.until_seconds)
-                .fold(comparison.requested_until_seconds, u64::max);
-            self.comparison_route_goals(until)?
+            self.comparison_route_goals(comparison.requested_until_seconds)?
         } else {
             Vec::new()
         };
@@ -3582,13 +3576,14 @@ mod tests {
             .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
             .unwrap()
             .unwrap();
-        assert!(first.fence.obligations.is_empty());
+        // The joined cold-start debt rides with the comparison it requested.
+        assert_eq!(first.fence.obligations.len(), 1);
         let first = freeze_comparison(&mut owner, &storage, first);
         assert_eq!(
             first.comparison_plan.as_ref().unwrap().live_since_seconds,
             Some(90)
         );
-        assert!(first.plan().unwrap().is_empty());
+        assert_eq!(first.plan().unwrap().len(), 1);
         drop(first); // Cancelled after freeze; the pending slot and cost survive.
         let before = storage.recovery_retry_state().unwrap();
         storage
@@ -3637,9 +3632,10 @@ mod tests {
                 .unwrap()
         );
         assert!(storage.recovery_comparison().unwrap().pending());
+        // Cancelled passes checkpoint nothing: the debt stays ready.
         assert_eq!(
             storage.pending_recovery_demands().unwrap()[0].eligibility,
-            storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+            storage_sqlite::RecoveryEligibility::Ready
         );
     }
 
@@ -3654,7 +3650,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(first.comparison_revision.is_some());
-        assert_eq!(first.fence.obligations.len(), 1);
+        // The loss and the joined cold-start debt share the comparison's cost.
+        assert_eq!(first.fence.obligations.len(), 2);
         let first = freeze_comparison(&mut owner, &storage, first);
         drop(first);
         assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
@@ -3673,7 +3670,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(next.fence.obligations.len(), 1);
+        assert_eq!(next.fence.obligations.len(), 2);
         assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 2);
         drop(next);
         assert!(
@@ -4021,14 +4018,13 @@ mod tests {
             .unwrap();
         assert!(!storage.recovery_comparison().unwrap().pending());
         assert!(
-            storage
+            !storage
                 .pending_recovery_demands()
                 .unwrap()
                 .iter()
-                .any(
-                    |d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory
-                        && d.eligibility == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
-                )
+                .any(|d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory),
+            "the inbox certificate from the first pass and the group certificate from the \
+             retry together complete the cold-start debt"
         );
         let revision = storage.recovery_comparison().unwrap().revision;
         let cost = storage.recovery_retry_state().unwrap();
@@ -4057,7 +4053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_comparison_executor_keeps_intent_cost_and_parked_coverage() {
+    async fn cancelled_comparison_executor_keeps_intent_cost_and_coverage() {
         use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
@@ -4097,12 +4093,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // A cancelled pass checkpoints nothing: the debt stays ready for the
+        // next paced grant.
         assert!(
             storage
                 .pending_recovery_demands()
                 .unwrap()
                 .iter()
-                .all(|d| d.eligibility == storage_sqlite::RecoveryEligibility::NeedsDeepRepair)
+                .all(|d| d.eligibility == storage_sqlite::RecoveryEligibility::Ready)
         );
     }
 
@@ -4231,10 +4229,8 @@ mod tests {
             2,
             "unattempted route coverage cannot disappear"
         );
-        assert_eq!(
-            debt.eligibility,
-            storage_sqlite::RecoveryEligibility::NeedsDeepRepair
-        );
+        // One quiet pass is below the parking budget.
+        assert_eq!(debt.eligibility, storage_sqlite::RecoveryEligibility::Retry);
     }
 
     #[test]

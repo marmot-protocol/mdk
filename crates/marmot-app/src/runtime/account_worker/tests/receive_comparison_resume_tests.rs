@@ -224,8 +224,8 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
                 && trace
                     .iter()
                     .any(|kind| matches!(*kind, "route_relay_failed" | "route_timed_out"))
-                && bounded_recovery::available_credits(&pool)
-                    == bounded_recovery::MAX_CONCURRENT_JOBS
+                && recovery_credits::available_credits(&pool)
+                    == recovery_credits::MAX_CONCURRENT_JOBS
             {
                 break;
             }
@@ -353,8 +353,8 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
         .unwrap();
     assert_eq!(gate.active.load(Ordering::SeqCst), 1);
     assert_eq!(
-        bounded_recovery::available_credits(&pool),
-        bounded_recovery::MAX_CONCURRENT_JOBS - 1,
+        recovery_credits::available_credits(&pool),
+        recovery_credits::MAX_CONCURRENT_JOBS - 1,
         "the selected comparison task still owns its credit through the status probe"
     );
     if shutdown_while_held {
@@ -365,8 +365,8 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
             .expect("shutdown reaps the Receive comparison without relay release")
             .unwrap();
         assert_eq!(
-            bounded_recovery::available_credits(&pool),
-            bounded_recovery::MAX_CONCURRENT_JOBS
+            recovery_credits::available_credits(&pool),
+            recovery_credits::MAX_CONCURRENT_JOBS
         );
         gate.release();
         relay.shutdown();
@@ -424,7 +424,7 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
     assert_eq!(gate.active.load(Ordering::SeqCst), 1);
     gate.release();
     timeout(Duration::from_secs(15), async {
-        while bounded_recovery::available_credits(&pool) != bounded_recovery::MAX_CONCURRENT_JOBS {
+        while recovery_credits::available_credits(&pool) != recovery_credits::MAX_CONCURRENT_JOBS {
             sleep(Duration::from_millis(10)).await;
         }
     })

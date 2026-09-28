@@ -1221,11 +1221,26 @@ impl NostrTransportAdapter {
             .await
     }
 
-    async fn handle_relay_event_scoped(
+    /// Route a comparison result to one account without the delivery queue.
+    /// The caller admits each delivery itself, a few per worker turn.
+    pub async fn reconciled_deliveries(
+        &self,
+        account_id: &MemberId,
+        relay_event: NostrRelayEvent,
+    ) -> Result<Vec<TransportDelivery>, TransportAdapterError> {
+        let deliveries = self.deliveries_for(relay_event, Some(account_id)).await?;
+        self.state
+            .write()
+            .await
+            .record_inbound_event(deliveries.len());
+        Ok(deliveries)
+    }
+
+    async fn deliveries_for(
         &self,
         relay_event: NostrRelayEvent,
         account_id: Option<&MemberId>,
-    ) -> Result<usize, TransportAdapterError> {
+    ) -> Result<Vec<TransportDelivery>, TransportAdapterError> {
         let message = relay_event
             .event
             .to_transport_message()
@@ -1238,26 +1253,37 @@ impl NostrTransportAdapter {
         if let Some(account_id) = account_id {
             routes.retain(|route| &route.account_id == account_id);
         }
+        let wire = inbound_wire_metadata(&relay_event.event, &message.envelope);
+        Ok(routes
+            .into_iter()
+            .map(|route| TransportDelivery {
+                account_id: route.account_id,
+                group_id_hint: route.group_id_hint,
+                message: message.clone(),
+                received_at,
+                source: TransportDeliverySource {
+                    transport: TransportSource(NOSTR_SOURCE.into()),
+                    plane: route.plane,
+                    endpoint: Some(relay_event.endpoint.clone()),
+                    subscription_id: relay_event.subscription_id.clone(),
+                    wire: Some(wire.clone()),
+                },
+            })
+            .collect())
+    }
 
-        let mut delivered = 0;
-        for route in routes {
+    async fn handle_relay_event_scoped(
+        &self,
+        relay_event: NostrRelayEvent,
+        account_id: Option<&MemberId>,
+    ) -> Result<usize, TransportAdapterError> {
+        let deliveries = self.deliveries_for(relay_event, account_id).await?;
+        let delivered = deliveries.len();
+        for delivery in deliveries {
             self.delivery_tx
-                .send(TransportDelivery {
-                    account_id: route.account_id,
-                    group_id_hint: route.group_id_hint,
-                    message: message.clone(),
-                    received_at,
-                    source: TransportDeliverySource {
-                        transport: TransportSource(NOSTR_SOURCE.into()),
-                        plane: route.plane,
-                        endpoint: Some(relay_event.endpoint.clone()),
-                        subscription_id: relay_event.subscription_id.clone(),
-                        wire: Some(inbound_wire_metadata(&relay_event.event, &message.envelope)),
-                    },
-                })
+                .send(delivery)
                 .await
                 .map_err(|_| TransportAdapterError::Closed)?;
-            delivered += 1;
         }
 
         // Delivery only. The relay pool emits one deduplicated `Event` per

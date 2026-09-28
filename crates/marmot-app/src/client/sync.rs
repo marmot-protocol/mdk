@@ -15,7 +15,6 @@ use storage_sqlite::{
 use tokio::time::timeout;
 use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrReconciliationItem as AdapterReconciliationItem,
-    SubscriptionAttempt,
 };
 
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
@@ -45,144 +44,10 @@ use super::epoch_stall::BackfillDecision;
 use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
 use crate::config::CursorPersistence;
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TestRecoveryPhase {
-    Activation,
-    Reconciliation,
-    Completion,
-}
-
-#[cfg(test)]
-#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TestRecoveryPhaseSnapshot {
-    pub(crate) attempt_serial: u64,
-    pub(crate) phase: TestRecoveryPhase,
-}
-
-#[cfg(test)]
-#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TestRecoveryTerminal {
-    pub(crate) attempt_serial: u64,
-    pub(crate) local_epoch_after: Option<u64>,
-    pub(crate) deliveries: u64,
-    pub(crate) skipped: u64,
-    pub(crate) qualified: bool,
-    pub(crate) result_ok: bool,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct TestRecoveryPhaseState {
-    selected_attempt: Option<u64>,
-    active: Option<TestRecoveryPhaseSnapshot>,
-    terminal: Option<TestRecoveryTerminal>,
-    target_terminals: Vec<TestRecoveryTerminal>,
-    target_group_id: Option<GroupId>,
-}
-
-/// Default-disabled witness for one selected EpochGap grant on one account.
-/// It records whole AppClient phase futures, not an individual SDK request.
-#[cfg(test)]
-#[derive(Clone, Default)]
-pub(crate) struct TestRecoveryPhaseWitness {
-    armed: std::sync::Arc<AtomicBool>,
-    state: std::sync::Arc<std::sync::Mutex<TestRecoveryPhaseState>>,
-}
-
-#[cfg(test)]
-#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
-impl TestRecoveryPhaseWitness {
-    pub(crate) fn arm(&self) {
-        *self.state.lock().unwrap() = TestRecoveryPhaseState::default();
-        self.armed.store(true, Ordering::SeqCst);
-    }
-
-    pub(crate) fn active(&self) -> Option<TestRecoveryPhaseSnapshot> {
-        self.state.lock().unwrap().active
-    }
-
-    pub(crate) fn terminal(&self) -> Option<TestRecoveryTerminal> {
-        self.state.lock().unwrap().terminal
-    }
-
-    pub(crate) fn target_terminals(&self) -> Vec<TestRecoveryTerminal> {
-        self.state.lock().unwrap().target_terminals.clone()
-    }
-
-    pub(crate) fn set_target_group_id(&self, id: GroupId) {
-        self.state.lock().unwrap().target_group_id = Some(id);
-    }
-
-    pub(crate) fn is_target_group(&self, id: &GroupId) -> bool {
-        self.state.lock().unwrap().target_group_id.as_ref() == Some(id)
-    }
-
-    fn record_terminal(&self, terminal: TestRecoveryTerminal) {
-        let mut state = self.state.lock().unwrap();
-        if state.selected_attempt.is_some() {
-            state.target_terminals.push(terminal);
-        }
-        if state.selected_attempt == Some(terminal.attempt_serial) {
-            state.terminal = Some(terminal);
-        }
-    }
-
-    fn enter(
-        &self,
-        attempt_serial: u64,
-        phase: TestRecoveryPhase,
-    ) -> Option<TestRecoveryPhaseGuard> {
-        if !self.armed.load(Ordering::SeqCst) {
-            return None;
-        }
-        let mut state = self.state.lock().unwrap();
-        match state.selected_attempt {
-            Some(selected) if selected != attempt_serial => return None,
-            None => state.selected_attempt = Some(attempt_serial),
-            _ => {}
-        }
-        assert!(state.active.is_none(), "recovery phases must not overlap");
-        state.active = Some(TestRecoveryPhaseSnapshot {
-            attempt_serial,
-            phase,
-        });
-        Some(TestRecoveryPhaseGuard {
-            witness: self.clone(),
-            attempt_serial,
-            phase,
-        })
-    }
-}
-
-#[cfg(test)]
-struct TestRecoveryPhaseGuard {
-    witness: TestRecoveryPhaseWitness,
-    attempt_serial: u64,
-    phase: TestRecoveryPhase,
-}
-
-#[cfg(test)]
-impl Drop for TestRecoveryPhaseGuard {
-    fn drop(&mut self) {
-        let mut state = self.witness.state.lock().unwrap();
-        if state.active.is_some_and(|active| {
-            active.attempt_serial == self.attempt_serial && active.phase == self.phase
-        }) {
-            state.active = None;
-        }
-    }
-}
-
 mod comparison_job;
 #[cfg(test)]
 pub(crate) use comparison_job::TestComparisonActivityWitness;
-pub(crate) use comparison_job::{
-    ComparisonActivation, ComparisonNetworkJob, ComparisonNetworkResult, EpochGapQueueJob,
-    RouteSubmission,
-};
+pub(crate) use comparison_job::{ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob};
 
 pub(crate) enum PendingRecoverySelection {
     NotPending,
@@ -524,10 +389,6 @@ pub(crate) struct RecoveryDrainState {
     gate_polled_at: std::time::Instant,
 }
 
-/// Owner scheduling budget between completed recovery deliveries. The
-/// transport receive deadline and the recovery silence budget span slices.
-const ONLINE_EPOCH_GAP_DRAIN_SLICE: Duration = Duration::from_millis(40);
-
 /// The audit and loss guard of one already-reserved executor attempt. Both the
 /// inline executor and the worker continuation close it through the same
 /// terminal path.
@@ -540,21 +401,6 @@ pub(crate) struct RecoveryExecutionState {
     counts: DrainCounts,
     activation: EpochBackfillActivationOutcome,
     drain_verdict: Option<DrainVerdict>,
-}
-
-pub(crate) struct OnlineEpochGapRecovery {
-    grant: AttemptGrant,
-    execution: RecoveryExecutionState,
-    subscription_attempt: SubscriptionAttempt,
-    drain: Option<RecoveryDrainState>,
-    #[cfg(test)]
-    phase: Option<TestRecoveryPhaseGuard>,
-}
-
-impl OnlineEpochGapRecovery {
-    pub(crate) fn grant(&self) -> &AttemptGrant {
-        &self.grant
-    }
 }
 
 impl RecoveryDrainState {
@@ -766,6 +612,17 @@ struct DeliveryIngest {
     /// it is deliberately narrower than `must_stay_fetchable`: an unknown-group
     /// object was not refused for want of a resource.
     refused_group: Option<cgka_traits::GroupId>,
+}
+
+/// How one comparison-fetched delivery settled on admission.
+pub(crate) enum RecoveredDelivery {
+    AlreadyHeld,
+    /// `unpersisted`: the engine kept no durable trace, so the comparison
+    /// did not admit it. `refused_group`: a local resource bound refused it.
+    Ingested {
+        unpersisted: bool,
+        refused_group: Option<cgka_traits::GroupId>,
+    },
 }
 
 /// One compared route: its settlement outcome, and whether the comparison
@@ -2285,13 +2142,33 @@ impl AppClient {
         // A spilled delivery gets exactly the live path's one ingest attempt.
         let result = self.ingest_received_delivery_once(delivery).await;
         self.settle_spilled_delivery();
-        result
+        result.map(|(summary, _)| summary)
+    }
+
+    /// Admit one delivery a comparison fetched through the ordinary ingest
+    /// path, without the live queue. An event the account already holds needs
+    /// no ingest.
+    pub(crate) async fn admit_recovered_delivery(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<(SyncSummary, RecoveredDelivery), AppError> {
+        let event_id = hex::encode(delivery.message.id.as_slice());
+        if self.transport_receipts()?.contains(&event_id) {
+            self.record_durable_transport_reconciliation_delivery(&delivery);
+            return Ok((SyncSummary::default(), RecoveredDelivery::AlreadyHeld));
+        }
+        self.ingest_received_delivery_once(delivery)
+            .await
+            .map_err(|(_, _, _, error, _)| error)
     }
 
     async fn ingest_received_delivery_once(
         &mut self,
         delivery: cgka_traits::TransportDelivery,
-    ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {
+    ) -> Result<
+        (SyncSummary, RecoveredDelivery),
+        (SyncSummary, bool, bool, AppError, SyncFailureStage),
+    > {
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
@@ -2317,6 +2194,10 @@ impl AppClient {
                     SyncFailureStage::CgkaIngest,
                 )
             })?;
+        let settled = RecoveredDelivery::Ingested {
+            unpersisted: ingested.must_stay_fetchable,
+            refused_group: ingested.refused_group.clone(),
+        };
         if self.delivery_loss_blocks_cursor() {
             // `record_drop` publishes this process-local fence at the exact
             // omission, before marker I/O or the reserved control record can
@@ -2378,7 +2259,7 @@ impl AppClient {
         }
         self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
         self.drain_epoch_stall_escalations(&mut summary);
-        Ok(summary)
+        Ok((summary, settled))
     }
 
     fn checkpoint_error_stage_and_cursor(
@@ -3720,7 +3601,7 @@ impl AppClient {
     ) {
         // Demand is already authoritative in SQL. Hydration does not rebuild
         // an independent execution queue or reset retry cost.
-        self.drop_terminal_epoch_backfill_intents();
+        self.drop_settled_epoch_backfill_intents();
     }
 
     /// Write the detector's frozen-epoch evidence for `groups` to durable
@@ -4030,7 +3911,7 @@ impl AppClient {
     /// warn is in here so both callers share it — but a caller holding
     /// something that would strand the evidence row on failure has to be able
     /// to see it, which is what
-    /// [`Self::drop_terminal_epoch_backfill_intents`] does with the intent row.
+    /// [`Self::drop_settled_epoch_backfill_intents`] does with the intent row.
     fn retire_terminal_group_recovery(&mut self, group_id: &cgka_traits::GroupId) -> bool {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_terminal_recovery_retire) {
@@ -4088,7 +3969,11 @@ impl AppClient {
     /// Terminal retirement applies to every epoch of the group. Ordinary
     /// completion instead uses the owner's exact obligation revision and scope
     /// tokens, so stale attempts cannot retire newer demand.
-    fn drop_terminal_epoch_backfill_intents(&mut self) {
+    ///
+    /// An epoch gap also completes on its own evidence: once the group's local
+    /// epoch moves past the stalled one, that exact gap no longer applies. A
+    /// later stall arms a new gap at its own epoch.
+    fn drop_settled_epoch_backfill_intents(&mut self) {
         let intents = match self
             .app
             .account_storage(&self.state.label)
@@ -4096,11 +3981,30 @@ impl AppClient {
         {
             Ok(intents) => intents,
             Err(error) => {
-                tracing::warn!(target: "marmot_app::epoch_stall", method = "drop_terminal_epoch_backfill_intents",
-                    error_kind=error.privacy_safe_kind(), "could not inspect terminal recovery demand");
+                tracing::warn!(target: "marmot_app::epoch_stall", method = "drop_settled_epoch_backfill_intents",
+                    error_kind=error.privacy_safe_kind(), "could not inspect settled recovery demand");
                 return;
             }
         };
+        let resolved = intents
+            .iter()
+            .filter(|intent| {
+                hex::decode(&intent.group_id_hex)
+                    .ok()
+                    .and_then(|group| self.local_epoch_for_group(&cgka_traits::GroupId::new(group)))
+                    .is_some_and(|epoch| epoch > intent.stalled_epoch)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !resolved.is_empty()
+            && let Err(error) = self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| Ok(storage.clear_epoch_backfill_intents(&resolved)?))
+        {
+            tracing::warn!(target: "marmot_app::epoch_stall", method = "drop_settled_epoch_backfill_intents",
+                error_kind=error.privacy_safe_kind(), "could not retire resolved epoch-gap demand");
+        }
         let mut terminal = self
             .pending_recovery_arm_writes
             .keys()
@@ -4206,6 +4110,9 @@ impl AppClient {
     /// replaying the account's full transport history (`since = None`). One replay
     /// re-fetches every group, so the detector collapses simultaneously-stuck
     /// groups into a single replay. A no-op when nothing stalled.
+    /// Select and execute one grant inline: a test seam. The worker offloads
+    /// eligible grants through its owned comparison job instead.
+    #[cfg(test)]
     pub(crate) async fn run_pending_epoch_backfill(
         &mut self,
         seam: EpochBackfillExecutionSeam,
@@ -4225,7 +4132,7 @@ impl AppClient {
         &mut self,
         seam: EpochBackfillExecutionSeam,
     ) -> Result<PendingRecoverySelection, AppError> {
-        self.drop_terminal_epoch_backfill_intents();
+        self.drop_settled_epoch_backfill_intents();
         let storage = self.app.account_storage(&self.state.label)?;
         if storage.pending_recovery_demands()?.is_empty()
             && !storage.recovery_comparison()?.pending()
@@ -4395,19 +4302,6 @@ impl AppClient {
                 .account_storage(&self.state.label)
                 .and_then(|storage| Ok(storage.recovery_obligation_is_satisfied(id, revision)?))
                 .unwrap_or(false);
-            #[cfg(test)]
-            if let Some(witness) = &self.test_recovery_phase_witness
-                && witness.is_target_group(&group)
-            {
-                witness.record_terminal(TestRecoveryTerminal {
-                    attempt_serial: grant.reservation.attempt_serial,
-                    local_epoch_after: after,
-                    deliveries: execution.counts.deliveries,
-                    skipped: execution.counts.skipped,
-                    qualified,
-                    result_ok: result.is_ok(),
-                });
-            }
             self.record_epoch_stall_backfill_terminal(
                 &group,
                 qualified && after.is_some(),
@@ -4490,254 +4384,6 @@ impl AppClient {
         result
     }
 
-    /// Start the same reserved executor at the worker's Receive seam, then
-    /// leave only immutable reconciliation I/O outside the account owner.
-    pub(crate) async fn begin_online_epoch_gap(
-        &mut self,
-        grant: AttemptGrant,
-    ) -> Result<OnlineEpochGapRecovery, AppError> {
-        let mut execution = self
-            .begin_recovery_execution(&grant)
-            .map_err(|failure| failure.source)?;
-        #[cfg(test)]
-        let phase = self.recovery_phase_guard(&grant, TestRecoveryPhase::Activation);
-        let activation = self
-            .activate_recovery_grant_inner(&grant, None, &mut execution.activation)
-            .await;
-        #[cfg(test)]
-        drop(phase);
-        if let Err(failure) = activation {
-            return self
-                .finish_recovery_execution(&grant, execution, Err(failure), false)
-                .map(|_| unreachable!("failed activation cannot complete"))
-                .map_err(|failure| failure.source);
-        }
-        let Some(subscription_attempt) = self.adapter.account_subscription_attempt().await else {
-            let failure = ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                cgka_traits::TransportAdapterError::Subscription(
-                    "activated recovery subscription disappeared".into(),
-                )
-                .into(),
-                SyncFailureStage::TransportActivation,
-            );
-            return self
-                .finish_recovery_execution(&grant, execution, Err(failure), false)
-                .map(|_| unreachable!("missing activation cannot complete"))
-                .map_err(|failure| failure.source);
-        };
-        #[cfg(test)]
-        let phase = self.recovery_phase_guard(&grant, TestRecoveryPhase::Reconciliation);
-        Ok(OnlineEpochGapRecovery {
-            grant,
-            execution,
-            subscription_attempt,
-            drain: None,
-            #[cfg(test)]
-            phase,
-        })
-    }
-
-    /// No network byte is queued until the worker checks the frozen owner and
-    /// live activation. A changed comparison slot cannot be substituted.
-    pub(crate) async fn online_epoch_gap_network_stable(
-        &mut self,
-        recovery: &OnlineEpochGapRecovery,
-    ) -> Result<bool, AppError> {
-        let storage = self.app.account_storage(&self.state.label)?;
-        storage.synchronize_account_delivery_loss(&self.state.label)?;
-        drop(self.transport_receipts()?);
-        self.observe_recovery_route_policy()?;
-        let current = storage.recovery_revision_fence()?;
-        Ok(current.loss_revision == recovery.grant.fence.loss_revision
-            && current.route_revision == recovery.grant.fence.route_revision
-            && current.inventory_revision == recovery.grant.fence.inventory_revision
-            && storage.recovery_retry_state()?.attempt_serial
-                == recovery.grant.reservation.attempt_serial
-            && !storage.recovery_comparison()?.pending()
-            && recovery
-                .grant
-                .fence
-                .obligations
-                .iter()
-                .all(|selected| current.obligations.contains(selected))
-            && self.adapter.account_subscription_attempt().await
-                == Some(recovery.subscription_attempt))
-    }
-
-    pub(crate) fn online_epoch_gap_start_drain(&self, recovery: &mut OnlineEpochGapRecovery) {
-        #[cfg(test)]
-        {
-            drop(recovery.phase.take());
-            recovery.phase =
-                self.recovery_phase_guard(&recovery.grant, TestRecoveryPhase::Completion);
-        }
-        recovery.drain = Some(RecoveryDrainState::new(
-            DrainCompletion::EndOfStoredEvents {
-                silence_budget: self.epoch_backfill_eose_wait(),
-                execution_quantum: self.epoch_backfill_execution_quantum(),
-            },
-            self.state.last_transport_timestamp,
-        ));
-    }
-
-    pub(crate) async fn online_epoch_gap_drain_slice(
-        &mut self,
-        recovery: &mut OnlineEpochGapRecovery,
-        admission_complete: bool,
-    ) -> Result<Option<(SyncSummary, DrainVerdict)>, ClassifiedSyncFailure> {
-        self.drain_sdk_relay_slice(
-            recovery.drain.as_mut().expect("online drain initialized"),
-            &mut recovery.execution.counts,
-            Some(ONLINE_EPOCH_GAP_DRAIN_SLICE),
-            admission_complete,
-        )
-        .await
-    }
-
-    pub(crate) async fn finish_online_epoch_gap(
-        &mut self,
-        mut recovery: OnlineEpochGapRecovery,
-        drain: Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure>,
-        submissions: Vec<RouteSubmission>,
-    ) -> Result<EpochBackfillRunOutcome, AppError> {
-        #[cfg(test)]
-        drop(recovery.phase.take());
-        let result = match drain {
-            Ok((summary, verdict)) => {
-                let outcomes = self
-                    .app
-                    .account_storage(&self.state.label)
-                    .and_then(|storage| {
-                        submissions
-                            .into_iter()
-                            .map(|route| self.persist_reconciliation_submission(&storage, route))
-                            .collect::<Result<Vec<_>, AppError>>()
-                    })
-                    .map_err(|error| {
-                        ClassifiedSyncFailure::at_stage(
-                            summary.clone(),
-                            error,
-                            SyncFailureStage::StatePersist,
-                        )
-                    });
-                match outcomes {
-                    Ok(outcomes) => {
-                        self.finish_recovery_grant_after_drain(
-                            &recovery.grant,
-                            &mut recovery.execution.counts,
-                            &mut recovery.execution.drain_verdict,
-                            outcomes,
-                            summary,
-                            verdict,
-                        )
-                        .await
-                    }
-                    Err(failure) => Err(failure),
-                }
-            }
-            Err(failure) => Err(failure),
-        };
-        let selected = recovery.grant.fence.obligations.clone();
-        let result =
-            self.finish_recovery_execution(&recovery.grant, recovery.execution, result, false);
-        match result {
-            Ok(summary) => {
-                let storage = self.app.account_storage(&self.state.label)?;
-                let complete = selected.iter().all(|(id, revision)| {
-                    storage
-                        .recovery_obligation_is_satisfied(*id, *revision)
-                        .unwrap_or(false)
-                });
-                Ok(if complete {
-                    EpochBackfillRunOutcome::Completed(summary)
-                } else {
-                    EpochBackfillRunOutcome::Incomplete(summary)
-                })
-            }
-            Err(failure) => {
-                self.pending_failed_sync_summary
-                    .merge(failure.partial_summary);
-                Err(failure.source)
-            }
-        }
-    }
-
-    pub(crate) fn abandon_online_epoch_gap(
-        &mut self,
-        recovery: OnlineEpochGapRecovery,
-    ) -> Result<EpochBackfillRunOutcome, AppError> {
-        #[cfg(test)]
-        let mut recovery = recovery;
-        #[cfg(test)]
-        drop(recovery.phase.take());
-        self.finish_recovery_execution(
-            &recovery.grant,
-            recovery.execution,
-            Ok(SyncSummary::default()),
-            false,
-        )
-        .map_err(|failure| failure.source)?;
-        Ok(EpochBackfillRunOutcome::Deferred)
-    }
-
-    pub(crate) async fn fail_online_epoch_gap(
-        &mut self,
-        mut recovery: OnlineEpochGapRecovery,
-        error: AppError,
-    ) -> Result<EpochBackfillRunOutcome, AppError> {
-        #[cfg(test)]
-        drop(recovery.phase.take());
-        let failure = if let Some(drain) = recovery.drain.take() {
-            self.finish_failed_sync_drain(
-                drain.summary,
-                drain.routes_dirty,
-                recovery.execution.counts.clone(),
-                StagedSyncError::new(error, SyncFailureStage::Unknown),
-                drain.drain_started,
-                drain.cursor_before_secs,
-            )
-            .await
-        } else {
-            ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::Unknown,
-            )
-        };
-        match self.finish_recovery_execution(
-            &recovery.grant,
-            recovery.execution,
-            Err(failure),
-            false,
-        ) {
-            Ok(_) => unreachable!("failed recovery cannot complete"),
-            Err(failure) => {
-                self.pending_failed_sync_summary
-                    .merge(failure.partial_summary);
-                Err(failure.source)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn recovery_phase_guard(
-        &self,
-        grant: &AttemptGrant,
-        phase: TestRecoveryPhase,
-    ) -> Option<TestRecoveryPhaseGuard> {
-        let plan = grant.plan()?;
-        if grant.comparison_revision.is_some()
-            || plan.len() != 1
-            || plan[0].cause != storage_sqlite::RecoveryCause::EpochGap
-        {
-            return None;
-        }
-        self.test_recovery_phase_witness
-            .as_ref()?
-            .enter(grant.reservation.attempt_serial, phase)
-    }
-
     async fn execute_recovery_grant_inner(
         &mut self,
         grant: &AttemptGrant,
@@ -4747,12 +4393,8 @@ impl AppClient {
         activation_outcome: &mut EpochBackfillActivationOutcome,
         drain_verdict: &mut Option<DrainVerdict>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        #[cfg(test)]
-        let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Activation);
         self.activate_recovery_grant_inner(grant, telemetry, activation_outcome)
             .await?;
-        #[cfg(test)]
-        drop(_phase);
         // Every cause except a maintenance boundary completes on comparison
         // certificates, so each pass compares its uncertified routes within
         // the retained-inventory floor. Subscription installation never
@@ -4764,8 +4406,6 @@ impl AppClient {
                 .iter()
                 .any(|obligation| obligation.cause != storage_sqlite::RecoveryCause::Maintenance);
         let comparison_outcomes = if compares {
-            #[cfg(test)]
-            let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Reconciliation);
             self.reconcile_transport_history(&grant.inventory)
                 .await
                 .map_err(|error| {
@@ -4778,8 +4418,6 @@ impl AppClient {
         } else {
             Vec::new()
         };
-        #[cfg(test)]
-        let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Completion);
         self.complete_recovery_grant_inner(
             grant,
             repair,
@@ -5075,7 +4713,26 @@ impl AppClient {
                     .scopes
                     .iter()
                     .all(|scope| scope.goal.admitted_endpoints.is_empty());
-                let outcome = if !unroutable {
+                // Cold-start history has no evidence but comparison. When no
+                // compared route had a comparison backend, wait for a
+                // capability change instead of spending passes on it.
+                let mut compared = obligation.scopes.iter().filter_map(|scope| {
+                    let route = match (scope.goal.route_kind, scope.goal.transport_group_id) {
+                        (0, _) => TransportReconciliationRoute::Inbox,
+                        (1, Some(id)) => TransportReconciliationRoute::Group(id),
+                        _ => return None,
+                    };
+                    comparison_outcomes.iter().find(|c| c.route == route)
+                });
+                let unsupported = obligation.cause
+                    == storage_sqlite::RecoveryCause::IncrementalHistory
+                    && compared.clone().next().is_some()
+                    && compared.all(|c| {
+                        c.outcome == storage_sqlite::RecoveryComparisonOutcome::Unsupported
+                    });
+                let outcome = if unsupported {
+                    storage_sqlite::RecoveryScopeOutcome::Unsupported
+                } else if !unroutable {
                     outcome
                 } else if obligation
                     .scopes
@@ -7875,7 +7532,7 @@ mod tests {
                 None
             };
             make_group_terminal(&client, &group, disbanded);
-            client.drop_terminal_epoch_backfill_intents();
+            client.drop_settled_epoch_backfill_intents();
             assert!(!qualify_epoch_obligation(&storage, &grant, &group));
             assert!(client.pending_epoch_stall_escalations.is_empty());
             assert!(client.epoch_stall.wedge_evidence(&group).is_none());

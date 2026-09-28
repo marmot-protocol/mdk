@@ -91,18 +91,6 @@ pub struct MarmotRelayPlane {
     inner: Arc<MarmotRelayPlaneInner>,
 }
 
-#[cfg(test)]
-/// Holds only this plane's router; drop always resumes it, including on a
-/// fixture panic. Production routing has no pause path.
-pub(crate) struct RouterPauseForTest(MarmotRelayPlane);
-
-#[cfg(test)]
-impl Drop for RouterPauseForTest {
-    fn drop(&mut self) {
-        self.0.spawn_router();
-    }
-}
-
 struct MarmotRelayPlaneInner {
     subscription_rebuild_lookback: Option<Duration>,
     relay_safety: RelaySafetyPolicy,
@@ -1609,16 +1597,6 @@ impl MarmotRelayPlane {
             .store(0, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
-    pub(crate) async fn pause_router_for_test(&self) -> RouterPauseForTest {
-        let handle = self.inner.transport.router.lock().await.take();
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await;
-        }
-        RouterPauseForTest(self.clone())
-    }
-
     fn spawn_router(&self) {
         if self.inner.transport.shutting_down.load(Ordering::SeqCst) {
             return;
@@ -2690,6 +2668,20 @@ impl MarmotRelayPlaneAccountAdapter {
             .transport
             .adapter
             .handle_reconciled_event(&self.account_id, event)
+            .await
+    }
+
+    /// This account's deliveries for one owned comparison event. The worker
+    /// admits them directly, never through the live queue.
+    pub(crate) async fn recovered_deliveries(
+        &self,
+        event: transport_nostr_adapter::NostrRelayEvent,
+    ) -> Result<Vec<TransportDelivery>, TransportAdapterError> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .reconciled_deliveries(&self.account_id, event)
             .await
     }
 
