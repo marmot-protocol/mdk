@@ -118,6 +118,13 @@ impl Fixture {
             .unwrap();
         self.signal();
     }
+    /// Background content change: a visible row's badge changes in place.
+    fn mark_unread(&self, id: &str) {
+        self.store
+            .set_chat_manually_unread(&self.account_id, id, true, &|_, _| false)
+            .unwrap();
+        self.signal();
+    }
 }
 async fn next(sub: &mut RuntimeChatListWindowSubscription) -> ChatListWindowSnapshot {
     tokio::time::timeout(Duration::from_secs(10), sub.recv())
@@ -125,6 +132,21 @@ async fn next(sub: &mut RuntimeChatListWindowSubscription) -> ChatListWindowSnap
         .unwrap()
         .unwrap()
         .unwrap()
+}
+async fn next_with_unread(
+    sub: &mut RuntimeChatListWindowSubscription,
+    id: &str,
+) -> ChatListWindowSnapshot {
+    loop {
+        let window = next(sub).await;
+        if window
+            .rows
+            .iter()
+            .any(|r| r.row.group_id_hex == id && r.row.has_unread)
+        {
+            return window;
+        }
+    }
 }
 fn ids(window: &ChatListWindowSnapshot) -> Vec<&str> {
     window
@@ -261,6 +283,105 @@ async fn paging_while_recv_waits_slides_capped_window_and_rejects_old_commands()
     let top = handle.return_to_top(backwards.sequence).await.unwrap();
     assert_eq!(top.anchor, ChatListAnchorOutcome::Top);
     assert_eq!(top.rows.len(), 200);
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn commands_quoting_a_sequence_replaced_only_by_new_content_apply_to_the_current_viewport() {
+    let f = Fixture::new(20);
+    let mut sub = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(5))
+        .await
+        .unwrap();
+    let handle = sub.window_handle();
+    f.mark_unread("0000");
+    next_with_unread(&mut sub, "0000").await;
+    let paged = handle
+        .page(0, ChatListPageDirection::Forward, 5)
+        .await
+        .unwrap();
+    assert_eq!(ids(&paged).len(), 10);
+    assert!(paged.rows[0].row.has_unread);
+    f.mark_unread("0001");
+    next_with_unread(&mut sub, "0001").await;
+    let anchored = handle
+        .set_visible_anchor(paged.sequence, "0007")
+        .await
+        .unwrap();
+    assert!(
+        matches!(&anchored.anchor, ChatListAnchorOutcome::Retained { group_id_hex, index: 7 } if group_id_hex == "0007")
+    );
+    f.mark_unread("0002");
+    next_with_unread(&mut sub, "0002").await;
+    let top = handle.return_to_top(anchored.sequence).await.unwrap();
+    assert_eq!(top.anchor, ChatListAnchorOutcome::Top);
+    assert!(top.rows[2].row.has_unread);
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_command_that_leaves_the_viewport_in_place_does_not_supersede_sequences() {
+    let f = Fixture::new(20);
+    let sub = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(5))
+        .await
+        .unwrap();
+    let handle = sub.window_handle();
+    let top = handle.return_to_top(0).await.unwrap();
+    assert!(top.sequence > 0);
+    let anchored = handle.set_visible_anchor(0, "0003").await.unwrap();
+    let again = handle
+        .set_visible_anchor(anchored.sequence, "0003")
+        .await
+        .unwrap();
+    assert!(again.sequence > anchored.sequence);
+    let paged = handle
+        .page(anchored.sequence, ChatListPageDirection::Forward, 5)
+        .await
+        .unwrap();
+    assert_eq!(ids(&paged).len(), 10);
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn anchor_dropped_by_a_background_replacement_is_stale_for_an_older_sequence() {
+    let f = Fixture::new(20);
+    let mut sub = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(5))
+        .await
+        .unwrap();
+    let handle = sub.window_handle();
+    f.mutate("0004", |g| g.archived = true);
+    let replacement = next(&mut sub).await;
+    assert_eq!(ids(&replacement), ["0000", "0001", "0002", "0003", "0005"]);
+    assert!(matches!(
+        handle.set_visible_anchor(0, "0004").await,
+        Err(ChatListWindowError::StaleWindow)
+    ));
+    assert!(matches!(
+        handle
+            .set_visible_anchor(replacement.sequence, "0004")
+            .await,
+        Err(ChatListWindowError::AnchorOutsideWindow)
+    ));
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn commands_quoting_an_unpublished_sequence_are_stale() {
+    let f = Fixture::new(5);
+    let sub = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(3))
+        .await
+        .unwrap();
+    assert!(matches!(
+        sub.window_handle().return_to_top(1).await,
+        Err(ChatListWindowError::StaleWindow)
+    ));
     f.runtime.shutdown_and_close().await.unwrap();
 }
 

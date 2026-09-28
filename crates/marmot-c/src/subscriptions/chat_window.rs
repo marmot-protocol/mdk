@@ -171,8 +171,9 @@ pub unsafe extern "C" fn marmot_subscribe_account_attention(
     })
 }
 
-/// Apply a window command against the installed sequence, returning a complete replacement.
-/// May run while next waits. Stale sequence returns CHAT_WINDOW_STALE; refresh before retrying.
+/// Apply a window command to the current viewport, returning a complete replacement.
+/// May run while next waits. Background content changes keep a sequence usable; one older
+/// than a published viewport move, or not yet published, returns CHAT_WINDOW_STALE.
 /// The same completion also arrives through next; deduplicate by generation/sequence.
 /// # Safety
 /// sub must be live, any input string valid, and out writable. Never free during a call.
@@ -199,8 +200,10 @@ pub unsafe extern "C" fn marmot_chat_list_window_subscription_page(
     })
 }
 
-/// Apply a window command against the installed sequence, returning a complete replacement.
-/// May run while next waits. Stale sequence returns CHAT_WINDOW_STALE; refresh before retrying.
+/// Apply a window command to the current viewport, returning a complete replacement.
+/// May run while next waits. Background content changes keep a sequence usable; one older
+/// than a published viewport move, or not yet published, returns CHAT_WINDOW_STALE, as does
+/// an older sequence whose anchor row a background replacement dropped.
 /// The same completion also arrives through next; deduplicate by generation/sequence.
 /// # Safety
 /// sub must be live, any input string valid, and out writable. Never free during a call.
@@ -226,8 +229,9 @@ pub unsafe extern "C" fn marmot_chat_list_window_subscription_set_visible_anchor
     })
 }
 
-/// Apply a window command against the installed sequence, returning a complete replacement.
-/// May run while next waits. Stale sequence returns CHAT_WINDOW_STALE; refresh before retrying.
+/// Apply a window command to the current viewport, returning a complete replacement.
+/// May run while next waits. Background content changes keep a sequence usable; one older
+/// than a published viewport move, or not yet published, returns CHAT_WINDOW_STALE.
 /// The same completion also arrives through next; deduplicate by generation/sequence.
 /// # Safety
 /// sub must be live, any input string valid, and out writable. Never free during a call.

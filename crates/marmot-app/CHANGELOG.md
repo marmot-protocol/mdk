@@ -60,6 +60,11 @@
   and report a stale window when an older visible-anchor quote names a row
   dropped by a background replacement. (#2052)
 
+- Keep chat-list-window commands usable across content-only replacements, so
+  paging no longer livelocks on `StaleWindow` while other chats' previews,
+  badges or order keep changing. An older visible-anchor quote naming a row a
+  background replacement dropped reports a stale window.
+
 - Keep an account's delivery route open when its relay notification consumer lags. A lag
   used to close the route and send the account worker through reconnect. The reopened
   session replayed the backlog from the loss-fenced cursor, which overflowed again, so large

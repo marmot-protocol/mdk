@@ -39,6 +39,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   free), and `MarmotEvent` appends the `MARMOT_EVENT_HISTORY_NOTICES_CHANGED` tag and body.
   Existing tag values are unchanged. Recompile with the matching header and library. (#2068)
 
+### Fixed
+
+- Chat-list-window commands quoting a sequence replaced only by background
+  content changes now apply to the current viewport instead of returning
+  `MARMOT_STATUS_CHAT_WINDOW_STALE`. The header and library signatures are unchanged.
+
 ## [0.10.4] - 2026-09-20
 
 ### Added

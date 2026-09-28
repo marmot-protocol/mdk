@@ -24,7 +24,13 @@ notifications are complete `ChatListWindowSnapshot` replacements, identified by
 a random subscription generation and increasing sequence. A slow consumer receives
 the latest replacement; skipped sequences are normal. Clients should ignore any
 response older than their installed generation/sequence. A command supplies the
-sequence it acts on; an outdated command receives `StaleWindow`.
+sequence it acts on and applies to the current retained viewport. Background
+replacements (preview, badge, order or membership changes) do not supersede a
+sequence, so paging keeps working under steady account activity. A command
+receives `StaleWindow` when it quotes a sequence not yet published, or one older
+than the first replacement showing another command's viewport move, or when
+`set_visible_anchor` quotes an older sequence whose row a background replacement
+dropped. The same miss against the current sequence is `AnchorOutsideWindow`.
 
 `window_handle()` is independently cloneable so paging and anchor commands work
 while `recv()` waits. Once queued, a command outlives cancellation of its caller;

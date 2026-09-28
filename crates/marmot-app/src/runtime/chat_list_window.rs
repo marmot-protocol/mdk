@@ -80,6 +80,12 @@ impl std::fmt::Debug for ChatListWindowSnapshot {
     }
 }
 
+/// Commands apply to the current retained viewport. Background replacements (preview,
+/// badge, order or membership changes) do not supersede a sequence;
+/// `set_visible_anchor` returns `StaleWindow` if a background replacement dropped
+/// its row. Once a replacement showing a command's viewport move is published,
+/// every earlier sequence returns `StaleWindow`, as does a sequence not yet
+/// published. Consume the latest snapshot and reassess the user's intent before retrying.
 #[derive(Clone)]
 pub struct ChatListWindowHandle {
     commands: mpsc::Sender<Command>,
@@ -164,7 +170,7 @@ struct Command {
     sequence: u64,
     reply: oneshot::Sender<Result<ChatListWindowSnapshot, ChatListWindowError>>,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Position {
     limit: usize,
     anchor: Option<String>,
@@ -510,8 +516,12 @@ fn command_position(
     command: &Command,
     current: &ChatListWindowSnapshot,
     position: &Position,
+    viewport_sequence: u64,
 ) -> Result<Position, ChatListWindowError> {
-    if command.sequence != current.sequence {
+    // Background replacements keep old sequences usable unless they drop the
+    // row named by set_visible_anchor. A published viewport move supersedes
+    // earlier sequences.
+    if !(viewport_sequence..=current.sequence).contains(&command.sequence) {
         return Err(ChatListWindowError::StaleWindow);
     }
     let mut next = position.clone();
@@ -525,7 +535,11 @@ fn command_position(
                 .rows
                 .iter()
                 .position(|r| r.row.group_id_hex.eq_ignore_ascii_case(group))
-                .ok_or(ChatListWindowError::AnchorOutsideWindow)?;
+                .ok_or(if command.sequence == current.sequence {
+                    ChatListWindowError::AnchorOutsideWindow
+                } else {
+                    ChatListWindowError::StaleWindow
+                })?;
             next.anchor = if index == 0 && !current.has_more_before {
                 None
             } else {
@@ -570,6 +584,8 @@ async fn run(
 ) {
     let mut dirty = false;
     let mut failed = false;
+    // First published sequence showing the viewport the latest command moved to.
+    let mut viewport_sequence = current.sequence;
     loop {
         let expiry = current
             .rows
@@ -599,7 +615,7 @@ async fn run(
         };
         let next = match command
             .as_ref()
-            .map(|c| command_position(c, &current, &position))
+            .map(|c| command_position(c, &current, &position, viewport_sequence))
             .transpose()
         {
             Ok(next) => next.unwrap_or_else(|| position.clone()),
@@ -610,6 +626,8 @@ async fn run(
                 continue;
             }
         };
+        // A failed read keeps `position`, so it is always the viewport `current` shows.
+        let moves_viewport = next != position;
         sources.drain();
         let result = tokio::select! {
             biased;
@@ -660,6 +678,9 @@ async fn run(
                     }
                 }
                 current = replacement;
+                if moves_viewport {
+                    viewport_sequence = current.sequence;
+                }
                 if changed || failed {
                     let _ = updates.send_replace(Ok(current.clone()));
                 }

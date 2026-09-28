@@ -15,6 +15,10 @@
   An older visible-anchor quote whose row has left the retained window now
   reports a stale window so hosts can reassess the visible row. (#2052)
 
+- Keep native chat-list-window paging usable while account activity refreshes
+  the window. An older visible-anchor quote whose row has left the retained
+  window reports a stale window so hosts can reassess the visible row.
+
 - Fetched kind:0 `about` text keeps normalized line breaks. Other known profile strings
   stay single-line, and unsafe controls are still removed. (#1973)
 
