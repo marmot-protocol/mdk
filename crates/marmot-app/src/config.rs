@@ -177,19 +177,8 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this proves a canonical
     /// invite still returns success and attempts Welcome fanout.
     pub dev_fail_invite_local_refresh: bool,
-    /// Dev/test-only override for how long the epoch-gap backfill drain waits
-    /// in silence for end-of-stored-events before reporting an incomplete
-    /// replay ([`crate::EPOCH_BACKFILL_EOSE_WAIT`]). Honored only with
-    /// `test-policy-overrides`; this keeps the give-up path testable without
-    /// spending the production budget in wall-clock.
-    pub dev_epoch_backfill_eose_wait_ms: Option<u64>,
-    /// Dev/test-only override for the maximum wall-clock quantum spent in one
-    /// epoch-gap backfill drain. Honored only with `test-policy-overrides`;
-    /// this keeps worker-yield behavior testable without spending the
-    /// production quantum in wall-clock.
-    pub dev_epoch_backfill_execution_quantum_ms: Option<u64>,
-    /// Dev/test-only override for the base interval an unconfirmed epoch-gap
-    /// backfill waits before an automatic seam may retry it
+    /// Dev/test-only override for the base interval a recovery attempt waits
+    /// before an automatic seam may start another
     /// ([`crate::EPOCH_BACKFILL_RETRY_BACKOFF`]). Honored only with
     /// `test-policy-overrides`; this lets a test exercise both sides of the
     /// cooldown without spending it in wall-clock.
@@ -297,8 +286,6 @@ impl Default for MarmotAppConfig {
             dev_fail_invite_welcome_intent: false,
             dev_fail_create_local_projection: false,
             dev_fail_invite_local_refresh: false,
-            dev_epoch_backfill_eose_wait_ms: None,
-            dev_epoch_backfill_execution_quantum_ms: None,
             dev_epoch_backfill_retry_backoff_ms: None,
             dev_epoch_stall_wedge_rearm_interval_ms: None,
             dev_fail_sync_before_delivery: None,
@@ -446,21 +433,6 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_fail_invite_local_refresh(mut self, enabled: bool) -> Self {
         self.dev_fail_invite_local_refresh = enabled;
-        self
-    }
-
-    /// Give the epoch-gap backfill drain `ms` of silence to reach
-    /// end-of-stored-events in test-policy builds. Normal builds ignore this
-    /// field.
-    pub fn with_dev_epoch_backfill_eose_wait_ms(mut self, ms: u64) -> Self {
-        self.dev_epoch_backfill_eose_wait_ms = Some(ms);
-        self
-    }
-
-    /// Limit one epoch-gap backfill drain to `ms` in test-policy builds.
-    /// Normal builds ignore this field.
-    pub fn with_dev_epoch_backfill_execution_quantum_ms(mut self, ms: u64) -> Self {
-        self.dev_epoch_backfill_execution_quantum_ms = Some(ms);
         self
     }
 

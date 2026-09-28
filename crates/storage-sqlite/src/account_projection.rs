@@ -120,8 +120,8 @@ pub struct StoredEpochBackfillIntent {
 }
 
 /// Durable evidence that the app relay plane omitted at least one delivery
-/// from a bounded per-account queue and must complete an unfloored replay
-/// before trusting the account's transport cursor again.
+/// from a bounded per-account queue and must settle that loss through
+/// recovery before trusting the account's transport cursor again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccountDeliveryRecovery {
     pub marker_token: u64,

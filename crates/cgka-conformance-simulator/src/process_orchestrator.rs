@@ -1145,6 +1145,11 @@ impl ProcessOrchestrator {
                         | ScenarioRelaySyncModeV2::SetReconciliation
                 );
                 self.catch_up(&clients, action_id, full_history).await?;
+                if full_history && !clients.is_empty() {
+                    // Nodes run the pinned settlement window.
+                    tokio::time::sleep(crate::app_runtime::full_history_settlement_window(None))
+                        .await;
+                }
                 Ok((clients, ProcessActionStatusV1::Completed))
             }
             ScenarioStep::Observe { clients } | ScenarioStep::ObserveExact { clients } => {

@@ -53,10 +53,7 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
             })
             .collect(),
     );
-    client
-        .execute_recovery_grant(grant, None, None)
-        .await
-        .unwrap();
+    client.run_recovery_grant_for_test(grant).await.unwrap();
     assert!(client.test_comparison_results.as_ref().unwrap().is_empty());
 
     let after = storage.recovery_comparison().unwrap();

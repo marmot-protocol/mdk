@@ -23,12 +23,32 @@
   required relay failed or timed out does not count; one that answered but could not fetch a
   claimed event, or whose events were not durably admitted, does. New evidence, or durable
   admission on a route, starts that route's count over. (#2068)
-- Every automatic recovery cause except maintenance boundaries, explicit repair and
-  known-event demand compares off the account worker. The worker then admits what the
+- Recovery compares off the account worker. The worker then admits what the
   comparison fetched a few events per turn, between commands and live input, and never
-  through the live delivery queue. Automatic recovery reuses the live subscriptions
-  instead of re-subscribing, so it no longer replays history the account already holds.
-  The separate online epoch-gap job is removed. (#2068)
+  through the live delivery queue. Recovery reuses the live subscriptions instead of
+  re-subscribing, so it no longer replays history the account already holds. The separate
+  online epoch-gap job is removed. (#2068)
+- The inline recovery executor is gone; every cause and caller runs the one comparison
+  job. A post-join maintenance boundary installs only its own REQ and completes on that
+  REQ's end of stored events. Known-event demand and routes with more than four relays are
+  compared off the worker too. Explicit catch-up, `sync()` and a directly owned client's
+  `next_event()` drain the live queue, then run one job in place, and no longer re-activate
+  transport or re-issue live REQs once the session is active; a route change still
+  refreshes them. `repair_full_history` compares every route over the retained-inventory
+  window in one pass inside its 60-second budget and installs no unfloored replay, so it
+  no longer fetches history older than the retained window. Full history has no lower
+  bound, so the repair never reports complete. When every route's window certified it
+  returns `BelowRetentionWindow` and closes its request. The owner's automatic passes over
+  a pending explicit request keep each route's certified window, off the parking streak,
+  and close it once every route is certified: no explicit-history debt is left
+  to park into a "history may be incomplete" notice, and nothing is recorded as coverage.
+  Otherwise it returns `CoverageUnproven`, `Cancelled` or `Deadline`, and the debt stays
+  open for the owner's ordinary retries. The comparison gets the first 50 seconds; routes
+  that finished by then are admitted in the last 10, stopping at a turn boundary if the
+  budget runs out; that budget starts once the repair holds its process credit. A certified
+  window wins over the clock: `Deadline` means admission ran out, or the cutoff cut a
+  route and left the window uncertified. Only cancellation discards what a pass already
+  fetched.
 - Account recovery certifies a route on its operated relays only.
   `MarmotAppConfig::recovery_operated_relays` names them and defaults to
   `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`. A route that lists
@@ -158,6 +178,15 @@
 
 ### Breaking changes
 
+- `FullHistoryRepairIncompleteReason` gains `BelowRetentionWindow`
+  (`full_history_below_retention_window`): an explicit repair certified every route's
+  retained window, but history below that window was never searched, and the request
+  closed without leaving debt or a notice. Exhaustive Rust
+  matches must handle it; bindings see only the existing error code.
+- Remove `MarmotAppConfig::dev_epoch_backfill_eose_wait_ms` and
+  `dev_epoch_backfill_execution_quantum_ms` with their `with_*` builders. Recovery no
+  longer drains toward an end-of-stored-events budget, so neither had an effect. The
+  bindings and CLI never exposed them.
 - Remove `RecoveryExecutorMode` and `MarmotAppConfig::recovery_executor_mode`. The
   conservative mode ran one recovery obligation per grant as a same-schema rollback
   switch. The bindings and CLI never exposed it, and recovery now has one execution

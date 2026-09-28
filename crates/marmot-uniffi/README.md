@@ -902,8 +902,8 @@ Do not dismiss on the user's behalf, and do not persist `notice_id` as a group o
 account identity: it changes whenever recovery re-arms. A dismissed occurrence never
 comes back, but genuinely new evidence can raise a new notice: new loss, a higher missing
 epoch, a later startup's incremental comparison, or a new explicit repair. Explicit
-full-history repair remains available and can still complete parked history with
-qualified coverage. Notices carry no relay, message or key identities; keep them out of
+full-history repair remains available and can still complete parked history that its
+comparison of the retained window certifies. Notices carry no relay, message or key identities; keep them out of
 analytics. C callers use `marmot_history_notices` (free with
 `marmot_history_notice_list_free`), `marmot_dismiss_history_notice` and the
 `MARMOT_EVENT_HISTORY_NOTICES_CHANGED` event tag.

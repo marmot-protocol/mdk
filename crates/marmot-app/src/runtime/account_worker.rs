@@ -2,7 +2,7 @@
 //! and the runtime-event publishing helpers the loop drives.
 
 mod attachments;
-pub(super) mod recovery_credits;
+pub(crate) mod recovery_credits;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
@@ -126,13 +126,14 @@ enum StartupSyncStep {
 type StartupSyncContinuation<'a> =
     Pin<Box<dyn Future<Output = Option<Result<SyncSummary, ClassifiedSyncFailure>>> + Send + 'a>>;
 
-enum PendingComparisonExecution {
-    Offloaded {
+enum PendingRecoveryJob {
+    Started {
         grant: Box<AttemptGrant>,
         execution: ComparisonExecution,
         network: ComparisonNetworkJob,
     },
-    Inline(Result<EpochBackfillRunOutcome, AppError>),
+    /// Nothing started: no credit, nothing due, or selection failed.
+    Settled(Result<EpochBackfillRunOutcome, AppError>),
 }
 
 pub(crate) struct ManagedAccountWorker {
@@ -582,6 +583,12 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
+    /// Explicit recovery runs one job in place, so it waits while the
+    /// account's worker-owned job is in flight: there is one job per account.
+    fn waits_for_recovery_job(&self) -> bool {
+        matches!(self, Self::CatchUp { .. } | Self::RepairFullHistory { .. })
+    }
+
     /// Reads that can cross a deferred explicit catch-up without changing the
     /// recovery grant or the order of later mutations.
     fn readable_during_comparison_catch_up(&self) -> bool {
@@ -854,6 +861,7 @@ async fn run_app_runtime_account_worker(
     };
     install_storage_telemetry(&client, &shared.app_performance_telemetry());
     client.runtime_telemetry = Some(shared.app_performance_telemetry());
+    client.recovery_credits = shared.recovery_credit_pool();
     #[cfg(test)]
     {
         client.test_recovery_selection_witness = shared
@@ -1044,17 +1052,28 @@ async fn run_app_runtime_account_worker(
                 barrier.wait().await;
                 barrier.wait().await;
             }
-            let mut credit =
+            let state_persist = |error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error,
+                    SyncFailureStage::StatePersist,
+                )
+            };
+            // Activation installs the complete current group set, so a routing
+            // change found here needs no separate refresh.
+            client.refresh_sync_routes().map_err(state_persist)?;
+            // The session's first live subscriptions, floored at the cursor,
+            // go out before any recovery grant is selected. A failed attempt
+            // has side effects, so it is startup's failure and spends no
+            // recovery reservation.
+            client
+                .activate_live_transport(Some(&startup_stage_telemetry))
+                .await?;
+            let credit =
                 recovery_credits::try_acquire_recovery_credit(&shared.recovery_credit_pool());
-            let mut grant = client
-                .prepare_sync_grant(Some(&startup_stage_telemetry), false, credit.is_none())
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::StatePersist,
-                    )
-                })?;
+            let grant = client
+                .prepare_sync_grant(Some(&startup_stage_telemetry), false, credit.is_some())
+                .map_err(state_persist)?;
             #[cfg(test)]
             let activity_witness = shared
                 .comparison_activity_witness
@@ -1062,43 +1081,30 @@ async fn run_app_runtime_account_worker(
                 .unwrap()
                 .as_ref()
                 .and_then(|(label, witness)| (label == &account_label).then(|| witness.clone()));
-            if let Some(selected) = grant.as_ref()
-                && client
-                    .comparison_offload_eligible(selected)
-                    .unwrap_or(false)
-                && let Some(credit) = credit.take()
-            {
-                // An attempted activation has side effects even when it fails.
-                // Surface that first failure as the old inline startup did;
-                // falling through would issue a second subscription attempt
-                // and could publish local-ready sends before recovery.
+            if let (Some(grant), Some(credit)) = (grant, credit) {
+                let unknown = |error| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::Unknown,
+                    )
+                };
                 let execution = client
-                    .activate_startup_comparison_grant(selected, Some(&startup_stage_telemetry))
+                    .begin_comparison_grant(&grant)
                     .await
-                    .map_err(|error| {
-                        ClassifiedSyncFailure::at_stage(
-                            SyncSummary::default(),
-                            error,
-                            SyncFailureStage::TransportActivation,
-                        )
-                    })?;
-                let network = ComparisonNetworkJob::start(
+                    .map_err(unknown)?;
+                let network = match ComparisonNetworkJob::start(
                     &client,
-                    selected,
+                    &grant,
                     credit,
+                    ComparisonNetworkJob::automatic_deadline(),
                     #[cfg(test)]
                     activity_witness,
-                );
-                let grant = grant.take().expect("selected startup grant");
-                let network = match network {
+                ) {
                     Ok(network) => network,
                     Err(error) => {
                         let _ = client.abandon_comparison_grant(grant, execution);
-                        return Err(ClassifiedSyncFailure::at_stage(
-                            SyncSummary::default(),
-                            error,
-                            SyncFailureStage::Unknown,
-                        ));
+                        return Err(unknown(error));
                     }
                 };
                 return Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Network {
@@ -1107,12 +1113,7 @@ async fn run_app_runtime_account_worker(
                     network,
                 });
             }
-            // A grant with no off-worker request keeps the same inline path,
-            // but must not hold a speculative process credit across its wait.
-            drop(credit.take());
-            let summary = client
-                .execute_prepared_sync(grant, Some(&startup_stage_telemetry), false)
-                .await?;
+            let summary = client.finish_deferred_comparison_sync().await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
             Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Complete(summary))
@@ -1817,10 +1818,9 @@ async fn run_app_runtime_account_worker(
                         // to fresh channel arrivals, or the earlier work would
                         // be requeued behind CatchUp after capacity returns.
                         if comparison_recovery.is_some() && !approved_pending
-                            && (matches!(command, AccountWorkerCommand::CatchUp { .. })
-                                || (pending.iter().any(|queued| {
-                                    matches!(queued, AccountWorkerCommand::CatchUp { .. })
-                                }) && !command.readable_during_comparison_catch_up()))
+                            && (command.waits_for_recovery_job()
+                                || (pending.iter().any(AccountWorkerCommand::waits_for_recovery_job)
+                                    && !command.readable_during_comparison_catch_up()))
                         {
                             pending.push_back(command);
                             continue;
@@ -1974,12 +1974,12 @@ async fn run_app_runtime_account_worker(
                                         let backfill_result = if comparison_recovery.is_some() {
                                             Ok(EpochBackfillRunOutcome::Deferred)
                                         } else {
-                                            match execute_pending_comparison_or_inline(
+                                            match start_pending_recovery_job(
                                                 &mut client,
                                                 &shared,
                                                 EpochBackfillExecutionSeam::Maintenance,
                                             ).await {
-                                                PendingComparisonExecution::Offloaded {
+                                                PendingRecoveryJob::Started {
                                                     grant, execution, network,
                                                 } => {
                                                     comparison_recovery = Some(ComparisonRecoveryJob::new(
@@ -1995,7 +1995,7 @@ async fn run_app_runtime_account_worker(
                                                     ));
                                                     return;
                                                 }
-                                                PendingComparisonExecution::Inline(result) => result,
+                                                PendingRecoveryJob::Settled(result) => result,
                                             }
                                         };
                                         let _ = report_pending_epoch_backfill_result(
@@ -2147,14 +2147,14 @@ async fn run_app_runtime_account_worker(
                         // Keep this delivered message complete and let
                         // that job settle the still-durable recovery debt.
                         let backfill_result = if comparison_recovery.is_some() {
-                            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
+                            PendingRecoveryJob::Settled(Ok(EpochBackfillRunOutcome::Deferred))
                         } else {
-                            execute_pending_comparison_or_inline(
+                            start_pending_recovery_job(
                                 &mut client, &shared, EpochBackfillExecutionSeam::Receive,
                             ).await
                         };
                         match backfill_result {
-                            PendingComparisonExecution::Offloaded {
+                            PendingRecoveryJob::Started {
                                 grant, execution, network,
                             } => {
                                 comparison_recovery = Some(ComparisonRecoveryJob::new(
@@ -2171,7 +2171,7 @@ async fn run_app_runtime_account_worker(
                                 ));
                                 continue 'worker;
                             }
-                            PendingComparisonExecution::Inline(result) => {
+                            PendingRecoveryJob::Settled(result) => {
                                 let _ = report_pending_epoch_backfill_result(
                                     &client,
                                     result, backfill_armed, observation,
@@ -2302,6 +2302,7 @@ async fn run_app_runtime_account_worker(
                                 Ok(mut reopened) => {
                                     install_storage_telemetry(&reopened, &shared.app_performance_telemetry());
                                     reopened.runtime_telemetry = Some(shared.app_performance_telemetry());
+                                    reopened.recovery_credits = shared.recovery_credit_pool();
                                     #[cfg(test)]
                                     {
                                         reopened.test_recovery_selection_witness = shared
@@ -2510,11 +2511,9 @@ async fn run_app_runtime_account_worker(
                 attachment_due = true;
                 presentation_due = true;
                 avatar_due = true;
-                // Periodic maintenance is never urgent, and its longest legs
-                // run well past the whole shutdown budget: the key-package
-                // catch-up below is capped at 15s, and an armed epoch-gap
-                // backfill can hold the worker for EPOCH_BACKFILL_EOSE_WAIT
-                // waiting on end-of-stored-events. Skip the tick outright once
+                // Periodic maintenance is never urgent, and its longest leg
+                // runs past the whole shutdown budget: the key-package
+                // catch-up below is capped at 15s. Skip the tick outright once
                 // shutdown is requested rather than starting work the drain
                 // would then have to wait out.
                 if lifecycle.is_stopping() {
@@ -2621,14 +2620,14 @@ async fn run_app_runtime_account_worker(
                 let observation = backfill_armed.then(|| shared.product_analytics.begin(
                     crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                 )).flatten();
-                let backfill_result = match execute_pending_comparison_or_inline(
+                let backfill_result = match start_pending_recovery_job(
                     &mut client,
                     &shared,
                     EpochBackfillExecutionSeam::Maintenance,
                 )
                 .await
                 {
-                    PendingComparisonExecution::Offloaded {
+                    PendingRecoveryJob::Started {
                         grant,
                         execution,
                         network,
@@ -2644,7 +2643,7 @@ async fn run_app_runtime_account_worker(
                         ));
                         continue 'worker;
                     }
-                    PendingComparisonExecution::Inline(result) => result,
+                    PendingRecoveryJob::Settled(result) => result,
                 };
                 let _ = report_pending_epoch_backfill_result(
                     &client,
@@ -2679,135 +2678,98 @@ async fn run_app_runtime_account_worker(
     }
 }
 
-/// Select one existing owner grant, then move only an eligible comparison's
-/// immutable SDK request to the shared worker job. Other frozen shapes execute
-/// through the original inline path without reserving a replacement grant.
-async fn execute_pending_comparison_or_inline(
+/// Select one owner grant and start its job: begin on the worker, then its
+/// immutable SDK request off the worker. Without a process credit nothing is
+/// selected, so the durable demand waits without spending a reservation.
+async fn start_pending_recovery_job(
     client: &mut AppClient,
     shared: &RuntimeSharedServices,
     seam: EpochBackfillExecutionSeam,
-) -> PendingComparisonExecution {
-    let mut credit = recovery_credits::try_acquire_recovery_credit(&shared.recovery_credit_pool());
-    let selection =
-        if credit.is_none() && client.comparison_only_waiting_for_credit().unwrap_or(false) {
-            Ok(crate::client::PendingRecoverySelection::Deferred)
-        } else {
-            client.select_pending_epoch_backfill(seam)
-        };
-    match selection {
-        Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
-            let grant = *grant;
-            let eligible =
-                credit.is_some() && client.comparison_offload_eligible(&grant).unwrap_or(false);
-            #[cfg(test)]
-            shared
-                .comparison_test_trace
-                .lock()
-                .unwrap()
-                .push(if eligible {
-                    "grant_eligible"
-                } else {
-                    "grant_inline"
-                });
-            if eligible {
-                match client.begin_comparison_grant(&grant).await {
-                    Ok(execution) => match ComparisonNetworkJob::start(
-                        client,
-                        &grant,
-                        credit.take().expect("offloaded grant owns credit"),
-                        #[cfg(test)]
-                        shared
-                            .comparison_activity_witness
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .and_then(|(label, witness)| {
-                                (label == &client.state.label).then(|| witness.clone())
-                            }),
-                    ) {
-                        Ok(network) => {
-                            #[cfg(test)]
-                            shared
-                                .comparison_test_trace
-                                .lock()
-                                .unwrap()
-                                .push("task_started");
-                            PendingComparisonExecution::Offloaded {
-                                grant: Box::new(grant),
-                                execution,
-                                network,
-                            }
-                        }
-                        Err(error) => {
-                            #[cfg(test)]
-                            shared
-                                .comparison_test_trace
-                                .lock()
-                                .unwrap()
-                                .push("task_start_error");
-                            let _ = client.abandon_comparison_grant(grant, execution);
-                            PendingComparisonExecution::Inline(Err(error))
-                        }
-                    },
-                    Err(error) => {
-                        #[cfg(test)]
-                        shared
-                            .comparison_test_trace
-                            .lock()
-                            .unwrap()
-                            .push("activation_error");
-                        PendingComparisonExecution::Inline(Err(error))
-                    }
-                }
+) -> PendingRecoveryJob {
+    #[cfg(test)]
+    let trace = |kind: &'static str| shared.comparison_test_trace.lock().unwrap().push(kind);
+    let Some(credit) =
+        recovery_credits::try_acquire_recovery_credit(&shared.recovery_credit_pool())
+    else {
+        #[cfg(test)]
+        trace("credit_unavailable");
+        return PendingRecoveryJob::Settled(client.recovery_pending().map(|pending| {
+            if pending {
+                EpochBackfillRunOutcome::Deferred
             } else {
-                drop(credit.take());
-                PendingComparisonExecution::Inline(
-                    client.execute_pending_epoch_backfill_grant(grant).await,
-                )
+                EpochBackfillRunOutcome::NotPending
             }
-        }
+        }));
+    };
+    let grant = match client.select_pending_epoch_backfill(seam) {
+        Ok(crate::client::PendingRecoverySelection::Grant(grant)) => *grant,
         Ok(crate::client::PendingRecoverySelection::Deferred) => {
             #[cfg(test)]
-            shared
-                .comparison_test_trace
-                .lock()
-                .unwrap()
-                .push("selection_deferred");
-            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
+            trace("selection_deferred");
+            return PendingRecoveryJob::Settled(Ok(EpochBackfillRunOutcome::Deferred));
         }
         Ok(crate::client::PendingRecoverySelection::NotPending) => {
             #[cfg(test)]
-            shared
-                .comparison_test_trace
-                .lock()
-                .unwrap()
-                .push("selection_empty");
-            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::NotPending))
+            trace("selection_empty");
+            return PendingRecoveryJob::Settled(Ok(EpochBackfillRunOutcome::NotPending));
         }
         Err(error) => {
             #[cfg(test)]
-            shared
-                .comparison_test_trace
-                .lock()
-                .unwrap()
-                .push(match &error {
-                    AppError::Storage(cgka_traits::storage::StorageError::Serialization(
-                        message,
-                    )) if message == "invalid recovery comparison" => {
-                        "selection_invalid_comparison"
-                    }
-                    AppError::Storage(cgka_traits::storage::StorageError::Serialization(_)) => {
-                        "selection_storage_serialization"
-                    }
-                    AppError::Storage(cgka_traits::storage::StorageError::Busy(_)) => {
-                        "selection_storage_busy"
-                    }
-                    AppError::Storage(_) => "selection_storage_other",
-                    AppError::Transport(_) => "selection_transport_error",
-                    AppError::Sqlite(_) => "selection_sqlite_error",
-                    _ => "selection_other_error",
-                });
-            PendingComparisonExecution::Inline(Err(error))
+            trace(match &error {
+                AppError::Storage(cgka_traits::storage::StorageError::Serialization(message))
+                    if message == "invalid recovery comparison" =>
+                {
+                    "selection_invalid_comparison"
+                }
+                AppError::Storage(cgka_traits::storage::StorageError::Serialization(_)) => {
+                    "selection_storage_serialization"
+                }
+                AppError::Storage(cgka_traits::storage::StorageError::Busy(_)) => {
+                    "selection_storage_busy"
+                }
+                AppError::Storage(_) => "selection_storage_other",
+                AppError::Transport(_) => "selection_transport_error",
+                AppError::Sqlite(_) => "selection_sqlite_error",
+                _ => "selection_other_error",
+            });
+            return PendingRecoveryJob::Settled(Err(error));
+        }
+    };
+    let execution = match client.begin_comparison_grant(&grant).await {
+        Ok(execution) => execution,
+        Err(error) => {
+            #[cfg(test)]
+            trace("begin_error");
+            return PendingRecoveryJob::Settled(Err(error));
+        }
+    };
+    match ComparisonNetworkJob::start(
+        client,
+        &grant,
+        credit,
+        ComparisonNetworkJob::automatic_deadline(),
+        #[cfg(test)]
+        shared
+            .comparison_activity_witness
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(label, witness)| (label == &client.state.label).then(|| witness.clone())),
+    ) {
+        Ok(network) => {
+            #[cfg(test)]
+            trace("task_started");
+            PendingRecoveryJob::Started {
+                grant: Box::new(grant),
+                execution,
+                network,
+            }
+        }
+        Err(error) => {
+            #[cfg(test)]
+            trace("task_start_error");
+            let _ = client.abandon_comparison_grant(grant, execution);
+            PendingRecoveryJob::Settled(Err(error))
         }
     }
 }
@@ -2931,7 +2893,20 @@ async fn handle_account_worker_catch_up(
     let sync_started_at = Instant::now();
     let stage_telemetry = context.shared.app_performance_telemetry();
     let sync_result = {
-        let mut sync = std::pin::pin!(client.sync_with_stage_telemetry(&stage_telemetry, true));
+        let mut sync = std::pin::pin!(async {
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            if let Some(barrier) = context
+                .shared
+                .take_next_catch_up_barrier(context.account_id_hex)
+            {
+                // Acknowledge entry, then hold until the test releases it.
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+            client
+                .sync_with_stage_telemetry(&stage_telemetry, true)
+                .await
+        });
         loop {
             let command = if let Some(command) = pending.pop_front() {
                 Some(command)
@@ -3103,6 +3078,14 @@ async fn handle_account_worker_catch_up(
     } else {
         TelemetryOutcome::Failure
     });
+    // A job that parked or reopened recovery debt announces it before the
+    // caller, who may re-read the notices at once, gets its answer.
+    publish_history_notice_changes(
+        client,
+        context.events,
+        context.account_id_hex,
+        context.account_label,
+    );
     for respond in catch_up_responders {
         let _ = respond.send(result.clone());
     }
@@ -3747,7 +3730,7 @@ fn ready_command_index(
         .then(|| {
             pending
                 .iter()
-                .position(|command| matches!(command, AccountWorkerCommand::CatchUp { .. }))
+                .position(AccountWorkerCommand::waits_for_recovery_job)
         })
         .flatten();
     pending.iter().enumerate().position(|(index, command)| {
@@ -4370,6 +4353,9 @@ fn account_worker_command_future<'a>(
                     .err()
                     .map(AccountCatchUpFailure::classification),
             );
+            // Announce a parked or reopened obligation before the caller
+            // re-reads the notices.
+            publish_history_notice_changes(client, events, account_id_hex, account_label);
             let _ = respond.send(result);
             true
         }),
@@ -6480,14 +6466,12 @@ fn publish_sync_summary_with_audit(
 /// `epoch_stall_backfill_armed` row is already durable, a failing replay is the
 /// highest-value upload, and the arming pass returns an empty summary that
 /// never trips the visible-activity gate. Shared by every incremental sync and
-/// ingest seam so the capture-before-run ordering cannot drift. A replay
-/// activation failure is both published and returned: explicit catch-up fails
-/// its response while background seams retain their existing event-only
-/// reporting behavior. A deferred result is deliberately accepted only after
-/// the caller's ordinary sync has completed; the distinct outcome keeps that
-/// policy choice visible instead of conflating deferral with no pending work.
-/// Explicit full-history repair already performed the unfloored replay and
-/// consumes the same intent without calling this helper.
+/// ingest seam so the capture-before-run ordering cannot drift. A job failure
+/// is both published and returned: explicit catch-up fails its response while
+/// background seams retain their existing event-only reporting behavior. A
+/// deferred result is deliberately accepted only after the caller's ordinary
+/// sync has completed; the distinct outcome keeps that policy choice visible
+/// instead of conflating deferral with no pending work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyPackageMaintenanceCatchUpOutcome {
     Completed,
@@ -8410,7 +8394,6 @@ mod tests {
         .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(AuditLogSettings { enabled: true })
             .unwrap();
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
             .create_group("failed epoch backfill audit", &[])
@@ -8426,22 +8409,33 @@ mod tests {
 
         let (events, mut subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
-        relay.fail_next_subscribe();
-        let error = run_pending_epoch_backfill_reporting_arm(
-            &mut client,
-            &events,
-            "account-id",
-            "alice",
-            &shared,
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
+        // The job fails while it takes ownership of its network result.
+        let mut permit = crate::client::recovery::ExplicitRecoveryPermit::default();
+        let grant = client
+            .authorize_account_recovery(
+                Some(&mut permit),
+                EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .unwrap()
+            .expect("the armed gap is granted");
+        client.released_backfill_reload_pending = true;
+        client.fail_next_released_backfill_reload = true;
+        let result = client.run_recovery_grant_for_test(grant).await;
+        let error = report_pending_epoch_backfill_result(
+            &client,
+            result,
+            true,
+            None,
+            EpochBackfillReportContext {
+                events: &events,
+                account_id_hex: "account-id",
+                account_label: "alice",
+                shared: &shared,
+            },
         )
-        .await
-        .expect_err("failed replay activation must be returned");
+        .expect_err("a failed job must be returned");
 
-        assert_eq!(
-            error.to_string(),
-            "epoch-gap backfill failed: account_transport"
-        );
+        assert_eq!(error.to_string(), "epoch-gap backfill failed: storage_busy");
         assert!(client.has_pending_epoch_backfill());
         let failed_rows: Vec<serde_json::Value> = app
             .audit_log_files()
@@ -8462,13 +8456,13 @@ mod tests {
             .collect();
         assert_eq!(failed_rows.len(), 1);
         assert_eq!(
-            failed_rows[0]["event"]["activation_outcome"].as_str(),
-            Some("failed")
+            failed_rows[0]["event"]["error_kind"].as_str(),
+            Some("storage_busy")
         );
         assert!(matches!(
             subscriber.try_recv().unwrap(),
             MarmotAppEvent::AccountError(RuntimeAccountError { message, .. })
-                if message == "epoch-gap backfill failed: account_transport"
+                if message == "epoch-gap backfill failed: storage_busy"
         ));
 
         run_pending_epoch_backfill_reporting_arm(
@@ -8482,7 +8476,7 @@ mod tests {
         .await
         .unwrap();
         assert!(client.has_pending_epoch_backfill());
-        let subscriptions_after_replay = relay.subscription_count();
+        let subscriptions_after_retry = relay.subscription_count();
         let retry = app
             .account_storage("alice")
             .unwrap()
@@ -8500,7 +8494,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(relay.subscription_count(), subscriptions_after_replay);
+        assert_eq!(relay.subscription_count(), subscriptions_after_retry);
         assert_eq!(
             app.account_storage("alice")
                 .unwrap()
@@ -8523,9 +8517,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config()
-                .with_dev_epoch_backfill_eose_wait_ms(25)
-                .with_dev_epoch_backfill_retry_backoff_ms(300_000),
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
         .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -8651,7 +8643,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_eose_wait_ms(25),
+            bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -8673,7 +8665,7 @@ mod tests {
             EpochBackfillExecutionSeam::ExplicitCatchUp,
         )
         .await
-        .expect("missing relay EOSE is incomplete recovery, not a catch-up failure");
+        .expect("an unproven pass is incomplete recovery, not a catch-up failure");
 
         assert!(client.delivery_overflow_recovery_pending);
         assert!(
@@ -8699,7 +8691,6 @@ mod tests {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
             .create_group("explicit catch-up epoch backfill", &[])
@@ -8804,9 +8795,10 @@ mod tests {
             .await
             .unwrap()
             .expect("the completed ordinary catch-up remains successful");
-        assert!(
-            relay.subscription_count() > subscriptions_before,
-            "ordinary catch-up must still activate and drain transport"
+        assert_eq!(
+            relay.subscription_count(),
+            subscriptions_before,
+            "catch-up reuses the live subscriptions; its job installs none"
         );
         assert!(
             client.has_pending_epoch_backfill(),
@@ -8837,8 +8829,6 @@ mod tests {
                 bounded_epoch_backfill_config(),
             )
             .with_test_relay_client(relay.clone());
-            let _eose =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             let mut client = client_on_app_relay_plane(&app, "alice").await;
             let group_id = client
                 .create_group("full-history epoch backfill", &[])
@@ -8911,8 +8901,8 @@ mod tests {
             );
             assert_eq!(
                 relay.subscription_count(),
-                subscriptions_before_repair + 2,
-                "one activation serves the coalesced demands without a second replay",
+                subscriptions_before_repair,
+                "one comparison job serves the coalesced demands and installs no subscription",
             );
         }
     }
@@ -8929,8 +8919,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config(),
         )
-        .with_test_relay_client(relay.clone());
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        .with_test_relay_client(relay);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
             .create_group("combined full-history repair", &[])
@@ -8954,7 +8943,7 @@ mod tests {
         client
             .repair_full_history()
             .await
-            .expect_err("EOSE alone cannot complete either recovery predicate");
+            .expect_err("an unproven pass cannot complete either recovery predicate");
 
         assert!(client.has_pending_epoch_backfill());
         assert!(client.delivery_overflow_recovery_pending);
@@ -8993,7 +8982,7 @@ mod tests {
         let failure = client
             .repair_full_history()
             .await
-            .expect_err("relay silence cannot resolve the durable delivery gap");
+            .expect_err("an uncertified pass cannot resolve the durable delivery gap");
 
         assert_eq!(
             failure.classification().failure_stage,
@@ -9007,12 +8996,8 @@ mod tests {
             matches!(
                 failure.source,
                 AppError::FullHistoryRepairIncomplete {
-                    reason,
+                    reason: crate::FullHistoryRepairIncompleteReason::CoverageUnproven,
                     delivery_loss_pending: true,
-                } if reason == if cfg!(feature = "test-policy-overrides") {
-                    crate::FullHistoryRepairIncompleteReason::NoRelayEose
-                } else {
-                    crate::FullHistoryRepairIncompleteReason::Deadline
                 }
             ),
             "the stop reason and independent loss fact must both survive: {:?}",
@@ -9045,7 +9030,6 @@ mod tests {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
             .create_group("deferred full-history repair", &[])
@@ -9077,8 +9061,8 @@ mod tests {
 
         assert_eq!(
             relay.subscription_count(),
-            subscriptions_before + 2,
-            "the fallback repair must install the complete account-wide replay"
+            subscriptions_before,
+            "the fallback repair compares every route and installs no subscription"
         );
         assert!(
             client.has_pending_epoch_backfill(),
@@ -9099,7 +9083,6 @@ mod tests {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_a = client.create_group("demand a", &[]).await.unwrap();
         let group_b = client.create_group("demand b", &[]).await.unwrap();
@@ -9120,13 +9103,10 @@ mod tests {
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        relay.fail_next_subscribe();
-        assert!(
-            client
-                .execute_recovery_grant(grant, None, None)
-                .await
-                .is_err()
-        );
+        // The job fails while it takes ownership of its network result.
+        client.released_backfill_reload_pending = true;
+        client.fail_next_released_backfill_reload = true;
+        assert!(client.run_recovery_grant_for_test(grant).await.is_err());
         let before = relay.unfloored_account_subscription_count();
         let attempts = storage.recovery_retry_state().unwrap().attempt_serial;
         assert!(
@@ -9138,7 +9118,7 @@ mod tests {
                 .to_string()
                 .contains("full_history_coverage_unproven")
         );
-        assert_eq!(relay.unfloored_account_subscription_count(), before + 1);
+        assert_eq!(relay.unfloored_account_subscription_count(), before);
         assert_eq!(
             storage.recovery_retry_state().unwrap().attempt_serial,
             attempts + 1
@@ -9146,7 +9126,7 @@ mod tests {
         assert_eq!(
             storage.pending_epoch_backfill_intents().unwrap().len(),
             2,
-            "both independent gap predicates remain incomplete after the shared EOSE"
+            "both independent gap predicates remain incomplete after the shared uncertified pass"
         );
     }
 
@@ -9640,10 +9620,14 @@ mod tests {
             let app = MarmotApp::with_relay_and_config(
                 dir.path(),
                 "wss://relay.example".to_owned(),
-                bounded_epoch_backfill_config().with_dev_epoch_backfill_execution_quantum_ms(10),
+                bounded_epoch_backfill_config(),
             )
             .with_test_relay_client(relay.clone());
             let mut client = client_on_app_relay_plane(&app, "alice").await;
+            // Hold the repair's comparison in flight until its caller stops it.
+            client.test_comparison_results =
+                Some(crate::client::ScriptedComparisons::by_route(|_| Ok(None)));
+            client.test_comparison_delay = Some(Duration::from_secs(30));
             let mut bob = client_on_app_relay_plane(&app, "bob").await;
             let bob_id = cgka_traits::MemberId::new(
                 hex::decode(app.account_home().account("bob").unwrap().account_id_hex).unwrap(),
@@ -9681,9 +9665,6 @@ mod tests {
                 },
             );
             let observer = async {
-                while relay.subscription_count() == before {
-                    tokio::task::yield_now().await;
-                }
                 let (respond, read) = oneshot::channel();
                 command_tx
                     .send(AccountWorkerCommand::QuarantinedGroups { respond })
@@ -9702,8 +9683,7 @@ mod tests {
                     Err(oneshot::error::TryRecvError::Empty)
                 ));
                 // Another account uses its own worker catch-up path while
-                // Alice's history drain still waits for cancellation. No relay
-                // boundary is supplied to manufacture either completion.
+                // Alice's comparison is still in flight.
                 let (bob_tx, mut bob_commands) = mpsc::channel(1);
                 let mut bob_pending = VecDeque::new();
                 let (bob_respond, bob_response) = oneshot::channel();
@@ -9722,7 +9702,11 @@ mod tests {
                 )
                 .await;
                 bob_response.await.unwrap().unwrap();
-                assert_eq!(relay.inbox_subscription_count(&bob_id), bob_before + 1);
+                assert_eq!(
+                    relay.inbox_subscription_count(&bob_id),
+                    bob_before,
+                    "Bob's catch-up reuses his live activation"
+                );
                 drop(bob_tx);
                 if caller_cancels {
                     drop(response);
@@ -9740,7 +9724,11 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(relay.subscription_count(), before + 2);
+            assert_eq!(
+                relay.subscription_count(),
+                before,
+                "neither Alice's repair nor Bob's catch-up installs a subscription"
+            );
             assert_eq!(
                 app.account_storage("bob")
                     .unwrap()

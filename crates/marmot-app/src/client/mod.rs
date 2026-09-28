@@ -83,6 +83,8 @@ mod sync;
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 #[cfg(test)]
+pub(crate) use sync::ScriptedComparisons;
+#[cfg(test)]
 pub(crate) use sync::TestComparisonActivityWitness;
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
@@ -359,11 +361,18 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_evidence: Option<recovery::TestRecoveryEvidence>,
     #[cfg(test)]
-    pub(super) test_comparison_results:
-        Option<std::collections::VecDeque<sync::TestComparisonResult>>,
+    pub(crate) test_comparison_results: Option<sync::ScriptedComparisons>,
     #[cfg(test)]
-    pub(super) test_comparison_delay: Option<std::time::Duration>,
+    pub(crate) test_comparison_delay: Option<std::time::Duration>,
+    /// A cursor a scripted comparison saves before its delay, as the adapter
+    /// does before each exact-ID fetch.
+    #[cfg(test)]
+    pub(crate) test_comparison_saved_cursor: Option<[u8; 32]>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
+    /// The process credits recovery jobs share. A managed worker installs
+    /// its runtime's pool; a directly owned client uses the process pool.
+    pub(crate) recovery_credits:
+        Arc<crate::runtime::account_worker::recovery_credits::RecoveryCreditPool>,
     pub(super) comparison_startup_requested: bool,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,
@@ -423,6 +432,15 @@ pub struct AppClient {
     /// successful checkpoint. A reopened client recovers the same outputs from
     /// the durable engine outbox instead.
     pub(crate) pending_failed_sync_summary: crate::SyncSummary,
+    /// Whether the last settled job certified the retained window of every
+    /// explicit-history scope it compared. Explicit history reaches below
+    /// that window, so this never completes it; it names why it stays open.
+    pub(crate) explicit_history_window_certified: bool,
+    /// Whether the last in-place job's network cutoff skipped or timed out a
+    /// route. A pass that finished early and was admitted late was not cut.
+    pub(crate) recovery_job_network_cut: bool,
+    /// Whether the last in-place job's admission stopped at the whole budget.
+    pub(crate) recovery_job_admission_expired: bool,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
     ///
@@ -471,8 +489,8 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) fail_ingest_of: Option<cgka_traits::MessageId>,
     /// Durable account-wide marker set when the bounded relay-plane queue
-    /// omits a delivery. While true, every subscription rebuild is unfloored
-    /// and EOSE-gated recovery must complete before the cursor is trusted.
+    /// omits a delivery. While true, the comparison job must settle that loss
+    /// before the cursor is trusted.
     pub(crate) delivery_overflow_recovery_pending: bool,
     pub(crate) delivery_overflow_recovery_marker_token: Option<u64>,
     /// Durable overflow rows awaiting admission through the live ingest path.
@@ -1099,9 +1117,11 @@ impl AppClient {
                 .unwrap_or(false)
     }
 
-    /// Install, poll, and retire temporary post-join full-history
-    /// subscriptions. A restart reconstructs this ephemeral map from durable
-    /// CatchUp obligations; the EOSE deadline itself remains persisted.
+    /// Request, poll, and retire temporary post-join full-history
+    /// subscriptions. The recovery job installs a requested one under its
+    /// grant; this pass observes its first boundary. A restart reconstructs
+    /// this ephemeral map from durable CatchUp obligations; the EOSE deadline
+    /// itself remains persisted.
     pub(crate) async fn advance_post_join_maintenance_subscriptions(
         &mut self,
     ) -> Result<(), AppError> {
@@ -1158,7 +1178,6 @@ impl AppClient {
             })
             .collect::<Result<Vec<_>, _>>()?;
         storage.retain_recovery_maintenance_jobs(&active_jobs)?;
-        let mut requested = false;
         let mut waiting = HashSet::new();
 
         for group in self.state.groups.clone() {
@@ -1233,7 +1252,6 @@ impl AppClient {
                     unix_now_seconds().saturating_mul(1000),
                 )?;
                 storage.restore_recovery_maintenance_session(ticket)?;
-                requested = true;
             }
             self.observe_post_join_recovery_boundary(&group_id).await?;
         }
@@ -1266,21 +1284,6 @@ impl AppClient {
             self.recovery_owner
                 .maintenance_observations
                 .remove(&group_id);
-        }
-        if requested
-            && let Some(grant) = self.authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )?
-        {
-            match self.execute_recovery_grant(grant, None, None).await {
-                Ok(summary) => self.pending_applied_sync_summary.merge(summary),
-                Err(failure) => {
-                    self.pending_applied_sync_summary
-                        .merge(failure.partial_summary);
-                    return Err(failure.source);
-                }
-            }
         }
         Ok(())
     }

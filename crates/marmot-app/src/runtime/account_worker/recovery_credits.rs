@@ -1,6 +1,6 @@
-//! The process-wide pool of recovery credits. Every off-worker comparison
-//! reserves one before it spends a durable attempt, and keeps it through
-//! worker admission and checkpoint.
+//! The process-wide pool of recovery credits. Every recovery job reserves one
+//! before it spends a durable attempt, and keeps it through admission and
+//! checkpoint. The worker never waits for one; an explicit caller may.
 
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -11,7 +11,7 @@ static RECOVERY_CREDITS: LazyLock<Arc<RecoveryCreditPool>> =
 
 /// One process pool in production. A test fixture may explicitly substitute
 /// another two-credit pool while all accounts in that runtime still share it.
-pub(in crate::runtime) struct RecoveryCreditPool {
+pub(crate) struct RecoveryCreditPool {
     semaphore: Arc<Semaphore>,
 }
 
@@ -23,28 +23,39 @@ impl RecoveryCreditPool {
     }
 }
 
-pub(in crate::runtime) fn shared_recovery_credit_pool() -> Arc<RecoveryCreditPool> {
+pub(crate) fn shared_recovery_credit_pool() -> Arc<RecoveryCreditPool> {
     RECOVERY_CREDITS.clone()
 }
 
 #[cfg(test)]
-pub(in crate::runtime) fn private_recovery_credit_pool_for_test() -> Arc<RecoveryCreditPool> {
+pub(crate) fn private_recovery_credit_pool_for_test() -> Arc<RecoveryCreditPool> {
     Arc::new(RecoveryCreditPool::new())
 }
 
-pub(super) fn try_acquire_recovery_credit(
+pub(crate) fn try_acquire_recovery_credit(
     pool: &Arc<RecoveryCreditPool>,
 ) -> Option<OwnedSemaphorePermit> {
     pool.semaphore.clone().try_acquire_owned().ok()
 }
 
+/// An explicit caller waits for its credit instead of deferring.
+pub(crate) async fn acquire_recovery_credit(
+    pool: &Arc<RecoveryCreditPool>,
+) -> OwnedSemaphorePermit {
+    pool.semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("the recovery credit pool is never closed")
+}
+
 #[cfg(test)]
-pub(super) fn available_credits(pool: &Arc<RecoveryCreditPool>) -> usize {
+pub(crate) fn available_credits(pool: &Arc<RecoveryCreditPool>) -> usize {
     pool.semaphore.available_permits()
 }
 
 #[cfg(test)]
-pub(super) fn hold_all_credits_for_test(pool: &Arc<RecoveryCreditPool>) -> OwnedSemaphorePermit {
+pub(crate) fn hold_all_credits_for_test(pool: &Arc<RecoveryCreditPool>) -> OwnedSemaphorePermit {
     pool.semaphore
         .clone()
         .try_acquire_many_owned(MAX_CONCURRENT_JOBS as u32)

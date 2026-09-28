@@ -1,202 +1,236 @@
-//! Explicit repair continuation: actual adapter coverage, checkpointed summaries,
-//! and attempt identity. Short quanta are available only in the test-policy build.
+//! Explicit full-history repair runs the one comparison job in place. It
+//! compares every route of its grant inside the repair budget, never installs
+//! or replays a subscription, and succeeds only on certified coverage.
+//! Cancellation and the deadline stop it at safe boundaries.
 use super::*;
 use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
 use crate::{MarmotApp, MarmotAppConfig};
 use marmot_account::AccountHome;
 use std::sync::Arc;
-#[cfg(feature = "test-policy-overrides")]
-use std::sync::atomic::AtomicUsize;
-#[cfg(feature = "test-policy-overrides")]
-use tokio::sync::Notify;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn fixture() -> (tempfile::TempDir, MarmotApp, Arc<ScriptedPushRelayClient>) {
+    fixture_with_relays(vec!["wss://relay.example".to_owned()])
+}
+
+fn fixture_with_relays(
+    relays: Vec<String>,
+) -> (tempfile::TempDir, MarmotApp, Arc<ScriptedPushRelayClient>) {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        "wss://relay.example".to_owned(),
-        MarmotAppConfig::default()
-            .with_dev_epoch_backfill_execution_quantum_ms(10)
-            .with_dev_epoch_backfill_eose_wait_ms(1_000),
-    )
-    .with_test_relay_client(relay.clone());
+    let app = MarmotApp::with_relays_and_config(dir.path(), relays, MarmotAppConfig::default())
+        .with_test_relay_client(relay.clone());
     (dir, app, relay)
 }
 
-#[cfg(feature = "test-policy-overrides")]
-async fn report(
-    plane: &crate::MarmotRelayPlane,
-    subscriptions: &[transport_nostr_adapter::NostrSubscription],
-) {
-    for subscription in subscriptions {
-        for endpoint in subscription.endpoints() {
-            plane
-                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-                .await;
-        }
+/// One scripted comparison per route the repair can select, each answered by
+/// every relay the route compares.
+fn answered(routes: usize) -> ScriptedComparisons {
+    (0..routes)
+        .map(|_| {
+            Ok(Some((
+                transport_nostr_adapter::NostrReconciliationSummary {
+                    relays_succeeded: 1,
+                    ..Default::default()
+                },
+                Vec::new(),
+            )))
+        })
+        .collect()
+}
+
+fn explicit_pending(app: &MarmotApp) -> bool {
+    app.account_storage("alice")
+        .unwrap()
+        .pending_recovery_demands()
+        .unwrap()
+        .iter()
+        .any(|demand| demand.cause == storage_sqlite::RecoveryCause::ExplicitHistory)
+}
+
+fn control<'a>(
+    timeout: Duration,
+    cancelled: &'a (dyn Fn() -> bool + Sync),
+) -> FullHistoryRepairControl<'a> {
+    FullHistoryRepairControl {
+        started: Instant::now(),
+        timeout,
+        cancelled,
     }
 }
 
+/// A relay may still hold an event older than the retained-inventory window.
+/// No comparison searched below that floor, so a certified window must not
+/// report full history: the repair names the unsearched history instead, and
+/// closes its request rather than leaving debt that parks into a notice.
 #[tokio::test]
-async fn missing_eose_exhausts_overall_budget_and_retains_prefix() {
+async fn certified_window_closes_the_request_and_names_the_history_below_it() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let before = relay.subscription_count();
-    let prefix = SyncSummary {
-        joined_groups: vec![GroupId::new(vec![42])],
-        ..Default::default()
-    };
-    client.pending_failed_sync_summary.merge(prefix.clone());
-    // Exercise missing EOSE after activation, not the speed of route/signing
-    // setup. Under CI load an 80 ms end-to-end budget can expire before the
-    // repair activates; that correctly leaves the prefix buffered for later.
-    client.runtime.activate_transport(None).await.unwrap();
-    let (summary, verdict) = client
-        .drain_full_history_repair(
-            &mut DrainCounts::default(),
-            &FullHistoryRepairControl {
-                started: Instant::now(),
-                timeout: Duration::from_millis(80),
-                cancelled: &|| false,
-            },
-        )
-        .await
-        .unwrap();
-    let failure = client
-        .finish_full_history_repair(summary, verdict)
-        .await
-        .unwrap_err();
-    assert!(
-        failure
-            .source
-            .to_string()
-            .contains("full_history_repair_deadline")
-    );
-    assert_eq!(failure.partial_summary, prefix);
-    assert_eq!(
-        relay.subscription_count(),
-        before + 1,
-        "one activation across all slices"
-    );
-}
-
-#[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
-async fn delayed_eose_completes_same_attempt_across_multiple_checkpoints() {
-    let (_dir, app, relay) = fixture();
-    let mut client = client_on_app_relay_plane(&app, "alice").await;
-    client.test_recovery_evidence = Some(super::super::recovery::empty_finite_history);
-    let before = relay.subscription_count();
-    let prefix = SyncSummary {
-        joined_groups: vec![GroupId::new(vec![42])],
-        ..Default::default()
-    };
-    client.pending_failed_sync_summary.merge(prefix.clone());
-    let checks = AtomicUsize::new(0);
-    let ready = Notify::new();
-    // Entry and pre-activation are the first two checks, followed by one per
-    // drain. Wait until several completed drains have yielded before EOSE.
-    let cancelled = || {
-        if checks.fetch_add(1, Ordering::SeqCst) >= 5 {
-            ready.notify_one();
-        }
-        false
-    };
-    let control = FullHistoryRepairControl {
-        started: Instant::now(),
-        timeout: Duration::from_secs(2),
-        cancelled: &cancelled,
-    };
-    let (result, ()) = tokio::join!(client.repair_full_history_with_control(&control), async {
-        ready.notified().await;
-        let subscriptions = relay.accepted_subscriptions();
-        assert_eq!(subscriptions.len(), before + 1);
-        report(&app.relay_plane, &subscriptions[before..]).await;
-    });
-    assert_eq!(
-        result.unwrap(),
-        prefix,
-        "each durable prefix is returned exactly once"
-    );
-    assert!(checks.load(Ordering::SeqCst) >= 6);
-    assert_eq!(
-        relay.subscription_count(),
-        before + 1,
-        "EOSE belongs to the original attempt"
-    );
-}
-
-#[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
-async fn cancellation_retains_prefix_and_old_eose_cannot_complete_next_attempt() {
-    let (_dir, app, relay) = fixture();
-    let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let before = relay.subscription_count();
-    let prefix = SyncSummary {
-        joined_groups: vec![GroupId::new(vec![42])],
-        ..Default::default()
-    };
-    client.pending_failed_sync_summary.merge(prefix.clone());
-    let checks = AtomicUsize::new(0);
-    let cancelled = || checks.fetch_add(1, Ordering::SeqCst) >= 4;
-    let failure = client
-        .repair_full_history_with_control(&FullHistoryRepairControl {
-            started: Instant::now(),
-            timeout: Duration::from_secs(2),
-            cancelled: &cancelled,
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        failure
-            .source
-            .to_string()
-            .contains("full_history_repair_cancelled")
-    );
-    assert_eq!(failure.partial_summary, prefix);
-    let old = relay.accepted_subscriptions();
-    assert_eq!(old.len(), before + 1);
-    let control = FullHistoryRepairControl {
-        started: Instant::now(),
-        timeout: Duration::from_millis(100),
-        cancelled: &|| false,
-    };
-    let (result, ()) = tokio::join!(client.repair_full_history_with_control(&control), async {
-        while relay.subscription_count() == old.len() {
-            tokio::task::yield_now().await;
-        }
-        report(&app.relay_plane, &old[before..]).await;
-    });
-    let failure = result.unwrap_err();
-    assert!(
-        failure
-            .source
-            .to_string()
-            .contains("full_history_repair_deadline")
-    );
-    assert_eq!(relay.subscription_count(), before + 2);
-    assert_eq!(
-        failure.partial_summary,
-        SyncSummary::default(),
-        "old prefix is not emitted twice"
-    );
-}
-
-#[tokio::test]
-async fn cancelled_before_start_does_not_activate_or_clear_overflow() {
-    let (_dir, app, relay) = fixture();
-    let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let before = relay.subscription_count();
-    app.account_storage("alice")
+    let group = client.create_group("older history", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
         .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let floor = crate::unix_now_seconds()
+        .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+    // The relay's older event sits a day below the floor. The comparison's
+    // window starts at the floor, so its answer cannot name the event.
+    let older = crate::tests::epoch_gap_probe(&route, floor - 24 * 60 * 60, "below-window");
+    let before = relay.subscription_count();
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(|_| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )))
+    }));
+    // The notice baseline: the first read only records it.
+    assert!(client.take_history_notice_changes().is_none());
+    // Three finished passes would park open explicit debt into a notice.
+    for _ in 0..3 {
+        let failure = client.repair_full_history().await.unwrap_err();
+        assert_eq!(
+            failure.source.full_history_repair_incomplete(),
+            Some((
+                crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
+                false
+            ))
+        );
+        assert!(
+            !explicit_pending(&app),
+            "the finished pass closes its explicit request"
+        );
+    }
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .parked_recovery_obligations()
+            .unwrap()
+            .is_empty(),
+        "a closed request never parks"
+    );
+    assert!(
+        client.take_history_notice_changes().is_none(),
+        "and publishes no notice"
+    );
+    assert!(
+        !client.state.seen_events.contains(&older.id),
+        "nothing fetched the older event"
+    );
+    assert_eq!(
+        relay.subscription_count(),
+        before,
+        "repair compares history; it never activates or replays"
+    );
+}
+
+/// A comparison that returns just inside the budget can hand over a large
+/// batch. Admission stops at the first turn boundary past the deadline: the
+/// admitted prefix stays durable and the repair reports the deadline.
+#[tokio::test]
+async fn the_deadline_stops_admission_at_a_turn_boundary() {
+    const FETCHED: usize = 200;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("large batch", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let route_id: [u8; 32] = hex::decode(&route).unwrap().try_into().unwrap();
+    let now = crate::unix_now_seconds();
+    let events = (0..FETCHED)
+        .map(|index| transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: crate::tests::epoch_gap_probe(&route, now - 60, &format!("batch-{index}")),
+        })
+        .collect::<Vec<_>>();
+    let ids = events
+        .iter()
+        .map(|event| event.event.id.clone())
+        .collect::<Vec<_>>();
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(move |compared| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            if *compared == TransportReconciliationRoute::Group(route_id) {
+                events.clone()
+            } else {
+                Vec::new()
+            },
+        )))
+    }));
+    // The budget outlives the instant comparison but not a whole batch of
+    // SQLCipher admissions.
+    let budget = Duration::from_millis(300);
+    let failure = client
+        .repair_full_history_with_control(&control(budget, &|| false))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((crate::FullHistoryRepairIncompleteReason::Deadline, false))
+    );
+    let admitted = ids
+        .iter()
+        .filter(|id| client.state.seen_events.contains(id))
+        .count();
+    assert!(
+        admitted < FETCHED,
+        "admission stopped before the whole batch ({admitted} admitted)"
+    );
+    assert!(explicit_pending(&app), "an expired repair keeps its debt");
+}
+
+#[tokio::test]
+async fn uncertified_repair_reports_unproven_coverage_and_keeps_its_debt() {
+    let (_dir, app, relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let before = relay.subscription_count();
+    // No comparison backend: the relays cannot certify anything.
+    let failure = client.repair_full_history().await.unwrap_err();
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("full_history_coverage_unproven")
+    );
+    assert_eq!(
+        failure.classification().failure_stage,
+        SyncFailureStage::RelayReceive
+    );
+    assert!(
+        explicit_pending(&app),
+        "uncertified explicit history stays debt"
+    );
+    assert_eq!(relay.subscription_count(), before);
+}
+
+#[tokio::test]
+async fn cancelled_before_start_requests_nothing_and_keeps_overflow() {
+    let (_dir, app, relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let before = relay.subscription_count();
+    let storage = app.account_storage("alice").unwrap();
+    storage
         .mark_account_delivery_recovery("alice", 7, 1)
         .unwrap();
     client.delivery_overflow_recovery_pending = true;
     client.delivery_overflow_recovery_marker_token = Some(7);
+    let retry = storage.recovery_retry_state().unwrap();
     let failure = client
         .repair_full_history_cancellable(&|| true)
         .await
@@ -208,65 +242,67 @@ async fn cancelled_before_start_does_not_activate_or_clear_overflow() {
             .contains("full_history_repair_cancelled")
     );
     assert_eq!(relay.subscription_count(), before);
+    assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+    assert!(!explicit_pending(&app));
     assert!(
-        app.account_storage("alice")
-            .unwrap()
+        storage
             .account_delivery_recovery("alice")
             .unwrap()
             .is_some()
     );
 }
 
-#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
-async fn delayed_overflow_repair_clears_only_its_own_durable_generation() {
-    for advance_generation in [false, true] {
-        let (_dir, app, relay) = fixture();
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        client.test_recovery_evidence = Some(super::super::recovery::empty_finite_history);
-        let before = relay.subscription_count();
-        let storage = app.account_storage("alice").unwrap();
-        storage
-            .mark_account_delivery_recovery("alice", 7, 1)
-            .unwrap();
-        client.delivery_overflow_recovery_pending = true;
-        client.delivery_overflow_recovery_marker_token = Some(7);
-        let checks = AtomicUsize::new(0);
-        let ready = Notify::new();
-        let cancelled = || {
-            if checks.fetch_add(1, Ordering::SeqCst) >= 6 {
-                ready.notify_one();
-            }
-            false
-        };
-        let control = FullHistoryRepairControl {
-            started: Instant::now(),
-            timeout: Duration::from_secs(2),
-            cancelled: &cancelled,
-        };
-        let (result, ()) = tokio::join!(client.repair_full_history_with_control(&control), async {
-            ready.notified().await;
-            if advance_generation {
-                storage
-                    .mark_account_delivery_recovery("alice", 8, 2)
-                    .unwrap();
-            }
-            report(&app.relay_plane, &relay.accepted_subscriptions()[before..]).await;
-        });
-        assert_eq!(relay.subscription_count(), before + 1);
-        assert_eq!(result.is_ok(), !advance_generation);
-        assert_eq!(
-            storage
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_some(),
-            advance_generation
-        );
-        assert_eq!(
-            client.delivery_overflow_recovery_pending,
-            advance_generation
-        );
-    }
+async fn the_deadline_bounds_the_comparison_pass() {
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    client.test_comparison_results = Some(answered(1));
+    client.test_comparison_delay = Some(Duration::from_secs(30));
+    let started = Instant::now();
+    let failure = client
+        .repair_full_history_with_control(&control(Duration::from_millis(200), &|| false))
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("full_history_repair_deadline")
+    );
+    assert!(explicit_pending(&app), "a timed-out route keeps its debt");
+}
+
+#[tokio::test]
+async fn cancellation_stops_the_comparison_and_keeps_debt_and_cost() {
+    let (_dir, app, relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let before = relay.subscription_count();
+    let storage = app.account_storage("alice").unwrap();
+    client.test_comparison_results = Some(answered(1));
+    client.test_comparison_delay = Some(Duration::from_secs(30));
+    let checks = AtomicUsize::new(0);
+    // The entry and credit checks pass; cancellation lands during the pass.
+    let cancelled = || checks.fetch_add(1, Ordering::SeqCst) >= 4;
+    let started = Instant::now();
+    let failure = client
+        .repair_full_history_with_control(&control(Duration::from_secs(20), &cancelled))
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("full_history_repair_cancelled")
+    );
+    assert_eq!(
+        storage.recovery_retry_state().unwrap().attempt_serial,
+        1,
+        "the cancelled attempt keeps its retry cost"
+    );
+    assert!(explicit_pending(&app));
+    assert_eq!(relay.subscription_count(), before);
 }
 
 #[tokio::test]
@@ -279,14 +315,7 @@ async fn unfinished_overflow_repair_survives_reopen() {
         .unwrap();
     client.delivery_overflow_recovery_pending = true;
     client.delivery_overflow_recovery_marker_token = Some(7);
-    let result = client
-        .repair_full_history_with_control(&FullHistoryRepairControl {
-            started: Instant::now(),
-            timeout: Duration::from_millis(80),
-            cancelled: &|| false,
-        })
-        .await;
-    assert!(result.is_err());
+    assert!(client.repair_full_history().await.is_err());
     drop(client);
     drop(app);
     let reopened =
@@ -302,47 +331,28 @@ async fn unfinished_overflow_repair_survives_reopen() {
 }
 
 #[tokio::test]
-async fn one_fast_endpoint_cannot_complete_full_history_repair() {
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relays_and_config(
-        dir.path(),
-        vec![
-            "wss://fast.example".to_owned(),
-            "wss://slow.example".to_owned(),
-        ],
-        MarmotAppConfig::default().with_dev_epoch_backfill_execution_quantum_ms(10),
-    )
-    .with_test_relay_client(relay.clone());
+async fn one_failed_required_relay_cannot_complete_full_history_repair() {
+    let (_dir, app, relay) = fixture_with_relays(vec![
+        "wss://fast.example".to_owned(),
+        "wss://slow.example".to_owned(),
+    ]);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let before = relay.subscription_count();
-    let control = FullHistoryRepairControl {
-        started: Instant::now(),
-        timeout: Duration::from_millis(80),
-        cancelled: &|| false,
-    };
-    let (result, ()) = tokio::join!(client.repair_full_history_with_control(&control), async {
-        while relay.subscription_count() == before {
-            tokio::task::yield_now().await;
-        }
-        for subscription in &relay.accepted_subscriptions()[before..] {
-            assert_eq!(subscription.endpoints().len(), 2);
-            app.relay_plane
-                .handle_relay_eose_for_test(
-                    subscription.endpoints()[0].clone(),
-                    subscription.subscription_id(),
-                )
-                .await;
-        }
-    });
-    assert!(result.is_err());
-    let coverage = client.adapter.account_subscription_eose().await;
-    assert!(coverage.any());
-    assert!(!coverage.complete());
-    assert_eq!(relay.subscription_count(), before + 1);
+    client.test_comparison_results = Some(
+        [Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                relays_failed: 1,
+                failed_endpoints: vec![cgka_traits::TransportEndpoint("wss://slow.example".into())],
+                ..Default::default()
+            },
+            Vec::new(),
+        )))]
+        .into(),
+    );
+    assert!(client.repair_full_history().await.is_err());
+    assert!(explicit_pending(&app));
+    assert_eq!(relay.subscription_count(), before);
 }
 
 #[tokio::test]
@@ -355,18 +365,23 @@ async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_r
         .unwrap();
     client.delivery_overflow_recovery_pending = true;
     client.delivery_overflow_recovery_marker_token = Some(42);
+    client.test_comparison_results = Some(answered(1));
+    client.test_comparison_delay = Some(Duration::from_secs(30));
     let before = relay.subscription_count();
     {
         let repair = client.repair_full_history();
         tokio::pin!(repair);
         tokio::select! {
-            result = &mut repair => panic!("unproven repair returned before cancellation: {result:?}"),
-            _ = async {
+            result = &mut repair => panic!("repair returned before cancellation: {result:?}"),
+            () = async {
                 timeout(Duration::from_secs(5), async {
-                    while relay.subscription_count() == before {
-                        tokio::task::yield_now().await;
+                    while storage.recovery_retry_state().unwrap().attempt_serial == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                }).await.expect("repair must activate before it is dropped");
+                })
+                .await
+                .expect("repair must reserve its attempt before it is dropped");
+                tokio::time::sleep(Duration::from_millis(100)).await;
             } => {}
         }
     }
@@ -392,7 +407,7 @@ async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_r
     let retry = storage.recovery_retry_state().unwrap();
     assert_eq!(retry.attempt_serial, 1);
     assert!(retry.not_before_ms > retry.recorded_at_ms);
-    assert_eq!(relay.subscription_count(), before + 1);
+    assert_eq!(relay.subscription_count(), before);
     drop(client);
     let reopened = client_on_app_relay_plane(&app, "alice").await;
     let demands = storage.pending_recovery_demands().unwrap();
@@ -440,7 +455,6 @@ async fn loss_handoff_active_attempt_does_not_advance_the_durable_cursor() {
     );
 }
 
-#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn qualified_loss_acknowledgment_persists_admitted_cursor_only_after_handoff() {
     let (_dir, app, relay) = fixture();
@@ -452,20 +466,17 @@ async fn qualified_loss_acknowledgment_persists_admitted_cursor_only_after_hando
     client.delivery_overflow_recovery_pending = true;
     client.delivery_overflow_recovery_marker_token = Some(91);
     let before = relay.subscription_count();
+    // An unbounded loss goal cannot certify by comparison; the synthetic
+    // finite inventory supplies the qualified proof.
     client.test_recovery_evidence = Some(super::super::recovery::empty_finite_history);
+    client.test_comparison_results = Some(answered(1));
     // The already admitted prefix is volatile while loss remains pending.
     client.state.last_transport_timestamp = Some(123);
-    let (result, ()) = tokio::join!(client.repair_full_history(), async {
-        while relay.subscription_count() == before {
-            tokio::task::yield_now().await;
-        }
-        assert_ne!(
-            app.load_state("alice").unwrap().last_transport_timestamp,
-            Some(123)
-        );
-        report(&app.relay_plane, &relay.accepted_subscriptions()[before..]).await;
-    });
-    result.unwrap();
+    assert_ne!(
+        app.load_state("alice").unwrap().last_transport_timestamp,
+        Some(123)
+    );
+    client.repair_full_history().await.unwrap();
     assert!(!client.delivery_loss_blocks_cursor());
     assert!(
         storage
@@ -477,13 +488,12 @@ async fn qualified_loss_acknowledgment_persists_admitted_cursor_only_after_hando
         app.load_state("alice").unwrap().last_transport_timestamp,
         Some(123)
     );
-    assert_eq!(relay.subscription_count(), before + 1);
+    assert_eq!(relay.subscription_count(), before);
 }
 
-/// Explicit synthetic backend evidence is separate from the real adapter's
-/// EOSE signal. Empty finite endpoint inventories qualify; incomplete endpoint
+/// Explicit synthetic backend evidence is separate from what a comparison
+/// certifies. Empty finite endpoint inventories qualify; incomplete endpoint
 /// admission/exhaustiveness or an omitted required endpoint must not qualify.
-#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn qualified_repair_requires_every_endpoint_and_complete_admission() {
     use super::super::recovery::{TestRecoveryEvidence, empty_finite_history};
@@ -515,38 +525,457 @@ async fn qualified_repair_requires_every_endpoint_and_complete_admission() {
         (empty_finite_history, true),
     ];
     for (evidence, qualifies) in cases {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relays_and_config(
-            dir.path(),
-            vec!["wss://a.example".into(), "wss://b.example".into()],
-            MarmotAppConfig::default().with_dev_epoch_backfill_execution_quantum_ms(10),
-        )
-        .with_test_relay_client(relay.clone());
+        let (_dir, app, relay) =
+            fixture_with_relays(vec!["wss://a.example".into(), "wss://b.example".into()]);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.test_recovery_evidence = Some(evidence);
+        client.test_comparison_results = Some(answered(1));
         let before = relay.subscription_count();
-        let (result, ()) = tokio::join!(client.repair_full_history(), async {
-            while relay.subscription_count() == before {
-                tokio::task::yield_now().await;
-            }
-            report(&app.relay_plane, &relay.accepted_subscriptions()[before..]).await;
-        });
+        let result = client.repair_full_history().await;
         assert_eq!(result.is_ok(), qualifies, "{result:?}");
-        assert_eq!(relay.subscription_count(), before + 1);
-        let pending = app
-            .account_storage("alice")
+        if let Err(failure) = result {
+            // Every route answered, so the unqualified pass names what it
+            // could not search and closes its request.
+            assert_eq!(
+                failure.source.full_history_repair_incomplete(),
+                Some((
+                    crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
+                    false
+                ))
+            );
+        }
+        assert_eq!(relay.subscription_count(), before);
+        assert!(!explicit_pending(&app));
+    }
+}
+
+/// A sync whose recovery debt no grant can select, here because the account
+/// has no relay recovery may contact, never waits for a process credit, so a
+/// busy pool cannot hold it behind another account's comparison.
+#[tokio::test]
+async fn a_sync_with_nothing_to_select_takes_no_recovery_credit() {
+    use crate::runtime::account_worker::recovery_credits;
+    let (_dir, app, _relay) = fixture_with_relays(Vec::new());
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let _held = recovery_credits::hold_all_credits_for_test(&client.recovery_credits);
+    assert!(
+        client.recovery_pending().unwrap(),
+        "startup history is debt"
+    );
+    tokio::time::timeout(Duration::from_secs(10), client.sync())
+        .await
+        .expect("the sync must not wait for a credit")
+        .unwrap();
+    assert_eq!(
+        app.account_storage("alice")
             .unwrap()
-            .pending_recovery_demands()
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial,
+        0,
+        "no job ran"
+    );
+}
+
+/// An in-place job counts against the process pool until its admission and
+/// checkpoint finish, not only while its network request runs.
+#[tokio::test]
+async fn the_in_place_job_holds_its_credit_through_admission() {
+    use crate::runtime::account_worker::recovery_credits;
+    const FETCHED: usize = 12;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("held credit", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let route_id: [u8; 32] = hex::decode(&route).unwrap().try_into().unwrap();
+    let now = crate::unix_now_seconds();
+    let events = (0..FETCHED)
+        .map(|index| transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: crate::tests::epoch_gap_probe(&route, now - 60, &format!("held-{index}")),
+        })
+        .collect::<Vec<_>>();
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(move |compared| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            if *compared == TransportReconciliationRoute::Group(route_id) {
+                events.clone()
+            } else {
+                Vec::new()
+            },
+        )))
+    }));
+    let pool = client.recovery_credits.clone();
+    let available = std::sync::Mutex::new(Vec::new());
+    // The repair's stop check runs at every admission turn boundary.
+    let observe = || {
+        available
+            .lock()
+            .unwrap()
+            .push(recovery_credits::available_credits(&pool));
+        false
+    };
+    let _ = client
+        .repair_full_history_with_control(&control(Duration::from_secs(60), &observe))
+        .await;
+    let seen = available.into_inner().unwrap();
+    assert!(
+        seen.len() > FETCHED / 4,
+        "the stop check ran at each admission turn: {seen:?}"
+    );
+    // The final entry is the repair's own verdict check, after settlement.
+    let during_job = &seen[..seen.len() - 1];
+    assert!(
+        during_job
+            .iter()
+            .rev()
+            .take(FETCHED / 4)
+            .all(|&free| free == 1),
+        "every admission turn still held the job's credit: {seen:?}"
+    );
+    assert_eq!(recovery_credits::available_credits(&pool), 2);
+}
+
+/// A route the pass never compared, here a group whose only relay recovery
+/// may not contact, keeps the explicit request open even while every compared
+/// route certifies: no window was searched there at all.
+#[tokio::test]
+async fn an_uncompared_scope_keeps_the_explicit_request_open() {
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("unreachable route", &[]).await.unwrap();
+    // Model a route whose only relay the host-safety rule refuses, so the
+    // pass freezes no inventory for it and never compares it.
+    let group_hex = hex::encode(group.as_slice());
+    client
+        .state
+        .groups
+        .iter_mut()
+        .find(|projection| projection.group_id_hex == group_hex)
+        .unwrap()
+        .nostr_routing
+        .relays = vec!["wss://127.0.0.1:9".into()];
+    client.refresh_sync_routes().unwrap();
+    let routing = client.routing.snapshot();
+    assert!(
+        routing.group_routes.iter().any(|route| {
+            client
+                .adapter
+                .recovery_admitted_endpoints(&route.endpoints)
+                .is_empty()
+        }),
+        "the group's route has no relay recovery may contact"
+    );
+    assert!(client.recovery_endpoints_admitted(), "the inbox route does");
+    // Every route the pass compares certifies.
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(|_| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )))
+    }));
+    let failure = client.repair_full_history().await.unwrap_err();
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((
+            crate::FullHistoryRepairIncompleteReason::CoverageUnproven,
+            false
+        ))
+    );
+    assert!(
+        explicit_pending(&app),
+        "the uncompared route keeps the explicit request open"
+    );
+}
+
+/// The pass that reaches the network deadline still hands over what it
+/// fetched. One route returns events at once; the other is still comparing
+/// when the deadline ends the pass. The finished route's events are admitted
+/// inside the admission reserve, the repair reports the deadline, and the
+/// debt stays open.
+#[tokio::test]
+async fn a_pass_cut_by_the_network_deadline_admits_what_it_fetched() {
+    const FETCHED: usize = 6;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("deadline batch", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let now = crate::unix_now_seconds();
+    let events = (0..FETCHED)
+        .map(|index| transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: crate::tests::epoch_gap_probe(&route, now - 60, &format!("fetched-{index}")),
+        })
+        .collect::<Vec<_>>();
+    let ids = events
+        .iter()
+        .map(|event| event.event.id.clone())
+        .collect::<Vec<_>>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let answered_calls = calls.clone();
+    client.test_comparison_results = Some(ScriptedComparisons::timed(move |_| {
+        let answered = Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )));
+        if answered_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The first route compared returns its events at once.
+            let mut fetched = answered;
+            if let Ok(Some((_, returned))) = &mut fetched {
+                returned.extend(events.clone());
+            }
+            (None, fetched)
+        } else {
+            // The next is still comparing when the network deadline passes.
+            (Some(Duration::from_secs(600)), answered)
+        }
+    }));
+    let started = Instant::now();
+    let failure = client
+        .repair_full_history_with_control(&control(Duration::from_secs(3), &|| false))
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "both routes were compared");
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((crate::FullHistoryRepairIncompleteReason::Deadline, false))
+    );
+    assert!(
+        ids.iter().all(|id| client.state.seen_events.contains(id)),
+        "every event the finished route fetched was admitted"
+    );
+    assert!(explicit_pending(&app), "an expired repair keeps its debt");
+}
+
+/// Every route returns before the network cutoff and the pass crosses it only
+/// while admitting. The certified window wins over the clock: the repair
+/// reports the unsearched history below it and closes its request, not
+/// `Deadline`.
+#[tokio::test]
+async fn an_early_pass_admitted_past_the_network_cutoff_is_not_a_deadline() {
+    const FETCHED: usize = 24;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("late admission", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let now = crate::unix_now_seconds();
+    let events = (0..FETCHED)
+        .map(|index| transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: crate::tests::epoch_gap_probe(&route, now - 60, &format!("late-{index}")),
+        })
+        .collect::<Vec<_>>();
+    let ids = events
+        .iter()
+        .map(|event| event.event.id.clone())
+        .collect::<Vec<_>>();
+    // The budget is 6 s, so the network cutoff falls at 5 s.
+    let budget = Duration::from_secs(6);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let answered_calls = calls.clone();
+    client.test_comparison_results = Some(ScriptedComparisons::timed(move |_| {
+        let mut answer = Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )));
+        if answered_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The first route finishes just inside the cutoff with a batch
+            // whose admission crosses it.
+            if let Ok(Some((_, returned))) = &mut answer {
+                returned.extend(events.clone());
+            }
+            (Some(Duration::from_millis(4_950)), answer)
+        } else {
+            (None, answer)
+        }
+    }));
+    let started = Instant::now();
+    let failure = client
+        .repair_full_history_with_control(&control(budget, &|| false))
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "admission crossed the network cutoff"
+    );
+    assert!(started.elapsed() < budget, "and finished inside the budget");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "both routes were compared");
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((
+            crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
+            false
+        ))
+    );
+    assert!(ids.iter().all(|id| client.state.seen_events.contains(id)));
+    assert!(
+        !explicit_pending(&app),
+        "the completed pass closes its request"
+    );
+}
+
+/// The credit wait does not eat the job's budget. A repair that waits past
+/// its own network cutoff for a credit still runs a whole pass once it holds
+/// one, and a certified window closes the request.
+#[tokio::test]
+async fn a_long_credit_wait_still_closes_a_certified_pass() {
+    use crate::runtime::account_worker::recovery_credits;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    client.test_comparison_results = Some(answered(1));
+    // The budget is 3 s, so a cutoff counted from the call would fall at
+    // 2.5 s; the credit is released only after that.
+    let budget = Duration::from_secs(3);
+    let held = recovery_credits::hold_all_credits_for_test(&client.recovery_credits);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2_800)).await;
+        drop(held);
+    });
+    let started = Instant::now();
+    let failure = client
+        .repair_full_history_with_control(&control(budget, &|| false))
+        .await
+        .unwrap_err();
+    release.await.unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(2_800),
+        "it waited for the credit"
+    );
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((
+            crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow,
+            false
+        ))
+    );
+    assert!(
+        !explicit_pending(&app),
+        "the certified pass closes its request"
+    );
+}
+
+/// An explicit request left pending, for example by an uncertified repair,
+/// is served by the owner's automatic passes four routes at a time. Each
+/// slice whose window certifies is kept, off the quiet streak, and once every
+/// route's window is certified the request closes: it never parks into a
+/// "history may be incomplete" notice.
+#[tokio::test]
+async fn owner_passes_close_a_certified_explicit_request_without_a_notice() {
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    // Six routes: the inbox and five groups, more than one pass freezes.
+    for index in 0..5 {
+        client
+            .create_group(&format!("slice {index}"), &[])
+            .await
             .unwrap();
-        assert_eq!(
-            pending
-                .iter()
-                .any(|d| d.cause == storage_sqlite::RecoveryCause::ExplicitHistory),
-            !qualifies
+    }
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .request_recovery(
+            storage_sqlite::RecoveryRequest::ExplicitHistory {
+                operation_id: &[9; 16],
+            },
+            crate::unix_now_seconds() * 1000,
+        )
+        .unwrap();
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(|_| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )))
+    }));
+    assert!(client.take_history_notice_changes().is_none(), "baseline");
+    let mut passes = 0;
+    while explicit_pending(&app) {
+        assert!(passes < 3, "three owner passes close the request");
+        if passes > 0 {
+            client.recovery_owner.test_advance_to_retry(&storage);
+        }
+        let grant = client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .expect("the pending explicit request is selected");
+        assert!(grant.inventory.len() <= TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        passes += 1;
+        assert!(
+            storage.parked_recovery_obligations().unwrap().is_empty(),
+            "a certified slice never parks the rest"
         );
     }
+    assert!(passes > 1, "the request needed more than one slice");
+    assert!(storage.parked_recovery_obligations().unwrap().is_empty());
+    assert!(
+        client.take_history_notice_changes().is_none(),
+        "no notice was raised"
+    );
+}
+
+/// A route the network cutoff times out lost what it collected with its
+/// future, even though the adapter already saved a cursor past it. It
+/// admitted nothing, so its stored replay cursor must not move.
+#[tokio::test]
+async fn a_route_the_cutoff_timed_out_keeps_its_replay_cursor() {
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    client.test_comparison_results = Some(answered(1));
+    client.test_comparison_saved_cursor = Some([0x5a; 32]);
+    client.test_comparison_delay = Some(Duration::from_secs(600));
+    let storage = app.account_storage("alice").unwrap();
+    // A route never compared has no stored cursor yet.
+    let cursor = || {
+        storage
+            .transport_reconciliation_replay_cursor(&TransportReconciliationRoute::Inbox)
+            .ok()
+            .flatten()
+    };
+    let before = cursor();
+    let failure = client
+        .repair_full_history_with_control(&control(Duration::from_millis(600), &|| false))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((crate::FullHistoryRepairIncompleteReason::Deadline, false))
+    );
+    assert_eq!(
+        cursor(),
+        before,
+        "the timed-out route's saved cursor is not persisted"
+    );
 }

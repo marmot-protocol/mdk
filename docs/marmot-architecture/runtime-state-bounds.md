@@ -245,16 +245,16 @@ Retirement is per occurrence and only on the user's decision; it is not such a c
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | Active grant and admission snapshot | One per account; scopes are input-relative to selected unresolved obligations and their frozen route/endpoint goals. The owner holds a weak admission reference. | Completion, error or future drop releases the snapshot and its inventory; quiescence does not retain an old plan. |
-| Frozen comparison inventory | At most four routes, each using the existing 16,384-item retained inventory bound | Owned by one grant; future drop releases all copied items. Older uncovered ranges remain durable debt, not omitted success. |
+| Frozen comparison inventory | At most four routes for an automatic or catch-up pass; every route of the account for an explicit full-history repair, which runs one at a time per account. Each route uses the existing 16,384-item retained inventory bound, and the process's two recovery credits cap concurrent passes | Owned by one grant; future drop releases all copied items. Older uncovered ranges remain durable debt, not omitted success. |
 | Pending cross-grant acknowledgment | At most the queue and notification causes; each holds one obligation revision and a fixed-size loss snapshot | Exact live/SQL acknowledgment clears it. Failed execution or reopen restores unreclaimed debt and discards the cache. |
 | Completed known-event rows and scopes | No historical completed-event log | Reclaimed before owner selection with no live grant, and on owner reconstruction. Pending exact-event debt is untouched. |
-| Explicit caller metadata | One serialized account-wide explicit-history row | Successful caller detach removes it; cancellation removes urgency only. Reopen performs the same cleanup. |
+| Explicit caller metadata | One serialized account-wide explicit-history row | Successful caller detach removes it, and a finished pass whose every route's window certified closes it; cancellation removes urgency only. Reopen performs the same cleanup. |
 | Maintenance boundary metadata and live observations | Input-relative to active post-join domain jobs | Removed with the job/session lifecycle; grace and quiet timers remain domain-owned. |
 | Epoch evidence and qualified certificates | One current record per tracked group/epoch, no per-evaluation log | Authenticated recovery or terminal retirement clears it; replacement updates the same row. |
 | Unresolved obligations/scopes | Input-relative to unresolved events and frozen historical route/endpoint goals; not a fixed account-wide byte cap | Independent qualified completion, explicit terminal domain retirement, or the user's explicit retirement of a parked occurrence (`state = 2`, "history may be incomplete"). A retired row keeps its unique demand key and its latest scope checkpoints, so it is bounded by the key space; genuinely new demand for that key reopens it. Obsolete routes cannot be silently removed from an outstanding goal. Each scope retains one latest checkpoint rather than an attempt history. |
 
-Automatic unknown-history investigation stops at the existing drain quantum or
-completed inconclusive boundary and parks the obligation in `needs_deep_repair`.
+Automatic unknown-history investigation runs one bounded comparison pass per
+attempt and parks the obligation once its fixed budget of fruitless passes is spent.
 Timer ticks and duplicate joins do not rearm it. New loss/policy evidence or a
 serialized explicit caller can authorize another bounded investigation, subject
 to the shared owner. Missing epoch/event input uses the capped durable retry policy;

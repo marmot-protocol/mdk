@@ -371,59 +371,12 @@ const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
-/// Maximum wall-clock quantum one epoch-gap backfill drain owns the serial
-/// account worker before it checkpoints its prefix and yields incomplete.
+/// How long a recovery attempt waits before the automatic seams may start
+/// another, doubling per attempt up to [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`].
 ///
-/// The bound is observed between deliveries, where no engine snapshot guard or
-/// account-state transaction is live. One already-claimed delivery and the
-/// final prefix checkpoint may therefore extend wall-clock time past the
-/// quantum, but the relay receive loop itself cannot monopolize the worker.
-/// Five seconds leaves headroom inside [`APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT`]
-/// for that boundary work while still amortizing relay subscription setup over
-/// useful replay progress.
-pub(crate) const EPOCH_BACKFILL_EXECUTION_QUANTUM: Duration = Duration::from_secs(5);
-/// How long the epoch-gap backfill drain waits through *silence* for
-/// end-of-stored-events before it gives up and reports an incomplete replay.
-///
-/// Ordinary sync treats a quiet relay as a finished drain, which is right for a
-/// floored subscription that asks for a little and gets it. The backfill's
-/// subscription is unfloored, so silence there is ambiguous: it is equally the
-/// relay having nothing more to send and the relay still resolving a
-/// whole-account history query. Only EOSE separates them, and this is the
-/// budget for waiting on it.
-///
-/// This bounds consecutive silence inside one
-/// [`EPOCH_BACKFILL_EXECUTION_QUANTUM`]. Every delivery resets it. Long working
-/// replays therefore continue across multiple checkpointed quanta instead of
-/// being discarded or holding the worker for their entire wall-clock span.
-///
-/// Because this budget is only consulted when the receive wait times out, a
-/// relay delivering faster than [`SDK_DRAIN_WAIT`] never reaches it; skipped
-/// deliveries therefore poll the end-of-stored-events gate directly. The
-/// execution quantum independently ends duplicate-only traffic when that gate
-/// never arrives.
-///
-/// 30 s remains the conservative consecutive-silence ceiling, but an open
-/// automatic recovery stream never spends it in one attempt: the 5 s execution quantum
-/// yields first and a later seam resubscribes. Explicit full-history repair instead
-/// continues the same activation across quanta under its own overall budget.
-/// Automatic EOSE completion
-/// therefore requires the gate to report within that quantum (or before an
-/// adapter-closed result). A worker-quantum yield is only a scheduling event:
-/// it paces a later resubscription but does not spend the EOSE-failure ordinal.
-/// An unavailable required relay leaves the durable intent pending; bounded
-/// worker quanta and paced retries preserve availability without weakening the
-/// proof that stored history was served.
-pub(crate) const EPOCH_BACKFILL_EOSE_WAIT: Duration = Duration::from_secs(30);
-/// How long an epoch-gap backfill whose replay went unconfirmed waits before
-/// the automatic seams may try it again, doubling per attempt up to
-/// [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`].
-///
-/// Without pacing, the receive seam runs a pending intent after *every* inbound
-/// ingest, so a permanently unconfirmable replay would spend one
-/// [`EPOCH_BACKFILL_EXECUTION_QUANTUM`] per delivery. Productive quantum yields
-/// are exempt; only an unproductive account-wide replay earns this floor,
-/// which matches the maintenance tick cadence.
+/// Without pacing, the receive seam would start a recovery job after *every*
+/// inbound ingest. Progress (new coverage or admitted history) resets it to
+/// this floor, which matches the maintenance tick cadence.
 pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 /// Ceiling on the doubling in [`EPOCH_BACKFILL_RETRY_BACKOFF`]. A relay outage
 /// that outlasts this is not going to be resolved by trying harder, and the
@@ -1844,7 +1797,16 @@ impl MarmotApp {
             test_comparison_results: None,
             #[cfg(test)]
             test_comparison_delay: None,
+            #[cfg(test)]
+            test_comparison_saved_cursor: None,
             recovery_owner,
+            // Unit tests run many directly owned clients in one process; each
+            // gets its own pool so one test's held job cannot stall another.
+            #[cfg(not(test))]
+            recovery_credits:
+                crate::runtime::account_worker::recovery_credits::shared_recovery_credit_pool(),
+            #[cfg(test)]
+            recovery_credits: crate::runtime::account_worker::recovery_credits::private_recovery_credit_pool_for_test(),
             comparison_startup_requested: false,
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
@@ -1869,6 +1831,9 @@ impl MarmotApp {
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_failed_sync_summary: SyncSummary::default(),
+            explicit_history_window_certified: false,
+            recovery_job_network_cut: false,
+            recovery_job_admission_expired: false,
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),

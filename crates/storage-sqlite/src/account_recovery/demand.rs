@@ -182,22 +182,6 @@ impl SqliteAccountStorage {
         Ok(())
     }
 
-    /// A selected account activation replaces all physical subscriptions.
-    /// Include its still-needed maintenance sessions in that same reservation.
-    /// Call within the reservation transaction, only once other work is due.
-    pub fn rearm_recovery_maintenance_for_activation(&self, ids: &[[u8; 16]]) -> StorageResult<()> {
-        let conn = self.lock()?;
-        for id in ids {
-            conn.execute_cached(
-                "UPDATE account_recovery_obligations SET state=0,eligibility=1,revision=revision+1
-                 WHERE id=?1 AND cause=2 AND predicate=2 AND state IN (0,1)",
-                [id.as_slice()],
-            )
-            .storage()?;
-        }
-        Ok(())
-    }
-
     /// Remove prerequisites whose owning domain job no longer needs a session.
     /// The caller supplies the complete current domain set; independent history
     /// and loss obligations are never included in this reclamation.
@@ -233,6 +217,31 @@ impl SqliteAccountStorage {
             "DELETE FROM account_recovery_obligations WHERE cause=4 AND predicate=1 AND state=1 AND urgency=0",
             [],
         ).storage()
+    }
+
+    /// Close an explicit full-history request whose pass finished: its goal
+    /// has no lower bound, so nothing can complete it, and leaving it pending
+    /// would only park it into a notice. Closing records neither coverage nor
+    /// a retirement notice. The explicit-history row is reused by a later
+    /// request, which raises its revision, so only this ticket's revision is
+    /// closed: newer debt survives. Returns whether a row was closed.
+    pub fn close_explicit_history_request(
+        &self,
+        ticket: RecoveryDemandTicket,
+    ) -> StorageResult<bool> {
+        let closed = self
+            .lock()?
+            .execute_cached(
+                "DELETE FROM account_recovery_obligations
+                 WHERE id=?1 AND revision=?2 AND cause=?3 AND state=0",
+                params![
+                    ticket.id.as_slice(),
+                    sqlite_integer(ticket.revision)?,
+                    RecoveryCause::ExplicitHistory as i64
+                ],
+            )
+            .storage()?;
+        Ok(closed > 0)
     }
 
     /// A cancelled last foreground waiter loses urgency, not durable work.
@@ -360,6 +369,45 @@ impl SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second explicit request reuses the row and raises its revision. The
+    /// first repair's late close must not delete that newer debt.
+    #[test]
+    fn a_stale_explicit_close_keeps_a_newer_request() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let first = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[1; 16],
+                },
+                1000,
+            )
+            .unwrap();
+        // The second request lands between the first repair's pass and its
+        // close.
+        let second = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[2; 16],
+                },
+                2000,
+            )
+            .unwrap();
+        assert_eq!(second.id, first.id, "the explicit row is reused");
+        assert!(second.revision > first.revision);
+        let explicit_pending = |store: &SqliteAccountStorage| {
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.cause == RecoveryCause::ExplicitHistory)
+        };
+        assert!(!store.close_explicit_history_request(first).unwrap());
+        assert!(explicit_pending(&store), "the newer request survives");
+        assert!(store.close_explicit_history_request(second).unwrap());
+        assert!(!explicit_pending(&store));
+    }
+
     #[test]
     fn cancelling_one_caller_preserves_independent_demand_and_quiescence() {
         let store = SqliteAccountStorage::in_memory().unwrap();

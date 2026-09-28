@@ -53,7 +53,6 @@ A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_ITEM
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
 # A13 is the one comparison job; #2068 deleted the online EpochGap slice.
-A13|crates/marmot-app/src/client/sync/comparison_job.rs|MAX_COMPARISON_ENDPOINTS_PER_ROUTE
 A13|crates/marmot-app/src/client/sync/comparison_job.rs|MAX_COMPARISON_ADMISSION_PER_TURN
 # A14 floors the post-join maintenance and retained-route REQs at their anchors.
 A14|crates/marmot-app/src/lib.rs|HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE

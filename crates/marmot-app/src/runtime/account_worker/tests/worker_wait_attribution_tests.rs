@@ -1,6 +1,6 @@
-//! Attribution witness for a legacy owner-granted network wait on the account worker.
-//! P5 should invert the pending assertion: the queued command must be served while
-//! a broad relay request is held. Keep this fixture when replacing that wait.
+//! Attribution witness for the owner-granted network wait that used to hold the
+//! account worker. Known-event demand now runs as the one comparison job: it
+//! issues no broad relay request, and the worker keeps serving commands.
 
 use super::*;
 use nostr_relay_builder::prelude::{
@@ -73,7 +73,7 @@ impl QueryPolicy for HeldBroadRequest {
 }
 
 #[tokio::test]
-async fn owner_granted_broad_recovery_wait_holds_queued_worker_command() {
+async fn known_event_demand_runs_as_a_job_without_a_broad_request() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldBroadRequest::default();
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(gate.clone()));
@@ -86,10 +86,7 @@ async fn owner_granted_broad_recovery_wait_holds_queued_worker_command() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        crate::MarmotAppConfig::default()
-            .with_allow_loopback_relay_endpoints(true)
-            .with_dev_epoch_backfill_eose_wait_ms(30_000)
-            .with_dev_epoch_backfill_execution_quantum_ms(30_000),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
@@ -190,8 +187,6 @@ async fn owner_granted_broad_recovery_wait_holds_queued_worker_command() {
         )
         .unwrap();
     let prior_attempt = storage.recovery_retry_state().unwrap().attempt_serial;
-    let mut entered = Box::pin(gate.entered.notified());
-    entered.as_mut().enable();
     gate.armed.store(true, Ordering::SeqCst);
     let release_on_drop = ReleaseGateOnDrop(gate.clone());
     let (respond, advanced) = oneshot::channel();
@@ -205,45 +200,40 @@ async fn owner_granted_broad_recovery_wait_holds_queued_worker_command() {
         .await
         .expect("clock command reaches the worker")
         .unwrap();
-    // Either due convergence or periodic maintenance can enter the same
-    // legacy backfill helper with the Maintenance seam.
+    // Either due convergence or periodic maintenance starts the job.
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(16)).await;
     tokio::time::resume();
-    timeout(Duration::from_secs(5), entered.as_mut())
-        .await
-        .expect("the owner-granted broad REQ reached the real relay");
-    let held_since = TokioInstant::now();
-    let retry = storage.recovery_retry_state().unwrap();
-    assert_eq!(retry.attempt_serial, prior_attempt + 1);
-    let scopes = storage.recovery_scope_snapshots(ticket.id).unwrap();
-    assert!(scopes.iter().any(|scope| {
-        scope.attempt_serial == retry.attempt_serial && scope.plan.known_event_id == Some(event_id)
-    }));
-    assert_eq!(gate.held_requests.load(Ordering::SeqCst), 1);
-    assert!(gate.inside_gate.load(Ordering::SeqCst));
-    let (respond, mut status) = oneshot::channel();
+    // The event is already retained, so the job completes the demand from
+    // its own route comparison, with no broad replay and no worker wait.
+    timeout(Duration::from_secs(10), async {
+        while storage
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .any(|demand| demand.ticket.id == ticket.id)
+        {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the job completes known-event demand");
+    assert!(storage.recovery_retry_state().unwrap().attempt_serial > prior_attempt);
+    assert_eq!(
+        gate.held_requests.load(Ordering::SeqCst),
+        0,
+        "recovery issued no broad group REQ"
+    );
+    let (respond, status) = oneshot::channel();
     commands
         .try_send(AccountWorkerCommand::GroupRecoveryStatus {
             group_id: group.clone(),
             respond,
         })
         .expect("the command entered the same account worker queue");
-    assert!(
-        timeout(Duration::from_millis(150), &mut status)
-            .await
-            .is_err(),
-        "the queued command unexpectedly completed during the held broad network wait"
-    );
-    assert!(gate.inside_gate.load(Ordering::SeqCst));
-    assert!(
-        held_since.elapsed() < Duration::from_secs(1),
-        "the held-window observation must finish before the executor's own deadline"
-    );
-    gate.release();
     timeout(Duration::from_secs(2), status)
         .await
-        .expect("the queued command completes after release and before the executor timeout")
+        .expect("the worker serves commands after the job")
         .unwrap()
         .unwrap();
     drop(release_on_drop);
