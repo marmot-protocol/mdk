@@ -9,7 +9,6 @@ use crate::tests::{
 };
 use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use transport_nostr_adapter::{NostrReconciliationSummary, NostrRelayEvent};
 
@@ -56,7 +55,7 @@ fn candidate() -> NostrRelayEvent {
     }
 }
 
-fn scripted_results() -> VecDeque<TestComparisonResult> {
+fn scripted_results() -> ScriptedComparisons {
     [
         Ok(Some((
             NostrReconciliationSummary {

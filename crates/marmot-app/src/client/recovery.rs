@@ -264,9 +264,6 @@ pub(crate) struct AttemptGrant {
     /// never replaces a certificate still valid for this goal.
     pub(super) certified_scopes: std::collections::HashSet<([u8; 16], u64)>,
     loss: Vec<GrantedLoss>,
-    /// Exact-ID side-channel acquisition does not replace installed live
-    /// maintenance subscriptions or their session-bound observations.
-    preserve_maintenance_observations: bool,
     _live: Arc<()>,
     admission: Option<Arc<RecoveryAdmissionSnapshot>>,
 }
@@ -490,20 +487,6 @@ impl AccountRecoveryOwner {
         now: Instant,
         explicit: Option<&mut ExplicitRecoveryPermit>,
     ) -> StorageResult<Option<AttemptGrant>> {
-        self.select_authorized_attempt_for(storage, readiness, now, explicit, None)
-    }
-
-    /// A bounded executor may accept only its exact selected obligation. The
-    /// owner still applies its normal ordering and pacing; a different winner
-    /// returns before a retry reservation is spent.
-    pub(crate) fn select_authorized_attempt_for(
-        &mut self,
-        storage: &SqliteAccountStorage,
-        readiness: RecoveryReadiness,
-        now: Instant,
-        explicit: Option<&mut ExplicitRecoveryPermit>,
-        required: Option<[u8; 16]>,
-    ) -> StorageResult<Option<AttemptGrant>> {
         if self.active.upgrade().is_some() {
             return Ok(None);
         }
@@ -516,7 +499,7 @@ impl AccountRecoveryOwner {
         let immediate = explicit.as_ref().is_some_and(|permit| !permit.spent);
         let mut fence = storage.recovery_eligible_revision_fence(immediate)?;
         let comparison = storage.recovery_comparison()?;
-        let mut comparison_revision = (comparison.pending()
+        let comparison_revision = (comparison.pending()
             && !explicit
                 .as_ref()
                 .is_some_and(|permit| permit.full_history_requested)
@@ -525,9 +508,9 @@ impl AccountRecoveryOwner {
                     .blocked_route_revision
                     .is_none_or(|r| r != fence.route_revision)))
         .then_some(comparison.revision);
-        // An installed maintenance subscription is awaiting evidence, not
-        // another acquisition. Observations are bound to its original scope
-        // token and live session; reconnect cannot manufacture a new proof.
+        // An installed maintenance subscription is awaiting its boundary, not
+        // another acquisition. No grant tears it down, so it stays out of every
+        // later grant until its observation goes stale.
         fence.obligations.retain(|selected| {
             !self.maintenance_observations.values().any(|observation| {
                 observation.fence.route_revision == fence.route_revision
@@ -543,81 +526,13 @@ impl AccountRecoveryOwner {
             {
                 return Ok::<_, StorageError>(None);
             }
-            if required.is_none() {
-                let maintenance = self
-                    .maintenance_observations
-                    .values()
-                    .map(|observation| observation.id)
-                    .collect::<Vec<_>>();
-                storage.rearm_recovery_maintenance_for_activation(&maintenance)?;
-                fence = storage.recovery_eligible_revision_fence(immediate)?;
-            } else {
-                // One predicate owns this grant. Restore other physical sessions
-                // without re-completing their predicates or restarting grace.
-                // Oldest installed attempt first prevents a retrying predicate
-                // from starving the remaining durable obligations across reopen.
-                let demands = storage.pending_recovery_demands()?;
-                // Displaced unqualified boundaries need a new selected grant;
-                // their prior waiting state cannot strand them after we discard
-                // the old session observation. Completed grace stays completed.
-                let displaced = self
-                    .maintenance_observations
-                    .values()
-                    .filter(|observation| demands.iter().any(|d| d.ticket.id == observation.id))
-                    .map(|observation| observation.id)
-                    .collect::<Vec<_>>();
-                if required.is_none() {
-                    storage.rearm_recovery_maintenance_for_activation(&displaced)?;
-                }
-                let mut ordered = fence
-                    .obligations
-                    .iter()
-                    .map(|(id, revision)| {
-                        let caller = immediate
-                            && demands
-                                .iter()
-                                .any(|d| d.ticket.id == *id && d.caller_waiting);
-                        let last = storage
-                            .recovery_scope_snapshots(*id)?
-                            .iter()
-                            .map(|scope| scope.attempt_serial)
-                            .max()
-                            .unwrap_or(0);
-                        Ok((!caller, last, *id, *revision))
-                    })
-                    .collect::<StorageResult<Vec<_>>>()?;
-                ordered.sort();
-                if comparison_revision.is_some() {
-                    let choose_comparison = ordered.first().is_none_or(|(not_caller, last, ..)| {
-                        *not_caller && comparison.attempt_serial <= *last
-                    });
-                    if choose_comparison {
-                        ordered.clear();
-                    } else {
-                        comparison_revision = None;
-                    }
-                }
-                fence.obligations = ordered
-                    .into_iter()
-                    .take(1)
-                    .map(|(_, _, id, revision)| (id, revision))
-                    .collect();
-            }
-            if required.is_some_and(|id| {
-                comparison_revision.is_some()
-                    || fence.obligations.len() != 1
-                    || fence.obligations[0].0 != id
-            }) {
-                return Ok(None);
-            }
-            let reservation = storage.reserve_recovery_work(
+            storage.reserve_recovery_work(
                 &fence,
                 comparison_revision,
                 now_ms,
                 self.policy.delay_ms(prior.ordinal)?,
                 immediate,
-            )?;
-            Ok(reservation)
+            )
         })?;
         let Some(reservation) = reserved else {
             return Ok(None);
@@ -636,7 +551,6 @@ impl AccountRecoveryOwner {
             inventory: Vec::new(),
             certified_scopes: Default::default(),
             loss: Vec::new(),
-            preserve_maintenance_observations: required.is_some(),
             _live: live,
             admission: None,
         }))
@@ -743,11 +657,6 @@ impl AccountRecoveryOwner {
         });
         self.active_admission = Arc::downgrade(&admission);
         grant.admission = Some(admission);
-        // Reservation is durable retry cost, not permission to disturb an
-        // installed session. Commit transient effects only after plan freeze.
-        if !grant.preserve_maintenance_observations {
-            self.maintenance_observations.clear();
-        }
         if let Some(permit) = explicit {
             permit.spent = true;
         }
@@ -947,11 +856,20 @@ impl AppClient {
                 continue;
             };
             let group_id = cgka_traits::GroupId::new(group.clone());
-            if self
+            // Selection passes over a live observation, so a session this
+            // grant selected is stale. Replace it under this grant's tokens.
+            if let Some((stale, _)) = self
                 .post_join_maintenance_subscriptions
-                .contains_key(&group_id)
+                .get(&group_id)
+                .cloned()
             {
-                continue;
+                self.adapter
+                    .remove_group_maintenance_subscription(&stale)
+                    .await?;
+                self.post_join_maintenance_subscriptions.remove(&group_id);
+                self.recovery_owner
+                    .maintenance_observations
+                    .remove(&group_id);
             }
             let Some(scope) = obligation
                 .scopes
@@ -1351,17 +1269,8 @@ impl AppClient {
     /// consumer before selecting a revision-fenced immutable history plan.
     pub(crate) fn authorize_account_recovery(
         &mut self,
-        explicit: Option<&mut ExplicitRecoveryPermit>,
-        seam: marmot_forensics::EpochBackfillExecutionSeam,
-    ) -> Result<Option<AttemptGrant>, AppError> {
-        self.authorize_account_recovery_for(explicit, seam, None)
-    }
-
-    pub(crate) fn authorize_account_recovery_for(
-        &mut self,
         mut explicit: Option<&mut ExplicitRecoveryPermit>,
         seam: marmot_forensics::EpochBackfillExecutionSeam,
-        required: Option<[u8; 16]>,
     ) -> Result<Option<AttemptGrant>, AppError> {
         // Wake collection retains the loaded live floor and leaves recovery
         // debt/pacing to an Advance runtime. Only the separate full-history
@@ -1414,22 +1323,12 @@ impl AppClient {
         } else {
             RecoveryReadiness::Waiting
         };
-        let selected = if required.is_some() {
-            self.recovery_owner.select_authorized_attempt_for(
-                &storage,
-                readiness,
-                Instant::now(),
-                explicit.as_deref_mut(),
-                required,
-            )?
-        } else {
-            self.recovery_owner.select_authorized_attempt(
-                &storage,
-                readiness,
-                Instant::now(),
-                explicit.as_deref_mut(),
-            )?
-        };
+        let selected = self.recovery_owner.select_authorized_attempt(
+            &storage,
+            readiness,
+            Instant::now(),
+            explicit.as_deref_mut(),
+        )?;
         self.record_unavailable_epoch_observation(&storage)?;
         let Some(mut grant) = selected else {
             return Ok(None);
@@ -1681,7 +1580,20 @@ impl AppClient {
                 &std::collections::HashSet::new(),
             )?
         } else {
-            self.freeze_recovery_inventory(&mut goals, &certified_scopes)?
+            // A maintenance boundary is its own REQ's end of stored events,
+            // never a comparison, so only other causes' routes are compared.
+            let uncompared = goals
+                .iter()
+                .filter(|(id, _)| {
+                    demands.iter().any(|demand| {
+                        demand.ticket.id == *id
+                            && demand.cause == storage_sqlite::RecoveryCause::Maintenance
+                    })
+                })
+                .flat_map(|(id, scopes)| scopes.iter().map(move |scope| (*id, scope.scope_id)))
+                .chain(certified_scopes.iter().copied())
+                .collect();
+            self.freeze_recovery_inventory(&mut goals, &uncompared)?
         };
         grant.rotation_claim = rotation_claim;
         if grant.comparison_revision.is_some() {
@@ -1815,41 +1727,11 @@ mod tests {
     }
 
     #[test]
-    fn bounded_executor_does_not_spend_an_unrelated_owner_selection() {
-        let (storage, mut owner, now) = fixture();
-        assert!(
-            owner
-                .select_authorized_attempt_for(
-                    &storage,
-                    RecoveryReadiness::Ready,
-                    now,
-                    None,
-                    Some([99; 16]),
-                )
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 0);
-        assert!(
-            owner
-                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn bounded_grant_freeze_preserves_live_maintenance_observation() {
+    fn grant_freeze_preserves_an_installed_maintenance_observation() {
         let (storage, mut owner, now) = fixture();
         let selected = storage.pending_recovery_demands().unwrap()[0].ticket.id;
         let grant = owner
-            .select_authorized_attempt_for(
-                &storage,
-                RecoveryReadiness::Ready,
-                now,
-                None,
-                Some(selected),
-            )
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
             .unwrap()
             .unwrap();
         let group = cgka_traits::GroupId::new(vec![7; 16]);
@@ -1881,11 +1763,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        // No grant tears an installed session down, so none forgets it.
         assert!(owner.maintenance_observations.contains_key(&group));
     }
 
     #[tokio::test]
-    async fn bounded_grant_keeps_installed_maintenance_boundary_checkpointable() {
+    async fn a_later_grant_keeps_an_installed_maintenance_boundary_checkpointable() {
         use storage_sqlite::{
             RecoveryEndpointCheckpoint, RecoveryRequest, RecoveryScopeCheckpoint,
         };
@@ -1944,21 +1827,6 @@ mod tests {
             .unwrap()
             .scopes[0]
             .clone();
-        assert!(
-            !storage
-                .checkpoint_recovery_obligation(
-                    &grant.fence,
-                    grant.reservation.attempt_serial,
-                    maintenance.id,
-                    &[RecoveryScopeCheckpoint {
-                        token: prior_scope.token.clone(),
-                        endpoints: Vec::new(),
-                        retained_known_event: false,
-                    }],
-                    storage_sqlite::RecoveryEligibility::WaitingCapability,
-                )
-                .unwrap()
-        );
         owner.maintenance_observations.insert(
             group.clone(),
             MaintenanceRecoveryObservation {
@@ -1980,30 +1848,54 @@ mod tests {
                 1_000_001,
             )
             .unwrap();
-        let bounded = owner
-            .select_authorized_attempt_for(
+        let later = owner
+            .select_authorized_attempt(
                 &storage,
                 RecoveryReadiness::Ready,
                 now + Duration::from_secs(15),
                 None,
-                Some(known.id),
             )
             .unwrap()
             .unwrap();
-        let bounded_goal = RecoveryScopePlan {
+        assert!(
+            later
+                .fence
+                .obligations
+                .iter()
+                .all(|(id, _)| *id != maintenance.id),
+            "an installed session awaits its boundary, not another acquisition"
+        );
+        assert!(
+            later
+                .fence
+                .obligations
+                .iter()
+                .any(|(id, _)| *id == known.id)
+        );
+        let known_goal = RecoveryScopePlan {
             known_event_id: Some(known_id),
-            ..goal
+            ..goal.clone()
         };
-        let bounded = owner
-            .freeze_plan(
-                &storage,
-                bounded,
-                vec![(known.id, vec![bounded_goal])],
-                None,
-            )
+        let goals = later
+            .fence
+            .obligations
+            .iter()
+            .map(|(id, _)| {
+                (
+                    *id,
+                    vec![if *id == known.id {
+                        known_goal.clone()
+                    } else {
+                        goal.clone()
+                    }],
+                )
+            })
+            .collect();
+        let later = owner
+            .freeze_plan(&storage, later, goals, None)
             .unwrap()
             .unwrap();
-        assert_eq!(bounded.plan().unwrap()[0].id, known.id);
+        assert!(later.plan().unwrap().iter().any(|o| o.id == known.id));
         assert_eq!(
             owner.maintenance_observations[&group].attempt_serial,
             installed.attempt_serial
@@ -2017,7 +1909,8 @@ mod tests {
                 .unwrap()
                 .ticket
                 .revision,
-            maintenance.revision
+            maintenance.revision,
+            "a later grant never rearms an installed session"
         );
         assert!(
             storage
@@ -2309,42 +2202,6 @@ mod tests {
         );
         drop(grant);
         let old = owner.maintenance_observations[&group].clone();
-        let maintenance_before = storage
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|demand| demand.ticket.id == ticket.id)
-            .unwrap()
-            .ticket
-            .revision;
-        assert!(
-            owner
-                .select_authorized_attempt_for(
-                    &storage,
-                    RecoveryReadiness::Ready,
-                    now + Duration::from_secs(15),
-                    None,
-                    Some([99; 16]),
-                )
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            storage
-                .pending_recovery_demands()
-                .unwrap()
-                .into_iter()
-                .find(|demand| demand.ticket.id == ticket.id)
-                .unwrap()
-                .ticket
-                .revision,
-            maintenance_before,
-            "a declined exact-ID selection must not rearm a live maintenance session"
-        );
-        assert_eq!(
-            owner.maintenance_observations[&group].attempt_serial,
-            old.attempt_serial
-        );
         let mut permit = ExplicitRecoveryPermit::default();
         let rejected = owner
             .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, Some(&mut permit))
@@ -2424,9 +2281,13 @@ mod tests {
             .freeze_plan(&storage, successor, goals, Some(&mut permit))
             .unwrap()
             .unwrap();
-        // The successful freeze consumes one override and releases observations
-        // only when a successor can actually be dispatched.
-        assert!(owner.maintenance_observations.is_empty());
+        // New loss made the installed observation stale, so the successor
+        // selects its maintenance obligation again. Freeze keeps the old
+        // observation; the job's begin step replaces that session.
+        assert_eq!(
+            owner.maintenance_observations[&group].attempt_serial,
+            old.attempt_serial
+        );
         assert!(permit.spent);
         drop(successor);
         assert!(
@@ -2780,7 +2641,7 @@ mod tests {
         verify_post_join_boundary_and_grace().await;
     }
 
-    async fn verify_maintenance_activation_floor(incremental: bool) {
+    async fn verify_maintenance_boundary_request(incremental: bool) {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
             every_subscription, scripted_eose_pump,
@@ -2832,7 +2693,6 @@ mod tests {
         client.checkpointed_transport_timestamp = Some(cursor);
         client.state.last_transport_timestamp = Some(cursor);
         app.save_state(&client.state).unwrap();
-        let expected = client.subscription_rebuild_since().unwrap();
         // Settle the initial no-cursor investigation through its honest
         // outcome: every route it compares is certified.
         let initial = client
@@ -2843,10 +2703,7 @@ mod tests {
             .unwrap()
             .unwrap();
         client.test_comparison_results = Some(scripted_routes(&initial, |_| false));
-        client
-            .execute_recovery_grant(initial, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(initial).await.unwrap();
         client.test_comparison_results = None;
         if incremental {
             storage
@@ -2883,41 +2740,25 @@ mod tests {
         assert_eq!(grant.plan().unwrap().len(), if incremental { 2 } else { 1 });
         // No route certifies, so only the maintenance boundary can complete.
         client.test_comparison_results = Some(scripted_routes(&grant, |_| true));
-        client
-            .execute_recovery_grant(grant, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        // The job installs only the boundary's own REQ. The live inbox and
+        // group subscriptions keep the floors they were built with.
         let subscriptions = relay.accepted_subscriptions();
-        let mut inbox = 0;
-        let mut groups = 0;
-        let mut maintenance = 0;
-        for subscription in &subscriptions[before..] {
-            match subscription {
-                transport_nostr_adapter::NostrSubscription::AccountInbox { since, .. } => {
-                    inbox += 1;
-                    assert_eq!(
-                        *since,
-                        expected.map(|floor| cgka_traits::transport::Timestamp(
-                            floor.0.saturating_sub(
-                                transport_nostr_adapter::NIP59_TIMESTAMP_TWEAK_SECS
-                            )
-                        )),
-                        "maintenance must preserve the live inbox floor and NIP-59 overlap"
-                    );
-                }
-                transport_nostr_adapter::NostrSubscription::Group { since, .. } => {
-                    groups += 1;
-                    assert_eq!(
-                        *since, expected,
-                        "maintenance must preserve the live group floor"
-                    );
-                }
-                transport_nostr_adapter::NostrSubscription::GroupMaintenance { .. } => {
-                    maintenance += 1
-                }
-            }
-        }
-        assert!(inbox > 0 && groups > 0 && maintenance == 1);
+        let maintenance = subscriptions[before..]
+            .iter()
+            .filter(|subscription| {
+                matches!(
+                    subscription,
+                    transport_nostr_adapter::NostrSubscription::GroupMaintenance { .. }
+                )
+            })
+            .count();
+        assert_eq!(maintenance, 1);
+        assert_eq!(
+            subscriptions.len() - before,
+            maintenance,
+            "recovery never touches live subscriptions"
+        );
         let (subscription, route) = &client.post_join_maintenance_subscriptions[&group];
         for endpoint in &route.endpoints {
             app.relay_plane
@@ -3008,9 +2849,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maintenance_activation_preserves_incremental_and_live_tail_floors() {
-        verify_maintenance_activation_floor(true).await;
-        verify_maintenance_activation_floor(false).await;
+    async fn maintenance_boundary_installs_only_its_own_request() {
+        verify_maintenance_boundary_request(true).await;
+        verify_maintenance_boundary_request(false).await;
     }
 
     /// The post-join maintenance REQ is floored at the Welcome that installed
@@ -3156,6 +2997,18 @@ mod tests {
             .advance_post_join_maintenance_subscriptions()
             .await
             .unwrap();
+        assert!(
+            client.post_join_maintenance_subscriptions.is_empty(),
+            "advance requests the boundary; the recovery job installs it"
+        );
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
         assert_eq!(client.post_join_maintenance_subscriptions.len(), 1);
         client
             .advance_post_join_maintenance_subscriptions()
@@ -3195,8 +3048,8 @@ mod tests {
             storage.recovery_retry_state().unwrap().attempt_serial,
             attempts
         );
-        // Another due recovery activation replaces physical sessions. Its one
-        // grant restores maintenance too; the grace deadline cannot restart.
+        // Another due recovery job leaves the installed session alone: no job
+        // replaces physical subscriptions, and the grace deadline cannot restart.
         let old_id = client.post_join_maintenance_subscriptions[&group].0.clone();
         let mut permit = ExplicitRecoveryPermit::default();
         let grant = client
@@ -3206,12 +3059,9 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        client
-            .execute_recovery_grant(grant, None, None)
-            .await
-            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
         let new_id = client.post_join_maintenance_subscriptions[&group].0.clone();
-        assert_ne!(old_id, new_id);
+        assert_eq!(old_id, new_id);
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -3261,6 +3111,14 @@ mod tests {
             .advance_post_join_maintenance_subscriptions()
             .await
             .unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
         assert_ne!(client.post_join_maintenance_subscriptions[&group].0, new_id);
         assert_eq!(
             storage
@@ -4079,7 +3937,7 @@ mod tests {
     fn scripted_routes(
         grant: &AttemptGrant,
         failed: impl Fn(&storage_sqlite::TransportReconciliationRoute) -> bool,
-    ) -> std::collections::VecDeque<crate::client::sync::TestComparisonResult> {
+    ) -> crate::client::sync::ScriptedComparisons {
         grant
             .inventory
             .iter()
@@ -4097,9 +3955,7 @@ mod tests {
     }
 
     /// Every compared relay answers but withholds an ID it claimed.
-    fn scripted_withheld_routes(
-        grant: &AttemptGrant,
-    ) -> std::collections::VecDeque<crate::client::sync::TestComparisonResult> {
+    fn scripted_withheld_routes(grant: &AttemptGrant) -> crate::client::sync::ScriptedComparisons {
         grant
             .inventory
             .iter()
@@ -4122,10 +3978,7 @@ mod tests {
     async fn run_loss_pass(
         client: &mut AppClient,
         storage: &SqliteAccountStorage,
-        script: fn(
-            &AttemptGrant,
-        )
-            -> std::collections::VecDeque<crate::client::sync::TestComparisonResult>,
+        script: fn(&AttemptGrant) -> crate::client::sync::ScriptedComparisons,
     ) -> usize {
         let grant = client
             .authorize_account_recovery(

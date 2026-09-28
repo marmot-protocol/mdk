@@ -359,8 +359,7 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_evidence: Option<recovery::TestRecoveryEvidence>,
     #[cfg(test)]
-    pub(super) test_comparison_results:
-        Option<std::collections::VecDeque<sync::TestComparisonResult>>,
+    pub(super) test_comparison_results: Option<sync::ScriptedComparisons>,
     #[cfg(test)]
     pub(super) test_comparison_delay: Option<std::time::Duration>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
@@ -1099,9 +1098,11 @@ impl AppClient {
                 .unwrap_or(false)
     }
 
-    /// Install, poll, and retire temporary post-join full-history
-    /// subscriptions. A restart reconstructs this ephemeral map from durable
-    /// CatchUp obligations; the EOSE deadline itself remains persisted.
+    /// Request, poll, and retire temporary post-join full-history
+    /// subscriptions. The recovery job installs a requested one under its
+    /// grant; this pass observes its first boundary. A restart reconstructs
+    /// this ephemeral map from durable CatchUp obligations; the EOSE deadline
+    /// itself remains persisted.
     pub(crate) async fn advance_post_join_maintenance_subscriptions(
         &mut self,
     ) -> Result<(), AppError> {
@@ -1158,7 +1159,6 @@ impl AppClient {
             })
             .collect::<Result<Vec<_>, _>>()?;
         storage.retain_recovery_maintenance_jobs(&active_jobs)?;
-        let mut requested = false;
         let mut waiting = HashSet::new();
 
         for group in self.state.groups.clone() {
@@ -1233,7 +1233,6 @@ impl AppClient {
                     unix_now_seconds().saturating_mul(1000),
                 )?;
                 storage.restore_recovery_maintenance_session(ticket)?;
-                requested = true;
             }
             self.observe_post_join_recovery_boundary(&group_id).await?;
         }
@@ -1266,21 +1265,6 @@ impl AppClient {
             self.recovery_owner
                 .maintenance_observations
                 .remove(&group_id);
-        }
-        if requested
-            && let Some(grant) = self.authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )?
-        {
-            match self.execute_recovery_grant(grant, None, None).await {
-                Ok(summary) => self.pending_applied_sync_summary.merge(summary),
-                Err(failure) => {
-                    self.pending_applied_sync_summary
-                        .merge(failure.partial_summary);
-                    return Err(failure.source);
-                }
-            }
         }
         Ok(())
     }

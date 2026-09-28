@@ -182,22 +182,6 @@ impl SqliteAccountStorage {
         Ok(())
     }
 
-    /// A selected account activation replaces all physical subscriptions.
-    /// Include its still-needed maintenance sessions in that same reservation.
-    /// Call within the reservation transaction, only once other work is due.
-    pub fn rearm_recovery_maintenance_for_activation(&self, ids: &[[u8; 16]]) -> StorageResult<()> {
-        let conn = self.lock()?;
-        for id in ids {
-            conn.execute_cached(
-                "UPDATE account_recovery_obligations SET state=0,eligibility=1,revision=revision+1
-                 WHERE id=?1 AND cause=2 AND predicate=2 AND state IN (0,1)",
-                [id.as_slice()],
-            )
-            .storage()?;
-        }
-        Ok(())
-    }
-
     /// Remove prerequisites whose owning domain job no longer needs a session.
     /// The caller supplies the complete current domain set; independent history
     /// and loss obligations are never included in this reclamation.

@@ -81,6 +81,46 @@ type OwnedComparisonResult = Result<
 #[cfg(test)]
 pub(super) type TestComparisonResult = OwnedComparisonResult;
 
+/// Scripted comparison results, one per compared route in selection order.
+/// The network task takes each one where it would have called the adapter,
+/// so a route the pass never reaches leaves its result queued.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ScriptedComparisons(
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TestComparisonResult>>>,
+);
+
+#[cfg(test)]
+impl ScriptedComparisons {
+    pub(crate) fn pop(&self) -> Option<TestComparisonResult> {
+        self.0.lock().unwrap().pop_front()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(test)]
+impl FromIterator<TestComparisonResult> for ScriptedComparisons {
+    fn from_iter<T: IntoIterator<Item = TestComparisonResult>>(iter: T) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(
+            iter.into_iter().collect(),
+        )))
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> From<[TestComparisonResult; N]> for ScriptedComparisons {
+    fn from(results: [TestComparisonResult; N]) -> Self {
+        results.into_iter().collect()
+    }
+}
+
 #[cfg(test)]
 tokio::task_local! {
     static TEST_COMPARISON_QUEUE_ACTIONS: std::cell::RefCell<std::collections::VecDeque<TestComparisonQueueAction>>;
@@ -1232,7 +1272,7 @@ impl AppClient {
     pub(super) fn freeze_recovery_inventory(
         &mut self,
         goals: &mut [([u8; 16], Vec<storage_sqlite::RecoveryScopePlan>)],
-        certified: &HashSet<([u8; 16], u64)>,
+        uncompared: &HashSet<([u8; 16], u64)>,
     ) -> Result<
         (
             Vec<super::recovery::FrozenRecoveryInventory>,
@@ -1246,7 +1286,7 @@ impl AppClient {
         for scope in goals.iter().flat_map(|(id, scopes)| {
             scopes
                 .iter()
-                .filter(move |scope| !certified.contains(&(*id, scope.scope_id)))
+                .filter(move |scope| !uncompared.contains(&(*id, scope.scope_id)))
         }) {
             if scope.admitted_endpoints.is_empty() {
                 continue;
@@ -1373,13 +1413,13 @@ impl AppClient {
             let progress = StoredReconciliationProgress::new(&storage, &inventory.route);
             let result = tokio::time::timeout_at(deadline, async {
                 #[cfg(test)]
-                let scripted = if let Some(results) = &mut self.test_comparison_results {
+                let scripted = if let Some(results) = &self.test_comparison_results {
                     if let Some(delay) = self.test_comparison_delay {
                         tokio::time::sleep(delay).await;
                     }
                     Some(
                         results
-                            .pop_front()
+                            .pop()
                             .expect("one scripted result per selected comparison route"),
                     )
                 } else {
@@ -1657,38 +1697,43 @@ impl AppClient {
         telemetry: Option<&AppPerformanceTelemetry>,
         explicit: bool,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let state_persist = |error| {
+            ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                error,
+                SyncFailureStage::StatePersist,
+            )
+        };
+        self.refresh_sync_routes().map_err(state_persist)?;
         let grant = self
-            .prepare_sync_grant(telemetry, explicit, false)
-            .map_err(|error| {
-                ClassifiedSyncFailure::at_stage(
-                    SyncSummary::default(),
-                    error,
-                    SyncFailureStage::StatePersist,
-                )
-            })?;
+            .prepare_sync_grant(telemetry, explicit, true)
+            .map_err(state_persist)?;
         self.execute_prepared_sync(grant, telemetry, explicit).await
     }
 
-    /// Keep the same startup/explicit reservation path available to the
-    /// account worker before it lends an immutable comparison request to a
-    /// network task. A grant is selected once; an ineligible shape keeps this
-    /// exact reservation when the inline executor takes over.
+    /// Reconcile epoch-bounded prior routes before issuing the first relay
+    /// subscriptions. This makes retirement deterministic even for a quiet
+    /// group that has no new inbound events after restart.
+    pub(crate) fn refresh_sync_routes(&mut self) -> Result<(), AppError> {
+        let refresh = self.refresh_group_routes()?;
+        // A routing-table delta lives in memory and obligates the subscription
+        // refresh, not a state write; only route retirement mutates persisted
+        // group state.
+        if refresh.state_pruned {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        Ok(())
+    }
+
+    /// Record a startup or explicit comparison request, then select one grant.
+    /// Without a process credit nothing is selected: the durable demand waits
+    /// for the worker's next recovery job instead of spending a reservation.
     pub(crate) fn prepare_sync_grant(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
         explicit: bool,
-        defer_comparison_without_credit: bool,
+        credit_available: bool,
     ) -> Result<Option<AttemptGrant>, AppError> {
-        // Reconcile epoch-bounded prior routes before issuing the first relay
-        // subscriptions. This makes retirement deterministic even for a quiet
-        // group that has no new inbound events after restart.
-        let refresh = self.refresh_group_routes()?;
-        // A routing-table delta lives in memory and obligates the subscription
-        // refresh below, not a state write; only route retirement mutates
-        // persisted group state.
-        if refresh.state_pruned {
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        }
         if self.app.cursor_persistence() == CursorPersistence::Advance
             && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
         {
@@ -1697,10 +1742,7 @@ impl AppClient {
                 self.comparison_startup_requested = true;
             }
         }
-        if defer_comparison_without_credit && self.comparison_only_waiting_for_credit()? {
-            // Startup still activates and drains ordinary live interest below.
-            // A saturated process pool cannot spend a durable comparison
-            // reservation merely to fall back to another inline SDK wait.
+        if !credit_available {
             return Ok(None);
         }
         let mut caller = ExplicitRecoveryPermit::default();
@@ -1716,6 +1758,33 @@ impl AppClient {
         )
     }
 
+    /// Install the session's live subscriptions, floored at the cursor. This
+    /// is ordinary live interest, never recovery: recovery compares history
+    /// without touching these subscriptions.
+    pub(crate) async fn activate_live_transport(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<(), ClassifiedSyncFailure> {
+        if self.app.cursor_persistence() == CursorPersistence::Frozen {
+            self.adapter.require_fresh_activation().await;
+        }
+        self.prepare_transport_for_sync(telemetry)
+            .await
+            .map_err(|(stage, error)| {
+                ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage)
+            })?;
+        let since = self.subscription_rebuild_since().map_err(|error| {
+            ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                error,
+                SyncFailureStage::TransportActivation,
+            )
+        })?;
+        self.record_subscription_rebuild(since.map(|timestamp| timestamp.0))
+            .await;
+        Ok(())
+    }
+
     pub(crate) async fn execute_prepared_sync(
         &mut self,
         grant: Option<AttemptGrant>,
@@ -1728,27 +1797,11 @@ impl AppClient {
             if self.app.cursor_persistence() == CursorPersistence::Frozen
                 || (telemetry.is_some() && !explicit)
             {
-                if self.app.cursor_persistence() == CursorPersistence::Frozen {
-                    self.adapter.require_fresh_activation().await;
-                }
                 // A reopened worker may inherit a history cooldown or parked
                 // debt before it owns any live subscriptions. Restore its
                 // ordinary floored live interest without reserving history or
                 // changing the durable retry deadline.
-                self.prepare_transport_for_sync(telemetry)
-                    .await
-                    .map_err(|(stage, error)| {
-                        ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage)
-                    })?;
-                let since = self.subscription_rebuild_since().map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::TransportActivation,
-                    )
-                })?;
-                self.record_subscription_rebuild(since.map(|timestamp| timestamp.0))
-                    .await;
+                self.activate_live_transport(telemetry).await?;
             }
             // Network cooldown never withholds already queued input or engine
             // events. Receiving existing subscriptions is not a new acquisition.
@@ -4348,12 +4401,7 @@ impl AppClient {
         seam: EpochBackfillExecutionSeam,
     ) -> Result<PendingRecoverySelection, AppError> {
         self.drop_settled_epoch_backfill_intents();
-        let storage = self.app.account_storage(&self.state.label)?;
-        if storage.pending_recovery_demands()?.is_empty()
-            && !storage.recovery_comparison()?.pending()
-            && self.pending_recovery_arm_writes.is_empty()
-            && self.pending_recovery_capacity_writes.is_empty()
-        {
+        if !self.recovery_pending()? {
             return Ok(PendingRecoverySelection::NotPending);
         }
         let mut explicit = ExplicitRecoveryPermit::default();
@@ -4373,6 +4421,7 @@ impl AppClient {
         Ok(PendingRecoverySelection::Grant(Box::new(grant)))
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_pending_epoch_backfill_grant(
         &mut self,
         grant: AttemptGrant,
