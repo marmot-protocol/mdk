@@ -50,6 +50,10 @@
 
 ### Breaking changes
 
+- Remove `RecoveryExecutorMode` and `MarmotAppConfig::recovery_executor_mode`. The
+  conservative mode ran one recovery obligation per grant as a same-schema rollback
+  switch. The bindings and CLI never exposed it, and recovery now has one execution
+  path. Rust callers that set the field should delete it. (#2068)
 - `HostPerformanceOperation` and `RuntimePerformanceOperation` gain 28 shared and
   nine Linux-specific host stages. Downstream exhaustive Rust matches must handle
   the new variants. The snapshot struct layout is unchanged; stages appear in

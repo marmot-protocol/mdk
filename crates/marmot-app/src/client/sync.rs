@@ -4901,8 +4901,8 @@ impl AppClient {
                     SyncFailureStage::GroupSubscriptionSync,
                 )
             })?;
-        // Conservative grants select one predicate, but a broad activation must
-        // preserve every existing temporary session. Restoration supplies no
+        // A grant for one required predicate selects only that predicate, but a
+        // broad activation must preserve every existing temporary session. Restoration supplies no
         // completion evidence for an unselected obligation. A pending boundary
         // remains eligible; a completed boundary keeps its domain grace clock.
         for (group, (_, route)) in displaced {
