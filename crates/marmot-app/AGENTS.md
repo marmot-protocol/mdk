@@ -165,6 +165,10 @@ App runtime bridge for the first real Marmot app surfaces.
   never coverage) and release the delivery-loss fence through `release_retired_delivery_loss`, which keeps the
   fence while any loss obligation is pending, clears the plane only against the exact observed generation, and
   never counts a recovery success. Notice ids are opaque and must not be logged.
+- Keep an account's delivery route open when its relay notification consumer lags: charge the lag as notification
+  loss with the REQ floor its SDK context reported at the lag, and enqueue the generation's control record. Only an
+  unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
+  notification loss before waiting for its control record.
 - Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; relay filtering may affect
   connections, but must not rewrite signed routing state. Relay endpoints pass through the `RelaySafetyPolicy`
   host-safety chokepoint (`src/relay_plane/safety.rs`), and agent-stream broker candidates through
