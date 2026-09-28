@@ -253,8 +253,8 @@ Retirement is per occurrence and only on the user's decision; it is not such a c
 | Epoch evidence and qualified certificates | One current record per tracked group/epoch, no per-evaluation log | Authenticated recovery or terminal retirement clears it; replacement updates the same row. |
 | Unresolved obligations/scopes | Input-relative to unresolved events and frozen historical route/endpoint goals; not a fixed account-wide byte cap | Independent qualified completion, explicit terminal domain retirement, or the user's explicit retirement of a parked occurrence (`state = 2`, "history may be incomplete"). A retired row keeps its unique demand key and its latest scope checkpoints, so it is bounded by the key space; genuinely new demand for that key reopens it. Obsolete routes cannot be silently removed from an outstanding goal. Each scope retains one latest checkpoint rather than an attempt history. |
 
-Automatic unknown-history investigation stops at the existing drain quantum or
-completed inconclusive boundary and parks the obligation in `needs_deep_repair`.
+Automatic unknown-history investigation runs one bounded comparison pass per
+attempt and parks the obligation once its fixed budget of fruitless passes is spent.
 Timer ticks and duplicate joins do not rearm it. New loss/policy evidence or a
 serialized explicit caller can authorize another bounded investigation, subject
 to the shared owner. Missing epoch/event input uses the capped durable retry policy;

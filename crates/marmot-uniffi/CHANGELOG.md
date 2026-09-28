@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Explicit catch-up ingests live input, then runs the account's recovery comparison in
+  place. It no longer re-subscribes relays once the session is active; a route change
+  still refreshes them.
 - Generated identities and later relay-list or profile edits schedule
   best-effort copies of kind 10002, kind 10050, and kind 0 to the built-in
   public directory indexers. Development accounts using loopback relays skip

@@ -162,14 +162,16 @@ NIP-77 comparison covers what remains.
 Recovery stops calling `require_fresh_activation`, `activate_transport(since)` and the
 group re-subscribe. Live subscriptions follow the cursor and change only on route changes
 or reconnects, both owned by the relay plane. Broad unfloored replay is removed from
-automatic recovery.
+recovery, explicit repair included. Explicit callers reuse the live subscriptions too:
+only startup, a frozen wake or a client with no activation yet installs them, and a route
+change refreshes them.
 
 ### 3. One execution path for every cause
 
 | Cause | Source of work |
 | --- | --- |
 | Released receipts | Known event IDs |
-| Spill overflow, SDK notification loss, epoch gap, cold-start incremental history, explicit repair | NIP-77 comparison of the affected routes over the retained-inventory window (explicit repair may use a wider window) |
+| Spill overflow, SDK notification loss, epoch gap, cold-start incremental history, explicit repair | NIP-77 comparison of the affected routes over the retained-inventory window. Explicit repair compares every route in one pass |
 
 Every cause runs the same job:
 
@@ -187,13 +189,25 @@ Every cause runs the same job:
    the tier rules, using the existing revision checks. Old attempts still cannot clear newer
    demand.
 
-The worker never awaits the network. There is one recovery job per account.
+The worker loop never awaits the network. There is one recovery job per account, and
+every cause and every caller runs it:
 
-After step 2 the inline executor remains for maintenance boundaries, explicit repair,
-known-event demand and routes with more than four relays. It activates transport floored at
-the cursor, compares on the worker, and feeds what it fetched back through the live queue.
-The startup grant activates the session's first live subscriptions before its off-worker
-comparison.
+- A post-join maintenance grant installs only its own REQ when its job begins, under the
+  grant's scope tokens, and completes on that REQ's end of stored events. Its scopes are
+  not compared.
+- Known-event demand compares its route and completes once that exact event is durably
+  retained.
+- A route compares all of its relays in one request, each under its own deadline, however
+  many relays it lists.
+- Explicit catch-up, `sync()` and a directly owned client's `next_event()` drain the live
+  queue first, so the frozen inventory holds what the live subscriptions delivered, then
+  wait for a credit and run one job in place. The worker keeps serving snapshot reads while
+  an explicit caller's job runs. Startup runs its job only when a credit is free. Without a
+  credit nothing is selected, so no reservation is spent.
+- Explicit repair runs the job in place too. Its one pass compares every route of the grant
+  inside the 60-second repair budget. Cancellation or the deadline aborts the network
+  request at a 50 ms poll and stops admission at a turn boundary, keeping the admitted
+  prefix. It succeeds only when its explicit-history obligation certifies.
 
 Rules kept from the current design: complete coverage with a still-stuck engine means no
 replay; the blocked reason is recorded; the existing one-shot wedge report still escalates
@@ -361,19 +375,27 @@ Deleted in step 2:
 - The per-trigger offload rules in `client/sync/comparison_job.rs`, the online epoch-gap
   job and the test-only bounded exact-ID path. That file is now the one comparison job for
   every automatic cause.
-- Activation and broad replay in automatic recovery. Only explicit repair widens.
+- Activation and broad replay in automatic recovery. Explicit repair kept its replay until
+  the inline executor retired.
 - Conservative mode (`RecoveryExecutorMode`). It was internal to `marmot-app` and not in the
   bindings.
 - The recovery job slots, replaced by one comparison job and one admission loop.
 - The 22 recovery notes, replaced by this one. The bounded-acquisition interface contract
   stays in its own document.
 
+Deleted when the inline executor retired, after step 2:
+
+- The inline executor, `execute_recovery_grant`, with its activation, drain-based
+  completion (`DrainVerdict`, the EOSE gate and drain state), `recover_delivery_overflow*`,
+  the explicit repair drain and the `queue_reconciled_event` path back into the live queue.
+- The drain budgets `EPOCH_BACKFILL_EOSE_WAIT` and `EPOCH_BACKFILL_EXECUTION_QUANTUM`, their
+  `dev_epoch_backfill_eose_wait_ms` and `dev_epoch_backfill_execution_quantum_ms`
+  overrides, and `MAX_COMPARISON_ENDPOINTS_PER_ROUTE`.
+- The inline fallback when no credit is free, the per-cause offload checks, explicit
+  catch-up's re-activation, and explicit repair's unfloored replay.
+
 Still to delete:
 
-- The inline executor inside `execute_recovery_grant` that the causes above still use: its
-  activation, drain-based completion (`DrainVerdict` mapping), `recover_delivery_overflow*`,
-  and the `queue_reconciled_event` → `handle_reconciled_event` path back into the live
-  queue.
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
 Each PR reports exact before/after line counts. The goal is a large net reduction across
@@ -390,7 +412,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Epoch-stall detector facts.
 - Post-join maintenance subscriptions, now floored at the Welcome that installed the copy
   less a fifteen-minute clock-skew allowance (design section 5), rather than a
-  full-history request. They still complete on EOSE, not on comparison.
+  full-history request. A maintenance grant's job installs them, and they still complete
+  on EOSE, not on comparison.
 - The #1946 rule that recovery debt is never evicted. Spill rows are capped; unresolved loss
   is not. Every unresolved loss generation and every parked obligation stays, with no fixed
   row cap, until qualified completion (an explicit deep repair counts only when it achieves
@@ -448,7 +471,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 | --- | --- | --- |
 | 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Done (#2063, #2064, #2069) |
 | 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | Merged |
-| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | Merged (#2068), with the notification-lag fix (#2070, #2074). Live cursor promotion (design section 6) follows. The inline executor for maintenance, explicit repair, known events and routes over four relays remains. |
+| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | Merged (#2068), with the notification-lag fix (#2070, #2074). History floors (#2077, design section 5) and live cursor promotion (#2075, design section 6) merged. |
+| 2, follow-up | Retire the inline executor: maintenance boundaries, explicit repair, known events, routes over four relays and explicit callers run the one job | Implemented; PR pending |
 
 ## Risks and open items
 
@@ -488,6 +512,13 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   what falls below the floor is spilled, not lost. A drain checkpoint spills only what
   arrives while it saves; an older delivery that arrives after it is queued below its floor,
   exposed to a stop as it always was.
+- Explicit repair compares the retained window only. A goal with no lower bound, or one
+  below the inventory floor, cannot be certified by it, and explicit repair no longer
+  fetches history older than the window: the unfloored replay it replaced fetched that
+  history but never certified it. Each pass also fetches at most 16 missing events per
+  relay. A wider window needs acquisition below the inventory floor.
+- Explicit catch-up no longer re-subscribes, so a maintenance boundary whose EOSE a lag
+  lost waits for the next activation, at reconnect or restart.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.

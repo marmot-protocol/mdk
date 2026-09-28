@@ -203,12 +203,14 @@ See [`AGENTS.md`](AGENTS.md) for the module map and privacy-safe telemetry rules
 
 ## Explicit full-history repair
 
-`MarmotAppRuntime::repair_full_history` requests one owner-authorized unfloored attempt and retains its frozen
-scope and endpoint session across checkpointed drain quanta. A quantum yield does not resubscribe or buy another
-retry. Success requires qualified exhaustive history and durable admission for every required endpoint/scope;
-EOSE alone, a fast subset, or a superseded session cannot certify completion. The current SDK supplies no such
-exhaustiveness certificate, so it honestly returns incomplete even if all endpoints report EOSE. Known-event
-recovery can instead complete from a validated retained copy. Maintenance uses its separately fenced boundary.
+`MarmotAppRuntime::repair_full_history` requests one owner-authorized explicit-history obligation and runs the
+account's one recovery job for it in place: a NIP-77 comparison of every route over the retained-inventory window,
+then bounded admission of what it fetched through ordinary ingest. It installs and replays no subscription.
+Success requires that every required relay certified its route and every difference was durably admitted; an
+answer from only some required relays, or a goal below the inventory floor, cannot certify completion. Each pass
+fetches at most 16 missing events per relay, so a large gap can take further repairs or automatic passes.
+Known-event recovery can instead complete from a validated retained copy. Maintenance uses its separately fenced
+boundary.
 
 The Rust `AppError::FullHistoryRepairIncomplete` preserves a bounded `FullHistoryRepairIncompleteReason` and an
 independent `delivery_loss_pending` flag. Worker/binding calls retain their existing error channel; their safe
@@ -217,17 +219,18 @@ attempt is converted to a success. Rust callers can inspect
 `AppError::full_history_repair_incomplete()` for the typed reason and independent loss flag,
 including through `AccountCatchUp`. It never parses display strings. The API shape for repair calls is unchanged.
 
-The explicit attempt has a 60-second overall cooperative budget, including setup and reconciliation. A started
-ingest/checkpoint finishes before deadline or caller/runtime cancellation is observed; this is not a hard bound
-on an individual storage or network operation. An earlier terminal transport or drain-silence verdict also ends
-the attempt. Partial progress remains durable, outstanding loss survives reopen, and only qualified completion
-plus the exact live acknowledgment can reclaim captured loss evidence. The only other way to release its cursor
-fence is the user dismissing that loss's "history may be incomplete" notice (below), which is never coverage.
+The explicit attempt has a 60-second overall cooperative budget, including setup and comparison. Cancellation or
+the deadline aborts the comparison request and stops admission at a turn boundary; a started ingest/checkpoint
+finishes first, so this is not a hard bound on an individual storage operation. The attempt then reports
+`Cancelled` or `Deadline`, and an uncertified pass reports `CoverageUnproven`. Partial progress remains durable,
+outstanding loss survives reopen, and only qualified completion plus the exact live acknowledgment can reclaim
+captured loss evidence. The only other way to release its cursor fence is the user dismissing that loss's "history
+may be incomplete" notice (below), which is never coverage.
 
-The account remains serialized during repair. The worker can serve committed member/roster snapshots while relay
-I/O waits; mutations, subsequent repair requests, and reads behind queued mutations retain FIFO order. Send fairness
-and isolated nonblocking network acquisition remain #1947 work. All automatic history triggers use the same
-owner and durable pacing; bounded investigation can leave unresolved debt parked for new evidence or explicit repair.
+The account remains serialized during repair. The worker can serve committed member/roster snapshots while the
+comparison runs off the worker; mutations, subsequent repair requests, and reads behind queued mutations retain
+FIFO order. Send fairness remains #1947 work. All automatic history triggers use the same owner, job and durable
+pacing; bounded investigation can leave unresolved debt parked for new evidence or explicit repair.
 
 ## History may be incomplete notices
 

@@ -25,7 +25,7 @@ App runtime bridge for the first real Marmot app surfaces.
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent
   send commands, and the lifecycle helpers and encrypted-media helpers they share), `sync.rs` (transport sync: `sync`,
   `next_event`, `sync_sdk_relay`, `ingest_delivery`, `sync_runtime_groups`, the relay-echo/transport-cursor helpers, and
-  the cursor unit tests; `sync/full_history_tests.rs` covers explicit repair continuation), `projection.rs`
+  the cursor unit tests; `sync/full_history_tests.rs` covers explicit repair), `projection.rs`
   (timeline/group projection accessors, the `*_for_group` component reads, the
   kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
   transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
@@ -154,12 +154,17 @@ App runtime bridge for the first real Marmot app surfaces.
 - Incoming welcomes may auto-join MLS state, but app projections must preserve local confirmation state. Pending invites
   should stay visible until accepted, and decline should leave the group before archiving the local projection.
 - Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
-- Explicit full-history repair keeps one unfloored relay activation and its endpoint EOSE coverage across drain
-  quanta; a quantum yield is not completion or a new subscription. Keep cancellation/deadline checks cooperative
-  around completed ingest/checkpoint work, and preserve generation-checked overflow marker clearing. The account
-  worker can serve committed snapshot reads while repair waits; mutations retain FIFO order. Client continuation
-  tests live in `src/client/sync/full_history_tests.rs`; worker cancellation/read-order tests stay in
-  `src/runtime/account_worker.rs`. See the README for the automatic-recovery and send-fairness limits.
+- Every recovery cause and caller runs the one comparison job in `src/client/sync/comparison_job.rs`; there is
+  no inline executor. Explicit catch-up and `sync()` drain the live queue, then run one job in place; nothing
+  re-subscribes to recover history, and only startup, a frozen wake or an unactivated client installs live
+  subscriptions. Explicit full-history repair runs the job in place: one comparison pass over every route of its
+  grant inside the repair budget, succeeding only on certified coverage. Keep cancellation and deadline checks
+  cooperative (abort the network request, stop admission at a turn boundary, keep the admitted prefix), and
+  preserve generation-checked overflow marker clearing. The account worker can serve committed snapshot reads
+  while repair waits; mutations retain FIFO order, and explicit catch-up and repair wait while a worker-owned job
+  is in flight. Client continuation tests live in `src/client/sync/full_history_tests.rs`; worker
+  cancellation/read-order tests stay in `src/runtime/account_worker.rs`. See the README for the
+  automatic-recovery and send-fairness limits.
 - A dismissed "history may be incomplete" notice is the one user-authorized ending for parked recovery debt
   besides qualified completion. Record it only through `retire_parked_recovery_obligation` (its own outcome,
   never coverage) and release the delivery-loss fence through `release_retired_delivery_loss`, which keeps the
