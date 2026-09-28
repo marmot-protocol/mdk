@@ -308,19 +308,26 @@ pub(super) struct FrozenRecoveryInventory {
 impl FrozenRecoveryInventory {
     /// The route's comparison as its required relays saw it. A best-effort
     /// relay's failure neither withholds the certificate nor schedules a
-    /// retry. A failure the backend did not attribute to a relay counts
-    /// against every relay.
+    /// retry. A failure the backend did not attribute to one of the compared
+    /// relays counts against every relay.
     pub(super) fn judge(
         &self,
         summary: &transport_nostr_adapter::NostrReconciliationSummary,
     ) -> (storage_sqlite::RecoveryComparisonOutcome, bool) {
-        let unattributed = summary.failed_endpoints.len() < summary.relays_failed;
+        use crate::relay_plane::same_relay;
+        let compared = self.work.endpoints();
+        let unattributed = summary.failed_endpoints.len() < summary.relays_failed
+            || summary.failed_endpoints.iter().any(|failed| {
+                !compared
+                    .iter()
+                    .any(|endpoint| same_relay(endpoint.as_str(), failed.as_str()))
+            });
         let required_failed = self.required.iter().any(|endpoint| {
             unattributed
                 || summary
                     .failed_endpoints
                     .iter()
-                    .any(|failed| failed.as_str() == endpoint)
+                    .any(|failed| same_relay(failed.as_str(), endpoint))
         });
         if required_failed {
             return (
@@ -328,13 +335,12 @@ impl FrozenRecoveryInventory {
                 false,
             );
         }
-        let compared = self.work.endpoints();
         let certified = summary.relays_succeeded > 0
             && !self.required.is_empty()
             && self.required.iter().all(|endpoint| {
                 compared
                     .iter()
-                    .any(|compared| compared.as_str() == endpoint)
+                    .any(|compared| same_relay(compared.as_str(), endpoint))
             });
         (
             storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown,
@@ -4022,6 +4028,15 @@ mod tests {
         };
         assert!(group.judge(&failing(BEST_EFFORT)) == (Outcome::ServicedUnknown, true));
         assert!(group.judge(&failing(OPERATED)) == (Outcome::TransientFailure, false));
+        assert!(
+            group.judge(&failing("wss://Operated.Example:443/"))
+                == (Outcome::TransientFailure, false),
+            "the adapter's normalized spelling still names the operated relay"
+        );
+        assert!(
+            group.judge(&failing("wss://elsewhere.example")) == (Outcome::TransientFailure, false),
+            "a failure on no compared relay counts against every relay"
+        );
         assert!(
             group.judge(&transport_nostr_adapter::NostrReconciliationSummary {
                 relays_succeeded: 1,

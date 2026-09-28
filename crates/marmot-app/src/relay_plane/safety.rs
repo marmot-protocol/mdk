@@ -274,6 +274,16 @@ impl super::MarmotRelayPlaneAccountAdapter {
     }
 }
 
+/// Whether two endpoint spellings name the same relay. Parsing normalizes
+/// case and default ports, which a route's signed spelling may not.
+pub(crate) fn same_relay(left: &str, right: &str) -> bool {
+    left == right
+        || matches!(
+            (RelayUrl::parse(left.trim()), RelayUrl::parse(right.trim())),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
 /// The endpoints whose comparison certifies a recovery scope: the route's
 /// operated relays. Any other relay is best effort and never blocks
 /// completion. A route with no operated relay requires all of its relays, so
@@ -633,6 +643,14 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn same_relay_compares_parsed_identities() {
+        assert!(same_relay("wss://relay.example", "wss://relay.example"));
+        assert!(same_relay("wss://Relay.Example:443", "wss://relay.example"));
+        assert!(same_relay("wss://relay.example/", "wss://relay.example"));
+        assert!(!same_relay("wss://relay.example", "wss://other.example"));
     }
 
     #[test]
