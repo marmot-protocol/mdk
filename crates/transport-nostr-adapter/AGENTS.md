@@ -60,9 +60,11 @@ for reconnect/backoff and relay status mechanics.
   answers `CLOSED duplicate:` makes the SDK drop the REQ from the registry that restores it on reconnect, and a lone
   CLOSE would leave it without the REQ. Keep that registry in place; a relay-level unsubscribe and subscribe drops its
   entry when a send fails. The SDK client re-issues only to a connected relay and only while its floor record holds
-  the REQ live, and records it with `open` first. A relay whose re-issue went out keeps its claim, so a replay that
-  lags again cannot loop; one that got nothing is released and counted in `EoseReissueSummary::failed_relays` so the
-  caller repairs it again later. Never wait for queue room under the lifecycle lock. Never infer EOSE at a lag, change
+  the REQ live, and records it with `open` first. Every repair reads the SDK's EOSE record for every relay still
+  awaiting EOSE, through `subscription_eose_received` for one already re-issued to, so an answer a later lag lost
+  still completes; only the network re-issue is once per relay, so a replay that lags again cannot loop. A relay that
+  got nothing has its re-issue released and counted in `EoseReissueSummary::failed_relays` so the caller repairs it
+  again later. Never wait for queue room under the lifecycle lock. Never infer EOSE at a lag, change
   a re-issued REQ's filter, or reopen a closed REQ.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.

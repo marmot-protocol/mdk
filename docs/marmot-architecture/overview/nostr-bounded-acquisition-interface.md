@@ -123,7 +123,8 @@ REQ again, unchanged and under its own id, in one all-or-nothing `Relay::batch_m
 while it is live there and the SDK's reconnect registry keeps the REQ. It never waits: a relay that is not connected
 or has no room for both frames gets nothing, keeps the old REQ live, and is repaired again later. The account context
 records the REQ again first, with the `since` it was issued with, and never reopens a closed REQ, so the re-issue
-leaves the floor where it was.
+leaves the floor where it was. `subscription_eose_received` reads the same record without sending anything; the
+adapter uses it on relays it already re-issued a REQ to, which never get the REQ a second time.
 
 The recovery consumer subscribes for each activated account and never infers a group from a receiver gap. The backend
 must update the watch without waiting for room in the event-delivery queue, so loss stays observable when event

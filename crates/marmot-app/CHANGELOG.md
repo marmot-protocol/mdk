@@ -129,9 +129,10 @@
   and the REQ again, unchanged and under its own id, are queued together or not at all, and
   the relay replays from the same `since` before a fresh EOSE; the relay never sees a
   repeated live id, and the SDK keeps the REQ it restores on reconnect. A relay whose
-  re-issue went out is not re-issued again; one that got nothing is repaired again after
-  the settle window. The notification-loss floor does not move. `NostrRelayClient` gains
-  `reissue_subscription`, unsupported by default, and `NostrTransportAdapter` gains
+  re-issue went out is not re-issued again, but later repairs still read the SDK's record,
+  so a fresh EOSE that a later lag lost still completes; one that got nothing is repaired
+  again after the settle window. The notification-loss floor does not move. `NostrRelayClient` gains
+  `reissue_subscription` and `subscription_eose_received`, unsupported by default, and `NostrTransportAdapter` gains
   `reissue_subscriptions_awaiting_eose`. The `nostr-sdk` fork pin moves to
   `a9c7a6423d104c603de6ea8244265ea17f0f9d89` for `Relay::batch_msg` and
   `Relay::subscription_received_eose`. (#2070)
