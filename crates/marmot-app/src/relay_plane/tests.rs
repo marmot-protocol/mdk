@@ -5029,10 +5029,19 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
             last_failure_code: None,
         })
         .unwrap();
+    // Advance requests the boundary; the recovery job installs its REQ.
     client
         .advance_post_join_maintenance_subscriptions()
         .await
         .unwrap();
+    let grant = client
+        .authorize_account_recovery(
+            None,
+            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+        )
+        .unwrap()
+        .unwrap();
+    client.run_recovery_grant_for_test(grant).await.unwrap();
     assert!(
         client
             .post_join_maintenance_subscriptions
@@ -5252,13 +5261,9 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
         "no live REQ reaches back to the rename"
     );
 
-    let comparisons = bob_app
-        .relay_telemetry()
-        .await
-        .metrics
-        .reconciliation_attempts;
     // The maintenance tick runs after the cold-start comparison's paced retry
-    // deadline; move the owner clock there instead of waiting.
+    // deadline; move the owner clock there instead of waiting. Advance
+    // requests the boundary; the recovery job installs its REQ.
     let bob_storage = bob_app.account_storage("bob").unwrap();
     bob_client
         .recovery_owner
@@ -5267,11 +5272,29 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
         .advance_post_join_maintenance_subscriptions()
         .await
         .unwrap();
+    let grant = bob_client
+        .authorize_account_recovery(
+            None,
+            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+        )
+        .unwrap()
+        .unwrap();
+    bob_client.run_recovery_grant_for_test(grant).await.unwrap();
     assert!(
         bob_client
             .post_join_maintenance_subscriptions
             .contains_key(&group)
     );
+    assert_eq!(
+        bob_client.runtime.group_record(&group).unwrap().epoch,
+        joined_epoch,
+        "installing the REQ fetched nothing by itself"
+    );
+    let comparisons = bob_app
+        .relay_telemetry()
+        .await
+        .metrics
+        .reconciliation_attempts;
     timeout(Duration::from_secs(20), async {
         while bob_client.runtime.group_record(&group).unwrap().epoch < renamed_epoch {
             if let AccountDeliveryReceive::Delivery(delivery) =

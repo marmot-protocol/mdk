@@ -2857,10 +2857,19 @@ mod tests {
         }
         let before = relay.accepted_subscriptions().len();
 
+        // Advance requests each boundary; the recovery job installs its REQ.
         client
             .advance_post_join_maintenance_subscriptions()
             .await
             .unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
 
         assert_eq!(client.post_join_maintenance_subscriptions.len(), 2);
         let floors = relay.accepted_subscriptions()[before..]
