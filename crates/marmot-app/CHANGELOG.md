@@ -41,8 +41,9 @@
   returns `BelowRetentionWindow` and closes its request: no explicit-history debt is left
   to park into a "history may be incomplete" notice, and nothing is recorded as coverage.
   Otherwise it returns `CoverageUnproven`, `Cancelled` or `Deadline`, and the debt stays
-  open for the owner's ordinary retries. The deadline also stops admission at a turn
-  boundary, keeping what was already admitted.
+  open for the owner's ordinary retries. The comparison gets the first 50 seconds; routes
+  that finished by then are admitted in the last 10, stopping at a turn boundary if the
+  budget runs out. Only cancellation discards what a pass already fetched.
 - Account recovery certifies a route on its operated relays only.
   `MarmotAppConfig::recovery_operated_relays` names them and defaults to
   `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`. A route that lists

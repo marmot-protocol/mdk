@@ -232,10 +232,11 @@ impl ComparisonNetworkJob {
                         .map(|witness| ActiveCounter::new(witness.active_requests.clone()));
                     #[cfg(test)]
                     if let Some(scripted) = &scripted {
-                        if let Some(delay) = scripted_delay {
+                        let (delay, answer) = scripted.answer_after(&inventory.route);
+                        if let Some(delay) = delay.or(scripted_delay) {
                             tokio::time::sleep(delay).await;
                         }
-                        return scripted.answer(&inventory.route);
+                        return answer;
                     }
                     match inventory.work {
                         TransportReconciliationWork::Inbox(endpoints) => {
@@ -505,9 +506,11 @@ impl AppClient {
     /// explicit caller or a directly owned client, which has no worker loop to
     /// interleave. The comparison still runs in its own task under `credit`,
     /// and admission takes the same bounded turns. An explicit repair's
-    /// `control` bounds the network pass by its budget; cancellation or the
-    /// deadline also stops admission at a turn boundary, keeping the admitted
-    /// prefix and certifying nothing.
+    /// `control` ends the network pass at its network deadline, and the
+    /// routes that finished are admitted inside the admission reserve.
+    /// Cancellation discards a pass in flight; cancellation or the whole
+    /// budget stops admission at a turn boundary, keeping the admitted prefix
+    /// and certifying nothing.
     pub(crate) async fn run_recovery_job(
         &mut self,
         grant: AttemptGrant,
@@ -517,7 +520,7 @@ impl AppClient {
         let execution = self.begin_comparison_grant(&grant).await?;
         let deadline = control.map_or_else(
             ComparisonNetworkJob::automatic_deadline,
-            FullHistoryRepairControl::deadline,
+            FullHistoryRepairControl::network_deadline,
         );
         let mut network = match ComparisonNetworkJob::start(
             self,
@@ -539,7 +542,10 @@ impl AppClient {
                 () = tokio::time::sleep(RECOVERY_JOB_CANCEL_POLL),
                     if control.is_some() =>
                 {
-                    if control.is_some_and(|control| control.stopped().is_some()) {
+                    // Only cancellation discards the pass. The network
+                    // deadline ends it inside the task, which returns the
+                    // routes that finished for admission.
+                    if control.is_some_and(FullHistoryRepairControl::cancelled) {
                         network.abort_and_wait().await;
                         break None;
                     }
@@ -599,9 +605,11 @@ impl AppClient {
         };
         if let Some(admission) = admission.as_mut() {
             loop {
+                // Cancellation, or the whole budget spent past the admission
+                // reserve, stops at a turn boundary. The admitted prefix stays
+                // durable; the pass certifies nothing, so the debt waits for a
+                // later grant.
                 if control.is_some_and(|control| control.stopped().is_some()) {
-                    // The admitted prefix stays durable; the pass certifies
-                    // nothing, so the debt waits for a later grant.
                     admission.invalid = true;
                     admission.pending.clear();
                     break;

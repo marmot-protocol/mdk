@@ -699,3 +699,72 @@ async fn an_uncompared_scope_keeps_the_explicit_request_open() {
         "the uncompared route keeps the explicit request open"
     );
 }
+
+/// The pass that reaches the network deadline still hands over what it
+/// fetched. One route returns events at once; the other is still comparing
+/// when the deadline ends the pass. The finished route's events are admitted
+/// inside the admission reserve, the repair reports the deadline, and the
+/// debt stays open.
+#[tokio::test]
+async fn a_pass_cut_by_the_network_deadline_admits_what_it_fetched() {
+    const FETCHED: usize = 6;
+    let (_dir, app, _relay) = fixture();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client.create_group("deadline batch", &[]).await.unwrap();
+    let route = app
+        .group("alice", &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let now = crate::unix_now_seconds();
+    let events = (0..FETCHED)
+        .map(|index| transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+            subscription_id: None,
+            event: crate::tests::epoch_gap_probe(&route, now - 60, &format!("fetched-{index}")),
+        })
+        .collect::<Vec<_>>();
+    let ids = events
+        .iter()
+        .map(|event| event.event.id.clone())
+        .collect::<Vec<_>>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let answered_calls = calls.clone();
+    client.test_comparison_results = Some(ScriptedComparisons::timed(move |_| {
+        let answered = Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )));
+        if answered_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The first route compared returns its events at once.
+            let mut fetched = answered;
+            if let Ok(Some((_, returned))) = &mut fetched {
+                returned.extend(events.clone());
+            }
+            (None, fetched)
+        } else {
+            // The next is still comparing when the network deadline passes.
+            (Some(Duration::from_secs(600)), answered)
+        }
+    }));
+    let started = Instant::now();
+    let failure = client
+        .repair_full_history_with_control(&control(Duration::from_secs(3), &|| false))
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "both routes were compared");
+    assert_eq!(
+        failure.source.full_history_repair_incomplete(),
+        Some((crate::FullHistoryRepairIncompleteReason::Deadline, false))
+    );
+    assert!(
+        ids.iter().all(|id| client.state.seen_events.contains(id)),
+        "every event the finished route fetched was admitted"
+    );
+    assert!(explicit_pending(&app), "an expired repair keeps its debt");
+}

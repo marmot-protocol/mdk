@@ -222,10 +222,11 @@ attempt is converted to a success. Rust callers can inspect
 `AppError::full_history_repair_incomplete()` for the typed reason and independent loss flag,
 including through `AccountCatchUp`. It never parses display strings. The API shape for repair calls is unchanged.
 
-The explicit attempt has a 60-second overall cooperative budget, including setup and comparison. Cancellation or
-the deadline aborts the comparison request and stops admission at a turn boundary; a started ingest/checkpoint
-finishes first, so this is not a hard bound on an individual storage operation. The attempt then reports
-`Cancelled` or `Deadline`. Partial progress remains durable,
+The explicit attempt has a 60-second overall cooperative budget, including setup and comparison. The comparison
+gets the first 50 seconds: a route still comparing then times out, and the routes that finished are admitted and
+checkpointed in the remaining 10, stopping at a turn boundary if the whole budget runs out. Cancellation discards
+a comparison in flight and also stops admission at a turn boundary. A started ingest/checkpoint finishes first, so
+this is not a hard bound on an individual storage operation. The attempt then reports `Cancelled` or `Deadline`. Partial progress remains durable,
 outstanding loss survives reopen, and only qualified completion plus the exact live acknowledgment can reclaim
 captured loss evidence. The only other way to release its cursor fence is the user dismissing that loss's "history
 may be incomplete" notice (below), which is never coverage.

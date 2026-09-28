@@ -162,8 +162,9 @@ App runtime bridge for the first real Marmot app surfaces.
   (`BelowRetentionWindow` when the window certified), so never certify explicit history from a window; that
   result closes the request (`close_explicit_history_request`) instead of leaving debt that parks into a notice,
   while `CoverageUnproven`, `Cancelled` and `Deadline` keep it open. Keep
-  cancellation and deadline checks (`FullHistoryRepairControl::stopped`, at the network poll and every turn)
-  cooperative (abort the network request, stop admission at a turn boundary, keep the admitted prefix), and
+  the budget split: the network pass ends at `FullHistoryRepairControl::network_deadline` and returns its finished
+  routes for admission; only cancellation aborts the request at the poll; `stopped` ends admission at a turn
+  boundary, keeping the admitted prefix; and
   preserve generation-checked overflow marker clearing. The account worker can serve committed snapshot reads
   while repair waits; mutations retain FIFO order, and explicit catch-up and repair wait while a worker-owned job
   is in flight. Client continuation tests live in `src/client/sync/full_history_tests.rs`; worker

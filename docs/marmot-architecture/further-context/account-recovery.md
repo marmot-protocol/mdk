@@ -207,9 +207,12 @@ every cause and every caller runs it:
   an explicit caller's job runs. Startup runs its job only when a credit is free. Without a
   credit nothing is selected, so no reservation is spent.
 - Explicit repair runs the job in place too. Its one pass compares every route of the grant
-  inside the 60-second repair budget. Cancellation or the deadline aborts the network
-  request at a 50 ms poll and stops admission at a turn boundary, keeping the admitted
-  prefix. Explicit history has no lower bound, so no window certifies it: a pass whose
+  inside the first 50 seconds of its 60-second budget. At that network deadline a route
+  still comparing times out and the routes that finished come back; their events are
+  admitted and checkpointed in the last 10 seconds, stopping at a turn boundary if the whole
+  budget runs out, and the repair reports `Deadline`. Only cancellation, polled every 50 ms,
+  discards a pass in flight; it also stops admission at a turn boundary, keeping the
+  admitted prefix. Explicit history has no lower bound, so no window certifies it: a pass whose
   every route's window certified returns `BelowRetentionWindow`, naming the unsearched older
   history, and closes its request (decided with Jeff, 2026-09-28): no explicit-history debt
   remains to park into a notice, and nothing is recorded as coverage. An uncertified,

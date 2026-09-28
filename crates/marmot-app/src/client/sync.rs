@@ -87,7 +87,13 @@ pub(crate) enum ScriptedComparisons {
     ByRoute(
         std::sync::Arc<dyn Fn(&TransportReconciliationRoute) -> TestComparisonResult + Send + Sync>,
     ),
+    /// An answer that arrives only after its own delay.
+    Timed(std::sync::Arc<TimedComparison>),
 }
+
+#[cfg(test)]
+type TimedComparison =
+    dyn Fn(&TransportReconciliationRoute) -> (Option<Duration>, TestComparisonResult) + Send + Sync;
 
 #[cfg(test)]
 impl ScriptedComparisons {
@@ -98,21 +104,39 @@ impl ScriptedComparisons {
         Self::ByRoute(std::sync::Arc::new(answer))
     }
 
-    pub(crate) fn answer(&self, route: &TransportReconciliationRoute) -> TestComparisonResult {
+    /// Answer each compared route after the delay the script chose for it.
+    pub(crate) fn timed(
+        answer: impl Fn(&TransportReconciliationRoute) -> (Option<Duration>, TestComparisonResult)
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self::Timed(std::sync::Arc::new(answer))
+    }
+
+    /// The route's answer and how long it takes to arrive.
+    pub(crate) fn answer_after(
+        &self,
+        route: &TransportReconciliationRoute,
+    ) -> (Option<Duration>, TestComparisonResult) {
         match self {
-            Self::Queue(queue) => queue
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("one scripted result per selected comparison route"),
-            Self::ByRoute(answer) => answer(route),
+            Self::Queue(queue) => (
+                None,
+                queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("one scripted result per selected comparison route"),
+            ),
+            Self::ByRoute(answer) => (None, answer(route)),
+            Self::Timed(answer) => answer(route),
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Queue(queue) => queue.lock().unwrap().len(),
-            Self::ByRoute(_) => 0,
+            Self::ByRoute(_) | Self::Timed(_) => 0,
         }
     }
 
@@ -137,10 +161,16 @@ impl<const N: usize> From<[TestComparisonResult; N]> for ScriptedComparisons {
     }
 }
 
-/// Overall explicit repair budget. The comparison pass runs inside it; the
-/// admission of what that pass fetched is bounded work and always finishes.
-/// Leave headroom inside the public worker RPC deadline for setup and cleanup.
+/// Overall explicit repair budget. The comparison pass gets the first five
+/// sixths of it (50 s of 60 s): a route still comparing then times out and
+/// the routes that finished come back. The last sixth is reserved for
+/// admitting and checkpointing what they fetched; admission stops at a turn
+/// boundary once the whole budget is spent. Leave headroom inside the public
+/// worker RPC deadline for setup and cleanup.
 const FULL_HISTORY_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The share of the repair budget reserved for admission, as a divisor.
+const FULL_HISTORY_ADMISSION_RESERVE_DIVISOR: u32 = 6;
 
 /// How often an explicit caller's in-place job checks for cancellation while
 /// its network task runs.
@@ -163,8 +193,30 @@ impl FullHistoryRepairControl<'_> {
         }
     }
 
-    pub(crate) fn deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::from_std(self.started) + self.timeout
+    /// Only the caller's cancellation discards a pass in flight.
+    pub(crate) fn cancelled(&self) -> bool {
+        (self.cancelled)()
+    }
+
+    /// When the comparison pass must end, leaving the admission reserve.
+    pub(crate) fn network_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(self.started) + self.network_budget()
+    }
+
+    fn network_budget(&self) -> Duration {
+        self.timeout - self.timeout / FULL_HISTORY_ADMISSION_RESERVE_DIVISOR
+    }
+
+    /// Why a finished repair stopped short: cancellation, or a deadline that
+    /// cut the comparison pass or its admission.
+    pub(crate) fn verdict(&self) -> Option<crate::FullHistoryRepairIncompleteReason> {
+        if (self.cancelled)() {
+            Some(crate::FullHistoryRepairIncompleteReason::Cancelled)
+        } else if self.started.elapsed() >= self.network_budget() {
+            Some(crate::FullHistoryRepairIncompleteReason::Deadline)
+        } else {
+            None
+        }
     }
 }
 
@@ -4358,7 +4410,7 @@ impl AppClient {
             .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
             .map_err(|error| state_persist(summary.clone(), error.into()))?;
         let reason = control
-            .stopped()
+            .verdict()
             .unwrap_or(if self.explicit_history_window_certified {
                 crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow
             } else {
