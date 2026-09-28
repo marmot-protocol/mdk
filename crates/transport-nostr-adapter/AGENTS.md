@@ -52,21 +52,18 @@ for reconnect/backoff and relay status mechanics.
   and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be lost in a lag. Do
   not add a time-based expiry. Read `notification_loss_floor` at the lag; an unfloored REQ or missing evidence is
   `Unbounded`, never "no loss".
-- Recover a lag-lost end-of-stored-events only by re-issuing the live REQ unchanged, under its own id
-  (`reissue_subscriptions_awaiting_eose`): only REQs issued by the lag's `NotificationLagMark`, only on relays that
-  have not reported EOSE, under the subscription lifecycle lock. A claim is a distinct `EoseReissueClaim`: one whose
-  re-issue went out stays spent, so a replay that lags again cannot loop; one that got none is released and counted in
-  `EoseRepair::unrepaired` so the caller repairs it again later. The SDK client re-sends a REQ only to a connected
-  relay and only while its floor record holds it live, and records it with `open` first. It sends a raw CLOSE before
-  the raw REQ: a relay must never see a repeated live id, because one that answers `CLOSED duplicate:` makes the SDK
-  drop the REQ from the registry that restores it on reconnect. Keep that registry untouched; a relay-level
-  unsubscribe and subscribe drops its entry when a send fails. Never wait for queue room under the lifecycle lock: a
-  REQ with no room behind its CLOSE comes back pending and the adapter retries it in the background, taking the lock
-  only per attempt, rechecking its own claim, and never sending on a later connection: each attempt fetches filters
-  first, then checks the connection and queues the REQ with no await between, and counts it unrepaired if the
-  connection changed by the check after the enqueue. Do not force a reconnect: the
-  SDK re-sends REQs before its sender drains the queue, so a full queue refuses them too. Never infer EOSE at a lag,
-  change a re-issued REQ's filter, or reopen a closed REQ.
+- Recover a lag-lost end-of-stored-events only through `reissue_subscriptions_awaiting_eose`: only REQs issued by the
+  lag's `NotificationLagMark`, only on relays that have not reported EOSE to the adapter, all under the subscription
+  lifecycle lock. Ask the SDK first: a relay with `Relay::subscription_received_eose` true lost only the notification,
+  so record its EOSE and send nothing. Otherwise queue the REQ's CLOSE and the REQ again, unchanged and under its own
+  id, in one `Relay::batch_msg`, never as separate sends: a relay must never see a repeated live id, because one that
+  answers `CLOSED duplicate:` makes the SDK drop the REQ from the registry that restores it on reconnect, and a lone
+  CLOSE would leave it without the REQ. Keep that registry in place; a relay-level unsubscribe and subscribe drops its
+  entry when a send fails. The SDK client re-issues only to a connected relay and only while its floor record holds
+  the REQ live, and records it with `open` first. A relay whose re-issue went out keeps its claim, so a replay that
+  lags again cannot loop; one that got nothing is released and counted in `EoseReissueSummary::failed_relays` so the
+  caller repairs it again later. Never wait for queue room under the lifecycle lock. Never infer EOSE at a lag, change
+  a re-issued REQ's filter, or reopen a closed REQ.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`
