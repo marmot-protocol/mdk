@@ -62,7 +62,9 @@ for reconnect/backoff and relay status mechanics.
   drop the REQ from the registry that restores it on reconnect. Keep that registry untouched; a relay-level
   unsubscribe and subscribe drops its entry when a send fails. Never wait for queue room under the lifecycle lock: a
   REQ with no room behind its CLOSE comes back pending and the adapter retries it in the background, taking the lock
-  only per attempt, rechecking its own claim, and never sending on a later connection. Do not force a reconnect: the
+  only per attempt, rechecking its own claim, and never sending on a later connection: each attempt fetches filters
+  first, then checks the connection and queues the REQ with no await between, and counts it unrepaired if the
+  connection changed by the check after the enqueue. Do not force a reconnect: the
   SDK re-sends REQs before its sender drains the queue, so a full queue refuses them too. Never infer EOSE at a lag,
   change a re-issued REQ's filter, or reopen a closed REQ.
 - Keep real relay clients behind `NostrRelayClient`.

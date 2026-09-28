@@ -491,7 +491,12 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   REQ on the CLOSE's connection once there is room, and lets it go once an activation,
   close or new registration owns the REQ. If that connection ends first, the reconnect
   re-sends registered REQs before it drains the queue, so a still-full queue refuses them;
-  the relay counts as unrepaired. A relay whose re-issue went out keeps its claim, so a
+  the relay counts as unrepaired. Each attempt fetches the REQ's filters first, then checks
+  the connection and queues the REQ with no await between them, and checks the connection
+  again after: a changed one means the REQ may follow the SDK's own on the new connection,
+  so it counts as unrepaired too. The only window left is a reconnect on another thread
+  between that check and the enqueue, two synchronous steps; it is the window the SDK
+  already has for any REQ queued just as a connection ends. A relay whose re-issue went out keeps its claim, so a
   replay that keeps lagging cannot loop. An unrepaired relay, one that was not connected
   or had no room for the CLOSE, has its claim released, and the repair runs again after
   the settle window for the same lag, until the REQ goes out or its EOSE arrives. What

@@ -430,6 +430,10 @@ pub struct NostrSdkRelayClient {
     /// Runs on the relay right after a re-issue's CLOSE is queued.
     #[cfg(test)]
     after_reissue_close: Arc<StdMutex<Option<ReissueCloseHook>>>,
+    /// Runs on the relay after a re-issued REQ's connection check, where it
+    /// can reconnect the relay before the REQ is queued.
+    #[cfg(test)]
+    before_reissue_req: Arc<StdMutex<Option<ReissueCloseHook>>>,
     /// Per-account, per-relay subscription-registration outcomes accumulated
     /// since that account's last
     /// [`take_subscription_registrations`](Self::take_subscription_registrations)
@@ -547,6 +551,8 @@ impl NostrSdkRelayClient {
             reissue_req_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             after_reissue_close: Arc::default(),
+            #[cfg(test)]
+            before_reissue_req: Arc::default(),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1419,28 +1425,55 @@ impl NostrSdkRelayClient {
         }
     }
 
-    /// Queue a re-issued REQ once, behind the CLOSE already queued for it,
-    /// without waiting for room.
+    /// Queue a re-issued REQ once, behind the CLOSE already queued for it on
+    /// `connection`, without waiting for room. The connection check and the
+    /// enqueue have no await between them, since queueing a frame without
+    /// waiting for it to be sent never yields. A reconnect that still lands
+    /// between them, on another thread, shows in the check after the enqueue:
+    /// the SDK's own REQ from its registry may then share the new connection
+    /// with this one, so it does not count as sent.
     async fn queue_reissued_req(
         &self,
         relay: &Relay,
         id: &SubscriptionId,
         filters: Vec<Filter>,
-    ) -> bool {
+        connection: RelayConnection,
+    ) -> QueuedReissue {
+        if relay_connection(relay) != Some(connection) {
+            return QueuedReissue::ConnectionEnded;
+        }
         #[cfg(test)]
-        if self
+        {
+            let hook = self
+                .before_reissue_req
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook(relay.clone()).await;
+            }
+        }
+        #[cfg(test)]
+        let refused = self
             .reissue_req_failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             })
-            .is_ok()
-        {
-            return false;
+            .is_ok();
+        #[cfg(not(test))]
+        let refused = false;
+        let queued = !refused
+            && relay
+                .send_msg(ClientMessage::req(id.clone(), filters))
+                .await
+                .is_ok();
+        if relay_connection(relay) != Some(connection) {
+            QueuedReissue::ConnectionEnded
+        } else if queued {
+            QueuedReissue::Sent
+        } else {
+            QueuedReissue::Full
         }
-        relay
-            .send_msg(ClientMessage::req(id.clone(), filters))
-            .await
-            .is_ok()
     }
 
     /// The REQ's retained filters on this relay, recorded with its floor
@@ -1500,10 +1533,15 @@ impl NostrSdkRelayClient {
                 hook(relay.clone()).await;
             }
         }
-        if self.queue_reissued_req(&relay, id, filters).await {
-            RelayReissue::Sent
-        } else {
-            RelayReissue::Pending(connection)
+        match self
+            .queue_reissued_req(&relay, id, filters, connection)
+            .await
+        {
+            QueuedReissue::Sent => RelayReissue::Sent,
+            QueuedReissue::Full => RelayReissue::Pending(connection),
+            // The claim is released, and the follow-up repair checks the
+            // REQ's EOSE again.
+            QueuedReissue::ConnectionEnded => RelayReissue::Unsent,
         }
     }
 
@@ -2615,18 +2653,22 @@ impl NostrRelayClient for NostrSdkRelayClient {
         let Ok(Some(relay)) = self.client.relay(&url).await else {
             return Ok(ReissueRetry::Gone);
         };
-        if relay_connection(&relay) != Some(connection) {
-            return Ok(ReissueRetry::ConnectionEnded);
-        }
         let id = SubscriptionId::new(subscription_id);
+        // The filters come first: fetching them yields, so the connection
+        // check has to follow them, right before the enqueue.
         let Some(filters) = self.reissuable_filters(&relay, &id).await else {
             return Ok(ReissueRetry::Gone);
         };
-        Ok(if self.queue_reissued_req(&relay, &id, filters).await {
-            ReissueRetry::Sent
-        } else {
-            ReissueRetry::Waiting
-        })
+        Ok(
+            match self
+                .queue_reissued_req(&relay, &id, filters, connection)
+                .await
+            {
+                QueuedReissue::Sent => ReissueRetry::Sent,
+                QueuedReissue::Full => ReissueRetry::Waiting,
+                QueuedReissue::ConnectionEnded => ReissueRetry::ConnectionEnded,
+            },
+        )
     }
 
     async fn unsubscribe_account(
@@ -2950,6 +2992,17 @@ fn relay_connection(relay: &Relay) -> Option<RelayConnection> {
         attempts: stats.attempts() as u64,
         successes: stats.success() as u64,
     })
+}
+
+/// What queueing a re-issued REQ did.
+enum QueuedReissue {
+    /// Queued on the connection its CLOSE was queued on.
+    Sent,
+    /// The outbound queue had no room; the connection is unchanged.
+    Full,
+    /// The relay is no longer on that connection. The REQ may have been
+    /// queued anyway, so it does not count as sent.
+    ConnectionEnded,
 }
 
 #[cfg(test)]
@@ -4422,6 +4475,84 @@ mod tests {
             req.repair(lag).await.summary.awaiting_relays,
             1,
             "the released claim lets a later repair try again"
+        );
+        req.root.shutdown_accounts().await;
+    }
+
+    /// A reconnect that lands between the retry's connection check and its
+    /// enqueue, widened here by a hook that waits for the SDK to restore the
+    /// REQ on the new connection. The retry's REQ then follows the SDK's on
+    /// that connection, so it does not count as sent: the relay is reported
+    /// unrepaired and its claim is released for the follow-up repair.
+    #[tokio::test]
+    async fn deferred_reissue_reports_a_reconnect_between_its_check_and_enqueue() {
+        let relay = duplicate_refusing_relay().await;
+        let req = ScriptedAccount::open(&relay).await;
+        req.hold_reqs_behind_close();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (hook_attempts, hook_log, hook_entry, hook_account) = (
+            attempts.clone(),
+            relay.log.clone(),
+            req.entry(2, "REQ"),
+            req.account.clone(),
+        );
+        *req.account.before_reissue_req.lock().unwrap() =
+            Some(Arc::new(move |sdk_relay: Relay| {
+                let (attempts, log, entry, account) = (
+                    hook_attempts.clone(),
+                    hook_log.clone(),
+                    hook_entry.clone(),
+                    hook_account.clone(),
+                );
+                Box::pin(async move {
+                    // The first attempt, under the lock, stays held behind the
+                    // CLOSE; the first background retry meets the reconnect.
+                    if attempts.fetch_add(1, Ordering::SeqCst) != 1 {
+                        return;
+                    }
+                    sdk_relay.disconnect();
+                    sdk_relay.connect();
+                    wait_for_entry(
+                        &log,
+                        &entry,
+                        "the SDK restores the REQ on the new connection",
+                    )
+                    .await;
+                    account.reissue_req_failures.store(0, Ordering::SeqCst);
+                })
+            }));
+        let lag = req.adapter.notification_lag_mark();
+        let repair = req.repair(lag).await;
+        assert_eq!(repair.summary.deferred_relays, 1);
+        assert_eq!(
+            timeout(Duration::from_secs(20), repair.unrepaired)
+                .await
+                .expect("the retry ends at the reconnect"),
+            1,
+            "a REQ queued across a reconnect does not count as sent"
+        );
+        *req.account.before_reissue_req.lock().unwrap() = None;
+        wait_for_entry(
+            &relay.log,
+            &req.entry(2, "CLOSED"),
+            "the relay answers the repeat on the new connection",
+        )
+        .await;
+        assert_eq!(
+            req.log_for(&relay.log.lock().await),
+            vec![
+                req.entry(1, "REQ"),
+                req.entry(1, "CLOSE"),
+                req.entry(2, "REQ"),
+                req.entry(2, "REQ"),
+                req.entry(2, "CLOSED"),
+            ],
+            "the retry queued its REQ after the SDK's on the new connection"
+        );
+        assert_eq!(
+            req.repair(lag).await.summary.awaiting_relays,
+            1,
+            "the released claim lets the follow-up repair check the REQ again"
         );
         req.root.shutdown_accounts().await;
     }
