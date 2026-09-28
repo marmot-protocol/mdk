@@ -43,7 +43,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Chat-list-window commands quoting a sequence replaced only by background
   content changes now apply to the current viewport instead of returning
-  `MARMOT_STATUS_CHAT_WINDOW_STALE`. The header and library signatures are unchanged.
+  `MARMOT_STATUS_CHAT_WINDOW_STALE`. An older visible-anchor quote naming a row a
+  background replacement dropped still returns it. The header and library
+  signatures are unchanged.
 
 ## [0.10.4] - 2026-09-20
 
