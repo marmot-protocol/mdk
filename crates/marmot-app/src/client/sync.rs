@@ -197,6 +197,14 @@ impl TransportReconciliationWork {
         }
     }
 
+    /// The relays this work compares.
+    pub(super) fn endpoints(&self) -> &[cgka_traits::TransportEndpoint] {
+        match self {
+            Self::Inbox(endpoints) => endpoints,
+            Self::Group(group) => &group.endpoints,
+        }
+    }
+
     /// Whether this route carries history for one of `groups`. The local inbox
     /// carries welcomes, never a group's own epoch history.
     fn repairs_group_in(&self, groups: &HashSet<cgka_traits::GroupId>) -> bool {
@@ -626,9 +634,9 @@ pub(crate) enum RecoveredDelivery {
 }
 
 /// One compared route: its settlement outcome, and whether the comparison
-/// certifies it. A route is certified only when every endpoint finished the
-/// comparison without truncation and every missing event it found was handed
-/// to admission.
+/// certifies it. A route is certified only when every required endpoint
+/// finished the comparison without truncation and every missing event it
+/// found was handed to admission. Best-effort endpoints only fetch.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RouteComparison {
     pub(crate) route: TransportReconciliationRoute,
@@ -637,14 +645,6 @@ pub(crate) struct RouteComparison {
     /// Events the comparison fetched for admission. Any is progress, even
     /// while an unsupported required relay withholds the certificate.
     pub(crate) fetched: usize,
-}
-
-/// Every physical endpoint counts as exactly one success or failure, so no
-/// failure and at least one success means every endpoint finished.
-pub(crate) fn route_comparison_certified(
-    summary: &transport_nostr_adapter::NostrReconciliationSummary,
-) -> bool {
-    summary.relays_failed == 0 && summary.relays_succeeded > 0
 }
 
 /// What one drain loop saw on the wire.
@@ -1165,6 +1165,14 @@ impl AppClient {
                 .map(|scope| scope.until_seconds)
                 .max()
                 .unwrap_or_default();
+            let mut required = goals
+                .iter()
+                .flat_map(|(_, scopes)| scopes)
+                .filter(|scope| matches(scope))
+                .flat_map(|scope| scope.required_endpoints.iter().cloned())
+                .collect::<Vec<_>>();
+            required.sort();
+            required.dedup();
             let inventory = receipts.inventory(&route, until)?;
             for scope in goals
                 .iter_mut()
@@ -1179,6 +1187,7 @@ impl AppClient {
                 frozen.push(super::recovery::FrozenRecoveryInventory {
                     work,
                     route,
+                    required,
                     since: inventory.since,
                     until,
                     items: inventory
@@ -1307,12 +1316,9 @@ impl AppClient {
                     remote_items += summary.remote_items;
                     received_items += summary.received_items;
                     fetched = summary.received_items;
-                    certified = route_comparison_certified(&summary);
-                    if summary.relays_failed > 0 {
-                        Outcome::TransientFailure
-                    } else {
-                        Outcome::ServicedUnknown
-                    }
+                    let judged;
+                    (judged, certified) = inventory.judge(&summary);
+                    judged
                 }
                 // The plane returns None only when no SDK reconciliation
                 // backend exists. Missing exhaustive proof returns Some, not None.

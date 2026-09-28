@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- A recovery scope may admit relays it does not require. Completion checks only the
+  required relays, each of which must be admitted and covered. Checkpoints may name any
+  required or admitted relay, and joining comparison debt replaces its required relays
+  instead of accumulating them. (#2068)
+
 ### Added
 
 - Add schema 0096 `account_delivery_spill`, the durable overflow tail of the in-memory account

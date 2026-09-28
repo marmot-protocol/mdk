@@ -55,7 +55,7 @@ pub(crate) use directory::{
     DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
     DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
 };
-pub(crate) use safety::RelaySafetyPolicy;
+pub(crate) use safety::{RelaySafetyPolicy, recovery_required_endpoints};
 pub(crate) use telemetry::rollup_from_snapshots;
 
 // Re-exported so the in-tree `tests` module (which uses `super::*`) keeps

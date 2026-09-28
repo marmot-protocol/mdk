@@ -297,9 +297,50 @@ struct GrantedLoss {
 pub(super) struct FrozenRecoveryInventory {
     pub(super) work: super::sync::TransportReconciliationWork,
     pub(super) route: storage_sqlite::TransportReconciliationRoute,
+    /// The relays whose comparison certifies this route, across every scope
+    /// that froze it. The route's other relays are best effort.
+    pub(super) required: Vec<String>,
     pub(super) since: u64,
     pub(super) until: u64,
     pub(super) items: Vec<transport_nostr_adapter::NostrReconciliationItem>,
+}
+
+impl FrozenRecoveryInventory {
+    /// The route's comparison as its required relays saw it. A best-effort
+    /// relay's failure neither withholds the certificate nor schedules a
+    /// retry. A failure the backend did not attribute to a relay counts
+    /// against every relay.
+    pub(super) fn judge(
+        &self,
+        summary: &transport_nostr_adapter::NostrReconciliationSummary,
+    ) -> (storage_sqlite::RecoveryComparisonOutcome, bool) {
+        let unattributed = summary.failed_endpoints.len() < summary.relays_failed;
+        let required_failed = self.required.iter().any(|endpoint| {
+            unattributed
+                || summary
+                    .failed_endpoints
+                    .iter()
+                    .any(|failed| failed.as_str() == endpoint)
+        });
+        if required_failed {
+            return (
+                storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
+                false,
+            );
+        }
+        let compared = self.work.endpoints();
+        let certified = summary.relays_succeeded > 0
+            && !self.required.is_empty()
+            && self.required.iter().all(|endpoint| {
+                compared
+                    .iter()
+                    .any(|compared| compared.as_str() == endpoint)
+            });
+        (
+            storage_sqlite::RecoveryComparisonOutcome::ServicedUnknown,
+            certified,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -795,12 +836,10 @@ impl AppClient {
         let mut push = |group_id: Option<Vec<u8>>,
                         transport_group_id: Option<[u8; 32]>,
                         endpoints: &[cgka_traits::TransportEndpoint]| {
-            let mut required = endpoints
-                .iter()
-                .map(|endpoint| endpoint.0.clone())
-                .collect::<Vec<_>>();
-            required.sort();
-            required.dedup();
+            let required = crate::relay_plane::recovery_required_endpoints(
+                endpoints,
+                &self.app.config.recovery_operated_relays,
+            );
             goals.push(RecoveryScopePlan {
                 scope_id: goals.len() as u64,
                 route_kind: u8::from(group_id.is_some()),
@@ -1032,8 +1071,20 @@ impl AppClient {
             .collect::<Vec<_>>();
         groups.sort();
         groups.dedup();
-        let canonical = serde_json::to_vec(&("history-route-policy-v1", inbox, groups))
-            .map_err(|_| StorageError::Serialization("invalid recovery route snapshot".into()))?;
+        // The operated set decides which relays certify a scope, so changing it
+        // is a policy change that rebuilds every pending scope.
+        let mut operated = self
+            .app
+            .config
+            .recovery_operated_relays
+            .iter()
+            .collect::<Vec<_>>();
+        operated.sort();
+        operated.dedup();
+        let canonical = serde_json::to_vec(&("history-route-policy-v2", inbox, groups, operated))
+            .map_err(|_| {
+            StorageError::Serialization("invalid recovery route snapshot".into())
+        })?;
         self.app
             .account_storage(&self.state.label)?
             .observe_recovery_route_snapshot(Sha256::digest(canonical).into())?;
@@ -1382,13 +1433,10 @@ impl AppClient {
             } else {
                 let mut scopes = Vec::new();
                 if demand.group_id.is_none() {
-                    let mut endpoints = routing
-                        .local_inbox_endpoints
-                        .iter()
-                        .map(|endpoint| endpoint.0.clone())
-                        .collect::<Vec<_>>();
-                    endpoints.sort();
-                    endpoints.dedup();
+                    let endpoints = crate::relay_plane::recovery_required_endpoints(
+                        &routing.local_inbox_endpoints,
+                        &self.app.config.recovery_operated_relays,
+                    );
                     scopes.push(RecoveryScopePlan {
                         scope_id: 0,
                         route_kind: 0,
@@ -1432,13 +1480,10 @@ impl AppClient {
                         .map_err(|_| {
                             StorageError::Serialization("invalid recovery transport route".into())
                         })?;
-                    let mut endpoints = route
-                        .endpoints
-                        .iter()
-                        .map(|endpoint| endpoint.0.clone())
-                        .collect::<Vec<_>>();
-                    endpoints.sort();
-                    endpoints.dedup();
+                    let endpoints = crate::relay_plane::recovery_required_endpoints(
+                        &route.endpoints,
+                        &self.app.config.recovery_operated_relays,
+                    );
                     scopes.push(RecoveryScopePlan {
                         scope_id: scopes.len() as u64,
                         route_kind: 1,
@@ -1483,15 +1528,13 @@ impl AppClient {
                                 && old.plan.group_id == scope.group_id
                                 && old.plan.transport_group_id == scope.transport_group_id
                         }) {
+                            // Required relays follow the current route and
+                            // operated set; a rebuild never keeps a relay the
+                            // policy no longer requires.
                             scope.scope_id = old.plan.scope_id;
                             scope.since_seconds = old.plan.since_seconds;
                             scope.until_seconds = goal_until;
                             scope.inventory_floor = old.plan.inventory_floor;
-                            scope
-                                .required_endpoints
-                                .extend(old.plan.required_endpoints.iter().cloned());
-                            scope.required_endpoints.sort();
-                            scope.required_endpoints.dedup();
                         } else {
                             scope.scope_id = next_id;
                             next_id = next_id.saturating_add(1);
@@ -3910,6 +3953,121 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a parked obligation waits for new evidence or explicit repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn best_effort_relay_failure_completes_on_the_operated_relay() {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        use storage_sqlite::RecoveryComparisonOutcome as Outcome;
+        const OPERATED: &str = "wss://operated.example";
+        const BEST_EFFORT: &str = "wss://best-effort.example";
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relays_and_config(
+            dir.path(),
+            vec!["wss://relay.example".into()],
+            crate::MarmotAppConfig::default()
+                .with_allow_loopback_relay_endpoints(true)
+                .with_open_ranking_provider(None, Vec::new())
+                .with_recovery_operated_relays(vec![OPERATED.into()]),
+        )
+        .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client
+            .create_group_with_options(
+                "best effort",
+                &[],
+                crate::AppCreateGroupOptions {
+                    relays: Some(vec![OPERATED.into(), BEST_EFFORT.into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        client.request_bounded_comparison().unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let grant = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .unwrap();
+        let group = grant
+            .inventory
+            .iter()
+            .find(|inventory| {
+                matches!(
+                    inventory.route,
+                    storage_sqlite::TransportReconciliationRoute::Group(_)
+                )
+            })
+            .expect("the group route is compared");
+        assert_eq!(group.required, vec![OPERATED.to_owned()]);
+        assert_eq!(
+            group.work.endpoints().len(),
+            2,
+            "the best-effort relay is still compared"
+        );
+        let failing = |endpoint: &str| transport_nostr_adapter::NostrReconciliationSummary {
+            relays_succeeded: 1,
+            relays_failed: 1,
+            failed_endpoints: vec![cgka_traits::TransportEndpoint(endpoint.into())],
+            ..Default::default()
+        };
+        assert!(group.judge(&failing(BEST_EFFORT)) == (Outcome::ServicedUnknown, true));
+        assert!(group.judge(&failing(OPERATED)) == (Outcome::TransientFailure, false));
+        assert!(
+            group.judge(&transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                relays_failed: 1,
+                ..Default::default()
+            }) == (Outcome::TransientFailure, false),
+            "an unattributed failure counts against the operated relay too"
+        );
+        client.test_comparison_results = Some(
+            grant
+                .inventory
+                .iter()
+                .map(|inventory| {
+                    let group = matches!(
+                        inventory.route,
+                        storage_sqlite::TransportReconciliationRoute::Group(_)
+                    );
+                    Ok(Some((
+                        if group {
+                            failing(BEST_EFFORT)
+                        } else {
+                            transport_nostr_adapter::NostrReconciliationSummary {
+                                relays_succeeded: 1,
+                                ..Default::default()
+                            }
+                        },
+                        Vec::new(),
+                    )))
+                })
+                .collect(),
+        );
+        client
+            .execute_recovery_grant(grant, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !storage.recovery_comparison().unwrap().pending(),
+            "a best-effort failure schedules no retry"
+        );
+        assert!(
+            !storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory),
+            "the operated relay's certificate completes the cold-start debt"
         );
     }
 

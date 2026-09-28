@@ -40,6 +40,7 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
                             relays_failed: 1,
                             remote_items: 17,
                             received_items: 16,
+                            ..Default::default()
                         }
                     } else {
                         NostrReconciliationSummary {

@@ -457,6 +457,10 @@ impl AppClient {
         }
         let mut admission = ComparisonAdmission::default();
         for (index, route) in network.routes.into_iter().enumerate() {
+            let inventory = grant
+                .inventory
+                .iter()
+                .find(|inventory| inventory.route == route.route);
             let (outcome, certified, events) = match route.result {
                 ComparisonRouteWorkResult::Skipped => (Outcome::ServicedPartial, false, Vec::new()),
                 ComparisonRouteWorkResult::TimedOut
@@ -467,12 +471,11 @@ impl AppClient {
                     (Outcome::Unsupported, false, Vec::new())
                 }
                 ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
-                    if summary.relays_failed > 0 {
-                        (Outcome::TransientFailure, false, events)
-                    } else {
-                        let certified = super::route_comparison_certified(&summary);
-                        (Outcome::ServicedUnknown, certified, events)
-                    }
+                    let (outcome, certified) = inventory
+                        .map_or((Outcome::TransientFailure, false), |inventory| {
+                            inventory.judge(&summary)
+                        });
+                    (outcome, certified, events)
                 }
             };
             admission

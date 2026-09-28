@@ -134,11 +134,15 @@ pub struct NostrReconciliationItem {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NostrReconciliationSummary {
-    /// Endpoints whose comparison and every selected exact-ID request reached
-    /// their request policy. This is not exhaustive history coverage.
+    /// Endpoints whose comparison finished and whose every missing ID this
+    /// pass returned. This is not exhaustive history coverage.
     pub relays_succeeded: usize,
     /// Endpoints with comparison, acquisition, or selected-suffix gaps.
     pub relays_failed: usize,
+    /// The endpoints counted in `relays_failed`, sorted. An endpoint's result
+    /// never depends on another endpoint's gaps, so callers can certify a
+    /// subset. Account-private: never log them.
+    pub failed_endpoints: Vec<TransportEndpoint>,
     pub remote_items: usize,
     pub received_items: usize,
 }
@@ -687,18 +691,23 @@ impl NostrSdkRelayClient {
             let items = items.clone();
             let options = options.clone();
             async move {
-                let result = match client.relay(&endpoint).await {
-                    Ok(Some(relay)) => Some(relay.sync(filter).items(items).opts(options).await),
-                    Ok(None) | Err(_) => None,
-                };
+                // Each endpoint owns its deadline: one silent relay fails
+                // alone instead of failing its route's other endpoints.
+                let result = timeout_at(deadline, async {
+                    match client.relay(&endpoint).await {
+                        Ok(Some(relay)) => {
+                            Some(relay.sync(filter).items(items).opts(options).await)
+                        }
+                        Ok(None) | Err(_) => None,
+                    }
+                })
+                .await
+                .ok()
+                .flatten();
                 (endpoint, result)
             }
         });
-        let outcomes = timeout_at(deadline, futures::future::join_all(syncs))
-            .await
-            .map_err(|_| {
-                TransportAdapterError::Subscription("NIP-77 reconciliation timed out".to_owned())
-            })?;
+        let outcomes = futures::future::join_all(syncs).await;
         let mut remote = HashSet::new();
         let mut remote_by_endpoint = HashMap::new();
         let mut failed_endpoints = HashSet::new();
@@ -731,21 +740,16 @@ impl NostrSdkRelayClient {
         // The durable cursor rotates refused and oversized IDs on later passes.
         let remote_item_count = remote.len();
         let remote_ids = select_reconciliation_remote_ids(&remote, progress)?;
-        let selected_item_count = remote_ids.len();
-        let selected_set = remote_ids.iter().copied().collect::<HashSet<_>>();
-        for ids in remote_by_endpoint.values_mut() {
-            ids.retain(|id| selected_set.contains(id));
-        }
         drop(remote);
         let mut sdk_events = Vec::new();
         let mut spent_items = 0usize;
         let mut spent_bytes = 0usize;
         let mut returned_ids = HashSet::new();
         let mut requests = 0usize;
-        let mut incomplete = remote_item_count > remote_ids.len();
-        for (index, event_id) in remote_ids.into_iter().enumerate() {
+        // A pass that stops early leaves the unreturned IDs' claimants failed;
+        // an endpoint that claimed nothing left behind still succeeds.
+        for event_id in remote_ids {
             if tokio::time::Instant::now() >= deadline {
-                incomplete = true;
                 break;
             }
             if let Some(event) = self
@@ -769,7 +773,6 @@ impl NostrSdkRelayClient {
                 };
                 let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
                 if remaining_items == 0 || event_bytes > remaining_bytes {
-                    incomplete = true;
                     if event_bytes > SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES {
                         // This object can never fit the pass allowance. Rotate
                         // past it so smaller missing IDs remain reachable;
@@ -795,13 +798,11 @@ impl NostrSdkRelayClient {
                 ));
                 if event_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
                     // One large cached object is the entire returned batch.
-                    incomplete |= index + 1 < selected_item_count;
                     break;
                 }
                 continue;
             }
             if requests >= SDK_RECONCILIATION_MAX_ID_REQUESTS {
-                incomplete = true;
                 break;
             }
             let remaining_items =
@@ -817,7 +818,6 @@ impl NostrSdkRelayClient {
             let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
             let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining_items == 0 || remaining_bytes == 0 || remaining_time.is_zero() {
-                incomplete = true;
                 break;
             }
             // Do not advance past an ID merely because this pass ran out of
@@ -825,6 +825,21 @@ impl NostrSdkRelayClient {
             // only worker admission removes the ID from later comparisons.
             let prior_cursor = progress.load_cursor()?;
             let single_object_request = byte_allowance == SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES;
+            // Ask only the endpoints that claimed this ID. An endpoint that
+            // lacks it has nothing to return, and a silent one must not spend
+            // the budget of IDs it never claimed.
+            let claimants = endpoints
+                .iter()
+                .filter(|endpoint| {
+                    remote_by_endpoint
+                        .get(*endpoint)
+                        .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if claimants.is_empty() {
+                continue;
+            }
             progress.save_cursor(Some(event_id.to_bytes()))?;
             requests += 1;
             let result = self
@@ -832,12 +847,12 @@ impl NostrSdkRelayClient {
                     NostrAcquisitionRequest {
                         account_id: subscription.account_id().clone(),
                         scope: NostrAcquisitionScope::KnownEventIds(vec![event_id.to_bytes()]),
-                        endpoints: endpoints
+                        endpoints: claimants
                             .iter()
                             .map(|endpoint| TransportEndpoint(endpoint.to_string()))
                             .collect(),
                         limits: NostrAcquisitionLimits {
-                            max_endpoints: endpoints.len(),
+                            max_endpoints: claimants.len(),
                             max_requested_event_ids: 1,
                             max_received_items_per_endpoint: remaining_items,
                             max_serialized_event_bytes_per_endpoint: remaining_bytes,
@@ -860,14 +875,11 @@ impl NostrSdkRelayClient {
             let mut request_bytes = 0usize;
             let mut byte_limited = false;
             let wanted_id = event_id.to_hex();
-            for (endpoint, outcome) in endpoints.iter().zip(result.endpoints) {
+            for (endpoint, outcome) in claimants.iter().zip(result.endpoints) {
                 request_items = request_items.max(outcome.stats.received_items);
                 request_bytes = request_bytes.max(outcome.stats.serialized_event_bytes);
                 byte_limited |= outcome.end == NostrAcquisitionEnd::ByteLimitReached;
-                let claimed_id_missing = remote_by_endpoint
-                    .get(endpoint)
-                    .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id))
-                    && !outcome.events.iter().any(|event| event.id == wanted_id);
+                let claimed_id_missing = !outcome.events.iter().any(|event| event.id == wanted_id);
                 if outcome.end != NostrAcquisitionEnd::RequestPolicySatisfied || claimed_id_missing
                 {
                     failed_endpoints.insert(endpoint.clone());
@@ -900,21 +912,26 @@ impl NostrSdkRelayClient {
                 // next pass, even if that earlier result stays unadmitted.
                 // An object beyond the single-event ceiling still rotates.
                 progress.save_cursor(prior_cursor)?;
-                incomplete |= index + 1 < selected_item_count;
                 break;
             }
             if spent_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
                 // A first oversized result, or expensive duplicate/boundary
                 // traffic, consumes this pass. Failed endpoints remain marked
                 // while the unattempted suffix stays retryable.
-                incomplete |= index + 1 < selected_item_count;
                 break;
             }
         }
-        if incomplete {
-            // Unattempted IDs are still debt on every endpoint, even if its
-            // earlier exact-ID REQs reached EOSE. No partial pass is coverage.
-            failed_endpoints.extend(endpoints.iter().cloned());
+        // An ID an endpoint claimed but this pass did not return is still debt
+        // on that endpoint, even if its earlier exact-ID REQs reached EOSE.
+        // No partial pass is coverage for the endpoints it left behind.
+        let returned = returned_ids
+            .iter()
+            .filter_map(|id| EventId::from_hex(id).ok())
+            .collect::<HashSet<_>>();
+        for (endpoint, ids) in &remote_by_endpoint {
+            if ids.iter().any(|id| !returned.contains(id)) {
+                failed_endpoints.insert(endpoint.clone());
+            }
         }
         // Negentropy reports a set. MLS input is sequential, so replay the
         // materialized difference in the same authored-time/id order used by
@@ -931,9 +948,15 @@ impl NostrSdkRelayClient {
                 event,
             });
         }
+        let mut failed = failed_endpoints
+            .iter()
+            .map(|endpoint| TransportEndpoint(endpoint.to_string()))
+            .collect::<Vec<_>>();
+        failed.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
         let summary = NostrReconciliationSummary {
             relays_succeeded: endpoints.len().saturating_sub(failed_endpoints.len()),
             relays_failed: failed_endpoints.len(),
+            failed_endpoints: failed,
             remote_items: remote_item_count,
             received_items: remote_events.len(),
         };

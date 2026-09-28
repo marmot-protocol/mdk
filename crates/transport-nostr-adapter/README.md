@@ -116,10 +116,15 @@ default normalized-message ceiling; larger events remain incomplete. Full-event 
 share this rule with fetched events. The first exact-ID request may temporarily retain up to 5 MiB
 per endpoint before deduplication, and the SDK can observe one rejected boundary event beyond its
 byte limit. The largest endpoint's received count/bytes conservatively charges each network
-request. Fast endpoint failures leave that endpoint incomplete while healthy IDs continue within
-the same pass budgets; a silent endpoint can still consume most of the two-second deadline. A
-byte/item/deadline exit retains partial events but leaves comparison incomplete. These are
-returned-result and SDK-received budgets, not complete wire or memory ceilings.
+request. Each exact-ID request goes only to the endpoints whose comparison claimed that ID, and
+each endpoint's comparison has its own deadline. Fast endpoint failures leave that endpoint
+incomplete while healthy IDs continue within the same pass budgets; a silent endpoint can still
+consume most of the two-second deadline for the IDs it claimed. A byte/item/deadline exit
+retains partial events but leaves incomplete every endpoint whose claimed IDs the pass did not
+return. An endpoint that claimed nothing left behind still succeeds, and
+`NostrReconciliationSummary::failed_endpoints` names the ones that failed, so a caller can
+certify a subset of a route's relays. These are returned-result and SDK-received budgets, not
+complete wire or memory ceilings.
 
 Replay position is advisory, separate from admitted event inventory. A cancelled fetch retains its
 pre-I/O cursor advance. A completed byte-limit rejection of an otherwise eligible network ID

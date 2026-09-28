@@ -96,7 +96,7 @@ pub enum RecoveryEligibility {
 #[serde(deny_unknown_fields)]
 pub(super) struct ScopePayloadV1 {
     pub(super) required_endpoints: Vec<String>,
-    admitted_endpoints: Vec<String>,
+    pub(super) admitted_endpoints: Vec<String>,
     checkpoints: Vec<RecoveryEndpointCheckpoint>,
     retained_known_event: bool,
     attempt_serial: u64,
@@ -126,17 +126,16 @@ fn encode_scope(payload: &ScopePayloadV1) -> StorageResult<Vec<u8>> {
     serde_json::to_vec(payload).map_err(|_| invalid_scope())
 }
 
+/// Required endpoints certify a scope; admitted endpoints are the ones its
+/// comparison may contact. Either may hold an endpoint the other lacks: a
+/// best-effort relay is admitted without being required, and a required
+/// relay the dial policy refuses is required without being admitted.
 fn validate_endpoints(required: &[String], admitted: &[String]) -> StorageResult<()> {
     let canonical = |values: &[String]| {
         values.iter().all(|value| !value.is_empty())
             && values.windows(2).all(|pair| pair[0] < pair[1])
     };
-    if !canonical(required)
-        || !canonical(admitted)
-        || admitted
-            .iter()
-            .any(|endpoint| required.binary_search(endpoint).is_err())
-    {
+    if !canonical(required) || !canonical(admitted) {
         return Err(invalid_scope());
     }
     Ok(())
@@ -148,12 +147,15 @@ fn validate_checkpoints(
 ) -> StorageResult<()> {
     let mut seen = std::collections::BTreeSet::new();
     for checkpoint in checkpoints {
-        if payload
+        let known = payload
             .required_endpoints
             .binary_search(&checkpoint.endpoint)
-            .is_err()
-            || !seen.insert(&checkpoint.endpoint)
-        {
+            .is_ok()
+            || payload
+                .admitted_endpoints
+                .binary_search(&checkpoint.endpoint)
+                .is_ok();
+        if !known || !seen.insert(&checkpoint.endpoint) {
             return Err(invalid_scope());
         }
     }
@@ -166,9 +168,14 @@ pub(super) fn payload_is_qualified(
     known_event: bool,
 ) -> bool {
     match predicate {
+        // Only required endpoints certify. Each must also have been admitted:
+        // a relay the dial policy refused cannot vouch for anything.
         0 => {
             !payload.required_endpoints.is_empty()
-                && payload.required_endpoints == payload.admitted_endpoints
+                && payload
+                    .required_endpoints
+                    .iter()
+                    .all(|endpoint| payload.admitted_endpoints.binary_search(endpoint).is_ok())
                 && payload.required_endpoints.iter().all(|endpoint| {
                     payload.checkpoints.iter().any(|checkpoint| {
                         &checkpoint.endpoint == endpoint
@@ -666,6 +673,68 @@ mod tests {
             endpoints,
             retained_known_event: false,
         }
+    }
+
+    #[test]
+    fn required_relays_alone_certify_and_best_effort_checkpoints_are_kept() {
+        let (store, fence, attempt, id) = fixture();
+        // "a" certifies; "b" is admitted best effort; "c" is required but the
+        // dial policy refused it in the second plan.
+        let mut goal = plan(&["a", "b"]);
+        goal.required_endpoints = vec!["a".into()];
+        let token = store
+            .install_recovery_scope_plan(&fence, attempt, id, &[goal])
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        let mut failed = covered("b");
+        failed.outcome = RecoveryScopeOutcome::Unavailable;
+        failed.exhaustive = false;
+        assert!(
+            store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt,
+                    id,
+                    &[checkpoint(&token, vec![covered("a"), failed])],
+                    RecoveryEligibility::Retry
+                )
+                .unwrap(),
+            "a best-effort relay's gap never withholds the certificate"
+        );
+
+        let (store, fence, attempt, id) = fixture();
+        let mut refused = plan(&["a"]);
+        refused.required_endpoints = vec!["a".into(), "c".into()];
+        let token = store
+            .install_recovery_scope_plan(&fence, attempt, id, &[refused])
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        assert!(
+            !store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt,
+                    id,
+                    &[checkpoint(&token, vec![covered("a"), covered("c")])],
+                    RecoveryEligibility::Retry
+                )
+                .unwrap(),
+            "a required relay that was never admitted cannot vouch"
+        );
+        assert!(
+            store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt,
+                    id,
+                    &[checkpoint(&token, vec![covered("d")])],
+                    RecoveryEligibility::Retry
+                )
+                .is_err(),
+            "a checkpoint names only a required or admitted relay"
+        );
     }
 
     #[test]

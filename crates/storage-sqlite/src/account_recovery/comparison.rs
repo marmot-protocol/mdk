@@ -164,8 +164,9 @@ impl SqliteAccountStorage {
                         (old, new) => new.or(old),
                     };
                     old.until_seconds = old.until_seconds.max(goal.until_seconds);
-                    old.required_endpoints.extend(goal.required_endpoints.iter().cloned());
-                    old.required_endpoints.sort(); old.required_endpoints.dedup();
+                    // The current route and operated set decide which relays
+                    // certify; a relay the route dropped no longer does.
+                    old.required_endpoints = goal.required_endpoints.clone();
                     old.admitted_endpoints = goal.admitted_endpoints.clone();
                 } else {
                     let mut goal = goal.clone();
@@ -242,10 +243,10 @@ impl SqliteAccountStorage {
                 let mut covered = false;
                 for (format, bytes) in payloads {
                     let debt = plan::decode_scope(format, &bytes)?;
-                    covered |= route
-                        .admitted_endpoints
-                        .iter()
-                        .all(|endpoint| debt.required_endpoints.contains(endpoint));
+                    covered |= route.admitted_endpoints.iter().all(|endpoint| {
+                        debt.required_endpoints.contains(endpoint)
+                            || debt.admitted_endpoints.contains(endpoint)
+                    });
                 }
                 if !covered {
                     return Err(invalid());

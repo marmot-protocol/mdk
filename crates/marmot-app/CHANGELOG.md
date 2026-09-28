@@ -9,6 +9,12 @@
   profile edits also schedule indexer copies after account-relay acknowledgement;
   indexer latency does not delay account readiness or edit returns. Pending
   copies are cancelled on runtime shutdown or account removal.
+- Account recovery certifies a route on its operated relays only.
+  `MarmotAppConfig::recovery_operated_relays` names them and defaults to
+  `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`. A route that lists
+  none of them still certifies on all of its relays. The route's other relays are still
+  compared and their events admitted, but their failures never withhold completion or
+  schedule a retry. Changing the operated set rebuilds pending recovery scopes. (#2068)
 
 - A full account delivery queue now spills deliveries into the account database instead of
   dropping them. The worker admits spilled deliveries through the ordinary ingest path,

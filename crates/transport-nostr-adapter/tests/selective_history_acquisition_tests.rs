@@ -867,3 +867,61 @@ async fn comparison_claim_without_exact_id_bytes_remains_incomplete() {
     left.shutdown();
     right.shutdown();
 }
+
+#[tokio::test]
+async fn endpoint_with_nothing_missing_succeeds_while_a_silent_peer_fails() {
+    // Only the left relay holds the missing event. Its exact-ID request goes
+    // unanswered, which fails the left relay alone: the right relay claimed
+    // nothing, is never asked, and its comparison still vouches for it.
+    let holding = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(8),
+    });
+    let event = EventBuilder::new(Kind::MlsGroupMessage, "held by one relay")
+        .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+        .finalize(&Keys::generate())
+        .unwrap();
+    holding
+        .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+        .await
+        .unwrap();
+    let left = LocalRelay::new(RelayBuilder::default().database(holding));
+    let right = LocalRelay::new(RelayBuilder::default().database(MemoryDatabase::with_opts(
+        MemoryDatabaseOptions {
+            events: true,
+            max_events: Some(8),
+        },
+    )));
+    left.run().await.unwrap();
+    right.run().await.unwrap();
+    let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
+    let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
+    left_counts.drop_requests.store(true, Ordering::SeqCst);
+    let urls = vec![left_url.clone(), right_url];
+    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    for url in &urls {
+        sdk.client().add_relay(url.as_str()).await.unwrap();
+    }
+    sdk.client().connect().await;
+    let (summary, events) = sdk
+        .reconcile_subscription(subscription(&urls), &[], 0, u64::MAX, &Cursor::default())
+        .await
+        .unwrap();
+    assert!(events.is_empty());
+    assert_eq!(summary.relays_succeeded, 1);
+    assert_eq!(summary.relays_failed, 1);
+    assert_eq!(summary.failed_endpoints.len(), 1);
+    assert_eq!(
+        summary.failed_endpoints[0].as_str().trim_end_matches('/'),
+        left_url.trim_end_matches('/')
+    );
+    assert!(left_counts.requests.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        right_counts.requests.load(Ordering::SeqCst),
+        0,
+        "an endpoint that claimed nothing is never asked for it"
+    );
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}

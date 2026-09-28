@@ -274,6 +274,38 @@ impl super::MarmotRelayPlaneAccountAdapter {
     }
 }
 
+/// The endpoints whose comparison certifies a recovery scope: the route's
+/// operated relays. Any other relay is best effort and never blocks
+/// completion. A route with no operated relay requires all of its relays, so
+/// its history can still certify.
+pub(crate) fn recovery_required_endpoints(
+    endpoints: &[TransportEndpoint],
+    operated: &[String],
+) -> Vec<String> {
+    let operated = operated
+        .iter()
+        .filter_map(|relay| RelayUrl::parse(relay.trim()).ok())
+        .collect::<std::collections::HashSet<_>>();
+    let is_operated = |endpoint: &&TransportEndpoint| {
+        RelayUrl::parse(endpoint.as_str().trim()).is_ok_and(|url| operated.contains(&url))
+    };
+    let mut required = if endpoints.iter().any(|endpoint| is_operated(&endpoint)) {
+        endpoints
+            .iter()
+            .filter(is_operated)
+            .map(|endpoint| endpoint.0.clone())
+            .collect::<Vec<_>>()
+    } else {
+        endpoints
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect()
+    };
+    required.sort();
+    required.dedup();
+    required
+}
+
 /// Require TLS for every public relay. Plaintext `ws://` is admitted only for
 /// an explicitly enabled loopback host; private/link-local/CGNAT and public
 /// plaintext endpoints stay rejected even with the dev flag. Relay
@@ -601,6 +633,51 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn operated_relays_alone_certify_a_route_that_names_them() {
+        let operated = vec![
+            "wss://relay.eu.whitenoise.chat".to_owned(),
+            "wss://relay.us.whitenoise.chat/".to_owned(),
+        ];
+        assert_eq!(
+            recovery_required_endpoints(
+                &endpoints(&[
+                    "wss://relay.damus.io",
+                    "wss://relay.us.whitenoise.chat",
+                    "wss://nos.lol",
+                ]),
+                &operated,
+            ),
+            vec!["wss://relay.us.whitenoise.chat".to_owned()],
+            "an operated relay certifies in the route's own spelling; the rest are best effort"
+        );
+        assert_eq!(
+            recovery_required_endpoints(
+                &endpoints(&[
+                    "wss://relay.us.whitenoise.chat",
+                    "wss://relay.eu.whitenoise.chat"
+                ]),
+                &operated,
+            ),
+            vec![
+                "wss://relay.eu.whitenoise.chat".to_owned(),
+                "wss://relay.us.whitenoise.chat".to_owned(),
+            ]
+        );
+        assert_eq!(
+            recovery_required_endpoints(
+                &endpoints(&["wss://nos.lol", "wss://relay.damus.io"]),
+                &operated,
+            ),
+            vec![
+                "wss://nos.lol".to_owned(),
+                "wss://relay.damus.io".to_owned()
+            ],
+            "a route with no operated relay still certifies on all of its relays"
+        );
+        assert!(recovery_required_endpoints(&[], &operated).is_empty());
     }
 
     #[test]

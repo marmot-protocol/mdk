@@ -257,8 +257,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Spill write latency under a burst, and cursor safety while writes are pending (covered by
   tests).
 - Truncated comparisons. The whitenoise relays' own match-set cap is 5,000,000, so the
-  adapter's request limit is the binding one. `NostrReconciliationSummary` reports only
-  aggregate relay success and failure, with no truncation outcome. The adapter therefore
+  adapter's request limit is the binding one. `NostrReconciliationSummary` names each
+  failed relay but has no truncation outcome. The adapter therefore
   asks for one item more than the inventory cap (16,385). It reconstructs each endpoint's
   relay-side set size from the SDK sync summary: local items in the window, minus the
   local-only IDs, plus the remote-only IDs. The remote difference alone is not that set.
