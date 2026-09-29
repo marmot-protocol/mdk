@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Messages are no longer withdrawn as undecryptable by a convergence pass that selected
+  no branch, such as the pass that settles the device's own disband. That pass never tried
+  them against the group's state; they now wait for a pass that selects a branch, or for
+  the engine to try them against its live state.
+
 ## 0.11.0 - 2026-09-29
 
 ### Changed

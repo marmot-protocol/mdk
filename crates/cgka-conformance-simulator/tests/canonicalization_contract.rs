@@ -665,6 +665,68 @@ fn app_message_beyond_mls_past_epoch_limit_is_invalidated() {
 }
 
 #[test]
+fn a_pass_that_selects_no_branch_keeps_only_epoch_verdicts_terminal() {
+    let mut input = input(
+        vec![
+            app_message("below-anchor-app", "alice", 2, &[], None),
+            app_message("expired-app", "alice", 4, &[], None),
+            app_message("at-tip-app", "alice", 10, &[], None),
+            app_message("future-app", "alice", 11, &[], None),
+            commit("stale-commit", "stale", 4),
+        ],
+        vec![],
+    );
+    input.state.current_tip_epoch = 10;
+    input.state.retained_anchor_epoch = 3;
+
+    let result = canonicalize(input);
+
+    assert_eq!(result.selected_branch_id, None);
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        result.invalidated_app_messages,
+        vec![
+            InvalidatedAppMessage {
+                message_id: "below-anchor-app".into(),
+                epoch: 2,
+                reason: InvalidatedAppMessageReason::BeyondAnchor,
+                decrypted_payload_ref: None,
+            },
+            InvalidatedAppMessage {
+                message_id: "expired-app".into(),
+                epoch: 4,
+                reason: InvalidatedAppMessageReason::BeyondAppRetention,
+                decrypted_payload_ref: None,
+            },
+        ]
+    );
+    assert_eq!(
+        result.dropped_messages,
+        vec![DroppedMessage {
+            message_id: "stale-commit".into(),
+            kind: MessageKind::Commit,
+            reason: DroppedMessageReason::BeyondRollbackHorizon,
+            rejection_category: None,
+        }]
+    );
+    assert_eq!(
+        result.deferred_messages,
+        vec![
+            DeferredMessage {
+                message_id: "at-tip-app".into(),
+                kind: MessageKind::AppMessage,
+                reason: DeferredMessageReason::NoCanonicalBranchSelected,
+            },
+            DeferredMessage {
+                message_id: "future-app".into(),
+                kind: MessageKind::AppMessage,
+                reason: DeferredMessageReason::FutureEpoch,
+            },
+        ]
+    );
+}
+
+#[test]
 fn commit_beyond_rollback_horizon_is_discarded() {
     let mut input = input(
         vec![commit("stale-commit", "stale", 4)],

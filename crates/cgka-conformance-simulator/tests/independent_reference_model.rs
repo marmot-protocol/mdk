@@ -287,6 +287,50 @@ fn missing_parent_disposition_matches_production_canonicalizer() {
 }
 
 #[test]
+fn unselected_pass_application_disposition_matches_production_canonicalizer() {
+    let mut input = canonical_input(vec![PeeledMessage {
+        message_id: "at-tip-app".into(),
+        group_id: "group".into(),
+        sender: b"alice".to_vec(),
+        source_epoch: 3,
+        kind: PeeledMessageKind::AppMessage {
+            epoch: 3,
+            decrypts_on_branches: Vec::new(),
+            decrypted_payload_ref: None,
+            already_delivered: false,
+        },
+    }]);
+    input.candidate_branches.clear();
+    let production = canonicalize(input);
+    let reference = evaluate(&ReferenceInput {
+        current_tip_epoch: 3,
+        retained_anchor_epoch: 1,
+        candidates: Vec::new(),
+        commits: Vec::new(),
+        proposals: Vec::new(),
+        app_messages: vec![ReferenceAppMessage {
+            message_id: "at-tip-app".into(),
+            sender: b"alice".to_vec(),
+            epoch: 3,
+            decrypts_on_branches: Vec::new(),
+            authenticated: true,
+            authorized: true,
+        }],
+        policy: ReferencePolicy::default(),
+        witness_mode: WitnessMode::Enabled,
+    });
+    assert_eq!(reference.selected_branch_id, None);
+    assert_eq!(
+        reference.dispositions["at-tip-app"],
+        ReferenceDisposition::DeferredNoCanonicalBranchSelected
+    );
+    assert!(production.deferred_messages.iter().any(|entry| {
+        entry.message_id == "at-tip-app"
+            && entry.reason == DeferredMessageReason::NoCanonicalBranchSelected
+    }));
+}
+
+#[test]
 fn invalid_commit_shape_is_not_misclassified_as_a_missing_parent() {
     let reference = evaluate(&ReferenceInput {
         current_tip_epoch: 3,
