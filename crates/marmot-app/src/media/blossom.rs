@@ -13,6 +13,7 @@ use transport_nostr_peeler::MarmotNostrSigner;
 use url::{Host, Url};
 
 use super::AttachmentDownloadFailure;
+use super::attachment_resume::BODY_IDLE_TIMEOUT;
 use super::attachment_resume::NetworkPollError;
 use super::host_safety::{
     is_loopback_host, parse_profile_image_fetch_url, parse_profile_image_redirect_url,
@@ -29,7 +30,7 @@ const BLOSSOM_UPLOAD_CONTENT_TYPE: &str = "application/octet-stream";
 const MAX_BLOSSOM_ERROR_BODY_BYTES: u64 = 1024;
 pub(crate) const MAX_BLOSSOM_DESCRIPTOR_BYTES: u64 = 16 * 1024;
 const MEDIA_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const MEDIA_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const MEDIA_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MEDIA_BLOB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// A candidate that cannot resolve, connect, return headers, and yield its first
@@ -115,6 +116,7 @@ pub(crate) struct BlossomHttpTransport {
     address_lease: Duration,
     candidate_startup_timeout: Duration,
     transfer_timeout: Duration,
+    pub(super) read_timeout: Duration,
     kind: MediaHttpKind,
     download_limit: u64,
     pub(super) resume: Option<Arc<super::attachment_resume::AttachmentResume>>,
@@ -168,6 +170,7 @@ impl BlossomHttpTransport {
             address_lease,
             candidate_startup_timeout,
             transfer_timeout,
+            read_timeout: BODY_IDLE_TIMEOUT,
             kind: MediaHttpKind::Download,
             download_limit: MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
             resume: None,
@@ -206,6 +209,13 @@ impl BlossomHttpTransport {
             transfer_timeout,
             system_dns_resolver(),
         )
+    }
+
+    #[cfg(test)]
+    /// Scale the download client's idle bound without changing the production policy.
+    pub(super) fn with_read_timeout_for_test(mut self, read_timeout: Duration) -> Self {
+        self.read_timeout = read_timeout;
+        self
     }
 
     #[cfg(feature = "media-benchmarks")]
@@ -295,7 +305,9 @@ impl BlossomHttpTransport {
             return Ok(cached.client.clone());
         }
         let client = match self.kind {
-            MediaHttpKind::Download => build_pinned_media_http_client(pin.clone())?,
+            MediaHttpKind::Download => {
+                build_pinned_media_blob_download_client(pin.clone(), self.read_timeout)?
+            }
             MediaHttpKind::Upload => build_pinned_media_upload_client(pin.clone())?,
         };
         *generation = Some(CachedMediaClient {
@@ -1201,19 +1213,30 @@ async fn resolve_pinned_media_host_for_url(
 fn build_pinned_media_http_client(
     pin: Option<(String, Vec<SocketAddr>)>,
 ) -> Result<reqwest::Client, AppError> {
-    build_pinned_media_http_client_from_builder(reqwest::Client::builder(), pin, true)
+    build_pinned_media_http_client_from_builder(
+        reqwest::Client::builder(),
+        pin,
+        Some(MEDIA_HTTP_READ_TIMEOUT),
+    )
+}
+
+fn build_pinned_media_blob_download_client(
+    pin: Option<(String, Vec<SocketAddr>)>,
+    read_timeout: Duration,
+) -> Result<reqwest::Client, AppError> {
+    build_pinned_media_http_client_from_builder(reqwest::Client::builder(), pin, Some(read_timeout))
 }
 
 fn build_pinned_media_upload_client(
     pin: Option<(String, Vec<SocketAddr>)>,
 ) -> Result<reqwest::Client, AppError> {
-    build_pinned_media_http_client_from_builder(reqwest::Client::builder(), pin, false)
+    build_pinned_media_http_client_from_builder(reqwest::Client::builder(), pin, None)
 }
 
 fn build_pinned_media_http_client_from_builder(
     builder: reqwest::ClientBuilder,
     pin: Option<(String, Vec<SocketAddr>)>,
-    apply_read_timeout: bool,
+    read_timeout: Option<Duration>,
 ) -> Result<reqwest::Client, AppError> {
     let mut builder = builder
         .redirect(reqwest::redirect::Policy::none())
@@ -1224,8 +1247,8 @@ fn build_pinned_media_http_client_from_builder(
         .no_brotli()
         .no_zstd()
         .no_deflate();
-    if apply_read_timeout {
-        builder = builder.read_timeout(MEDIA_HTTP_READ_TIMEOUT);
+    if let Some(read_timeout) = read_timeout {
+        builder = builder.read_timeout(read_timeout);
     }
     if let Some((domain, addrs)) = pin {
         builder = builder.resolve_to_addrs(&domain, &addrs);
@@ -1242,7 +1265,11 @@ pub(super) fn build_pinned_media_http_client_with_proxy_for_test(
 ) -> Result<reqwest::Client, AppError> {
     let proxy = reqwest::Proxy::all(proxy_url)
         .map_err(|_| AppError::BlobStore("failed to configure test HTTP proxy".into()))?;
-    build_pinned_media_http_client_from_builder(reqwest::Client::builder().proxy(proxy), pin, true)
+    build_pinned_media_http_client_from_builder(
+        reqwest::Client::builder().proxy(proxy),
+        pin,
+        Some(MEDIA_HTTP_READ_TIMEOUT),
+    )
 }
 
 async fn resolve_media_host_with(

@@ -18,7 +18,7 @@ use storage_sqlite::{
 
 pub(crate) const AUTOMATIC_TRANSFER_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(120);
-const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(super) const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Clone)]
