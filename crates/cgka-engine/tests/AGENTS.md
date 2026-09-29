@@ -87,7 +87,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `record_write_atomicity.rs`
   - **Owns:** Group-projection atomicity under injected record/cache write failures (mdk#333, mdk#794), one test per
-    seam that projects the record plus direct-ingest capability-cache coverage. No torn record or capability cache,
+    seam that projects the record plus inbound capability-cache coverage. No torn record or capability cache,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. Also owns the snapshot-guard durability pair: a guard whose

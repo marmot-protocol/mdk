@@ -166,66 +166,6 @@ impl<S: StorageProvider> Engine<S> {
         Ok(SendResult::DisbandRequested { request })
     }
 
-    pub(crate) fn record_inbound_disband_candidate(
-        &mut self,
-        group_id: &GroupId,
-        source_epoch: EpochId,
-        commit_id: cgka_traits::MessageId,
-        commit_bytes: &[u8],
-        actor: cgka_traits::MemberId,
-        local_was_committer_leaf: bool,
-    ) -> Result<(), EngineError> {
-        let former_members = deduplicated_roster(&self.storage.get_group(group_id)?.members);
-        let candidate = DisbandCandidate {
-            group_id: group_id.clone(),
-            source_epoch,
-            commit_id,
-            content_commit_id: crate::message_processor::content_dedup_id(commit_bytes),
-            commit_digest: Sha256::digest(commit_bytes).into(),
-            actor,
-            local_was_committer_leaf,
-            former_members,
-        };
-        self.storage.with_transaction(|storage| {
-            storage.put_disband_candidate(&candidate)?;
-            for queued in storage.list_queued_outbound_intents(group_id)? {
-                storage.delete_queued_outbound_intent(&queued.id)?;
-            }
-            for welcome in storage
-                .list_welcomes()?
-                .into_iter()
-                .filter(|welcome| &welcome.group_id == group_id)
-            {
-                let _ = storage.take_welcome(&welcome.message_id)?;
-            }
-            for fanout in storage.list_outbound_fanouts_for_group(group_id)? {
-                storage.delete_outbound_fanout(fanout.message_id())?;
-            }
-            if let Some(maintenance) = storage.maintenance_storage() {
-                maintenance.delete_group_maintenance(group_id)?;
-                for obligation in maintenance.list_maintenance_obligations_for_group(group_id)? {
-                    maintenance.delete_maintenance_obligation(&obligation.id)?;
-                }
-                for evolution in maintenance.list_group_evolutions_for_group(group_id)? {
-                    maintenance.delete_group_evolution(&evolution.id)?;
-                }
-                for fanout in maintenance.list_transport_fanouts()? {
-                    if fanout.group_id.as_ref() == Some(group_id) {
-                        maintenance.delete_transport_fanout(&fanout.id)?;
-                    }
-                }
-            }
-            Ok::<(), StorageError>(())
-        })?;
-        self.queued_intent_by_message
-            .retain(|_, (queued_group, _)| queued_group != group_id);
-        self.queued_intent_by_pending
-            .retain(|_, (queued_group, _)| queued_group != group_id);
-        self.drop_self_remove_auto_commit_schedules_for_group(group_id);
-        self.schedule_pending_convergence_group(group_id);
-        Ok(())
-    }
-
     pub(crate) fn disband_request_pending(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         Ok(self
             .storage

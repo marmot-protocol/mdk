@@ -12,8 +12,7 @@ use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::group_lifecycle::{self};
 use crate::identity::{member_id_of_processed_message, member_id_of_sender};
 use crate::openmls_projection::{
-    CandidateBranchPeel, CandidateBranchPeelContext, OpenMlsContentKind,
-    process_commit_with_app_data_updates, project_mls_message,
+    CandidateBranchPeel, CandidateBranchPeelContext, OpenMlsContentKind, project_mls_message,
     retained_anchor_epoch_from_snapshot_name,
 };
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
@@ -239,17 +238,6 @@ struct RetainedSelfRemoveProposal {
     leaf: openmls::prelude::LeafNodeIndex,
     digest: [u8; 32],
     queued: QueuedProposal,
-}
-
-/// What an applied inbound commit changed, derived from the merged group state.
-///
-/// Produced inside the apply transaction because the durable record mirror is
-/// written from the same values the post-apply events are synthesized from.
-struct AppliedCommitProjection {
-    epoch: EpochId,
-    remaining_member_ids: std::collections::HashSet<MemberId>,
-    removed_member_ids: Vec<MemberId>,
-    message_retention_seconds: Option<u64>,
 }
 
 enum ScheduledAutoCommitReplay {
@@ -1246,10 +1234,6 @@ impl<S: StorageProvider> Engine<S> {
         // per inbound message. The processing result leaves the closure as a
         // value so a decrypt failure still commits the row the error branches
         // below transition.
-        //
-        // Process via MLS. Commits may contain AppDataUpdate proposals,
-        // which require the application to compute the resulting
-        // AppDataDictionary before OpenMLS stages the commit.
         let processed = match self.storage.with_transaction(|_storage| {
             // A commit row's epoch is the epoch it forks from, and the
             // `commit_should_enter_convergence` decision above left only
@@ -1267,19 +1251,15 @@ impl<S: StorageProvider> Engine<S> {
                 MessageState::Created,
                 &raw_msg_id,
             )?;
-            Ok::<_, EngineError>(if msg_content_type == ContentType::Commit {
-                process_commit_with_app_data_updates(&mut mls_group, &provider, proto)
-            } else {
-                mls_group.process_message(&provider, proto)
-            })
+            Ok::<_, EngineError>(mls_group.process_message(&provider, proto))
         })? {
             Ok(p) => p,
             // Every arm below transitions a row that may carry a commit's
             // source epoch, so all of them report `current_epoch` explicitly:
             // `update_stored_message_state`'s default would emit the row epoch.
-            // The success-path arms further down keep the plain form, because a
-            // commit `process_message` accepted was at the live epoch and an
-            // application row is persisted at `current_epoch`.
+            // The success-path arms further down keep the plain form, because
+            // only application and proposal rows, persisted at `current_epoch`,
+            // reach them; the commit arm among them reports explicitly too.
             Err(e) if process_message_error_is_too_distant_in_the_past(&e) => {
                 // Refine the historical classification (mdk#339):
                 // below either of this copy's floors the message was never
@@ -1429,10 +1409,6 @@ impl<S: StorageProvider> Engine<S> {
         };
 
         // Classify content.
-        let sender_leaf_index = match processed.sender() {
-            Sender::Member(index) => Some(*index),
-            _ => None,
-        };
         let sender_id = member_id_of_processed_message(&processed, &mls_group);
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(bytes) => {
@@ -1581,396 +1557,6 @@ impl<S: StorageProvider> Engine<S> {
                 self.return_mls_group(&group_id, mls_group);
                 reported(IngestOutcome::Processed)
             }
-            ProcessedMessageContent::StagedCommitMessage(staged) => {
-                let before = EpochId(mls_group.epoch().as_u64());
-                if let Err(error) = self.strict_cutover_rejects_legacy_group_addition(
-                    &group_id,
-                    staged.add_proposals().next().is_some(),
-                ) {
-                    return match error {
-                        EngineError::InvalidTransition(_) => {
-                            reported(self.terminalize_rejected_proposal(
-                                &group_id,
-                                &msg.id,
-                                Some(&raw_msg_id),
-                                ProposalRejectionCategory::UnsupportedProposal,
-                            )?)
-                        }
-                        error => Err(error),
-                    };
-                }
-                if let Err(rejection) =
-                    crate::app_components::authorize_staged_commit_proposals(&mls_group, &staged)
-                {
-                    return reported(self.terminalize_rejected_proposal(
-                        &group_id,
-                        &msg.id,
-                        Some(&raw_msg_id),
-                        rejection.category,
-                    )?);
-                }
-                if let Err(err) = crate::app_components::require_admin_for_staged_commit(
-                    &mls_group,
-                    &group_id,
-                    sender_id.as_ref(),
-                    &staged,
-                ) {
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    return Err(err);
-                }
-                // Reject (pre-merge) a commit whose resulting epoch would list an
-                // admin key with no member leaf — e.g. removing an account's last
-                // leaf without dropping it from `admins`. admin-policy-v1.md.
-                if let Err(err) =
-                    crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
-                        &mls_group, &group_id, &staged,
-                    )
-                {
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    return Err(err);
-                }
-                // Reject (pre-merge) a commit whose resulting GroupContext
-                // strips or rewrites app-component state outside the
-                // validated AppDataUpdate channel — e.g. a
-                // GroupContextExtensions-only commit that replaces the
-                // extensions without the dictionary, or with tampered
-                // component bytes.
-                if let Err(err) =
-                    crate::app_components::validate_app_component_integrity_for_staged_commit(
-                        &mls_group, &group_id, &staged,
-                    )
-                {
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    return Err(err);
-                }
-                let Some(commit_committer) = sender_id.clone() else {
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    return Err(EngineError::Backend(
-                        "commit has no authenticated member sender".into(),
-                    ));
-                };
-                let Some(committer_index) = sender_leaf_index else {
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    return Err(EngineError::Backend(
-                        "commit has no authenticated member leaf".into(),
-                    ));
-                };
-                // foundation/identity.md: reject inbound commits that
-                // introduce or mutate a member LeafNode whose credential
-                // identity is invalid, lacks a valid account proof, or no
-                // longer matches the member identity being updated.
-                let added = match crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
-                    &staged,
-                    &mls_group,
-                    &commit_committer,
-                    self.ciphersuite,
-                ) {
-                    Ok(added) => added,
-                    Err(err) => {
-                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                        return Err(err);
-                    }
-                };
-                if let Err(err) =
-                    crate::app_components::validate_current_profile_invariants_for_staged_commit(
-                        &mls_group,
-                        &staged,
-                        committer_index,
-                    )
-                {
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    return Err(err);
-                }
-                // A valid terminal Commit never takes the direct merge
-                // shortcut. Persist its authenticated evidence and force
-                // the same bounded convergence pass used for competing
-                // branches; terminal cleanup happens only after selection.
-                if crate::app_components::staged_commit_disbands(&mls_group, &staged)? {
-                    self.record_inbound_disband_candidate(
-                        &group_id,
-                        before,
-                        msg.id.clone(),
-                        mls_bytes.as_slice(),
-                        commit_committer,
-                        committer_index == mls_group.own_leaf_index(),
-                    )?;
-                    // The pass below can report `Buffered`, so the wrapper is
-                    // retired here: see AGENTS.md, "a `Buffered` outcome never
-                    // lets the caller retire the wrapper".
-                    self.retire_raw_wrapper(
-                        &raw_msg_id,
-                        &msg.id,
-                        "inbound_disband_candidate_converged",
-                    )?;
-                    let result = self
-                        .converge_stored_openmls_messages(&group_id)
-                        .map_err(|error| EngineError::Backend(format!("converge: {error}")))?;
-                    return reported(convergence_ingest_outcome(
-                        &result,
-                        msg,
-                        group_id,
-                        current_epoch,
-                    ));
-                }
-                // Classify departures before the merge consumes the staged
-                // commit and the leaving leaves disappear: a SelfRemove is a
-                // member leaving (attributed to themselves); a Remove is an
-                // admin removing someone (attributed to the committer).
-                let mut self_removed: std::collections::HashSet<MemberId> =
-                    std::collections::HashSet::new();
-                for queued in staged.queued_proposals() {
-                    if matches!(queued.proposal(), Proposal::SelfRemove)
-                        && let Some(id) = member_id_of_sender(queued.sender(), &mls_group)
-                    {
-                        self_removed.insert(id);
-                    }
-                }
-                let before_members = group_lifecycle::marmot_members(&mls_group);
-                let before_admins =
-                    crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
-                let before_profile = crate::app_components::group_profile_of_group(&mls_group)
-                    .ok()
-                    .flatten();
-                let before_avatar = avatar_component_snapshot(&mls_group);
-                let before_message_retention =
-                    crate::app_components::message_retention_seconds_of_group(&mls_group)?;
-                self.retain_current_epoch_snapshot_for_group(&group_id)?;
-                // Merge and mirror the Marmot record in one durable unit, the
-                // same rule `do_confirm_published` applies to its own merge.
-                // Session open seeds the epoch state machine FROM that
-                // record, so a failed mirror must undo the merge instead of
-                // leaving the two stores at different epochs. Nothing between
-                // this transaction and `set_stable` below is fallible, so the
-                // in-memory epoch authority can only advance over a committed
-                // mirror.
-                let AppliedCommitProjection {
-                    epoch: after,
-                    remaining_member_ids: after_ids,
-                    removed_member_ids: removed,
-                    message_retention_seconds: after_message_retention,
-                } = match self.storage.with_transaction(
-                    |storage| -> Result<AppliedCommitProjection, EngineError> {
-                        // The staged commit is the only public source for
-                        // newly added members' KeyPackage capabilities.
-                        // Cache them on the same transaction rail as the
-                        // merge and every other durable projection.
-                        crate::capability_manager::cache_from_staged_commit(
-                            storage, &group_id, &staged,
-                        )?;
-                        let tx_provider =
-                            EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-                        mls_group
-                            .merge_staged_commit(&tx_provider, *staged)
-                            .map_err(|e| {
-                                EngineError::Backend(format!("merge_staged_commit: {e:?}"))
-                            })?;
-                        crate::app_components::validate_current_profile_group_invariants(
-                            &mls_group,
-                        )?;
-                        let after = EpochId(mls_group.epoch().as_u64());
-                        let after_members = group_lifecycle::marmot_members(&mls_group);
-                        let after_ids: std::collections::HashSet<MemberId> =
-                            after_members.iter().map(|m| m.id.clone()).collect();
-                        let removed: Vec<MemberId> = before_members
-                            .into_iter()
-                            .filter_map(|m| (!after_ids.contains(&m.id)).then_some(m.id))
-                            .collect();
-                        let mut g = storage.get_group(&group_id)?;
-                        g.epoch = after;
-                        g.members = after_members;
-                        g.required_capabilities =
-                            crate::capability_manager::required_capabilities_from_group(&mls_group);
-                        crate::group_lifecycle::mirror_app_components_into_record(
-                            &mls_group, &mut g,
-                        );
-                        // This commit removed our own leaf: mark the local
-                        // copy removed (member-departure.md, "Realizing
-                        // removal") in the same record write. The departure
-                        // notification for self is emitted with the roster
-                        // diff below, so the marker and the notification stay
-                        // coupled and later `SelfEvicted` input does not
-                        // re-emit it.
-                        if removed
-                            .iter()
-                            .any(|member| member == self.identity.self_id())
-                        {
-                            g.removed = true;
-                        }
-                        storage.put_group(&g)?;
-                        // A commit path update may change our own leaf.
-                        // Feature-status correctness requires this cache to
-                        // advance atomically with MLS and the group record.
-                        crate::capability_manager::cache_self_capabilities(
-                            storage,
-                            &group_id,
-                            &mls_group,
-                            self.identity.self_id(),
-                            self.ciphersuite,
-                        )?;
-                        Ok(AppliedCommitProjection {
-                            epoch: after,
-                            remaining_member_ids: after_ids,
-                            removed_member_ids: removed,
-                            message_retention_seconds:
-                                crate::app_components::message_retention_seconds_of_group(
-                                    &mls_group,
-                                )?,
-                        })
-                    },
-                ) {
-                    Ok(projection) => projection,
-                    Err(error) => {
-                        // The commit is durably retained as a `Created` wire
-                        // row, so hand the group back to stored convergence —
-                        // that pass is the repair path, and without the
-                        // schedule nothing would ever apply it.
-                        self.schedule_pending_convergence_group(&group_id);
-                        return Err(error);
-                    }
-                };
-                let after_admins =
-                    crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
-                let after_profile = crate::app_components::group_profile_of_group(&mls_group)
-                    .ok()
-                    .flatten();
-                let after_avatar = avatar_component_snapshot(&mls_group);
-
-                // Update our per-group state machine.
-                self.invalidate_deferred_peel_candidate_cache(&group_id);
-                self.epoch_manager.set_stable(group_id.clone(), after);
-                self.drop_self_remove_auto_commit_schedules_for_group(&group_id);
-                // Proposal-arrival schedule signals are source-epoch
-                // scoped. An accepted commit advances the group, so every
-                // such signal from the prior epoch is obsolete.
-                self.valid_proposal_groups.remove(&group_id);
-                // #740 rotation: a peer's applied commit may have changed the
-                // Nostr routing component; additively refresh the transport-id
-                // index so the new nostr_group_id resolves (prior id retained
-                // for the overlap window). No-op when routing was unchanged.
-                self.reindex_transport_group_id(&group_id);
-
-                self.events_buf.push_back(GroupEvent::EpochChanged {
-                    group_id: group_id.clone(),
-                    from: before,
-                    to: after,
-                });
-                // Synthesize attributed state-change events, ordered:
-                // additions, departures, admin grants/revocations, then
-                // profile changes. The app turns each into a kind-1210 row.
-                // All rows from this commit carry its transport id so they
-                // can be invalidated together if the commit later loses a
-                // fork and is rolled back.
-                let origin_commit_id = Some(msg.id.clone());
-                for member in added {
-                    self.push_group_state_change(
-                        &group_id,
-                        after,
-                        sender_id.clone(),
-                        GroupStateChange::MemberAdded { member },
-                        origin_commit_id.clone(),
-                    );
-                }
-                if removed
-                    .iter()
-                    .any(|member| member == self.identity.self_id())
-                {
-                    self.clear_leave_request_state(&group_id)?;
-                    // The copy just became removed: purge queued outbound
-                    // intents so later drains do not re-fail them forever
-                    // against the removed-copy send gate.
-                    self.discard_queued_outbound_intents_for_removed_group(&group_id)?;
-                    // And retire the deferred-peel backlog (see
-                    // `retire_deferred_peel_rows_for_terminal_group`). This
-                    // seam owns that here rather than deferring to
-                    // `realize_self_eviction`: the transaction above already
-                    // wrote `removed`, so a later realization early-returns
-                    // without ever reaching it.
-                    self.retire_deferred_peel_rows_for_terminal_group(&group_id)?;
-                } else if after_ids.contains(self.identity.self_id()) {
-                    if self.load_leave_request_state(&group_id)?.is_some() {
-                        // A SelfRemove proposal is valid only in its
-                        // source epoch, but the local leave request is not.
-                        // Keep the send gate and publish a fresh proposal
-                        // for the accepted epoch.
-                        self.leaving_groups.insert(group_id.clone());
-                        self.try_auto_repropose_leave_request(&group_id).await;
-                    } else if self.leaving_groups.contains(&group_id) {
-                        // Compatibility cleanup for a pre-durable in-memory
-                        // gate that survived until an unrelated accepted
-                        // commit kept us in the group.
-                        self.leaving_groups.remove(&group_id);
-                    }
-                }
-
-                for member in removed {
-                    let (change, actor) = if self_removed.contains(&member) {
-                        // A leave is attributed to the leaver, not the member
-                        // that sequenced the auto-commit.
-                        (
-                            GroupStateChange::MemberLeft {
-                                member: member.clone(),
-                            },
-                            Some(member),
-                        )
-                    } else {
-                        (
-                            GroupStateChange::MemberRemoved { member },
-                            sender_id.clone(),
-                        )
-                    };
-                    self.push_group_state_change(
-                        &group_id,
-                        after,
-                        actor,
-                        change,
-                        origin_commit_id.clone(),
-                    );
-                }
-                for change in
-                    crate::group_state_changes::admin_changes(&before_admins, &after_admins)
-                {
-                    self.push_group_state_change(
-                        &group_id,
-                        after,
-                        sender_id.clone(),
-                        change,
-                        origin_commit_id.clone(),
-                    );
-                }
-                for change in crate::group_state_changes::profile_changes(
-                    before_profile.as_ref().map(|(name, _)| name.as_str()),
-                    after_profile.as_ref().map(|(name, _)| name.as_str()),
-                    &before_avatar,
-                    &after_avatar,
-                ) {
-                    self.push_group_state_change(
-                        &group_id,
-                        after,
-                        sender_id.clone(),
-                        change,
-                        origin_commit_id.clone(),
-                    );
-                }
-                for change in crate::group_state_changes::message_retention_changes(
-                    before_message_retention,
-                    after_message_retention,
-                ) {
-                    self.push_group_state_change(
-                        &group_id,
-                        after,
-                        sender_id.clone(),
-                        change,
-                        origin_commit_id.clone(),
-                    );
-                }
-                self.update_stored_message_state(&msg.id, MessageState::Processed)?;
-                // In-memory fast path mirrors the durable record, keyed on
-                // the content-derived id so a re-wrapped duplicate commit is
-                // caught before the durable lookup.
-                self.seen_message_ids.insert(msg.id.clone());
-                self.return_mls_group(&group_id, mls_group);
-                reported(IngestOutcome::Processed)
-            }
             ProcessedMessageContent::ProposalMessage(queued) => {
                 if let Err(error) = self.strict_cutover_rejects_legacy_group_addition(
                     &group_id,
@@ -2054,13 +1640,19 @@ impl<S: StorageProvider> Engine<S> {
                     category: InputRejectionCategory::OwnEcho,
                 })
             }
-            ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
-                // `process_commit_with_app_data_updates` must resolve this
-                // before returning. Retain the message for diagnosis and
-                // retry rather than accepting a partially processed commit.
-                self.update_stored_message_state(&msg.id, MessageState::Retryable)?;
+            ProcessedMessageContent::StagedCommitMessage(_)
+            | ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                // Direct ingest never stages a commit: one at or above the live
+                // epoch entered convergence above, and OpenMLS refuses every
+                // other with `WrongEpoch`. Merging belongs to convergence alone,
+                // so retain the message for diagnosis and retry instead.
+                self.update_stored_message_state_reported_at(
+                    &msg.id,
+                    MessageState::Retryable,
+                    current_epoch,
+                )?;
                 Err(EngineError::Backend(
-                    "commit retained unresolved app-data updates".into(),
+                    "direct ingest staged a commit outside convergence".into(),
                 ))
             }
         }

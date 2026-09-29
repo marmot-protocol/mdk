@@ -397,8 +397,8 @@ fn build_with_opaque_component(id: &[u8], component_id: u16) -> Engine<SqliteAcc
 /// messages addressed to the NEW `nostr_group_id` still resolve to the group.
 /// Before the fix the index was populated only at hydrate/create/join and went
 /// stale on rotation, stranding the group until restart. Exercises the
-/// convergence-apply reindex site on the recipient; `confirm_published` and the
-/// direct remote-commit-apply path call the same `reindex_transport_group_id`.
+/// convergence-apply reindex site on the recipient; `confirm_published` calls
+/// the same `reindex_transport_group_id`.
 #[tokio::test]
 async fn routing_rotation_reindexes_inbound_transport_group_id() {
     let mut alice = build_with_routing(b"alice");
