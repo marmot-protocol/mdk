@@ -6877,7 +6877,7 @@ async fn connector_group_profile_update_preserves_fields_and_requires_current_ad
             &agent.label,
             "Original",
             std::slice::from_ref(&peer.label),
-            Some("Keep this description"),
+            Some("Keep this description".into()),
         )
         .await
         .unwrap();
