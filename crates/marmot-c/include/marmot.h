@@ -4055,6 +4055,28 @@ typedef struct MarmotStringArray {
 } MarmotStringArray;
 
 /**
+ * One voter's effective (latest valid) poll selection; a poll's list
+ * sums to its `MarmotPollProjection` tally.
+ */
+typedef struct MarmotPollVote {
+  char *voter_account_id_hex;
+  char **option_ids;
+  uintptr_t option_ids_len;
+  /**
+   * Authenticated time of the effective response.
+   */
+  uint64_t voted_at;
+} MarmotPollVote;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotPollVoteList {
+  struct MarmotPollVote *items;
+  uintptr_t len;
+} MarmotPollVoteList;
+
+/**
  * One endpoint's dial verdict. Free the list with
  * `marmot_relay_endpoint_classification_list_free`.
  */
@@ -8624,6 +8646,25 @@ MarmotStatus marmot_cast_poll_vote(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
+ * Who voted for what: each voter's effective (latest valid) selection,
+ * counted by the same rules as the row's `MarmotPollProjection`. Blocked
+ * voters stay listed because the tally counts them. Hidden, deleted,
+ * missing, or non-poll rows give an empty list. Ordered by
+ * `(voted_at, voter)`. Free with `marmot_poll_vote_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_poll_votes(const struct MarmotClient *client,
+                               const char *account_ref,
+                               const char *group_id_hex,
+                               const char *poll_event_id,
+                               struct MarmotPollVoteList **out);
+
+/**
  * Classify relay endpoints against the dial-safety and retired-relay
  * policies without dialing any of them. Free with
  * `marmot_relay_endpoint_classification_list_free`.
@@ -11113,6 +11154,15 @@ void marmot_relay_endpoint_classification_list_free(struct MarmotRelayEndpointCl
  * this library.
  */
 void marmot_app_performance_snapshot_free(struct MarmotAppPerformanceSnapshot *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_poll_vote_list_free(struct MarmotPollVoteList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

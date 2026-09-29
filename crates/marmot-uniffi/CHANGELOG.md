@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- `Marmot::poll_votes` returns each voter's effective poll selection
+  (`PollVoteFfi`: voter account id, option ids, vote time) for a "View votes"
+  sheet. It uses the same rules as the `PollProjectionFfi` tally, so the list
+  sums to `options[].votes` and `participants`. Blocked voters stay listed;
+  hidden or deleted polls return an empty list. (#2091)
+
+
 ## 0.11.0 - 2026-09-29
 
 ### Changed

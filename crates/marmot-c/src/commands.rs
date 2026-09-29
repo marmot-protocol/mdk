@@ -87,7 +87,8 @@ use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
 use crate::types::timeline::{
-    MarmotPollType, MarmotTimelineMessageQuery, MarmotTimelineMessageRecord, MarmotTimelinePage,
+    MarmotPollType, MarmotPollVoteList, MarmotTimelineMessageQuery, MarmotTimelineMessageRecord,
+    MarmotTimelinePage,
 };
 use crate::types::user_blocks::MarmotBlockedUserList;
 use crate::{MarmotClient, client_ref, ffi_guard, write_out};
@@ -2448,6 +2449,15 @@ pub unsafe extern "C" fn marmot_cast_poll_vote(
             )
         }
     })
+}
+
+c_cmd! {
+    /// Who voted for what: each voter's effective (latest valid) selection,
+    /// counted by the same rules as the row's `MarmotPollProjection`. Blocked
+    /// voters stay listed because the tally counts them. Hidden, deleted,
+    /// missing, or non-poll rows give an empty list. Ordered by
+    /// `(voted_at, voter)`. Free with `marmot_poll_vote_list_free`.
+    sync fn marmot_poll_votes(account_ref: str, group_id_hex: str, poll_event_id: str) -> rec(MarmotPollVoteList) = poll_votes;
 }
 
 /// Classify relay endpoints against the dial-safety and retired-relay

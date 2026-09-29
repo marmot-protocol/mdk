@@ -40,6 +40,31 @@ impl Marmot {
             .into())
     }
 
+    /// Who voted for what in one poll: each voter's effective (latest valid)
+    /// selection, using the same rules as the row's `PollProjectionFfi`, so the
+    /// list's length is `participants` and it sums to each option's `votes`.
+    /// Polls in this profile are not anonymous: every member can already read
+    /// each response and its sender. Blocked voters stay listed because the
+    /// tally still counts them; mark them with the account's block list.
+    /// Hidden, deleted, missing, or non-poll rows return an empty list.
+    /// At most one entry per voter, ordered by `(voted_at, voter)`. Re-read
+    /// when the poll row is reprojected. Run this synchronous details query
+    /// off the UI thread.
+    pub fn poll_votes(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        poll_event_id: String,
+    ) -> Result<Vec<crate::conversions::PollVoteFfi>, MarmotKitError> {
+        let group = crate::conversions::group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .poll_votes(&account_ref, &hex::encode(group.as_slice()), &poll_event_id)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Materialized conversation timeline for a group or account-wide tail.
     ///
     /// This is the app-facing aggregated view: kind-9 chat/reply/media rows,

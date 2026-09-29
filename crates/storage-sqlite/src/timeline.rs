@@ -39,7 +39,8 @@ use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, MarmotAppEvent,
-    PollOptionResult, PollProjection, parse_poll, parse_poll_response, validate_poll_response,
+    PollDefinition, PollOptionResult, PollProjection, PollVote, parse_poll, parse_poll_response,
+    validate_poll_response,
 };
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -1573,33 +1574,35 @@ impl SqliteAccountStorage {
         message_id_hex: &str,
     ) -> StorageResult<Option<TimelineMessageRecord>> {
         let conn = self.lock()?;
-        let mut message = conn
-            .query_row_cached(
-                &format!("SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
-                        source.retention_seconds, source.retention_expires_at,
-                        timeline.direction, timeline.group_id_hex, timeline.sender,
-                        timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
-                        timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
-                        timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                        timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
-                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
-                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
-                 FROM visible_message_timeline AS timeline
-                 LEFT JOIN app_events AS source
-                   ON source.group_id_hex = timeline.group_id_hex
-                  AND source.message_id_hex = timeline.message_id_hex
-                 WHERE timeline.group_id_hex = ?1
-                   AND timeline.message_id_hex = ?2
-                 LIMIT 1"),
-                params![group_id_hex, message_id_hex],
-                timeline_record_from_row,
-            )
-            .optional()
-            .storage()?;
+        let mut message = visible_timeline_record(&conn, group_id_hex, message_id_hex)?;
         if let Some(message) = message.as_mut() {
             hydrate_timeline_presentation(&conn, std::slice::from_mut(message))?;
         }
         Ok(message)
+    }
+
+    /// Each voter's effective selection for one visible poll, resolved by the
+    /// same rules as the row's tally: the latest valid response per voter, so
+    /// the list's length equals `participants` and its selections sum to each
+    /// option's `votes`. Personal blocks do not remove voters, matching the
+    /// tally; hosts mark blocked voters with their own block list. A poll the
+    /// timeline hides (missing, deleted, invalidated, or by a blocked author)
+    /// has no votes. At most one entry per group member who ever voted,
+    /// ordered by `(voted_at, voter)`.
+    pub fn poll_votes(
+        &self,
+        group_id_hex: &str,
+        poll_event_id: &str,
+    ) -> StorageResult<Vec<PollVote>> {
+        let conn = self.lock()?;
+        let Some(message) = visible_timeline_record(&conn, group_id_hex, poll_event_id)? else {
+            return Ok(Vec::new());
+        };
+        Ok(effective_poll_votes(&conn, std::slice::from_ref(&message))?
+            .into_iter()
+            .next()
+            .map(|(_, _, votes)| votes)
+            .unwrap_or_default())
     }
 
     /// Resolve a single materialized-timeline row by `(group_id_hex,
@@ -3999,6 +4002,36 @@ fn poll_response_candidate_from_row(
     })
 }
 
+fn visible_timeline_record(
+    conn: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<Option<TimelineMessageRecord>> {
+    conn
+        .query_row_cached(
+            &format!("SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                    source.retention_seconds, source.retention_expires_at,
+                    timeline.direction, timeline.group_id_hex, timeline.sender,
+                    timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
+                    timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
+                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
+                {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
+                (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
+             FROM visible_message_timeline AS timeline
+             LEFT JOIN app_events AS source
+               ON source.group_id_hex = timeline.group_id_hex
+              AND source.message_id_hex = timeline.message_id_hex
+             WHERE timeline.group_id_hex = ?1
+               AND timeline.message_id_hex = ?2
+             LIMIT 1"),
+            params![group_id_hex, message_id_hex],
+            timeline_record_from_row,
+        )
+        .optional()
+        .storage()
+}
+
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
     let deleted = row.get::<_, bool>(17)?;
     Ok(TimelineMessageRecord {
@@ -4083,7 +4116,13 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
 /// deterministic fallback through ordinary response deletion/retention.
 const MAX_POLL_RESPONSES_PER_AUTHOR: usize = 64;
 
-fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> StorageResult<()> {
+/// Parse the visible polls in `messages` and resolve each voter's effective
+/// response: the latest valid one, ordered by `(recorded_at, message_id_hex)`.
+/// Returns `(row index, definition, votes ordered by (voted_at, voter))`.
+fn effective_poll_votes(
+    conn: &Connection,
+    messages: &[TimelineMessageRecord],
+) -> StorageResult<Vec<(usize, PollDefinition, Vec<PollVote>)>> {
     let mut definitions = HashMap::new();
     for (index, message) in messages.iter().enumerate() {
         if message.kind != MARMOT_APP_EVENT_KIND_POLL
@@ -4103,30 +4142,13 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
         if let Ok(definition) = parse_poll(&event) {
             definitions.insert(
                 (message.group_id_hex.clone(), message.message_id_hex.clone()),
-                (
-                    index,
-                    definition,
-                    message.sender.clone(),
-                    message.timeline_at,
-                ),
+                (index, definition, message.timeline_at),
             );
         }
     }
     if definitions.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let local_account_id_hex = conn
-        .query_row_cached(
-            "SELECT local_account_id_hex
-             FROM account_state
-             WHERE local_account_id_hex IS NOT NULL
-             LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .storage()?;
-
     let mut by_group = BTreeMap::<String, Vec<String>>::new();
     for (group, poll_id) in definitions.keys() {
         by_group
@@ -4212,7 +4234,7 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
         let Ok((poll_id, selections)) = parse_poll_response(&event) else {
             continue;
         };
-        let Some((_, poll, _, poll_created_at)) =
+        let Some((_, poll, poll_created_at)) =
             definitions.get(&(response.group_id_hex.clone(), poll_id.clone()))
         else {
             continue;
@@ -4239,29 +4261,56 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
         }
     }
 
-    let mut effective_by_poll = HashMap::<(String, String), Vec<(String, Vec<String>)>>::new();
-    for ((group, poll_id, sender), (_, _, selections)) in effective {
+    let mut effective_by_poll = HashMap::<(String, String), Vec<PollVote>>::new();
+    for ((group, poll_id, voter), (voted_at, _, option_ids)) in effective {
         effective_by_poll
             .entry((group, poll_id))
             .or_default()
-            .push((sender, selections));
+            .push(PollVote {
+                voter,
+                option_ids,
+                voted_at,
+            });
     }
 
+    Ok(definitions
+        .into_iter()
+        .map(|(key, (index, definition, _))| {
+            let mut votes = effective_by_poll.remove(&key).unwrap_or_default();
+            votes.sort_by(|a, b| (a.voted_at, &a.voter).cmp(&(b.voted_at, &b.voter)));
+            (index, definition, votes)
+        })
+        .collect())
+}
+
+fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> StorageResult<()> {
+    let polls = effective_poll_votes(conn, messages)?;
+    if polls.is_empty() {
+        return Ok(());
+    }
+    let local_account_id_hex = conn
+        .query_row_cached(
+            "SELECT local_account_id_hex
+             FROM account_state
+             WHERE local_account_id_hex IS NOT NULL
+             LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .storage()?;
+
     let now = unix_now_seconds();
-    for ((group, poll_id), (index, definition, creator, _)) in definitions {
+    for (index, definition, votes) in polls {
         let mut counts = definition
             .options
             .iter()
             .map(|option| (option.id.clone(), 0_u64))
             .collect::<BTreeMap<_, _>>();
         let mut local_selection = Vec::new();
-        let mut participants = 0_u64;
-        for (sender, selections) in effective_by_poll
-            .remove(&(group, poll_id))
-            .unwrap_or_default()
-        {
-            participants = participants.saturating_add(1);
-            for selection in &selections {
+        let participants = votes.len() as u64;
+        for vote in votes {
+            for selection in &vote.option_ids {
                 if let Some(count) = counts.get_mut(selection) {
                     *count = count.saturating_add(1);
                 }
@@ -4271,11 +4320,12 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
             // become a second identity rule when the projection root is absent.
             let is_local = local_account_id_hex
                 .as_deref()
-                .is_some_and(|local| sender.eq_ignore_ascii_case(local));
+                .is_some_and(|local| vote.voter.eq_ignore_ascii_case(local));
             if is_local {
-                local_selection = selections;
+                local_selection = vote.option_ids;
             }
         }
+        let creator = messages[index].sender.clone();
         messages[index].poll = Some(PollProjection {
             question: definition.question,
             options: definition

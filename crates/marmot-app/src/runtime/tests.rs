@@ -244,7 +244,7 @@ async fn cast_poll_vote_rejects_unknown_closed_and_invalid_selections_before_sen
 async fn poll_creation_uses_conversation_kind_and_existing_polls_remain_votable() {
     let root = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(root.path());
-    home.create_account("alice").unwrap();
+    let alice = home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
     let carol = home.create_account("carol").unwrap();
     let dave = home.create_account("dave").unwrap();
@@ -370,6 +370,15 @@ async fn poll_creation_uses_conversation_kind_and_existing_polls_remain_votable(
     assert_eq!(projected.participants, 1);
     assert_eq!(projected.options[0].votes, 0);
     assert_eq!(projected.options[1].votes, 1);
+    assert_eq!(
+        runtime
+            .poll_votes("alice", &hex::encode(group.as_slice()), &poll_id)
+            .unwrap()
+            .into_iter()
+            .map(|vote| (vote.voter, vote.option_ids))
+            .collect::<Vec<_>>(),
+        [(alice.account_id_hex, vec!["1".to_owned()])]
+    );
 
     runtime.shutdown_and_close().await.unwrap();
 }

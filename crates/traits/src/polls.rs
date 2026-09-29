@@ -73,6 +73,16 @@ pub struct PollProjection {
     pub open: bool,
 }
 
+/// One voter's effective poll selection: the same latest valid response the
+/// tally in [`PollProjection`] counts.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PollVote {
+    pub voter: String,
+    pub option_ids: Vec<String>,
+    /// Authenticated time of the effective response.
+    pub voted_at: u64,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum PollError {
     #[error("poll question is empty or exceeds the byte limit")]

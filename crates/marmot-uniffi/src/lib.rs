@@ -102,7 +102,7 @@ pub use conversions::{
     OnboardingIssueFfi, OnboardingOptionsFfi, OnboardingRepairProposalFfi,
     OnboardingSingleDeviceNoticeFfi, OnboardingSnapshotFfi, OnboardingStatusFfi, OnboardingStepFfi,
     OnboardingStepStateFfi, PeriodicMaintenancePolicyFfi, PollOptionResultFfi, PollProjectionFfi,
-    PollTypeFfi, ProductAnalyticsActivityFfi, ProductAnalyticsMetadataFfi,
+    PollTypeFfi, PollVoteFfi, ProductAnalyticsActivityFfi, ProductAnalyticsMetadataFfi,
     ProductAnalyticsRuntimeConfigFfi, ProductEventFfi, ProductEventModeFfi,
     ProductEventPropertyFfi, ProductEventSchemaFfi, ProductPropertyKindFfi,
     ProductPropertySchemaFfi, ProductRecordResultFfi, PushPlatformFfi, PushRegistrationFfi,

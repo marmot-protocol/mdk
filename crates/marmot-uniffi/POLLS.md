@@ -39,6 +39,13 @@ deadline should also close its controls from the `endsAt` timestamp instead of w
 lists suppress alerts and presentation for blocked senders but do not rewrite the shared poll tally; every authenticated
 member's valid response remains part of the group result.
 
+Use `pollVotes` with the poll event id for a "View votes" sheet. It returns one `PollVoteFfi` per voter: the voter's
+account id, their effective option ids, and the authenticated time of that response. MDK resolves it with the same rules
+as `poll`, so the list's length is `participants` and its selections sum to each option's `votes`. Blocked voters stay
+listed because the shared tally counts them; hosts mark them with the account's block list. A missing, deleted, hidden,
+or non-poll row returns an empty list. Entries are ordered by `(voted_at, voter_account_id_hex)`. The call is a
+synchronous local read, so run it off the UI thread and re-read it when the poll row is reprojected.
+
 Every client must handle polls: peers on 0.11.0 can create them, and a client that ignores
 `poll` shows only the bare question with no way to answer.
 
@@ -46,6 +53,6 @@ Polls are coordination tools, not anonymous or election-grade voting. Every grou
 identity with each response, and distributed clients/relays do not provide a global sequencer at the closing boundary.
 Hosts must not describe the feature as anonymous or use the result for high-stakes elections.
 
-The C surface mirrors this contract as `marmot_create_poll`, `marmot_cast_poll_vote`, and the nullable
-`MarmotTimelineMessageRecord.poll`. Recompile C clients against the matching generated header because the timeline record
-layout changes.
+The C surface mirrors this contract as `marmot_create_poll`, `marmot_cast_poll_vote`, `marmot_poll_votes`, and the
+nullable `MarmotTimelineMessageRecord.poll`. Recompile C clients against the matching generated header because the
+timeline record layout changes.

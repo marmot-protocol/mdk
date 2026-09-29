@@ -236,6 +236,141 @@ fn polls_fold_latest_response_and_delete_falls_back_deterministically() {
 }
 
 #[test]
+fn poll_votes_list_each_effective_selection_and_match_the_tally() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .ensure_account_projection_with_identity("local", "alice")
+        .unwrap();
+    let group = "11".repeat(32);
+    let poll_id = "22".repeat(32);
+    store
+        .record_app_event(&poll(&poll_id, "creator", 100))
+        .unwrap();
+    for (id, sender, at, option, direction) in [
+        ("31", "bob", 150, "0", "received"),
+        ("32", "bob", 160, "1", "received"),
+        ("33", "alice", 120, "0", "sent"),
+        // Unknown option and post-deadline responses never count.
+        ("34", "carol", 170, "7", "received"),
+        ("35", "dave", 250, "0", "received"),
+        ("36", "erin", 130, "1", "received"),
+    ] {
+        store
+            .record_app_event(&poll_response(
+                &id.repeat(32),
+                sender,
+                &poll_id,
+                at,
+                option,
+                direction,
+            ))
+            .unwrap();
+    }
+    store
+        .record_app_event(&delete(&"37".repeat(32), "erin", &"36".repeat(32), 140))
+        .unwrap();
+
+    let expected = vec![
+        cgka_traits::PollVote {
+            voter: "alice".into(),
+            option_ids: vec!["0".into()],
+            voted_at: 120,
+        },
+        cgka_traits::PollVote {
+            voter: "bob".into(),
+            option_ids: vec!["1".into()],
+            voted_at: 160,
+        },
+    ];
+    let assert_matches_tally = |votes: &[cgka_traits::PollVote]| {
+        let projected = store
+            .timeline_message(&group, &poll_id)
+            .unwrap()
+            .unwrap()
+            .poll
+            .unwrap();
+        assert_eq!(votes.len() as u64, projected.participants);
+        for option in &projected.options {
+            let voters = votes
+                .iter()
+                .filter(|vote| vote.option_ids.contains(&option.id))
+                .count() as u64;
+            assert_eq!(voters, option.votes, "option {}", option.id);
+        }
+    };
+    let votes = store.poll_votes(&group, &poll_id).unwrap();
+    assert_eq!(votes, expected);
+    assert_matches_tally(&votes);
+
+    // A personal block hides nothing here: the tally still counts the
+    // blocked voter, so the per-voter read keeps them too.
+    let block = |event_id: &str, at: u64, keys: &[&str]| {
+        let list = crate::StoredBlockList {
+            event_id: event_id.into(),
+            event_created_at: at,
+            ..Default::default()
+        };
+        let keys = keys
+            .iter()
+            .map(|key| ((*key).to_owned(), true))
+            .collect::<Vec<_>>();
+        store
+            .adopt_block_list(&list, &keys, at as i64, "local", &no_mentions)
+            .unwrap();
+    };
+    block("block-bob", 10, &["bob"]);
+    let votes = store.poll_votes(&group, &poll_id).unwrap();
+    assert_eq!(votes, expected);
+    assert_matches_tally(&votes);
+
+    // Polls the timeline would not show have no votes to read.
+    assert!(
+        store
+            .poll_votes(&group, &"99".repeat(32))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .poll_votes(&"aa".repeat(32), &poll_id)
+            .unwrap()
+            .is_empty()
+    );
+    block("block-creator", 20, &["bob", "creator"]);
+    assert!(store.poll_votes(&group, &poll_id).unwrap().is_empty());
+}
+
+#[test]
+fn poll_votes_are_empty_for_non_poll_and_deleted_poll_rows() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group = "11".repeat(32);
+    let poll_id = "22".repeat(32);
+    store
+        .record_app_event(&chat("chat", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&poll(&poll_id, "creator", 100))
+        .unwrap();
+    store
+        .record_app_event(&poll_response(
+            &"31".repeat(32),
+            "bob",
+            &poll_id,
+            150,
+            "0",
+            "received",
+        ))
+        .unwrap();
+    assert!(store.poll_votes(&group, "chat").unwrap().is_empty());
+    assert_eq!(store.poll_votes(&group, &poll_id).unwrap().len(), 1);
+
+    store
+        .record_app_event(&delete(&"32".repeat(32), "creator", &poll_id, 160))
+        .unwrap();
+    assert!(store.poll_votes(&group, &poll_id).unwrap().is_empty());
+}
+
+#[test]
 fn poll_response_moderator_delete_falls_back_but_cross_author_delete_does_not() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let poll_id = "12".repeat(32);

@@ -7,6 +7,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- `marmot_poll_votes` returns a `MarmotPollVoteList` of each voter's effective
+  poll selection, summing to the `MarmotPollProjection` tally. Free it with
+  `marmot_poll_vote_list_free`; requires the matching regenerated header and
+  library. (#2091)
+
+
 ## [0.11.0] - 2026-09-29
 
 ### Added

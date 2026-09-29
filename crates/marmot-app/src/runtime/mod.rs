@@ -4771,6 +4771,20 @@ impl MarmotAppRuntime {
             .message_edit_history(&account.label, group, target, before, limit)
     }
 
+    /// Each voter's effective selection for one visible poll; see
+    /// `SqliteAccountStorage::poll_votes` for the tally and block rules.
+    pub fn poll_votes(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        poll_event_id: &str,
+    ) -> Result<Vec<crate::PollVote>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .poll_votes(&account.label, group_id_hex, poll_event_id)
+    }
+
     pub fn timeline_message(
         &self,
         account_ref: &str,

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- `MarmotAppRuntime::poll_votes` reads each voter's effective poll selection
+  (`PollVote`) with the same rules as the timeline poll tally. (#2091)
+
+
 ## 0.11.0 - 2026-09-29
 
 ### Changed

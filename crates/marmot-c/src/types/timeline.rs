@@ -4,9 +4,9 @@ use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
     DeletionSourceFfi, GroupSystemEventFfi, GroupSystemEventProvenanceFfi, PollOptionResultFfi,
-    PollProjectionFfi, PollTypeFfi, RuntimeProjectionUpdateFfi, TimelineEditHistoryPageFfi,
-    TimelineEditSummaryFfi, TimelineEditVersionFfi, TimelineMessageChangeFfi,
-    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    PollProjectionFfi, PollTypeFfi, PollVoteFfi, RuntimeProjectionUpdateFfi,
+    TimelineEditHistoryPageFfi, TimelineEditSummaryFfi, TimelineEditVersionFfi,
+    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi,
     TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
@@ -106,6 +106,18 @@ c_mirror! {
         str creator,
         opt_copy has_ends_at/ends_at: u64,
         copy open: bool,
+    }
+}
+
+c_mirror! {
+    /// One voter's effective (latest valid) poll selection; a poll's list
+    /// sums to its `MarmotPollProjection` tally.
+    MarmotPollVote from PollVoteFfi,
+    list(MarmotPollVoteList, marmot_poll_vote_list_free) {
+        str voter_account_id_hex,
+        str_vec option_ids/option_ids_len,
+        /// Authenticated time of the effective response.
+        copy voted_at: u64,
     }
 }
 
@@ -449,6 +461,37 @@ mod edit_tests {
         unsafe {
             summary.free_in_place();
             page.free_in_place();
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
+    #[test]
+    fn poll_vote_list_preserves_selections_and_deep_frees() {
+        #[cfg(feature = "alloc-audit")]
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let list: MarmotPollVoteList = vec![PollVoteFfi {
+            voter_account_id_hex: "bob".into(),
+            option_ids: vec!["0".into(), "2".into()],
+            voted_at: 160,
+        }]
+        .into();
+        assert_eq!(list.len, 1);
+        unsafe {
+            let vote = &*list.items;
+            assert_eq!(
+                std::ffi::CStr::from_ptr(vote.voter_account_id_hex).to_str(),
+                Ok("bob")
+            );
+            assert_eq!(vote.option_ids_len, 2);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*vote.option_ids.add(1)).to_str(),
+                Ok("2")
+            );
+            assert_eq!(vote.voted_at, 160);
+            marmot_poll_vote_list_free(crate::memory::boxed(list));
+            marmot_poll_vote_list_free(std::ptr::null_mut());
         }
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), before);

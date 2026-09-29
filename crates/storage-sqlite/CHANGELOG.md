@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- `SqliteAccountStorage::poll_votes` lists each voter's effective selection for
+  one visible poll. The timeline tally and this read share one resolver, so the
+  per-voter list always sums to `PollProjection`'s counts and `participants`.
+  (#2091)
+
+
 ## 0.11.0 - 2026-09-29
 
 ### Changed
