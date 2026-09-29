@@ -65,7 +65,8 @@ pub(crate) struct RecoveryPassTally {
     progress: Option<RecoveryScopeProgress>,
     routes_compared: u64,
     routes_certified: u64,
-    /// Compared routes whose required relays did not all answer.
+    /// Compared routes whose required relays did not all answer, or that no
+    /// comparison backend could compare: no relay comparison ran for them.
     routes_unanswered: u64,
     retrieved: u64,
     rejected: u64,
@@ -81,9 +82,10 @@ impl RecoveryPassTally {
             self.routes_certified = self
                 .routes_certified
                 .saturating_add(u64::from(route.certified));
-            self.routes_unanswered = self
-                .routes_unanswered
-                .saturating_add(u64::from(!route.answered));
+            self.routes_unanswered = self.routes_unanswered.saturating_add(u64::from(
+                !route.answered
+                    || route.outcome == storage_sqlite::RecoveryComparisonOutcome::Unsupported,
+            ));
             let acquired = &route.acquisition;
             self.retrieved = self.retrieved.saturating_add(count(acquired.retrieved));
             self.rejected = self.rejected.saturating_add(count(acquired.rejected));
@@ -124,8 +126,9 @@ impl RecoveryPassTally {
     }
 }
 
-/// Progressed beats quiet beats unserved: a pass progressed if any scope did,
-/// and is quiet only if no scope progressed and some scope was served.
+/// Progressed beats a certified window beats unserved beats quiet: a pass
+/// progressed if any scope did, and is quiet only if no scope progressed and
+/// every compared scope was served.
 pub(crate) fn merge_progress(
     current: Option<RecoveryScopeProgress>,
     next: RecoveryPassProgress,
@@ -136,11 +139,13 @@ pub(crate) fn merge_progress(
         RecoveryPassProgress::Unserved => RecoveryScopeProgress::Unserved,
         RecoveryPassProgress::WindowCertified => RecoveryScopeProgress::WindowCertified,
     };
+    // Quiet claims every compared relay answered, so one unserved scope
+    // makes an unprogressed aggregate unserved.
     let rank = |progress: RecoveryScopeProgress| match progress {
         RecoveryScopeProgress::Progressed => 3,
         RecoveryScopeProgress::WindowCertified => 2,
-        RecoveryScopeProgress::Quiet => 1,
-        RecoveryScopeProgress::Unserved => 0,
+        RecoveryScopeProgress::Unserved => 1,
+        RecoveryScopeProgress::Quiet => 0,
     };
     match current {
         Some(current) if rank(current) >= rank(next) => current,
@@ -228,13 +233,13 @@ pub(crate) fn pass_outcome(
             RecoveryPassOutcome::Progressed
         }
         _ if retained > 0 => RecoveryPassOutcome::Progressed,
-        Some(RecoveryScopeProgress::Quiet) => RecoveryPassOutcome::Quiet,
         Some(RecoveryScopeProgress::Unserved) => RecoveryPassOutcome::Unserved,
-        // No obligation scope was compared: a comparison-only pass, or a
-        // maintenance boundary alone. Its routes decide: any route whose
-        // required relays did not answer leaves it unserved.
-        None if tally.routes_unanswered > 0 => RecoveryPassOutcome::Unserved,
-        None => RecoveryPassOutcome::Quiet,
+        // Quiet only when every compared route actually answered: a route
+        // whose relays failed, or that no backend could compare, leaves the
+        // pass unserved, with or without obligation scopes (a comparison-only
+        // pass has none).
+        _ if tally.routes_unanswered > 0 => RecoveryPassOutcome::Unserved,
+        Some(RecoveryScopeProgress::Quiet) | None => RecoveryPassOutcome::Quiet,
     }
 }
 
@@ -647,15 +652,21 @@ mod tests {
                 .iter()
                 .fold(None, |current, next| Some(merge_progress(current, *next)))
         };
-        assert_eq!(
-            fold(&[Unserved, Quiet, Unserved]),
-            Some(RecoveryScopeProgress::Quiet)
-        );
+        assert_eq!(fold(&[Quiet, Quiet]), Some(RecoveryScopeProgress::Quiet));
         assert_eq!(
             fold(&[Quiet, Progressed, Unserved]),
             Some(RecoveryScopeProgress::Progressed)
         );
         assert_eq!(fold(&[Unserved]), Some(RecoveryScopeProgress::Unserved));
+        // One answered scope and one timed out: not quiet.
+        assert_eq!(
+            fold(&[Quiet, Unserved]),
+            Some(RecoveryScopeProgress::Unserved)
+        );
+        assert_eq!(
+            fold(&[Unserved, Quiet]),
+            Some(RecoveryScopeProgress::Unserved)
+        );
         assert_eq!(
             fold(&[Quiet, WindowCertified]),
             Some(RecoveryScopeProgress::WindowCertified)
@@ -769,6 +780,21 @@ mod tests {
         ]);
         assert_eq!(
             pass_outcome(false, None, &comparison_only, 0),
+            RecoveryPassOutcome::Unserved
+        );
+        // Mixed scopes: one answered with nothing, one timed out.
+        let mut mixed = RecoveryPassTally::default();
+        mixed.observe_progress(RecoveryPassProgress::Quiet);
+        mixed.observe_progress(RecoveryPassProgress::Unserved);
+        assert_eq!(
+            pass_outcome(false, None, &mixed, 0),
+            RecoveryPassOutcome::Unserved
+        );
+        // Scopes read quiet, but a compared route had no backend.
+        let mut no_backend = with(Some(RecoveryScopeProgress::Quiet));
+        no_backend.observe_unsettled_routes([(false, RouteAcquisition::default())]);
+        assert_eq!(
+            pass_outcome(false, None, &no_backend, 0),
             RecoveryPassOutcome::Unserved
         );
         let mut answered = RecoveryPassTally::default();

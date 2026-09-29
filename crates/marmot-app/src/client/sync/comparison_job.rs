@@ -319,9 +319,12 @@ impl ComparisonAdmission {
     fn unsettled_routes(
         &self,
     ) -> impl Iterator<Item = (bool, super::super::audit_recovery::RouteAcquisition)> + '_ {
-        self.routes
-            .iter()
-            .map(|route| (route.answered, route.acquisition))
+        self.routes.iter().map(|route| {
+            (
+                route.answered && route.outcome != Outcome::Unsupported,
+                route.acquisition,
+            )
+        })
     }
 }
 
@@ -1780,5 +1783,63 @@ mod tests {
         assert_eq!(finished[0]["event"]["outcome"], "unserved");
         assert_eq!(finished[0]["event"]["routes_certified"], 0);
         assert_eq!(finished[0]["event"]["events_retrieved"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_comparison_only_pass_without_a_backend_is_unserved_not_quiet() {
+        use crate::client::audit_recovery::recorded_v5_rows;
+        let mut fixture = fixture_with_options(None, false, true).await;
+        // Settle the create-group history demand, as the epoch-gap fixture
+        // does, so the next grant owns only the comparison slot.
+        let baseline = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        fixture
+            .client
+            .run_recovery_grant_for_test(baseline)
+            .await
+            .unwrap();
+        fixture.client.request_bounded_comparison().unwrap();
+        fixture
+            .client
+            .recovery_owner
+            .test_advance_to_retry(&fixture.storage);
+        let grant = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .expect("the comparison slot is selected");
+        assert!(
+            grant.fence.obligations.is_empty(),
+            "a comparison-only grant"
+        );
+        assert!(grant.comparison_revision.is_some());
+        let serial = grant.reservation.attempt_serial;
+        let routes = grant
+            .inventory
+            .iter()
+            .map(|inventory| ComparisonRouteResult {
+                route: inventory.route.clone(),
+                initial_cursor: None,
+                cursor: None,
+                // No comparison backend: no relay comparison ran.
+                result: ComparisonRouteWorkResult::Returned(Ok(None)),
+            })
+            .collect();
+        let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
+        fixture
+            .client
+            .admit_comparison_inline(grant, execution, ComparisonNetworkResult { routes })
+            .await
+            .unwrap();
+        let finished = recorded_v5_rows(&fixture.client.app.clone(), "recovery_attempt_finished")
+            .into_iter()
+            .find(|row| row["event"]["attempt_serial"] == serial)
+            .expect("the comparison-only pass finished");
+        assert_eq!(finished["event"]["obligation_count"], 0);
+        assert_eq!(finished["event"]["outcome"], "unserved");
+        assert_eq!(finished["event"]["routes_certified"], 0);
     }
 }

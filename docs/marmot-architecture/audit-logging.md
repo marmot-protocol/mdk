@@ -1052,16 +1052,16 @@ Outcomes:
 | Outcome | Meaning |
 | --- | --- |
 | `progressed` | Some compared scope certified or durably admitted history (the code's `RecoveryPassProgress::Progressed`), certified the retained window of an explicit goal that reaches below it (`WindowCertified`: searched, never quiet), or the pass retained deliveries. |
-| `quiet` | Required relays answered; nothing certified or admitted (`Quiet`). Counts toward parking. A pass that compared nothing, such as a maintenance boundary alone, is also `quiet`. |
-| `unserved` | A required relay failed, timed out or was skipped, or admission was refused (`Unserved`). Says nothing about history and never counts toward parking. |
+| `quiet` | Every compared route's required relays answered, and nothing certified or admitted (`Quiet`). Counts toward parking. A pass that compared nothing, such as a maintenance boundary alone, is also `quiet`. |
+| `unserved` | Nothing progressed, and some compared scope or route was not served: a required relay failed, timed out or was skipped, admission was refused (`Unserved`), or no comparison backend could compare the route. Says nothing about history and never counts toward parking. |
 | `deadline` | An explicit repair spent its whole budget and stopped admission at a turn boundary. A network cutoff that skipped routes still settles, and shows as those routes being unserved. |
 
 A pass that stops before settlement (`deadline`, `cancelled` at a turn boundary, `superseded` during admission, or
 `failed` mid-admission) still reports what its relays returned and what it retained: route and relay counts come from
 the routes it accepted, none of them certified. It writes no reassessment rows.
 
-A pass that selected no obligation (a comparison-only pass) has no scope progress; its routes decide, and any route
-whose required relays did not answer makes it `unserved`.
+A pass that selected no obligation (a comparison-only pass) has no scope progress; its routes decide. Any route whose
+required relays did not answer, or that no comparison backend could compare, makes an unprogressed pass `unserved`.
 | `cancelled` | Explicit repair was cancelled, or the comparison's network task ended without a result. |
 | `superseded` | The grant changed before or during admission, for example new loss imported by the job's stability check. Before admission nothing was admitted; during it the admitted prefix stays durable. Nothing was certified and newer demand owns the debt. |
 | `failed` | The pass failed; see `error_kind`. |
@@ -1087,7 +1087,7 @@ pass that stopped before settlement writes none.
 | `obligation_revision` | The revision the pass selected. |
 | `verdict` | `satisfied`, `deferred`, `waiting_capacity`, `waiting_capability`, `parked`, `retired`, `superseded`, or `closed_below_window`. |
 | `next_attempt` | `not_needed`, `paced_retry`, `after_capacity`, `after_capability_change`, `explicit_repair_only`, or `newer_revision`: why another automatic attempt is, or is not, permitted. |
-| `progress` | This obligation's compared scopes, aggregated: `progressed`, `window_certified`, `quiet`, or `unserved` (in that precedence). Absent when the pass compared none of them. |
+| `progress` | This obligation's compared scopes, aggregated: `progressed`, `window_certified`, `unserved`, or `quiet`, in that precedence, so `quiet` means every compared scope was served. Absent when the pass compared none of them. |
 | `scopes_total` / `scopes_certified` | The obligation's scopes, and how many hold a certificate valid for this goal after the pass. |
 | `quiet_passes` | Comparison-owned causes only: the shortest quiet streak among the scopes that still decide parking (neither qualified nor window certified), after the pass. The obligation parks when this reaches `park_after_quiet_passes`. Absent when no scope still counts. |
 | `park_after_quiet_passes` | The parking budget in this build. |
