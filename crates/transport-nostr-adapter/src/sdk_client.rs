@@ -17,10 +17,10 @@ use nostr_gossip::NostrGossip;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     AcquisitionEnd as SdkAcquisitionEnd, AcquisitionLimits as SdkAcquisitionLimits, Client,
-    ClientBuilder, ClientMessage, ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder, EventId,
-    Filter, FinalizeEventAsync, Kind, PublicKey, Relay, RelayAcquisition, RelayCapabilities, RelayMessage,
-    RelayStatus, RelayUrl, ReqTarget, SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions,
-    Tag, Timestamp as NostrTimestamp,
+    ClientBuilder, ClientMessage, ClientNotification, ErrorKind as SdkErrorKind, Event,
+    EventBuilder, EventId, Filter, FinalizeEventAsync, Kind, PublicKey, Relay, RelayAcquisition,
+    RelayCapabilities, RelayMessage, RelayStatus, RelayUrl, ReqTarget, SingleLetterTag,
+    SubscriptionId, SyncDirection, SyncOptions, Tag, Timestamp as NostrTimestamp,
 };
 use nostr_sdk::relay::EventSendStatus;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
@@ -1775,7 +1775,7 @@ impl NostrSdkRelayClient {
         endpoint: &RelayUrl,
         event: &Event,
         transport_endpoint: &TransportEndpoint,
-    ) -> Result<(), TransportEndpointFailure> {
+    ) -> Result<Option<TransportEndpointAckKind>, TransportEndpointFailure> {
         let local_failure = |reason: &str| TransportEndpointFailure {
             endpoint: transport_endpoint.clone(),
             reason: reason.to_owned(),
@@ -1792,7 +1792,7 @@ impl NostrSdkRelayClient {
                     .map_err(|_| local_failure("send event failed"))?;
                 let remote = output.failed.get(endpoint).map(String::as_str);
                 if relay_endpoint_publish_accepted(output.success.contains_key(endpoint), remote) {
-                    Ok(())
+                    Ok(typed_relay_ack_kind(output.success.get(endpoint)))
                 } else if let Some(remote) = remote {
                     Err(relay_rejection_endpoint_failure(
                         transport_endpoint.clone(),
@@ -1823,11 +1823,11 @@ impl NostrSdkRelayClient {
                     .map_err(|_| local_failure("send event failed"))?
                     .ok_or_else(|| local_failure("send event failed"))?;
                 match relay.send_event(event).await {
-                    Ok(_) => Ok(()),
+                    Ok(output) => Ok(typed_relay_ack_kind(Some(output.status()))),
                     Err(error) if error.kind() == SdkErrorKind::Rejected => {
                         let message = error.to_string();
                         if relay_endpoint_publish_accepted(false, Some(&message)) {
-                            Ok(())
+                            Ok(None)
                         } else {
                             Err(relay_rejection_endpoint_failure(
                                 transport_endpoint.clone(),
@@ -1862,14 +1862,14 @@ impl NostrSdkRelayClient {
             )
             .await
             {
-                Ok(Ok(())) => {
+                Ok(Ok(ack_kind)) => {
                     return Ok(TransportEndpointReceipt {
                         endpoint: transport_endpoint,
                         accepted_at: None,
                         // Only a typed SDK ACK can establish this detail. The
                         // legacy failed-map duplicate path remains accepted
                         // but has no preserved ACK status to classify.
-                        ack_kind: typed_relay_ack_kind(output.success.get(&endpoint)),
+                        ack_kind,
                     });
                 }
                 Ok(Err(failure)) => last_failure = failure,
@@ -2256,13 +2256,14 @@ impl NostrSdkRelayClient {
         Ok(())
     }
 
-    /// Register a history-only endpoint without upgrading an existing
-    /// write-only publication socket to READ. Request subscriptions remain
+    /// Enable READ for history acquisition within this account's pool.
+    /// Promoted publication sockets outlive idle WRITE eviction. Request subscriptions remain
     /// SDK-owned and close on finish, cancellation, or dropped work; a newly
     /// registered relay stays in this account's compatible connection pool.
     async fn add_acquisition_relay(&self, endpoint: &RelayUrl) -> Result<(), ()> {
         let _relay_lifecycle = self.publish_relay_cache.lifecycle.lock().await;
-        if self.client.relays().await.contains_key(endpoint) {
+        if let Some(relay) = self.client.relays().await.get(endpoint) {
+            relay.capabilities().add(RelayCapabilities::READ);
             return Ok(());
         }
         let added = self
@@ -3411,6 +3412,56 @@ mod tests {
         assert_eq!(outcome.accepted[0].endpoint, endpoint);
         assert!(registered.capabilities().load().can_write());
         assert_eq!(sdk.relay_health().await.total_relays, 1);
+        sdk.client.shutdown().await;
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn retained_publish_reads_history() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let endpoint = TransportEndpoint(url.to_string());
+        let keys = Keys::generate();
+        let account = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let sdk = signed_sdk(keys.clone());
+        let event = EventBuilder::new(Kind::TextNote, "retained publication")
+            .finalize(&keys)
+            .unwrap();
+        sdk.publish_event(
+            &[endpoint],
+            &NostrTransportEvent::from_nostr_event(&event).unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+        let registered = sdk.client.relays().await.get(&url).cloned().unwrap();
+        assert!(!registered.capabilities().can_read());
+
+        let history = sdk
+            .acquire_history(
+                acquisition_request(account, url.clone(), vec![event.id.to_bytes()], 4, 100_000),
+                NostrAcquisitionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            history.endpoints[0].end,
+            NostrAcquisitionEnd::RequestPolicySatisfied
+        );
+        assert_eq!(
+            history.endpoints[0].events,
+            vec![NostrTransportEvent::from_nostr_event(&event).unwrap()]
+        );
+        assert!(registered.capabilities().can_read());
+        assert!(registered.capabilities().can_write());
+
+        tokio::time::pause();
+        advance(SDK_PUBLISH_RELAY_IDLE_WAIT + Duration::from_secs(1)).await;
+        sdk.publish_relay_cache
+            .evict_idle(&mut *sdk.publish_relay_cache.lifecycle.lock().await)
+            .await;
+        assert!(sdk.client.relays().await.contains_key(&url));
+        assert_eq!(registered.status(), RelayStatus::Connected);
         sdk.client.shutdown().await;
         relay.shutdown();
     }

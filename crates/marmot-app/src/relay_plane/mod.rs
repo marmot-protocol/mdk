@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use cgka_traits::transport::Timestamp;
 use cgka_traits::{
     MemberId, MessageId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportDeliveryPlane, TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
-    TransportEndpointRejectionCategory, TransportGroupSubscription, TransportGroupSync,
-    TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    TransportDelivery, TransportDeliveryPlane, TransportEndpoint, TransportEndpointFailure,
+    TransportEndpointFailureKind, TransportEndpointRejectionCategory, TransportGroupSubscription,
+    TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
 };
 use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use nostr_sdk::NotificationUpdate;

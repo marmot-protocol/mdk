@@ -32,6 +32,7 @@ async fn unchanged_sync_latency() {
                 group_id: cgka_traits::GroupId::new(index.to_be_bytes().to_vec()),
                 transport_group_id: [index.to_be_bytes().as_slice(), &[0; 28]].concat(),
                 endpoints: vec![TransportEndpoint("wss://group.example".into())],
+                retained_since: None,
             })
             .collect::<Vec<_>>();
         adapter
