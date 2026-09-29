@@ -1088,7 +1088,7 @@ pass that stopped before settlement writes none.
 | `obligation_revision` | The revision the pass selected. |
 | `verdict` | `satisfied`, `deferred`, `waiting_capacity`, `waiting_capability`, `parked`, `retired`, `superseded`, or `closed_below_window`. |
 | `next_attempt` | `not_needed`, `paced_retry`, `after_capacity`, `after_capability_change`, `explicit_repair_only`, or `newer_revision`: why another automatic attempt is, or is not, permitted. |
-| `progress` | This obligation's compared scopes, aggregated: `progressed`, `window_certified`, `unserved`, or `quiet`, in that precedence, so `quiet` means every compared scope was served. Absent when the pass compared none of them. |
+| `progress` | This obligation's compared scopes, aggregated: `progressed`, `window_certified`, `unserved`, or `quiet`, in that precedence, so `quiet` means every compared scope was served. A scope whose route no comparison backend could compare is `unserved` here, although storage's own retry classification for it is unchanged. Absent when the pass compared none of them. |
 | `scopes_total` / `scopes_certified` | The obligation's scopes, and how many hold a certificate valid for this goal after the pass. |
 | `quiet_passes` | Comparison-owned causes only: the shortest quiet streak among the scopes that still decide parking (neither qualified nor window certified), after the pass. The obligation parks when this reaches `park_after_quiet_passes`. Absent when no scope still counts. |
 | `park_after_quiet_passes` | The parking budget in this build. |

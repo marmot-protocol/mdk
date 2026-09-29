@@ -4298,11 +4298,22 @@ impl AppClient {
                     } else {
                         storage_sqlite::RecoveryPassProgress::Unserved
                     };
-                    if compared.is_some() {
-                        tally.observe_progress(scope_progress);
+                    if let Some(compared) = compared {
+                        // Audit only: a route no comparison backend could
+                        // compare was not served, although storage keeps its
+                        // own classification and retry policy for it.
+                        let audit_progress = if compared.outcome
+                            == storage_sqlite::RecoveryComparisonOutcome::Unsupported
+                            && scope_progress == storage_sqlite::RecoveryPassProgress::Quiet
+                        {
+                            storage_sqlite::RecoveryPassProgress::Unserved
+                        } else {
+                            scope_progress
+                        };
+                        tally.observe_progress(audit_progress);
                         obligation_progress = Some(super::audit_recovery::merge_progress(
                             obligation_progress,
-                            scope_progress,
+                            audit_progress,
                         ));
                     }
                     progress.push((scope.goal.scope_id, scope_progress));

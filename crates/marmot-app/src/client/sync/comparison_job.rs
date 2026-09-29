@@ -1882,4 +1882,50 @@ mod tests {
         assert_eq!(finished["event"]["outcome"], "unserved");
         assert_eq!(finished["event"]["routes_certified"], 0);
     }
+
+    #[tokio::test]
+    async fn an_obligation_compared_without_a_backend_is_reassessed_as_unserved() {
+        use crate::client::audit_recovery::recorded_v5_rows;
+        let mut fixture = audited_fixture().await;
+        let grant = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        let serial = grant.reservation.attempt_serial;
+        let routes = grant
+            .inventory
+            .iter()
+            .map(|inventory| ComparisonRouteResult {
+                route: inventory.route.clone(),
+                initial_cursor: None,
+                cursor: None,
+                // No comparison backend: no relay comparison ran.
+                result: ComparisonRouteWorkResult::Returned(Ok(None)),
+            })
+            .collect();
+        let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
+        fixture
+            .client
+            .admit_comparison_inline(grant, execution, ComparisonNetworkResult { routes })
+            .await
+            .unwrap();
+        let app = fixture.client.app.clone();
+        let incremental = recorded_v5_rows(&app, "recovery_obligation_reassessed")
+            .into_iter()
+            .find(|row| {
+                row["event"]["attempt_serial"] == serial
+                    && row["event"]["cause"] == "incremental_history"
+            })
+            .expect("the startup history obligation is reassessed");
+        // Storage waits for a capability change; the audit row agrees with
+        // the finish row that nothing served the scope.
+        assert_eq!(incremental["event"]["verdict"], "waiting_capability");
+        assert_eq!(incremental["event"]["progress"], "unserved");
+        let finished = recorded_v5_rows(&app, "recovery_attempt_finished")
+            .into_iter()
+            .find(|row| row["event"]["attempt_serial"] == serial)
+            .unwrap();
+        assert_eq!(finished["event"]["outcome"], "unserved");
+    }
 }
