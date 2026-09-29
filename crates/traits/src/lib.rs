@@ -102,8 +102,8 @@ pub use message::{
 pub use peeler::{GroupMessageMetadata, TransportPeeler};
 pub use polls::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollDefinition, PollError,
-    PollOptionDefinition, PollOptionResult, PollProjection, PollType, PollVote, parse_poll,
-    parse_poll_response, poll_response_tags, poll_tags, validate_poll_response,
+    PollOptionDefinition, PollOptionResult, PollProjection, PollType, PollVote, PollVotePage,
+    parse_poll, parse_poll_response, poll_response_tags, poll_tags, validate_poll_response,
     validate_poll_selection,
 };
 pub use storage::{

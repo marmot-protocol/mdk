@@ -298,7 +298,7 @@ fn poll_votes_list_each_effective_selection_and_match_the_tally() {
             assert_eq!(voters, option.votes, "option {}", option.id);
         }
     };
-    let votes = store.poll_votes(&group, &poll_id).unwrap();
+    let votes = store.poll_votes(&group, &poll_id, None, 100).unwrap().votes;
     assert_eq!(votes, expected);
     assert_matches_tally(&votes);
 
@@ -319,25 +319,87 @@ fn poll_votes_list_each_effective_selection_and_match_the_tally() {
             .unwrap();
     };
     block("block-bob", 10, &["bob"]);
-    let votes = store.poll_votes(&group, &poll_id).unwrap();
+    let votes = store.poll_votes(&group, &poll_id, None, 100).unwrap().votes;
     assert_eq!(votes, expected);
     assert_matches_tally(&votes);
 
     // Polls the timeline would not show have no votes to read.
     assert!(
         store
-            .poll_votes(&group, &"99".repeat(32))
+            .poll_votes(&group, &"99".repeat(32), None, 100)
             .unwrap()
+            .votes
             .is_empty()
     );
     assert!(
         store
-            .poll_votes(&"aa".repeat(32), &poll_id)
+            .poll_votes(&"aa".repeat(32), &poll_id, None, 100)
             .unwrap()
+            .votes
             .is_empty()
     );
     block("block-creator", 20, &["bob", "creator"]);
-    assert!(store.poll_votes(&group, &poll_id).unwrap().is_empty());
+    assert!(
+        store
+            .poll_votes(&group, &poll_id, None, 100)
+            .unwrap()
+            .votes
+            .is_empty()
+    );
+}
+
+#[test]
+fn poll_votes_page_by_vote_time_then_voter_with_an_exclusive_cursor() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group = "11".repeat(32);
+    let poll_id = "22".repeat(32);
+    store
+        .record_app_event(&poll(&poll_id, "creator", 100))
+        .unwrap();
+    for (id, voter, at) in [
+        ("31", "erin", 150),
+        ("32", "carol", 120),
+        ("33", "bob", 120),
+        ("34", "dave", 130),
+        ("35", "alice", 110),
+    ] {
+        store
+            .record_app_event(&poll_response(
+                &id.repeat(32),
+                voter,
+                &poll_id,
+                at,
+                "0",
+                "received",
+            ))
+            .unwrap();
+    }
+
+    let mut after = None;
+    let mut pages = Vec::new();
+    loop {
+        let page = store.poll_votes(&group, &poll_id, after, 2).unwrap();
+        pages.push(
+            page.votes
+                .iter()
+                .map(|vote| vote.voter.as_str().to_owned())
+                .collect::<Vec<_>>(),
+        );
+        after = page
+            .votes
+            .last()
+            .map(|vote| (vote.voted_at, vote.voter.clone()));
+        if !page.has_more_after {
+            break;
+        }
+    }
+    assert_eq!(
+        pages,
+        [vec!["alice", "bob"], vec!["carol", "dave"], vec!["erin"]]
+    );
+    for limit in [0, 101] {
+        assert!(store.poll_votes(&group, &poll_id, None, limit).is_err());
+    }
 }
 
 #[test]
@@ -361,13 +423,32 @@ fn poll_votes_are_empty_for_non_poll_and_deleted_poll_rows() {
             "received",
         ))
         .unwrap();
-    assert!(store.poll_votes(&group, "chat").unwrap().is_empty());
-    assert_eq!(store.poll_votes(&group, &poll_id).unwrap().len(), 1);
+    assert!(
+        store
+            .poll_votes(&group, "chat", None, 100)
+            .unwrap()
+            .votes
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .poll_votes(&group, &poll_id, None, 100)
+            .unwrap()
+            .votes
+            .len(),
+        1
+    );
 
     store
         .record_app_event(&delete(&"32".repeat(32), "creator", &poll_id, 160))
         .unwrap();
-    assert!(store.poll_votes(&group, &poll_id).unwrap().is_empty());
+    assert!(
+        store
+            .poll_votes(&group, &poll_id, None, 100)
+            .unwrap()
+            .votes
+            .is_empty()
+    );
 }
 
 #[test]

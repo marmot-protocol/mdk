@@ -39,8 +39,8 @@ use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, MarmotAppEvent,
-    PollDefinition, PollOptionResult, PollProjection, PollVote, parse_poll, parse_poll_response,
-    validate_poll_response,
+    PollDefinition, PollOptionResult, PollProjection, PollVote, PollVotePage, parse_poll,
+    parse_poll_response, validate_poll_response,
 };
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -1581,28 +1581,46 @@ impl SqliteAccountStorage {
         Ok(message)
     }
 
-    /// Each voter's effective selection for one visible poll, resolved by the
-    /// same rules as the row's tally: the latest valid response per voter, so
-    /// the list's length equals `participants` and its selections sum to each
-    /// option's `votes`. Personal blocks do not remove voters, matching the
-    /// tally; hosts mark blocked voters with their own block list. A poll the
-    /// timeline hides (missing, deleted, invalidated, or by a blocked author)
-    /// has no votes. At most one entry per group member who ever voted,
-    /// ordered by `(voted_at, voter)`.
+    /// One page of each voter's effective selection for one visible poll,
+    /// resolved by the same rules as the row's tally: the latest valid
+    /// response per voter, so all pages together hold `participants` entries
+    /// whose selections sum to each option's `votes`. Personal blocks do not
+    /// remove voters, matching the tally; hosts mark blocked voters with their
+    /// own block list. A poll the timeline hides (missing, deleted,
+    /// invalidated, or by a blocked author) has no votes. Votes are ordered by
+    /// `(voted_at, voter)`; `after` is an exclusive cursor of that key and
+    /// `limit` is 1..=100, because retained votes from former members are not
+    /// bounded by the current group size.
     pub fn poll_votes(
         &self,
         group_id_hex: &str,
         poll_event_id: &str,
-    ) -> StorageResult<Vec<PollVote>> {
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> StorageResult<PollVotePage> {
+        if !(1..=100).contains(&limit) {
+            return Err(StorageError::Serialization(
+                "poll votes limit must be 1..=100".into(),
+            ));
+        }
         let conn = self.lock()?;
         let Some(message) = visible_timeline_record(&conn, group_id_hex, poll_event_id)? else {
-            return Ok(Vec::new());
+            return Ok(PollVotePage::default());
         };
-        Ok(effective_poll_votes(&conn, std::slice::from_ref(&message))?
+        let mut votes = effective_poll_votes(&conn, std::slice::from_ref(&message))?
             .into_iter()
             .next()
             .map(|(_, _, votes)| votes)
-            .unwrap_or_default())
+            .unwrap_or_default();
+        if let Some((at, voter)) = after {
+            votes.retain(|vote| (vote.voted_at, vote.voter.as_str()) > (at, voter.as_str()));
+        }
+        let has_more_after = votes.len() > limit;
+        votes.truncate(limit);
+        Ok(PollVotePage {
+            votes,
+            has_more_after,
+        })
     }
 
     /// Resolve a single materialized-timeline row by `(group_id_hex,

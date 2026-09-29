@@ -188,7 +188,7 @@ pub use audit_log::{
 };
 pub use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,
-    PollProjection, PollType, PollVote,
+    PollProjection, PollType, PollVote, PollVotePage,
 };
 pub use client::AppClient;
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
@@ -2976,11 +2976,13 @@ impl MarmotApp {
         label: &str,
         group_id_hex: &str,
         poll_event_id: &str,
-    ) -> Result<Vec<PollVote>, AppError> {
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<PollVotePage, AppError> {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
-            .poll_votes(group_id_hex, poll_event_id)?)
+            .poll_votes(group_id_hex, poll_event_id, after, limit)?)
     }
 
     pub fn timeline_message(

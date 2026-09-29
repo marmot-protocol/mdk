@@ -76,6 +76,24 @@ impl From<marmot_app::PollVote> for PollVoteFfi {
     }
 }
 
+/// One page of poll votes ordered by `(voted_at, voter_account_id_hex)`.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PollVotePageFfi {
+    pub votes: Vec<PollVoteFfi>,
+    /// More votes follow; pass the last vote's `voted_at` and
+    /// `voter_account_id_hex` as the next cursor.
+    pub has_more_after: bool,
+}
+
+impl From<marmot_app::PollVotePage> for PollVotePageFfi {
+    fn from(value: marmot_app::PollVotePage) -> Self {
+        Self {
+            votes: value.votes.into_iter().map(Into::into).collect(),
+            has_more_after: value.has_more_after,
+        }
+    }
+}
+
 impl From<marmot_app::PollProjection> for PollProjectionFfi {
     fn from(value: marmot_app::PollProjection) -> Self {
         Self {
@@ -887,12 +905,17 @@ mod tests {
     }
 
     #[test]
-    fn poll_vote_ffi_names_the_voter_account() {
-        let vote = PollVoteFfi::from(marmot_app::PollVote {
-            voter: "bob".into(),
-            option_ids: vec!["1".into()],
-            voted_at: 160,
+    fn poll_vote_page_ffi_names_the_voter_account() {
+        let page = PollVotePageFfi::from(marmot_app::PollVotePage {
+            votes: vec![marmot_app::PollVote {
+                voter: "bob".into(),
+                option_ids: vec!["1".into()],
+                voted_at: 160,
+            }],
+            has_more_after: true,
         });
+        assert!(page.has_more_after);
+        let vote = &page.votes[0];
         assert_eq!(vote.voter_account_id_hex, "bob");
         assert_eq!(vote.option_ids, ["1"]);
         assert_eq!(vote.voted_at, 160);

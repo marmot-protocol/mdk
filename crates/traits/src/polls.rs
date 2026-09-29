@@ -83,6 +83,15 @@ pub struct PollVote {
     pub voted_at: u64,
 }
 
+/// One page of [`PollVote`]s ordered by `(voted_at, voter)`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PollVotePage {
+    pub votes: Vec<PollVote>,
+    /// More votes follow the last one; pass its `(voted_at, voter)` as the
+    /// next cursor.
+    pub has_more_after: bool,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum PollError {
     #[error("poll question is empty or exceeds the byte limit")]

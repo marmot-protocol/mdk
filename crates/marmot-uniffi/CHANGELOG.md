@@ -4,11 +4,12 @@
 
 ### Added
 
-- `Marmot::poll_votes` returns each voter's effective poll selection
+- `Marmot::poll_votes` pages each voter's effective poll selection
   (`PollVoteFfi`: voter account id, option ids, vote time) for a "View votes"
-  sheet. It uses the same rules as the `PollProjectionFfi` tally, so the list
-  sums to `options[].votes` and `participants`. Blocked voters stay listed;
-  hidden or deleted polls return an empty list. (#2091)
+  sheet, 1..=100 per `PollVotePageFfi` with a `(voted_at, voter)` cursor. It
+  uses the same rules as the `PollProjectionFfi` tally, so all pages sum to
+  `options[].votes` and `participants`. Blocked voters stay listed; hidden or
+  deleted polls return an empty page. (#2091)
 
 
 ## 0.11.0 - 2026-09-29

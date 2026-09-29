@@ -39,12 +39,15 @@ deadline should also close its controls from the `endsAt` timestamp instead of w
 lists suppress alerts and presentation for blocked senders but do not rewrite the shared poll tally; every authenticated
 member's valid response remains part of the group result.
 
-Use `pollVotes` with the poll event id for a "View votes" sheet. It returns one `PollVoteFfi` per voter: the voter's
-account id, their effective option ids, and the authenticated time of that response. MDK resolves it with the same rules
-as `poll`, so the list's length is `participants` and its selections sum to each option's `votes`. Blocked voters stay
-listed because the shared tally counts them; hosts mark them with the account's block list. A missing, deleted, hidden,
-or non-poll row returns an empty list. Entries are ordered by `(voted_at, voter_account_id_hex)`. The call is a
-synchronous local read, so run it off the UI thread and re-read it when the poll row is reprojected.
+Use `pollVotes` with the poll event id for a "View votes" sheet. It returns a `PollVotePageFfi` of `PollVoteFfi`
+entries, one per voter: the voter's account id, their effective option ids, and the authenticated time of that
+response. MDK resolves it with the same rules as `poll`, so all pages together hold `participants` entries whose
+selections sum to each option's `votes`. Blocked voters stay listed because the shared tally counts them; hosts mark them
+with the account's block list. A missing, deleted, hidden, or non-poll row returns an empty page. Votes are ordered by
+`(voted_at, voter_account_id_hex)`; page with a limit of 1 through 100 by passing the last vote's `voted_at` and
+`voter_account_id_hex` while `hasMoreAfter` is true. Pages are required because votes retained from former members are
+not bounded by the current group size. The call is a synchronous local read, so run it off the UI thread and re-read
+from the first page when the poll row is reprojected.
 
 Every client must handle polls: peers on 0.11.0 can create them, and a client that ignores
 `poll` shows only the bare question with no way to answer.

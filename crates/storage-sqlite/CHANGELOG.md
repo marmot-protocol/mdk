@@ -4,10 +4,10 @@
 
 ### Added
 
-- `SqliteAccountStorage::poll_votes` lists each voter's effective selection for
-  one visible poll. The timeline tally and this read share one resolver, so the
-  per-voter list always sums to `PollProjection`'s counts and `participants`.
-  (#2091)
+- `SqliteAccountStorage::poll_votes` pages each voter's effective selection for
+  one visible poll (1..=100 per page, `(voted_at, voter)` cursor). The timeline
+  tally and this read share one resolver, so the per-voter pages always sum to
+  `PollProjection`'s counts and `participants`. (#2091)
 
 
 ## 0.11.0 - 2026-09-29

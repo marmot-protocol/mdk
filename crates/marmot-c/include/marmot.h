@@ -4069,12 +4069,16 @@ typedef struct MarmotPollVote {
 } MarmotPollVote;
 
 /**
- *Owned list; free the root with its `_free` function only.
+ * One page of poll votes ordered by `(voted_at, voter_account_id_hex)`.
  */
-typedef struct MarmotPollVoteList {
-  struct MarmotPollVote *items;
-  uintptr_t len;
-} MarmotPollVoteList;
+typedef struct MarmotPollVotePage {
+  struct MarmotPollVote *votes;
+  uintptr_t votes_len;
+  /**
+   * More votes follow; pass the last vote as the next cursor.
+   */
+  bool has_more_after;
+} MarmotPollVotePage;
 
 /**
  * One endpoint's dial verdict. Free the list with
@@ -8646,23 +8650,27 @@ MarmotStatus marmot_cast_poll_vote(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
- * Who voted for what: each voter's effective (latest valid) selection,
- * counted by the same rules as the row's `MarmotPollProjection`. Blocked
- * voters stay listed because the tally counts them. Hidden, deleted,
- * missing, or non-poll rows give an empty list. Ordered by
- * `(voted_at, voter)`. Free with `marmot_poll_vote_list_free`.
+ * Who voted for what: one page of each voter's effective (latest valid)
+ * selection, counted by the same rules as the row's `MarmotPollProjection`.
+ * Blocked voters stay listed because the tally counts them. Hidden, deleted,
+ * missing, or non-poll rows give an empty page. Ordered by
+ * `(voted_at, voter)`; supply both cursor values from the last vote, or
+ * has_after=0 and a NULL voter for the first page. Limit 1..=100.
+ * Free with `marmot_poll_vote_page_free`.
  *
  * # Safety
- * `client` must be a live handle; string arguments must be valid
- * NUL-terminated strings (nullable ones may be NULL); array
- * arguments must hold their stated length (or be NULL with
- * length 0); out-pointers must be valid.
+ * Client and strings must be valid, after_voter_account_id_hex nullable,
+ * out writable.
  */
 MarmotStatus marmot_poll_votes(const struct MarmotClient *client,
                                const char *account_ref,
                                const char *group_id_hex,
                                const char *poll_event_id,
-                               struct MarmotPollVoteList **out);
+                               uint8_t has_after,
+                               uint64_t after_voted_at,
+                               const char *after_voter_account_id_hex,
+                               uint32_t limit,
+                               struct MarmotPollVotePage **out);
 
 /**
  * Classify relay endpoints against the dial-safety and retired-relay
@@ -11156,13 +11164,14 @@ void marmot_relay_endpoint_classification_list_free(struct MarmotRelayEndpointCl
 void marmot_app_performance_snapshot_free(struct MarmotAppPerformanceSnapshot *ptr);
 
 /**
- * Free a list returned by this library. NULL is a no-op.
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
  *
  * # Safety
- * `list` must be NULL or an unfreed pointer returned by this
- * library.
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
  */
-void marmot_poll_vote_list_free(struct MarmotPollVoteList *list);
+void marmot_poll_vote_page_free(struct MarmotPollVotePage *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

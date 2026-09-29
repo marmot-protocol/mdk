@@ -9,9 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
-- `marmot_poll_votes` returns a `MarmotPollVoteList` of each voter's effective
-  poll selection, summing to the `MarmotPollProjection` tally. Free it with
-  `marmot_poll_vote_list_free`; requires the matching regenerated header and
+- `marmot_poll_votes` returns a `MarmotPollVotePage` of each voter's effective
+  poll selection, 1..=100 per page with a `(voted_at, voter)` cursor; all pages
+  sum to the `MarmotPollProjection` tally. Free it with
+  `marmot_poll_vote_page_free`; requires the matching regenerated header and
   library. (#2091)
 
 

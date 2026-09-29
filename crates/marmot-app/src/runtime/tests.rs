@@ -372,8 +372,9 @@ async fn poll_creation_uses_conversation_kind_and_existing_polls_remain_votable(
     assert_eq!(projected.options[1].votes, 1);
     assert_eq!(
         runtime
-            .poll_votes("alice", &hex::encode(group.as_slice()), &poll_id)
+            .poll_votes("alice", &hex::encode(group.as_slice()), &poll_id, None, 100)
             .unwrap()
+            .votes
             .into_iter()
             .map(|vote| (vote.voter, vote.option_ids))
             .collect::<Vec<_>>(),

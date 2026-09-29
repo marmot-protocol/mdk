@@ -4,8 +4,9 @@
 
 ### Added
 
-- `MarmotAppRuntime::poll_votes` reads each voter's effective poll selection
-  (`PollVote`) with the same rules as the timeline poll tally. (#2091)
+- `MarmotAppRuntime::poll_votes` pages each voter's effective poll selection
+  (`PollVotePage` of `PollVote`) with the same rules as the timeline poll
+  tally. (#2091)
 
 ### Fixed
 

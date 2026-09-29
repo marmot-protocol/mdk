@@ -4,7 +4,7 @@ use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
     DeletionSourceFfi, GroupSystemEventFfi, GroupSystemEventProvenanceFfi, PollOptionResultFfi,
-    PollProjectionFfi, PollTypeFfi, PollVoteFfi, RuntimeProjectionUpdateFfi,
+    PollProjectionFfi, PollTypeFfi, PollVoteFfi, PollVotePageFfi, RuntimeProjectionUpdateFfi,
     TimelineEditHistoryPageFfi, TimelineEditSummaryFfi, TimelineEditVersionFfi,
     TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
@@ -112,12 +112,21 @@ c_mirror! {
 c_mirror! {
     /// One voter's effective (latest valid) poll selection; a poll's list
     /// sums to its `MarmotPollProjection` tally.
-    MarmotPollVote from PollVoteFfi,
-    list(MarmotPollVoteList, marmot_poll_vote_list_free) {
+    MarmotPollVote from PollVoteFfi {
         str voter_account_id_hex,
         str_vec option_ids/option_ids_len,
         /// Authenticated time of the effective response.
         copy voted_at: u64,
+    }
+}
+
+c_mirror! {
+    /// One page of poll votes ordered by `(voted_at, voter_account_id_hex)`.
+    MarmotPollVotePage from PollVotePageFfi,
+    free marmot_poll_vote_page_free {
+        vec votes/votes_len: MarmotPollVote,
+        /// More votes follow; pass the last vote as the next cursor.
+        copy has_more_after: bool,
     }
 }
 
@@ -466,20 +475,23 @@ mod edit_tests {
         assert_eq!(crate::memory::audit::live_allocations(), before);
     }
     #[test]
-    fn poll_vote_list_preserves_selections_and_deep_frees() {
+    fn poll_vote_page_preserves_selections_and_deep_frees() {
         #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let before = crate::memory::audit::live_allocations();
-        let list: MarmotPollVoteList = vec![PollVoteFfi {
-            voter_account_id_hex: "bob".into(),
-            option_ids: vec!["0".into(), "2".into()],
-            voted_at: 160,
-        }]
-        .into();
-        assert_eq!(list.len, 1);
+        let page = MarmotPollVotePage::from(PollVotePageFfi {
+            votes: vec![PollVoteFfi {
+                voter_account_id_hex: "bob".into(),
+                option_ids: vec!["0".into(), "2".into()],
+                voted_at: 160,
+            }],
+            has_more_after: true,
+        });
+        assert_eq!(page.votes_len, 1);
+        assert!(page.has_more_after);
         unsafe {
-            let vote = &*list.items;
+            let vote = &*page.votes;
             assert_eq!(
                 std::ffi::CStr::from_ptr(vote.voter_account_id_hex).to_str(),
                 Ok("bob")
@@ -490,8 +502,8 @@ mod edit_tests {
                 Ok("2")
             );
             assert_eq!(vote.voted_at, 160);
-            marmot_poll_vote_list_free(crate::memory::boxed(list));
-            marmot_poll_vote_list_free(std::ptr::null_mut());
+            marmot_poll_vote_page_free(crate::memory::boxed(page));
+            marmot_poll_vote_page_free(std::ptr::null_mut());
         }
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), before);

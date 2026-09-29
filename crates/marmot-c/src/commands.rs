@@ -87,7 +87,7 @@ use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
 use crate::types::timeline::{
-    MarmotPollType, MarmotPollVoteList, MarmotTimelineMessageQuery, MarmotTimelineMessageRecord,
+    MarmotPollType, MarmotPollVotePage, MarmotTimelineMessageQuery, MarmotTimelineMessageRecord,
     MarmotTimelinePage,
 };
 use crate::types::user_blocks::MarmotBlockedUserList;
@@ -2451,13 +2451,54 @@ pub unsafe extern "C" fn marmot_cast_poll_vote(
     })
 }
 
-c_cmd! {
-    /// Who voted for what: each voter's effective (latest valid) selection,
-    /// counted by the same rules as the row's `MarmotPollProjection`. Blocked
-    /// voters stay listed because the tally counts them. Hidden, deleted,
-    /// missing, or non-poll rows give an empty list. Ordered by
-    /// `(voted_at, voter)`. Free with `marmot_poll_vote_list_free`.
-    sync fn marmot_poll_votes(account_ref: str, group_id_hex: str, poll_event_id: str) -> rec(MarmotPollVoteList) = poll_votes;
+/// Who voted for what: one page of each voter's effective (latest valid)
+/// selection, counted by the same rules as the row's `MarmotPollProjection`.
+/// Blocked voters stay listed because the tally counts them. Hidden, deleted,
+/// missing, or non-poll rows give an empty page. Ordered by
+/// `(voted_at, voter)`; supply both cursor values from the last vote, or
+/// has_after=0 and a NULL voter for the first page. Limit 1..=100.
+/// Free with `marmot_poll_vote_page_free`.
+///
+/// # Safety
+/// Client and strings must be valid, after_voter_account_id_hex nullable,
+/// out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_poll_votes(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    poll_event_id: *const c_char,
+    has_after: u8,
+    after_voted_at: u64,
+    after_voter_account_id_hex: *const c_char,
+    limit: u32,
+    out: *mut *mut MarmotPollVotePage,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let poll_event_id = try_arg!(unsafe { required_str(poll_event_id) });
+        let after_voter =
+            try_arg!(unsafe { crate::memory::optional_str(after_voter_account_id_hex) });
+        if (has_after != 0) != after_voter.is_some() || !(1..=100).contains(&limit) {
+            return MarmotStatus::InvalidArgument;
+        }
+        unsafe {
+            deliver(
+                client.marmot.poll_votes(
+                    account_ref,
+                    group_id_hex,
+                    poll_event_id,
+                    (has_after != 0).then_some(after_voted_at),
+                    after_voter,
+                    limit,
+                ),
+                out,
+            )
+        }
+    })
 }
 
 /// Classify relay endpoints against the dial-safety and retired-relay
