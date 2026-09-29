@@ -138,6 +138,7 @@ pub enum ReferenceDisposition {
     DeferredLosingEligibleBranch,
     DeferredAwaitingCommit,
     DeferredFutureEpoch,
+    DeferredNoCanonicalBranchSelected,
     DroppedUnauthenticated,
     DroppedUnauthorized,
     DroppedBeyondAnchor,
@@ -481,6 +482,10 @@ fn app_disposition(
         && message.epoch > selected_tip.unwrap_or(input.current_tip_epoch)
     {
         ReferenceDisposition::DeferredFutureEpoch
+    } else if message.decrypts_on_branches.is_empty() && selected_id.is_none() {
+        // Decryptability is only observed on candidates, so a pass that
+        // selected no branch has not tried the message against canonical state.
+        ReferenceDisposition::DeferredNoCanonicalBranchSelected
     } else if message.decrypts_on_branches.is_empty() {
         ReferenceDisposition::InvalidatedUndecryptable
     } else if message

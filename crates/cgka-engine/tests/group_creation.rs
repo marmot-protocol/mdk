@@ -1649,6 +1649,98 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
     );
 }
 
+/// The convergence pass that settles a device's own disband has no rival
+/// branch to materialize: the disband commit is already applied, so the pass
+/// selects nothing. The device's own sends retained in that pass's window must
+/// not be judged against a canonical state nobody selected — they were
+/// published long before and must neither be withdrawn from the application
+/// nor stamped terminal.
+#[tokio::test]
+async fn own_sends_survive_the_pass_that_settles_their_senders_disband() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let identity = b"alice-own-sends-before-disband";
+    let clock = ManualConvergenceClock::new(0, 10_000);
+    let mut alice = EngineBuilder::new(storage.clone())
+        .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .convergence_clock(Arc::new(clock.clone()))
+        .build()
+        .expect("build current-profile engine");
+    let (group_id, _) = alice
+        .create_group(CreateGroupRequest {
+            name: "own sends then disband".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let mut own_sends = Vec::new();
+    for body in ["first", "second", "third"] {
+        match alice
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&alice, body),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::ApplicationMessage { msg, .. } => own_sends.push(msg.id),
+            other => panic!("expected an application message, got {other:?}"),
+        }
+    }
+    alice.drain_events();
+
+    alice
+        .send(cgka_traits::engine::SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let pending = match alice
+        .advance_convergence(&group_id)
+        .await
+        .unwrap()
+        .as_slice()
+    {
+        [SendResult::GroupEvolution { pending, .. }] => *pending,
+        other => panic!("expected one prepared disband commit, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    alice.advance_convergence(&group_id).await.unwrap();
+    clock.advance_ms(1_000);
+    alice.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        matches!(
+            alice.epoch_state(&group_id),
+            Some(cgka_traits::EpochState::Disbanded(_))
+        ),
+        "the disband must settle through its convergence pass"
+    );
+
+    let events = alice.drain_events();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::AppMessageInvalidated { message_id, .. }
+                if own_sends.contains(message_id)
+        )),
+        "a pass that selected no branch withdrew the sender's own messages: {events:?}"
+    );
+    for id in &own_sends {
+        assert_ne!(
+            storage.get_message(id).unwrap().state,
+            cgka_traits::message::MessageState::EpochInvalidated,
+            "a pass that selected no branch stamped an own send terminal"
+        );
+    }
+}
+
 /// Helper for the announce-once tests: drive one solo group all the way to a
 /// settled, durable disband and hand back the storage that outlives the engine.
 async fn settle_solo_disband(identity: &[u8]) -> (SqliteAccountStorage, cgka_traits::GroupId) {

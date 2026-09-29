@@ -311,6 +311,7 @@ pub enum DeferredMessageReason {
     NonSelectedEligibleBranch,
     AwaitingCanonicalCommit,
     FutureEpoch,
+    NoCanonicalBranchSelected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1011,6 +1012,17 @@ fn handle_app_message(
         result
             .deferred_messages
             .push(deferred(message, DeferredMessageReason::FutureEpoch));
+    } else if decrypts_on_branches.is_empty() && result.selected_branch_id.is_none() {
+        // Branch decryptability is only observed on materialized candidates,
+        // so with no branch selected nothing has tried this message against
+        // the canonical state. Judging it undecryptable there would be a
+        // terminal verdict from a pass that must not mutate group state; it
+        // waits for a pass that selects a branch, or for the canonical
+        // application drain to try it against the live state.
+        result.deferred_messages.push(deferred(
+            message,
+            DeferredMessageReason::NoCanonicalBranchSelected,
+        ));
     } else if decrypts_on_branches.is_empty() {
         result.invalidated_app_messages.push(invalidated_app(
             message,

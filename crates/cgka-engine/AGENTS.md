@@ -260,7 +260,8 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
     future-epoch `UndecryptableInCanonicalState` app message is persisted `Retryable` (not terminal
     `EpochInvalidated`), and `distributed_convergence` neither marks it seen nor emits `AppMessageInvalidated`, so it
     re-enters convergence once the awaited commit advances the epoch (mdk#144). At or below the resulting tip, the
-    same reason is terminal and does emit the invalidation (mdk#995).
+    same reason is terminal and does emit the invalidation (mdk#995) — but only from a pass that selected a branch; one
+    that selected none defers the message `NoCanonicalBranchSelected` instead.
   - **Test:** covered by distributed-convergence integration tests, incl.
     `future_epoch_app_message_stays_retryable_until_commit_arrives` and
     `terminal_undecryptable_app_emits_invalidation_without_message_received`
@@ -580,10 +581,13 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   so keeps the drain arm unreachable, while widening the gate to any pending commit would let one forged
   beyond-ceiling row hold every parked application back. The gate's other half is a coupling to keep in step:
   `handle_app_message`'s park arm fires on exactly the materialized/eligible/non-selected branches for which
-  `handle_commit` answers `NonSelectedEligibleBranch`, so a parked application always has a parked commit beside it.
-  What the gate cannot see is *why* an application is parked: `FutureEpoch` and `NonSelectedEligibleBranch` share
-  `ConvergenceDeferred`, and the row carries no deferral reason (the only stored epoch authenticator,
-  `OwnApplicationConvergenceStamp`, belongs to locally authored rows the drain already skips). It withholds both, which
+  `handle_commit` answers `NonSelectedEligibleBranch`, so a branch-parked application always has a parked commit beside
+  it. The one branchless park, `NoCanonicalBranchSelected` (a pass that selected no branch has tried nothing against
+  canonical state, so it may not answer `UndecryptableInCanonicalState`), is meant to reach the drain, which tries it
+  against the live state that pass left canonical. What the gate cannot see is *why* an application is parked:
+  `FutureEpoch`, `NonSelectedEligibleBranch` and `NoCanonicalBranchSelected` share `ConvergenceDeferred`, and the row
+  carries no deferral reason (the only stored epoch authenticator, `OwnApplicationConvergenceStamp`, belongs to locally
+  authored rows the drain already skips). It withholds all three, which
   is harmless only because the drain is not the deliverer of a matured row: a pass re-seeds every
   `ConvergenceDeferred` application above the retained anchor and re-evaluates its disposition — one that decrypts on
   the selected canonical branch is delivered, one that decrypts only on a still-eligible losing branch is re-deferred

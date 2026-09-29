@@ -319,6 +319,10 @@ Rules:
 - Duplicate app messages MUST be reported as `AlreadySeen`.
 - A future-epoch app message without a reachable commit in the frozen batch is deferred for a later pass; it is not
   invalidated merely because current retained state cannot yet decrypt it.
+- `UndecryptableInCanonicalState` requires a selected canonical branch. Decryptability is observed only on materialized
+  candidates, so a pass that selects no branch has tried no message against canonical state: an app message that
+  decrypts on no candidate is deferred (`NoCanonicalBranchSelected`) until a pass selects a branch or the engine tries
+  it against its live canonical state. Epoch-only verdicts (`BeyondAnchor`, `BeyondAppRetention`) still apply.
 - If the engine decrypted and stored the payload before invalidation, the invalidation result MUST retain a reference to
   that stored payload.
 
@@ -420,7 +424,8 @@ DeferredMessage {
     MissingCandidateParent
   | NonSelectedEligibleBranch
   | AwaitingCanonicalCommit
-  | FutureEpoch,
+  | FutureEpoch
+  | NoCanonicalBranchSelected,
 }
 ```
 
@@ -522,6 +527,7 @@ The conformance suite should cover:
   unchanged completed pass,
 - future-epoch app message without its advancing commit deferred and later delivered after that commit arrives,
 - app message on a losing branch that can no longer be reconsidered invalidated with payload reference when known,
+- app message in a pass that selects no branch deferred rather than invalidated as undecryptable,
 - end-to-end peeler ingest emits selected branch epoch/member `GroupEvent` output across multiple clients
   (`convergence-e2e-group-events/v1`),
 - generated `convergence-e2e-delivery/v1` variants preserve that epoch/member output under duplicated, delayed, and

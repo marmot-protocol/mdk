@@ -1365,6 +1365,178 @@ async fn convergence_rejects_remove_that_leaves_orphan_admin_key() {
     );
 }
 
+/// Carol after a pass whose only commit fails validation, so it selected no
+/// branch: a peer application and Carol's own were retained beside that commit.
+struct UnselectedPass {
+    alice: Engine<SqliteAccountStorage>,
+    carol: Engine<SqliteAccountStorage>,
+    carol_storage: SqliteAccountStorage,
+    group_id: GroupId,
+    own_app: TransportMessage,
+    peer_app: TransportMessage,
+}
+
+const UNSELECTED_PASS_PEER_PAYLOAD: &[u8] = b"alice before the pass";
+
+async fn unselected_pass(group_name: &str) -> UnselectedPass {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: group_name.into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    let own_app = send_app(&mut carol, &group_id, b"carol before the pass".to_vec()).await;
+    let peer_app = send_app(&mut alice, &group_id, UNSELECTED_PASS_PEER_PAYLOAD.to_vec()).await;
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, peer_app.clone(), 1_000)
+        .expect("peer application retained");
+    let invalid_remove = route(
+        raw_remove_members_commit(
+            &bob_storage,
+            &bob.self_id(),
+            &group_id,
+            std::slice::from_ref(&alice.self_id()),
+        ),
+        &group_id,
+    );
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, invalid_remove.clone(), 1_000)
+        .expect("invalid commit opens a pass");
+
+    let unselected = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("a pass selecting no branch still completes");
+    assert_eq!(unselected.selected_branch_id, None);
+    assert!(
+        unselected.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == content_hex(&invalid_remove)
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        }),
+        "the invalid commit keeps its own verdict: {unselected:?}"
+    );
+    UnselectedPass {
+        alice,
+        carol,
+        carol_storage,
+        group_id,
+        own_app,
+        peer_app,
+    }
+}
+
+fn peer_deliveries(events: &[GroupEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GroupEvent::MessageReceived { payload, .. }
+                    if app_content(payload) == UNSELECTED_PASS_PEER_PAYLOAD
+            )
+        })
+        .count()
+}
+
+fn any_invalidation(events: &[GroupEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, GroupEvent::AppMessageInvalidated { .. }))
+}
+
+/// A pass that selected no branch cannot say what the canonical state
+/// decrypts, so it judges no application undecryptable: both stay pending, and
+/// the next pass that selects a branch delivers them.
+#[tokio::test]
+async fn applications_outlive_a_pass_that_selects_no_branch() {
+    let UnselectedPass {
+        mut alice,
+        mut carol,
+        carol_storage,
+        group_id,
+        own_app,
+        peer_app,
+    } = unselected_pass("applications-outlive-no-selection").await;
+    assert_message_state(&carol_storage, &peer_app, MessageState::ConvergenceDeferred);
+    assert_eq!(
+        carol_storage.get_message(&own_app.id).unwrap().state,
+        MessageState::ConvergenceDeferred
+    );
+    assert!(
+        !any_invalidation(&carol.drain_events()),
+        "nothing is withdrawn by a pass that selected no branch"
+    );
+
+    let rename = alice_rename_commit(&mut alice, &group_id, "renamed after the pass").await;
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, rename.clone(), 2_000_000)
+        .expect("valid commit opens the next pass");
+    let selected = carol
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .expect("the next pass selects the valid commit");
+    assert_eq!(selected.accepted_commits, vec![content_hex(&rename)]);
+    assert_message_state(&carol_storage, &peer_app, MessageState::Processed);
+    assert_eq!(
+        carol_storage.get_message(&own_app.id).unwrap().state,
+        MessageState::Processed
+    );
+    let events = carol.drain_events();
+    assert_eq!(peer_deliveries(&events), 1, "{events:?}");
+    assert!(!any_invalidation(&events), "{events:?}");
+}
+
+/// With no later commit, the peer application a pass that selected no branch
+/// left pending is delivered by the canonical application drain against the
+/// live state; Carol's own stays a pending witness, never withdrawn.
+#[tokio::test]
+async fn the_application_drain_delivers_what_an_unselected_pass_left_pending() {
+    let UnselectedPass {
+        mut carol,
+        carol_storage,
+        group_id,
+        own_app,
+        peer_app,
+        ..
+    } = unselected_pass("drain-after-no-selection").await;
+
+    carol
+        .advance_convergence_inputs_until_settled(&group_id, 2_000_000)
+        .await
+        .expect("background convergence settles");
+
+    assert_message_state(&carol_storage, &peer_app, MessageState::Processed);
+    assert_eq!(
+        carol_storage.get_message(&own_app.id).unwrap().state,
+        MessageState::ConvergenceDeferred
+    );
+    let events = carol.drain_events();
+    assert_eq!(peer_deliveries(&events), 1, "{events:?}");
+    assert!(!any_invalidation(&events), "{events:?}");
+}
+
 #[tokio::test]
 async fn openmls_rejects_remove_commit_dropping_app_data_dictionary_at_construction() {
     // OpenMLS upstream commit 34222ef6 moved this draft invariant into the

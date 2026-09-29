@@ -109,12 +109,15 @@ impl<S: StorageProvider> Engine<S> {
         //   `CommitEdge => true`), and `advance_convergence_inputs` only reaches
         //   here on its `!has_unresolved_convergence_inputs` arm. Pinned by
         //   `tests/distributed_convergence.rs::a_commit_awaiting_adjudication_is_adjudicated_before_the_application_drain`.
-        // * A pass never parks an application without parking its branch's
-        //   commits. `handle_app_message`'s park arm requires a materialized,
-        //   eligible, non-selected branch, which is exactly when `handle_commit`
-        //   answers `NonSelectedEligibleBranch` for that branch's commits. Keep
-        //   those two arms in step: an application parked on a branch holding no
-        //   parked commit would open this gate.
+        // * A pass never parks an application on a branch without parking that
+        //   branch's commits. `handle_app_message`'s park arm requires a
+        //   materialized, eligible, non-selected branch, which is exactly when
+        //   `handle_commit` answers `NonSelectedEligibleBranch` for that
+        //   branch's commits. Keep those two arms in step: an application parked
+        //   on a branch holding no parked commit would open this gate. The one
+        //   park with no branch behind it, `NoCanonicalBranchSelected`, is meant
+        //   to open it: a pass that selected nothing left the live state
+        //   canonical, and this drain is what tries the row against it.
         //
         // The gate cannot tell a parked branch message from an ordinary
         // `FutureEpoch` one whose commit has since landed: both are
