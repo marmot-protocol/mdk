@@ -1883,9 +1883,7 @@ impl MarmotApp {
         };
         // Loss the open imported, and the startup history request, become
         // audit rows once the client that records them exists.
-        if let Ok(storage) = self.account_storage(&client.state.label) {
-            client.record_recovery_loss_imports(&storage, recovery_loss_imports);
-        }
+        client.record_recovery_loss_imports(recovery_loss_imports);
         if let Some((ticket, transition)) = incremental_request {
             client.record_recovery_request(
                 storage_sqlite::RecoveryCause::IncrementalHistory,

@@ -441,6 +441,51 @@ fn quiet_scopes_exhausted(
 }
 
 impl SqliteAccountStorage {
+    /// The quiet streak that decides parking for one obligation: the shortest
+    /// among the scopes that still count (neither qualified nor with their
+    /// retained window certified), as the parking rule reads them. `None` when
+    /// no scope counts or the obligation is gone. Audit-only; changes nothing.
+    pub fn recovery_parking_streak(&self, obligation_id: [u8; 16]) -> StorageResult<Option<u64>> {
+        let conn = self.lock()?;
+        let predicate: Option<i64> = conn
+            .query_row_cached(
+                "SELECT predicate FROM account_recovery_obligations WHERE id = ?1",
+                [obligation_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?;
+        let Some(predicate) = predicate else {
+            return Ok(None);
+        };
+        let rows = conn
+            .prepare_cached(
+                "SELECT scope_format, scope_payload, known_event_id IS NOT NULL
+                 FROM account_recovery_scopes WHERE obligation_id = ?1 AND snapshot_state = 1",
+            )
+            .storage()?
+            .query_map([obligation_id.as_slice()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        let mut streak: Option<u64> = None;
+        for (format, bytes, known_event) in rows {
+            let Some(bytes) = bytes else { continue };
+            let payload = decode_scope(format, &bytes)?;
+            if payload.window_certified || payload_is_qualified(&payload, predicate, known_event) {
+                continue;
+            }
+            streak = Some(streak.map_or(payload.quiet_passes, |s| s.min(payload.quiet_passes)));
+        }
+        Ok(streak)
+    }
+
     pub fn recovery_scope_snapshots(
         &self,
         obligation_id: [u8; 16],

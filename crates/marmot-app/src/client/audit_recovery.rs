@@ -65,6 +65,8 @@ pub(crate) struct RecoveryPassTally {
     progress: Option<RecoveryScopeProgress>,
     routes_compared: u64,
     routes_certified: u64,
+    /// Compared routes whose required relays did not all answer.
+    routes_unanswered: u64,
     retrieved: u64,
     rejected: u64,
     relays_failed: u64,
@@ -79,7 +81,32 @@ impl RecoveryPassTally {
             self.routes_certified = self
                 .routes_certified
                 .saturating_add(u64::from(route.certified));
+            self.routes_unanswered = self
+                .routes_unanswered
+                .saturating_add(u64::from(!route.answered));
             let acquired = &route.acquisition;
+            self.retrieved = self.retrieved.saturating_add(count(acquired.retrieved));
+            self.rejected = self.rejected.saturating_add(count(acquired.rejected));
+            self.relays_failed = self
+                .relays_failed
+                .saturating_add(count(acquired.relays_failed));
+            self.relays_incomplete = self
+                .relays_incomplete
+                .saturating_add(count(acquired.relays_incomplete));
+        }
+    }
+
+    /// A pass that ended before settlement still reports what its relays
+    /// returned: `(answered, acquisition)` per route it compared. None of them
+    /// is certified; the pass certified nothing.
+    pub(crate) fn observe_unsettled_routes(
+        &mut self,
+        routes: impl IntoIterator<Item = (bool, RouteAcquisition)>,
+    ) {
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        for (answered, acquired) in routes {
+            self.routes_compared = self.routes_compared.saturating_add(1);
+            self.routes_unanswered = self.routes_unanswered.saturating_add(u64::from(!answered));
             self.retrieved = self.retrieved.saturating_add(count(acquired.retrieved));
             self.rejected = self.rejected.saturating_add(count(acquired.rejected));
             self.relays_failed = self
@@ -201,9 +228,13 @@ pub(crate) fn pass_outcome(
             RecoveryPassOutcome::Progressed
         }
         _ if retained > 0 => RecoveryPassOutcome::Progressed,
-        // Nothing compared (a maintenance boundary) and nothing failed.
-        Some(RecoveryScopeProgress::Quiet) | None => RecoveryPassOutcome::Quiet,
+        Some(RecoveryScopeProgress::Quiet) => RecoveryPassOutcome::Quiet,
         Some(RecoveryScopeProgress::Unserved) => RecoveryPassOutcome::Unserved,
+        // No obligation scope was compared: a comparison-only pass, or a
+        // maintenance boundary alone. Its routes decide: any route whose
+        // required relays did not answer leaves it unserved.
+        None if tally.routes_unanswered > 0 => RecoveryPassOutcome::Unserved,
+        None => RecoveryPassOutcome::Quiet,
     }
 }
 
@@ -227,17 +258,13 @@ impl AppClient {
         storage: &SqliteAccountStorage,
     ) -> Result<(), AppError> {
         let imports = storage.synchronize_account_delivery_loss(&self.state.label)?;
-        self.record_recovery_loss_imports(storage, imports);
+        self.record_recovery_loss_imports(imports);
         Ok(())
     }
 
     /// One `recovery_need_changed` row per loss cause an import changed, with
     /// the goal bound the comparison will use after it.
-    pub(crate) fn record_recovery_loss_imports(
-        &self,
-        storage: &SqliteAccountStorage,
-        imports: Vec<RecoveryLossImport>,
-    ) {
+    pub(crate) fn record_recovery_loss_imports(&self, imports: Vec<RecoveryLossImport>) {
         if imports.is_empty() || !self.audit_v5_enabled() {
             return;
         }
@@ -245,11 +272,9 @@ impl AppClient {
             let Some(change) = need_change(import.transition) else {
                 continue;
             };
-            // An unreadable floor is reported as unknown, never as a bound.
-            let floor = storage
-                .recovery_loss_goal_floor(&self.state.label, import.cause)
-                .ok()
-                .flatten();
+            // Read in the import's own transaction, so it is the bound of
+            // exactly the revision this row names.
+            let floor = import.goal_floor;
             self.record_need_changed(
                 None,
                 match import.cause {
@@ -502,11 +527,13 @@ impl AppClient {
             } else {
                 obligation_verdict(status.as_ref(), revision)
             };
+            // The streak parking reads: the shortest among the scopes that
+            // still count. A closed request has no row left to read.
             let quiet_passes = settled
                 .comparison_owned
-                .then(|| storage.recovery_scope_snapshots(settled.id).ok())
+                .then(|| storage.recovery_parking_streak(settled.id).ok())
                 .flatten()
-                .and_then(|scopes| scopes.iter().map(|scope| scope.quiet_passes).max());
+                .flatten();
             self.runtime.session().record_audit_event(
                 obligation.group_id.as_ref(),
                 Some(context.clone()),
@@ -732,6 +759,23 @@ mod tests {
         assert_eq!(
             pass_outcome(false, None, &with(Some(RecoveryScopeProgress::Unserved)), 0),
             RecoveryPassOutcome::Unserved
+        );
+        // A comparison-only pass selects no obligation, so no scope progress
+        // is recorded; its failed route alone makes it unserved.
+        let mut comparison_only = RecoveryPassTally::default();
+        comparison_only.observe_unsettled_routes([
+            (true, RouteAcquisition::default()),
+            (false, RouteAcquisition::default()),
+        ]);
+        assert_eq!(
+            pass_outcome(false, None, &comparison_only, 0),
+            RecoveryPassOutcome::Unserved
+        );
+        let mut answered = RecoveryPassTally::default();
+        answered.observe_unsettled_routes([(true, RouteAcquisition::default())]);
+        assert_eq!(
+            pass_outcome(false, None, &answered, 0),
+            RecoveryPassOutcome::Quiet
         );
     }
 }

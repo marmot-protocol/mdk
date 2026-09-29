@@ -53,6 +53,10 @@ pub struct RecoveryLossImport {
     /// Deliveries (queue loss) or lagged notifications (notification loss)
     /// newly charged by this import, summed over the generations it imported.
     pub charged: u64,
+    /// The goal's lower bound after this import, read in the same
+    /// transaction: the lowest bound charged by any unresolved generation of
+    /// the cause, or `None` when any charge had no known time.
+    pub goal_floor: Option<u64>,
 }
 
 /// `(revision, cause, state, eligibility, group_id)` as stored.
@@ -240,6 +244,10 @@ mod tests {
         assert_eq!(imports[0].transition, RecoveryDemandTransition::Recorded);
         assert_eq!(imports[1].cause, RecoveryLossCause::NotificationConsumer);
         assert_eq!(imports[1].charged, 4);
+        // The bound is read in the import's own transaction: the lowest known
+        // charge for queue loss, unknown for a lag with no floor.
+        assert_eq!(imports[0].goal_floor, Some(5));
+        assert_eq!(imports[1].goal_floor, None);
         // Nothing new: nothing reported.
         assert!(
             store

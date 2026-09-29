@@ -1620,9 +1620,12 @@ async fn run_app_runtime_account_worker(
                     .take()
                     .expect("settling comparison exists");
                 let result = match (turn, job.failure) {
-                    (Err(error), _) | (_, Some(error)) => {
-                        Err(client.fail_comparison_grant(job.grant, job.execution, error))
-                    }
+                    (Err(error), _) | (_, Some(error)) => Err(client.fail_comparison_grant(
+                        job.grant,
+                        job.execution,
+                        job.admission.as_ref(),
+                        error,
+                    )),
                     _ if job.abandoned => client.abandon_comparison_grant(job.grant, job.execution),
                     _ => {
                         client

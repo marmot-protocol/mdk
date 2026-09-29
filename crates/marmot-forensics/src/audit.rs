@@ -1289,8 +1289,10 @@ pub enum AuditEventKind {
     /// writes no reassessment: its obligations stand as they were.
     ///
     /// `scopes_certified` counts scopes with a certificate valid for this
-    /// goal after the pass, `quiet_passes` the longest quiet streak among the
-    /// rest, against `park_after_quiet_passes`. `progress` aggregates this
+    /// goal after the pass, `quiet_passes` the shortest quiet streak among the
+    /// scopes that still decide parking (neither qualified nor window
+    /// certified), against `park_after_quiet_passes`: the obligation parks
+    /// once that shortest streak reaches the budget. `progress` aggregates this
     /// obligation's compared scopes; absent when the pass compared none.
     /// v5 only.
     RecoveryObligationReassessed {

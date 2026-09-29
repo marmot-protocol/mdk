@@ -87,6 +87,30 @@ fn watermarks(
         .collect()
 }
 
+/// The earliest `created_at` every unresolved charge of this cause is known to
+/// cover, or `None` when any charge had no known time.
+pub(super) fn goal_floor(
+    conn: &Connection,
+    label: &str,
+    cause: RecoveryLossCause,
+) -> StorageResult<Option<u64>> {
+    let (rows, known, earliest): (i64, i64, Option<i64>) = conn
+        .query_row_cached(
+            "SELECT COUNT(*), COALESCE(SUM(bound_state = 1), 0), MIN(bound_seconds)
+                 FROM account_delivery_loss_evidence
+                 WHERE account_label = ?1 AND cause = ?2
+                   AND (legacy_retired_count IS NULL OR legacy_retired_count < dropped_count)
+                   AND (retired_count IS NULL OR retired_count < dropped_count)",
+            params![label, cause as i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .storage()?;
+    Ok((rows > 0 && known == rows)
+        .then_some(earliest)
+        .flatten()
+        .and_then(|seconds| u64::try_from(seconds).ok()))
+}
+
 impl SqliteAccountStorage {
     /// Typed evidence only. A notification count is an observation count, never
     /// a claim about how many encrypted events the receiver missed.
@@ -157,22 +181,8 @@ impl SqliteAccountStorage {
         label: &str,
         cause: RecoveryLossCause,
     ) -> StorageResult<Option<u64>> {
-        let (rows, known, earliest): (i64, i64, Option<i64>) = self
-            .lock()?
-            .query_row_cached(
-                "SELECT COUNT(*), COALESCE(SUM(bound_state = 1), 0), MIN(bound_seconds)
-                 FROM account_delivery_loss_evidence
-                 WHERE account_label = ?1 AND cause = ?2
-                   AND (legacy_retired_count IS NULL OR legacy_retired_count < dropped_count)
-                   AND (retired_count IS NULL OR retired_count < dropped_count)",
-                params![label, cause as i64],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .storage()?;
-        Ok((rows > 0 && known == rows)
-            .then_some(earliest)
-            .flatten()
-            .and_then(|seconds| u64::try_from(seconds).ok()))
+        let conn = self.lock()?;
+        goal_floor(&conn, label, cause)
     }
 
     pub fn recovery_loss_watermarks(

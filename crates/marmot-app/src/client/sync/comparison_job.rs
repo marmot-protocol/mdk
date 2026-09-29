@@ -313,6 +313,18 @@ impl ComparisonNetworkJob {
     }
 }
 
+impl ComparisonAdmission {
+    /// What each accepted route's relays returned, for a pass that ends
+    /// before settlement.
+    fn unsettled_routes(
+        &self,
+    ) -> impl Iterator<Item = (bool, super::super::audit_recovery::RouteAcquisition)> + '_ {
+        self.routes
+            .iter()
+            .map(|route| (route.answered, route.acquisition))
+    }
+}
+
 impl AppClient {
     /// Whether recovery has any work a grant could select, asked without
     /// spending a reservation: a direct caller asks before it waits for a
@@ -635,7 +647,7 @@ impl AppClient {
             .await
         {
             Ok(admission) => admission,
-            Err(error) => return Err(self.fail_comparison_grant(grant, execution, error)),
+            Err(error) => return Err(self.fail_comparison_grant(grant, execution, None, error)),
         };
         if let Some(admission) = admission.as_mut() {
             loop {
@@ -663,7 +675,14 @@ impl AppClient {
                 {
                     Ok(true) => break,
                     Ok(false) => tokio::task::yield_now().await,
-                    Err(error) => return Err(self.fail_comparison_grant(grant, execution, error)),
+                    Err(error) => {
+                        return Err(self.fail_comparison_grant(
+                            grant,
+                            execution,
+                            Some(admission),
+                            error,
+                        ));
+                    }
                 }
             }
         }
@@ -695,6 +714,11 @@ impl AppClient {
                 execution.interruption = execution
                     .interruption
                     .or(Some(marmot_forensics::RecoveryPassOutcome::Superseded));
+                // Settlement is skipped, but the finish row still reports
+                // what the relays returned and the admitted prefix.
+                execution
+                    .tally
+                    .observe_unsettled_routes(admission.unsettled_routes());
                 Ok(Some(admission.summary))
             }
             Some(admission) => self
@@ -747,13 +771,16 @@ impl AppClient {
         &mut self,
         grant: AttemptGrant,
         execution: ComparisonExecution,
+        admission: Option<&ComparisonAdmission>,
         error: AppError,
     ) -> AppError {
-        match self.finish_recovery_execution(
-            &grant,
-            *execution.execution,
-            Err(comparison_failure(error)),
-        ) {
+        let mut execution = *execution.execution;
+        if let Some(admission) = admission {
+            execution
+                .tally
+                .observe_unsettled_routes(admission.unsettled_routes());
+        }
+        match self.finish_recovery_execution(&grant, execution, Err(comparison_failure(error))) {
             Ok(_) => unreachable!("a failed recovery cannot complete"),
             Err(failure) => {
                 self.pending_failed_sync_summary
@@ -1669,5 +1696,89 @@ mod tests {
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0]["event"]["outcome"], "cancelled");
         assert_eq!(finished[0]["event"]["routes_compared"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_repair_stopped_by_its_deadline_reports_what_it_fetched_and_retained() {
+        use crate::client::audit_recovery::recorded_v5_rows;
+        let mut fixture = audited_fixture().await;
+        let (grant, execution, route, group_route) = group_route_grant(&mut fixture).await;
+        let serial = grant.reservation.attempt_serial;
+        let events = (0..MAX_COMPARISON_ADMISSION_PER_TURN + 1)
+            .map(|_| candidate_for_route(group_route))
+            .collect();
+        // The first turn runs inside the budget; the repair's budget is spent
+        // before the second, which stops admission at that boundary.
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let cancelled = || {
+            if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            false
+        };
+        let control = FullHistoryRepairControl {
+            started: Instant::now(),
+            timeout: Duration::from_millis(300),
+            cancelled: &cancelled,
+        };
+        fixture
+            .client
+            .admit_comparison_until(grant, execution, fetched(route, events), Some(&control))
+            .await
+            .unwrap();
+        let app = fixture.client.app.clone();
+        let finished = recorded_v5_rows(&app, "recovery_attempt_finished");
+        assert_eq!(finished.len(), 1);
+        let finished = &finished[0]["event"];
+        assert_eq!(finished["attempt_serial"], serial);
+        assert_eq!(finished["outcome"], "deadline");
+        assert_eq!(
+            finished["events_retrieved"],
+            MAX_COMPARISON_ADMISSION_PER_TURN + 1,
+            "the relays' answer is reported although settlement was skipped"
+        );
+        assert!(
+            finished["events_retained"].as_u64().unwrap() >= 1,
+            "the first turn's durable prefix is reported: {finished}"
+        );
+        assert_eq!(finished["routes_compared"], 1);
+        assert_eq!(finished["routes_certified"], 0);
+        assert!(
+            recorded_v5_rows(&app, "recovery_obligation_reassessed").is_empty(),
+            "an unsettled pass writes no verdicts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pass_whose_routes_timed_out_is_unserved_not_quiet() {
+        use crate::client::audit_recovery::recorded_v5_rows;
+        let mut fixture = audited_fixture().await;
+        let grant = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .unwrap()
+            .unwrap();
+        let routes = grant
+            .inventory
+            .iter()
+            .map(|inventory| ComparisonRouteResult {
+                route: inventory.route.clone(),
+                initial_cursor: None,
+                cursor: None,
+                result: ComparisonRouteWorkResult::TimedOut,
+            })
+            .collect();
+        let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
+        fixture
+            .client
+            .admit_comparison_inline(grant, execution, ComparisonNetworkResult { routes })
+            .await
+            .unwrap();
+        let app = fixture.client.app.clone();
+        let finished = recorded_v5_rows(&app, "recovery_attempt_finished");
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0]["event"]["outcome"], "unserved");
+        assert_eq!(finished[0]["event"]["routes_certified"], 0);
+        assert_eq!(finished[0]["event"]["events_retrieved"], 0);
     }
 }

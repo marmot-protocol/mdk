@@ -112,8 +112,9 @@ pub enum RecoveryPassOutcome {
     Deadline,
     /// The pass was cancelled, or its network task ended without a result.
     Cancelled,
-    /// The grant changed before admission, so nothing of it was admitted;
-    /// newer demand owns the debt.
+    /// The grant changed before or during admission. Before admission,
+    /// nothing was admitted; during it, the admitted prefix stays durable.
+    /// Either way the pass certifies nothing and newer demand owns the debt.
     Superseded,
     /// The pass failed; `error_kind` names the class.
     Failed,

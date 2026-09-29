@@ -1064,7 +1064,7 @@ impl AppClient {
                 overflow.dropped,
                 overflow.earliest_dropped,
             )?;
-            self.record_recovery_loss_imports(&storage, marked.into_iter().collect());
+            self.record_recovery_loss_imports(marked.into_iter().collect());
         }
         if overflow.notification_losses > 0 {
             // The lag's REQ floors bound the loss from below. Each lag mints a

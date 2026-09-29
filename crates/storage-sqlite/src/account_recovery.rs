@@ -797,15 +797,17 @@ impl SqliteAccountStorage {
                 if transition == RecoveryDemandTransition::Unchanged {
                     continue;
                 }
+                let cause = if cause == 0 {
+                    RecoveryLossCause::Queue
+                } else {
+                    RecoveryLossCause::NotificationConsumer
+                };
                 changes.push(RecoveryLossImport {
-                    cause: if cause == 0 {
-                        RecoveryLossCause::Queue
-                    } else {
-                        RecoveryLossCause::NotificationConsumer
-                    },
+                    cause,
                     obligation: observe::ticket(&after)?,
                     transition,
                     charged,
+                    goal_floor: loss::goal_floor(&conn, label, cause)?,
                 });
             }
             Ok(changes)
@@ -859,6 +861,7 @@ impl SqliteAccountStorage {
                 obligation: observe::ticket(&after)?,
                 transition,
                 charged: i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?,
+                goal_floor: loss::goal_floor(&conn, label, RecoveryLossCause::Queue)?,
             }))
         })
     }
