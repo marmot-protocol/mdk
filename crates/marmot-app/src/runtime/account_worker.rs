@@ -6813,6 +6813,9 @@ fn publish_history_notice_changes(
     account_id_hex: &str,
     account_label: &str,
 ) {
+    // The relay plane's lag-lost EOSE repairs queue their reports; this seam
+    // records them, off the repair's path.
+    client.record_eose_repair_reports();
     let Some(groups) = client.take_history_notice_changes() else {
         return;
     };

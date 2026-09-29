@@ -552,6 +552,32 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
             scopes_certified <= scopes_total,
             "certified scopes cannot exceed the obligation's scopes",
         ),
+        AuditEventKind::SubscriptionEoseRepaired {
+            awaiting_relays,
+            complete_relays,
+            reissued_relays,
+            reissued_earlier_relays,
+            failed_relays,
+            follow_up_scheduled,
+            ..
+        } => {
+            require(
+                [
+                    complete_relays,
+                    reissued_relays,
+                    reissued_earlier_relays,
+                    failed_relays,
+                ]
+                .into_iter()
+                .try_fold(0_u64, |sum, count| sum.checked_add(*count))
+                .is_some_and(|sum| sum <= *awaiting_relays),
+                "repaired relay outcomes cannot exceed the relays awaiting EOSE",
+            )?;
+            require(
+                !*follow_up_scheduled || *failed_relays > 0,
+                "a follow-up repair needs a failed relay",
+            )
+        }
         _ => Ok(()),
     }
 }

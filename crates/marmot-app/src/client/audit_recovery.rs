@@ -559,6 +559,46 @@ impl AppClient {
         }
     }
 
+    /// Record the relay plane's finished lag-lost EOSE repairs for this
+    /// account, one row per pass. The repair only queued its report, so it
+    /// never waited on audit; reports are taken even when no v5 recorder is
+    /// installed, so a later enable does not replay stale passes.
+    pub(crate) fn record_eose_repair_reports(&self) {
+        let reports = self
+            .relay_plane
+            .take_eose_repair_reports(self.adapter.account_id());
+        if reports.is_empty() || !self.audit_v5_enabled() {
+            return;
+        }
+        for report in reports {
+            let summary = report.summary;
+            self.runtime.session().record_audit_event(
+                None,
+                None,
+                AuditEventKind::SubscriptionEoseRepaired {
+                    receiver: if report.scope.is_some() {
+                        marmot_forensics::EoseRepairReceiver::Account
+                    } else {
+                        marmot_forensics::EoseRepairReceiver::Shared
+                    },
+                    trigger: if report.follow_up {
+                        marmot_forensics::EoseRepairTrigger::FollowUp
+                    } else {
+                        marmot_forensics::EoseRepairTrigger::NotificationLag
+                    },
+                    lags: report.lags,
+                    awaiting_relays: count(summary.awaiting_relays),
+                    complete_relays: count(summary.complete_relays),
+                    reissued_relays: count(summary.reissued_relays),
+                    reissued_earlier_relays: count(summary.reissued_earlier_relays),
+                    failed_relays: count(summary.failed_relays),
+                    follow_up_scheduled: report.follow_up_scheduled,
+                    dropped_before: report.dropped_before,
+                },
+            );
+        }
+    }
+
     /// A cursor commit's save succeeded. Settled commits record every
     /// advance; a live promotion only a jump beyond the rebuild lookback.
     pub(crate) fn record_transport_cursor_advanced(

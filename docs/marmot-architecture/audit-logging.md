@@ -943,7 +943,7 @@ Metadata notes:
 ### Account recovery owner rows (v5 only)
 
 The account recovery owner ([`account-recovery.md`](./further-context/account-recovery.md)) records its decisions in
-five kinds that exist only in audit v5. A v4 recorder drops them, so v4 files stay valid against the frozen v4 schema.
+kinds that exist only in audit v5, alongside the transport-cursor and lag-lost EOSE repair rows. A v4 recorder drops them, so v4 files stay valid against the frozen v4 schema.
 They follow the recovery evidence model agreed for v5: need and eligibility changes, attempt start, acquisition and
 processing outcomes, and the owner's reassessment. Rows are transitions at the seam that made them durable, never
 scheduler polls, and recording never blocks or fails a recovery step: an audit-only storage read that fails skips the
@@ -1129,12 +1129,33 @@ Notes:
   records a row; it only counts.
 - `sync_drain` keeps its own before/after cursor per drain; this row names what committed each advance.
 
-#### Lost-EOSE repair (pending #2076)
+#### `subscription_eose_repaired`
 
-The lost-EOSE repair in the relay plane and transport adapter is not on master yet, so no row kind exists for it. The
-hook point is marked `TODO(#2076)` at `MarmotRelayPlaneAccountAdapter::account_subscription_eose`. When it lands, it
-should record one account-scoped row per repair pass at its owner seam, with counts only: relays still awaiting EOSE,
-relays repaired through the SDK flag, REQs re-issued, and repairs that failed.
+One pass of the relay plane's lag-lost end-of-stored-events repair (#2076). A notification lag can lose a relay's EOSE
+with whatever else was buffered; once the lagging receiver settles, the plane re-issues the REQs issued by the lag on
+the relays that have not reported EOSE (`reissue_subscriptions_awaiting_eose`). Account-scoped; one row per pass.
+
+| Field | Meaning |
+| --- | --- |
+| `receiver` | `account` (this account's own notification receiver lagged) or `shared` (a receiver shared across accounts; the pass covered all of them, and the first account to record it carries the row). |
+| `trigger` | `notification_lag` (lags, once the receiver settled) or `follow_up` (an earlier pass left relays unrepaired). |
+| `lags` | Lags folded into this pass while the receiver settled; 0 for a follow-up. |
+| `awaiting_relays` | Relays, across the REQs issued by the lag, that had not reported EOSE. |
+| `complete_relays` | Of those, relays the relay client had already seen answer with EOSE; completed with no traffic. |
+| `reissued_relays` | Of those, relays that had the REQ queued again. |
+| `reissued_earlier_relays` | Of those, relays an earlier pass re-issued to that still await EOSE. Each relay is re-issued once, so they get nothing more. |
+| `failed_relays` | Of those, relays that got nothing queued (not connected, no room, or refused); the old REQ is still live there. |
+| `follow_up_scheduled` | A later pass will try the failed relays again. |
+| `dropped_before` | Earlier passes of this receiver whose reports were dropped at the in-memory bound (64) before a worker recorded them. |
+
+Notes:
+
+- The four outcome counts never exceed `awaiting_relays`; the rest of the awaiting relays no longer hold the REQ. A
+  follow-up is scheduled only when some relay failed.
+- The repair runs off the worker and only queues its report. The account worker records it at its publication seam
+  (`publish_history_notice_changes`), so recording never delays the repair, and a pass whose account never reaches that
+  seam before a restart is not recorded.
+- Counts only: no subscription ids, relay URLs, filters or lag marks.
 
 ### `auto_commit_decision`
 
@@ -1274,6 +1295,8 @@ metadata keys for indexing.
 | `RecoveryObligationVerdict` | `satisfied`, `deferred`, `waiting_capacity`, `waiting_capability`, `parked`, `retired`, `superseded`, `closed_below_window` |
 | `RecoveryNextAttempt` | `not_needed`, `paced_retry`, `after_capacity`, `after_capability_change`, `explicit_repair_only`, `newer_revision` |
 | `TransportCursorTrigger` | `drain_checkpoint`, `live_promotion`, `loss_settled`, `notice_retired` |
+| `EoseRepairReceiver` | `account`, `shared` |
+| `EoseRepairTrigger` | `notification_lag`, `follow_up` |
 
 ## Upload and tracker path
 
@@ -1578,6 +1601,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 | Why did recovery stop, retry, wait or park, and is another attempt permitted? | `recovery_obligation_reassessed` per settled obligation: `verdict`, `next_attempt`, progress, certified scopes and the quiet streak against the parking budget. |
 | When was "history may be incomplete" shown, dismissed or resolved? | `recovery_need_changed` with `notice_shown`, `notice_dismissed`, `resumed`, or `closed`, joined by `obligation_ref`. |
 | Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
+| Did a notification lag cost subscriptions their end-of-stored-events, and were they repaired? | `subscription_eose_repaired` per repair pass: relays awaiting EOSE, completed without traffic, re-issued, re-issued earlier and failed, and whether a follow-up was scheduled. |
 | Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or Goggles classification. |
 
 Intentional non-goals / limits:

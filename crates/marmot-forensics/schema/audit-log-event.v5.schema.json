@@ -2570,6 +2570,9 @@
         },
         {
           "$ref": "#/$defs/OperationalEvent_transport_cursor_advanced"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_subscription_eose_repaired"
         }
       ]
     },
@@ -3231,6 +3234,18 @@
         "live_promotion",
         "loss_settled",
         "notice_retired"
+      ]
+    },
+    "Operational_eoseRepairReceiver": {
+      "enum": [
+        "account",
+        "shared"
+      ]
+    },
+    "Operational_eoseRepairTrigger": {
+      "enum": [
+        "notification_lag",
+        "follow_up"
       ]
     },
     "OperationalDiagnosticRef": {
@@ -4939,6 +4954,61 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "queue_dropped": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_subscription_eose_repaired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "receiver",
+        "trigger",
+        "lags",
+        "awaiting_relays",
+        "complete_relays",
+        "reissued_relays",
+        "reissued_earlier_relays",
+        "failed_relays",
+        "follow_up_scheduled",
+        "dropped_before"
+      ],
+      "properties": {
+        "type": {
+          "const": "subscription_eose_repaired"
+        },
+        "receiver": {
+          "$ref": "#/$defs/Operational_eoseRepairReceiver"
+        },
+        "trigger": {
+          "$ref": "#/$defs/Operational_eoseRepairTrigger"
+        },
+        "lags": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "awaiting_relays": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "complete_relays": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "reissued_relays": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "reissued_earlier_relays": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "failed_relays": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "follow_up_scheduled": {
+          "type": "boolean"
+        },
+        "dropped_before": {
           "$ref": "#/$defs/Operational_u64"
         },
         "record_context": {

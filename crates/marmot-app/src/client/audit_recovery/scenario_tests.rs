@@ -520,3 +520,58 @@ async fn explicit_repair_below_the_window_records_a_searched_pass_and_its_close(
             .all(|row| row["event"]["change"] != "closed_below_window")
     );
 }
+
+/// A notification lag schedules the relay plane's lost-EOSE repair. The pass
+/// only queues its report; the worker's publication seam records it.
+#[tokio::test]
+async fn a_lag_lost_eose_repair_pass_is_recorded_at_the_worker_seam() {
+    let fixture = fixture().await;
+    let plane = fixture.app.relay_plane.clone();
+    plane.set_eose_repair_settle_for_test(std::time::Duration::from_millis(20));
+    let account = fixture.client.adapter.account_id().clone();
+    plane.simulate_notification_lag_for_test(
+        &account,
+        1,
+        transport_nostr_adapter::NostrNotificationLossFloor::Since(unix_now_seconds() - 60),
+    );
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            fixture.client.record_eose_repair_reports();
+            let rows = recorded_v5_rows(&fixture.app, "subscription_eose_repaired");
+            if !rows.is_empty() {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the repair runs once the receiver settles");
+    assert_eq!(rows.len(), 1);
+    let event = &rows[0]["event"];
+    assert_eq!(event["receiver"], "account");
+    assert_eq!(event["trigger"], "notification_lag");
+    assert_eq!(event["lags"], 1);
+    assert_eq!(event["dropped_before"], 0);
+    let awaiting = event["awaiting_relays"].as_u64().unwrap();
+    let accounted = [
+        "complete_relays",
+        "reissued_relays",
+        "reissued_earlier_relays",
+        "failed_relays",
+    ]
+    .iter()
+    .map(|field| event[*field].as_u64().unwrap())
+    .sum::<u64>();
+    assert!(accounted <= awaiting);
+    assert_eq!(
+        event["follow_up_scheduled"],
+        event["failed_relays"].as_u64().unwrap() > 0
+    );
+    assert!(rows[0]["group_ref"].is_null());
+    // Taken once: another seam records nothing new.
+    fixture.client.record_eose_repair_reports();
+    assert_eq!(
+        recorded_v5_rows(&fixture.app, "subscription_eose_repaired").len(),
+        1
+    );
+}

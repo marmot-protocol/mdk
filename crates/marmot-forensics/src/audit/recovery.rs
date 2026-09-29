@@ -1,7 +1,8 @@
 //! Closed vocabularies for the account-recovery owner rows
 //! (`recovery_need_changed`, `recovery_attempt_started`,
 //! `recovery_attempt_finished`, `recovery_obligation_reassessed`) and the
-//! transport-cursor row (`transport_cursor_advanced`). These kinds exist only
+//! transport-cursor row (`transport_cursor_advanced`) and the lag-lost EOSE
+//! repair row (`subscription_eose_repaired`). These kinds exist only
 //! in audit v5; a v4 recorder drops them (see `AuditEventKind::is_v5_only`).
 //!
 //! Each enum mirrors a name the recovery code already uses, so a reader can
@@ -193,6 +194,27 @@ pub enum TransportCursorTrigger {
     NoticeRetired,
 }
 
+/// Whose notification receiver lagged, for a lag-lost EOSE repair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EoseRepairReceiver {
+    /// This account's own receiver.
+    Account,
+    /// A receiver shared across accounts; the pass covered every account on
+    /// it, and the first account to record it carries the row.
+    Shared,
+}
+
+/// What started a lag-lost EOSE repair pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EoseRepairTrigger {
+    /// One or more notification lags, once the receiver settled.
+    NotificationLag,
+    /// An earlier pass left relays unrepaired and scheduled this one.
+    FollowUp,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +361,44 @@ mod tests {
     }
 
     #[test]
+    fn strict_writer_refuses_eose_repair_counts_beyond_the_awaiting_relays() {
+        let repaired =
+            |failed_relays, follow_up_scheduled| AuditEventKind::SubscriptionEoseRepaired {
+                receiver: EoseRepairReceiver::Account,
+                trigger: EoseRepairTrigger::NotificationLag,
+                lags: 1,
+                awaiting_relays: 2,
+                complete_relays: 1,
+                reissued_relays: 1,
+                reissued_earlier_relays: 0,
+                failed_relays,
+                follow_up_scheduled,
+                dropped_before: 0,
+            };
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::audit::default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+        let recorder =
+            JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, producer())
+                .unwrap();
+        recorder.record(AuditRecord::new(None, repaired(0, false)));
+        // Three outcomes for two awaiting relays, and a follow-up with no
+        // failed relay: both inconsistent, neither written.
+        recorder.record(AuditRecord::new(None, repaired(1, true)));
+        recorder.record(AuditRecord::new(None, repaired(0, true)));
+        let written = std::fs::read_to_string(&path).unwrap();
+        let rows = written
+            .lines()
+            .filter(|line| line.contains("subscription_eose_repaired"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "only the consistent pass is written");
+        let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&serde_json::from_str(rows[0]).unwrap()));
+        assert!(v5::Record::from_json(rows[0].as_bytes()).is_ok());
+        assert!(recorder.health_snapshot().serialization_failures >= 2);
+    }
+
+    #[test]
     fn v5_schema_tracks_the_recovery_enum_catalogs() {
         fn names<T: Serialize>(values: &[T]) -> std::collections::BTreeSet<String> {
             values
@@ -440,6 +500,17 @@ mod tests {
                 A::NewerRevision
             ]),
             defined("Operational_recoveryNextAttempt")
+        );
+        assert_eq!(
+            names(&[EoseRepairReceiver::Account, EoseRepairReceiver::Shared]),
+            defined("Operational_eoseRepairReceiver")
+        );
+        assert_eq!(
+            names(&[
+                EoseRepairTrigger::NotificationLag,
+                EoseRepairTrigger::FollowUp
+            ]),
+            defined("Operational_eoseRepairTrigger")
         );
         use TransportCursorTrigger as T;
         assert_eq!(

@@ -33,9 +33,10 @@ use sha2::{Digest, Sha256};
 
 mod recovery;
 pub use recovery::{
-    RECOVERY_AUDIT_MAX_ENDPOINTS, RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope,
-    RecoveryGoalBound, RecoveryNeedChange, RecoveryNextAttempt, RecoveryObligationCause,
-    RecoveryObligationVerdict, RecoveryPassOutcome, RecoveryScopeProgress, TransportCursorTrigger,
+    EoseRepairReceiver, EoseRepairTrigger, RECOVERY_AUDIT_MAX_ENDPOINTS,
+    RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
+    RecoveryNextAttempt, RecoveryObligationCause, RecoveryObligationVerdict, RecoveryPassOutcome,
+    RecoveryScopeProgress, TransportCursorTrigger,
 };
 
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
@@ -1335,6 +1336,35 @@ pub enum AuditEventKind {
         spill_already_seen: u64,
         queue_dropped: u64,
     },
+    /// One pass of the relay plane's lag-lost end-of-stored-events repair,
+    /// which re-issues the REQs a notification lag may have cost their EOSE.
+    /// Account-scoped. The repair runs off the worker and only queues its
+    /// report; the account worker records it at its next publication seam,
+    /// so recording never delays the repair.
+    ///
+    /// Counts are relays across the REQs issued by the lag that had not
+    /// reported EOSE (`awaiting_relays`). Of those, `complete_relays` were
+    /// completed from the relay client's own EOSE record with no traffic,
+    /// `reissued_relays` had the REQ queued again, `reissued_earlier_relays`
+    /// were re-issued by an earlier pass and still await EOSE (each relay is
+    /// re-issued once), and `failed_relays` got nothing queued; the rest no
+    /// longer hold the REQ. `follow_up_scheduled` says a later pass will try
+    /// the failed relays again. `lags` counts the lags folded into the pass,
+    /// and `dropped_before` earlier passes of this receiver whose reports
+    /// were dropped at the in-memory bound before any worker recorded them.
+    /// v5 only.
+    SubscriptionEoseRepaired {
+        receiver: EoseRepairReceiver,
+        trigger: EoseRepairTrigger,
+        lags: u64,
+        awaiting_relays: u64,
+        complete_relays: u64,
+        reissued_relays: u64,
+        reissued_earlier_relays: u64,
+        failed_relays: u64,
+        follow_up_scheduled: bool,
+        dropped_before: u64,
+    },
 }
 
 impl AuditEventKind {
@@ -1395,6 +1425,7 @@ impl AuditEventKind {
             AuditEventKind::RecoveryAttemptFinished { .. } => "recovery_attempt_finished",
             AuditEventKind::RecoveryObligationReassessed { .. } => "recovery_obligation_reassessed",
             AuditEventKind::TransportCursorAdvanced { .. } => "transport_cursor_advanced",
+            AuditEventKind::SubscriptionEoseRepaired { .. } => "subscription_eose_repaired",
         }
     }
 
@@ -1408,6 +1439,7 @@ impl AuditEventKind {
                 | AuditEventKind::RecoveryAttemptFinished { .. }
                 | AuditEventKind::RecoveryObligationReassessed { .. }
                 | AuditEventKind::TransportCursorAdvanced { .. }
+                | AuditEventKind::SubscriptionEoseRepaired { .. }
         )
     }
 }

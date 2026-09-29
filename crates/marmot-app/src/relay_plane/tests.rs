@@ -1095,6 +1095,21 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
     ];
     expected.sort();
     assert_eq!(reissued_reqs(&relay, 2).await, expected);
+    // The pass queued one report for the account's audit row: both lags,
+    // the two REQs whose EOSE was lost re-issued, nothing left to retry.
+    let reports = relay_plane.take_eose_repair_reports(&account);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].scope.as_ref(), Some(&account));
+    assert_eq!(reports[0].lags, 2);
+    assert!(!reports[0].follow_up);
+    assert_eq!(reports[0].summary.awaiting_relays, 2);
+    assert_eq!(reports[0].summary.reissued_relays, 2);
+    assert_eq!(reports[0].summary.failed_relays, 0);
+    assert!(!reports[0].follow_up_scheduled);
+    assert!(
+        relay_plane.take_eose_repair_reports(&account).is_empty(),
+        "a report is recorded once"
+    );
 
     for id in [&group_id, &maintenance_id] {
         relay_plane

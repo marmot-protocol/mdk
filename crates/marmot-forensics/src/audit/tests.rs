@@ -1038,6 +1038,18 @@ fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
             quiet_passes: Some(3),
             park_after_quiet_passes: 3,
         },
+        AuditEventKind::SubscriptionEoseRepaired {
+            receiver: EoseRepairReceiver::Account,
+            trigger: EoseRepairTrigger::FollowUp,
+            lags: 2,
+            awaiting_relays: 5,
+            complete_relays: 1,
+            reissued_relays: 2,
+            reissued_earlier_relays: 1,
+            failed_relays: 1,
+            follow_up_scheduled: true,
+            dropped_before: 0,
+        },
         AuditEventKind::TransportCursorAdvanced {
             trigger: TransportCursorTrigger::LivePromotion,
             cursor_before_secs: Some(1_700_000_000),
@@ -2500,7 +2512,7 @@ fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
         operational,
         expected.into_iter().map(str::to_owned).collect()
     );
-    assert_eq!(operational.len(), 49);
+    assert_eq!(operational.len(), 50);
 }
 
 #[test]

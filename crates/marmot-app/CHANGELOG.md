@@ -220,7 +220,9 @@
   retained window) and whether another attempt may follow. The
   transport cursor writes `transport_cursor_advanced` for drain checkpoints, settled loss
   and retired notices, and for a live promotion only when it moves the cursor past the
-  rebuild lookback, with spill and queue-loss placement counts. Rows carry enums, counts
+  rebuild lookback, with spill and queue-loss placement counts. Each lag-lost end-of-stored-events repair
+  pass writes `subscription_eose_repaired` with its relay counts (awaiting, completed without
+  traffic, re-issued, re-issued earlier, failed) and whether a follow-up was scheduled. Rows carry enums, counts
   and hashed references only, and are written only when a v5 recorder is installed.
 
 - Route reviewed host stages through the existing runtime telemetry registry,

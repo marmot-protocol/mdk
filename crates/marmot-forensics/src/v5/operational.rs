@@ -664,6 +664,7 @@ fn protect(value: &mut Value) -> Result<(), ContractError> {
                     | "scope"
                     | "verdict"
                     | "next_attempt"
+                    | "receiver"
                     | "progress" => {
                         if matches!(child, Value::String(_) | Value::Array(_)) {
                             map_strings(&mut child, |s| Ok(safe_category(s)))?;

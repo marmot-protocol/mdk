@@ -567,6 +567,6 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Recovery audit. The owner records its decisions in audit v5 only: need changes, attempt
   start and finish, per-obligation reassessment, and transport-cursor advances
   ([audit-logging.md](../audit-logging.md#account-recovery-owner-rows-v5-only)). The rows sit at
-  the comparison job's execution bracket and the owner's storage transitions. The lost-EOSE repair (#2076) has a marked hook point but no row yet.
+  the comparison job's execution bracket and the owner's storage transitions. Each lag-lost EOSE repair pass (#2076) records its counts as `subscription_eose_repaired`.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.

@@ -132,7 +132,41 @@ struct RelayPlaneTransport {
     /// [`NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`] in milliseconds; tests shorten
     /// it.
     eose_repair_settle_ms: AtomicU64,
+    /// Finished lag-lost EOSE repairs waiting for an account worker to record
+    /// them, oldest first, bounded by [`EOSE_REPAIR_REPORTS_MAX`]. The
+    /// repair only pushes; recording happens on the worker, so it never
+    /// waits on audit.
+    eose_repair_reports: std::sync::Mutex<EoseRepairReports>,
     shutting_down: AtomicBool,
+}
+
+/// At most this many unrecorded repair reports are kept; older ones are
+/// dropped and counted.
+const EOSE_REPAIR_REPORTS_MAX: usize = 64;
+
+#[derive(Default)]
+struct EoseRepairReports {
+    pending: std::collections::VecDeque<EoseRepairReport>,
+    /// Reports dropped at the bound since the last take, by scope.
+    dropped: HashMap<Option<MemberId>, u64>,
+}
+
+/// One finished lag-lost EOSE repair pass, for its audit row.
+#[derive(Clone, Debug)]
+pub(crate) struct EoseRepairReport {
+    /// The lagging receiver's account, or `None` for a receiver shared
+    /// across accounts.
+    pub(crate) scope: Option<MemberId>,
+    /// Whether this pass followed an earlier one that left relays
+    /// unrepaired, rather than a lag directly.
+    pub(crate) follow_up: bool,
+    /// Lags folded into this pass while its receiver settled.
+    pub(crate) lags: u64,
+    pub(crate) summary: transport_nostr_adapter::EoseReissueSummary,
+    /// Whether a follow-up repair was scheduled for the failed relays.
+    pub(crate) follow_up_scheduled: bool,
+    /// Earlier reports for this scope dropped at the queue bound.
+    pub(crate) dropped_before: u64,
 }
 
 /// A lag-lost EOSE repair waiting for its receiver to settle.
@@ -141,6 +175,10 @@ struct EoseRepairSchedule {
     due: tokio::time::Instant,
     /// The latest lag: only REQs issued by then are re-issued.
     lag: NotificationLagMark,
+    /// Audit only: lags folded into this schedule, and whether it retries an
+    /// earlier pass's unrepaired relays.
+    lags: u64,
+    follow_up: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1281,6 +1319,7 @@ impl MarmotRelayPlane {
             eose_repair_settle_ms: AtomicU64::new(
                 NOTIFICATION_LAG_EOSE_REPAIR_SETTLE.as_millis() as u64
             ),
+            eose_repair_reports: std::sync::Mutex::new(EoseRepairReports::default()),
             shutting_down: AtomicBool::new(false),
         });
         let this = Self {
@@ -1487,6 +1526,33 @@ impl MarmotRelayPlane {
     /// custom (non-SDK) relay client does not track registration outcomes, so
     /// this returns empty for it — the audit row then carries `since`/`lookback`
     /// without relay rows.
+    /// Take the finished lag-lost EOSE repair reports this account records:
+    /// its own receiver's, and those of a receiver shared across accounts,
+    /// which the first account to look records once.
+    pub(crate) fn take_eose_repair_reports(&self, account: &MemberId) -> Vec<EoseRepairReport> {
+        let mut reports = self
+            .inner
+            .transport
+            .eose_repair_reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reports.pending.is_empty() {
+            return Vec::new();
+        }
+        let mut taken = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+        for mut report in std::mem::take(&mut reports.pending) {
+            if report.scope.as_ref().is_none_or(|scope| scope == account) {
+                report.dropped_before = reports.dropped.remove(&report.scope).unwrap_or(0);
+                taken.push(report);
+            } else {
+                kept.push_back(report);
+            }
+        }
+        reports.pending = kept;
+        taken
+    }
+
     pub async fn take_subscription_registrations(
         &self,
         account: &MemberId,
@@ -2978,6 +3044,15 @@ fn schedule_eose_repair(
     account_id: Option<&MemberId>,
     lag: NotificationLagMark,
 ) {
+    schedule_eose_repair_pass(transport, account_id, lag, false);
+}
+
+fn schedule_eose_repair_pass(
+    transport: &Arc<RelayPlaneTransport>,
+    account_id: Option<&MemberId>,
+    lag: NotificationLagMark,
+    follow_up: bool,
+) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
@@ -2991,9 +3066,20 @@ fn schedule_eose_repair(
     if let Some(pending) = repairs.get_mut(&scope) {
         pending.due = due;
         pending.lag = pending.lag.max(lag);
+        if !follow_up {
+            pending.lags = pending.lags.saturating_add(1);
+        }
         return;
     }
-    repairs.insert(scope.clone(), EoseRepairSchedule { due, lag });
+    repairs.insert(
+        scope.clone(),
+        EoseRepairSchedule {
+            due,
+            lag,
+            lags: u64::from(!follow_up),
+            follow_up,
+        },
+    );
     drop(repairs);
     runtime.spawn(run_eose_repair(Arc::downgrade(transport), scope));
 }
@@ -3002,7 +3088,7 @@ fn schedule_eose_repair(
 /// that a relay has not answered with end-of-stored-events. Holds the plane
 /// only weakly, so it never keeps a shut-down plane alive.
 async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<MemberId>) {
-    let (transport, lag) = loop {
+    let (transport, lag, lags, follow_up) = loop {
         let due = {
             let Some(transport) = transport.upgrade() else {
                 return;
@@ -3026,16 +3112,16 @@ async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<Mem
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match repairs.get(&scope) {
-                Some(pending) if pending.due <= tokio::time::Instant::now() => {
-                    repairs.remove(&scope).map(|pending| pending.lag)
-                }
+                Some(pending) if pending.due <= tokio::time::Instant::now() => repairs
+                    .remove(&scope)
+                    .map(|pending| (pending.lag, pending.lags, pending.follow_up)),
                 // A later lag postponed it.
                 Some(_) => None,
                 None => return,
             }
         };
-        if let Some(lag) = lag {
-            break (transport, lag);
+        if let Some((lag, lags, follow_up)) = lag {
+            break (transport, lag, lags, follow_up);
         }
     };
     if transport.shutting_down.load(Ordering::SeqCst) {
@@ -3058,25 +3144,49 @@ async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<Mem
         "repaired subscriptions whose end-of-stored-events a notification lag may have lost",
     );
     let unrepaired = summary.failed_relays;
-    if unrepaired == 0 {
+    let Some(transport) = weak.upgrade() else {
+        return;
+    };
+    let follow_up_scheduled = unrepaired > 0 && !transport.shutting_down.load(Ordering::SeqCst);
+    push_eose_repair_report(
+        &transport,
+        EoseRepairReport {
+            scope: scope.clone(),
+            follow_up,
+            lags,
+            summary,
+            follow_up_scheduled,
+            dropped_before: 0,
+        },
+    );
+    if !follow_up_scheduled {
         return;
     }
     // Each unrepaired relay's claim was released. A relay that keeps failing
     // is tried again at most once per settle window, while a re-issue that
     // went out keeps its claim, so a replay that lags again cannot loop.
-    let Some(transport) = weak.upgrade() else {
-        return;
-    };
-    if transport.shutting_down.load(Ordering::SeqCst) {
-        return;
-    }
     tracing::info!(
         target: "marmot_app::relay_plane",
         method = "repair_lag_lost_eose",
         unrepaired_relays = unrepaired,
         "scheduling another lag-lost end-of-stored-events repair",
     );
-    schedule_eose_repair(&transport, scope.as_ref(), lag);
+    schedule_eose_repair_pass(&transport, scope.as_ref(), lag, true);
+}
+
+/// Queue a finished repair for its audit row, dropping the oldest at the
+/// bound. Never waits: the lock guards a small in-memory queue.
+fn push_eose_repair_report(transport: &RelayPlaneTransport, report: EoseRepairReport) {
+    let mut reports = transport
+        .eose_repair_reports
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reports.pending.len() >= EOSE_REPAIR_REPORTS_MAX
+        && let Some(dropped) = reports.pending.pop_front()
+    {
+        *reports.dropped.entry(dropped.scope).or_default() += 1;
+    }
+    reports.pending.push_back(report);
 }
 
 impl MarmotRelayPlaneAccountAdapter {
@@ -3314,13 +3424,6 @@ impl MarmotRelayPlaneAccountAdapter {
     ///
     /// The epoch-gap backfill drain reads this to tell a relay that has
     /// finished replaying stored history from one that has simply gone quiet.
-    ///
-    /// TODO(#2076): the lost-EOSE repair lands in this plane and the transport
-    /// adapter. When it merges, record one account-scoped audit v5 row per
-    /// repair pass at its owner seam (not per poll): relays still awaiting
-    /// EOSE, relays repaired through the SDK flag, REQs re-issued, and repairs
-    /// that failed, as counts only. No row kind exists for it yet; see
-    /// `docs/marmot-architecture/audit-logging.md` ("Lost-EOSE repair").
     pub(crate) async fn account_subscription_eose(&self) -> AccountSubscriptionEose {
         let mut eose = self
             .relay_plane

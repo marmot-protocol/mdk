@@ -79,7 +79,8 @@ App runtime bridge for the first real Marmot app surfaces.
   the checkpoint commits, the notice publication seam and dismissal, and cursor commits after their save succeeds.
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
-  lost-EOSE repair (#2076) has a `TODO(#2076)` hook point and no row yet. Scenario tests live in
+  relay plane's lag-lost EOSE repair only queues a bounded `EoseRepairReport`; the worker's
+  `publish_history_notice_changes` seam records it as `subscription_eose_repaired`. Scenario tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
