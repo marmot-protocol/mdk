@@ -56,3 +56,5 @@ A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_SING
 A13|crates/marmot-app/src/client/sync/comparison_job.rs|MAX_COMPARISON_ADMISSION_PER_TURN
 # A14 floors the post-join maintenance and retained-route REQs at their anchors.
 A14|crates/marmot-app/src/lib.rs|HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE
+# A15 settles a receiver after a notification lag before its lost-EOSE repair.
+A15|crates/marmot-app/src/relay_plane/mod.rs|NOTIFICATION_LAG_EOSE_REPAIR_SETTLE

@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 37] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 38] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -226,6 +226,13 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 37] = [
     ),
     decision(
         "A14",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    // The lag-lost EOSE repair re-issues REQs unchanged, so it changes when
+    // relay history arrives, never which history.
+    decision(
+        "A15",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),
