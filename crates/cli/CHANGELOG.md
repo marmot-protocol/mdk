@@ -9,6 +9,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-29
+
+Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through
+migration 98; back up before upgrade because downgrade is unsupported. Hosts should surface and let users dismiss the
+new "history may be incomplete" notices. OpenClaw operators must configure a sender policy. See the
+[release notes](../../docs/release/0.11.0.md) and the
+[client upgrade guide](../../docs/integration/0.11.0.md).
+
 ### Added
 
 - OpenClaw Marmot now enforces an account-global inbound sender ACL before
@@ -2674,7 +2682,9 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.10.3...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/marmot-protocol/mdk/compare/v0.10.4...v0.11.0
+[0.10.4]: https://github.com/marmot-protocol/mdk/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/marmot-protocol/mdk/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/marmot-protocol/mdk/compare/v0.10.1...v0.10.2
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/v0.9.19...v0.9.20

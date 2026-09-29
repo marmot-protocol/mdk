@@ -4109,7 +4109,7 @@ token, even while the original awaits relay publication. Use a new edit token
 for each submitted revision. The return value is local acceptance, not
 delivery; follow the edit token with `local_send_status` and preserve rejected
 text for retry. The original token must belong to the same account and group.
-See [pending edits](LOCAL-SENDS.md#edits-of-a-pending-local-send-unreleased-source).
+See [pending edits](LOCAL-SENDS.md#edits-of-a-pending-local-send-0110).
 
 [Source](src/commands/local_submissions.rs#L59)
 

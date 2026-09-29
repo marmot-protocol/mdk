@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-29
+
 ### Added
 
 - `marmot_edit_local_message_with_client_token` durably queues a revision of a
@@ -328,6 +330,7 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.20...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...HEAD
+[0.11.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.10.4...marmotc-v0.11.0
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
 [0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16

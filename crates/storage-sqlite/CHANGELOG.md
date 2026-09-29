@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.11.0 - 2026-09-29
+
 ### Changed
 
 - A recovery scope may admit relays it does not require. Completion checks only the

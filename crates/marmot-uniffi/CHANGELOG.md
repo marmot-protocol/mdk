@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.11.0 - 2026-09-29
+
 ### Changed
 
 - Explicit catch-up ingests live input, then runs the account's recovery comparison in

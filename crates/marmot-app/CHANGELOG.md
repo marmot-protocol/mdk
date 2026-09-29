@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.11.0 - 2026-09-29
+
 ### Changed
 
 - A recovery scope whose route no comparison backend could compare is no longer counted as

@@ -4869,7 +4869,7 @@ reply in the same account and group. Give each submitted revision a new edit
 token. This call returns local acceptance, not delivery; use
 `marmot_local_send_status` for recovery and free the result with
 `marmot_local_send_acceptance_free`. All string inputs are borrowed. Pair the
-generated header with the matching library. See [pending edits](../marmot-uniffi/LOCAL-SENDS.md#edits-of-a-pending-local-send-unreleased-source).
+generated header with the matching library. See [pending edits](../marmot-uniffi/LOCAL-SENDS.md#edits-of-a-pending-local-send-0110).
 
 [Header contract](include/marmot.h#L6713)
 

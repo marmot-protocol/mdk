@@ -17,7 +17,7 @@ Use the [complete C symbol reference](API-REFERENCE.md) for every function decla
 including ownership helpers, and the [shared method reference](../marmot-uniffi/API-REFERENCE.md)
 for runtime purposes and recommended alternatives to older screen paths.
 
-The [0.10.3 → 0.10.4 integration guide](../../docs/integration/0.10.4.md) explains
+The [0.10.4 → 0.11.0 integration guide](../../docs/integration/0.11.0.md) explains
 the current record, enum, error and schema changes. Every supported release has a
 companion in the [integration index](../../docs/integration/README.md).
 Read the exact version's header and docs; C record layout compatibility is not implied
@@ -32,7 +32,7 @@ acceptance), rather than relay completion. Free their results with
 `marmot_local_send_status_free`. The nullable timeline `client_token` is owned by
 its row and released by the row's existing deep-free. Rebuild against the matching
 header/library because this changes the timeline record layout.
-Unreleased source also provides `marmot_edit_local_message_with_client_token` for
+Starting with 0.11.0, `marmot_edit_local_message_with_client_token` provides
 durable revisions of pending text or replies. Each revision needs a new edit token;
 the C call returns local acceptance and uses the same status and free functions.
 

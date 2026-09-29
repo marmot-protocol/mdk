@@ -68,7 +68,7 @@ publication independently. Engine queue/fanout persistence atomically transfers
 ownership, preventing a restart from admitting the same payload twice. Shutdown
 leaves undrained work durable for a subsequent account worker.
 
-## Edits of a pending local send (unreleased source)
+## Edits of a pending local send (0.11.0)
 
 Call `edit_local_message_with_client_token(account_ref, group_id_hex,
 original_client_token, content, edit_client_token)` when a user submits a
