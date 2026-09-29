@@ -3138,6 +3138,19 @@ mod tests {
             .unwrap();
         client.delivery_overflow_recovery_pending = true;
         client.delivery_overflow_recovery_marker_token = Some(42);
+        // Every compared relay answers and certifies nothing. Only answered
+        // passes spend the parking budget; a route with no comparison
+        // backend would not.
+        client.test_comparison_results =
+            Some(crate::client::sync::ScriptedComparisons::by_route(|_| {
+                Ok(Some((
+                    transport_nostr_adapter::NostrReconciliationSummary {
+                        relays_succeeded: 1,
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )))
+            }));
         let grant = client
             .authorize_account_recovery(
                 None,

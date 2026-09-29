@@ -4293,27 +4293,25 @@ impl AppClient {
                         || compared.is_some_and(|compared| compared.fetched > 0)
                     {
                         storage_sqlite::RecoveryPassProgress::Progressed
-                    } else if !refused && compared.is_some_and(|compared| compared.answered) {
+                    } else if !refused
+                        && compared.is_some_and(|compared| {
+                            // A route no comparison backend could compare
+                            // was not answered by its relays, so it spends
+                            // no parking budget.
+                            compared.answered
+                                && compared.outcome
+                                    != storage_sqlite::RecoveryComparisonOutcome::Unsupported
+                        })
+                    {
                         storage_sqlite::RecoveryPassProgress::Quiet
                     } else {
                         storage_sqlite::RecoveryPassProgress::Unserved
                     };
-                    if let Some(compared) = compared {
-                        // Audit only: a route no comparison backend could
-                        // compare was not served, although storage keeps its
-                        // own classification and retry policy for it.
-                        let audit_progress = if compared.outcome
-                            == storage_sqlite::RecoveryComparisonOutcome::Unsupported
-                            && scope_progress == storage_sqlite::RecoveryPassProgress::Quiet
-                        {
-                            storage_sqlite::RecoveryPassProgress::Unserved
-                        } else {
-                            scope_progress
-                        };
-                        tally.observe_progress(audit_progress);
+                    if compared.is_some() {
+                        tally.observe_progress(scope_progress);
                         obligation_progress = Some(super::audit_recovery::merge_progress(
                             obligation_progress,
-                            audit_progress,
+                            scope_progress,
                         ));
                     }
                     progress.push((scope.goal.scope_id, scope_progress));

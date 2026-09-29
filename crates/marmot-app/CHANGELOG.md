@@ -4,6 +4,10 @@
 
 ### Changed
 
+- A recovery scope whose route no comparison backend could compare is no longer counted as
+  a quiet pass. No relay answered it, so it spends none of the three-pass parking budget and
+  is recorded as unserved; incremental history still waits for a capability change.
+
 - Generated accounts can copy signed kind 10002, kind 10050, and kind 0 records
   to separate public indexers after bootstrap confirmation. Relay-list and
   profile edits also schedule indexer copies after account-relay acknowledgement;

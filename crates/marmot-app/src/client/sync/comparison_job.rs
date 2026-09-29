@@ -1884,7 +1884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_obligation_compared_without_a_backend_is_reassessed_as_unserved() {
+    async fn an_obligation_compared_without_a_backend_is_unserved_and_spends_no_budget() {
         use crate::client::audit_recovery::recorded_v5_rows;
         let mut fixture = audited_fixture().await;
         let grant = fixture
@@ -1918,10 +1918,14 @@ mod tests {
                     && row["event"]["cause"] == "incremental_history"
             })
             .expect("the startup history obligation is reassessed");
-        // Storage waits for a capability change; the audit row agrees with
-        // the finish row that nothing served the scope.
+        // Storage waits for a capability change, and a pass no relay
+        // answered spends none of the parking budget.
         assert_eq!(incremental["event"]["verdict"], "waiting_capability");
         assert_eq!(incremental["event"]["progress"], "unserved");
+        assert_eq!(
+            incremental["event"]["quiet_passes"], 0,
+            "no quiet pass was counted for an uncompared scope"
+        );
         let finished = recorded_v5_rows(&app, "recovery_attempt_finished")
             .into_iter()
             .find(|row| row["event"]["attempt_serial"] == serial)
