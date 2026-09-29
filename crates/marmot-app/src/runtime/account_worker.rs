@@ -1735,7 +1735,7 @@ async fn run_app_runtime_account_worker(
                         // ended; keep it through owner admission/checkpoint.
                         job.credit = Some(credit);
                         match client
-                            .accept_comparison_network(&job.grant, &job.execution, network)
+                            .accept_comparison_network(&job.grant, &mut job.execution, network)
                             .await
                         {
                             Ok(admission) => job.admission = admission,

@@ -125,6 +125,29 @@ pub(crate) struct ComparisonNetworkResult {
     routes: Vec<ComparisonRouteResult>,
 }
 
+impl ComparisonNetworkResult {
+    /// What each route's relays returned, for a pass discarded before any
+    /// admission exists: counts only, nothing admitted or certified. A route
+    /// counts as answered only when its comparison ran and every failed relay
+    /// still answered.
+    fn unsettled_routes(
+        &self,
+    ) -> impl Iterator<Item = (bool, super::super::audit_recovery::RouteAcquisition)> + '_ {
+        self.routes.iter().map(|route| match &route.result {
+            ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
+                let mut acquisition =
+                    super::super::audit_recovery::RouteAcquisition::from_summary(summary);
+                acquisition.retrieved = events.len();
+                (
+                    summary.failed_endpoints.len() == summary.incomplete_endpoints.len(),
+                    acquisition,
+                )
+            }
+            _ => (false, Default::default()),
+        })
+    }
+}
+
 #[cfg(test)]
 impl ComparisonNetworkResult {
     pub(crate) fn outcome_kinds_for_test(&self) -> Vec<&'static str> {
@@ -411,11 +434,18 @@ impl AppClient {
     pub(crate) async fn accept_comparison_network(
         &mut self,
         grant: &AttemptGrant,
-        execution: &ComparisonExecution,
+        execution: &mut ComparisonExecution,
         network: ComparisonNetworkResult,
     ) -> Result<Option<ComparisonAdmission>, AppError> {
-        if !self.comparison_grant_stable(grant, execution, true).await? {
-            return Ok(None);
+        let stable = self.comparison_grant_stable(grant, execution, true).await;
+        if !matches!(stable, Ok(true)) {
+            // The result is discarded unadmitted; its finish row still says
+            // what the relays returned.
+            execution
+                .execution
+                .tally
+                .observe_unsettled_routes(network.unsettled_routes());
+            return stable.map(|_| None);
         }
         let mut admission = ComparisonAdmission::default();
         for (index, route) in network.routes.into_iter().enumerate() {
@@ -646,7 +676,7 @@ impl AppClient {
         control: Option<&FullHistoryRepairControl<'_>>,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         let mut admission = match self
-            .accept_comparison_network(&grant, &execution, network)
+            .accept_comparison_network(&grant, &mut execution, network)
             .await
         {
             Ok(admission) => admission,
@@ -1420,7 +1450,7 @@ mod tests {
             .collect();
         let mut admission = fixture
             .client
-            .accept_comparison_network(&grant, &execution, fetched(route, events))
+            .accept_comparison_network(&grant, &mut execution, fetched(route, events))
             .await
             .unwrap()
             .expect("an unchanged grant owns its result");
@@ -1456,7 +1486,7 @@ mod tests {
             .collect();
         let mut admission = fixture
             .client
-            .accept_comparison_network(&grant, &execution, fetched(route.clone(), events))
+            .accept_comparison_network(&grant, &mut execution, fetched(route.clone(), events))
             .await
             .unwrap()
             .unwrap();
@@ -1670,7 +1700,11 @@ mod tests {
             .unwrap();
         let result = fixture
             .client
-            .admit_comparison_inline(grant, attempt, network_result(route, Some([8; 32])))
+            .admit_comparison_inline(
+                grant,
+                attempt,
+                fetched(route, vec![candidate(), candidate()]),
+            )
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Deferred));
@@ -1678,6 +1712,12 @@ mod tests {
         let finished = recorded_v5_rows(&app, "recovery_attempt_finished");
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0]["event"]["outcome"], "superseded");
+        // The relays answered before the grant was found changed: the row
+        // reports that, although nothing was admitted or certified.
+        assert_eq!(finished[0]["event"]["routes_compared"], 1);
+        assert_eq!(finished[0]["event"]["events_retrieved"], 2);
+        assert_eq!(finished[0]["event"]["events_retained"], 0);
+        assert_eq!(finished[0]["event"]["routes_certified"], 0);
         assert!(
             recorded_v5_rows(&app, "recovery_obligation_reassessed").is_empty(),
             "a pass that settled nothing records no verdicts"

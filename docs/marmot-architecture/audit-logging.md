@@ -1055,16 +1055,17 @@ Outcomes:
 | `quiet` | Every compared route's required relays answered, and nothing certified or admitted (`Quiet`). Counts toward parking. A pass that compared nothing, such as a maintenance boundary alone, is also `quiet`. |
 | `unserved` | Nothing progressed, and some compared scope or route was not served: a required relay failed, timed out or was skipped, admission was refused (`Unserved`), or no comparison backend could compare the route. Says nothing about history and never counts toward parking. |
 | `deadline` | An explicit repair spent its whole budget and stopped admission at a turn boundary. A network cutoff that skipped routes still settles, and shows as those routes being unserved. |
-
-A pass that stops before settlement (`deadline`, `cancelled` at a turn boundary, `superseded` during admission, or
-`failed` mid-admission) still reports what its relays returned and what it retained: route and relay counts come from
-the routes it accepted, none of them certified. It writes no reassessment rows.
-
-A pass that selected no obligation (a comparison-only pass) has no scope progress; its routes decide. Any route whose
-required relays did not answer, or that no comparison backend could compare, makes an unprogressed pass `unserved`.
 | `cancelled` | Explicit repair was cancelled, or the comparison's network task ended without a result. |
 | `superseded` | The grant changed before or during admission, for example new loss imported by the job's stability check. Before admission nothing was admitted; during it the admitted prefix stays durable. Nothing was certified and newer demand owns the debt. |
 | `failed` | The pass failed; see `error_kind`. |
+
+A pass that stops before settlement (`deadline`, `cancelled` at a turn boundary, `superseded` before or during
+admission, or `failed`) still reports what its relays returned and what it retained. Route and relay counts come from
+the routes its network pass returned, none of them certified; a result discarded before admission contributes counts
+only, never event bytes. It writes no reassessment rows.
+
+A pass that selected no obligation (a comparison-only pass) has no scope progress; its routes decide. Any route whose
+required relays did not answer, or that no comparison backend could compare, makes an unprogressed pass `unserved`.
 
 Notes:
 
