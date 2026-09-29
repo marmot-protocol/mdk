@@ -16657,7 +16657,7 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
     // The runtime's own open: hydration deferred, no transport preparation, so
     // the route table is seeded from persisted state alone.
     let mut reopened = app
-        .local_client_with_relay_plane_and_hydration("bob", &plane, None, true)
+        .local_client_with_relay_plane_and_hydration("bob", &plane, None, true, None)
         .await
         .unwrap();
     // The worker's pipeline, run to completion the way a reconnect does.

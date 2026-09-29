@@ -139,7 +139,7 @@ pub use subscriptions::{
 
 // Bring split-out items the orchestration core references back into scope.
 pub(crate) use account_worker::{
-    AccountWorkerCommand, AccountWorkerRuntime, ManagedAccountWorker,
+    AccountStartupProgress, AccountWorkerCommand, AccountWorkerRuntime, ManagedAccountWorker,
     publish_app_runtime_group_state_updated, spawn_app_runtime_account_worker,
 };
 pub(crate) use audit_tracker::{
@@ -6724,6 +6724,7 @@ impl AccountManager {
                     }
                     let account_id = account.account_id_hex.clone();
                     let (ready_tx, ready_rx) = oneshot::channel();
+                    let startup_progress = AccountStartupProgress::default();
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
                     let handle = spawn_app_runtime_account_worker(
@@ -6739,6 +6740,7 @@ impl AccountManager {
                         command_tx.clone(),
                         command_rx,
                         ready_tx,
+                        startup_progress.clone(),
                         shutdown_rx,
                     );
                     workers.insert(
@@ -6751,18 +6753,23 @@ impl AccountManager {
                             shutdown: shutdown_tx,
                         },
                     );
-                    ready_receivers.push((account_id, Instant::now(), ready_rx));
+                    ready_receivers.push((account_id, Instant::now(), ready_rx, startup_progress));
                 }
             }
             let mut ready_waits = FuturesUnordered::new();
-            for (account_id, account_started_at, ready) in ready_receivers {
+            for (account_id, account_started_at, ready, startup_progress) in ready_receivers {
                 ready_waits.push(async move {
                     let ready_result = timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await;
-                    (account_id, account_started_at.elapsed(), ready_result)
+                    (
+                        account_id,
+                        account_started_at.elapsed(),
+                        ready_result,
+                        startup_progress,
+                    )
                 });
             }
             let mut failed_account_ids = Vec::new();
-            while let Some((account_id, account_open_elapsed, ready_result)) =
+            while let Some((account_id, account_open_elapsed, ready_result, startup_progress)) =
                 ready_waits.next().await
             {
                 let (mut outcome, mut classification) = match ready_result {
@@ -6784,15 +6791,32 @@ impl AccountManager {
                             SyncErrorClass::TransportClosed,
                         )),
                     ),
-                    Err(_) => (
-                        Err(AppError::BlockingTask(
-                            "account worker startup timed out".into(),
-                        )),
-                        Some(SyncFailureClassification::new(
-                            SyncFailureStage::AccountWorker,
-                            SyncErrorClass::Timeout,
-                        )),
-                    ),
+                    Err(_) => {
+                        // Name the pre-ready step the worker is blocked in
+                        // (mdk#1911); the stage is the only context exported.
+                        let stage = startup_progress.stage();
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "reconcile",
+                            stage = stage.as_str(),
+                            "account worker startup timed out"
+                        );
+                        self.shared.app_performance_telemetry().record_runtime(
+                            stage.timeout_operation(),
+                            account_open_elapsed,
+                            TelemetryOutcome::Timeout,
+                        );
+                        (
+                            Err(AppError::BlockingTask(format!(
+                                "account worker startup timed out at {}",
+                                stage.as_str()
+                            ))),
+                            Some(SyncFailureClassification::new(
+                                SyncFailureStage::AccountWorker,
+                                SyncErrorClass::Timeout,
+                            )),
+                        )
+                    }
                 };
                 if outcome.is_ok() {
                     let mut workers = self.workers.lock().await;

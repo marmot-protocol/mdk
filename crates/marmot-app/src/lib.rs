@@ -131,6 +131,7 @@ pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
 pub use marmot_account::MaintenanceTiming;
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
+use runtime::account_worker::{AccountStartupProgress, AccountStartupStage};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -1681,12 +1682,19 @@ impl MarmotApp {
         label: &str,
         relay_plane: &MarmotRelayPlane,
         lifecycle: runtime::RuntimeLifecycle,
+        startup_progress: Option<&AccountStartupProgress>,
     ) -> Result<AppClient, AppError> {
         // Deferred hydration (mdk#1161): the account worker drives the
         // background per-group hydration pipeline after signalling local
         // readiness, so runtime opens stay flat in stored-group count.
-        self.local_client_with_relay_plane_and_hydration(label, relay_plane, Some(lifecycle), true)
-            .await
+        self.local_client_with_relay_plane_and_hydration(
+            label,
+            relay_plane,
+            Some(lifecycle),
+            true,
+            startup_progress,
+        )
+        .await
     }
 
     async fn client_with_relay_plane(
@@ -1713,7 +1721,7 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: Option<runtime::RuntimeLifecycle>,
     ) -> Result<AppClient, AppError> {
-        self.local_client_with_relay_plane_and_hydration(label, relay_plane, lifecycle, false)
+        self.local_client_with_relay_plane_and_hydration(label, relay_plane, lifecycle, false, None)
             .await
     }
 
@@ -1723,7 +1731,11 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: Option<runtime::RuntimeLifecycle>,
         defer_group_hydration: bool,
+        startup_progress: Option<&AccountStartupProgress>,
     ) -> Result<AppClient, AppError> {
+        // Only a starting worker's ready-waiter reads the stage; other opens
+        // advance a cell nobody observes.
+        let startup_progress = startup_progress.cloned().unwrap_or_default();
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
@@ -1733,15 +1745,20 @@ impl MarmotApp {
             .as_ref()
             .map(runtime::RuntimeLifecycle::begin_account_open)
             .transpose()?;
+        startup_progress.enter(AccountStartupStage::OpenQueued);
+        let blocking_progress = startup_progress.clone();
         let open = blocking_app_task(move || {
             let _permit = permit;
+            blocking_progress.enter(AccountStartupStage::AccountState);
             app.ensure_account_state(&label)?;
+            blocking_progress.enter(AccountStartupStage::SessionOpen);
             let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
             #[cfg(test)]
             app.local_open_gates.wait(&label);
             open
         })
         .await?;
+        startup_progress.enter(AccountStartupStage::ClientRestore);
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }

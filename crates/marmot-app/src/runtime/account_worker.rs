@@ -181,6 +181,79 @@ impl ManagedAccountWorker {
     }
 }
 
+/// The pre-ready step an account worker last entered (mdk#1911).
+///
+/// The startup path records nothing durable until the worker is ready, so a
+/// ready-wait that expires reports this instead: which step the worker was
+/// blocked in. The set is closed and names only steps; it is exported as a
+/// runtime operation name, never with account context.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AccountStartupStage {
+    /// The worker task exists but has not submitted its blocking open.
+    #[default]
+    Spawned,
+    /// The blocking open is waiting for a blocking-pool thread.
+    OpenQueued,
+    /// `ensure_account_state`: projection migration and first account
+    /// database open, under the process-wide account-state lock.
+    AccountState,
+    /// `open_account`: session-owner claim, SQLCipher key and session open,
+    /// and seeded group hydration.
+    SessionOpen,
+    /// Synchronous account-storage restore after the session opened:
+    /// recovery owner, startup history request, receipts and durable sweeps.
+    ClientRestore,
+    /// The worker holds its client and is recording open timings and reading
+    /// the setup journal before it signals ready.
+    ReadyHandoff,
+}
+
+impl AccountStartupStage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::OpenQueued => "open_queued",
+            Self::AccountState => "account_state",
+            Self::SessionOpen => "session_open",
+            Self::ClientRestore => "client_restore",
+            Self::ReadyHandoff => "ready_handoff",
+        }
+    }
+
+    /// The runtime operation whose `timeouts` counter counts ready-waits that
+    /// expired while a worker was in this stage.
+    pub(crate) const fn timeout_operation(self) -> RuntimeOp {
+        match self {
+            Self::Spawned => RuntimeOp::AccountStartupSpawned,
+            Self::OpenQueued => RuntimeOp::AccountStartupOpenQueued,
+            Self::AccountState => RuntimeOp::AccountStartupAccountState,
+            Self::SessionOpen => RuntimeOp::AccountStartupSessionOpen,
+            Self::ClientRestore => RuntimeOp::AccountStartupClientRestore,
+            Self::ReadyHandoff => RuntimeOp::AccountStartupReadyHandoff,
+        }
+    }
+}
+
+/// Shared cell a starting worker advances and its ready-waiter reads.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AccountStartupProgress(Arc<Mutex<AccountStartupStage>>);
+
+impl AccountStartupProgress {
+    pub(crate) fn enter(&self, stage: AccountStartupStage) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stage;
+    }
+
+    pub(crate) fn stage(&self) -> AccountStartupStage {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 pub(crate) struct AccountWorkerRuntime {
     pub(crate) app: MarmotApp,
     pub(crate) account_label: String,
@@ -790,10 +863,16 @@ pub(crate) fn spawn_app_runtime_account_worker(
     command_tx: mpsc::Sender<AccountWorkerCommand>,
     commands: mpsc::Receiver<AccountWorkerCommand>,
     ready: oneshot::Sender<Result<(), AppError>>,
+    startup_progress: AccountStartupProgress,
     shutdown: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(run_app_runtime_account_worker(
-        runtime, command_tx, commands, ready, shutdown,
+        runtime,
+        command_tx,
+        commands,
+        ready,
+        startup_progress,
+        shutdown,
     ))
 }
 
@@ -802,6 +881,7 @@ async fn run_app_runtime_account_worker(
     command_tx: mpsc::Sender<AccountWorkerCommand>,
     mut commands: mpsc::Receiver<AccountWorkerCommand>,
     ready: oneshot::Sender<Result<(), AppError>>,
+    startup_progress: AccountStartupProgress,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let worker_started_at = Instant::now();
@@ -816,8 +896,12 @@ async fn run_app_runtime_account_worker(
         shared,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
-    let mut open_client =
-        std::pin::pin!(app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone(),));
+    let mut open_client = std::pin::pin!(app.runtime_local_client(
+        &account_label,
+        &relay_plane,
+        lifecycle.clone(),
+        Some(&startup_progress),
+    ));
     let startup = shared
         .app_performance_telemetry()
         .observe(RuntimeOp::AccountStartup);
@@ -844,7 +928,10 @@ async fn run_app_runtime_account_worker(
     };
     startup.finish_app(&opened);
     let mut client = match opened {
-        Ok(client) => client,
+        Ok(client) => {
+            startup_progress.enter(AccountStartupStage::ReadyHandoff);
+            client
+        }
         Err(err) => {
             let message = account_error_message("runtime startup failed", &err);
             publish_app_runtime_account_error(
@@ -2297,7 +2384,7 @@ async fn run_app_runtime_account_worker(
                                     // The reopened session registers a new signer,
                                     // so retire the previous session's SDK context.
                                     relay_plane.retire_account_session_transport(&transport_account).await;
-                                    app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()).await
+                                    app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone(), None).await
                                 } => result,
                             };
                             reopen.finish_app(&reopened_result);
@@ -7913,6 +8000,7 @@ mod tests {
             commands.clone(),
             receiver,
             ready,
+            AccountStartupProgress::default(),
             shutdown_rx,
         );
         let runtime = super::super::MarmotAppRuntime::new(app.clone());

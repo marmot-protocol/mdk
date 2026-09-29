@@ -74,6 +74,7 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `lifecycle_lock_wait` | Wait for the account manager's lifecycle transaction lock |
 | `account_startup`, `worker_reopen` | Initial/reconnect runtime client open; existing account stage metrics provide additional subdivision |
 | `account_startup_retry_suppressed` | Zero-duration completed-only `not_ready` count for each eligible account whose trigger was deferred by the worker-start cooldown |
+| `account_startup_spawned`, `account_startup_open_queued`, `account_startup_account_state`, `account_startup_session_open`, `account_startup_client_restore`, `account_startup_ready_handoff` | Completed-only `timeouts` count, one per expired account-worker ready-wait, under the pre-ready step the worker was in when it expired (mdk#1911); the duration is the ready-wait. `open_queued` means the blocking open never got a blocking-pool thread |
 | `worker_hydration` | Nonempty startup hydration pipeline, including command service between slices |
 | `worker_catch_up` | Worker catch-up including the preceding frozen read snapshot and coalescing |
 | `worker_snapshot` | Frozen group read snapshot immediately before catch-up |
@@ -138,7 +139,8 @@ Existing `app_account_open_failures` now receives bounded failure-stage/error-cl
 classification from actual account-worker readiness attempts. The separate
 `app_runtime_account_startup_retry_suppressed_not_ready` counter records deferred trigger
 decisions, not unique accounts or elapsed cooldown time. It carries no account label or
-failure text. Existing outbound queue, execution, local acceptance,
+failure text. An expired ready-wait names its startup stage in the `account_startup_<stage>`
+timeout counter, the reconcile error text and a `reconcile` warning, and nothing else. Existing outbound queue, execution, local acceptance,
 local projection, publication and caller-response metrics now also cover draft sends. Compare
 build cohorts separately: increased outbound sample coverage is not itself a performance regression.
 Publication success retains the existing required-ack semantics, not recipient delivery semantics.

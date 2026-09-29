@@ -431,7 +431,7 @@ async fn cold_open_storage_and_hydration_timings() {
         let plane = crate::relay_plane::MarmotRelayPlane::new(None, h.relay.clone());
         let mut client = h
             .app
-            .local_client_with_relay_plane_and_hydration("alice", &plane, None, true)
+            .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
             .await
             .unwrap();
         let store = h.app.account_storage("alice").unwrap();

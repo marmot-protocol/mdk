@@ -1279,7 +1279,7 @@ async fn cold_capture_does_not_force_group_hydration() {
     let plane = f.runtime.shared_services().relay_plane().clone();
     let mut client = f
         .app
-        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true)
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
         .await
         .unwrap();
     assert_eq!(
