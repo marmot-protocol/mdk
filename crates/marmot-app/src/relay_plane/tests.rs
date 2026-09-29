@@ -1097,7 +1097,7 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
     assert_eq!(reissued_reqs(&relay, 2).await, expected);
     // The pass queued one report for the account's audit row: both lags,
     // the two REQs whose EOSE was lost re-issued, nothing left to retry.
-    let reports = relay_plane.take_eose_repair_reports(&account);
+    let reports = relay_plane.take_eose_repair_reports(&account, true);
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].scope.as_ref(), Some(&account));
     assert_eq!(reports[0].lags, 2);
@@ -1107,7 +1107,9 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
     assert_eq!(reports[0].summary.failed_relays, 0);
     assert!(!reports[0].follow_up_scheduled);
     assert!(
-        relay_plane.take_eose_repair_reports(&account).is_empty(),
+        relay_plane
+            .take_eose_repair_reports(&account, true)
+            .is_empty(),
         "a report is recorded once"
     );
 
@@ -5665,4 +5667,104 @@ async fn cancelled_reopen_retirement_cannot_remove_a_replacement_context() {
         "no retirement outlives the cancelled worker"
     );
     sdk.shutdown_accounts().await;
+}
+
+fn eose_report(scope: Option<MemberId>) -> EoseRepairReport {
+    EoseRepairReport {
+        scope,
+        follow_up: false,
+        lags: 1,
+        summary: transport_nostr_adapter::EoseReissueSummary::default(),
+        follow_up_scheduled: false,
+        dropped_before: 0,
+    }
+}
+
+/// A shared receiver's report waits for an account that can record it: a
+/// worker with no v5 recorder that looks first takes only its own reports.
+#[tokio::test]
+async fn a_shared_eose_repair_report_waits_for_an_account_that_records_it() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay);
+    let unrecorded = MemberId::new(vec![0xA1; 32]);
+    let recorded = MemberId::new(vec![0xB2; 32]);
+    push_eose_repair_report(&plane.inner.transport, eose_report(None));
+    push_eose_repair_report(
+        &plane.inner.transport,
+        eose_report(Some(unrecorded.clone())),
+    );
+    push_eose_repair_report(&plane.inner.transport, eose_report(Some(recorded.clone())));
+
+    // The account without a v5 recorder reaches its seam first.
+    let own = plane.take_eose_repair_reports(&unrecorded, false);
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].scope.as_ref(), Some(&unrecorded));
+
+    let taken = plane.take_eose_repair_reports(&recorded, true);
+    assert_eq!(taken.len(), 2, "its own and the shared receiver's");
+    assert!(taken.iter().any(|report| report.scope.is_none()));
+    assert!(plane.take_eose_repair_reports(&recorded, true).is_empty());
+    plane.shutdown().await;
+}
+
+/// Evicted reports are counted on their receiver's next surviving report,
+/// or in one bounded scalar: the accounting never grows with the number of
+/// receivers.
+#[tokio::test]
+async fn evicted_eose_repair_reports_are_counted_without_unbounded_state() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay);
+    let transport = &plane.inner.transport;
+    let account = MemberId::new(vec![0xC3; 32]);
+    let other = |index: usize| Some(MemberId::new(vec![index as u8, 0xEE]));
+    push_eose_repair_report(transport, eose_report(Some(account.clone())));
+    for index in 0..EOSE_REPAIR_REPORTS_MAX - 1 {
+        push_eose_repair_report(transport, eose_report(other(index)));
+    }
+    // The queue is full; this pass evicts the account's first report and
+    // carries its count.
+    push_eose_repair_report(transport, eose_report(Some(account.clone())));
+    let taken = plane.take_eose_repair_reports(&account, false);
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].dropped_before, 1);
+
+    // Many receivers each evicted with no later report of their own.
+    for index in 0..EOSE_REPAIR_REPORTS_MAX * 2 {
+        push_eose_repair_report(transport, eose_report(other(index + 100)));
+    }
+    {
+        let reports = transport.eose_repair_reports.lock().unwrap();
+        assert_eq!(reports.pending.len(), EOSE_REPAIR_REPORTS_MAX);
+        assert!(reports.dropped_unattributed >= EOSE_REPAIR_REPORTS_MAX as u64);
+    }
+    plane.shutdown().await;
+}
+
+/// A lag that postpones a pending follow-up widens the pass to its own REQs,
+/// so the lag owns it: the report names the lag, not the follow-up.
+#[tokio::test(start_paused = true)]
+async fn a_lag_that_postpones_a_follow_up_repair_owns_the_pass() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay);
+    let transport = &plane.inner.transport;
+    let account = MemberId::new(vec![0xD4; 32]);
+    let mark = transport.adapter.notification_lag_mark();
+    schedule_eose_repair_pass(transport, Some(&account), mark, true);
+    schedule_eose_repair(transport, Some(&account), mark);
+    tokio::time::sleep(NOTIFICATION_LAG_EOSE_REPAIR_SETTLE + Duration::from_millis(1)).await;
+    let reports = timeout(Duration::from_secs(5), async {
+        loop {
+            let reports = plane.take_eose_repair_reports(&account, false);
+            if !reports.is_empty() {
+                break reports;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the postponed pass runs");
+    assert_eq!(reports.len(), 1);
+    assert!(!reports[0].follow_up, "the lag owns the pass");
+    assert_eq!(reports[0].lags, 1);
+    plane.shutdown().await;
 }

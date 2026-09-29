@@ -147,8 +147,9 @@ const EOSE_REPAIR_REPORTS_MAX: usize = 64;
 #[derive(Default)]
 struct EoseRepairReports {
     pending: std::collections::VecDeque<EoseRepairReport>,
-    /// Reports dropped at the bound since the last take, by scope.
-    dropped: HashMap<Option<MemberId>, u64>,
+    /// Evicted reports whose receiver had no later pending report to carry
+    /// the count. A scalar, so the accounting stays bounded with the queue.
+    dropped_unattributed: u64,
 }
 
 /// One finished lag-lost EOSE repair pass, for its audit row.
@@ -165,7 +166,8 @@ pub(crate) struct EoseRepairReport {
     pub(crate) summary: transport_nostr_adapter::EoseReissueSummary,
     /// Whether a follow-up repair was scheduled for the failed relays.
     pub(crate) follow_up_scheduled: bool,
-    /// Earlier reports for this scope dropped at the queue bound.
+    /// Earlier reports for this scope dropped at the queue bound, carried
+    /// forward onto this one when they were evicted.
     pub(crate) dropped_before: u64,
 }
 
@@ -1513,6 +1515,39 @@ impl MarmotRelayPlane {
             .map(|lookback| lookback.as_secs())
     }
 
+    /// Take the finished lag-lost EOSE repair reports this account records:
+    /// its own receiver's, and, when `shared` is set, those of a receiver
+    /// shared across accounts, which the first account to take them records
+    /// once. An account with no v5 recorder takes only its own, so it never
+    /// consumes a shared report another account could record.
+    pub(crate) fn take_eose_repair_reports(
+        &self,
+        account: &MemberId,
+        shared: bool,
+    ) -> Vec<EoseRepairReport> {
+        let mut reports = self
+            .inner
+            .transport
+            .eose_repair_reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reports.pending.is_empty() {
+            return Vec::new();
+        }
+        let mut taken = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+        for report in std::mem::take(&mut reports.pending) {
+            let own = report.scope.as_ref() == Some(account);
+            if own || (shared && report.scope.is_none()) {
+                taken.push(report);
+            } else {
+                kept.push_back(report);
+            }
+        }
+        reports.pending = kept;
+        taken
+    }
+
     /// Drain the per-relay subscription-registration outcomes `account`
     /// accumulated since its previous drain, for its `subscription_rebuild`
     /// forensic audit row.
@@ -1526,33 +1561,6 @@ impl MarmotRelayPlane {
     /// custom (non-SDK) relay client does not track registration outcomes, so
     /// this returns empty for it — the audit row then carries `since`/`lookback`
     /// without relay rows.
-    /// Take the finished lag-lost EOSE repair reports this account records:
-    /// its own receiver's, and those of a receiver shared across accounts,
-    /// which the first account to look records once.
-    pub(crate) fn take_eose_repair_reports(&self, account: &MemberId) -> Vec<EoseRepairReport> {
-        let mut reports = self
-            .inner
-            .transport
-            .eose_repair_reports
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if reports.pending.is_empty() {
-            return Vec::new();
-        }
-        let mut taken = Vec::new();
-        let mut kept = std::collections::VecDeque::new();
-        for mut report in std::mem::take(&mut reports.pending) {
-            if report.scope.as_ref().is_none_or(|scope| scope == account) {
-                report.dropped_before = reports.dropped.remove(&report.scope).unwrap_or(0);
-                taken.push(report);
-            } else {
-                kept.push_back(report);
-            }
-        }
-        reports.pending = kept;
-        taken
-    }
-
     pub async fn take_subscription_registrations(
         &self,
         account: &MemberId,
@@ -3067,7 +3075,10 @@ fn schedule_eose_repair_pass(
         pending.due = due;
         pending.lag = pending.lag.max(lag);
         if !follow_up {
+            // A lag that postpones a pending follow-up owns the pass: it
+            // widens it to the REQs issued by the lag.
             pending.lags = pending.lags.saturating_add(1);
+            pending.follow_up = false;
         }
         return;
     }
@@ -3181,10 +3192,24 @@ fn push_eose_repair_report(transport: &RelayPlaneTransport, report: EoseRepairRe
         .eose_repair_reports
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut report = report;
     if reports.pending.len() >= EOSE_REPAIR_REPORTS_MAX
         && let Some(dropped) = reports.pending.pop_front()
     {
-        *reports.dropped.entry(dropped.scope).or_default() += 1;
+        // Carry the count to this receiver's next surviving report, the new
+        // one included; otherwise keep only a bounded scalar.
+        let carried = dropped.dropped_before.saturating_add(1);
+        if let Some(next) = reports
+            .pending
+            .iter_mut()
+            .find(|pending| pending.scope == dropped.scope)
+        {
+            next.dropped_before = next.dropped_before.saturating_add(carried);
+        } else if report.scope == dropped.scope {
+            report.dropped_before = report.dropped_before.saturating_add(carried);
+        } else {
+            reports.dropped_unattributed = reports.dropped_unattributed.saturating_add(carried);
+        }
     }
     reports.pending.push_back(report);
 }

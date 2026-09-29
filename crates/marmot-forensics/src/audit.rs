@@ -1350,8 +1350,10 @@ pub enum AuditEventKind {
     /// re-issued once), and `failed_relays` got nothing queued; the rest no
     /// longer hold the REQ. `follow_up_scheduled` says a later pass will try
     /// the failed relays again. `lags` counts the lags folded into the pass,
-    /// and `dropped_before` earlier passes of this receiver whose reports
-    /// were dropped at the in-memory bound before any worker recorded them.
+    /// at least one for `notification_lag` and none for `follow_up` (a lag
+    /// that postpones a follow-up owns the pass), and `dropped_before`
+    /// earlier passes of this receiver whose reports were dropped at the
+    /// in-memory bound before any worker recorded them.
     /// v5 only.
     SubscriptionEoseRepaired {
         receiver: EoseRepairReceiver,

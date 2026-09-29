@@ -1040,7 +1040,7 @@ fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
         },
         AuditEventKind::SubscriptionEoseRepaired {
             receiver: EoseRepairReceiver::Account,
-            trigger: EoseRepairTrigger::FollowUp,
+            trigger: EoseRepairTrigger::NotificationLag,
             lags: 2,
             awaiting_relays: 5,
             complete_relays: 1,

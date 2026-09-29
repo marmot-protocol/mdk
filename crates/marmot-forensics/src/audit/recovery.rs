@@ -381,10 +381,17 @@ mod tests {
             JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, producer())
                 .unwrap();
         recorder.record(AuditRecord::new(None, repaired(0, false)));
-        // Three outcomes for two awaiting relays, and a follow-up with no
-        // failed relay: both inconsistent, neither written.
+        // Three outcomes for two awaiting relays, a follow-up scheduled with
+        // no failed relay, and a follow-up pass that folded in a lag: all
+        // inconsistent, none written.
         recorder.record(AuditRecord::new(None, repaired(1, true)));
         recorder.record(AuditRecord::new(None, repaired(0, true)));
+        // A follow-up pass folds in no lag.
+        let mut follow_up_with_lag = repaired(0, false);
+        if let AuditEventKind::SubscriptionEoseRepaired { trigger, .. } = &mut follow_up_with_lag {
+            *trigger = EoseRepairTrigger::FollowUp;
+        }
+        recorder.record(AuditRecord::new(None, follow_up_with_lag));
         let written = std::fs::read_to_string(&path).unwrap();
         let rows = written
             .lines()
@@ -395,7 +402,7 @@ mod tests {
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.is_valid(&serde_json::from_str(rows[0]).unwrap()));
         assert!(v5::Record::from_json(rows[0].as_bytes()).is_ok());
-        assert!(recorder.health_snapshot().serialization_failures >= 2);
+        assert!(recorder.health_snapshot().serialization_failures >= 3);
     }
 
     #[test]

@@ -561,13 +561,16 @@ impl AppClient {
 
     /// Record the relay plane's finished lag-lost EOSE repairs for this
     /// account, one row per pass. The repair only queued its report, so it
-    /// never waited on audit; reports are taken even when no v5 recorder is
-    /// installed, so a later enable does not replay stale passes.
+    /// never waited on audit. Without a v5 recorder this account still
+    /// discards its own reports, so a later enable does not replay stale
+    /// passes, but leaves shared-receiver reports for an account that can
+    /// record them.
     pub(crate) fn record_eose_repair_reports(&self) {
+        let recording = self.audit_v5_enabled();
         let reports = self
             .relay_plane
-            .take_eose_repair_reports(self.adapter.account_id());
-        if reports.is_empty() || !self.audit_v5_enabled() {
+            .take_eose_repair_reports(self.adapter.account_id(), recording);
+        if reports.is_empty() || !recording {
             return;
         }
         for report in reports {

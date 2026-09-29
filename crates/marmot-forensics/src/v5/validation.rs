@@ -559,8 +559,14 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
             reissued_earlier_relays,
             failed_relays,
             follow_up_scheduled,
+            trigger,
+            lags,
             ..
         } => {
+            require(
+                (*trigger == crate::audit::EoseRepairTrigger::FollowUp) == (*lags == 0),
+                "a follow-up pass folds in no lag, and a lag pass folds in at least one",
+            )?;
             require(
                 [
                     complete_relays,

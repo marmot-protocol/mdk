@@ -1138,15 +1138,15 @@ the relays that have not reported EOSE (`reissue_subscriptions_awaiting_eose`). 
 | Field | Meaning |
 | --- | --- |
 | `receiver` | `account` (this account's own notification receiver lagged) or `shared` (a receiver shared across accounts; the pass covered all of them, and the first account to record it carries the row). |
-| `trigger` | `notification_lag` (lags, once the receiver settled) or `follow_up` (an earlier pass left relays unrepaired). |
-| `lags` | Lags folded into this pass while the receiver settled; 0 for a follow-up. |
+| `trigger` | `notification_lag` (lags, once the receiver settled) or `follow_up` (an earlier pass left relays unrepaired and nothing lagged since). A lag that postpones a pending follow-up widens it to its own REQs and owns the pass. |
+| `lags` | Lags folded into this pass while the receiver settled: at least 1 for `notification_lag`, exactly 0 for `follow_up`. |
 | `awaiting_relays` | Relays, across the REQs issued by the lag, that had not reported EOSE. |
 | `complete_relays` | Of those, relays the relay client had already seen answer with EOSE; completed with no traffic. |
 | `reissued_relays` | Of those, relays that had the REQ queued again. |
 | `reissued_earlier_relays` | Of those, relays an earlier pass re-issued to that still await EOSE. Each relay is re-issued once, so they get nothing more. |
 | `failed_relays` | Of those, relays that got nothing queued (not connected, no room, or refused); the old REQ is still live there. |
 | `follow_up_scheduled` | A later pass will try the failed relays again. |
-| `dropped_before` | Earlier passes of this receiver whose reports were dropped at the in-memory bound (64) before a worker recorded them. |
+| `dropped_before` | Earlier passes of this receiver whose reports were dropped at the in-memory bound (64) before a worker recorded them, carried onto its next surviving report. A dropped report with no later report of its receiver is counted only in a bounded plane-local total, not on any row. |
 
 Notes:
 
@@ -1155,6 +1155,8 @@ Notes:
 - The repair runs off the worker and only queues its report. The account worker records it at its publication seam
   (`publish_history_notice_changes`), so recording never delays the repair, and a pass whose account never reaches that
   seam before a restart is not recorded.
+- An account with no v5 recorder discards its own receiver's reports at that seam but leaves a shared receiver's
+  reports for an account that records them.
 - Counts only: no subscription ids, relay URLs, filters or lag marks.
 
 ### `auto_commit_decision`
