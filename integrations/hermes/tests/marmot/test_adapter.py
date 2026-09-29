@@ -264,6 +264,33 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
     async def start_server(self, handler):
         self.server = await asyncio.start_unix_server(handler, path=self.socket_path)
 
+    async def test_group_profile_update_sends_only_selected_fields(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(writer, {
+                "marmot_agent_control": "marmot.agent-control.v2",
+                "id": request["id"],
+                "type": "group_profile_updated",
+                "group_id_hex": request["group_id_hex"],
+                "message_ids_hex": ["33" * 32],
+            })
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        response = await client.group_profile_update(
+            "11" * 32, "22" * 16, description="",
+        )
+        self.assertEqual(response["type"], "group_profile_updated")
+        self.assertEqual(requests[0]["description"], "")
+        self.assertNotIn("name", requests[0])
+        self.assertEqual(requests[0]["group_id_hex"], "22" * 16)
+        with self.assertRaises(ValueError):
+            await client.group_profile_update("11" * 32, "22" * 16)
+
     async def test_send_final_writes_protocol_envelope_and_reads_response(self):
         requests = []
 
@@ -7203,6 +7230,12 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])
         self.assertIs(history["handler"], self.adapter_module._marmot_history_tool)
         self.assertTrue(history["is_async"])
+        group_profile = next(tool for tool in ctx.tools if tool["name"] == "marmot_group_profile")
+        self.assertEqual(group_profile["toolset"], "platform")
+        self.assertEqual(group_profile["schema"]["required"], ["group_id_hex"])
+        self.assertFalse(group_profile["schema"]["additionalProperties"])
+        self.assertIs(group_profile["handler"], self.adapter_module._marmot_group_profile_tool)
+        self.assertTrue(group_profile["is_async"])
         reaction = next(tool for tool in ctx.tools if tool["name"] == "marmot_reaction")
         self.assertEqual(reaction["toolset"], "platform")
         self.assertEqual(reaction["schema"]["required"], ["action", "group_id_hex"])
@@ -7499,6 +7532,57 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["type"], "timeline_message")
         self.assertEqual(calls, [("11" * 32, "22" * 32, "33" * 32)])
+
+    async def test_group_profile_tool_preserves_omitted_fields_and_reports_admin_denial(self):
+        calls = []
+        module = self.adapter_module
+
+        class FakeClient:
+            async def group_profile_update(self, account_id_hex, group_id_hex, *, name, description):
+                calls.append((account_id_hex, group_id_hex, name, description))
+                if name == "Denied":
+                    raise module.AgentControlError(
+                        "only a group admin can make this change", code="not_group_admin"
+                    )
+                if name == "Uncertain":
+                    raise module.AgentControlError("timed out", code="timeout", retryable=True)
+                return {
+                    "type": "group_profile_updated",
+                    "group_id_hex": group_id_hex,
+                    "message_ids_hex": ["33" * 32],
+                }
+
+        class FakeAdapter:
+            client = FakeClient()
+
+            async def _ensure_account_id(self):
+                return "11" * 32
+
+        adapter = FakeAdapter()
+        module._remember_live_adapter(adapter)
+        group_id = "22" * 16
+        updated = json.loads(await module._marmot_group_profile_tool({
+            "group_id_hex": group_id, "description": "",
+        }))
+        self.assertTrue(updated["ok"])
+        self.assertEqual(calls[-1], ("11" * 32, group_id, None, ""))
+        denied = json.loads(await module._marmot_group_profile_tool({
+            "group_id_hex": group_id, "name": "Denied",
+        }))
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["error_code"], "not_group_admin")
+        uncertain = json.loads(await module._marmot_group_profile_tool({
+            "group_id_hex": group_id, "name": "Uncertain",
+        }))
+        self.assertFalse(uncertain["ok"])
+        self.assertTrue(uncertain["outcome_unknown"])
+        missing = json.loads(await module._marmot_group_profile_tool({"group_id_hex": group_id}))
+        self.assertFalse(missing["ok"])
+        oversized = json.loads(await module._marmot_group_profile_tool({
+            "group_id_hex": group_id, "name": "é" * 129,
+        }))
+        self.assertFalse(oversized["ok"])
+        self.assertEqual(len(calls), 3)
 
     async def test_marmot_reaction_tool_calls_live_adapter_for_add_and_matching_remove(self):
         calls = []

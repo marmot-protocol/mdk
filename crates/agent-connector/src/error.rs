@@ -1,6 +1,7 @@
 //! Connector error type and its privacy-safe code/message projections.
 
 use agent_control::AgentControlError;
+use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
 use marmot_app::AppError;
 
@@ -59,6 +60,15 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
             Self::App(AppError::AgentStreamFinishMismatch) => "stream_finalize_mismatch",
             Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
+            Self::App(AppError::InvalidGroupProfile(_)) => "invalid_group_profile",
+            Self::App(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(EngineError::NotGroupAdmin { .. })
+                ) =>
+            {
+                "not_group_admin"
+            }
             Self::App(_) => "app_error",
             Self::Control(_) => "control_error",
             Self::Hex(_) => "invalid_hex",
@@ -97,6 +107,15 @@ impl ConnectorError {
             }
             Self::App(AppError::AgentStreamSendFailed(_)) => {
                 "stream durable send failed; retry the same finish request"
+            }
+            Self::App(AppError::InvalidGroupProfile(_)) => "invalid group profile",
+            Self::App(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(EngineError::NotGroupAdmin { .. })
+                ) =>
+            {
+                "only a group admin can make this change"
             }
             Self::InvalidGroupCreate(_) => "invalid group create request",
             Self::InvalidProfileName(_) => "invalid profile name",

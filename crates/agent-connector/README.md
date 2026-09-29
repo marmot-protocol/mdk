@@ -159,6 +159,17 @@ It creates and pushes an annotated `wn-agent-v<version>` tag. Pushing that tag s
 Pull requests, `master` pushes, and manual workflow runs build validation artifacts only; they do not publish a GitHub
 Release.
 
+## Group Profile Updates
+
+The `group_profile_update` control request accepts an account id, group id,
+and at least one of `name` or `description`. Omitted fields retain their
+current authenticated value; an empty string clears a field. MDK enforces the
+256-byte name and 4096-byte description limits and requires the selected
+account to be a current group admin when constructing the MLS commit. A
+successful `group_profile_updated` response carries the published commit's
+message ids. A timeout can leave the result uncertain: read current group
+metadata before retrying, because this mutation has no idempotency key yet.
+
 ## Control Plane Security
 
 The v2 control plane is local-only:

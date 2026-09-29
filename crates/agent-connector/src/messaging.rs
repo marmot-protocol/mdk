@@ -405,6 +405,26 @@ impl AgentConnector {
         })
     }
 
+    pub(crate) async fn update_group_profile_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        name: Option<String>,
+        description: Option<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let summary = self
+            .runtime
+            .update_group_profile(&account.label, &group_id, name, description)
+            .await?;
+        Ok(AgentControlResponse::GroupProfileUpdated {
+            group_id_hex,
+            message_ids_hex: summary.message_ids,
+        })
+    }
+
     pub(crate) fn debug_inject_inbound_response(
         &self,
         account_id_hex: &str,

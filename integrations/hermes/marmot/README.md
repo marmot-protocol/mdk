@@ -15,6 +15,16 @@ cached, so a rename, a cleared name, or a recovered projection appears on the
 next metadata read. Display enrichment never changes routing ids, activation
 policy, or send/reply targets.
 
+The `marmot_group_profile` platform tool updates an existing group's name,
+description, or both. Pass its `group_id_hex` and at least one field. Omitted
+fields keep their current values; an empty string clears a field. Names are
+limited to 256 UTF-8 bytes and descriptions to 4096. `wn-agent` uses MDK's
+authenticated group-profile commit path, which rejects an account that is not
+a current group admin. A successful result includes the published commit's
+message ids. If the control connection times out, check the group's current
+profile before trying again: repeating an uncertain update may publish a
+second commit.
+
 For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
 materialized chat window and supplies Hermes with durable message ids, senders,
 timestamps, reply links, current reaction summaries, and

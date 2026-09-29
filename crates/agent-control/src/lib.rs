@@ -346,6 +346,17 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
     },
+    /// Update authenticated group profile fields. Omitted fields keep their
+    /// current value; an empty string explicitly clears a field. Only a current
+    /// group admin can publish this MLS commit.
+    GroupProfileUpdate {
+        account_id_hex: String,
+        group_id_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
     MaintenanceStatus {
         account_id_hex: String,
         group_id_hex: String,
@@ -554,6 +565,10 @@ pub enum AgentControlResponse {
         is_direct: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
+    },
+    GroupProfileUpdated {
+        group_id_hex: String,
+        message_ids_hex: Vec<String>,
     },
     MaintenanceStatus {
         status: AgentControlMaintenanceStatus,
@@ -1066,6 +1081,49 @@ mod tests {
         assert_eq!(
             decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn group_profile_update_round_trips_partial_and_clear_fields() {
+        for (name, description) in [
+            (Some("New name".to_owned()), None),
+            (None, Some("New description".to_owned())),
+            (Some(String::new()), Some(String::new())),
+        ] {
+            let request = AgentControlEnvelope::request(
+                Some("profile-1".into()),
+                AgentControlRequest::GroupProfileUpdate {
+                    account_id_hex: "ab".repeat(32),
+                    group_id_hex: "cd".repeat(16),
+                    name: name.clone(),
+                    description: description.clone(),
+                },
+            );
+            let encoded = encode_frame(&request).unwrap();
+            let json: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "group_profile_update");
+            assert_eq!(json.get("name").is_some(), name.is_some());
+            assert_eq!(json.get("description").is_some(), description.is_some());
+            assert_eq!(
+                decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+
+        let response = AgentControlEnvelope::new(
+            Some("profile-1".into()),
+            AgentControlResponse::GroupProfileUpdated {
+                group_id_hex: "cd".repeat(16),
+                message_ids_hex: vec!["ef".repeat(32)],
+            },
+        );
+        let encoded = encode_frame(&response).unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["type"], "group_profile_updated");
+        assert_eq!(
+            decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
+            response
         );
     }
 

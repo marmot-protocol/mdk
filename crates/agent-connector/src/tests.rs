@@ -6852,6 +6852,142 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
 }
 
 #[tokio::test]
+async fn connector_group_profile_update_preserves_fields_and_requires_current_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer = connector.account_home.create_account("peer").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&peer.label)
+        .await
+        .unwrap();
+    let group_id = connector
+        .runtime
+        .create_group(
+            &agent.label,
+            "Original",
+            std::slice::from_ref(&peer.label),
+            Some("Keep this description"),
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let update = |name, description| AgentControlRequest::GroupProfileUpdate {
+        account_id_hex: agent.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        name,
+        description,
+    };
+    let renamed = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "rename",
+        update(Some("Renamed".into()), None),
+    )
+    .await;
+    assert!(matches!(
+        renamed.payload,
+        AgentControlResponse::GroupProfileUpdated {
+            ref group_id_hex,
+            ref message_ids_hex,
+        } if group_id_hex == &hex::encode(group_id.as_slice()) && !message_ids_hex.is_empty()
+    ));
+    let changed = connector
+        .app
+        .groups(&agent.label)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .unwrap();
+    assert_eq!(changed.profile.name, "Renamed");
+    assert_eq!(changed.profile.description, "Keep this description");
+
+    let cleared = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "clear-description",
+        update(None, Some(String::new())),
+    )
+    .await;
+    assert!(matches!(
+        cleared.payload,
+        AgentControlResponse::GroupProfileUpdated { .. }
+    ));
+    let changed = connector
+        .app
+        .groups(&agent.label)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .unwrap();
+    assert_eq!(changed.profile.name, "Renamed");
+    assert_eq!(changed.profile.description, "");
+
+    let oversized = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "oversized-name",
+        update(Some("é".repeat(129)), None),
+    )
+    .await;
+    assert!(matches!(
+        oversized.payload,
+        AgentControlResponse::Error { ref code, retryable: false, .. } if code == "invalid_group_profile"
+    ));
+
+    connector
+        .runtime
+        .promote_admin(&agent.label, &group_id, &peer.account_id_hex)
+        .await
+        .unwrap();
+    connector
+        .runtime
+        .self_demote_admin(&agent.label, &group_id)
+        .await
+        .unwrap();
+    let denied = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "not-admin",
+        update(Some("Forbidden".into()), None),
+    )
+    .await;
+    assert!(matches!(
+        denied.payload,
+        AgentControlResponse::Error { ref code, retryable: false, .. } if code == "not_group_admin"
+    ));
+    let invalid = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "no-fields",
+        update(None, None),
+    )
+    .await;
+    assert!(matches!(
+        invalid.payload,
+        AgentControlResponse::Error { ref code, retryable: false, .. } if code == "invalid_group_profile"
+    ));
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn connector_group_create_rejects_invalid_inputs_without_creating_groups() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev/wn-agent.sock");

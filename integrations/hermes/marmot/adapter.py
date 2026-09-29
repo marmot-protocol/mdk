@@ -4804,6 +4804,54 @@ async def _marmot_history_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
         return json.dumps({"ok": False, "error": str(exc)})
 
 
+async def _marmot_group_profile_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
+    group_id_hex = args.get("group_id_hex")
+    name = args.get("name")
+    description = args.get("description")
+    if not isinstance(group_id_hex, str) or not group_id_hex.strip():
+        return json.dumps({"ok": False, "error": "group_id_hex required"})
+    if name is None and description is None:
+        return json.dumps({"ok": False, "error": "name or description required"})
+    if (name is not None and not isinstance(name, str)) or (
+        description is not None and not isinstance(description, str)
+    ):
+        return json.dumps({"ok": False, "error": "name and description must be strings"})
+    if name is not None and len(name.encode("utf-8")) > 256:
+        return json.dumps({"ok": False, "error": "name exceeds 256 UTF-8 bytes"})
+    if description is not None and len(description.encode("utf-8")) > 4096:
+        return json.dumps({"ok": False, "error": "description exceeds 4096 UTF-8 bytes"})
+    adapter = _live_adapter()
+    if adapter is None:
+        return json.dumps({"ok": False, "error": "marmot_group_profile requires a live Marmot adapter"})
+    try:
+        account_id_hex = await adapter._ensure_account_id()
+        response = await adapter.client.group_profile_update(
+            account_id_hex,
+            group_id_hex,
+            name=name,
+            description=description,
+        )
+        return json.dumps({"ok": True, **response})
+    except AgentControlError as exc:
+        if exc.code == "not_group_admin":
+            error = "only a current group admin can make this change"
+        elif exc.code == "invalid_group_profile":
+            error = "invalid group profile"
+        elif exc.code in {"timeout", "socket_closed", "socket_io", "operation_timed_out"}:
+            return json.dumps({
+                "ok": False,
+                "error_code": exc.code,
+                "outcome_unknown": True,
+                "error": "group profile update outcome is unknown; check current group details before retrying",
+            })
+        else:
+            error = "Marmot group profile update failed"
+        return json.dumps({"ok": False, "error_code": exc.code, "error": error})
+    except Exception as exc:
+        logger.debug("Marmot group profile update failed", exc_info=True)
+        return json.dumps({"ok": False, "error": "Marmot group profile update failed", "kind": type(exc).__name__})
+
+
 async def _marmot_reaction_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
     action = str(args.get("action") or "").strip().lower()
     group_id_hex = str(args.get("group_id_hex") or "").strip()
@@ -4982,6 +5030,31 @@ def register(ctx):
                 "required": ["group_id_hex"],
             },
             handler=_marmot_history_tool,
+            is_async=True,
+        )
+        register_tool(
+            name="marmot_group_profile",
+            toolset="platform",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "group_id_hex": {
+                        "type": "string",
+                        "description": "Marmot group id hex from the current conversation.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New group name (up to 256 UTF-8 bytes); omit to keep it, empty string to clear. Requires current group admin authority.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New description (up to 4096 UTF-8 bytes); omit to keep it, empty string to clear. Requires current group admin authority.",
+                    },
+                },
+                "required": ["group_id_hex"],
+            },
+            handler=_marmot_group_profile_tool,
             is_async=True,
         )
         register_tool(

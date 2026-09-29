@@ -198,6 +198,7 @@ impl AgentConnector {
             | AgentControlRequest::RemoveReaction { .. }
             | AgentControlRequest::AccountPublishKeyPackage { .. }
             | AgentControlRequest::AccountPublishProfile { .. }
+            | AgentControlRequest::GroupProfileUpdate { .. }
             | AgentControlRequest::SendMedia { .. }
             | AgentControlRequest::DownloadMedia { .. }
             | AgentControlRequest::MaintenanceScheduleSelfUpdate { .. }
@@ -303,6 +304,20 @@ impl AgentConnector {
             } => {
                 self.group_info_response(&account_id_hex, &group_id_hex)
                     .await
+            }
+            AgentControlRequest::GroupProfileUpdate {
+                account_id_hex,
+                group_id_hex,
+                name,
+                description,
+            } => {
+                self.update_group_profile_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    name,
+                    description,
+                )
+                .await
             }
             AgentControlRequest::MaintenanceStatus {
                 account_id_hex,
