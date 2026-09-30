@@ -181,16 +181,15 @@ impl ManagedAccountWorker {
     }
 }
 
-/// The pre-ready step an account worker last entered (mdk#1911).
+/// The pre-ready step an account worker is in (mdk#1911).
 ///
-/// The startup path records nothing durable until the worker is ready, so a
-/// ready-wait that expires reports this instead: which step the worker was
-/// blocked in. The set is closed and names only steps; it is exported as a
-/// runtime operation name, never with account context.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The startup path records nothing durable until the worker is ready, so
+/// each step is an in-flight span on its runtime operation instead. The set is
+/// closed and names only steps; it is exported as a runtime operation name,
+/// never with account context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AccountStartupStage {
     /// The worker task exists but has not submitted its blocking open.
-    #[default]
     Spawned,
     /// The blocking open is waiting for a blocking-pool thread.
     OpenQueued,
@@ -220,9 +219,8 @@ impl AccountStartupStage {
         }
     }
 
-    /// The runtime operation whose `timeouts` counter counts ready-waits that
-    /// expired while a worker was in this stage.
-    pub(crate) const fn timeout_operation(self) -> RuntimeOp {
+    /// The runtime operation that carries this stage's spans.
+    pub(crate) const fn operation(self) -> RuntimeOp {
         match self {
             Self::Spawned => RuntimeOp::AccountStartupSpawned,
             Self::OpenQueued => RuntimeOp::AccountStartupOpenQueued,
@@ -234,21 +232,94 @@ impl AccountStartupStage {
     }
 }
 
-/// Shared cell a starting worker advances and its ready-waiter reads.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct AccountStartupProgress(Arc<Mutex<AccountStartupStage>>);
+/// The stage a starting worker is in and its open span, shared by the worker,
+/// its blocking open and its ready-waiter.
+///
+/// Entering a stage completes the previous span. The last clone to drop ends
+/// an open span as cancelled, so a blocking open that outlives its aborted
+/// worker keeps its stage in flight until the open itself moves on.
+#[derive(Clone, Debug)]
+pub(crate) struct AccountStartupProgress {
+    telemetry: crate::AppPerformanceTelemetry,
+    state: Arc<Mutex<StartupStageState>>,
+}
+
+#[derive(Debug)]
+struct StartupStageState {
+    stage: AccountStartupStage,
+    span: StageSpan,
+}
+
+#[derive(Debug, Default)]
+struct StageSpan {
+    observation: Option<Observation>,
+    /// The ready-wait expired in this stage: the span ends as a timeout,
+    /// whenever and however it ends.
+    expired: bool,
+}
+
+impl StageSpan {
+    fn end(&mut self, outcome: TelemetryOutcome) {
+        if let Some(observation) = self.observation.take() {
+            observation.finish(if self.expired {
+                TelemetryOutcome::Timeout
+            } else {
+                outcome
+            });
+        }
+    }
+}
+
+impl Drop for StageSpan {
+    fn drop(&mut self) {
+        self.end(TelemetryOutcome::Cancelled);
+    }
+}
 
 impl AccountStartupProgress {
-    pub(crate) fn enter(&self, stage: AccountStartupStage) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stage;
+    /// Open the `Spawned` span of a worker about to be spawned.
+    pub(crate) fn new(telemetry: crate::AppPerformanceTelemetry) -> Self {
+        let stage = AccountStartupStage::Spawned;
+        let span = StageSpan {
+            observation: Some(telemetry.observe(stage.operation())),
+            expired: false,
+        };
+        Self {
+            telemetry,
+            state: Arc::new(Mutex::new(StartupStageState { stage, span })),
+        }
     }
 
-    pub(crate) fn stage(&self) -> AccountStartupStage {
-        *self
-            .0
+    pub(crate) fn enter(&self, stage: AccountStartupStage) {
+        let next = StageSpan {
+            observation: Some(self.telemetry.observe(stage.operation())),
+            expired: false,
+        };
+        let mut previous = {
+            let mut state = self.state();
+            state.stage = stage;
+            std::mem::replace(&mut state.span, next)
+        };
+        previous.end(TelemetryOutcome::Success);
+    }
+
+    /// End the current stage's span: the worker signalled ready, or its open
+    /// failed.
+    pub(crate) fn finish(&self, outcome: TelemetryOutcome) {
+        let mut span = std::mem::take(&mut self.state().span);
+        span.end(outcome);
+    }
+
+    /// Mark the ready-wait expired in the current stage and name it. The span
+    /// stays in flight for as long as the worker's open is in that stage.
+    pub(crate) fn expire(&self) -> AccountStartupStage {
+        let mut state = self.state();
+        state.span.expired = true;
+        state.stage
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, StartupStageState> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -946,6 +1017,7 @@ async fn run_app_runtime_account_worker(
             client
         }
         Err(err) => {
+            startup_progress.finish(TelemetryOutcome::Failure);
             let message = account_error_message("runtime startup failed", &err);
             publish_app_runtime_account_error(
                 &events,
@@ -1029,6 +1101,7 @@ async fn run_app_runtime_account_worker(
             worker_started_at.elapsed(),
             true,
         );
+        startup_progress.finish(TelemetryOutcome::Success);
         let _ = ready.send(Ok(()));
     }
 
@@ -8056,12 +8129,12 @@ mod tests {
                 relay_plane: app.relay_plane.clone(),
                 events,
                 lifecycle: shared.lifecycle(),
-                shared,
+                shared: shared.clone(),
             },
             commands.clone(),
             receiver,
             ready,
-            AccountStartupProgress::default(),
+            AccountStartupProgress::new(shared.app_performance_telemetry()),
             shutdown_rx,
         );
         let runtime = super::super::MarmotAppRuntime::new(app.clone());

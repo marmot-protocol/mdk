@@ -63,8 +63,8 @@ operations! {
     LifecycleLockWait => "lifecycle_lock_wait",
     AccountStartup => "account_startup",
     AccountStartupRetrySuppressed => "account_startup_retry_suppressed",
-    // One per `AccountStartupStage`; only `timeouts` is recorded, when the
-    // ready-wait expires with the worker in that stage.
+    // One per `AccountStartupStage`: one span per stage a starting account
+    // worker enters, ending as a timeout if its ready-wait expired there.
     AccountStartupSpawned => "account_startup_spawned",
     AccountStartupOpenQueued => "account_startup_open_queued",
     AccountStartupAccountState => "account_startup_account_state",

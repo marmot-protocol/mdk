@@ -1644,11 +1644,13 @@ impl MarmotApp {
     pub(crate) fn install_local_open_gate(
         &self,
         account_ref: &str,
+        stage: AccountStartupStage,
         reached: std::sync::mpsc::Sender<()>,
         proceed: std::sync::mpsc::Receiver<()>,
     ) -> Result<(), AppError> {
         let label = self.account_home().account(account_ref)?.label;
-        self.local_open_gates.install(label, reached, proceed);
+        self.local_open_gates
+            .install(label, stage, reached, proceed);
         Ok(())
     }
 
@@ -1733,9 +1735,6 @@ impl MarmotApp {
         defer_group_hydration: bool,
         startup_progress: Option<&AccountStartupProgress>,
     ) -> Result<AppClient, AppError> {
-        // Only a starting worker's ready-waiter reads the stage; other opens
-        // advance a cell nobody observes.
-        let startup_progress = startup_progress.cloned().unwrap_or_default();
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
@@ -1745,20 +1744,30 @@ impl MarmotApp {
             .as_ref()
             .map(runtime::RuntimeLifecycle::begin_account_open)
             .transpose()?;
-        startup_progress.enter(AccountStartupStage::OpenQueued);
-        let blocking_progress = startup_progress.clone();
+        // Only a starting worker records stage spans; other opens pass `None`.
+        let enter_stage = |progress: Option<&AccountStartupProgress>, stage| {
+            if let Some(progress) = progress {
+                progress.enter(stage);
+            }
+        };
+        enter_stage(startup_progress, AccountStartupStage::OpenQueued);
+        let blocking_progress = startup_progress.cloned();
         let open = blocking_app_task(move || {
             let _permit = permit;
-            blocking_progress.enter(AccountStartupStage::AccountState);
+            enter_stage(
+                blocking_progress.as_ref(),
+                AccountStartupStage::AccountState,
+            );
             app.ensure_account_state(&label)?;
-            blocking_progress.enter(AccountStartupStage::SessionOpen);
+            enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
             let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
             #[cfg(test)]
-            app.local_open_gates.wait(&label);
+            app.local_open_gates
+                .wait(&label, AccountStartupStage::SessionOpen);
             open
         })
         .await?;
-        startup_progress.enter(AccountStartupStage::ClientRestore);
+        enter_stage(startup_progress, AccountStartupStage::ClientRestore);
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
@@ -5610,6 +5619,9 @@ impl MarmotApp {
         if ready.contains(label) {
             return Ok(());
         }
+        #[cfg(test)]
+        self.local_open_gates
+            .wait(label, AccountStartupStage::AccountState);
         // Run KeyPackage cutover before any other account-storage access. The
         // cutover uses pre-existence of the encrypted account database as the
         // durable distinction between a fresh local account and an upgraded

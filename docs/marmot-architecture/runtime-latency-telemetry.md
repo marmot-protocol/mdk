@@ -74,7 +74,7 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `lifecycle_lock_wait` | Wait for the account manager's lifecycle transaction lock |
 | `account_startup`, `worker_reopen` | Initial/reconnect runtime client open; existing account stage metrics provide additional subdivision |
 | `account_startup_retry_suppressed` | Zero-duration completed-only `not_ready` count for each eligible account whose trigger was deferred by the worker-start cooldown |
-| `account_startup_spawned`, `account_startup_open_queued`, `account_startup_account_state`, `account_startup_session_open`, `account_startup_client_restore`, `account_startup_ready_handoff` | Completed-only `timeouts` count, one per expired account-worker ready-wait, under the pre-ready step the worker was in when it expired (mdk#1911); the duration is the ready-wait. `open_queued` means the blocking open never got a blocking-pool thread |
+| `account_startup_spawned`, `account_startup_open_queued`, `account_startup_account_state`, `account_startup_session_open`, `account_startup_client_restore`, `account_startup_ready_handoff` | One span per pre-ready step a managed account worker enters (mdk#1911): entering the next step ends it as a success, readiness ends `ready_handoff`, a failed open ends the current step as a failure, and an abandoned startup ends it as cancelled. A span current when the worker's ready-wait expired ends as a timeout whenever it ends. Reopens and non-worker opens record none. See [Reading account startup stages](#reading-account-startup-stages) |
 | `worker_hydration` | Nonempty startup hydration pipeline, including command service between slices |
 | `worker_catch_up` | Worker catch-up including the preceding frozen read snapshot and coalescing |
 | `worker_snapshot` | Frozen group read snapshot immediately before catch-up |
@@ -139,11 +139,33 @@ Existing `app_account_open_failures` now receives bounded failure-stage/error-cl
 classification from actual account-worker readiness attempts. The separate
 `app_runtime_account_startup_retry_suppressed_not_ready` counter records deferred trigger
 decisions, not unique accounts or elapsed cooldown time. It carries no account label or
-failure text. An expired ready-wait names its startup stage in the `account_startup_<stage>`
-timeout counter, the reconcile error text and a `reconcile` warning, and nothing else. Existing outbound queue, execution, local acceptance,
+failure text. An expired ready-wait names its startup stage in the reconcile error text, a
+`reconcile` warning and the `account_startup_<stage>` spans, and nothing else. Existing outbound queue, execution, local acceptance,
 local projection, publication and caller-response metrics now also cover draft sends. Compare
 build cohorts separately: increased outbound sample coverage is not itself a performance regression.
 Publication success retains the existing required-ack semantics, not recipient delivery semantics.
+
+### Reading account startup stages
+
+The `ensure_account_state` and `open_account` steps run on a blocking-pool thread that
+cannot be cancelled. When a ready-wait expires, reconcile shuts the worker down and aborts
+it after the shutdown wait, but a step running on that thread stays in flight until the
+thread leaves it: the span outlives its worker. `ensure_account_state` holds a process-wide
+lock, so a later open of any account waits in `account_state` behind a stuck one. A later
+open of the same account that finds the session claimed fails fast with
+`AccountSessionBusy` instead.
+
+- Where a ready-wait expired: `timeouts` on the step, once its span has ended; while it is
+  still stuck, an `in_flight` span older than the 45 s ready-wait.
+- Whether an aborted worker's open is still running: a worker still opening is aborted 5 s after its
+  expiry, so a span older than about 50 s belongs to a worker that no longer exists. `in_flight` above 1 on one step means a replacement is in that step beside it;
+  one per restart suggests each replacement is stuck behind the first.
+- Slow or stuck: a step whose spans end has a duration histogram and success or timeout
+  counts; a stuck step keeps `in_flight` with a growing `oldest_tracked_in_flight_ms` and
+  never records its duration.
+
+`started` equals `completed` plus `in_flight` on every step. A successful startup ends
+every span, leaving nothing in flight.
 
 ## Native app integration
 

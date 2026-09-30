@@ -15,6 +15,14 @@
   rows are rejected.
 - `ConversationReaction::reaction_message_id_hex` names the earliest active
   kind-7 carrying that emoji, so a NIP-30 reaction's image can be resolved.
+- Account-worker startup is observable stage by stage. Six runtime
+  operations, `account_startup_spawned`, `_open_queued`, `_account_state`,
+  `_session_open`, `_client_restore` and `_ready_handoff`, record one span
+  per stage a starting worker enters. A span stays in flight while the stage
+  runs, even after its worker was aborted, and ends as a timeout if the
+  ready-wait expired in that stage. An expired ready-wait now fails with
+  `account worker startup timed out at <stage>`; hosts that matched the old
+  message exactly should match its prefix. (#1911, #2098)
 
 ### Fixed
 

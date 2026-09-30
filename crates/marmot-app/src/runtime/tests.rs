@@ -4,6 +4,7 @@ use cgka_traits::transport_adapter::{
     TransportEndpointRejectionCategory, TransportPublishFailure,
 };
 
+use super::account_worker::AccountStartupStage;
 use super::subscriptions::{chat_list_mute_expiries, message_kind_filter_allows};
 use super::*;
 use crate::AppMessageProjection;
@@ -2750,13 +2751,23 @@ async fn account_setup_create_identity_rejects_import_nsec_sidecar() {
 /// so this bounds a hang rather than timing the open.
 const ACCOUNT_OPEN_TEST_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Hold the account's next open once its session open has returned.
 fn install_local_open_gate(
     app: &MarmotApp,
     account_ref: &str,
 ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    install_local_open_gate_at(app, account_ref, AccountStartupStage::SessionOpen)
+}
+
+/// Hold the account's next open inside `stage`.
+fn install_local_open_gate_at(
+    app: &MarmotApp,
+    account_ref: &str,
+    stage: AccountStartupStage,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
-    app.install_local_open_gate(account_ref, reached_tx, proceed_rx)
+    app.install_local_open_gate(account_ref, stage, reached_tx, proceed_rx)
         .expect("install local-open gate");
     (reached_rx, proceed_tx)
 }
@@ -2939,6 +2950,92 @@ async fn reconcile_failure_waits_for_sibling_and_preserves_its_session() {
     runtime.shutdown().await;
 }
 
+/// The six `account_startup_<stage>` operations, in startup order.
+const STARTUP_STAGE_OPERATIONS: [RuntimeOp; 6] = [
+    RuntimeOp::AccountStartupSpawned,
+    RuntimeOp::AccountStartupOpenQueued,
+    RuntimeOp::AccountStartupAccountState,
+    RuntimeOp::AccountStartupSessionOpen,
+    RuntimeOp::AccountStartupClientRestore,
+    RuntimeOp::AccountStartupReadyHandoff,
+];
+
+fn startup_stage_snapshot(
+    runtime: &MarmotAppRuntime,
+    operation: RuntimeOp,
+) -> crate::RuntimePerformanceSnapshot {
+    runtime
+        .app_performance_snapshot()
+        .runtime_operations
+        .into_iter()
+        .find(|snapshot| snapshot.operation == operation)
+        .expect("every runtime operation is exported")
+}
+
+async fn wait_for_startup_stages_to_settle(runtime: &MarmotAppRuntime) {
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while STARTUP_STAGE_OPERATIONS
+            .into_iter()
+            .any(|operation| startup_stage_snapshot(runtime, operation).in_flight > 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every startup stage span ends");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_ready_worker_completes_one_span_per_startup_stage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    runtime.accounts().reconcile().await.expect("alice starts");
+
+    for operation in STARTUP_STAGE_OPERATIONS {
+        let stage = startup_stage_snapshot(&runtime, operation);
+        assert_eq!(
+            (
+                stage.started,
+                stage.successes,
+                stage.completed,
+                stage.in_flight
+            ),
+            (1, 1, 1, 0),
+            "{}",
+            operation.as_str()
+        );
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_non_worker_open_records_no_startup_stage_spans() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let client = open_runtime_local_test_client(&app, &runtime, "alice").await;
+
+    for operation in STARTUP_STAGE_OPERATIONS {
+        assert_eq!(
+            startup_stage_snapshot(&runtime, operation).started,
+            0,
+            "{}",
+            operation.as_str()
+        );
+    }
+    drop(client);
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn startup_timeout_reports_the_stage_the_worker_was_blocked_in() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2965,7 +3062,7 @@ async fn startup_timeout_reports_the_stage_the_worker_was_blocked_in() {
     .expect("the expired ready-wait is recorded while the open is held");
     proceed.send(()).expect("release alice open");
 
-    let stage = account_worker::AccountStartupStage::SessionOpen;
+    let stage = AccountStartupStage::SessionOpen;
     let error = reconcile
         .await
         .expect("reconcile task")
@@ -2974,17 +3071,88 @@ async fn startup_timeout_reports_the_stage_the_worker_was_blocked_in() {
         matches!(&error, AppError::BlockingTask(message) if message.contains(stage.as_str())),
         "the timeout names the blocked stage: {error:?}"
     );
-    let snapshot = runtime.app_performance_snapshot();
-    for operation in &snapshot.runtime_operations {
-        let expected = u64::from(operation.operation == stage.timeout_operation());
-        if operation.operation.as_str().starts_with("account_startup_") {
-            assert_eq!(
-                operation.timeouts,
-                expected,
-                "{} timeouts",
-                operation.operation.as_str()
-            );
+    // The expired span ends, as a timeout, once the released open moves on.
+    wait_for_startup_stages_to_settle(&runtime).await;
+    for operation in STARTUP_STAGE_OPERATIONS {
+        assert_eq!(
+            startup_stage_snapshot(&runtime, operation).timeouts,
+            u64::from(operation == stage.operation()),
+            "{} timeouts",
+            operation.as_str()
+        );
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_timed_out_open_stays_in_flight_beside_its_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let account = app
+        .account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let manager = runtime.accounts();
+    let (reached, proceed) =
+        install_local_open_gate_at(&app, "alice", AccountStartupStage::AccountState);
+    let first = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.reconcile().await }
+    });
+    wait_for_test_signal(reached, "alice account state").await;
+
+    // The first open holds the account-state lock past its ready-wait and
+    // past the shutdown wait, so its worker is aborted mid-open.
+    tokio::time::pause();
+    tokio::time::advance(APP_RUNTIME_ACCOUNT_READY_WAIT + Duration::from_secs(1)).await;
+    let error = first
+        .await
+        .expect("first reconcile task")
+        .expect_err("first startup timed out");
+    assert!(
+        matches!(&error, AppError::BlockingTask(message) if message.contains("account_state")),
+        "the timeout names the blocked stage: {error:?}"
+    );
+    tokio::time::advance(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    let replacement = tokio::spawn({
+        let manager = manager.clone();
+        let account_id = account.account_id_hex.clone();
+        async move { manager.reconcile_for_account(&account_id).await }
+    });
+
+    // The replacement waits behind the aborted worker's open.
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while startup_stage_snapshot(&runtime, RuntimeOp::AccountStartupAccountState).in_flight < 2
+        {
+            tokio::task::yield_now().await;
         }
+    })
+    .await
+    .expect("both opens are in the account-state stage");
+
+    proceed.send(()).expect("release the first open");
+    // Released, the first open races its replacement for the session claim.
+    let replaced = replacement.await.expect("replacement reconcile task");
+    assert!(
+        matches!(replaced, Ok(()) | Err(AppError::AccountSessionBusy)),
+        "{replaced:?}"
+    );
+    wait_for_startup_stages_to_settle(&runtime).await;
+    let account_state = startup_stage_snapshot(&runtime, RuntimeOp::AccountStartupAccountState);
+    assert_eq!(
+        (
+            account_state.started,
+            account_state.timeouts,
+            account_state.successes,
+        ),
+        (2, 1, 1),
+        "the first open's span ends as its timeout, the replacement's as a success"
+    );
+    for operation in STARTUP_STAGE_OPERATIONS {
+        let stage = startup_stage_snapshot(&runtime, operation);
+        assert_eq!(stage.started, stage.completed, "{}", operation.as_str());
     }
     runtime.shutdown().await;
 }

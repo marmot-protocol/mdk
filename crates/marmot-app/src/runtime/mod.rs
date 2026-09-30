@@ -6822,7 +6822,8 @@ impl AccountManager {
                     }
                     let account_id = account.account_id_hex.clone();
                     let (ready_tx, ready_rx) = oneshot::channel();
-                    let startup_progress = AccountStartupProgress::default();
+                    let startup_progress =
+                        AccountStartupProgress::new(self.shared.app_performance_telemetry());
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
                     let handle = spawn_app_runtime_account_worker(
@@ -6892,17 +6893,12 @@ impl AccountManager {
                     Err(_) => {
                         // Name the pre-ready step the worker is blocked in
                         // (mdk#1911); the stage is the only context exported.
-                        let stage = startup_progress.stage();
+                        let stage = startup_progress.expire();
                         tracing::warn!(
                             target: "marmot_app::runtime",
                             method = "reconcile",
                             stage = stage.as_str(),
                             "account worker startup timed out"
-                        );
-                        self.shared.app_performance_telemetry().record_runtime(
-                            stage.timeout_operation(),
-                            account_open_elapsed,
-                            TelemetryOutcome::Timeout,
                         );
                         (
                             Err(AppError::BlockingTask(format!(
