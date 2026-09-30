@@ -3085,6 +3085,99 @@ mod tests {
             advanced.grace_until
         );
     }
+
+    /// Paused maintenance files no post-join boundary and drops an installed
+    /// session; resuming files it again.
+    #[tokio::test]
+    async fn paused_post_join_sweep_requests_nothing_and_drops_its_session() {
+        use crate::tests::{
+            ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
+            every_subscription, scripted_eose_pump,
+        };
+        use cgka_traits::storage::MaintenanceStorage;
+        let directory = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(directory.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay_and_config(
+            directory.path(),
+            "wss://relay.example",
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
+        )
+        .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group = client.create_group("paused post-join", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .put_maintenance_obligation(&cgka_traits::MaintenanceObligation {
+                id: cgka_traits::MessageId::new(vec![56; 32]),
+                group_id: group.clone(),
+                trigger: cgka_traits::MaintenanceTrigger::PostJoin,
+                phase: cgka_traits::MaintenancePhase::CatchUp,
+                created_at: cgka_traits::Timestamp(unix_now_seconds()),
+                operational_target_at: None,
+                overdue: false,
+                eose_deadline_at: None,
+                grace_until: None,
+                quiet_since: None,
+                own_leaf_baseline_hash: None,
+                sampled_jitter_ms: 0,
+                not_before: None,
+                attempt_count: 0,
+                semantic_rearm_count: 0,
+                last_failure_code: None,
+            })
+            .unwrap();
+        let boundary_requested = |storage: &storage_sqlite::SqliteAccountStorage| {
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.cause == storage_sqlite::RecoveryCause::Maintenance)
+        };
+
+        client.pause_maintenance();
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert!(
+            !boundary_requested(&storage),
+            "a paused sweep files no maintenance boundary"
+        );
+
+        client.resume_maintenance();
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert!(boundary_requested(&storage), "resuming files the boundary");
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        assert!(
+            client
+                .post_join_maintenance_subscriptions
+                .contains_key(&group)
+        );
+
+        client.pause_maintenance();
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert!(
+            client.post_join_maintenance_subscriptions.is_empty(),
+            "a paused sweep drops the installed session"
+        );
+    }
     #[test]
     fn outcome_policy_distinguishes_unknown_input_from_proven_incapability() {
         use storage_sqlite::{RecoveryEligibility as E, RecoveryScopeOutcome as O};
