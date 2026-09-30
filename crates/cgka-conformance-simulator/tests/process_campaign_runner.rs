@@ -1,6 +1,6 @@
 use cgka_conformance_simulator::{
-    GeneratedScenarioInputV1, ScenarioReport, ScenarioStepStatus,
-    generate_convergence_e2e_delivery_case, resolve_scenario_input_bytes,
+    GeneratedScenarioInputV1, ScenarioReport, generate_convergence_e2e_delivery_case,
+    resolve_scenario_input_bytes,
 };
 use std::path::Path;
 use std::process::Command;
@@ -132,8 +132,8 @@ fn strict_worker_failure_writes_a_portable_capsule() {
 }
 
 #[test]
-#[ignore = "64-member Welcome-refusal boundary; prefer the campaign-bin fixture tests::large_group_pressure_8001_30_reports_create_refusal"]
-fn large_group_pressure_8001_30_report_and_campaign_worker_exit_failed_scenario() {
+#[ignore = "slow 64-member extended-NIP-44 report and worker regression"]
+fn large_group_pressure_8001_30_report_and_campaign_worker_pass() {
     let temp = tempfile::tempdir().expect("temporary campaign root");
     let case = cgka_conformance_simulator::generate_large_group_pressure_case(8001, 30);
     let input = GeneratedScenarioInputV1::new(case);
@@ -158,7 +158,7 @@ fn large_group_pressure_8001_30_report_and_campaign_worker_exit_failed_scenario(
         .env("RUST_MIN_STACK", "4194304")
         .status()
         .expect("report binary starts");
-    assert_eq!(report_status.code(), Some(1));
+    assert_eq!(report_status.code(), Some(0));
 
     let campaign_status = Command::new(campaign_binary())
         .arg("--worker")
@@ -170,41 +170,27 @@ fn large_group_pressure_8001_30_report_and_campaign_worker_exit_failed_scenario(
         .env("RUST_MIN_STACK", "4194304")
         .status()
         .expect("campaign worker starts");
-    assert_eq!(campaign_status.code(), Some(1));
+    assert_eq!(campaign_status.code(), Some(0));
 
     let stem = "large-group-pressure-v1-seed-8001-case-30";
-    assert_create_refusal_artifacts(&report_out, stem);
-    assert_create_refusal_artifacts(&campaign_out, stem);
+    assert_large_group_pass_artifacts(&report_out, stem);
+    assert_large_group_pass_artifacts(&campaign_out, stem);
 }
 
-fn assert_create_refusal_artifacts(out: &Path, stem: &str) {
+fn assert_large_group_pass_artifacts(out: &Path, stem: &str) {
     let report_path = out.join(format!("{stem}.json"));
     let fixture_path = out.join(format!("{stem}-fixture.v1.json"));
-    let capsule_path = out.join(format!("{stem}-failure-capsule.v1.json"));
     let report: ScenarioReport =
-        serde_json::from_slice(&std::fs::read(&report_path).expect("create-refusal report reads"))
-            .expect("create-refusal report parses");
+        serde_json::from_slice(&std::fs::read(&report_path).expect("large-group report reads"))
+            .expect("large-group report parses");
     assert!(
         fixture_path.is_file(),
         "missing fixture {}",
         fixture_path.display()
     );
-    let capsule = cgka_conformance_simulator::read_failure_capsule(&capsule_path)
-        .expect("create-refusal capsule reads");
-    assert_eq!(
-        capsule.sensitivity,
-        cgka_conformance_simulator::FailureCapsuleSensitivity::SyntheticShareable
-    );
-    assert!(capsule.byte_replay.is_none());
-    let first = report
-        .step_log
-        .first()
-        .expect("failed create leaves a step log");
+    let first = report.step_log.first().expect("create leaves a step log");
     assert_eq!(first.step_type, "create_group");
-    match &first.status {
-        ScenarioStepStatus::Failed { kind, .. } => {
-            assert_eq!(kind, "peeler");
-        }
-        other => panic!("first step must fail with peeler, got {other:?}"),
-    }
+    assert!(first.status.is_completed(), "create must complete");
+    assert!(report.expectation_failures.is_empty());
+    assert!(report.invariant_failures.is_empty());
 }

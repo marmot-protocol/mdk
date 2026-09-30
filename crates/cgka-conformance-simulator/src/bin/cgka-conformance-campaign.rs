@@ -14,6 +14,7 @@ struct Args {
     family: String,
     seed: u64,
     cases: usize,
+    case_indices: Vec<usize>,
     out: PathBuf,
     storage: HarnessStorageMode,
     case_timeout: Duration,
@@ -122,13 +123,14 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
     )?;
     #[cfg(not(unix))]
     fs_private::create_dir_all_private(&args.out)?;
-    let mut observations = Vec::with_capacity(args.cases);
-    for (case_index, planned) in planned_cases.into_iter().enumerate() {
+    let mut observations = Vec::with_capacity(planned_cases.len());
+    for planned in planned_cases {
         let PlannedCase {
             case,
             paths,
             generated_input_bytes,
         } = planned;
+        let case_index = usize::try_from(case.case_index)?;
         fs_private::write_private(&paths.generated_input, &generated_input_bytes)?;
         let mut command = Command::new(&executable);
         command
@@ -432,6 +434,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
     let mut family = "adversarial-reliability/v1".to_owned();
     let mut seed = 7;
     let mut cases = 12;
+    let mut case_indices = Vec::new();
     let mut out = PathBuf::from("target/cgka-adversarial-reliability-process-campaign");
     let mut storage = HarnessStorageMode::TempFileBackedSqlite;
     let mut case_timeout = Duration::from_secs(300);
@@ -446,6 +449,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
             "--family" => family = args.next().ok_or("missing --family value")?,
             "--seed" => seed = args.next().ok_or("missing --seed value")?.parse()?,
             "--cases" => cases = args.next().ok_or("missing --cases value")?.parse()?,
+            "--case-index" => {
+                case_indices.push(args.next().ok_or("missing --case-index value")?.parse()?)
+            }
             "--out" => out = PathBuf::from(args.next().ok_or("missing --out value")?),
             "--input" => input = Some(PathBuf::from(args.next().ok_or("missing --input value")?)),
             "--capture-sensitive-replay" => capture_sensitive_replay = true,
@@ -492,8 +498,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
     if !worker && input.is_some() {
         return Err("--input is reserved for campaign workers".into());
     }
-    if !worker && cases == 0 {
+    if !worker && cases == 0 && case_indices.is_empty() {
         return Err("--cases must be greater than zero".into());
+    }
+    if !case_indices.is_empty() {
+        case_indices.sort_unstable();
+        case_indices.dedup();
     }
     if !worker && case_timeout.is_zero() {
         return Err("--case-timeout-secs must be greater than zero".into());
@@ -503,6 +513,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
         family,
         seed,
         cases,
+        case_indices,
         out,
         storage,
         case_timeout,
@@ -516,8 +527,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
 fn preflight_campaign(args: &Args) -> Result<(PathBuf, Vec<PlannedCase>), Box<dyn Error>> {
     let summary_path = args.out.join("process-campaign.v1.json");
     ensure_path_absent(&summary_path)?;
-    let mut planned_cases = Vec::with_capacity(args.cases);
-    for case_index in 0..args.cases {
+    let selected_indices: Vec<_> = if args.case_indices.is_empty() {
+        (0..args.cases).collect()
+    } else {
+        args.case_indices.clone()
+    };
+    let mut planned_cases = Vec::with_capacity(selected_indices.len());
+    for case_index in selected_indices {
         let case = generate_family_case(&args.family, args.seed, u64::try_from(case_index)?)?;
         let paths = case_artifact_paths(&args.out, &case);
         for path in [
@@ -742,6 +758,32 @@ fn wait_with_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selects_explicit_case_indices_without_a_prefix() {
+        let args = parse_args(
+            [
+                "--family",
+                "large-group-pressure/v1",
+                "--case-index",
+                "48",
+                "--case-index",
+                "24",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("arguments parse");
+        assert_eq!(args.case_indices, vec![24, 48]);
+        let (_, planned) = preflight_campaign(&args).expect("selected cases preflight");
+        assert_eq!(
+            planned
+                .iter()
+                .map(|planned| planned.case.case_index)
+                .collect::<Vec<_>>(),
+            vec![24, 48]
+        );
+    }
 
     #[test]
     fn parses_per_case_timeout() {
@@ -1049,6 +1091,7 @@ mod tests {
             family: "interrupted-minimization/v1".into(),
             seed: 0,
             cases: 1,
+            case_indices: Vec::new(),
             out,
             storage: HarnessStorageMode::InMemorySqlite,
             case_timeout: Duration::from_secs(300),
@@ -1172,8 +1215,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "64-member Welcome-refusal boundary; run: cargo test -p cgka-conformance-simulator --locked --bin cgka-conformance-campaign -- --ignored --exact tests::large_group_pressure_8001_30_reports_create_refusal"]
-    fn large_group_pressure_8001_30_reports_create_refusal() {
+    #[ignore = "slow 64-member extended-NIP-44 regression; run explicitly"]
+    fn large_group_pressure_8001_30_passes_extended_nip44() {
         let root = tempfile::tempdir().expect("temporary campaign root");
         let out = root.path().join("boundary");
         fs_private::create_dir_all_private(&out).expect("private output directory");
@@ -1198,17 +1241,13 @@ mod tests {
             .spawn()
             .expect("worker fixture starts");
         let worker_pid = child.id();
-        let usage = wait_with_usage(child, Duration::from_secs(180)).expect("worker is reaped");
-        assert!(!usage.timed_out, "boundary worker must not time out");
+        let usage = wait_with_usage(child, Duration::from_secs(600)).expect("worker is reaped");
+        assert!(!usage.timed_out, "64-member worker must not time out");
         assert!(
             usage.signal.is_none(),
             "boundary worker must not be signaled"
         );
-        assert_eq!(
-            usage.exit_code,
-            Some(1),
-            "failed scenario is exit 1, not panic 101"
-        );
+        assert_eq!(usage.exit_code, Some(0), "64-member scenario must pass");
 
         let mut inspection = inspect_case_artifacts(&case, &paths, &usage);
         inspection
@@ -1217,47 +1256,23 @@ mod tests {
         assert_eq!(inspection.integrity_errors, Vec::<String>::new());
         let measurement = build_case_measurement(30, paths, usage, inspection, started.elapsed());
         assert!(measurement.fixture_candidate.is_some());
-        assert!(measurement.failure_capsule.is_some());
+        assert!(measurement.failure_capsule.is_none());
         assert_eq!(measurement.artifact_integrity_errors, Vec::<String>::new());
 
         let report: ScenarioReport = serde_json::from_slice(
             &std::fs::read(&measurement.report).expect("scenario report reads"),
         )
         .expect("scenario report parses");
-        let first = report
-            .step_log
-            .first()
-            .expect("failed create leaves a step log");
+        let first = report.step_log.first().expect("create leaves a step log");
         assert_eq!(first.step_type, "create_group");
-        match &first.status {
-            cgka_conformance_simulator::ScenarioStepStatus::Failed { kind, .. } => {
-                assert_eq!(kind, "peeler");
-            }
-            other => panic!("first step must fail, got {other:?}"),
-        }
-
-        let capsule = cgka_conformance_simulator::read_failure_capsule(
-            measurement
-                .failure_capsule
-                .as_ref()
-                .expect("failure capsule path"),
-        )
-        .expect("portable capsule reads");
-        assert_eq!(
-            capsule.sensitivity,
-            cgka_conformance_simulator::FailureCapsuleSensitivity::SyntheticShareable
-        );
-        assert!(capsule.byte_replay.is_none());
-        assert_eq!(capsule.failure.failure_kind, "scenario_step_failed:peeler");
-        assert_eq!(
-            capsule.failure.first_failing_action_id.as_deref(),
-            Some("step-0:create_group")
-        );
+        assert!(first.status.is_completed(), "create must complete");
+        assert!(report.expectation_failures.is_empty());
+        assert!(report.invariant_failures.is_empty());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "process fixture launched by large_group_pressure_8001_30_reports_create_refusal"]
+    #[ignore = "process fixture launched by large_group_pressure_8001_30_passes_extended_nip44"]
     async fn large_group_pressure_8001_30_worker_fixture() {
         let input = PathBuf::from(
             std::env::var_os("CGKA_LARGE_GROUP_WORKER_INPUT").expect("worker fixture input path"),
@@ -1269,9 +1284,10 @@ mod tests {
             family: "large-group-pressure/v1".into(),
             seed: 8001,
             cases: 1,
+            case_indices: Vec::new(),
             out,
             storage: HarnessStorageMode::TempFileBackedSqlite,
-            case_timeout: Duration::from_secs(180),
+            case_timeout: Duration::from_secs(600),
             minimization_budget: GeneratedScenarioMinimizationBudget::default(),
             input: Some(input),
             capture_sensitive_replay: false,

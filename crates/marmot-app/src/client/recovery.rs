@@ -1506,7 +1506,31 @@ impl AppClient {
         }
         let comparison = storage.recovery_comparison()?;
         let mut comparison_goals = if grant.comparison_revision.is_some() {
+            // A route can appear after the comparison request was joined (for
+            // example, while a Welcome is being admitted). The frozen plan
+            // may only select routes backed by that request's durable debt.
+            let mut joined_routes = Vec::new();
+            for demand in demands
+                .iter()
+                .filter(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+            {
+                joined_routes.extend(
+                    storage
+                        .recovery_scope_snapshots(demand.ticket.id)?
+                        .into_iter()
+                        .map(|scope| scope.plan),
+                );
+            }
             self.comparison_route_goals(comparison.requested_until_seconds)?
+                .into_iter()
+                .filter(|goal| {
+                    joined_routes.iter().any(|joined| {
+                        joined.route_kind == goal.route_kind
+                            && joined.group_id == goal.group_id
+                            && joined.transport_group_id == goal.transport_group_id
+                    })
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -4179,6 +4203,32 @@ mod tests {
                 .is_none(),
             "an answered route is serviced, so no comparison slot keeps passes running"
         );
+    }
+
+    #[tokio::test]
+    async fn comparison_does_not_select_a_route_added_after_its_debt_was_recorded() {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.request_bounded_comparison().unwrap();
+        client.create_group("later route", &[]).await.unwrap();
+
+        let grant = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .expect("pending comparison");
+        let plan = grant.comparison_plan.expect("comparison plan");
+        assert!(plan.routes.iter().all(|route| route.route_kind == 0));
     }
 
     #[tokio::test]

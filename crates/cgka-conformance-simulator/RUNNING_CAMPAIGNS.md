@@ -218,6 +218,8 @@ timeout, and the original failure artifacts remain authoritative.
 `--cases` is a count, not a complexity dial. Case index selects a deterministic arm or generated history. More cases
 increase coverage; they do not promise that later cases are larger. `--seed` changes the deterministic choices within
 each indexed case. A family defines the available operations, weights/motifs, subject, and expectations.
+For isolated cases, repeat `--case-index N` instead of using a `--cases` prefix; the runner executes only the selected
+indices in ascending order and retains their original case indices in its summary.
 
 For `large-group-pressure/v1`, six consecutive cases form one size block, ordered by execution cost: 10, 16, 20, 32,
 50, 64, 100, 128, then 200 members. Cases `0..17` cover the 10/16/20-member blocks, `18..35` cover 32/50/64, and
@@ -226,16 +228,47 @@ anchor, `--cases 36` through the 64-member anchor, and `--cases 54` only as a de
 Run `cargo test -p cgka-conformance-simulator --test large_group_family --locked` for the ordinary 10-member
 application and retained-join canaries. Prefer the isolated file-backed campaign runner for broader execution;
 generator tests already compile all 54 shapes without running the expensive large/xlarge blocks.
+For example, select only the 100- and 200-member bulk arms with `--case-index 36 --case-index 48` and a fresh
+`--out` directory. If using `--release`, build and run with `CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true` because
+these generated cases select the legacy harness protocol profile, which ordinary release builds reject.
 
-The 64-member Welcome-refusal boundary (`seed=8001`, `case_index=30`) is an explicit opt-in:
+The 64-member bulk case (`seed=8001`, `case_index=30`) is an explicit slow regression for extended NIP-44 wrapping:
 
 ```sh
 cargo test -p cgka-conformance-simulator --locked --bin cgka-conformance-campaign -- \
-  --ignored --exact tests::large_group_pressure_8001_30_reports_create_refusal
+  --ignored --exact tests::large_group_pressure_8001_30_passes_extended_nip44
 ```
 
-Use a fresh `--out` directory. The worker must exit 1 with a report, fixture candidate, and portable capsule; a
-panic exit 101 means the refusal was not converted into a failed scenario step.
+For a direct campaign run, use a fresh `--out` directory. The worker must exit 0 with a strict report and fixture
+candidate, with no failure capsule. This exercises the former 64-member Welcome wrapping boundary with the forked
+NIP-44 codec.
+
+### Manual large-group app probe against strfry
+
+The ignored `app_runtime::strfry_process_scale::app_group_through_strfry_processes` test drives
+one public app runtime process and one private SQLCipher root per member through a real local
+strfry relay. It checks Welcome acceptance, exact roster and epoch agreement, founder and peer
+message fanout, and three offline recipients reopening and catching up. Use a fresh output root
+and relay database for each group-creation run. Build the matching release node first, set
+`MDK_APP_PROCESS_NODE` to its absolute path, and provide:
+
+```sh
+MDK_APP_PROCESS_NODE=/absolute/path/to/cgka-conformance-node \
+MDK_STRFRY_GROUP_MEMBERS=200 \
+MDK_STRFRY_URL=ws://127.0.0.1:7777 \
+MDK_STRFRY_APP_ARTIFACTS=/absolute/private/fresh-output-root \
+cargo test --release --locked -p cgka-conformance-simulator --lib \
+  app_runtime::strfry_process_scale::app_group_through_strfry_processes \
+  -- --ignored --exact --nocapture
+```
+
+The relay must use `dev/strfry.conf` with a suitable event and WebSocket payload limit, and
+the loopback URL must match its published port. The separate ignored
+`resumed_group_after_strfry_restart` test reopens the retained root after a relay restart and
+checks saved state and a fresh message. It intentionally retains failures as evidence; a
+successful initial journey does not establish that 200 simultaneous or staggered restarts are
+healthy. These local tests also do not establish acceptance by members' independently operated
+inbox relays.
 
 For `offline-catchup-pressure/v1`, six consecutive cases form one volume block: 24, 96, 384, then 1,024 application
 messages, interleaved with 4, 8, 12, then 16 commit rounds. Each block covers natural full history, reverse history,
