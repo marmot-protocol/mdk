@@ -488,6 +488,121 @@ async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings
 }
 
 #[tokio::test]
+async fn attachment_missing_secret_deferral_is_bounded_and_explicit_retry_readmits() {
+    let (_dir, client, storage, reference) = offline_fixture().await;
+    assert!(
+        client
+            .prepare_background_attachment_download(&GroupId::new(vec![0xab; 16]), reference, 1024)
+            .unwrap()
+            .is_none()
+    );
+    let now = crate::unix_now_seconds();
+    // Earlier worker ticks already found the source-epoch material missing.
+    let mut at = now - 10_000;
+    admit_demands(&storage, at, false).unwrap();
+    let asset = storage
+        .due_attachment_acquisitions(at, 1)
+        .unwrap()
+        .remove(0);
+    for _ in 0..5 {
+        assert!(!storage.defer_attachment_preparation(&asset, at).unwrap());
+        at = storage
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .due
+            .unwrap();
+    }
+    assert!(at <= now);
+    let shared = RuntimeSharedServices::default();
+    let (http, mut completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    admission.ready().await;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    let status = storage
+        .attachment_acquisition_status(&asset)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::Blocked
+    );
+    assert_eq!(status.attempts, 0);
+    assert!(status.due.is_none());
+    let transfer = || {
+        storage
+            .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Failed);
+    assert!(completions.try_recv().is_err());
+    assert!(storage.explicitly_retry_attachment(&asset, now).unwrap());
+    assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Queued);
+}
+
+#[tokio::test]
+async fn attachment_native_explicit_retry_failures_exhaust_the_budget() {
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let now = crate::unix_now_seconds();
+    admit_demands(&storage, now, false).unwrap();
+    let asset = storage
+        .due_attachment_acquisitions(now, 1)
+        .unwrap()
+        .remove(0);
+    assert!(storage.explicitly_retry_attachment(&asset, now).unwrap());
+    let mut at = now;
+    for claim in 1..=4 {
+        let job = storage
+            .claim_attachment_acquisition(&asset, at, at + EXPLICIT_LEASE_SECONDS)
+            .unwrap()
+            .unwrap();
+        complete(
+            &client,
+            &job,
+            Err(AttachmentDownloadFailure::Retry(AppError::BlobStore(
+                "download returned HTTP 503".into(),
+            ))),
+            10000,
+        )
+        .unwrap();
+        let status = storage
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap();
+        if claim < 4 {
+            assert_eq!(
+                status.state,
+                storage_sqlite::AttachmentAcquisitionState::RetryScheduled
+            );
+            at = status.due.unwrap();
+        } else {
+            assert_eq!(
+                status.state,
+                storage_sqlite::AttachmentAcquisitionState::Blocked
+            );
+            assert!(status.due.is_none());
+        }
+    }
+    assert_eq!(
+        storage
+            .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+            .unwrap()
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentTransferState::RetryExhausted
+    );
+    assert!(
+        storage
+            .attachment_transfer_candidates(u32::MAX.into(), 32, true)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() {
     let (_dir, client, storage, _) = offline_fixture().await;
     let now = crate::unix_now_seconds();

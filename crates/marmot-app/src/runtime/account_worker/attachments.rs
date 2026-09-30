@@ -257,14 +257,17 @@ pub(super) fn schedule(
         };
         let prepared = match client.prepare_background_attachment_download(&group, reference, max) {
             Ok(Some(prepared)) => prepared,
-            // Local readiness is not a failed transfer. Defer only this candidate
-            // for one maintenance tick, preserving siblings and their attempts.
+            // Local readiness is not a failed transfer. Defer only this candidate,
+            // preserving siblings and their attempts. The deferral streak is
+            // bounded: material that never arrives fails the job, not the loop.
             Ok(None) | Err(_) => {
-                storage.finish_attachment_preparation(
-                    &candidate,
-                    now,
-                    Some(now.saturating_add(15)),
-                )?;
+                if storage.defer_attachment_preparation(&candidate, now)? {
+                    tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "attachment_acquisition",
+                        "attachment decryption material stayed unavailable; acquisition failed"
+                    );
+                }
                 return Ok(more);
             }
         };

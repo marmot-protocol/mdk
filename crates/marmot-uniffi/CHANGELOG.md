@@ -21,6 +21,14 @@
   names the earliest active kind-7 for that emoji, whose custom image
   `list_media` returns under the same message id.
 
+### Changed
+
+- Native and explicit attachment downloads now reach a terminal state instead of
+  staying `RetryScheduled` indefinitely: `RetryExhausted` after the shared retry
+  budget, `Failed` when the blob is gone (404/410 everywhere) or its epoch key
+  never becomes available. Each app restart during a download spends one of four
+  claims; hosts should offer Retry, which starts a fresh budget.
+
 
 ## 0.11.0 - 2026-09-29
 

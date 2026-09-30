@@ -100,6 +100,19 @@ Obsolete references return false; obsolete/unavailable slots return no reference
 cannot download attachments before acceptance. These commands persist intent without waiting for
 network readiness; acquisition needs an active, non-frozen account runtime.
 
+No acquisition stays scheduled indefinitely. Every job (native automatic, explicit and
+host-managed) spends the same per-cycle budget of four claims and 64 network attempts
+(see [budgets](#host-managed-automatic-acquisition-0104)); a retryable failure that spends it
+reports `RetryExhausted`. HTTP 404 or 410 means that locator cannot serve the blob: when every
+candidate locator is missing or otherwise permanently unusable, the job reports `Failed` at
+once. Other 4xx, 5xx, timeouts and connection failures stay retryable within the budget. When
+the group's decryption material for the attachment's source epoch is not available locally, the
+job waits as `RetryScheduled` without spending an attempt (15 seconds, doubling) and reports
+`Failed` on the sixth consecutive miss, about eight minutes after the first. Disk-reserve and
+retained-quota pressure still defer without that limit. `Failed` and `RetryExhausted` survive
+restart and repeated demand; render a download action, and let only a deliberate Retry or
+download-again start a new cycle.
+
 `attachmentDownloadPolicy` / `setAttachmentDownloadPolicy` read/write a durable per-account
 policy. In `NativeAutomatic` mode automatic acquisition defaults on: 2 GiB retained quota, 256 MiB free-disk reserve plus
 SQLite/WAL headroom, 64 MiB automatic ciphertext ceiling, one runtime-wide acquisition at a time.
@@ -127,11 +140,11 @@ Android hosts with a network/type preference matrix should construct MDK with
 `MarmotOptions.attachment_acquisition_mode = HostManaged` **before startup**.
 The default remains `NativeAutomatic` for existing consumers. Host-managed mode
 never turns projection discovery into automatic demand. Both modes use the same
-SQLite jobs, source history, quotas, local reads and explicit controls. The new
-retry budgets and terminal retention-failure behavior apply only to jobs opted in
+SQLite jobs, source history, quotas, local reads, explicit controls and retry budgets.
+Terminal retention-failure behavior (`CompletedUnretained`) applies only to jobs opted in
 through `requestAutomaticAttachment` or claimed as automatic work by a HostManaged worker (including
-restored persisted jobs). Pure explicit requests are not opted in. Existing native jobs keep
-their retry behavior; opting a job in is durable even if runtime mode later changes.
+restored persisted jobs). Pure explicit requests are not opted in. Opting a job in is durable even
+if runtime mode later changes.
 
 Host-managed automatic permission starts denied for every account on each runtime
 construction, including newly created/imported accounts. Sign-out/removal also
@@ -186,7 +199,7 @@ cancellation, retry deadlines, progress, budgets and their opaque reference.
 | Failed / Cancelled / Removed | Preserves terminal state or suppression. |
 | Unavailable | Source is obsolete, hidden, expired, rejected or otherwise unusable. |
 
-For host-managed demand, the lifetime budget is **four acquisition attempts and
+For every job, the lifetime budget is **four acquisition attempts and
 at most 64 network attempts per source/request cycle**. The network ceiling is a
 separate bound: transport retries, redirects, range restarts, failed DNS/host setup
 and fallback each spend one. A transient 503 retry therefore does not by itself

@@ -1053,8 +1053,18 @@ where
             });
         }
         if !status.is_redirection() {
+            let error = AppError::BlobStore(format!("download returned HTTP {}", status.as_u16()));
+            // A content-addressed blob the server reports absent or gone will
+            // not reappear at this locator; other statuses may be transient.
             return Err(
-                AppError::BlobStore(format!("download returned HTTP {}", status.as_u16())).into(),
+                if matches!(
+                    status,
+                    reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+                ) {
+                    AttachmentDownloadFailure::Stop(error)
+                } else {
+                    error.into()
+                },
             );
         }
 

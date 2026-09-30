@@ -66,6 +66,15 @@
   Such a grant used to fail on every attempt until the next request. Each pass now compares
   the recorded incremental-history debt rather than the live routing snapshot, so it
   queries exactly the relays its settlement certifies. (#2100)
+- Attachments from a message whose epoch the group had already left no longer spin in
+  `RetryScheduled` forever. The receiver cached only the current epoch's encrypted-media
+  key, so a media message surfaced after a commit (common for agent sends) had no key.
+  The key for the message's source epoch is now derived from the engine's retained epoch
+  state (newest five epochs) and cached at projection.
+- Attachment acquisition always ends: missing-key deferrals back off and fail after about
+  eight minutes, the retry budget now applies to native and explicit jobs, and a blob that
+  every Blossom server reports as 404/410 fails without retrying. Explicit Retry starts a
+  fresh budget.
 
 ## 0.11.0 - 2026-09-29
 

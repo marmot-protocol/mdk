@@ -20997,6 +20997,147 @@ fn encrypted_media_warm_skips_authoritative_rechecks_at_an_unchanged_epoch() {
     });
 }
 
+/// A convergence pass merges every commit it adopts before the applications
+/// replayed between them are drained, and a delayed message is read from
+/// retained past-epoch secrets, so a media message can be projected after its
+/// source epoch ended. Its attachments stay keyed to that epoch, which must be
+/// cached for background acquisition; caching the then-current epoch instead
+/// left the download deferred forever.
+#[test]
+fn received_media_from_a_left_epoch_caches_its_source_epoch_secret() {
+    run_composed_app_runtime_test("received-media-left-epoch", || async {
+        use cgka_traits::app_components::{
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("left epoch media", &[]).await.unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
+        let storage = app.account_storage("alice").unwrap();
+
+        // Group creation warms its founding epoch, so the media message comes
+        // from a later epoch that no warm pass ever saw as current. Raw engine
+        // commits advance it without the app's subscription-refresh warm.
+        let founding_epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap();
+        let (source_epoch, source_secret) = client
+            .runtime
+            .exporter_secret_with_epoch(&group_id, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
+            .unwrap();
+        assert!(source_epoch > founding_epoch);
+        let reference = MediaAttachmentReference {
+            locators: vec![MediaLocator {
+                kind: "blossom-v1".to_owned(),
+                value: format!("https://media.example/{}.bin", hex::encode([0x66_u8; 32])),
+            }],
+            ciphertext_sha256: hex::encode([0x66_u8; 32]),
+            plaintext_sha256: hex::encode([0x14_u8; 32]),
+            nonce_hex: hex::encode([0x25_u8; 12]),
+            file_name: "report.pdf".to_owned(),
+            media_type: "application/pdf".to_owned(),
+            version: "encrypted-media-v2".to_owned(),
+            source_epoch: source_epoch.0,
+            dim: None,
+            thumbhash: None,
+        };
+        let payload = crate::messages::encode_inner_event(
+            &build_inner_event(
+                &AppMessageIntent::Media {
+                    attachments: vec![reference.clone()],
+                    caption: None,
+                },
+                &sender_hex,
+                unix_now_seconds(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let sent = client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: payload.clone(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        assert!(sent.failures.is_empty());
+
+        // The commit that ends the source epoch lands before the message is
+        // projected, as it does inside one convergence pass.
+        client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > source_epoch.0);
+        assert_eq!(
+            storage
+                .encrypted_media_epoch_secret(
+                    &group_id_hex,
+                    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    source_epoch.0,
+                )
+                .unwrap(),
+            None,
+            "precondition: the source epoch was never cached while current"
+        );
+
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+                authority: None,
+                group_id: group_id.clone(),
+                message_id: sent.reports[0].message_id.clone(),
+                sender: MemberId::new(hex::decode(&sender_hex).unwrap()),
+                epoch: source_epoch,
+                payload,
+                retention: None,
+            }],
+            ..Default::default()
+        };
+        let summary = client
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        assert_eq!(summary.messages.len(), 1);
+
+        assert_eq!(
+            storage
+                .encrypted_media_epoch_secret(
+                    &group_id_hex,
+                    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    source_epoch.0,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(source_secret.as_ref()),
+            "the cached key must be the source epoch's exporter secret"
+        );
+        assert!(
+            client
+                .prepare_background_attachment_download(&group_id, reference, 1024 * 1024)
+                .unwrap()
+                .is_some(),
+            "background acquisition must find the source epoch's key"
+        );
+    });
+}
+
 #[test]
 fn idle_sync_skips_the_checkpoint_route_recomputation() {
     run_composed_app_runtime_test("idle-sync-checkpoint-skip", || async {

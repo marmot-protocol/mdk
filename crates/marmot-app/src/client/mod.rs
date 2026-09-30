@@ -5004,8 +5004,9 @@ impl AppClient {
             .await
     }
 
-    /// Storage-only preparation for automatic work. Secret warming belongs to
-    /// sync; missing/retired epoch material cannot trigger engine hydration here.
+    /// Storage-only preparation for automatic work. Received-message projection
+    /// caches each message's source-epoch secret and sync warms current epochs;
+    /// missing/retired epoch material cannot trigger engine hydration here.
     pub(crate) fn prepare_background_attachment_download(
         &self,
         group_id: &GroupId,
@@ -5690,16 +5691,11 @@ impl AppClient {
         {
             return Ok(SecretBytes::new(secret));
         }
-        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
-            group_id,
-            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
-            32,
-        )?;
-        if epoch.0 == source_epoch {
+        if let Some(secret) = self.exportable_encrypted_media_secret(group_id, source_epoch)? {
             self.remember_encrypted_media_epoch_secret_for_component(
                 group_id,
                 component_id,
-                epoch.0,
+                source_epoch,
                 secret.as_ref(),
             )?;
             if let Some(secret) =
@@ -5732,6 +5728,86 @@ impl AppClient {
             32,
         )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())
+    }
+
+    /// Cache the exporter secret a received media message's attachments are
+    /// keyed to. The message names its source epoch, which the group may have
+    /// left before the message is projected: a convergence pass merges the
+    /// commits it adopts before its replayed applications are drained, and a
+    /// delayed message is read from retained past-epoch secrets. Caching the
+    /// then-current epoch instead leaves every such attachment unreadable.
+    fn remember_received_encrypted_media_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+        tags: &[Vec<String>],
+    ) -> Result<(), AppError> {
+        let allow_loopback = self.app.allow_loopback_blob_endpoints();
+        let mut component_ids = Vec::new();
+        for tag in tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        {
+            let Ok(reference) = crate::media::media_attachment_from_imeta_tag(
+                tag,
+                Some(source_epoch),
+                allow_loopback,
+            ) else {
+                continue;
+            };
+            let Ok(version) = EncryptedMediaVersion::parse(&reference.version) else {
+                continue;
+            };
+            let component_id = version.component_id();
+            if !component_ids.contains(&component_id)
+                && self
+                    .cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
+                    .is_none()
+            {
+                component_ids.push(component_id);
+            }
+        }
+        if component_ids.is_empty() {
+            return Ok(());
+        }
+        let secret = self
+            .exportable_encrypted_media_secret(group_id, source_epoch)?
+            .ok_or_else(|| {
+                AppError::InvalidEncryptedMedia(format!(
+                    "encrypted media secret unavailable for epoch {source_epoch}"
+                ))
+            })?;
+        for component_id in component_ids {
+            self.remember_encrypted_media_epoch_secret_for_component(
+                group_id,
+                component_id,
+                source_epoch,
+                secret.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The group's encrypted-media exporter secret at `source_epoch`: exported
+    /// live while that epoch is current, otherwise derived from the epoch's
+    /// retained anchor. `None` once the epoch has left the anchor horizon.
+    fn exportable_encrypted_media_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+    ) -> Result<Option<SecretBytes>, AppError> {
+        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
+            32,
+        )?;
+        if epoch.0 == source_epoch {
+            return Ok(Some(secret));
+        }
+        Ok(self.runtime.retained_encrypted_media_exporter_secret(
+            group_id,
+            cgka_traits::EpochId(source_epoch),
+        )?)
     }
 }
 

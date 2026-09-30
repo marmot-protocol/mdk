@@ -816,6 +816,17 @@ impl AccountDeviceSession {
         Ok((epoch, secret))
     }
 
+    /// Encrypted-media exporter secret of a past epoch, derived from its
+    /// retained anchor; `Ok(None)` when no usable anchor remains.
+    pub fn retained_encrypted_media_exporter_secret(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<Option<SecretBytes>, EngineError> {
+        self.engine
+            .retained_encrypted_media_exporter_secret(group_id, epoch)
+    }
+
     pub fn safe_export_secret_with_epoch(
         &mut self,
         group_id: &GroupId,

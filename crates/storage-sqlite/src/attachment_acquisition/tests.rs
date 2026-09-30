@@ -2443,45 +2443,157 @@ fn automatic_publication_receipt_does_not_override_cancel_or_removal() {
 }
 
 #[test]
-fn native_attachment_retry_and_retention_failures_do_not_acquire_host_limits() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    seed(&store, "one");
-    let asset = request(&store, "one");
-    for now in 12..22 {
-        let job = store
-            .claim_attachment_acquisition(&asset, now, 100)
-            .unwrap()
-            .unwrap();
-        for _ in 0..8 {
-            assert!(store.begin_attachment_network_attempt(&job, now).unwrap());
+fn native_attachment_retries_spend_the_shared_budget_but_not_the_receipt_contract() {
+    for explicit in [false, true] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed(&store, "one");
+        let asset = request(&store, "one");
+        if explicit {
+            assert!(store.explicitly_retry_attachment(&asset, 11).unwrap());
         }
-        assert!(store.mark_attachment_body_completed(&job, now).unwrap());
-        assert_eq!(
+        for now in 12..16 {
+            let job = store
+                .claim_attachment_acquisition(&asset, now, 100)
+                .unwrap()
+                .unwrap();
+            assert!(store.begin_attachment_network_attempt(&job, now).unwrap());
+            // A native verified body that cannot be retained stays retryable;
+            // only opted-in jobs become CompletedUnretained.
+            assert!(store.mark_attachment_body_completed(&job, now).unwrap());
+            assert_eq!(
+                store
+                    .complete_attachment_acquisition(&job, BODY, now, 0)
+                    .unwrap(),
+                AttachmentPublishResult::CapacityBlocked
+            );
+            assert!(
+                store
+                    .fail_attachment_acquisition(&job, Some(now + 1))
+                    .unwrap()
+            );
+            assert_eq!(
+                transfer(&store, "one", true).state,
+                if now < 15 {
+                    AttachmentTransferState::RetryScheduled
+                } else {
+                    AttachmentTransferState::RetryExhausted
+                },
+                "explicit={explicit} claim={now}"
+            );
+        }
+        assert!(
             store
-                .complete_attachment_acquisition(&job, BODY, now, 0)
-                .unwrap(),
-            AttachmentPublishResult::CapacityBlocked
+                .claim_attachment_acquisition(&asset, 30, 100)
+                .unwrap()
+                .is_none()
         );
         assert!(
             store
-                .fail_attachment_acquisition(&job, Some(now + 1))
+                .due_attachment_acquisitions(10_000, 64)
                 .unwrap()
+                .is_empty()
         );
+        // Ordinary demand cannot revive the job; explicit retry starts a new cycle.
+        assert_eq!(request(&store, "one"), asset);
+        assert!(
+            store
+                .due_attachment_acquisitions(10_000, 64)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.explicitly_retry_attachment(&asset, 30).unwrap());
+        let job = store
+            .claim_attachment_acquisition(&asset, 30, 100)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            transfer(&store, "one", true).state,
-            AttachmentTransferState::RetryScheduled
+            store
+                .complete_attachment_acquisition(&job, BODY, 30, 10000)
+                .unwrap(),
+            AttachmentPublishResult::Published
         );
     }
+}
+
+#[test]
+fn native_attachment_network_budget_is_terminal() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let asset = request(&store, "one");
     let job = store
-        .claim_attachment_acquisition(&asset, 30, 100)
+        .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
+    for _ in 0..64 {
+        assert!(store.begin_attachment_network_attempt(&job, 12).unwrap());
+    }
+    assert!(!store.begin_attachment_network_attempt(&job, 12).unwrap());
+    assert!(store.fail_attachment_acquisition(&job, Some(13)).unwrap());
     assert_eq!(
-        store
-            .complete_attachment_acquisition(&job, BODY, 30, 10000)
-            .unwrap(),
-        AttachmentPublishResult::Published
+        transfer(&store, "one", true).state,
+        AttachmentTransferState::RetryExhausted
     );
+    assert!(
+        store
+            .due_attachment_acquisitions(10_000, 64)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn attachment_preparation_deferral_backs_off_then_fails_until_explicit_retry() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let asset = request(&store, "one");
+    let status = |store: &SqliteAccountStorage| {
+        store
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+    };
+    let mut now = 11;
+    for delay in [15, 30, 60, 120, 240] {
+        assert!(!store.defer_attachment_preparation(&asset, now).unwrap());
+        let deferred = status(&store);
+        assert_eq!(deferred.state, AttachmentAcquisitionState::RetryScheduled);
+        assert_eq!(deferred.due, Some(now + delay));
+        assert_eq!(deferred.attempts, 0, "deferral is not a transfer attempt");
+        // A job that is not yet due is left untouched.
+        assert!(
+            !store
+                .defer_attachment_preparation(&asset, now + delay - 1)
+                .unwrap()
+        );
+        assert_eq!(status(&store).due, Some(now + delay));
+        now += delay;
+    }
+    assert!(store.defer_attachment_preparation(&asset, now).unwrap());
+    assert_eq!(status(&store).state, AttachmentAcquisitionState::Blocked);
+    assert_eq!(
+        transfer(&store, "one", true).state,
+        AttachmentTransferState::Failed
+    );
+    assert_eq!(request(&store, "one"), asset);
+    assert!(
+        store
+            .due_attachment_acquisitions(u32::MAX.into(), 64)
+            .unwrap()
+            .is_empty()
+    );
+    // Explicit retry starts a fresh window; a claim also ends the streak.
+    assert!(store.explicitly_retry_attachment(&asset, now).unwrap());
+    for _ in 0..(MAX_PREPARATION_DEFERRALS - 1) {
+        assert!(!store.defer_attachment_preparation(&asset, now).unwrap());
+        now = status(&store).due.unwrap();
+    }
+    let job = store
+        .claim_attachment_acquisition(&asset, now, now + 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.fail_attachment_acquisition(&job, Some(now)).unwrap());
+    assert!(!store.defer_attachment_preparation(&asset, now).unwrap());
+    assert_eq!(status(&store).due, Some(now + 15));
 }
 
 #[test]
@@ -2616,7 +2728,7 @@ fn attachment_terminal_failure_clears_permission_pause() {
             }
             store.pause_automatic_attachments(13).unwrap();
             // Cover hard failure and the exhausted-budget terminal arm.
-            let retry = (opted_in && exhausted).then_some(30);
+            let retry = exhausted.then_some(30);
             assert!(store.fail_attachment_acquisition(&job, retry).unwrap());
             let paused: bool = store
                 .lock()
@@ -2630,7 +2742,7 @@ fn attachment_terminal_failure_clears_permission_pause() {
             assert!(!paused);
             assert_eq!(
                 transfer(&store, "one", true).state,
-                if opted_in && exhausted {
+                if exhausted {
                     AttachmentTransferState::RetryExhausted
                 } else {
                     AttachmentTransferState::Failed

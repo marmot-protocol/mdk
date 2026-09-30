@@ -2670,6 +2670,95 @@ impl<S: StorageProvider> Engine<S> {
         Ok(resolved)
     }
 
+    /// Derive the encrypted-media exporter secret of an epoch on this device's
+    /// canonical lineage from that epoch's retained anchor.
+    ///
+    /// OpenMLS exports only from the live epoch, yet the app can learn of an
+    /// application message after its source epoch ended: a convergence pass
+    /// adopts commits and replays the applications between them before any
+    /// event is drained, and a delayed message is read from retained
+    /// past-epoch secrets after the group advanced. Media in such a message
+    /// is keyed to its source epoch, whose anchor stays retained inside the
+    /// same horizon that bounds delivering the message at all.
+    ///
+    /// `Ok(None)` means no usable anchor: none retained for `epoch`, the
+    /// anchor restores a different epoch, or its own leaf is evicted.
+    pub fn retained_encrypted_media_exporter_secret(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<Option<cgka_traits::SecretBytes>, EngineError> {
+        // A quarantined group's MLS state may load fine; never export it.
+        self.ensure_group_live(group_id)?;
+        let snapshot_name = self
+            .storage
+            .list_group_snapshots(group_id)?
+            .into_iter()
+            .find(|name| retained_anchor_epoch_from_snapshot_name(name) == Some(epoch.0));
+        let Some(snapshot_name) = snapshot_name else {
+            return Ok(None);
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-encrypted-media-restore/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(epoch.0.to_be_bytes());
+        let guard = SnapshotRollbackGuard::create_group_state(
+            &self.storage,
+            group_id.clone(),
+            RewindSite::EncryptedMediaSource,
+            &hex::encode(&hasher.finalize()[..8]),
+        )?;
+        let secret =
+            self.encrypted_media_secret_from_group_snapshot(group_id, &snapshot_name, epoch);
+        guard.commit()?;
+        secret
+    }
+
+    fn encrypted_media_secret_from_group_snapshot(
+        &self,
+        group_id: &GroupId,
+        snapshot_name: &str,
+        epoch: EpochId,
+    ) -> Result<Option<cgka_traits::SecretBytes>, EngineError> {
+        match self
+            .storage
+            .rollback_group_state_to_snapshot(group_id, snapshot_name)
+        {
+            Ok(()) => {}
+            Err(StorageError::SnapshotMissing(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = MlsGroup::load(
+            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|error| {
+            EngineError::Backend(format!("load encrypted media source snapshot: {error:?}"))
+        })?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        // An anchor taken before an own commit merged still holds that staged
+        // commit; the group itself is at the anchor epoch, which is the one
+        // exported here.
+        if mls_group.epoch().as_u64() != epoch.0 || !mls_group.is_active() {
+            return Ok(None);
+        }
+        let secret = mls_group
+            .export_secret(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
+                    &provider,
+                ),
+                group_lifecycle::EXPORTER_LABEL,
+                group_lifecycle::ENCRYPTED_MEDIA_EXPORTER_CONTEXT,
+                32,
+            )
+            .map_err(|error| {
+                EngineError::Backend(format!("retained encrypted media export_secret: {error:?}"))
+            })?;
+        Ok(Some(cgka_traits::SecretBytes::new(secret)))
+    }
+
     pub(crate) fn available_past_peel_snapshots(
         &self,
         group_id: &GroupId,

@@ -158,9 +158,9 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if !partial::valid_attempt(&conn, job, now)? { return Ok(false); }
-            Ok(conn.execute("UPDATE attachment_acquisition SET network_attempts=min(network_attempts+automatic_history,2147483647)
+            Ok(conn.execute("UPDATE attachment_acquisition SET network_attempts=min(network_attempts+1,2147483647)
                 WHERE token=?1 AND (automatic_history=0 OR body_completed=0) AND cancelled=0
-                AND (automatic_history=0 OR network_attempts<64) AND permission_paused=0 AND (explicit_request=1 OR COALESCE((SELECT automatic FROM attachment_download_policy WHERE id=1),1)=1)",
+                AND network_attempts<64 AND permission_paused=0 AND (explicit_request=1 OR COALESCE((SELECT automatic FROM attachment_download_policy WHERE id=1),1)=1)",
                 [&job.reference.token]).storage()? == 1)
         })
     }
@@ -363,7 +363,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
-            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
+            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
                 WHERE token=?1 AND (state IN(0,1,2,4,5) OR (state=3 AND NOT EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token))) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
                 params![reference.token,u64_to_i64(now)?]).storage()?==1)
         })
@@ -592,7 +592,7 @@ fn transfer_status(
                     _ if cancelled => AttachmentTransferState::Cancelled,
                     _ if r.get::<_,bool>(14)? && r.get::<_,bool>(10)? && stored_state!=1 => AttachmentTransferState::CompletedUnretained,
                     _ if size_blocked => AttachmentTransferState::PolicyBlocked,
-                    _ if r.get::<_,bool>(14)? && (nonnegative(r,11)? >= 64 || nonnegative(r,13)? >= 4) && stored_state!=1 => AttachmentTransferState::RetryExhausted,
+                    _ if (nonnegative(r,11)? >= 64 || nonnegative(r,13)? >= 4) && stored_state!=1 => AttachmentTransferState::RetryExhausted,
                     _ if r.get::<_,bool>(15)? && !r.get::<_,bool>(10)? => AttachmentTransferState::Paused,
                     4 => AttachmentTransferState::Failed,
                     _ if !automatic && !explicit => AttachmentTransferState::Paused,

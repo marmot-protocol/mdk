@@ -8,6 +8,15 @@
   one visible poll (1..=100 per page, `(voted_at, voter)` cursor). The timeline
   tally and this read share one resolver, so the per-voter pages always sum to
   `PollProjection`'s counts and `participants`. (#2091)
+- `SqliteAccountStorage::defer_attachment_preparation` counts consecutive
+  missing-key deferrals (migration 0099, `preparation_deferrals`) with backoff
+  and fails the acquisition after the sixth.
+
+### Changed
+
+- The attachment retry budget (4 claims, 64 network attempts) now applies to
+  native and explicit jobs, not only host-managed ones; exhausted jobs report
+  `RetryExhausted`.
 
 ### Fixed
 

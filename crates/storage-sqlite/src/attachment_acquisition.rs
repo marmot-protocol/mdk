@@ -17,6 +17,16 @@ pub const MAX_RETAINED_ATTACHMENT_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_ATTACHMENT_LOCAL_READ_BYTES: usize = 1024 * 1024;
 pub const ATTACHMENT_ACQUISITION_BATCH_LIMIT: usize = 64;
 const MAX_DESCRIPTOR_BYTES: usize = 16384;
+/// Retry budget shared by every job kind for one source/request cycle: four
+/// claims and 64 outbound network attempts. Only explicit retry starts a new
+/// cycle. An opted-in automatic job also ends at its verified-body receipt.
+const RETRY_EXHAUSTED: &str = "(acquisition_attempts>=4 OR network_attempts>=64
+ OR (automatic_history=1 AND body_completed=1))";
+/// Consecutive local-readiness deferrals before a job fails. With 15-second
+/// doubling this spans about eight minutes: far beyond the normal readiness lag
+/// (source-epoch media material lands during projection or the post-sync warm
+/// pass), yet material that never arrives cannot keep a job scheduled forever.
+const MAX_PREPARATION_DEFERRALS: u64 = 6;
 
 /// Shared permission buckets. Discriminants are persisted by migration 0087.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,13 +357,13 @@ impl SqliteAccountStorage {
             // Only policy parking is resumable through ordinary demand. Failed
             // jobs still require explicit retry; backoff and leases stay intact.
             conn.execute(
-                "INSERT INTO attachment_acquisition(
+                &format!("INSERT INTO attachment_acquisition(
                     token,group_id_hex,message_id_hex,attachment_index,
                     source_message_id_hex,source_epoch,slot_json,plaintext_digest,expires_at,due,permission_category)
                  VALUES(randomblob(16),?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(group_id_hex,message_id_hex,attachment_index)
                  DO UPDATE SET state=0,due=excluded.due,permission_category=excluded.permission_category
-                 WHERE attachment_acquisition.state=5 AND attachment_acquisition.cancelled=0 AND (attachment_acquisition.automatic_history=0 OR (attachment_acquisition.body_completed=0 AND attachment_acquisition.network_attempts<64 AND attachment_acquisition.acquisition_attempts<4)) AND attachment_acquisition.permission_paused=0",
+                 WHERE state=5 AND cancelled=0 AND NOT {RETRY_EXHAUSTED} AND permission_paused=0"),
                 params![
                     group,
                     message,
@@ -421,8 +431,8 @@ impl SqliteAccountStorage {
         if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
             return Err(invalid("invalid attachment resume limit"));
         }
-        self.lock()?.execute("UPDATE attachment_acquisition SET state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN 4 WHEN permission_paused=1 THEN 5 ELSE 0 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?1 END,attempt=NULL
-            WHERE token IN (SELECT token FROM attachment_acquisition WHERE state=1 ORDER BY token LIMIT ?2)",
+        self.lock()?.execute(&format!("UPDATE attachment_acquisition SET state=CASE WHEN {RETRY_EXHAUSTED} THEN 4 WHEN permission_paused=1 THEN 5 ELSE 0 END,due=CASE WHEN {RETRY_EXHAUSTED} THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?1 END,attempt=NULL
+            WHERE token IN (SELECT token FROM attachment_acquisition WHERE state=1 ORDER BY token LIMIT ?2)"),
             params![u64_to_i64(now)?,limit as i64]).storage()
     }
 
@@ -451,7 +461,7 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// Defer readiness checks without recording a transfer attempt, or block a
+    /// Defer resource admission without recording a transfer attempt, or block a
     /// structurally invalid source. Never replace an active lease or newer job.
     pub fn finish_attachment_preparation(
         &self,
@@ -480,6 +490,55 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Defer a due job whose local decryption material is not ready, without
+    /// claiming it or spending a transfer attempt. Consecutive deferrals back off
+    /// from 15 seconds, doubling; reaching `MAX_PREPARATION_DEFERRALS` blocks the
+    /// job until explicit retry. Claim and explicit retry reset the streak.
+    /// Returns true when this deferral made the job terminal.
+    pub fn defer_attachment_preparation(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+    ) -> StorageResult<bool> {
+        let now_sql = u64_to_i64(now)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(false);
+            }
+            let deferrals = conn
+                .query_row(
+                    "SELECT preparation_deferrals FROM attachment_acquisition
+                     WHERE token=?1 AND due<=?2 AND state IN (0,2)",
+                    params![reference.token, now_sql],
+                    |r| nonnegative(r, 0),
+                )
+                .optional()
+                .storage()?;
+            let Some(deferrals) = deferrals.map(|n| n.saturating_add(1)) else {
+                return Ok(false);
+            };
+            let exhausted = deferrals >= MAX_PREPARATION_DEFERRALS;
+            let due = (!exhausted)
+                .then(|| now.saturating_add(15_u64 << (deferrals - 1).min(8)))
+                .map(u64_to_i64)
+                .transpose()?;
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=?3,due=?4,preparation_deferrals=?5
+                 WHERE token=?1 AND due<=?2 AND state IN (0,2)",
+                params![
+                    reference.token,
+                    now_sql,
+                    if exhausted { 4 } else { 2 },
+                    due,
+                    u64_to_i64(deferrals)?
+                ],
+            )
+            .storage()?;
+            Ok(exhausted)
+        })
+    }
+
     /// Lease deadlines are chosen by the runtime transfer policy. Expired leases
     /// can be reclaimed after process death; the new attempt fences late results.
     pub fn claim_attachment_acquisition(
@@ -499,7 +558,7 @@ impl SqliteAccountStorage {
                 return Ok(None);
             }
             // A completed body or exhausted budget must survive lease recovery.
-            conn.execute("UPDATE attachment_acquisition SET state=4,due=NULL,attempt=NULL WHERE token=?1 AND due<=?2 AND state<>3 AND (automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4))", params![reference.token, now]).storage()?;
+            conn.execute(&format!("UPDATE attachment_acquisition SET state=4,due=NULL,attempt=NULL WHERE token=?1 AND due<=?2 AND state<>3 AND {RETRY_EXHAUSTED}"), params![reference.token, now]).storage()?;
             let claimable: bool = conn
                 .query_row(
                     &format!(
@@ -526,7 +585,7 @@ impl SqliteAccountStorage {
             conn.execute(
                 "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),progress_phase=0,body_completed=CASE WHEN automatic_history=0 THEN 0 ELSE body_completed END,
                     progress_epoch=progress_epoch+1,progress_received=0,progress_total=NULL,
-                    attempts=min(attempts+1,2147483647),acquisition_attempts=min(acquisition_attempts+automatic_history,2147483647) WHERE token=?1",
+                    attempts=min(attempts+1,2147483647),acquisition_attempts=min(acquisition_attempts+1,2147483647),preparation_deferrals=0 WHERE token=?1",
                 params![reference.token, deadline],
             )
             .storage()?;
@@ -643,7 +702,8 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// None blocks until an explicit retry; Some schedules a later attempt. Never
+    /// None blocks until an explicit retry; Some schedules a later attempt unless
+    /// the job's retry budget is spent, which blocks it until explicit retry. Never
     /// persist an error string, URL, secret or decrypted content as job metadata.
     pub fn fail_attachment_acquisition(
         &self,
@@ -657,8 +717,8 @@ impl SqliteAccountStorage {
         }
         Ok(conn
             .execute(
-                "UPDATE attachment_acquisition SET state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN 4 WHEN permission_paused=1 AND ?4 IS NOT NULL THEN 5 ELSE ?3 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?4 END,retry_not_before=CASE WHEN permission_paused=1 THEN COALESCE(?4,retry_not_before) ELSE retry_not_before END,permission_paused=CASE WHEN ?4 IS NULL OR (automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4)) THEN 0 ELSE permission_paused END,attempt=NULL
-             WHERE token=?1 AND state=1 AND attempt=?2",
+                &format!("UPDATE attachment_acquisition SET state=CASE WHEN {RETRY_EXHAUSTED} THEN 4 WHEN permission_paused=1 AND ?4 IS NOT NULL THEN 5 ELSE ?3 END,due=CASE WHEN {RETRY_EXHAUSTED} THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?4 END,retry_not_before=CASE WHEN permission_paused=1 THEN COALESCE(?4,retry_not_before) ELSE retry_not_before END,permission_paused=CASE WHEN ?4 IS NULL OR {RETRY_EXHAUSTED} THEN 0 ELSE permission_paused END,attempt=NULL
+             WHERE token=?1 AND state=1 AND attempt=?2"),
                 params![
                     job.reference.token,
                     job.attempt,
@@ -682,7 +742,7 @@ impl SqliteAccountStorage {
         }
         Ok(conn
             .execute(
-                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0
+                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
              WHERE token=?1 AND state IN (2,4,5)",
                 params![reference.token, u64_to_i64(now)?],
             )

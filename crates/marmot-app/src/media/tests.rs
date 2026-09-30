@@ -1603,8 +1603,9 @@ async fn download_prepare_stays_local() {
         .prepare_encrypted_media_download(&group, reference.clone())
         .await
         .unwrap();
-    // Remove only the historical cache entries; the current exporter cannot
-    // recover this original reference after the group has advanced.
+    // Remove only the historical cache entries. The current exporter cannot
+    // recover this original reference after the group has advanced, but the
+    // source epoch's retained MLS anchor can, without leaving the device.
     let path = app.account_storage_path("alice");
     let keys = app.account_home().load_signing_keys("alice").unwrap();
     let key = app
@@ -1617,17 +1618,36 @@ async fn download_prepare_stays_local() {
         storage_sqlite::SqlCipherHardening::cipher_only(),
     )
     .unwrap();
-    assert!(
-        connection
-            .execute(
-                "DELETE FROM encrypted_media_epoch_secrets WHERE group_id_hex = ?1 AND source_epoch = ?2",
-                rusqlite::params![
-                    hex::encode(group.as_slice()),
-                    i64::try_from(reference.source_epoch).unwrap(),
-                ],
-            )
-            .unwrap() > 0
-    );
+    let forget_source_epoch = || {
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM encrypted_media_epoch_secrets WHERE group_id_hex = ?1 AND source_epoch = ?2",
+                    rusqlite::params![
+                        hex::encode(group.as_slice()),
+                        i64::try_from(reference.source_epoch).unwrap(),
+                    ],
+                )
+                .unwrap()
+                > 0
+        );
+    };
+    forget_source_epoch();
+    client
+        .prepare_encrypted_media_download(&group, reference.clone())
+        .await
+        .expect("the source epoch's retained anchor recovers the secret");
+    assert_eq!(relay.subscription_count(), subscriptions);
+
+    // Past the five-epoch anchor horizon nothing on the device holds it.
+    while client.runtime.group_record(&group).unwrap().epoch.0 < reference.source_epoch + 6 {
+        client
+            .update_group_profile(&group, Some("advanced media again"), None)
+            .await
+            .unwrap();
+    }
+    forget_source_epoch();
+    let subscriptions = relay.subscription_count();
     let error = client
         .prepare_encrypted_media_download(&group, reference)
         .await
@@ -3281,22 +3301,54 @@ async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_w
             assert_eq!(result.unwrap().plaintext, b"authenticated plaintext");
         }
     }
-    let (mut reference, _) = attachment_worker_fixture(b"plaintext");
-    let server = spawn_http_response(http_not_found_response());
-    reference.locators = vec![MediaLocator {
-        kind: BLOSSOM_LOCATOR_KIND_V1.into(),
-        value: format!("{server}/{}", reference.ciphertext_sha256),
-    }];
-    assert!(matches!(
-        download_encrypted_media_classified(
+}
+
+#[tokio::test]
+async fn automatic_attachment_stops_only_when_every_locator_reports_the_blob_missing() {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.into()];
+    let status = |line: &str| {
+        format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+    };
+    let missing = || vec![status("404 Not Found")];
+    let gone = || vec![status("410 Gone")];
+    let limited = || vec![status("429 Too Many Requests")];
+    // Server errors are retried once within the candidate.
+    let unavailable = || vec![status("503 Service Unavailable"); 2];
+    for (servers, expected_stop) in [
+        (vec![missing()], true),
+        (vec![gone()], true),
+        (vec![missing(), gone()], true),
+        (vec![limited()], false),
+        (vec![vec![status("403 Forbidden")]], false),
+        (vec![unavailable()], false),
+        (vec![missing(), limited()], false),
+        (vec![unavailable(), missing()], false),
+    ] {
+        let (mut reference, _) = attachment_worker_fixture(b"plaintext");
+        reference.locators = servers
+            .into_iter()
+            .map(|responses| MediaLocator {
+                kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+                value: format!(
+                    "{}/{}",
+                    spawn_http_responses(responses),
+                    reference.ciphertext_sha256
+                ),
+            })
+            .collect();
+        let result = download_encrypted_media_classified(
             reference,
             &[7; 32],
             &[],
             &allowed,
             &BlossomHttpTransport::new(true),
-            None
+            None,
         )
-        .await,
-        Err(AttachmentDownloadFailure::Retry(_))
-    ));
+        .await;
+        match result {
+            Err(AttachmentDownloadFailure::Stop(_)) => assert!(expected_stop),
+            Err(AttachmentDownloadFailure::Retry(_)) => assert!(!expected_stop),
+            other => panic!("unexpected classification: {other:?}"),
+        }
+    }
 }

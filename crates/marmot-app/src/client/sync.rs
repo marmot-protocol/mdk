@@ -4936,7 +4936,11 @@ impl AppClient {
         )?;
         if retains_encrypted_media
             && self
-                .remember_current_encrypted_media_secret(&message.group_id)
+                .remember_received_encrypted_media_secret(
+                    &message.group_id,
+                    message.source_epoch,
+                    &message.tags,
+                )
                 .is_err()
         {
             tracing::warn!(
