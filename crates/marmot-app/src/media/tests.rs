@@ -3202,12 +3202,20 @@ async fn policy_refusal_on_the_first_hop_stays_unfetchable() {
 
 /// Shared runtime/media fixture: valid v2 ciphertext with a deterministic nonce.
 pub(crate) fn attachment_worker_fixture(plaintext: &[u8]) -> (MediaAttachmentReference, Vec<u8>) {
+    attachment_worker_fixture_with_secret(plaintext, &[7; 32])
+}
+
+/// `attachment_worker_fixture` encrypted under a caller-chosen epoch secret.
+pub(crate) fn attachment_worker_fixture_with_secret(
+    plaintext: &[u8],
+    media_secret: &[u8],
+) -> (MediaAttachmentReference, Vec<u8>) {
     let hash: [u8; 32] = Sha256::digest(plaintext).into();
     let mime = "application/octet-stream";
     let name = "fixture.bin";
     let nonce = [3; 12];
     let key =
-        derive_media_file_key(&[7; 32], EncryptedMediaVersion::V2, &hash, mime, name).unwrap();
+        derive_media_file_key(media_secret, EncryptedMediaVersion::V2, &hash, mime, name).unwrap();
     let aad = media_aad(EncryptedMediaVersion::V2, &hash, mime, name);
     let mut encrypted = plaintext.to_vec();
     ChaCha20Poly1305::new_from_slice(&key)

@@ -1956,6 +1956,7 @@ impl<S: StorageProvider> Engine<S> {
                 payload,
                 retention,
                 authority,
+                encrypted_media_secret,
                 ..
             } = observation
             else {
@@ -1981,6 +1982,7 @@ impl<S: StorageProvider> Engine<S> {
                 payload: payload.clone(),
                 retention: Some(*retention),
                 authority: *authority,
+                encrypted_media_secret: encrypted_media_secret.clone(),
             });
         }
         Ok(events)

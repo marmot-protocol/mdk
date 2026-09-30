@@ -191,13 +191,14 @@ Unknown free space fails closed. These are resource limits, not an OS background
 entitlement or mobile throughput evidence.
 
 Network failures back off durably from 15 seconds to one hour. New durable ciphertext
-checkpoint progress resets the failure streak; replaying an existing prefix does not. Every job
-kind spends one per-cycle budget of four claims and 64 network attempts; a retryable failure that
-exhausts it is terminal (`RetryExhausted`) until explicit retry. Unavailable local policy/secrets
-defer one candidate before claiming it, backing off from 15 seconds; no transfer attempt is
-consumed and due siblings keep their deadlines. The sixth consecutive deferral (about eight
-minutes) fails the job until explicit retry, so source-epoch material that never arrives cannot
-keep it scheduled. Integrity/decryption failures, publication digest mismatches, over-limit
+checkpoint progress resets the failure streak; replaying an existing prefix does not. Unavailable
+local policy/secrets defer one candidate before claiming it, backing off from 15 seconds; no
+transfer attempt is consumed and due siblings keep their deadlines. The sixth consecutive deferral
+(about eight minutes) fails the job until explicit retry, so source-epoch material that never
+arrives cannot keep it scheduled. Explicit work (Retry, download again) that finds no cached
+secret first derives it as the `DownloadMedia` command does, live or from the epoch's retained
+anchor, without hydrating; Retry therefore recovers rows projected before their source epoch was
+cached. Integrity/decryption failures, publication digest mismatches, over-limit
 responses and HTTP 404/410 require explicit retry; locator failover still runs, and a remaining
 transient candidate keeps the attempt retryable.
 Automatic transfers use three-minute leases around a two-minute transfer deadline.

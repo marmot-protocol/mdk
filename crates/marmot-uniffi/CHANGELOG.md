@@ -23,11 +23,11 @@
 
 ### Changed
 
-- Native and explicit attachment downloads now reach a terminal state instead of
-  staying `RetryScheduled` indefinitely: `RetryExhausted` after the shared retry
-  budget, `Failed` when the blob is gone (404/410 everywhere) or its epoch key
-  never becomes available. Each app restart during a download spends one of four
-  claims; hosts should offer Retry, which starts a fresh budget.
+- Attachment downloads report `Failed` instead of staying `RetryScheduled`
+  indefinitely when the blob is gone (404/410 everywhere) or its epoch key stays
+  unavailable for about eight minutes. Hosts should offer Retry: it derives a
+  missing key from retained epoch state, recovering attachments whose key was
+  never cached. Retry budgets are unchanged.
 
 
 ## 0.11.0 - 2026-09-29

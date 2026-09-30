@@ -158,9 +158,9 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if !partial::valid_attempt(&conn, job, now)? { return Ok(false); }
-            Ok(conn.execute("UPDATE attachment_acquisition SET network_attempts=min(network_attempts+1,2147483647)
+            Ok(conn.execute("UPDATE attachment_acquisition SET network_attempts=min(network_attempts+automatic_history,2147483647)
                 WHERE token=?1 AND (automatic_history=0 OR body_completed=0) AND cancelled=0
-                AND network_attempts<64 AND permission_paused=0 AND (explicit_request=1 OR COALESCE((SELECT automatic FROM attachment_download_policy WHERE id=1),1)=1)",
+                AND (automatic_history=0 OR network_attempts<64) AND permission_paused=0 AND (explicit_request=1 OR COALESCE((SELECT automatic FROM attachment_download_policy WHERE id=1),1)=1)",
                 [&job.reference.token]).storage()? == 1)
         })
     }
@@ -592,7 +592,7 @@ fn transfer_status(
                     _ if cancelled => AttachmentTransferState::Cancelled,
                     _ if r.get::<_,bool>(14)? && r.get::<_,bool>(10)? && stored_state!=1 => AttachmentTransferState::CompletedUnretained,
                     _ if size_blocked => AttachmentTransferState::PolicyBlocked,
-                    _ if (nonnegative(r,11)? >= 64 || nonnegative(r,13)? >= 4) && stored_state!=1 => AttachmentTransferState::RetryExhausted,
+                    _ if r.get::<_,bool>(14)? && (nonnegative(r,11)? >= 64 || nonnegative(r,13)? >= 4) && stored_state!=1 => AttachmentTransferState::RetryExhausted,
                     _ if r.get::<_,bool>(15)? && !r.get::<_,bool>(10)? => AttachmentTransferState::Paused,
                     4 => AttachmentTransferState::Failed,
                     _ if !automatic && !explicit => AttachmentTransferState::Paused,

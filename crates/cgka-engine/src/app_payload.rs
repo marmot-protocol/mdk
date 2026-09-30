@@ -23,6 +23,49 @@ pub(crate) fn decrypted_payload_ref(payload: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(payload)))
 }
 
+/// Encrypted-media exporter secret of `group`'s live epoch for a chat event
+/// that references attachments; `None` for everything else, so plain text
+/// carries no secret. Callers pass the group only while it sits at the
+/// message's source epoch: a later pass step may prune that epoch's anchor.
+pub(crate) fn encrypted_media_source_secret(
+    group: &openmls::group::MlsGroup,
+    crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
+    app_event: &MarmotAppEvent,
+) -> Result<Option<cgka_traits::EncryptedMediaSecret>, EngineError> {
+    let references_attachments = app_event.kind == cgka_traits::MARMOT_APP_EVENT_KIND_CHAT
+        && app_event
+            .tags
+            .iter()
+            .any(|tag| tag.first().map(String::as_str) == Some("imeta"));
+    if !references_attachments {
+        return Ok(None);
+    }
+    Ok(encrypted_media_exporter_secret(group, crypto)?.map(cgka_traits::EncryptedMediaSecret::new))
+}
+
+/// Encrypted-media exporter secret of `group`'s epoch; `None` when its own
+/// leaf is evicted, which refuses every exporter derivation and must not fail
+/// the replay, ingest or anchor read that asked.
+pub(crate) fn encrypted_media_exporter_secret(
+    group: &openmls::group::MlsGroup,
+    crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
+) -> Result<Option<cgka_traits::SecretBytes>, EngineError> {
+    if !group.is_active() {
+        return Ok(None);
+    }
+    let secret = group
+        .export_secret(
+            crypto,
+            crate::group_lifecycle::EXPORTER_LABEL,
+            crate::group_lifecycle::ENCRYPTED_MEDIA_EXPORTER_CONTEXT,
+            32,
+        )
+        .map_err(|error| {
+            EngineError::Backend(format!("encrypted media export_secret: {error:?}"))
+        })?;
+    Ok(Some(cgka_traits::SecretBytes::new(secret)))
+}
+
 /// Shared application-payload sender validation for every inbound seam
 /// (direct ingest, stored-convergence/replay). An application message is
 /// surfaced only when its inner event's author matches the MLS-authenticated
@@ -208,6 +251,9 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
                             source.retention_seconds,
                         ))
                     }),
+                    // Only moderation controls reach this rail; they carry no
+                    // attachments.
+                    encrypted_media_secret: None,
                 };
                 self.storage.put_pending_application_event(&event)?;
                 self.authority_recovery_attempts.remove(&request.message_id);

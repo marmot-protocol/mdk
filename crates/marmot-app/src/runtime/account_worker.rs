@@ -9461,6 +9461,7 @@ mod tests {
                 payload: Vec::new(),
                 retention: None,
                 authority: None,
+                encrypted_media_secret: None,
             });
         assert_eq!(
             runtime_summary_message_ref(&summary),

@@ -321,6 +321,9 @@ pub enum OpenMlsReplayObservation {
         payload: Vec<u8>,
         retention: AppMessageRetentionDecision,
         authority: Option<cgka_traits::app_event::AppMessageAuthority>,
+        /// Captured while the group sits at `source_epoch`; later commits in
+        /// the same pass may prune that epoch's retained anchor.
+        encrypted_media_secret: Option<cgka_traits::EncryptedMediaSecret>,
         decrypted_payload_ref: String,
     },
     OwnApplicationSent {
@@ -4220,6 +4223,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         .map(|event| (sender, event))
                 });
                 if let Some((sender, app_event)) = validated {
+                    let at_source_epoch = source_epoch == mls_group.epoch().as_u64();
                     let retention_seconds =
                         crate::app_components::message_retention_seconds_of_group(&mls_group)
                             .map_err(|error| {
@@ -4235,7 +4239,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         payload: payload.clone(),
                         authority: if cgka_traits::reporting::requires_source_authority(
                             app_event.kind,
-                        ) && source_epoch == mls_group.epoch().as_u64()
+                        ) && at_source_epoch
                         {
                             Some(
                                 crate::app_payload::source_authority(&mls_group, sender)
@@ -4245,6 +4249,14 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                             // Do not nest a source-policy rewind inside a replay
                             // guard. Durable control-only recovery authenticates
                             // historical evidence on the maintenance rail.
+                            None
+                        },
+                        encrypted_media_secret: if at_source_epoch {
+                            crate::app_payload::encrypted_media_source_secret(
+                                &mls_group, &crypto, &app_event,
+                            )
+                            .map_err(|e| OpenMlsProjectionError::Replay(e.to_string()))?
+                        } else {
                             None
                         },
                         retention: AppMessageRetentionDecision::new(

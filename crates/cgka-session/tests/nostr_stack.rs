@@ -72,6 +72,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
                 1_700_000_000,
                 0,
             )),
+            encrypted_media_secret: None,
         }]
     );
 }
@@ -186,6 +187,7 @@ async fn group_delivery_requires_synced_group_subscription() {
                 1_700_000_000,
                 0,
             )),
+            encrypted_media_secret: None,
         }]
     );
 }

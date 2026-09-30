@@ -715,6 +715,7 @@ fn snapshot_group_events() {
             sender: mem_id(),
             payload: b"hi".to_vec(),
             retention: None,
+            encrypted_media_secret: None,
         }
     );
     insta::assert_json_snapshot!(
@@ -730,7 +731,29 @@ fn snapshot_group_events() {
             sender: mem_id(),
             payload: b"hi".to_vec(),
             retention: None,
+            encrypted_media_secret: None,
         }
+    );
+    let with_media_secret = GroupEvent::MessageReceived {
+        authority: None,
+        group_id: gid(),
+        message_id: mid(),
+        epoch: EpochId(7),
+        sender: mem_id(),
+        payload: b"hi".to_vec(),
+        retention: None,
+        encrypted_media_secret: Some(cgka_traits::EncryptedMediaSecret::new(
+            cgka_traits::SecretBytes::new(vec![0xAB; 4]),
+        )),
+    };
+    assert!(
+        format!("{with_media_secret:?}")
+            .contains("encrypted_media_secret: Some(EncryptedMediaSecret([REDACTED]))"),
+        "Debug must redact the carried media secret"
+    );
+    insta::assert_json_snapshot!(
+        "event_message_received_with_encrypted_media_secret",
+        with_media_secret
     );
     insta::assert_json_snapshot!(
         "event_app_message_invalidated",

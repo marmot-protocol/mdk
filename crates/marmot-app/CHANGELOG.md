@@ -69,12 +69,17 @@
 - Attachments from a message whose epoch the group had already left no longer spin in
   `RetryScheduled` forever. The receiver cached only the current epoch's encrypted-media
   key, so a media message surfaced after a commit (common for agent sends) had no key.
-  The key for the message's source epoch is now derived from the engine's retained epoch
-  state (newest five epochs) and cached at projection.
-- Attachment acquisition always ends: missing-key deferrals back off and fail after about
-  eight minutes, the retry budget now applies to native and explicit jobs, and a blob that
-  every Blossom server reports as 404/410 fails without retrying. Explicit Retry starts a
-  fresh budget.
+  The engine now captures the key for the message's source epoch while it authenticates
+  the message and carries it on `GroupEvent::MessageReceived::encrypted_media_secret`,
+  so projection caches it even when the same convergence pass advanced more than five
+  epochs and pruned that epoch's retained state. Events without a carried key fall back
+  to the engine's retained epoch state (newest five epochs), and that fallback no longer
+  gives up when the live export fails.
+- Missing-key attachment deferrals back off and fail after about eight minutes instead of
+  repeating every 15 seconds forever, and a blob that every Blossom server reports as
+  404/410 fails without retrying. Retry and download-again derive a missing source-epoch
+  key from the engine's retained epoch state, so they recover attachments projected before
+  that key was cached.
 
 ## 0.11.0 - 2026-09-29
 

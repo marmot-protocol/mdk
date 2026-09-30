@@ -428,6 +428,7 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
                 1_700_000_000,
                 0,
             )),
+            encrypted_media_secret: None,
         }]
     );
 
@@ -520,6 +521,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
                 1_700_000_000,
                 0,
             )),
+            encrypted_media_secret: None,
         }]
     );
 }
@@ -595,6 +597,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
                 1_700_000_000,
                 0,
             )),
+            encrypted_media_secret: None,
         }]
     );
 }
