@@ -10,6 +10,12 @@
   uses the same rules as the `PollProjectionFfi` tally, so all pages sum to
   `options[].votes` and `participants`. Blocked voters stay listed; hidden or
   deleted polls return an empty page. (#2091)
+- `Marmot::send_tagged_text`, `send_tagged_media`, and `react_with_media` send
+  NIP-30 custom emoji: upload the image with `upload_media(send = false)`, then
+  name its first locator in an `["emoji", shortcode, url]` tag on a chat or a
+  `:shortcode:` reaction. `MediaUploadRequestFfi.message_tags` (default empty)
+  tags a sent upload. At most 64 tags and 16 KiB of values; `imeta` rows are
+  rejected.
 
 
 ## 0.11.0 - 2026-09-29

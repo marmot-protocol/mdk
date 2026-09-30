@@ -9,6 +9,12 @@
   tally and this read share one resolver, so the per-voter pages always sum to
   `PollProjection`'s counts and `participants`. (#2091)
 
+### Changed
+
+- Kind-7 reactions with encrypted-media `imeta` (NIP-30 custom emoji images)
+  now reference their media epoch secret like kind-9 chats, so the image stays
+  decryptable after the group advances.
+
 
 ## 0.11.0 - 2026-09-29
 

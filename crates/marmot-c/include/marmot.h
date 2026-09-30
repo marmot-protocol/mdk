@@ -3615,6 +3615,16 @@ typedef struct MarmotAuditOtlpConfigV5 {
 } MarmotAuditOtlpConfigV5;
 
 /**
+ * One borrowed row of a string matrix (e.g. one Nostr tag's values in
+ * `marmot_send_custom_event`). Borrowed input only: never freed or
+ * retained. `(NULL, 0)` is an empty row.
+ */
+typedef struct MarmotStringArray {
+  const char *const *values;
+  uintptr_t values_len;
+} MarmotStringArray;
+
+/**
  * One attachment to encrypt and upload. Borrowed input only: the
  * plaintext bytes are copied, never retained or freed.
  */
@@ -3652,6 +3662,12 @@ typedef struct MarmotMediaUploadRequest {
    * Override Blossom server URL. Nullable.
    */
   const char *blossom_server;
+  /**
+   * Extra tags on the sent kind-9 (e.g. NIP-30 `emoji`), each row a
+   * `(char **, len)` pair; NULL with length 0 for none. `imeta` is rejected.
+   */
+  const struct MarmotStringArray *message_tags;
+  uintptr_t message_tags_len;
 } MarmotMediaUploadRequest;
 
 /**
@@ -4053,16 +4069,6 @@ typedef struct MarmotCreateGroupOptions {
    */
   uint64_t disappearing_message_secs;
 } MarmotCreateGroupOptions;
-
-/**
- * One borrowed row of a string matrix (e.g. one Nostr tag's values in
- * `marmot_send_custom_event`). Borrowed input only: never freed or
- * retained. `(NULL, 0)` is an empty row.
- */
-typedef struct MarmotStringArray {
-  const char *const *values;
-  uintptr_t values_len;
-} MarmotStringArray;
 
 /**
  * One voter's effective (latest valid) poll selection; a poll's list
@@ -8304,6 +8310,49 @@ MarmotStatus marmot_send_media_attachments(const struct MarmotClient *client,
                                            struct MarmotSendSummary **out);
 
 /**
+ * Send previously uploaded attachments as one kind-9 message that also
+ * carries application `tags` (for example NIP-30 `emoji` tags), each row
+ * a `(char **, len)` pair. imeta tags are rejected. Free with
+ * `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `attachments` must
+ * point to `attachments_len` valid caller-owned structs; `tags` to
+ * `tags_len` valid rows (or NULL with length 0); `out` valid.
+ */
+MarmotStatus marmot_send_tagged_media(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      const struct MarmotMediaAttachmentReference *attachments,
+                                      uintptr_t attachments_len,
+                                      const struct MarmotStringArray *tags,
+                                      uintptr_t tags_len,
+                                      const char *caption,
+                                      struct MarmotSendSummary **out);
+
+/**
+ * React with a custom emoji image. `attachments` (already uploaded)
+ * become `imeta` tags on the kind-7 and `tags` name them, e.g. NIP-30
+ * `["emoji", shortcode, url]` for `emoji` == `:shortcode:`. imeta rows
+ * in `tags` are rejected. Free with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `attachments` must
+ * point to `attachments_len` valid structs and `tags` to `tags_len`
+ * valid rows (each NULL with length 0 allowed); `out` valid.
+ */
+MarmotStatus marmot_react_with_media(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     const char *target_message_id,
+                                     const char *emoji,
+                                     const struct MarmotMediaAttachmentReference *attachments,
+                                     uintptr_t attachments_len,
+                                     const struct MarmotStringArray *tags,
+                                     uintptr_t tags_len,
+                                     struct MarmotSendSummary **out);
+
+/**
  * Send one previously uploaded attachment as a message. Free with
  * `marmot_send_summary_free`.
  *
@@ -8623,6 +8672,24 @@ MarmotStatus marmot_build_media_imeta_tag(const struct MarmotClient *client,
                                           const char *group_id_hex,
                                           const struct MarmotMediaAttachmentReference *reference,
                                           struct MarmotMessageTag **out);
+
+/**
+ * Send kind-9 text with additional application tags. `tags` is a flat
+ * array of `tags_len` tag rows, each row a `(char **, len)` pair of
+ * string values. Free with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `tags` must point to
+ * `tags_len` valid rows (or be NULL with length 0), each row's values
+ * pointer holding its stated length; `out` valid.
+ */
+MarmotStatus marmot_send_tagged_text(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     const struct MarmotStringArray *tags,
+                                     uintptr_t tags_len,
+                                     const char *content,
+                                     struct MarmotSendSummary **out);
 
 /**
  * Send a custom application event into the group. `tags` is a flat

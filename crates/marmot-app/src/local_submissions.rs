@@ -100,6 +100,7 @@ impl LocalMessageRequest {
             AppMessageIntent::Media {
                 attachments: self.attachments.clone(),
                 caption: Some(self.content.clone()),
+                message_tags: Vec::new(),
             }
         } else if let Some(target) = &self.reply_to {
             AppMessageIntent::Reply {

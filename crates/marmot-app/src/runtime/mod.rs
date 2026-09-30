@@ -2619,6 +2619,32 @@ impl MarmotAppRuntime {
         Ok(summary)
     }
 
+    /// Send kind-9 text that also carries application tags, such as NIP-30
+    /// `emoji` tags. `imeta` rows are rejected; attachments use
+    /// [`Self::send_tagged_media`].
+    pub async fn send_tagged_text(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        content: String,
+        tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::TaggedChat { content, tags },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
+    }
+
     pub async fn send_agent_activity(
         &self,
         account_ref: &str,
@@ -3426,6 +3452,29 @@ impl MarmotAppRuntime {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
+        self.react_with_media(
+            account_ref,
+            group_id,
+            target_message_id,
+            emoji,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// React with a custom emoji: `attachments` are already-uploaded images
+    /// (emitted as `imeta`) and `tags` name them, e.g. NIP-30
+    /// `["emoji", shortcode, url]` for `emoji` == `:shortcode:`.
+    pub async fn react_with_media(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        target_message_id: &str,
+        emoji: &str,
+        tags: Vec<Vec<String>>,
+        attachments: Vec<MediaAttachmentReference>,
+    ) -> Result<SendSummary, AppError> {
         self.accounts
             .send_app_event(
                 account_ref,
@@ -3433,6 +3482,8 @@ impl MarmotAppRuntime {
                 AppMessageIntent::Reaction {
                     target_message_id: target_message_id.to_owned(),
                     emoji: emoji.to_owned(),
+                    tags,
+                    attachments,
                 },
             )
             .await
@@ -3543,23 +3594,8 @@ impl MarmotAppRuntime {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
-        let summary = self
-            .accounts
-            .send_app_event(
-                account_ref,
-                group_id,
-                AppMessageIntent::Media {
-                    attachments,
-                    caption,
-                },
-            )
-            .await?;
-        let _ = self.publish_chat_list_projection_refresh(
-            account_ref,
-            &hex::encode(group_id.as_slice()),
-            ChatListUpdateTrigger::NewLastMessage,
-        );
-        Ok(summary)
+        self.send_tagged_media(account_ref, group_id, attachments, caption, Vec::new())
+            .await
     }
 
     pub async fn upload_media(
@@ -3571,6 +3607,36 @@ impl MarmotAppRuntime {
         self.accounts
             .upload_media(account_ref, group_id, request)
             .await
+    }
+
+    /// Send already-uploaded attachments as one kind-9 chat that also carries
+    /// application tags, such as NIP-30 `emoji` tags naming those attachments.
+    pub async fn send_tagged_media(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        attachments: Vec<MediaAttachmentReference>,
+        caption: Option<String>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Media {
+                    message_tags,
+                    attachments,
+                    caption,
+                },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
     }
 
     /// Build an authenticated `imeta` tag for an optimistic host-side record

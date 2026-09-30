@@ -2112,6 +2112,18 @@ Send already-uploaded encrypted media attachments as a kind-9 chat carrying orde
 
 [Source](src/commands/media.rs#L56)
 
+### `Marmot::send_tagged_media`
+
+**Current.**
+
+```rust
+pub async fn send_tagged_media( &self, account_ref: String, group_id_hex: String, attachments: Vec<MediaAttachmentReferenceFfi>, caption: Option<String>, tags: Vec<Vec<String>>, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+`send_media_attachments` plus application tags on the same kind-9. For NIP-30 custom emoji, upload the image with `upload_media(send = false)`, then send its reference with an `["emoji", shortcode, reference.locators[0].value]` tag; receivers match the tag URL to the `imeta` locator and render that attachment inline. Same tag limits as `send_tagged_text`. `upload_media` with `MediaUploadRequestFfi.message_tags` and `send = true` is the one-call equivalent.
+
+[Source](src/commands/media.rs#L79)
+
 ### `Marmot::send_media_reference`
 
 **Current.**
@@ -2122,7 +2134,7 @@ pub async fn send_media_reference( &self, account_ref: String, group_id_hex: Str
 
 Backward-compatible single-attachment send helper. Prefer `send_media_attachments` for new callers so one chat can carry ordered mixed media attachments.
 
-[Source](src/commands/media.rs#L80)
+[Source](src/commands/media.rs#L132)
 
 ### `Marmot::upload_media`
 
@@ -2134,7 +2146,7 @@ pub async fn upload_media( &self, account_ref: String, group_id_hex: String, req
 
 Encrypt plaintext attachments, upload the ciphertext blobs, and optionally send the resulting media references into the group.
 
-[Source](src/commands/media.rs#L93)
+[Source](src/commands/media.rs#L145)
 
 ### `Marmot::download_media`
 
@@ -2146,7 +2158,7 @@ pub async fn download_media( &self, account_ref: String, group_id_hex: String, r
 
 Fetch an encrypted media blob and decrypt it using the group's encrypted media component secret.
 
-[Source](src/commands/media.rs#L117)
+[Source](src/commands/media.rs#L169)
 
 ### `Marmot::list_media`
 
@@ -2158,7 +2170,7 @@ pub fn list_media( &self, account_ref: String, group_id_hex: String, limit: Opti
 
 Typed media references projected from group message history. Host apps can pass a returned `reference` back to `download_media`.
 
-[Source](src/commands/media.rs#L138)
+[Source](src/commands/media.rs#L190)
 
 </details>
 
@@ -2177,6 +2189,18 @@ Send a plain UTF-8 text message. Structured payloads (reactions, replies, delete
 
 [Source](src/commands/message.rs#L21)
 
+### `Marmot::send_tagged_text`
+
+**Current.**
+
+```rust
+pub async fn send_tagged_text( &self, account_ref: String, group_id_hex: String, text: String, tags: Vec<Vec<String>>, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Send `send_text` content plus application tags on the same kind-9, e.g. NIP-30 `["emoji", shortcode, url]`. At most 64 tags and 16 KiB of tag values; `imeta` rows are rejected, and `e`/`q` rows need a non-empty target. Name custom emoji images through `send_tagged_media` instead: an `emoji` URL alone is not a decryptable Marmot media reference.
+
+[Source](src/commands/message.rs#L38)
+
 ### `Marmot::retry_group_convergence`
 
 **Current.**
@@ -2187,7 +2211,7 @@ pub async fn retry_group_convergence( &self, account_ref: String, group_id_hex: 
 
 Re-attempt publishing a group's pending (committed-but-undelivered) commit(s) without minting a new event.
 
-[Source](src/commands/message.rs#L54)
+[Source](src/commands/message.rs#L72)
 
 ### `Marmot::react_to_message`
 
@@ -2199,7 +2223,19 @@ pub async fn react_to_message( &self, account_ref: String, group_id_hex: String,
 
 React to `target_message_id` with `emoji` (an "add" reaction).
 
-[Source](src/commands/message.rs#L68)
+[Source](src/commands/message.rs#L86)
+
+### `Marmot::react_with_media`
+
+**Current.**
+
+```rust
+pub async fn react_with_media( &self, account_ref: String, group_id_hex: String, target_message_id: String, emoji: String, tags: Vec<Vec<String>>, attachments: Vec<MediaAttachmentReferenceFfi>, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+React with a custom emoji image. `emoji` is the reaction content (e.g. `:shortcode:`), `attachments` are already-uploaded references emitted as `imeta` on the kind-7, and `tags` name them (NIP-30 `["emoji", shortcode, url]`). The reaction retains its media epoch secret like a chat, so the image stays decryptable after the group advances. Same tag limits as `send_tagged_text`; repeating an existing reaction with the same content is a no-op.
+
+[Source](src/commands/media.rs#L104)
 
 ### `Marmot::unreact_from_message`
 
@@ -2211,7 +2247,7 @@ pub async fn unreact_from_message( &self, account_ref: String, group_id_hex: Str
 
 Remove all of this account's active reactions from `target_message_id`.
 
-[Source](src/commands/message.rs#L84)
+[Source](src/commands/message.rs#L102)
 
 ### `Marmot::reply_to_message`
 
@@ -2223,7 +2259,7 @@ pub async fn reply_to_message( &self, account_ref: String, group_id_hex: String,
 
 Send `text` as a reply that quotes `target_message_id`.
 
-[Source](src/commands/message.rs#L99)
+[Source](src/commands/message.rs#L117)
 
 ### `Marmot::delete_message`
 
@@ -2235,7 +2271,7 @@ pub async fn delete_message( &self, account_ref: String, group_id_hex: String, t
 
 Mark `target_message_id` deleted for the whole group. This is a tombstone — the original stays in everyone's store; clients render a "message deleted" placeholder.
 
-[Source](src/commands/message.rs#L117)
+[Source](src/commands/message.rs#L135)
 
 ### `Marmot::secure_delete_expired`
 
@@ -2247,7 +2283,7 @@ pub async fn secure_delete_expired( &self, account_ref: String, group_id_hex: St
 
 Securely scrub and prune expired disappearing-message plaintext for a group according to its active retention component. The media hash list identifies pruned encrypted-media blobs so host apps can purge their own decrypted-media disk caches keyed by ciphertext hash.
 
-[Source](src/commands/message.rs#L135)
+[Source](src/commands/message.rs#L153)
 
 ### `Marmot::sweep_expired_retention`
 
@@ -2259,7 +2295,7 @@ pub async fn sweep_expired_retention( &self, account_ref: String, now_ms: u64, )
 
 Run the engine-owned disappearing-message sweep for one account using the supplied Unix wall-clock time in milliseconds. Each group reports pruning, a fail-closed deferral, or a privacy-safe failure category.
 
-[Source](src/commands/message.rs#L151)
+[Source](src/commands/message.rs#L169)
 
 ### `Marmot::edit_message`
 
@@ -2271,7 +2307,7 @@ pub async fn edit_message( &self, account_ref: String, group_id_hex: String, tar
 
 Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits.
 
-[Source](src/commands/message.rs#L172)
+[Source](src/commands/message.rs#L190)
 
 ### `Marmot::send_custom_event`
 
@@ -2283,7 +2319,7 @@ pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String
 
 Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
-[Source](src/commands/message.rs#L193)
+[Source](src/commands/message.rs#L211)
 
 ### `Marmot::create_poll`
 
@@ -2299,7 +2335,7 @@ poll projection. Creation follows MDK's canonical conversation classification: n
 groups, while unnamed two-member conversations are direct. Polls are neither anonymous nor election-grade. See
 [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L211)
+[Source](src/commands/message.rs#L229)
 
 ### `Marmot::cast_poll_vote`
 
@@ -2314,7 +2350,7 @@ or one through ten unique ids for multiple choice; use the ids from `TimelineMes
 This is a replacement, not a delta or unvote. MDK revalidates the poll against the response event's actual timestamp at
 send time, and an accepted open poll remains votable after conversation reclassification. See [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L236)
+[Source](src/commands/message.rs#L254)
 
 ### `Marmot::poll_votes`
 
@@ -2345,7 +2381,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L257)
+[Source](src/commands/message.rs#L275)
 
 </details>
 

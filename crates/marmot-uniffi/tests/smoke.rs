@@ -555,6 +555,7 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
         thumbhash: None,
     };
     let request = MediaUploadRequestFfi {
+        message_tags: Vec::new(),
         attachments: vec![MediaUploadAttachmentRequestFfi {
             file_name: "note.txt".into(),
             media_type: "text/plain".into(),

@@ -216,6 +216,10 @@ pub struct MarmotMediaUploadRequest {
     pub send: u8,
     /// Override Blossom server URL. Nullable.
     pub blossom_server: *const ::std::ffi::c_char,
+    /// Extra tags on the sent kind-9 (e.g. NIP-30 `emoji`), each row a
+    /// `(char **, len)` pair; NULL with length 0 for none. `imeta` is rejected.
+    pub message_tags: *const super::common::MarmotStringArray,
+    pub message_tags_len: usize,
 }
 
 impl MarmotMediaUploadRequest {
@@ -236,6 +240,11 @@ impl MarmotMediaUploadRequest {
             caption: unsafe { optional_str(self.caption) }?,
             send: c_bool(self.send),
             blossom_server: unsafe { optional_str(self.blossom_server) }?,
+            message_tags: unsafe {
+                crate::commands::struct_array(self.message_tags, self.message_tags_len, |row| {
+                    crate::memory::str_array(row.values, row.values_len)
+                })
+            }?,
         })
     }
 }

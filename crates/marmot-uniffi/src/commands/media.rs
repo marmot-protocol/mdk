@@ -74,6 +74,58 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// `send_media_attachments` plus application tags on the same kind-9
+    /// event, e.g. NIP-30 `emoji` tags pointing at these attachments.
+    pub async fn send_tagged_media(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        attachments: Vec<MediaAttachmentReferenceFfi>,
+        caption: Option<String>,
+        tags: Vec<Vec<String>>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .send_tagged_media(
+                &account_ref,
+                &group_id,
+                attachments.into_iter().map(Into::into).collect(),
+                caption,
+                tags,
+            )
+            .await
+            .map_err(media_reference_error)?;
+        Ok(summary.into())
+    }
+
+    /// React with a custom emoji image: `attachments` become `imeta` tags on
+    /// the kind-7 and `tags` name them (NIP-30 `emoji`).
+    pub async fn react_with_media(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target_message_id: String,
+        emoji: String,
+        tags: Vec<Vec<String>>,
+        attachments: Vec<MediaAttachmentReferenceFfi>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .react_with_media(
+                &account_ref,
+                &group_id,
+                &target_message_id,
+                &emoji,
+                tags,
+                attachments.into_iter().map(Into::into).collect(),
+            )
+            .await
+            .map_err(media_reference_error)?;
+        Ok(summary.into())
+    }
+
     /// Backward-compatible single-attachment send helper. Prefer
     /// `send_media_attachments` for new callers so one chat can carry ordered
     /// mixed media attachments.

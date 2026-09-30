@@ -264,6 +264,7 @@ async fn attachment_draft_reply_validates_references_before_clearing() {
     reference.source_epoch = epoch;
     let invalid = crate::messages::build_inner_event_with_media_reply(
         &AppMessageIntent::Media {
+            message_tags: Vec::new(),
             attachments: vec![reference.clone()],
             caption: Some("caption".into()),
         },
