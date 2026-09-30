@@ -4113,6 +4113,7 @@ impl AppClient {
             let outcome = storage_sqlite::RecoveryScopeOutcome::Unknown;
             if let (Some(revision), Some(plan)) =
                 (grant.comparison_revision, &grant.comparison_plan)
+                && !plan.routes.is_empty()
             {
                 use storage_sqlite::RecoveryComparisonOutcome as Comparison;
                 let outcomes = plan
@@ -4279,6 +4280,13 @@ impl AppClient {
                                         .since_seconds
                                         .is_some_and(|since| since >= window.since))
                                 && scope.goal.until_seconds <= window.until
+                                // A route certificate says nothing about a
+                                // required relay absent from this network pass.
+                                && scope.goal.required_endpoints.iter().all(|endpoint| {
+                                    window.work.endpoints().iter().any(|queried| {
+                                        crate::relay_plane::same_relay(queried.as_str(), endpoint)
+                                    })
+                                })
                         })
                     });
                     let scope_certified = comparison_owned

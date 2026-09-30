@@ -1509,18 +1509,24 @@ impl AppClient {
             // A route can appear after the comparison request was joined (for
             // example, while a Welcome is being admitted). The frozen plan
             // may only select routes, windows and endpoints backed by the
-            // durable debt already recorded before this grant's rebuild.
+            // durable debt the install transaction will read. Selected debt
+            // uses the rebuilt scopes that freeze_plan installs first, so a
+            // comparison queries every relay its obligation will certify.
             let mut joined_routes = Vec::new();
             for demand in demands
                 .iter()
                 .filter(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
             {
-                joined_routes.extend(
-                    storage
-                        .recovery_scope_snapshots(demand.ticket.id)?
-                        .into_iter()
-                        .map(|scope| scope.plan),
-                );
+                if let Some((_, scopes)) = goals.iter().find(|(id, _)| *id == demand.ticket.id) {
+                    joined_routes.extend(scopes.iter().cloned());
+                } else {
+                    joined_routes.extend(
+                        storage
+                            .recovery_scope_snapshots(demand.ticket.id)?
+                            .into_iter()
+                            .map(|scope| scope.plan),
+                    );
+                }
             }
             self.comparison_route_goals(comparison.requested_until_seconds)?
                 .into_iter()
@@ -4324,7 +4330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn comparison_uses_endpoints_covered_by_the_prior_snapshot() {
+    async fn comparison_executes_against_the_rebuilt_endpoint_set_without_false_coverage() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
             scripted_eose_pump,
@@ -4340,108 +4346,136 @@ mod tests {
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.request_bounded_comparison().unwrap();
         let storage = app.account_storage("alice").unwrap();
-        let until = storage
-            .recovery_comparison()
-            .unwrap()
-            .requested_until_seconds;
-        let recorded = client
-            .comparison_route_goals(until)
-            .unwrap()
-            .remove(0)
-            .admitted_endpoints;
-        assert!(!recorded.is_empty());
         let new_endpoint = "wss://new-relay.example".to_owned();
         client
             .routing
             .write()
             .local_inbox_endpoints
             .push(cgka_traits::TransportEndpoint(new_endpoint.clone()));
-        assert!(
-            client.comparison_route_goals(until).unwrap()[0]
-                .admitted_endpoints
-                .contains(&new_endpoint)
-        );
-
-        for attempt in 0..2 {
-            let grant = client
-                .authorize_account_recovery(
-                    None,
-                    marmot_forensics::EpochBackfillExecutionSeam::Startup,
-                )
-                .unwrap()
-                .expect("comparison remains valid after endpoint expansion");
-            let plan = grant.comparison_plan.as_ref().unwrap();
-            assert_eq!(plan.routes.len(), 1);
-            if attempt == 0 {
-                assert_eq!(plan.routes[0].admitted_endpoints, recorded);
-            } else {
-                // The previous freeze recorded the updated route policy as
-                // debt. The retry can now compare its newly admitted endpoint.
-                assert!(plan.routes[0].admitted_endpoints.contains(&new_endpoint));
-            }
-            drop(grant);
-            client.recovery_owner.test_advance_to_retry(&storage);
-        }
-        client.request_bounded_comparison().unwrap();
         let grant = client
             .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
             .unwrap()
-            .expect("new request records the expanded endpoint set");
+            .expect("comparison after endpoint expansion");
+        let debt = grant
+            .plan()
+            .unwrap()
+            .iter()
+            .find(|obligation| {
+                obligation.cause == storage_sqlite::RecoveryCause::IncrementalHistory
+            })
+            .unwrap();
+        let id = debt.id;
+        let goal = &debt.scopes[0].goal;
+        let routes = &grant.comparison_plan.as_ref().unwrap().routes;
+        assert_eq!(routes.len(), 1);
+        assert!(goal.required_endpoints.contains(&new_endpoint));
+        assert_eq!(routes[0].admitted_endpoints, goal.admitted_endpoints);
+        assert_eq!(routes[0].required_endpoints, goal.required_endpoints);
         assert!(
-            grant.comparison_plan.as_ref().unwrap().routes[0]
+            grant.inventory[0]
+                .work
+                .endpoints()
+                .contains(&cgka_traits::TransportEndpoint(new_endpoint.clone()))
+        );
+
+        // The original relay certifies, but the added required relay fails.
+        // Route-level success must not cover that relay's history.
+        client.test_comparison_results = Some(
+            [Ok(Some((
+                transport_nostr_adapter::NostrReconciliationSummary {
+                    relays_succeeded: 1,
+                    relays_failed: 1,
+                    failed_endpoints: vec![cgka_traits::TransportEndpoint(new_endpoint.clone())],
+                    ..Default::default()
+                },
+                Vec::new(),
+            )))]
+            .into(),
+        );
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        let snapshots = storage.recovery_scope_snapshots(id).unwrap();
+        let endpoint = snapshots[0]
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.endpoint == new_endpoint)
+            .unwrap();
+        assert_ne!(
+            endpoint.outcome,
+            storage_sqlite::RecoveryScopeOutcome::Covered
+        );
+        assert!(!endpoint.exhaustive);
+        assert!(!endpoint.admission_complete);
+        assert!(storage.recovery_comparison().unwrap().pending());
+
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let retry = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .expect("failed required relay remains retryable");
+        assert!(
+            retry.comparison_plan.as_ref().unwrap().routes[0]
                 .admitted_endpoints
                 .contains(&new_endpoint)
         );
+        client.test_comparison_results = Some(scripted_routes(&retry, |_| false));
+        client.run_recovery_grant_for_test(retry).await.unwrap();
+        assert!(!storage.recovery_comparison().unwrap().pending());
     }
 
     #[tokio::test]
-    async fn comparison_waits_for_recorded_debt_to_include_the_required_relay() {
+    async fn empty_comparison_execution_keeps_the_request_pending() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
             scripted_eose_pump,
         };
-        const OPERATED: &str = "wss://operated.example";
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = crate::MarmotApp::with_relays_and_config(
-            dir.path(),
-            vec!["wss://relay.example".into()],
-            crate::MarmotAppConfig::default()
-                .with_open_ranking_provider(None, Vec::new())
-                .with_recovery_operated_relays(vec![OPERATED.into()]),
-        )
-        .with_test_relay_client(relay.clone());
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        client.request_bounded_comparison().unwrap();
-        client
-            .routing
-            .write()
-            .local_inbox_endpoints
-            .push(cgka_traits::TransportEndpoint(OPERATED.into()));
         let storage = app.account_storage("alice").unwrap();
+        let now = wall_now_ms().unwrap();
+        // Imported debt covers only a recent window. The comparison request
+        // asks for retained inventory, which this scope cannot certify yet.
+        let mut narrow = client.comparison_route_goals(now / 1000).unwrap();
+        narrow[0].since_seconds = Some(now / 1000 - 120);
+        storage
+            .join_recovery_comparison(&[7; 16], now, &narrow)
+            .unwrap();
         let grant = client
             .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
             .unwrap()
             .expect("pending comparison");
-        // The prior debt covers the best-effort relay, but not the operated
-        // relay required by the current policy. Do not freeze an uncertifiable
-        // plan containing only the best-effort relay.
         assert!(grant.comparison_plan.as_ref().unwrap().routes.is_empty());
         assert!(grant.inventory.is_empty());
-        drop(grant);
+        let before = storage.recovery_comparison().unwrap();
+        client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        let after = storage.recovery_comparison().unwrap();
+        assert!(after.pending());
+        assert_eq!(after.settled_revision, before.settled_revision);
         client.recovery_owner.test_advance_to_retry(&storage);
         let retry = client
             .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
             .unwrap()
-            .expect("rebuilt debt now covers the operated relay");
-        let routes = &retry.comparison_plan.as_ref().unwrap().routes;
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].required_endpoints, vec![OPERATED.to_owned()]);
-        assert!(routes[0].admitted_endpoints.contains(&OPERATED.to_owned()));
+            .expect("an empty pass cannot close the request");
+        assert!(retry.comparison_plan.as_ref().unwrap().routes.is_empty());
+        drop(retry);
+
+        client.request_bounded_comparison().unwrap();
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let widened = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .expect("new request widens the debt window");
+        assert_eq!(widened.comparison_plan.as_ref().unwrap().routes.len(), 1);
+        client.test_comparison_results = Some(scripted_routes(&widened, |_| false));
+        client.run_recovery_grant_for_test(widened).await.unwrap();
+        assert!(!storage.recovery_comparison().unwrap().pending());
     }
 
     #[tokio::test]
