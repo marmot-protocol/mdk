@@ -1506,52 +1506,29 @@ impl AppClient {
         }
         let comparison = storage.recovery_comparison()?;
         let mut comparison_goals = if grant.comparison_revision.is_some() {
-            // A route can appear after the comparison request was joined (for
-            // example, while a Welcome is being admitted). The frozen plan
-            // may only select routes, windows and endpoints backed by the
-            // durable debt the install transaction will read. Selected debt
-            // uses the rebuilt scopes that freeze_plan installs first, so a
-            // comparison queries every relay its obligation will certify.
-            let mut joined_routes = Vec::new();
+            // The comparison serves the incremental-history debt its join
+            // recorded, never the live routing snapshot. A selected obligation
+            // contributes the scopes freeze_plan installs below (current relays,
+            // preserved windows, routes discovered since the join); otherwise its
+            // stored snapshots. So the plan is backed by exactly the rows the
+            // install transaction reads, and it queries every relay settlement
+            // will certify, whatever changed since the join.
+            let mut debt = Vec::new();
             for demand in demands
                 .iter()
                 .filter(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
             {
-                if let Some((_, scopes)) = goals.iter().find(|(id, _)| *id == demand.ticket.id) {
-                    joined_routes.extend(scopes.iter().cloned());
-                } else {
-                    joined_routes.extend(
+                match goals.iter().find(|(id, _)| *id == demand.ticket.id) {
+                    Some((_, scopes)) => debt.extend(scopes.iter().cloned()),
+                    None => debt.extend(
                         storage
                             .recovery_scope_snapshots(demand.ticket.id)?
                             .into_iter()
                             .map(|scope| scope.plan),
-                    );
+                    ),
                 }
             }
-            self.comparison_route_goals(comparison.requested_until_seconds)?
-                .into_iter()
-                .filter_map(|mut goal| {
-                    let joined = joined_routes.iter().find(|joined| {
-                        joined.route_kind == goal.route_kind
-                            && joined.group_id == goal.group_id
-                            && joined.transport_group_id == goal.transport_group_id
-                            && joined.since_seconds.is_none_or(|since| {
-                                goal.since_seconds.is_some_and(|floor| since <= floor)
-                            })
-                            && joined.until_seconds >= goal.until_seconds
-                    })?;
-                    // Match the storage install predicate, including endpoints
-                    // and the inventory window, before freezing any scopes.
-                    goal.admitted_endpoints.retain(|endpoint| {
-                        joined.required_endpoints.contains(endpoint)
-                            || joined.admitted_endpoints.contains(endpoint)
-                    });
-                    goal.required_endpoints
-                        .retain(|endpoint| goal.admitted_endpoints.contains(endpoint));
-                    (!goal.admitted_endpoints.is_empty() && !goal.required_endpoints.is_empty())
-                        .then_some(goal)
-                })
-                .collect()
+            debt
         } else {
             Vec::new()
         };
@@ -1614,8 +1591,14 @@ impl AppClient {
                         goal.transport_group_id == Some(id)
                     }
                 }) {
+                    // The pass compares the local inventory from its floor; the
+                    // plan records the part of that window this debt covers.
+                    // A route discovered after the join has a narrower goal.
+                    let since = goal
+                        .since_seconds
+                        .map_or(item.since, |since| since.max(item.since));
                     let mut goal = goal.clone();
-                    goal.since_seconds = Some(item.since);
+                    goal.since_seconds = Some(since);
                     goal.until_seconds = item.until;
                     goal.inventory_floor = Some(item.since);
                     routes.push(goal);
@@ -4227,7 +4210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn comparison_does_not_select_a_route_added_after_its_debt_was_recorded() {
+    async fn comparison_compares_routes_added_after_its_join_through_their_debt() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
             scripted_eose_pump,
@@ -4247,85 +4230,84 @@ mod tests {
         );
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        client.request_bounded_comparison().unwrap();
-        // A live cursor makes newly discovered routes' incremental scopes
-        // narrower than the pending comparison's retained-inventory window.
-        client.checkpointed_transport_timestamp = Some(unix_now_seconds());
-        client.create_group("later route", &[]).await.unwrap();
-
-        let grant = client
-            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
-            .unwrap()
-            .expect("pending comparison");
-        let plan = grant.comparison_plan.as_ref().expect("comparison plan");
-        assert_eq!(plan.routes.len(), 1);
-        assert_eq!(plan.routes[0].route_kind, 0);
-        drop(grant);
-
-        // A second route change invalidates retry-route narrowing. Late
-        // scopes may exist now, but their windows still cannot back this plan.
-        client
-            .create_group("another later route", &[])
-            .await
-            .unwrap();
         let storage = app.account_storage("alice").unwrap();
-        client.recovery_owner.test_advance_to_retry(&storage);
-        let retry = client
-            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
-            .unwrap()
-            .expect("cancelled comparison remains pending");
-        let plan = retry
-            .comparison_plan
-            .as_ref()
-            .expect("retry comparison plan");
-        assert_eq!(plan.routes.len(), 1);
-        assert_eq!(plan.routes[0].route_kind, 0);
-        drop(retry);
-        let debt = storage
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
-            .unwrap();
-        let scopes = storage.recovery_scope_snapshots(debt.ticket.id).unwrap();
-        assert_eq!(scopes.len(), 3);
-        assert_eq!(scopes[0].plan.route_kind, 0);
+        client.request_bounded_comparison().unwrap();
         let floor = storage
             .recovery_comparison()
             .unwrap()
             .requested_until_seconds
             .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
-        assert!(
-            scopes
-                .iter()
-                .filter(|scope| scope.plan.route_kind == 1)
-                .all(|scope| scope.plan.since_seconds.is_some_and(|since| since > floor))
-        );
+        // A route discovered after the join, as a Welcome admitted during
+        // startup adds one. A live cursor makes its incremental goal narrower
+        // than the retained-inventory window the join recorded.
+        client.checkpointed_transport_timestamp = Some(unix_now_seconds());
+        client.create_group("later route", &[]).await.unwrap();
 
-        client.request_bounded_comparison().unwrap();
-        client.recovery_owner.test_advance_to_retry(&storage);
-        let joined = client
+        // Every comparison route is a debt scope this grant installs, with the
+        // same relays and a window inside that scope's goal.
+        let assert_plan_is_debt = |grant: &AttemptGrant, routes: usize| {
+            let debt = grant
+                .plan()
+                .unwrap()
+                .iter()
+                .find(|obligation| {
+                    obligation.cause == storage_sqlite::RecoveryCause::IncrementalHistory
+                })
+                .expect("the comparison's debt is selected");
+            let plan = grant.comparison_plan.as_ref().expect("comparison plan");
+            assert_eq!(plan.routes.len(), routes);
+            for route in &plan.routes {
+                let scope = debt
+                    .scopes
+                    .iter()
+                    .find(|scope| scope.goal.scope_id == route.scope_id)
+                    .expect("comparison route backed by its debt scope");
+                assert_eq!(route.route_kind, scope.goal.route_kind);
+                assert_eq!(route.transport_group_id, scope.goal.transport_group_id);
+                assert_eq!(route.admitted_endpoints, scope.goal.admitted_endpoints);
+                assert_eq!(route.required_endpoints, scope.goal.required_endpoints);
+                assert!(scope.goal.since_seconds.is_none_or(|since| {
+                    route
+                        .since_seconds
+                        .is_some_and(|compared| since <= compared)
+                }));
+                assert!(route.until_seconds <= scope.goal.until_seconds);
+            }
+            debt.id
+        };
+        let grant = client
             .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
             .unwrap()
-            .expect("new request admits the late routes");
-        let debt = storage
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+            .expect("a route added after the join cannot fail the install");
+        assert_plan_is_debt(&grant, 2);
+        let late = &grant.comparison_plan.as_ref().unwrap().routes[1];
+        assert_eq!(late.route_kind, 1);
+        assert!(late.since_seconds.is_some_and(|since| since > floor));
+        drop(grant);
+
+        // A second route change after a cancelled attempt skips retry-route
+        // narrowing. The rebuilt debt still backs every route it selects.
+        client
+            .create_group("another later route", &[])
+            .await
             .unwrap();
-        assert_eq!(
-            storage
-                .recovery_scope_snapshots(debt.ticket.id)
-                .unwrap()
-                .len(),
-            3
-        );
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let retry = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .expect("cancelled comparison remains pending");
+        let id = assert_plan_is_debt(&retry, 3);
+
+        // One answered pass certifies the debt and settles the request.
+        client.test_comparison_results = Some(scripted_routes(&retry, |_| false));
+        client.run_recovery_grant_for_test(retry).await.unwrap();
+        assert!(!storage.recovery_comparison().unwrap().pending());
         assert!(
-            joined
-                .comparison_plan
-                .as_ref()
-                .is_some_and(|plan| !plan.routes.is_empty())
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .all(|demand| demand.ticket.id != id)
         );
     }
 
@@ -4494,62 +4476,6 @@ mod tests {
                     })
                 }))
         );
-    }
-
-    #[tokio::test]
-    async fn empty_comparison_execution_keeps_the_request_pending() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        crate::AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let storage = app.account_storage("alice").unwrap();
-        let now = wall_now_ms().unwrap();
-        // Imported debt covers only a recent window. The comparison request
-        // asks for retained inventory, which this scope cannot certify yet.
-        let mut narrow = client.comparison_route_goals(now / 1000).unwrap();
-        narrow[0].since_seconds = Some(now / 1000 - 120);
-        storage
-            .join_recovery_comparison(&[7; 16], now, &narrow)
-            .unwrap();
-        let grant = client
-            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
-            .unwrap()
-            .expect("pending comparison");
-        assert!(grant.comparison_plan.as_ref().unwrap().routes.is_empty());
-        assert!(grant.inventory.is_empty());
-        let before = storage.recovery_comparison().unwrap();
-        client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
-        client.run_recovery_grant_for_test(grant).await.unwrap();
-        let after = storage.recovery_comparison().unwrap();
-        assert!(after.pending());
-        assert_eq!(after.settled_revision, before.settled_revision);
-        client.recovery_owner.test_advance_to_retry(&storage);
-        let retry = client
-            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
-            .unwrap()
-            .expect("an empty pass cannot close the request");
-        assert!(retry.comparison_plan.as_ref().unwrap().routes.is_empty());
-        drop(retry);
-
-        client.request_bounded_comparison().unwrap();
-        client.recovery_owner.test_advance_to_retry(&storage);
-        let widened = client
-            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
-            .unwrap()
-            .expect("new request widens the debt window");
-        assert_eq!(widened.comparison_plan.as_ref().unwrap().routes.len(), 1);
-        client.test_comparison_results = Some(scripted_routes(&widened, |_| false));
-        client.run_recovery_grant_for_test(widened).await.unwrap();
-        assert!(!storage.recovery_comparison().unwrap().pending());
     }
 
     #[tokio::test]

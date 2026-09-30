@@ -155,6 +155,45 @@ async fn wait_for_message(participants: &[Participant], group: &GroupId, expecte
     }
 }
 
+/// Every participant agrees with the founder on epoch, member count and roster.
+async fn assert_group_agreement(participants: &[Participant], group: &GroupId, count: usize) {
+    let expected_roster = participants
+        .iter()
+        .map(|participant| participant.account.clone())
+        .collect::<BTreeSet<_>>();
+    let founder_state: AppGroupMlsState = participants[0]
+        .client
+        .call_async("group_mls_state", json!([participants[0].account, group]))
+        .await
+        .expect("founder MLS state");
+    for (index, participant) in participants.iter().enumerate() {
+        let state: AppGroupMlsState = participant
+            .client
+            .call_async("group_mls_state", json!([participant.account, group]))
+            .await
+            .unwrap_or_else(|error| panic!("MLS state at index {index}: {error}"));
+        assert_eq!(state.member_count, count, "member count at index {index}");
+        assert_eq!(state.epoch, founder_state.epoch, "epoch at index {index}");
+        assert_eq!(
+            state.protocol_profile,
+            marmot_app::AppProtocolProfile::Current
+        );
+        let roster: Vec<AppGroupMemberRecord> = participant
+            .client
+            .call_async("group_members", json!([participant.account, group]))
+            .await
+            .unwrap_or_else(|error| panic!("members at index {index}: {error}"));
+        assert_eq!(
+            roster
+                .into_iter()
+                .map(|member| member.member_id_hex)
+                .collect::<BTreeSet<_>>(),
+            expected_roster,
+            "roster at index {index}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manual process-isolated 25/50/100/200-member app probe against local strfry"]
 async fn app_group_through_strfry_processes() {
@@ -231,41 +270,7 @@ async fn app_group_through_strfry_processes() {
     }
 
     catch_up_all(&participants).await;
-    let expected_roster = participants
-        .iter()
-        .map(|participant| participant.account.clone())
-        .collect::<BTreeSet<_>>();
-    let founder_state: AppGroupMlsState = participants[0]
-        .client
-        .call_async("group_mls_state", json!([participants[0].account, group]))
-        .await
-        .expect("founder MLS state");
-    for (index, participant) in participants.iter().enumerate() {
-        let state: AppGroupMlsState = participant
-            .client
-            .call_async("group_mls_state", json!([participant.account, group]))
-            .await
-            .unwrap_or_else(|error| panic!("MLS state at index {index}: {error}"));
-        assert_eq!(state.member_count, count, "member count at index {index}");
-        assert_eq!(state.epoch, founder_state.epoch, "epoch at index {index}");
-        assert_eq!(
-            state.protocol_profile,
-            marmot_app::AppProtocolProfile::Current
-        );
-        let roster: Vec<AppGroupMemberRecord> = participant
-            .client
-            .call_async("group_members", json!([participant.account, group]))
-            .await
-            .unwrap_or_else(|error| panic!("members at index {index}: {error}"));
-        assert_eq!(
-            roster
-                .into_iter()
-                .map(|member| member.member_id_hex)
-                .collect::<BTreeSet<_>>(),
-            expected_roster,
-            "roster at index {index}"
-        );
-    }
+    assert_group_agreement(&participants, &group, count).await;
     milestone(&root, "roster", started.elapsed(), count);
 
     let founder_message = "strfry-process-founder-message";
@@ -351,36 +356,8 @@ async fn resumed_group_after_strfry_restart() {
     assert_eq!(status.groups.len(), 1);
     let group = GroupId::new(hex::decode(&status.groups[0].group_id_hex).unwrap());
 
-    let expected_roster = participants
-        .iter()
-        .map(|participant| participant.account.clone())
-        .collect::<BTreeSet<_>>();
-    let founder_state: AppGroupMlsState = participants[0]
-        .client
-        .call_async("group_mls_state", json!([participants[0].account, group]))
-        .await
-        .expect("founder MLS state");
-    for (index, participant) in participants.iter().enumerate() {
-        let state: AppGroupMlsState = participant
-            .client
-            .call_async("group_mls_state", json!([participant.account, group]))
-            .await
-            .unwrap_or_else(|error| panic!("resumed MLS state at index {index}: {error}"));
-        assert_eq!(state.member_count, count, "member count at index {index}");
-        assert_eq!(state.epoch, founder_state.epoch, "epoch at index {index}");
-        let roster: Vec<AppGroupMemberRecord> = participant
-            .client
-            .call_async("group_members", json!([participant.account, group]))
-            .await
-            .unwrap_or_else(|error| panic!("resumed roster at index {index}: {error}"));
-        assert_eq!(
-            roster
-                .into_iter()
-                .map(|member| member.member_id_hex)
-                .collect::<BTreeSet<_>>(),
-            expected_roster,
-            "roster at index {index}"
-        );
+    assert_group_agreement(&participants, &group, count).await;
+    for participant in &participants {
         assert!(has_message(participant, &group, "strfry-process-founder-message").await);
         assert!(has_message(participant, &group, "strfry-process-peer-message").await);
     }
