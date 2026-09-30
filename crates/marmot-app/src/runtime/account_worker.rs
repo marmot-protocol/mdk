@@ -8963,6 +8963,25 @@ mod tests {
             client.has_pending_epoch_backfill(),
             "the unavailable recovery intent must remain pending"
         );
+        // The catch-up ran no job, so the owner's first pass runs one and
+        // cannot complete the unavailable intent. Its retry pacing then defers
+        // the next pass, which must stay distinct from no pending work.
+        let first = client
+            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("the owner's pass over an unavailable intent must not fail");
+        assert!(
+            matches!(first, EpochBackfillRunOutcome::Incomplete(_)),
+            "an unavailable intent cannot complete: {first:?}"
+        );
+        let outcome = client
+            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("rechecking a deferred intent must not fail");
+        assert!(
+            matches!(outcome, EpochBackfillRunOutcome::Deferred),
+            "deferred work must remain distinct from no pending work: {outcome:?}"
+        );
         drop(command_tx);
     }
 
