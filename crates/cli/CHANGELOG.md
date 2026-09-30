@@ -16,8 +16,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   worker. They drain live input and return; the worker's paced recovery job
   serves any history debt. Sends, conversation opens and new DMs no longer
   wait behind recovery, which grew with the number of chats (mdk#2110). New
-  `just bench-create-dm` measures DM creation latency with 300 and 1000
-  existing chats.
+  `just bench-create-direct-message` measures DM creation latency with 300
+  and 1000 existing chats.
+- The post-join maintenance sweep no longer decodes every transport fanout
+  once per group, which made it quadratic in the number of chats.
 
 ## [0.11.0] - 2026-09-29
 

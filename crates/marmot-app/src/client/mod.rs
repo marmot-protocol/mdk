@@ -1225,8 +1225,15 @@ impl AppClient {
                     continue;
                 }
             };
-            let status = match self.runtime.maintenance_status(&group_id) {
-                Ok(status) => status,
+            // Only the group's obligations: the full status also decodes every
+            // transport fanout in the account, which made this loop quadratic
+            // in the number of groups (mdk#2110).
+            let obligations = match self
+                .runtime
+                .session()
+                .maintenance_obligations_for_group(&group_id)
+            {
+                Ok(obligations) => obligations,
                 Err(_error) => {
                     tracing::warn!(
                         target: "marmot_app::maintenance",
@@ -1237,7 +1244,7 @@ impl AppClient {
                     continue;
                 }
             };
-            let prerequisite = status.obligations.iter().find(|obligation| {
+            let prerequisite = obligations.iter().find(|obligation| {
                 obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
                     && matches!(
                         obligation.phase,
