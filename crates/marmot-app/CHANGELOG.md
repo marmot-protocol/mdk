@@ -13,6 +13,8 @@
   attachments as `imeta`. `MediaUploadRequest::message_tags` does the same for
   a sent upload. Tags are capped at 64 rows and 16 KiB of values, and `imeta`
   rows are rejected.
+- `ConversationReaction::reaction_message_id_hex` names the earliest active
+  kind-7 carrying that emoji, so a NIP-30 reaction's image can be resolved.
 
 ### Fixed
 

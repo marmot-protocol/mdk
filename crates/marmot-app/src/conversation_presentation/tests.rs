@@ -649,3 +649,28 @@ fn conversation_viewer_reaction_is_account_scoped_and_independent_of_preview() {
     assert_eq!(reaction.count, 2);
     assert_eq!(reaction.reactors, previews);
 }
+
+#[test]
+fn custom_emoji_reaction_names_its_earliest_event() {
+    let (_dir, app, input) = setup();
+    let target = "ff".repeat(32);
+    let mut row = message(&input.group_id_hex, &target);
+    let reaction = |id: &str, emoji: &str, at| TimelineUserReaction {
+        reaction_message_id_hex: id.into(),
+        target_message_id_hex: target.clone(),
+        sender: "00".repeat(32),
+        emoji: emoji.into(),
+        reacted_at: at,
+    };
+    row.reactions.user_reactions = vec![
+        reaction("first-cat", ":cat:", 1),
+        reaction("thumb", "👍", 2),
+        reaction("second-cat", ":cat:", 3),
+    ];
+    row.reactions
+        .by_emoji
+        .insert(":cat:".into(), vec!["00".repeat(32)]);
+    let result = project(&app, &input, &page(vec![row]));
+    let cat = &result.messages[0].reactions.items[0];
+    assert_eq!(cat.reaction_message_id_hex.as_deref(), Some("first-cat"));
+}

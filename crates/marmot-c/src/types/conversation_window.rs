@@ -66,6 +66,7 @@ str emoji,
 copy count: u64,
 str_vec reactors/reactors_len,
 copy viewer_reacted: bool,
+opt_str reaction_message_id_hex,
 } }
 c_mirror! { MarmotConversationReactions from ConversationReactionsFfi {
 copy total_count: u64,
@@ -194,6 +195,7 @@ mod tests {
                 count: 3,
                 reactors: vec!["other-a".into(), "other-b".into()],
                 viewer_reacted,
+                reaction_message_id_hex: Some("ab".repeat(32)),
             };
             let mut mirror = MarmotConversationReaction::from(ffi);
             assert_eq!(mirror.viewer_reacted, viewer_reacted);

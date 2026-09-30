@@ -5226,6 +5226,7 @@ typedef struct MarmotConversationReaction {
   char **reactors;
   uintptr_t reactors_len;
   bool viewer_reacted;
+  char *reaction_message_id_hex;
 } MarmotConversationReaction;
 
 typedef struct MarmotConversationReactions {

@@ -16,6 +16,10 @@
   `:shortcode:` reaction. `MediaUploadRequestFfi.message_tags` (default empty)
   tags a sent upload. At most 64 tags and 16 KiB of values; `imeta` rows are
   rejected.
+- Conversation window kind-9 rows now keep NIP-30 `["emoji", shortcode, url]`
+  tags in `timeline.tags`, and `ConversationReactionFfi.reaction_message_id_hex`
+  names the earliest active kind-7 for that emoji, whose custom image
+  `list_media` returns under the same message id.
 
 
 ## 0.11.0 - 2026-09-29
