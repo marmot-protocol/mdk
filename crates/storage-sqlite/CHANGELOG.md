@@ -9,6 +9,12 @@
   tally and this read share one resolver, so the per-voter pages always sum to
   `PollProjection`'s counts and `participants`. (#2091)
 
+### Fixed
+
+- Certifying incremental-history debt through a full-history repair now settles the
+  pending recovery comparison, so a comparison with no work left is no longer selected
+  ahead of other recovery causes. (#2100)
+
 ### Changed
 
 - Kind-7 reactions with encrypted-media `imeta` (NIP-30 custom emoji images)

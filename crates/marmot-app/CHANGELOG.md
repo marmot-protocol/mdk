@@ -22,6 +22,11 @@
   no branch, such as the pass that settles the device's own disband. That pass never tried
   them against the group's state; they now wait for a pass that selects a branch, or for
   the engine to try them against its live state.
+- A recovery comparison no longer fails when a group route, window or relay changes after
+  the comparison was requested, for example when a Welcome is admitted during startup.
+  Such a grant used to fail on every attempt until the next request. Each pass now compares
+  the recorded incremental-history debt rather than the live routing snapshot, so it
+  queries exactly the relays its settlement certifies. (#2100)
 
 ## 0.11.0 - 2026-09-29
 
