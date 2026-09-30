@@ -18,6 +18,12 @@
 
 ### Fixed
 
+- A route change, such as creating or leaving a group, no longer resets
+  history recovery for every route. Routes whose own window and required
+  relays are unchanged keep their certificates and quiet streak; only changed
+  and new routes are compared again. Before, each new DM restarted recovery
+  over every route, so on accounts with many chats it rarely finished
+  (#2110).
 - Host catch-up (`catch_up_accounts`) and the catch-up after creating or
   changing a group no longer run a recovery job while holding the account
   worker. They drain live input and return; the worker's paced recovery job

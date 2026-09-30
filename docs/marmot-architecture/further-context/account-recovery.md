@@ -77,6 +77,10 @@ The simulator comes first; Jeff validates on a phone.
      times in a row without admitting or certifying anything**, the obligation parks. Each
      route counts its own comparisons, so a pass that compares a slice of routes cannot park
      the rest. New evidence, or durable admission on a route, starts that route's count over.
+     A route-policy change (a group created or left, a relay added to one route) is not new
+     evidence: it rebuilds the pending scopes, but a route whose own window and required
+     relays are unchanged keeps its count and its certificates. Only changed and new routes
+     start over, so creating a group does not reset every route's progress (mdk#2110).
      It shows "history may be incomplete" and offers an explicit deep repair, which can
      still complete it with qualified coverage, or an explicit retirement. There are no
      further automatic retries.
@@ -245,8 +249,11 @@ explicit user-authorized retirement, recorded as its own outcome, never as cover
 
 - Every pending obligation parked for deep repair is one notice. Its id encodes the
   obligation and its revision, so new evidence that re-arms the obligation removes the
-  notice, and a later parking is a new notice with a new id. The notice carries the cause,
-  the group for group-scoped demand, and when it parked.
+  notice, and a later parking is a new notice with a new id. A route change is not new
+  evidence: it re-checks a parked obligation without changing its revision, so the notice
+  leaves while the new routes are compared and returns with the same id if the obligation
+  parks again. The notice carries the cause, the group for group-scoped demand, and when
+  it parked.
 - A group's own occurrences (today an epoch gap) also show in its recovery status.
   Account-wide ones, such as delivery loss and incremental or explicit history, appear only
   in the account's list. One account event announces any change to the list.

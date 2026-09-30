@@ -151,15 +151,17 @@ fn bound_loss_goals(
     scopes
 }
 
-/// A stored scope whose certificates survive this grant's freeze: its goal is
-/// unchanged and every required endpoint is covered and admitted.
+/// A stored scope whose certificates can survive this grant's freeze: same
+/// obligation and loss revisions, and every required endpoint is covered and
+/// admitted. Like the storage carry rule, it ignores route-policy changes
+/// elsewhere in the account; the goal must also be unchanged
+/// ([`same_scope_goal`]).
 fn scope_is_certified(
     scope: &storage_sqlite::StoredRecoveryScope,
     revision: u64,
     fence: &storage_sqlite::RecoveryRevisionFence,
 ) -> bool {
     scope.obligation_revision == revision
-        && scope.route_revision == fence.route_revision
         && scope.loss_revision == fence.loss_revision
         && !scope.plan.required_endpoints.is_empty()
         && scope.plan.required_endpoints.iter().all(|endpoint| {
@@ -170,6 +172,24 @@ fn scope_is_certified(
                     && checkpoint.admission_complete
             })
         })
+}
+
+/// Whether a new goal keeps a stored scope's identity, window and required
+/// relays, so storage carries that scope's certificates into the new plan.
+fn same_scope_goal(
+    stored: &storage_sqlite::RecoveryScopePlan,
+    goal: &storage_sqlite::RecoveryScopePlan,
+) -> bool {
+    stored.scope_id == goal.scope_id
+        && stored.route_kind == goal.route_kind
+        && stored.route_role == goal.route_role
+        && stored.group_id == goal.group_id
+        && stored.transport_group_id == goal.transport_group_id
+        && stored.since_seconds == goal.since_seconds
+        && stored.until_seconds == goal.until_seconds
+        && stored.known_event_id == goal.known_event_id
+        && stored.inventory_floor == goal.inventory_floor
+        && stored.required_endpoints == goal.required_endpoints
 }
 
 #[cfg(test)]
@@ -1325,12 +1345,11 @@ impl AppClient {
                     StorageError::Serialization("selected recovery demand disappeared".into())
                 })?;
             let stored = storage.recovery_scope_snapshots(*id)?;
-            certified_scopes.extend(
-                stored
-                    .iter()
-                    .filter(|scope| scope_is_certified(scope, *revision, &grant.fence))
-                    .map(|scope| (*id, scope.plan.scope_id)),
-            );
+            let certified_prior = stored
+                .iter()
+                .filter(|scope| scope_is_certified(scope, *revision, &grant.fence))
+                .map(|scope| (scope.plan.scope_id, scope.plan.clone()))
+                .collect::<std::collections::HashMap<_, _>>();
             // Cold start compares the retained-inventory window, as the
             // startup comparison does. A checkpoint narrows the goal to the
             // gap below the live floor.
@@ -1487,6 +1506,16 @@ impl AppClient {
                 ),
                 None => scopes,
             };
+            certified_scopes.extend(
+                scopes
+                    .iter()
+                    .filter(|goal| {
+                        certified_prior
+                            .get(&goal.scope_id)
+                            .is_some_and(|stored| same_scope_goal(stored, goal))
+                    })
+                    .map(|goal| (*id, goal.scope_id)),
+            );
             goals.push((*id, scopes));
         }
         let mut loss = Vec::new();
@@ -4119,6 +4148,64 @@ mod tests {
             .unwrap()
             .unwrap();
         client.test_comparison_results = Some(scripted_routes(&retry, |route| !group(route)));
+        client.run_recovery_grant_for_test(retry).await.unwrap();
+        assert_eq!(queue_loss(&storage), None);
+    }
+
+    /// Creating a group changes the account's routes. That is not new
+    /// evidence about history: routes whose own goal is unchanged keep their
+    /// certificates, and only uncertified routes are compared again (mdk#2110).
+    #[tokio::test]
+    async fn a_new_route_keeps_certificates_of_unchanged_routes() {
+        let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
+        let storage = app.account_storage("alice").unwrap();
+        let inbox = |route: &storage_sqlite::TransportReconciliationRoute| {
+            matches!(route, storage_sqlite::TransportReconciliationRoute::Inbox)
+        };
+        let loss_revision = |storage: &SqliteAccountStorage| {
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+                .map(|demand| demand.ticket.revision)
+        };
+        // The inbox certifies; the group route fails and stays debt.
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        client.test_comparison_results = Some(scripted_routes(&grant, |route| !inbox(route)));
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        let before = loss_revision(&storage).expect("the group route keeps the loss pending");
+
+        client.create_group("new route", &[]).await.unwrap();
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let retry = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loss_revision(&storage),
+            Some(before),
+            "a route change is not new evidence"
+        );
+        assert!(
+            !retry.inventory.iter().any(|item| inbox(&item.route)),
+            "the certified inbox is not compared again"
+        );
+        assert_eq!(
+            retry.inventory.len(),
+            2,
+            "the failed group route and the new group route are compared"
+        );
+        client.test_comparison_results = Some(scripted_routes(&retry, |_| false));
         client.run_recovery_grant_for_test(retry).await.unwrap();
         assert_eq!(queue_loss(&storage), None);
     }

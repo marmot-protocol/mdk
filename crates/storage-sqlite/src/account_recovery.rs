@@ -522,8 +522,11 @@ impl SqliteAccountStorage {
 
     /// Observe current desired route/capability policy, not a historical goal.
     /// Reconnect/open with an identical snapshot is a read-equivalent no-op.
-    /// Changed policy invalidates in-flight results and rechecks pending demand,
-    /// but never forgives its durable retry reservation.
+    /// Changed policy invalidates in-flight results (the route revision is part
+    /// of every work fence) and rechecks pending demand, but never forgives its
+    /// durable retry reservation. It is not new evidence about history, so it
+    /// leaves obligation revisions alone: a scope whose own route and required
+    /// relays are unchanged keeps its certificates and quiet streak (mdk#2110).
     pub fn observe_recovery_route_snapshot(&self, snapshot: [u8; 32]) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -537,7 +540,7 @@ impl SqliteAccountStorage {
             conn.execute_cached("UPDATE account_recovery_state SET route_snapshot=?1,route_revision=route_revision+?2 WHERE singleton=1",
                 params![snapshot.as_slice(),i64::from(changed)]).storage()?;
             if changed {
-                conn.execute_cached("UPDATE account_recovery_obligations SET revision=revision+1,eligibility=0 WHERE state=0", []).storage()?;
+                conn.execute_cached("UPDATE account_recovery_obligations SET eligibility=0 WHERE state=0", []).storage()?;
             }
             Ok(changed)
         })
