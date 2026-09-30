@@ -1,4 +1,5 @@
 mod artifacts;
+pub mod attachment_preflight;
 mod bridge;
 mod chunking;
 mod commands;

@@ -6,14 +6,10 @@ sends every message from an allowed sender to `opencode run --format json`.
 
 `wn-agent` owns the Marmot account, MLS state, Nostr transport, invite allowlist,
 and durable encrypted sends. `wn-opencode` is intentionally thinner than the
-Hermes and OpenClaw gateway integrations: it has no mention activation, backend
-attachment support, profile onboarding, or live previews. It is a pure harness
-for an authorized operator.
-
-For a turn containing one or more files, the shared terminal harness first applies its attachment-count and aggregate-byte
-limits and downloads the complete ordered batch into private staging. Because
-the OpenCode backend does not opt in to attachments, the batch is then rejected
-before `opencode` is spawned; its accompanying text is not forwarded either.
+Hermes and OpenClaw gateway integrations: it has no mention activation, profile
+onboarding, or live previews. It is a pure harness for an authorized operator.
+Files sent with a message reach OpenCode through `opencode run --file`; see
+[Inbound attachments](#inbound-attachments).
 
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
@@ -25,6 +21,7 @@ For the current guided install, runtime chooser, and steps to finish in White No
 - [Workdir Picker](#workdir-picker)
 - [Chat Commands](#chat-commands)
 - [OpenCode Transport Contract](#opencode-transport-contract)
+- [Inbound attachments](#inbound-attachments)
 - [Security Notes](#security-notes)
 - [Development](#development)
 
@@ -139,8 +136,8 @@ Configure with environment variables:
 | `WN_OPENCODE_REQUEST_TIMEOUT_SECS` | `30` | Timeout for each control-socket request |
 | `WN_OPENCODE_MAX_REPLY_BYTES` | `30000` | UTF-8 byte limit for each durable Marmot reply chunk |
 | `WN_OPENCODE_MAX_PENDING_PER_GROUP` | `4` | Per-group in-flight/queued prompt cap |
-| `WN_OPENCODE_MAX_ATTACHMENTS` | `8` | Maximum inbound files validated before backend rejection |
-| `WN_OPENCODE_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate inbound bytes validated before rejection |
+| `WN_OPENCODE_MAX_ATTACHMENTS` | `8` | Maximum inbound files in one turn |
+| `WN_OPENCODE_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate plaintext bytes in one inbound batch |
 | `WN_OPENCODE_STATE_PATH` | `$XDG_STATE_HOME/wn-opencode/sessions.json` | Session map path |
 | `WN_OPENCODE_ACTIVATION` | `always` | Only `always` is supported today |
 | `RUST_LOG` | `info,marmot_terminal_harness=info` | tracing filter |
@@ -224,6 +221,66 @@ This ACP decision concerns only the OpenCode backend below the shared `Backend`
 trait. It does not change `marmot.agent-control.v2` and does not imply an ACP
 migration for other terminal harnesses.
 
+## Inbound attachments
+
+The shared harness downloads every file in one Marmot message in message order,
+enforces the count and aggregate-byte limits, and copies the batch into one
+owner-only temporary directory. `wn-opencode` then starts exactly one
+`opencode run` for the message:
+
+```text
+opencode run --format json [--auto] [--session <id>] --file <staged path> ... --
+```
+
+Each staged file gets its own `--file <path>` pair, in message order, after
+every other option. The final `--` ends option parsing. Staged paths are
+absolute, so a file name that begins with `-` cannot be read as an option. The
+caption or request text goes to stdin only, exactly as for a text-only turn.
+New and resumed groups use the same shape; a resumed group keeps its stored
+`--session` id, so the files join the existing OpenCode session. Execution
+profiles, the `unrestricted` config overlay, and the completed-text event filter
+are unchanged. A text-only turn has no `--file` arguments and no `--`.
+
+Without `--attach`, OpenCode 1.18.18 labels every `--file` path as `text/plain`
+([`run.ts`](https://github.com/anomalyco/opencode/blob/v1.18.18/packages/opencode/src/cli/cmd/run.ts#L357-L414))
+and resolves it through its Read tool
+([`prompt.ts`](https://github.com/anomalyco/opencode/blob/v1.18.18/packages/opencode/src/session/prompt.ts#L808-L907),
+[`read.ts`](https://github.com/anomalyco/opencode/blob/v1.18.18/packages/opencode/src/tool/read.ts#L300-L331)).
+When the Read tool fails, OpenCode keeps going and gives the model an error note
+in place of the file. To stop that from happening silently, the connector
+re-opens every staged file right before spawning OpenCode and applies the same
+rules the Read tool uses:
+
+| File | How OpenCode classifies it | Connector decision |
+| --- | --- | --- |
+| PNG, JPEG, GIF, WebP, or PDF | First bytes match the signature in [`util/media.ts`](https://github.com/anomalyco/opencode/blob/v1.18.18/packages/opencode/src/util/media.ts) | Accepted; OpenCode attaches the bytes as an image or PDF |
+| Text | Valid UTF-8; no NUL byte and at most 30% control characters in the first 4 KiB; extension not on OpenCode's binary list | Accepted; OpenCode inlines it with line numbers |
+| Signature missing but extension is `.png`, `.jpg`, `.jpeg`, `.jpe`, `.gif`, `.webp`, or `.pdf` | OpenCode would trust the extension and send non-matching bytes as media | Rejected |
+| Extension `.zip`, `.tar`, `.gz`, `.7z`, `.jar`, `.war`, `.class`, `.exe`, `.dll`, `.so`, `.o`, `.a`, `.lib`, `.obj`, `.wasm`, `.pyc`, `.pyo`, `.bin`, `.dat`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx`, `.odt`, `.ods`, or `.odp` | Read tool refuses it as binary, whatever the content | Rejected |
+| BMP, audio, archives, other binary, or non-UTF-8 text | Read tool refuses it as binary, or would decode it lossily | Rejected |
+
+Extensions come from the connector-sanitized staged name, which keeps the
+sender's extension unless the name is longer than 128 characters. One rejected,
+missing, size-changed, symlinked, or non-regular file fails the whole message
+before OpenCode starts: the other files and the caption are not forwarded, and
+nothing is split into separate turns. The sender gets the shared attachment
+failure reply. An error that OpenCode itself reports during the turn fails that
+turn and is not retried.
+
+OpenCode applies its own limits after these checks. The Read tool inlines at
+most 2000 lines or 50 KiB of a text file, cuts lines longer than 2000
+characters, and appends a note that tells the model where the output stopped.
+Images and PDFs pass through unchanged apart from OpenCode's own image
+resizing, so the configured model must accept image or PDF input. The connector
+does not check model capabilities. OpenCode 1.18.32 uses the same `run`, Read
+tool, and media-sniffing code for these paths as 1.18.18.
+
+Staged copies stay in place for the whole OpenCode process and are removed after
+success, OpenCode error, timeout, or cancellation. A cancelled or timed-out turn
+stops the OpenCode process group before the batch is deleted. Leftover batch
+directories are removed when the connector restarts. Logs and the session map
+never record file names, paths, contents, or prompt text.
+
 ## Security Notes
 
 - The control socket is local Unix-domain only. Use the normal `wn-agent`
@@ -241,6 +298,8 @@ migration for other terminal harnesses.
   key material.
 - Prompt text is written to `opencode run` over stdin and is absent from spawned
   process arguments and privacy-safe logs.
+- Attachment paths appear in `opencode run` arguments as private staged paths.
+  Their contents, sender file names, and captions never do.
 - The session map is written through `fs-private` with owner-only file and
   directory modes.
 
@@ -255,3 +314,14 @@ bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(prin
 ```
 
 The crate is a workspace member at `integrations/opencode/marmot`.
+
+The real OpenCode contract test is ignored by default because it needs an
+installed, authenticated OpenCode CLI and makes model requests. Its first turn
+checks that the model can read a staged text file passed with `--file`. Its
+second turn resumes the same session with a different file and checks that the
+model can read both. Set `WN_OPENCODE_BIN` to run it against a specific
+OpenCode build, such as the 1.18.18 minimum:
+
+```sh
+cargo test -p wn-opencode real_opencode_run_file_contract -- --ignored --nocapture
+```
