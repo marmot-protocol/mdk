@@ -434,6 +434,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
     let mut family = "adversarial-reliability/v1".to_owned();
     let mut seed = 7;
     let mut cases = 12;
+    let mut cases_explicit = false;
     let mut case_indices = Vec::new();
     let mut out = PathBuf::from("target/cgka-adversarial-reliability-process-campaign");
     let mut storage = HarnessStorageMode::TempFileBackedSqlite;
@@ -448,7 +449,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
             "--worker" => worker = true,
             "--family" => family = args.next().ok_or("missing --family value")?,
             "--seed" => seed = args.next().ok_or("missing --seed value")?.parse()?,
-            "--cases" => cases = args.next().ok_or("missing --cases value")?.parse()?,
+            "--cases" => {
+                cases_explicit = true;
+                cases = args.next().ok_or("missing --cases value")?.parse()?;
+            }
             "--case-index" => {
                 case_indices.push(args.next().ok_or("missing --case-index value")?.parse()?)
             }
@@ -501,10 +505,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
     if !worker && cases == 0 && case_indices.is_empty() {
         return Err("--cases must be greater than zero".into());
     }
-    if !case_indices.is_empty() {
-        case_indices.sort_unstable();
-        case_indices.dedup();
+    if cases_explicit && !case_indices.is_empty() {
+        return Err("--cases and --case-index cannot be combined".into());
     }
+    case_indices.sort_unstable();
+    case_indices.dedup();
     if !worker && case_timeout.is_zero() {
         return Err("--case-timeout-secs must be greater than zero".into());
     }
@@ -761,8 +766,11 @@ mod tests {
 
     #[test]
     fn selects_explicit_case_indices_without_a_prefix() {
+        let out = tempfile::tempdir().unwrap();
         let args = parse_args(
             [
+                "--out",
+                out.path().to_str().unwrap(),
                 "--family",
                 "large-group-pressure/v1",
                 "--case-index",
@@ -782,6 +790,18 @@ mod tests {
                 .map(|planned| planned.case.case_index)
                 .collect::<Vec<_>>(),
             vec![24, 48]
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_prefix_and_explicit_case_selection() {
+        assert!(
+            parse_args(
+                ["--cases", "50", "--case-index", "24"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
         );
     }
 

@@ -255,14 +255,16 @@ and relay database for each group-creation run. Build the matching release node 
 ```sh
 MDK_APP_PROCESS_NODE=/absolute/path/to/cgka-conformance-node \
 MDK_STRFRY_GROUP_MEMBERS=200 \
-MDK_STRFRY_URL=ws://127.0.0.1:7777 \
+MDK_STRFRY_URL=ws://127.0.0.1:27777 \
 MDK_STRFRY_APP_ARTIFACTS=/absolute/private/fresh-output-root \
 cargo test --release --locked -p cgka-conformance-simulator --lib \
   app_runtime::strfry_process_scale::app_group_through_strfry_processes \
   -- --ignored --exact --nocapture
 ```
 
-The relay must use `dev/strfry.conf` with a suitable event and WebSocket payload limit, and
+The shared local and CI relay config `dev/strfry.conf` accepts 1 MiB events with a 2 MiB
+WebSocket payload limit. It is more permissive than inbox relays enforcing a 64 KiB event limit;
+these probes do not enforce that production constraint. The relay must use this config, and
 the loopback URL must match its published port. The separate ignored
 `resumed_group_after_strfry_restart` test reopens the retained root after a relay restart and
 checks saved state and a fresh message. It intentionally retains failures as evidence; a

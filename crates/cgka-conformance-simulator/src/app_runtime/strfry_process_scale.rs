@@ -29,9 +29,13 @@ fn milestone(root: &Path, stage: &str, elapsed: Duration, count: usize) {
         .as_bytes(),
     )
     .unwrap();
-    eprintln!(
-        "STRFRY_PROCESS_STAGE {stage} members={count} elapsed_ms={}",
-        elapsed.as_millis()
+    tracing::info!(
+        target: "cgka_conformance_simulator::strfry_process_scale",
+        method = "milestone",
+        stage,
+        member_count = count,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "manual scale probe milestone"
     );
 }
 
@@ -98,10 +102,12 @@ async fn catch_up_all(participants: &[Participant]) {
         while let Some(result) = tasks.join_next().await {
             let (index, started, outcome) = result.expect("catch-up task");
             if started.elapsed() > Duration::from_secs(10) || outcome.is_err() {
-                eprintln!(
-                    "STRFRY_PROCESS_CATCH_UP index={index} elapsed_ms={} success={}",
-                    started.elapsed().as_millis(),
-                    outcome.is_ok()
+                tracing::info!(
+                    target: "cgka_conformance_simulator::strfry_process_scale",
+                    method = "catch_up_all",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    success = outcome.is_ok(),
+                    "manual scale probe catch-up completed"
                 );
             }
             outcome.unwrap_or_else(|error| panic!("catch-up at index {index}: {error}"));

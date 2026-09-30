@@ -27,8 +27,9 @@ The stable logical identity is:
 ```
 
 `--cases N` generates indices `0..N-1`. It is not a complexity setting. Increasing it must preserve the existing
-prefix. The current CLI has no case-start offset, so parallelize a large discovery run by assigning distinct seeds to
-shards. Do not run the same seed with several different case counts unless intentional prefix duplication is
+prefix. The process campaign runner accepts repeatable `--case-index N` to select isolated indices and preserves
+those original indices in its reports. Parallelize discovery using disjoint selections with fresh output roots or
+distinct seeds. Do not run the same seed with several different case counts unless intentional prefix duplication is
 acceptable.
 
 Always retain `*-generated-input.json`. It pins more than the tuple: the selected subject, expectations, exact
