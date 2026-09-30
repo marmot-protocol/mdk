@@ -67,6 +67,12 @@ test-message-journeys:
 bench-startup:
     cargo test --release -p marmot-app --test startup_scaling -- --ignored --nocapture --test-threads=1
 
+# Create-DM scaling benchmark: cold-starts an account holding 300 and 1000
+# existing chats, times fresh one-peer DM creation, and prints stable
+# `MDK_BENCH ...` lines with group-create stage averages.
+bench-create-direct-message:
+    cargo test --release -p marmot-app --test create_dm_scaling -- --ignored --nocapture --test-threads=1
+
 # Founding-image critical-path benchmark (mdk#1485): reports no-image,
 # typical-image, exact byte-limit, and stalled-Blossom rows. The successful
 # rows include the prior serialized-path model and the new canonical-create
