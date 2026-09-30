@@ -14,8 +14,6 @@ use tokio::sync::mpsc;
 /// Bytes Pi's `detectSupportedImageMimeTypeFromFile` sniffs from each `@file` operand.
 const PI_IMAGE_SNIFF_BYTES: usize = 4100;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
-/// Sanitized summary when Pi's initial user message lacks an image it was given.
-const ATTACHMENT_NOT_PROCESSED: &str = "an attachment it could not process";
 
 #[derive(Clone)]
 pub(crate) struct PiBackend {
@@ -253,8 +251,8 @@ fn read_u32_be(bytes: &[u8], offset: usize) -> u32 {
 ///
 /// With attachments, Pi's first completed user message must carry exactly one image part
 /// per accepted image. Pi replaces an image it cannot convert or resize with an
-/// `[Image omitted: ...]` note instead of failing, so a mismatch fails the whole turn and
-/// suppresses any later assistant text.
+/// `[Image omitted: ...]` note instead of failing, so a mismatch, or an assistant message
+/// before that user message, stops Pi before it can act on the altered prompt.
 struct PiEventParser {
     input: InputCheck,
 }
@@ -308,7 +306,7 @@ impl PiEventParser {
                 InputCheck::Rejected => ParsedEvent::Ignored,
                 InputCheck::Pending { .. } => {
                     self.input = InputCheck::Rejected;
-                    attachment_not_processed()
+                    ParsedEvent::AttachmentNotProcessed
                 }
             }),
             _ => Ok(ParsedEvent::Ignored),
@@ -331,15 +329,8 @@ impl PiEventParser {
             ParsedEvent::Ignored
         } else {
             self.input = InputCheck::Rejected;
-            attachment_not_processed()
+            ParsedEvent::AttachmentNotProcessed
         }
-    }
-}
-
-fn attachment_not_processed() -> ParsedEvent {
-    ParsedEvent::Error {
-        session_id: None,
-        summary: ATTACHMENT_NOT_PROCESSED.to_owned(),
     }
 }
 
@@ -878,10 +869,7 @@ exit 64
                 input: PiInput::Image,
             },
         ];
-        let not_processed = ParsedEvent::Error {
-            session_id: None,
-            summary: ATTACHMENT_NOT_PROCESSED.to_owned(),
-        };
+        let not_processed = ParsedEvent::AttachmentNotProcessed;
 
         let mut verified = PiEventParser::new(&prepared);
         assert_eq!(
@@ -1036,7 +1024,7 @@ printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn pi_file_processor_failures_fail_the_whole_turn_without_forwarding_text() {
+    async fn pi_that_drops_an_accepted_image_is_stopped_before_it_can_act() {
         let root = tempfile::tempdir().unwrap();
         let batch = private_batch(root.path());
         let attachments = vec![
@@ -1046,31 +1034,52 @@ printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type
         let session_dir = root.path().join("sessions");
         fs_private::create_dir_all_private(&session_dir).unwrap();
 
-        let omitted = root.path().join("fake-pi-image-omitted");
-        write_script(
-            &omitted,
-            &format!(
-                "#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s\\n' '{{\"type\":\"session\",\"version\":3,\"id\":\"pi-omitted\"}}' '{USER_WITHOUT_IMAGES}' '{ASSISTANT_TEXT}'\n"
-            ),
-        );
-        let (tx, mut rx) = mpsc::channel(4);
-        let outcome = run_with_bin(
-            omitted.to_str().unwrap(),
-            &session_dir,
-            ExecutionProfile::Inherit,
-            invocation(root.path(), None, Duration::from_secs(5)),
-            &attachments,
-            tx,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome.exit_code, Some(0));
-        assert_eq!(
-            outcome.error_summary.as_deref(),
-            Some(ATTACHMENT_NOT_PROCESSED)
-        );
-        assert_eq!(outcome.observed_session.as_deref(), Some("pi-omitted"));
-        assert!(rx.recv().await.is_none());
+        // An image replaced by Pi's note, and an assistant reply with no user message first.
+        for (name, trigger) in [
+            ("image-omitted", USER_WITHOUT_IMAGES),
+            ("unverified", ASSISTANT_TEXT),
+        ] {
+            let marker = root.path().join(format!("{name}-acted"));
+            let script = root.path().join(format!("fake-pi-{name}"));
+            // The subshell is a separate group member, so only a group kill stops it.
+            write_script(
+                &script,
+                &format!(
+                    "#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s\\n' '{{\"type\":\"session\",\"version\":3,\"id\":\"pi-{name}\"}}' '{trigger}'\n(sleep 0.3; touch '{}')\nprintf '%s\\n' '{ASSISTANT_TEXT}'\n",
+                    marker.display()
+                ),
+            );
+            let (tx, mut rx) = mpsc::channel(4);
+            let failure = run_with_bin(
+                script.to_str().unwrap(),
+                &session_dir,
+                ExecutionProfile::Inherit,
+                invocation(root.path(), None, Duration::from_secs(5)),
+                &attachments,
+                tx,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(failure.error, HarnessError::AttachmentNotProcessed),
+                "{name}"
+            );
+            assert_eq!(failure.observed_session, None, "{name}");
+            assert!(rx.recv().await.is_none(), "{name}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(!marker.exists(), "{name} kept running after the check");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_file_read_failure_fails_the_turn_without_forwarding_text() {
+        let root = tempfile::tempdir().unwrap();
+        let batch = private_batch(root.path());
+        let attachments = vec![staged(batch.path(), "000-notes.txt", b"notes\n")];
+        let session_dir = root.path().join("sessions");
+        fs_private::create_dir_all_private(&session_dir).unwrap();
 
         let unreadable = root.path().join("fake-pi-unreadable");
         write_script(

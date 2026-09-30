@@ -40,6 +40,10 @@ Each backend provides a typed `ProcessSpec`, selects its prompt transport, and
 maps its strict decoder into the shared `ParsedEvent` vocabulary. The shared
 runner owns spawning, bounded stderr, stdout and total deadlines, reply-channel
 backpressure, first-session capture, and child termination and reaping.
+A decoder that sees the backend drop or replace an attachment it was given
+returns `ParsedEvent::AttachmentNotProcessed`. The runner then kills the
+process group at once, before the backend can act on the altered prompt, and
+fails the turn without keeping the session id observed in that run.
 
 Claude Code, Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
 belongs in those connector crates, not in this shared runtime.
@@ -172,8 +176,9 @@ session epoch again. Observations from work started before that epoch boundary
 cannot restore the old session.
 
 On Unix, every backend invocation runs in its own process group. Timeout,
-cancellation, and failure cleanup terminate the whole group before reaping the
-direct child so backend-spawned descendants cannot outlive an interrupted turn.
+cancellation, an unprocessed attachment, and failure cleanup terminate the
+whole group before reaping the direct child so backend-spawned descendants
+cannot outlive an interrupted turn.
 Normal and nonzero leader exits also terminate remaining group members before
 reaping the leader. Exit observation retains the unreaped leader until this
 cleanup completes, preventing PID reuse from redirecting a later group signal.

@@ -15,10 +15,12 @@ Rust Pi harness for Marmot through the local `wn-agent` control socket. Read
   staged copy through the shared `attachment_preflight` and classifies it with
   Pi's own image sniffer (PNG without `acTL`, JPEG without `F7`, GIF, WebP) or
   as NUL-free UTF-8 text; anything else, including empty files and BMP, rejects
-  the whole batch before spawn. `PiEventParser` fails the turn and suppresses
-  assistant text when Pi's first user `message_end` carries fewer image parts
-  than accepted images. Keep the sniffer in step with Pi's `utils/mime.ts` for
-  the minimum supported version.
+  the whole batch before spawn. `PiEventParser` returns
+  `ParsedEvent::AttachmentNotProcessed` when Pi's first user `message_end`
+  carries fewer image parts than accepted images, or an assistant `message_end`
+  arrives first; the shared runner then kills the process group before Pi can
+  act and drops the observed session. Keep the sniffer in step with Pi's
+  `utils/mime.ts` for the minimum supported version.
 - Send prompts over stdin, emit only completed assistant text, and never expose
   thinking or tool output.
 - Keep Pi sessions in the configured private session directory and preserve the

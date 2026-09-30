@@ -2134,6 +2134,10 @@ async fn handle_backend_run_failure(
             "[{}] {} does not support this attachment batch; no backend turn was started.",
             config.spec.reply_prefix, config.spec.display_name
         ),
+        HarnessError::AttachmentNotProcessed => format!(
+            "[{}] {} could not process an attachment in this batch and was stopped before acting on it.",
+            config.spec.reply_prefix, config.spec.display_name
+        ),
         HarnessError::AttachmentBackendCapabilityUnsupported { capability } => format!(
             "[{}] {} does not expose the required {} attachment capability; upgrade {} and retry. No backend turn was started.",
             config.spec.reply_prefix,
