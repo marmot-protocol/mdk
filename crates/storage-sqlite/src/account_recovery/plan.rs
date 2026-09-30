@@ -912,6 +912,16 @@ impl SqliteAccountStorage {
                 params![obligation_id.as_slice(), if qualified { 1 } else { 0 }, eligibility as i64,
                     crate::codec::unix_now_ms().max(0)],
             ).storage()?;
+            // A full-history repair can complete incremental debt without
+            // owning the bounded comparison pass. Once that debt is certified,
+            // its comparison request has no remaining work and must not keep
+            // selecting empty grants ahead of other recovery causes.
+            if qualified && cause == RecoveryCause::IncrementalHistory as i64 {
+                conn.execute_cached(
+                    "UPDATE account_recovery_comparison SET settled_revision=revision WHERE singleton=1",
+                    [],
+                ).storage()?;
+            }
             Ok(qualified)
         })
     }

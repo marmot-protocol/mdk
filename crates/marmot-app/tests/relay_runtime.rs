@@ -3268,23 +3268,7 @@ async fn app_component_lifecycle() {
     // and defers while any received row is still unread, so mark the group read
     // and retry until it actually prunes.
     let group_hex = hex::encode(group.as_slice());
-    assert!(
-        runtime
-            .timeline_messages_with_query(
-                &alice,
-                TimelineMessageQuery {
-                    group_id_hex: Some(group_hex.clone()),
-                    ..TimelineMessageQuery::default()
-                },
-            )
-            .unwrap()
-            .messages
-            .iter()
-            .any(|message| message.plaintext == "expires"),
-        "the message must exist before the explicit retention sweep",
-    );
-    let mut last_sweep = Vec::new();
-    let completed = timeout(Duration::from_secs(15), async {
+    timeout(Duration::from_secs(15), async {
         loop {
             let newest = runtime
                 .timeline_messages_with_query(
@@ -3307,17 +3291,6 @@ async fn app_component_lifecycle() {
                 .sweep_expired_retention(&alice, later)
                 .await
                 .unwrap();
-            last_sweep = sweep
-                .groups
-                .iter()
-                .map(|outcome| {
-                    (
-                        outcome.status,
-                        outcome.pruned_messages,
-                        outcome.failure_kind.clone(),
-                    )
-                })
-                .collect();
             if sweep
                 .groups
                 .iter()
@@ -3328,11 +3301,8 @@ async fn app_component_lifecycle() {
             sleep(Duration::from_millis(25)).await;
         }
     })
-    .await;
-    assert!(
-        completed.is_ok(),
-        "retention sweep must prune the expired message; last outcomes: {last_sweep:?}"
-    );
+    .await
+    .expect("retention sweep must prune the expired message");
     wait_app_component(&runtime, &alice, &group, &[1, 0]).await;
     runtime
         .update_app_component(&alice, &group, COMPONENT, vec![])

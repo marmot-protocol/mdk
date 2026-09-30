@@ -4379,7 +4379,9 @@ mod tests {
         );
 
         // The original relay certifies, but the added required relay fails.
-        // Route-level success must not cover that relay's history.
+        // The rebuilt plan includes that relay, so the inventory judge must
+        // withhold coverage on its failure. Settlement's endpoint-presence
+        // check is an additional invariant guard for inconsistent work.
         client.test_comparison_results = Some(
             [Ok(Some((
                 transport_nostr_adapter::NostrReconciliationSummary {
@@ -4420,6 +4422,78 @@ mod tests {
         client.test_comparison_results = Some(scripted_routes(&retry, |_| false));
         client.run_recovery_grant_for_test(retry).await.unwrap();
         assert!(!storage.recovery_comparison().unwrap().pending());
+    }
+
+    #[tokio::test]
+    async fn full_history_completion_releases_comparison_and_other_recovery() {
+        let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
+        let storage = app.account_storage("alice").unwrap();
+        client.request_bounded_comparison().unwrap();
+        let initial = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .unwrap();
+        client.test_comparison_results = Some(scripted_routes(&initial, |_| true));
+        client.run_recovery_grant_for_test(initial).await.unwrap();
+        assert!(storage.recovery_comparison().unwrap().pending());
+
+        let mut permit = ExplicitRecoveryPermit::full_history();
+        let repair = client
+            .authorize_account_recovery(
+                Some(&mut permit),
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(repair.comparison_revision.is_none());
+        client.test_comparison_results = Some(scripted_routes(&repair, |_| false));
+        client.run_recovery_grant_for_test(repair).await.unwrap();
+        assert!(
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .all(|demand| {
+                    demand.cause != storage_sqlite::RecoveryCause::IncrementalHistory
+                })
+        );
+        assert!(!storage.recovery_comparison().unwrap().pending());
+
+        let group = client.state.groups[0].group_id_hex.clone();
+        let group_id = cgka_traits::GroupId::new(hex::decode(&group).unwrap());
+        let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        storage
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: group,
+                stalled_epoch: epoch,
+            }])
+            .unwrap();
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let automatic = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .expect("remaining recovery must get a network pass");
+        assert!(automatic.comparison_revision.is_none());
+        assert!(!automatic.inventory.is_empty());
+        let epoch_debt = automatic
+            .plan()
+            .unwrap()
+            .iter()
+            .find(|obligation| obligation.cause == storage_sqlite::RecoveryCause::EpochGap)
+            .expect("epoch debt must be selected");
+        assert!(
+            epoch_debt
+                .scopes
+                .iter()
+                .any(|scope| automatic.inventory.iter().any(|window| {
+                    scope.goal.transport_group_id.is_some_and(|id| {
+                        window.route == storage_sqlite::TransportReconciliationRoute::Group(id)
+                    })
+                }))
+        );
     }
 
     #[tokio::test]
