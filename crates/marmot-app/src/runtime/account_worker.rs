@@ -667,13 +667,15 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
-    /// Explicit recovery runs one job in place, so it waits while the
+    /// Full-history repair runs one job in place, so it waits while the
     /// account's worker-owned job is in flight: there is one job per account.
+    /// A catch-up only drains live input, like a delivery, so it crosses the
+    /// job instead of holding later sends and opens behind it (mdk#2110).
     fn waits_for_recovery_job(&self) -> bool {
-        matches!(self, Self::CatchUp { .. } | Self::RepairFullHistory { .. })
+        matches!(self, Self::RepairFullHistory { .. })
     }
 
-    /// Reads that can cross a deferred explicit catch-up without changing the
+    /// Reads that can cross a deferred full-history repair without changing the
     /// recovery grant or the order of later mutations.
     fn readable_during_comparison_catch_up(&self) -> bool {
         matches!(
@@ -3005,7 +3007,7 @@ async fn handle_account_worker_catch_up(
                 barrier.wait().await;
             }
             client
-                .sync_with_stage_telemetry(&stage_telemetry, true)
+                .sync_with_stage_telemetry(Some(&stage_telemetry), crate::client::SyncMode::Drain)
                 .await
         });
         loop {
@@ -4324,7 +4326,10 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::CatchUp { respond } => Box::pin(async move {
             let sync_started_at = Instant::now();
-            let result = match client.sync_with_classified_partial_progress().await {
+            let result = match client
+                .sync_with_stage_telemetry(None, crate::client::SyncMode::Drain)
+                .await
+            {
                 Ok(summary) => {
                     publish_app_runtime_summary_with_v5(
                         client,
@@ -8692,7 +8697,10 @@ mod tests {
         let shared = RuntimeSharedServices::default();
         let before = relay.unfloored_account_subscription_count();
         client
-            .sync_with_stage_telemetry(&shared.app_performance_telemetry(), false)
+            .sync_with_stage_telemetry(
+                Some(&shared.app_performance_telemetry()),
+                crate::client::SyncMode::Startup,
+            )
             .await
             .unwrap();
         for (seam, reason) in [
@@ -8829,7 +8837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_catch_up_runs_prearmed_backfill_before_success_response() {
+    async fn catch_up_leaves_prearmed_backfill_to_the_owner() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -8874,12 +8882,12 @@ mod tests {
         response.await.unwrap().unwrap();
         assert!(
             client.has_pending_epoch_backfill(),
-            "ordinary catch-up cannot certify complete historical coverage",
+            "a draining catch-up leaves the backfill to the owner's paced job",
         );
         assert_eq!(
             relay.unfloored_account_subscription_count(),
             before,
-            "the backfill acquires history by comparison, never by an unfloored replay"
+            "catch-up never replays unfloored history"
         );
         assert_eq!(
             app.account_storage("alice")
@@ -8887,13 +8895,14 @@ mod tests {
                 .recovery_retry_state()
                 .unwrap()
                 .attempt_serial,
-            1
+            0,
+            "catch-up reserves no recovery work (mdk#2110)"
         );
         drop(command_tx);
     }
 
     #[tokio::test]
-    async fn explicit_catch_up_succeeds_after_ordinary_sync_when_backfill_defers() {
+    async fn catch_up_succeeds_with_an_unavailable_backfill_intent() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -8953,14 +8962,6 @@ mod tests {
         assert!(
             client.has_pending_epoch_backfill(),
             "the unavailable recovery intent must remain pending"
-        );
-        let outcome = client
-            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .expect("rechecking a deferred intent must not fail");
-        assert!(
-            matches!(outcome, EpochBackfillRunOutcome::Deferred),
-            "deferred work must remain distinct from no pending work"
         );
         drop(command_tx);
     }
@@ -9885,7 +9886,8 @@ mod tests {
                     .recovery_retry_state()
                     .unwrap()
                     .attempt_serial,
-                1
+                0,
+                "Bob's catch-up only drains; it reserves no recovery work"
             );
         }
     }

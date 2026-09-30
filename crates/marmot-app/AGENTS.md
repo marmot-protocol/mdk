@@ -166,7 +166,8 @@ App runtime bridge for the first real Marmot app surfaces.
   should stay visible until accepted, and decline should leave the group before archiving the local projection.
 - Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
 - Every recovery cause and caller runs the one comparison job in `src/client/sync/comparison_job.rs`; there is
-  no inline executor. Explicit catch-up and `sync()` drain the live queue, then run one job in place; nothing
+  no inline executor. Runtime catch-ups (`SyncMode::Drain`) only drain the live queue and never run a job, so
+  they cross a worker-owned job (mdk#2110); `sync()` drains, then runs one job in place; nothing
   re-subscribes to recover history, and only startup, a frozen wake or an unactivated client installs live
   subscriptions. Explicit full-history repair runs the job in place: one comparison pass over every route of its
   grant inside the repair budget. It never reports complete: history below the retained window is unsearched
@@ -179,7 +180,7 @@ App runtime bridge for the first real Marmot app surfaces.
   routes for admission; only cancellation aborts the request at the poll; `stopped` ends admission at a turn
   boundary, keeping the admitted prefix; and
   preserve generation-checked overflow marker clearing. The account worker can serve committed snapshot reads
-  while repair waits; mutations retain FIFO order, and explicit catch-up and repair wait while a worker-owned job
+  while repair waits; mutations retain FIFO order, and repair waits while a worker-owned job
   is in flight. Client continuation tests live in `src/client/sync/full_history_tests.rs`; worker
   cancellation/read-order tests stay in `src/runtime/account_worker.rs`. See the README for the
   automatic-recovery and send-fairness limits.

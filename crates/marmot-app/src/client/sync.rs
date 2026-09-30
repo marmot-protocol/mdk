@@ -51,6 +51,21 @@ pub(crate) enum PendingRecoverySelection {
     Grant(Box<AttemptGrant>),
 }
 
+/// How much recovery work a sync may do beyond draining live input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncMode {
+    /// Drain live input only. Runtime catch-ups and automatic passes use this:
+    /// the worker's paced job serves any recovery debt, so a catch-up never
+    /// holds the account worker for a recovery job (mdk#2110).
+    Drain,
+    /// The worker's first pass: installs live subscriptions and takes a
+    /// recovery credit only if one is free.
+    Startup,
+    /// A directly owned client with no worker to run the paced job: joins the
+    /// comparison, waits for a credit and runs one job in place.
+    Explicit,
+}
+
 /// Account-wide startup budget for the timestamp-independent correctness pass.
 /// Partial progress is durable, so a slow or non-NIP-77 relay cannot hold the
 /// account worker indefinitely and the next sync can resume from a smaller
@@ -1316,7 +1331,7 @@ impl AppClient {
     /// contract. Call [`Self::sync_with_partial_progress`] when the caller must
     /// report the durably applied prefix of a failed catch-up pass.
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
-        match self.sync_inner(None, true).await {
+        match self.sync_inner(None, SyncMode::Explicit).await {
             Ok(summary) => Ok(summary),
             Err(failure) => {
                 // Compatibility callers cannot observe a failure summary.
@@ -1339,21 +1354,16 @@ impl AppClient {
     pub(crate) async fn sync_with_classified_partial_progress(
         &mut self,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        match self.sync_inner(None, true).await {
-            Ok(summary) => Ok(summary),
-            Err(mut failure) => {
-                self.drain_epoch_stall_escalations(&mut failure.partial_summary);
-                Err(failure)
-            }
-        }
+        self.sync_with_stage_telemetry(None, SyncMode::Explicit)
+            .await
     }
 
     pub(crate) async fn sync_with_stage_telemetry(
         &mut self,
-        telemetry: &AppPerformanceTelemetry,
-        explicit: bool,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        match self.sync_inner(Some(telemetry), explicit).await {
+        match self.sync_inner(telemetry, mode).await {
             Ok(summary) => Ok(summary),
             Err(mut failure) => {
                 self.drain_epoch_stall_escalations(&mut failure.partial_summary);
@@ -1365,12 +1375,13 @@ impl AppClient {
     pub(crate) async fn sync_automatically_with_partial_progress(
         &mut self,
     ) -> Result<SyncSummary, SyncFailure> {
-        self.sync_inner(None, false)
+        self.sync_inner(None, SyncMode::Drain)
             .await
             .map_err(SyncFailure::from)
     }
 
-    /// One sync: live interest, the live queue, then the recovery job.
+    /// One sync: live interest, the live queue, then (by mode) the recovery
+    /// job.
     ///
     /// Only startup, a frozen wake or a client with no activation yet installs
     /// live subscriptions, and a route change refreshes them; recovery never
@@ -1379,12 +1390,12 @@ impl AppClient {
     /// nothing is fetched twice. With recovery debt, an explicit caller then
     /// waits for a process credit, drains once more and runs one job in
     /// place; startup takes a credit only if one is free. Without debt no
-    /// credit is taken. Automatic catch-up, such as key-package maintenance,
-    /// only drains: the worker's own job serves its debt.
+    /// credit is taken. A drain, such as a runtime catch-up or key-package
+    /// maintenance, only drains: the worker's own job serves its debt.
     async fn sync_inner(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
-        explicit: bool,
+        mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let routing_changed = self.refresh_sync_routes().map_err(|error| {
             ClassifiedSyncFailure::at_stage(
@@ -1393,7 +1404,8 @@ impl AppClient {
                 SyncFailureStage::StatePersist,
             )
         })?;
-        let startup = telemetry.is_some() && !explicit;
+        let startup = mode == SyncMode::Startup;
+        let explicit = mode == SyncMode::Explicit;
         if self.app.cursor_persistence() == CursorPersistence::Frozen
             || startup
             || self.adapter.account_subscription_attempt().await.is_none()

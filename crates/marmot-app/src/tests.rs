@@ -1500,7 +1500,7 @@ fn comparison_fetches_probe(
 }
 
 #[test]
-fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
+fn catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
     run_composed_app_runtime_test("explicit-catch-up-backfill", || async {
         let dir = tempfile::tempdir().unwrap();
         let alice = AccountHome::open(dir.path())
@@ -1549,7 +1549,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
         assert_eq!(sync.synced_subscriptions, sync.tracked_subscriptions);
         let unfloored_before = relay.unfloored_account_subscription_count();
 
-        // Hold explicit CatchUp once it owns the account client. The worker is
+        // Hold the CatchUp once it owns the account client. The worker is
         // now committed to the command path and cannot consume these queued
         // deliveries through its live receive arm instead.
         let pin = Arc::new(tokio::sync::Barrier::new(2));
@@ -1560,7 +1560,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
         let catch_up = tokio::spawn(async move { catch_up_runtime.catch_up_accounts().await });
         tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, pin.wait())
             .await
-            .expect("explicit catch-up must reach its hold");
+            .expect("catch-up must reach its hold");
 
         let above_floor = cursor;
         for arm in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
@@ -1575,9 +1575,8 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
             .await;
         }
 
-        // The caller drains these probes before its one job, so that job
-        // already compares the gap they reveal. An unbounded gap cannot
-        // certify, so its debt stays pending for the owner.
+        // The catch-up only drains these probes and arms the gap they reveal;
+        // it runs no job (mdk#2110). The debt stays pending for the owner.
         tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, pin.wait())
             .await
             .expect("the held catch-up should accept its release");
@@ -1599,8 +1598,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
         );
-        // The caller's job earned the account its next backoff; the owner
-        // waits it out.
+        // The owner waits out the account's current backoff.
         runtime
             .advance_recovery_clock_for_test("alice", Duration::from_millis(retry.delay_ms))
             .await;
@@ -1666,8 +1664,8 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .map(|row| row["event"]["seam"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["explicit_catch_up", "maintenance"],
-            "the caller's job, then the owner's; incremental grants emit no epoch rows"
+            ["maintenance"],
+            "only the owner's job runs; incremental grants emit no epoch rows"
         );
         for started in &started_rows {
             let terminal = failed_rows
@@ -1688,7 +1686,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
             .into_iter()
             .filter(|row| {
                 row["event"]["record_context"]["operation_ref"]
-                    == started_rows[1]["event"]["record_context"]["operation_ref"]
+                    == started_rows[0]["event"]["record_context"]["operation_ref"]
             })
             .collect();
         assert!(

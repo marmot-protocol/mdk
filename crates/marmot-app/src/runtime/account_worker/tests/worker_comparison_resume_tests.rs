@@ -60,27 +60,43 @@ impl QueryPolicy for HeldComparisonId {
 
 #[tokio::test]
 async fn comparison_worker_held_sdk_request_keeps_status_command_ready() {
-    run_held_comparison(false, false, false).await;
+    run_held_comparison(false, HeldCaller::None, false).await;
+}
+
+/// A host catch-up only drains, so it and the commands behind it complete
+/// while the worker's comparison is held, without joining or reserving
+/// recovery work (mdk#2110).
+#[tokio::test]
+async fn catch_up_crosses_held_comparison_without_revising_it() {
+    run_held_comparison(false, HeldCaller::CatchUp, false).await;
 }
 
 #[tokio::test]
-async fn explicit_catch_up_waits_for_held_comparison_before_revising_it() {
-    run_held_comparison(false, true, false).await;
+async fn repair_waits_for_held_comparison_before_revising_it() {
+    run_held_comparison(false, HeldCaller::Repair, false).await;
 }
 
 #[tokio::test]
-async fn prebarrier_media_runs_before_deferred_explicit_catch_up() {
-    run_held_comparison(false, true, true).await;
+async fn prebarrier_media_runs_before_deferred_repair() {
+    run_held_comparison(false, HeldCaller::Repair, true).await;
 }
 
 #[tokio::test]
 async fn comparison_shutdown_reaps_task_and_releases_credit() {
-    run_held_comparison(true, false, false).await;
+    run_held_comparison(true, HeldCaller::None, false).await;
+}
+
+/// The recovery caller queued while the comparison is held.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeldCaller {
+    None,
+    CatchUp,
+    Repair,
 }
 
 async fn run_held_comparison(
     shutdown_while_held: bool,
-    catch_up_while_held: bool,
+    held_caller: HeldCaller,
     prebarrier_media: bool,
 ) {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
@@ -306,18 +322,21 @@ async fn run_held_comparison(
             timeout(Duration::from_millis(100), &mut entered)
                 .await
                 .is_err(),
-            "earlier media command is parked before CatchUp"
+            "earlier media command is parked before the repair"
         );
         Some((entered, release, completed))
     } else {
         None
     };
-    let catch_up = if catch_up_while_held {
+    let catch_up = if held_caller != HeldCaller::None {
         let revision = storage.recovery_comparison().unwrap().revision;
-        let (respond, waiting) = oneshot::channel();
-        commands
-            .try_send(AccountWorkerCommand::CatchUp { respond })
-            .unwrap();
+        let (respond, mut waiting) = oneshot::channel();
+        let command = if held_caller == HeldCaller::CatchUp {
+            AccountWorkerCommand::CatchUp { respond }
+        } else {
+            AccountWorkerCommand::RepairFullHistory { respond }
+        };
+        commands.try_send(command).unwrap();
         let (respond, mut mutation) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
@@ -338,6 +357,37 @@ async fn run_held_comparison(
             .expect("read after queued catch-up stays serviceable")
             .unwrap()
             .unwrap();
+        if held_caller == HeldCaller::CatchUp {
+            timeout(Duration::from_secs(5), &mut waiting)
+                .await
+                .expect("catch-up completes while the comparison is held")
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(5), &mut mutation)
+                .await
+                .expect("later mutation is not deferred behind the comparison")
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(5), &mut drain)
+                .await
+                .expect("drain is not deferred behind the comparison")
+                .unwrap();
+            assert_eq!(
+                recovery_credits::available_credits(&pool),
+                recovery_credits::MAX_CONCURRENT_JOBS - 1,
+                "the comparison is still held"
+            );
+            assert_eq!(
+                storage.recovery_comparison().unwrap().revision,
+                revision,
+                "a draining catch-up does not join the comparison"
+            );
+            assert_eq!(
+                storage.recovery_retry_state().unwrap().attempt_serial,
+                before_retry + 1,
+                "a draining catch-up does not reserve recovery work"
+            );
+        }
         if let Some((entered, release, completed)) = prebarrier {
             let (first_release, first_completed) = held_media.remove(0);
             first_release.send(()).unwrap();
@@ -348,12 +398,12 @@ async fn run_held_comparison(
                 .unwrap();
             timeout(Duration::from_secs(5), entered)
                 .await
-                .expect("pre-barrier media runs before CatchUp joins")
+                .expect("pre-barrier media runs before the repair")
                 .unwrap();
             assert_eq!(
                 storage.recovery_comparison().unwrap().revision,
                 revision,
-                "earlier media work did not cross the deferred CatchUp"
+                "earlier media work did not cross the deferred repair"
             );
             release.send(()).unwrap();
             timeout(Duration::from_secs(5), completed)
@@ -370,29 +420,33 @@ async fn run_held_comparison(
                     .unwrap();
             }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            matches!(
-                mutation.try_recv(),
+        if held_caller == HeldCaller::CatchUp {
+            None
+        } else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                matches!(
+                    mutation.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ),
+                "later mutation stays behind queued repair"
+            );
+            assert!(matches!(
+                drain.try_recv(),
                 Err(oneshot::error::TryRecvError::Empty)
-            ),
-            "later mutation stays behind queued catch-up"
-        );
-        assert!(matches!(
-            drain.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert_eq!(
-            storage.recovery_comparison().unwrap().revision,
-            revision,
-            "explicit catch-up stays queued until the live comparison joins"
-        );
-        assert_eq!(
-            storage.recovery_retry_state().unwrap().attempt_serial,
-            before_retry + 1,
-            "waiting explicit work cannot spend another reservation"
-        );
-        Some((waiting, mutation, drain))
+            ));
+            assert_eq!(
+                storage.recovery_comparison().unwrap().revision,
+                revision,
+                "repair stays queued until the live comparison joins"
+            );
+            assert_eq!(
+                storage.recovery_retry_state().unwrap().attempt_serial,
+                before_retry + 1,
+                "waiting repair cannot spend another reservation"
+            );
+            Some((waiting, mutation, drain))
+        }
     } else {
         None
     };
@@ -414,26 +468,27 @@ async fn run_held_comparison(
         .await
         .expect("worker finishes the result and releases its credit");
         if let Some((waiting, mutation, drain)) = catch_up {
-            timeout(Duration::from_secs(20), waiting)
+            // The repair's own outcome (this relay's history is below the
+            // retention window) is irrelevant; only its ordering is tested.
+            let _repair_outcome = timeout(Duration::from_secs(20), waiting)
                 .await
-                .expect("explicit catch-up follows comparison admission")
-                .unwrap()
+                .expect("repair follows comparison admission")
                 .unwrap();
             assert!(
                 storage
                     .transport_reconciliation_replay_cursor(&recovery_route)
                     .unwrap()
                     .is_some(),
-                "the held comparison proposal was admitted before catch-up revised it"
+                "the held comparison proposal was admitted before repair revised it"
             );
             timeout(Duration::from_secs(5), mutation)
                 .await
-                .expect("later mutation follows explicit catch-up")
+                .expect("later mutation follows repair")
                 .unwrap()
                 .unwrap();
             timeout(Duration::from_secs(5), drain)
                 .await
-                .expect("drain follows explicit catch-up")
+                .expect("drain follows repair")
                 .unwrap();
         }
         runtime.shutdown_and_close().await.unwrap();

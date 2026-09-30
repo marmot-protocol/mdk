@@ -91,7 +91,7 @@ pub(crate) use sync::TestComparisonActivityWitness;
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
     ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob, ConvergenceScheduleState,
-    EpochBackfillRunOutcome, PendingRecoverySelection,
+    EpochBackfillRunOutcome, PendingRecoverySelection, SyncMode,
 };
 
 #[cfg(test)]

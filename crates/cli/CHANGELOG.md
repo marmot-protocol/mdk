@@ -9,6 +9,16 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Host catch-up (`catch_up_accounts`) and the catch-up after creating a group
+  or changing one no longer run a recovery job while holding the account
+  worker. They drain live input and return; the worker's paced recovery job
+  serves any history debt. Sends, conversation opens and new DMs no longer
+  wait behind recovery, which grew with the number of chats (mdk#2110). New
+  `just bench-create-dm` measures DM creation latency with 300 and 1000
+  existing chats.
+
 ## [0.11.0] - 2026-09-29
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through

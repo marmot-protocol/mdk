@@ -24,7 +24,8 @@ maintenance, convergence and explicit repair; its coalesced demand and retry pac
 counts as coverage. NIP-77 route comparison keeps a durable per-route replay cursor and fetches missing IDs under fixed
 budgets. Eligible comparisons for startup, maintenance, scheduled convergence, ordinary receive and a selected online
 EpochGap run their SDK request off the account worker under two process-wide credits; the worker keeps activation,
-admission and settlement. Explicit catch-up and account-wide overflow still wait inline. The exact-ID worker path over
+admission and settlement. Runtime catch-ups only drain live input; explicit `sync()`, full-history repair and
+account-wide overflow still wait inline. The exact-ID worker path over
 the [bounded acquisition interface](nostr-bounded-acquisition-interface.md) stays behind a private switch that defaults
 off. A v2 redesign is in progress: a durable overflow spill, one execution path for every cause and tiered completion.
 See [account history recovery](../further-context/account-recovery.md).
