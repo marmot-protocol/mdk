@@ -491,6 +491,54 @@ async fn spawn_progressing_http_server(
     (url, requests, server)
 }
 
+/// Send a first byte promptly, then pause a live body without stalling headers.
+async fn spawn_http_server_with_body_gap(
+    body: Arc<Vec<u8>>,
+    gap: Duration,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            stream.set_nodelay(true).unwrap();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_err()
+                    || stream.write_all(&body[..1]).await.is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(gap).await;
+                let _ = stream.write_all(&body[1..]).await;
+            });
+        }
+    });
+    (url, server)
+}
+
 fn spawn_roundtrip_blob_server() -> (String, mpsc::Receiver<(u64, String)>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test server");
     let addr = listener.local_addr().expect("upload test server addr");
@@ -2097,6 +2145,46 @@ async fn slow_progressing_locator_is_not_cut_off_by_equal_fallback_share() {
     assert_eq!(primary_requests.load(Ordering::SeqCst), 1);
     assert_eq!(fallback_a_requests.load(Ordering::SeqCst), 0);
     assert_eq!(fallback_b_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn media_download_client_does_not_short_circuit_the_body_idle_policy() {
+    use super::attachment_resume::BODY_IDLE_TIMEOUT;
+
+    assert_eq!(
+        BlossomHttpTransport::new(true).read_timeout,
+        BODY_IDLE_TIMEOUT
+    );
+    assert!(BODY_IDLE_TIMEOUT > super::blossom::MEDIA_HTTP_READ_TIMEOUT);
+
+    // A 40 MiB encrypted blob matches the reported received-APK size band.
+    let body = Arc::new(vec![0x5a; 40 * 1024 * 1024]);
+    let (url, server) =
+        spawn_http_server_with_body_gap(body.clone(), Duration::from_millis(800)).await;
+    let reference = blob_reference_for_servers(&body, &[url]);
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let short =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1))
+            .with_read_timeout_for_test(Duration::from_millis(250));
+    let short_error = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &short)
+        .await
+        .expect_err("the shorter client timeout must interrupt the delayed body");
+    // The first yielded chunk may be coalesced with headers: either timeout
+    // branch is a download failure caused by the shorter HTTP read bound.
+    assert!(
+        matches!(&short_error, AppError::MediaDownloadFailed(detail) if detail == "request timed out" || detail == "body transfer failed"),
+        "expected a body-read failure, got {short_error:?}"
+    );
+
+    let viable =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1))
+            .with_read_timeout_for_test(Duration::from_secs(2));
+    let downloaded = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &viable)
+        .await
+        .expect("a progressing body must survive a gap below the native idle bound");
+    server.abort();
+    assert_eq!(downloaded.as_slice(), body.as_slice());
 }
 
 /// Expiring the shared deadline while a later locator is active must leave a

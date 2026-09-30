@@ -1187,6 +1187,142 @@ async fn required_lifecycle_component_cannot_be_unrequired() {
 }
 
 #[tokio::test]
+async fn app_state_budget() {
+    let mut alice = build_current(b"alice-app-budget");
+    let (gid, _) = alice
+        .create_group(CreateGroupRequest {
+            name: "budget".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    // The two entries encode to exactly 8192 bytes, including ids and lengths.
+    for (id, len) in [(0xf000, 4096), (0xf001, 4088), (0xf001, 4088)] {
+        let sent = alice
+            .send(SendIntent::UpdateAppComponents {
+                group_id: gid.clone(),
+                updates: vec![AppComponentData {
+                    component_id: id,
+                    data: vec![1; len],
+                }],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupEvolution { pending, .. } = sent else {
+            panic!("expected commit");
+        };
+        alice.confirm_published(pending).await.unwrap();
+    }
+    let epoch = alice.epoch(&gid).unwrap();
+    for (id, len) in [(0xf001, 4089), (0xf002, 0)] {
+        let error = alice
+            .send(SendIntent::UpdateAppComponents {
+                group_id: gid.clone(),
+                updates: vec![AppComponentData {
+                    component_id: id,
+                    data: vec![2; len],
+                }],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("application state exceeds"));
+        assert_eq!(alice.epoch(&gid).unwrap(), epoch);
+        assert_eq!(
+            alice.app_component(&gid, 0xf001).unwrap(),
+            Some(vec![1; 4088])
+        );
+        assert_eq!(alice.app_component(&gid, 0xf002).unwrap(), None);
+    }
+    // A batch can shrink existing values and fill all 32 slots atomically.
+    let sent = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: (0xf000..0xf020)
+                .map(|component_id| AppComponentData {
+                    component_id,
+                    data: vec![],
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { pending, .. } = sent else {
+        panic!("expected commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let error = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: 0xf020,
+                data: vec![],
+            }],
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("application state exceeds"));
+    assert_eq!(alice.app_component(&gid, 0xf020).unwrap(), None);
+    // Refusals leave no pending commit and no poisoned publish state.
+    let sent = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid,
+            updates: vec![AppComponentData {
+                component_id: 0xf000,
+                data: vec![3],
+            }],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { pending, .. } = sent else {
+        panic!("expected commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+}
+
+#[tokio::test]
+async fn ephemeral_update_rejected() {
+    use cgka_traits::app_components::MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID;
+    let (mut alice, _, mut bob, bob_storage, gid) = create_admin_pair_with_storage().await;
+    let component = AppComponentData {
+        component_id: MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
+        data: vec![0; 104],
+    };
+    let error = bob
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![component.clone()],
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ephemeral-only"));
+    let epoch = alice.epoch(&gid).unwrap();
+    let malicious =
+        malicious_app_component_commit(&bob_storage, &bob.self_id(), &gid, vec![component]);
+    let malicious_id = hex::encode(content_id(&malicious).as_slice());
+    alice.ingest(malicious).await.unwrap();
+    let result = alice
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert!(
+        result
+            .dropped_messages
+            .iter()
+            .any(|dropped| dropped.message_id == malicious_id)
+    );
+    assert_eq!(alice.epoch(&gid).unwrap(), epoch);
+    assert_eq!(
+        alice
+            .app_component(&gid, MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID)
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn non_admin_cannot_update_admin_policy_component() {
     let (_alice, mut bob, gid) = create_pair().await;
     let alice_id = pad32(b"alice");

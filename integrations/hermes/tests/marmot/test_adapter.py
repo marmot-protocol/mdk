@@ -737,6 +737,50 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["name"], "Hermes")
         self.assertEqual(requests[0]["display_name"], "Hermes Agent")
 
+    async def test_account_publish_profile_omits_fields_the_caller_does_not_name(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "profile_published",
+                    "account_id_hex": request["account_id_hex"],
+                    "name": request["name"],
+                    "display_name": request["display_name"],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        await client.account_publish_profile(
+            "11" * 32,
+            "Hermes",
+            "Hermes Agent",
+            about="Day family assistant.",
+            picture="https://example.com/avatar.png",
+        )
+        await client.account_publish_profile("11" * 32, "Hermes", "Hermes Agent")
+        await client.account_publish_profile("11" * 32, "Hermes", "Hermes Agent", about="")
+
+        self.assertEqual(requests[0].get("about"), "Day family assistant.")
+        self.assertEqual(requests[0].get("picture"), "https://example.com/avatar.png")
+
+        # An optional field the caller does not name keeps the account's published
+        # value, so it must be omitted from the request entirely: a null or an
+        # empty string would clear it instead.
+        for key in ("about", "picture", "nip05", "lud16"):
+            self.assertNotIn(key, requests[1])
+
+        # An empty value the caller does name is a clear, and is sent as one.
+        self.assertEqual(requests[2].get("about"), "")
+
     async def test_send_agent_operation_event_writes_typed_operation_request(self):
         requests = []
 

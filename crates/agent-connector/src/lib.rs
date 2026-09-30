@@ -114,6 +114,11 @@ pub(crate) use agent_control::{
 /// (1024) so every message that could be re-queried after a single overflow is still tracked.
 pub(crate) const DELIVERED_INBOUND_CURSOR_CAPACITY: usize = 4096;
 pub(crate) const MAX_PROFILE_NAME_CHARS: usize = 80;
+/// Longest value the connector accepts for one optional kind-0 field (`about`,
+/// `picture`, `nip05`, `lud16`). Those fields are free text read from the control
+/// socket, so they are bounded like the name: generous for a bio, and far below
+/// anything that would turn one control request into a multi-KB profile event.
+pub(crate) const MAX_PROFILE_FIELD_CHARS: usize = 512;
 /// Default maximum concurrently served control-socket connections. The
 /// control plane is local and authenticated, but the threat model includes a
 /// prompt-injected/compromised gateway; each connection holds a spawned task

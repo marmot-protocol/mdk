@@ -8,7 +8,8 @@ use cgka_traits::{GroupId, MemberId};
 
 use crate::error::ConnectorError;
 use crate::{
-    AGENT_SOCKET_DIR_MODE, AGENT_SOCKET_MODE, AgentConnectorConfig, MAX_PROFILE_NAME_CHARS,
+    AGENT_SOCKET_DIR_MODE, AGENT_SOCKET_MODE, AgentConnectorConfig, MAX_PROFILE_FIELD_CHARS,
+    MAX_PROFILE_NAME_CHARS,
 };
 #[cfg(test)]
 use crate::{INVITE_POLICY_RETRY_BASE, INVITE_POLICY_RETRY_MAX};
@@ -272,6 +273,31 @@ pub(crate) fn validate_profile_name(value: String) -> Result<String, ConnectorEr
         return Err(ConnectorError::InvalidProfileName("too_long"));
     }
     Ok(value)
+}
+
+/// Validate one optional kind-0 field a profile update may set. Unlike the name
+/// these are free text, so an empty value is allowed: it is how a caller clears a
+/// field. Two things are not: control characters, which would let one control
+/// request publish terminal escapes or line structure into a profile that another
+/// client renders, and an unbounded value, which would let one request publish an
+/// arbitrarily large kind-0 event.
+pub(crate) fn validate_profile_field(
+    field: &'static str,
+    value: Option<String>,
+) -> Result<Option<String>, ConnectorError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.chars().any(char::is_control) {
+        return Err(ConnectorError::InvalidProfileField(
+            field,
+            "control_characters",
+        ));
+    }
+    if value.chars().count() > MAX_PROFILE_FIELD_CHARS {
+        return Err(ConnectorError::InvalidProfileField(field, "too_long"));
+    }
+    Ok(Some(value))
 }
 
 pub(crate) fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], ConnectorError> {

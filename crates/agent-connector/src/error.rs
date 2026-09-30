@@ -31,6 +31,8 @@ pub enum ConnectorError {
     InvalidGroupCreate(&'static str),
     #[error("invalid profile name: {0}")]
     InvalidProfileName(&'static str),
+    #[error("invalid profile {0}: {1}")]
+    InvalidProfileField(&'static str, &'static str),
     #[error("connector operation timed out: {0}")]
     OperationTimedOut(&'static str),
     #[error("matching send is still in progress")]
@@ -80,6 +82,7 @@ impl ConnectorError {
             Self::Stream(_) => "stream_error",
             Self::InvalidGroupCreate(_) => "invalid_group_create",
             Self::InvalidProfileName(_) => "invalid_profile_name",
+            Self::InvalidProfileField(_, _) => "invalid_profile_field",
             Self::OperationTimedOut(_) => "operation_timed_out",
             Self::SendInProgress => "send_in_progress",
             Self::MediaPathDenied(_) => "media_path_denied",
@@ -119,6 +122,7 @@ impl ConnectorError {
             }
             Self::InvalidGroupCreate(_) => "invalid group create request",
             Self::InvalidProfileName(_) => "invalid profile name",
+            Self::InvalidProfileField(_, _) => "invalid profile field",
             Self::OperationTimedOut(_) => "connector operation timed out",
             Self::SendInProgress => {
                 "matching send is still in progress; retry with the same idempotency key"

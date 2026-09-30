@@ -320,6 +320,8 @@ pub enum MarmotKitError {
     /// An explicit target disappeared; an already-open window remains usable.
     #[error("conversation target message is no longer retained")]
     ConversationWindowMessageNotRetained,
+    #[error("invalid app component: {details}")]
+    InvalidAppComponent { details: String },
 }
 
 impl From<AppError> for MarmotKitError {
@@ -334,6 +336,9 @@ impl From<&AppError> for MarmotKitError {
             return Self::from_engine_error(err);
         }
         match value {
+            AppError::InvalidAppComponent(details) => Self::InvalidAppComponent {
+                details: details.clone(),
+            },
             AppError::UserBlocked => Self::UserBlocked,
             AppError::BlockListUnavailable => Self::BlockListUnavailable,
             AppError::BlockPublicationUncertain => Self::BlockPublicationUncertain,

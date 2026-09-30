@@ -2,11 +2,37 @@
 
 use agent_control::{AgentControlAccount, AgentControlProfileLookupStatus, AgentControlResponse};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
-use marmot_app::{AccountRelayListBootstrap, UserProfileMetadata};
+use marmot_app::AccountRelayListBootstrap;
 
 use crate::AgentConnector;
 use crate::error::ConnectorError;
-use crate::validation::{unix_now_seconds, validate_profile_name};
+use crate::validation::{unix_now_seconds, validate_profile_field, validate_profile_name};
+
+/// Optional kind-0 fields one publish may set. Every field left as `None` keeps
+/// the value already published for the account.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProfileUpdateFields {
+    pub(crate) about: Option<String>,
+    pub(crate) picture: Option<String>,
+    pub(crate) nip05: Option<String>,
+    pub(crate) lud16: Option<String>,
+}
+
+impl ProfileUpdateFields {
+    /// Reject the values a control request must not be able to publish. The name
+    /// already goes through [`validate_profile_name`]; these four arrived straight
+    /// from the socket, so one request could otherwise publish embedded control
+    /// bytes or a multi-KB `about`. Validation runs before the relay read, so a
+    /// hostile field cannot trigger network work either.
+    fn validated(self) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            about: validate_profile_field("about", self.about)?,
+            picture: validate_profile_field("picture", self.picture)?,
+            nip05: validate_profile_field("nip05", self.nip05)?,
+            lud16: validate_profile_field("lud16", self.lud16)?,
+        })
+    }
+}
 
 impl AgentConnector {
     pub(crate) fn account_list_response(&self) -> Result<AgentControlResponse, ConnectorError> {
@@ -141,6 +167,7 @@ impl AgentConnector {
         account_id_hex: &str,
         name: String,
         display_name: Option<String>,
+        fields: ProfileUpdateFields,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let name = validate_profile_name(name)?;
@@ -148,13 +175,72 @@ impl AgentConnector {
             .map(validate_profile_name)
             .transpose()?
             .unwrap_or_else(|| name.clone());
+        let fields = fields.validated()?;
         let bootstrap_relays = self.configured_relay_endpoints();
-        let profile = UserProfileMetadata {
-            name: Some(name.clone()),
-            display_name: Some(display_name.clone()),
-            created_at: unix_now_seconds(),
-            ..UserProfileMetadata::default()
+        // kind:0 is a *replaceable* event. `MarmotApp::publish_user_profile`
+        // already merges the currently published profile on its own publish path,
+        // and that merge keeps `banner` and any unknown key another client wrote.
+        // It does treat a `None` as a clear for `about`, `picture`, `nip05` and
+        // `lud16`, though, so a request that names only the name still wipes those
+        // four. Read the published profile first and overlay exactly the fields
+        // this request named, the way `wn profile update` does. A relay failure
+        // stays an error: an unconfirmed read must never become a partial
+        // replacement.
+        //
+        // The read is unconditional. An empty configured relay list is not "nothing
+        // to read": the read falls back to the directory and app relays, and the
+        // publish goes to the account's NIP-65 outbox (`outbox_endpoints`). Those
+        // can be different sets, so skipping the read would publish a partial
+        // replacement over a profile that exists on relays this request never
+        // looked at.
+        let published = self
+            .runtime
+            .fetch_current_user_profile_for_account_id(
+                &account.account_id_hex,
+                bootstrap_relays.clone(),
+            )
+            .await?;
+        // The read can also be *stale* rather than empty.
+        // `fetch_current_user_profile_for_account_id` returns the relay's copy
+        // even when its own `remember_directory_profile_if_newer` call has
+        // deliberately kept a newer cached profile, so starting from that copy
+        // would republish the older fields over a newer local edit: the
+        // runtime's `merge_user_profile_update` takes `about`, `picture`,
+        // `nip05` and `lud16` from this update unconditionally. Take the newer
+        // of the two and keep the cache on equality, the way the directory
+        // ingest rule does (`created_at` has second resolution, mdk#206), which
+        // is also what `newest_user_profile` selects for the runtime's own
+        // merge. An empty read is not proof that the account has no profile
+        // either: the relays the read reaches need not be the relays the
+        // account published to. The locally cached directory entry, which every
+        // publish writes through `remember_directory_profile`, covers both
+        // cases. Onboarding still needs its first publish to succeed, so
+        // refusing the publish here is not an option.
+        let cached = self
+            .app
+            .directory_entry_for_account_id(&account.account_id_hex)?
+            .and_then(|entry| entry.profile);
+        let mut profile = match (cached, published) {
+            (Some(cached), Some(published)) if cached.created_at >= published.created_at => cached,
+            (_, Some(published)) => published,
+            (cached, None) => cached.unwrap_or_default(),
         };
+        profile.name = Some(name.clone());
+        profile.display_name = Some(display_name.clone());
+        if let Some(about) = fields.about {
+            profile.about = Some(about);
+        }
+        if let Some(picture) = fields.picture {
+            profile.picture = Some(picture);
+        }
+        if let Some(nip05) = fields.nip05 {
+            profile.nip05 = Some(nip05);
+        }
+        if let Some(lud16) = fields.lud16 {
+            profile.lud16 = Some(lud16);
+        }
+        profile.created_at = unix_now_seconds();
+        profile.source_relays = Vec::new();
         self.runtime
             .publish_user_profile(
                 &account.label,
