@@ -269,8 +269,9 @@ the loopback URL must match its published port. The separate ignored
 `resumed_group_after_strfry_restart` test reopens the retained root after a relay restart and
 checks saved state and a fresh message. It intentionally retains failures as evidence; a
 successful initial journey does not establish that 200 simultaneous or staggered restarts are
-healthy. These local tests also do not establish acceptance by members' independently operated
-inbox relays.
+healthy. The known worker timeouts are tracked in
+[issue #2102](https://github.com/marmot-protocol/mdk/issues/2102). Both probes accept 25–200 members.
+These local tests also do not establish acceptance by members' independently operated inbox relays.
 
 For `offline-catchup-pressure/v1`, six consecutive cases form one volume block: 24, 96, 384, then 1,024 application
 messages, interleaved with 4, 8, 12, then 16 commit rounds. Each block covers natural full history, reverse history,

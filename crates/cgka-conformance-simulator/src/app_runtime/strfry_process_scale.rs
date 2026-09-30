@@ -317,13 +317,15 @@ async fn app_group_through_strfry_processes() {
     milestone(&root, "complete", started.elapsed(), count);
 }
 
+// Known 200-client reopen timeouts: https://github.com/marmot-protocol/mdk/issues/2102
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "resume a retained 200-member app fixture after local strfry restarts"]
+#[ignore = "resume a retained 25-200 member app fixture after local strfry restarts"]
 async fn resumed_group_after_strfry_restart() {
     let count = std::env::var("MDK_STRFRY_GROUP_MEMBERS")
         .unwrap()
         .parse::<usize>()
         .unwrap();
+    assert!((25..=200).contains(&count));
     let relay = std::env::var("MDK_STRFRY_URL").unwrap();
     assert!(relay.starts_with("ws://127.0.0.1:"));
     let root = PathBuf::from(std::env::var("MDK_STRFRY_APP_ARTIFACTS").unwrap());

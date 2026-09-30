@@ -15,7 +15,7 @@ When asked to run, extend, diagnose, or report on convergence campaigns:
    public facts they can actually expose.
 2. Start with a strict, file-backed canary. Do not use `--allow-weak-oracle` to make an assurance run green.
 3. For broad discovery, use `cgka-conformance-campaign`: it persists the exact input before action zero, isolates each
-   case in a child, enforces a deadline, and verifies artifacts. Build once and shard distinct seeds when scaling.
+   case in a child, enforces a deadline, and verifies artifacts. Build once and shard distinct seeds or disjoint `--case-index` selections when scaling.
 4. Reproduce from the saved `*-generated-input.json`, not from a remembered command alone. Record family version,
    seed, case index, selected/executed IR digests, adapter, storage mode, source revision, and output path.
 5. Move a failure down to the smallest compatible adapter before debugging it. Move representative cases outward to
@@ -33,8 +33,8 @@ CI-like Cargo commands.
 
 Do not infer that more `--cases` means more complex scenarios. Cases are independent indices and seed selects their
 deterministic choices. The stable identity is `(family_name, generator_version, seed, case_index)`, plus an
-independently versioned workload profile when applicable. The CLI has no case-start offset, so shard large campaigns
-by distinct seeds rather than overlapping prefixes of the same seed. Generated inputs/reports do not embed the tested
+independently versioned workload profile when applicable. The process campaign CLI accepts repeatable `--case-index N` for isolated selections; shard large campaigns
+by disjoint indices with fresh output roots or distinct seeds rather than overlapping prefixes of the same seed. Generated inputs/reports do not embed the tested
 Git commit; require a clean build and retain the exact source revision plus command matrix beside durable evidence.
 
 ## Pieces
@@ -119,8 +119,8 @@ Git commit; require a clean build and retain the exact source revision plus comm
 - **Module:** `src/large_group_family.rs`
   - **Role:** Replay-stable 10–200 member pressure catalog. Keeps group size, administrator population, active
     committer width, traffic balance, formation, and disruption explicit in versioned workload metadata. Size blocks
-    are ordered by execution cost because campaign selection is prefix-only; race arms must retain at least two active
-    committers, and bounded decryptability probes must preserve late-join/re-add and roster-tail representatives.
+    are ordered by execution cost for prefix campaigns; the process runner also supports isolated `--case-index`
+    selection. Race arms must retain at least two active committers, and bounded decryptability probes must preserve late-join/re-add and roster-tail representatives.
 
 - **Module:** `src/membership_reentry_family.rs`
   - **Role:** Replay-stable small-group departure/re-entry catalog. Guarantees single and repeated administrative
