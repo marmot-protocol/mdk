@@ -58,8 +58,9 @@ pub(crate) enum SyncMode {
     /// the worker's paced job serves any recovery debt, so a catch-up never
     /// holds the account worker for a recovery job (mdk#2110).
     Drain,
-    /// The worker's first pass: installs live subscriptions and takes a
-    /// recovery credit only if one is free.
+    /// A startup-shaped pass: installs live subscriptions and takes a recovery
+    /// credit only if one is free. The worker's real startup goes through
+    /// `prepare_sync_grant` instead; only tests drive this mode.
     Startup,
     /// A directly owned client with no worker to run the paced job: joins the
     /// comparison, waits for a credit and runs one job in place.
