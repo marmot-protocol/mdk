@@ -18,6 +18,15 @@
 
 ### Fixed
 
+- Host catch-up (`catch_up_accounts`) and the catch-up after creating or
+  changing a group no longer run a recovery job while holding the account
+  worker. They drain live input and return; the worker's paced recovery job
+  serves any history debt. Sends, conversation opens and new DMs no longer
+  wait behind recovery, which grew with the number of chats (#2110). New
+  `just bench-create-direct-message` measures DM creation latency with 300
+  and 1000 existing chats.
+- The post-join maintenance sweep no longer decodes every transport fanout
+  once per group, which made it quadratic in the number of chats.
 - Messages are no longer withdrawn as undecryptable by a convergence pass that selected
   no branch, such as the pass that settles the device's own disband. That pass never tried
   them against the group's state; they now wait for a pass that selects a branch, or for
