@@ -1444,6 +1444,17 @@ impl AppClient {
                     });
                 }
                 if !stored.is_empty() {
+                    // Incremental debt is extended only by a new comparison
+                    // request, never by rebuilding a cancelled grant's scopes.
+                    if demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory {
+                        scopes.retain(|scope| {
+                            stored.iter().any(|old| {
+                                old.plan.route_kind == scope.route_kind
+                                    && old.plan.group_id == scope.group_id
+                                    && old.plan.transport_group_id == scope.transport_group_id
+                            })
+                        });
+                    }
                     let mut next_id = stored
                         .iter()
                         .map(|scope| scope.plan.scope_id)
@@ -1463,6 +1474,15 @@ impl AppClient {
                             scope.since_seconds = old.plan.since_seconds;
                             scope.until_seconds = goal_until;
                             scope.inventory_floor = old.plan.inventory_floor;
+                            if demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory {
+                                scope.admitted_endpoints.retain(|endpoint| {
+                                    old.plan.required_endpoints.contains(endpoint)
+                                        || old.plan.admitted_endpoints.contains(endpoint)
+                                });
+                                scope
+                                    .required_endpoints
+                                    .retain(|endpoint| scope.admitted_endpoints.contains(endpoint));
+                            }
                         } else {
                             scope.scope_id = next_id;
                             next_id = next_id.saturating_add(1);
@@ -1523,12 +1543,25 @@ impl AppClient {
             }
             self.comparison_route_goals(comparison.requested_until_seconds)?
                 .into_iter()
-                .filter(|goal| {
-                    joined_routes.iter().any(|joined| {
+                .filter_map(|mut goal| {
+                    let joined = joined_routes.iter().find(|joined| {
                         joined.route_kind == goal.route_kind
                             && joined.group_id == goal.group_id
                             && joined.transport_group_id == goal.transport_group_id
-                    })
+                            && joined.since_seconds.is_none_or(|since| {
+                                goal.since_seconds.is_some_and(|floor| since <= floor)
+                            })
+                            && joined.until_seconds >= goal.until_seconds
+                    })?;
+                    // Match the storage install predicate, including endpoints
+                    // and the inventory window, before freezing any scopes.
+                    goal.admitted_endpoints.retain(|endpoint| {
+                        joined.required_endpoints.contains(endpoint)
+                            || joined.admitted_endpoints.contains(endpoint)
+                    });
+                    goal.required_endpoints
+                        .retain(|endpoint| goal.admitted_endpoints.contains(endpoint));
+                    (!goal.admitted_endpoints.is_empty()).then_some(goal)
                 })
                 .collect()
         } else {
@@ -4227,8 +4260,130 @@ mod tests {
             .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
             .unwrap()
             .expect("pending comparison");
-        let plan = grant.comparison_plan.expect("comparison plan");
-        assert!(plan.routes.iter().all(|route| route.route_kind == 0));
+        let plan = grant.comparison_plan.as_ref().expect("comparison plan");
+        assert_eq!(plan.routes.len(), 1);
+        assert_eq!(plan.routes[0].route_kind, 0);
+        drop(grant);
+
+        // A second route change invalidates retry-route narrowing. Even then,
+        // rebuilding scopes must not add either late group to the request.
+        client
+            .create_group("another later route", &[])
+            .await
+            .unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let retry = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .expect("cancelled comparison remains pending");
+        let plan = retry
+            .comparison_plan
+            .as_ref()
+            .expect("retry comparison plan");
+        assert_eq!(plan.routes.len(), 1);
+        assert_eq!(plan.routes[0].route_kind, 0);
+        drop(retry);
+        let debt = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+            .unwrap();
+        let scopes = storage.recovery_scope_snapshots(debt.ticket.id).unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].plan.route_kind, 0);
+
+        client.request_bounded_comparison().unwrap();
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let joined = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .expect("new request admits the late routes");
+        let debt = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+            .unwrap();
+        assert_eq!(
+            storage
+                .recovery_scope_snapshots(debt.ticket.id)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            joined
+                .comparison_plan
+                .as_ref()
+                .is_some_and(|plan| !plan.routes.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn comparison_defers_new_endpoints_until_a_new_request() {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.request_bounded_comparison().unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let until = storage
+            .recovery_comparison()
+            .unwrap()
+            .requested_until_seconds;
+        let recorded = client
+            .comparison_route_goals(until)
+            .unwrap()
+            .remove(0)
+            .admitted_endpoints;
+        assert!(!recorded.is_empty());
+        let new_endpoint = "wss://new-relay.example".to_owned();
+        client
+            .routing
+            .write()
+            .local_inbox_endpoints
+            .push(cgka_traits::TransportEndpoint(new_endpoint.clone()));
+        assert!(
+            client.comparison_route_goals(until).unwrap()[0]
+                .admitted_endpoints
+                .contains(&new_endpoint)
+        );
+
+        for _ in 0..2 {
+            let grant = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Startup,
+                )
+                .unwrap()
+                .expect("comparison remains valid after endpoint expansion");
+            let plan = grant.comparison_plan.as_ref().unwrap();
+            assert_eq!(plan.routes.len(), 1);
+            assert_eq!(plan.routes[0].admitted_endpoints, recorded);
+            drop(grant);
+            client.recovery_owner.test_advance_to_retry(&storage);
+        }
+        client.request_bounded_comparison().unwrap();
+        let grant = client
+            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
+            .unwrap()
+            .expect("new request records the expanded endpoint set");
+        assert!(
+            grant.comparison_plan.as_ref().unwrap().routes[0]
+                .admitted_endpoints
+                .contains(&new_endpoint)
+        );
     }
 
     #[tokio::test]
