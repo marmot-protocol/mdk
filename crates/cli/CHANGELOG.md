@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- The wn-codex attachment rejection test now tolerates filesystems such as
+  macOS APFS that reject non-UTF-8 fixture names. Other fixture failures still
+  fail the test, and rejection coverage remains on filesystems accepting them.
+
 ## [0.11.0] - 2026-09-29
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through

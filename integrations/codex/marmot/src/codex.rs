@@ -1130,12 +1130,19 @@ mod tests {
         let non_utf8_path = root
             .path()
             .join(std::ffi::OsString::from_vec(b"bad-\xff".to_vec()));
-        fs::write(&non_utf8_path, b"data").unwrap();
-        let non_utf8 = attachment(&non_utf8_path, "application/octet-stream", "opaque.bin");
-        assert!(matches!(
-            prepare_attachments(&[non_utf8]),
-            Err(HarnessError::AttachmentInvalid)
-        ));
+        match fs::write(&non_utf8_path, b"data") {
+            Ok(()) => {
+                let non_utf8 = attachment(&non_utf8_path, "application/octet-stream", "opaque.bin");
+                assert!(matches!(
+                    prepare_attachments(&[non_utf8]),
+                    Err(HarnessError::AttachmentInvalid)
+                ));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                // Filesystems such as APFS reject non-UTF-8 names during setup.
+            }
+            Err(error) => panic!("non-UTF-8 attachment fixture creation failed: {error}"),
+        }
     }
 
     #[test]
