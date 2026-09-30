@@ -320,9 +320,11 @@ Each integration also makes its own activation decision:
   `always` activation for prompt messages from explicitly allowed senders, and
   have no profile onboarding or live-preview behavior. Their shared runtime
   validates and privately stages bounded ordered attachment batches. `wn-codex`
-  maps image batches to ordered Codex image inputs; `wn-claude`, `wn-opencode`, and `wn-pi`
-  reject every non-empty batch, including its accompanying text, before spawning
-  their backends.
+  maps image batches to ordered Codex image inputs; `wn-opencode` passes each
+  file as an ordered `opencode run --file` argument; `wn-pi` passes each image
+  or UTF-8 text file as an ordered `@file` operand and rejects the whole batch
+  before spawning Pi if any file is another type; `wn-claude` rejects every
+  non-empty batch, including its accompanying text, before spawning its backend.
 
 Because activation is per integration, there is no global "claim this message"
 lease in shared-account deployments. If several integrations subscribe to the

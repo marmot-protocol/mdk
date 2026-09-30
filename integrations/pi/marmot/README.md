@@ -2,25 +2,70 @@
 
 `wn-pi` is a terminal-harness connector that sends authorized Marmot group
 messages to [Pi](https://pi.dev) through the local `wn-agent` control socket.
-It is intentionally a thin harness: no mention activation, backend attachment
-support, profile onboarding, live previews, MLS, or relay logic.
-
-For a turn containing one or more files, the shared terminal harness first applies its attachment-count and aggregate-byte
-limits and downloads the complete ordered batch into private staging. Because
-the Pi backend does not opt in to attachments, the batch is then rejected
-before `pi` is spawned; its accompanying text is not forwarded either.
+It is intentionally a thin harness: no mention activation, profile onboarding,
+live previews, MLS, or relay logic.
 
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
 
 ## Contents
 
+- [Attachments](#attachments)
 - [Install (Pi Already Installed)](#install-pi-already-installed)
 - [Manual setup](#manual-setup)
 - [Chat Commands](#chat-commands)
 - [Configuration](#configuration)
 - [Security Notes](#security-notes)
 - [Development](#development)
+
+## Attachments
+
+A Marmot message with files becomes one Pi turn. The shared terminal harness
+applies its attachment-count and aggregate-byte limits and downloads the whole
+ordered batch into owner-only staging. `wn-pi` then runs:
+
+```text
+pi --mode json --session-dir <dir> [--session-id <id>] @<staged-file-1> @<staged-file-2> ...
+```
+
+There is one `@` operand per file, in message order, after all Pi options. The
+message text still goes to Pi on stdin and never appears in argv. Staged paths
+are absolute and staged file names are reduced to `NNN-` plus ASCII letters,
+digits, `.`, `-`, and `_`, so a file name cannot turn into a Pi option.
+
+Pi embeds text files in the initial message and sends images as image content.
+Immediately before starting Pi, `wn-pi` reopens every staged copy without
+following symlinks, checks its size, and sorts it the way Pi's `@file`
+processor will:
+
+| Staged bytes | Result |
+| --- | --- |
+| PNG (not animated), JPEG (not arithmetic-coded), GIF, WebP, detected by content like Pi does | Sent to Pi as an image |
+| Non-empty UTF-8 without NUL bytes (source, logs, Markdown, JSON, CSV, and so on) | Embedded by Pi as text |
+| Empty files, other binaries (PDF, archives, audio, BMP, office documents), invalid UTF-8 | Whole message rejected; Pi is not started |
+
+The declared media type and file extension are ignored. BMP is rejected
+because Pi 0.79.6 reads it as text; newer Pi releases convert it.
+
+Files are never dropped while the caption goes through. If one file in the
+batch is unsupported, changed, or missing, the whole message gets one error
+reply and Pi does not run. Pi replaces an image it cannot convert or resize
+with a text note instead of failing, so `wn-pi` counts the image parts in
+Pi's initial user message. If that count is short, no assistant text is
+forwarded and the chat gets `Pi reported an attachment it could not process.`
+Pi has already started the model turn at that point, so the group's Pi session
+keeps a record of it.
+
+The staged batch stays on disk until the Pi process exits, then the shared
+harness removes it after success, failure, timeout, or cancellation. Stale
+batches are removed when the connector starts. Resumed turns keep using the
+group's `--session-id`, so a later text-only prompt can refer back to files
+from an earlier turn.
+
+`wn-pi` requires Pi `0.79.6` or newer for attachments. That release has the
+`@file` processor, image detection, and stdin-plus-files initial message this
+adapter mirrors (checked against Pi source at
+[`36b60d2e`](https://github.com/earendil-works/pi/tree/36b60d2e8985899743c4cf5bd5f8929832a3f05d/packages/coding-agent/src/cli)).
 
 ## Install (Pi Already Installed)
 
@@ -161,10 +206,13 @@ than adding a containment mechanism. See the shared
   sender from `WN_PI_ALLOWED_SENDERS_HEX`, restart `wn-pi`, and remove it from
   `wn-agent` separately if invite acceptance must also be revoked.
 - Prompts are passed to Pi over stdin rather than process arguments.
+- Attachment operands carry only staged paths. Staging directories are
+  owner-only and each staged file is owner-readable; other processes running as
+  the same operating-system user can still read them while the turn runs.
 - Only completed assistant text is returned. Thinking, tool calls, tool output,
   and other Pi event types are not sent to Marmot.
-- Logs exclude identifiers, paths, prompts, Pi output, relay URLs, pubkeys,
-  ciphertext, plaintext, and key material.
+- Logs exclude identifiers, paths, file names, file contents, prompts, Pi
+  output, relay URLs, pubkeys, ciphertext, plaintext, and key material.
 - Connector state and Pi session directories are created with owner-only
   permissions.
 - The optional control-socket bearer token grants the complete `wn-agent`
@@ -188,6 +236,14 @@ installed, authenticated Pi and makes a model request:
 
 ```sh
 cargo test -p wn-pi real_pi_0_79_6_contract -- --ignored --nocapture
+```
+
+The attachment contract test runs against any installed Pi `0.79.6` or newer.
+It sends a text file with a token and a PNG in one turn, checks that Pi inlined
+the image and quoted the token, then resumes the same session without files:
+
+```sh
+cargo test -p wn-pi real_pi_attachment_contract -- --ignored --nocapture
 ```
 
 The crate is a workspace member at `integrations/pi/marmot`.
