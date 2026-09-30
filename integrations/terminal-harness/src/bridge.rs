@@ -4328,6 +4328,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lost_send_media_response_retries_one_intent_with_same_idempotency_key() {
+        let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let export_root = root.path().join("exports");
+        std::fs::create_dir(&export_root).unwrap();
+        std::fs::write(export_root.join("report.pdf"), b"report").unwrap();
+        let outbox_path = root.path().join("outbox.json");
+
+        let socket = root.path().join("control.sock");
+        let listener = StdUnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let server_outbox_path = outbox_path.clone();
+        let server = tokio::spawn(async move {
+            // Stand-in for the connector's idempotency cache: the first
+            // request publishes, and a repeat of the same key replays it.
+            let mut published: Vec<String> = Vec::new();
+            let mut keys = Vec::new();
+            for request_index in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let request: agent_control::AgentControlEnvelope<
+                    agent_control::AgentControlRequest,
+                > = agent_control::read_envelope(&mut reader)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let agent_control::AgentControlRequest::SendMedia {
+                    idempotency_key: Some(key),
+                    ..
+                } = request.payload
+                else {
+                    panic!("expected keyed send_media, got {:?}", request.payload);
+                };
+                assert_eq!(
+                    ArtifactOutbox::load(server_outbox_path.clone())
+                        .unwrap()
+                        .pending()
+                        .len(),
+                    1,
+                    "exactly one durable intent while the send is in flight"
+                );
+                if !published.contains(&key) {
+                    published.push(key.clone());
+                }
+                keys.push(key);
+                if request_index == 0 {
+                    // Lose the response after the publish landed.
+                    drop(write_half);
+                    continue;
+                }
+                agent_control::write_frame(
+                    &mut write_half,
+                    &agent_control::AgentControlEnvelope::request(
+                        request.id.clone(),
+                        agent_control::AgentControlResponse::FinalSent {
+                            message_ids_hex: vec!["sent".to_owned()],
+                            maintenance_disposition: Default::default(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "unexpected duplicate send or text final"
+            );
+            (published, keys)
+        });
+
+        let mut config = test_config(root.path());
+        config.socket = socket.clone();
+        config.artifact_exports = crate::ArtifactExportConfig::new(
+            true,
+            vec![crate::ArtifactExportGrant {
+                group_id_hex: "group".to_owned(),
+                export_root: export_root.clone(),
+                ttl_seconds: 300,
+            }],
+            root.path().join("staging"),
+            outbox_path.clone(),
+        );
+        let sessions = SessionStore::load(config.state_path.clone(), root.path()).unwrap();
+        let ctx = Arc::new(BridgeContext {
+            cfg: Arc::new(config),
+            client: ControlClient::new(socket, None, Duration::from_secs(2), "wn-test"),
+            account_ref: "account".to_owned(),
+            sessions: Arc::new(sessions),
+            recovery: Arc::new(RecoveryStore::load(root.path().join("recovery.json")).unwrap()),
+            deliveries: Arc::new(
+                FinalDeliveryStore::load(root.path().join("delivery.json")).unwrap(),
+            ),
+            reconciliation_slot: ReconciliationSlot::new(),
+            queues: Arc::new(GroupQueues::new(1)),
+            dedupe: Arc::new(InboundDedupe::new(8)),
+            backend: Arc::new(ScriptedArtifactBackend {
+                text: Some("completed text".to_owned()),
+                file_names: vec!["report.pdf".to_owned()],
+                invented_authorization: false,
+                declaration_failed: false,
+            }),
+            outbox: Arc::new(Mutex::new(ArtifactOutbox::load(outbox_path).unwrap())),
+            home: root.path().to_path_buf(),
+        });
+        let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
+        handle_message(
+            ctx.clone(),
+            InboundPrompt {
+                account_ref: "account".to_owned(),
+                group_ref: "group".to_owned(),
+                message_ref: "message".to_owned(),
+                text: "create artifact".to_owned(),
+                media: Vec::new(),
+            },
+            permit,
+        )
+        .await;
+
+        let (published, keys) = server.await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(published.len(), 1);
+        assert!(ctx.outbox.lock().await.pending().is_empty());
+    }
+
+    #[tokio::test]
     async fn restart_retry_replays_durable_send_media_and_cleans_staged_file() {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("control.sock");
