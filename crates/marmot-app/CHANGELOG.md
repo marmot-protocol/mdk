@@ -7,6 +7,14 @@
 - `MarmotAppRuntime::poll_votes` pages each voter's effective poll selection
   (`PollVotePage` of `PollVote`) with the same rules as the timeline poll
   tally. (#2091)
+- `MarmotAppRuntime::send_tagged_text`, `send_tagged_media`, and
+  `react_with_media` add application tags (for example NIP-30 `emoji`) to a
+  kind-9 chat, a media chat, or a kind-7 reaction; the reaction emits its
+  attachments as `imeta`. `MediaUploadRequest::message_tags` does the same for
+  a sent upload. Tags are capped at 64 rows and 16 KiB of values, and `imeta`
+  rows are rejected.
+- `ConversationReaction::reaction_message_id_hex` names the earliest active
+  kind-7 carrying that emoji, so a NIP-30 reaction's image can be resolved.
 
 ### Fixed
 

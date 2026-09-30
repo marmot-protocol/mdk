@@ -275,6 +275,9 @@ pub struct MediaUploadRequestFfi {
     pub caption: Option<String>,
     pub send: bool,
     pub blossom_server: Option<String>,
+    /// Extra tags on the sent kind-9, e.g. NIP-30 `emoji`. `imeta` is rejected.
+    #[uniffi(default = [])]
+    pub message_tags: Vec<Vec<String>>,
 }
 
 impl From<MediaUploadRequestFfi> for MediaUploadRequest {
@@ -284,6 +287,7 @@ impl From<MediaUploadRequestFfi> for MediaUploadRequest {
             caption: value.caption,
             send: value.send,
             blossom_server: value.blossom_server,
+            message_tags: value.message_tags,
         }
     }
 }

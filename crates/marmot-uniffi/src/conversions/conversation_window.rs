@@ -1,6 +1,8 @@
 //! Prepared conversation screen values. No profile/roster reads occur in this mapper.
 use super::*;
+use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use marmot_app as app;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
@@ -144,6 +146,9 @@ pub struct ConversationReactionFfi {
     pub reactors: Vec<String>,
     /// Active reaction by the viewing account; independent of reactor previews.
     pub viewer_reacted: bool,
+    /// Earliest active kind-7 with this emoji. For a NIP-30 `:shortcode:`
+    /// reaction, `list_media` returns its image under this message id.
+    pub reaction_message_id_hex: Option<String>,
 }
 impl From<app::conversation_presentation::ConversationReaction> for ConversationReactionFfi {
     fn from(v: app::conversation_presentation::ConversationReaction) -> Self {
@@ -152,6 +157,7 @@ impl From<app::conversation_presentation::ConversationReaction> for Conversation
             count: v.count as u64,
             reactors: v.reactors,
             viewer_reacted: v.viewer_reacted,
+            reaction_message_id_hex: v.reaction_message_id_hex,
         }
     }
 }
@@ -340,7 +346,8 @@ impl From<app::SelectedMessageDraft> for SelectedMessageDraftFfi {
     }
 }
 /// Timeline content plus bounded display references. Use references.reactions for UI;
-/// custom-event tags are preserved; typed rows use structured fields and reactions use references.
+/// custom-event tags and NIP-30 `emoji` tags on chats are preserved; other typed-row tags use
+/// structured fields and reactions use references.
 #[derive(Clone, uniffi::Record)]
 pub struct ConversationMessageFfi {
     pub timeline: TimelineMessageRecordFfi,
@@ -360,15 +367,26 @@ pub struct ConversationWindowSnapshotFfi {
     pub has_more_before: bool,
     pub has_more_after: bool,
 }
-// Borrow raw rows and retain only custom-event tags in the FFI presentation.
-// MDK-owned tags and full reactor collections use prepared references instead.
-fn presented_custom_tags(row: &app::TimelineMessageRecord) -> &[Vec<String>] {
+// Borrow raw rows and retain only custom-event tags and chat NIP-30 `emoji` tags in the
+// FFI presentation. MDK-owned tags and full reactor collections use prepared references.
+fn presented_custom_tags(row: &app::TimelineMessageRecord) -> Cow<'_, [Vec<String>]> {
     // Defence in depth for in-memory records that did not cross the storage read boundary.
-    if !row.deleted && !app::is_reserved_app_event_kind(row.kind) {
-        &row.tags
-    } else {
-        &[]
+    if row.deleted {
+        return Cow::Borrowed(&[]);
     }
+    if !app::is_reserved_app_event_kind(row.kind) {
+        return Cow::Borrowed(&row.tags);
+    }
+    if row.kind != MARMOT_APP_EVENT_KIND_CHAT {
+        return Cow::Borrowed(&[]);
+    }
+    Cow::Owned(
+        row.tags
+            .iter()
+            .filter(|tag| tag.len() >= 3 && tag[0] == "emoji")
+            .cloned()
+            .collect(),
+    )
 }
 
 fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
@@ -400,7 +418,7 @@ fn presented_timeline_with_tokens(
         plaintext: row.plaintext.clone(),
         content_tokens,
         kind: row.kind,
-        tags: super::common::message_tags_ffi(presented_custom_tags(row).to_vec()),
+        tags: super::common::message_tags_ffi(presented_custom_tags(row).into_owned()),
         timeline_at: row.timeline_at,
         received_at: row.received_at,
         reply_to_message_id_hex: row.reply_to_message_id_hex.clone(),
@@ -544,7 +562,7 @@ impl ConversationConversionCache {
             sender: row.sender.clone(),
             plaintext: row.plaintext.clone(),
             kind: row.kind,
-            tags: presented_custom_tags(row).to_vec(),
+            tags: presented_custom_tags(row).into_owned(),
             timeline_at: row.timeline_at,
             received_at: row.received_at,
             reply_to_message_id_hex: row.reply_to_message_id_hex.clone(),
@@ -764,6 +782,7 @@ mod tests {
                 count: 3,
                 reactors: vec!["other-a".into(), "other-b".into()],
                 viewer_reacted,
+                reaction_message_id_hex: Some("ab".repeat(32)),
             };
             let native = ConversationReactionFfi::from(reaction);
             assert_eq!(native.viewer_reacted, viewer_reacted);

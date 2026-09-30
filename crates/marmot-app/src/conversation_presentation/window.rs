@@ -95,6 +95,9 @@ pub struct ConversationReaction {
     /// Whether the viewing account has an active reaction of this emoji,
     /// independently of the bounded reactor preview.
     pub viewer_reacted: bool,
+    /// Earliest active kind-7 carrying this emoji. A NIP-30 `:shortcode:`
+    /// reaction names its image through that event's `emoji` and `imeta` tags.
+    pub reaction_message_id_hex: Option<String>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -485,6 +488,12 @@ fn message_references(
             count: reactors.len(),
             reactors: previews,
             viewer_reacted: reactors.iter().any(|id| id.eq_ignore_ascii_case(viewer)),
+            reaction_message_id_hex: message
+                .reactions
+                .user_reactions
+                .iter()
+                .find(|reaction| &reaction.emoji == emoji)
+                .map(|reaction| reaction.reaction_message_id_hex.clone()),
         });
     }
     reactions.omitted_kinds = reactions.total_kinds - reactions.items.len();
@@ -549,6 +558,7 @@ mod budget_tests {
                         count: usize::MAX,
                         viewer_reacted: true,
                         reactors: vec![id.clone(); MAX_CONVERSATION_REACTOR_PREVIEWS],
+                        reaction_message_id_hex: Some("\u{0000}".repeat(MAX_REFERENCE_BYTES)),
                     };
                     MAX_CONVERSATION_REACTION_KINDS
                 ],

@@ -1598,6 +1598,103 @@ pub unsafe extern "C" fn marmot_send_media_attachments(
     })
 }
 
+/// Send previously uploaded attachments as one kind-9 message that also
+/// carries application `tags` (for example NIP-30 `emoji` tags), each row
+/// a `(char **, len)` pair. imeta tags are rejected. Free with
+/// `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `attachments` must
+/// point to `attachments_len` valid caller-owned structs; `tags` to
+/// `tags_len` valid rows (or NULL with length 0); `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_tagged_media(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    attachments: *const MarmotMediaAttachmentReference,
+    attachments_len: usize,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    caption: *const c_char,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let attachments =
+            try_arg!(unsafe { struct_array(attachments, attachments_len, |a| a.to_ffi()) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        let caption = try_arg!(unsafe { crate::memory::optional_str(caption) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_tagged_media(
+                    account_ref,
+                    group_id_hex,
+                    attachments,
+                    caption,
+                    tags,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// React with a custom emoji image. `attachments` (already uploaded)
+/// become `imeta` tags on the kind-7 and `tags` name them, e.g. NIP-30
+/// `["emoji", shortcode, url]` for `emoji` == `:shortcode:`. imeta rows
+/// in `tags` are rejected. Free with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `attachments` must
+/// point to `attachments_len` valid structs and `tags` to `tags_len`
+/// valid rows (each NULL with length 0 allowed); `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_react_with_media(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    target_message_id: *const c_char,
+    emoji: *const c_char,
+    attachments: *const MarmotMediaAttachmentReference,
+    attachments_len: usize,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let target_message_id = try_arg!(unsafe { required_str(target_message_id) });
+        let emoji = try_arg!(unsafe { required_str(emoji) });
+        let attachments =
+            try_arg!(unsafe { struct_array(attachments, attachments_len, |a| a.to_ffi()) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.react_with_media(
+                    account_ref,
+                    group_id_hex,
+                    target_message_id,
+                    emoji,
+                    tags,
+                    attachments,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// Send one previously uploaded attachment as a message. Free with
 /// `marmot_send_summary_free`.
 ///
@@ -2328,6 +2425,47 @@ pub unsafe extern "C" fn marmot_build_media_imeta_tag(
                     account_ref,
                     group_id_hex,
                     reference,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Send kind-9 text with additional application tags. `tags` is a flat
+/// array of `tags_len` tag rows, each row a `(char **, len)` pair of
+/// string values. Free with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `tags` must point to
+/// `tags_len` valid rows (or be NULL with length 0), each row's values
+/// pointer holding its stated length; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_tagged_text(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    content: *const c_char,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let content = try_arg!(unsafe { required_str(content) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_tagged_text(
+                    account_ref,
+                    group_id_hex,
+                    content,
+                    tags,
                 )),
                 out,
             )

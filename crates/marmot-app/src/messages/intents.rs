@@ -205,9 +205,17 @@ pub(crate) enum AppMessageIntent {
     Chat {
         content: String,
     },
+    TaggedChat {
+        content: String,
+        tags: Vec<Vec<String>>,
+    },
     Reaction {
         target_message_id: String,
         emoji: String,
+        /// Extra tags, e.g. NIP-30 `emoji` naming a custom reaction image.
+        tags: Vec<Vec<String>>,
+        /// Encrypted images those tags point at, emitted as `imeta`.
+        attachments: Vec<MediaAttachmentReference>,
     },
     Unreact {
         target_message_id: String,
@@ -240,6 +248,7 @@ pub(crate) enum AppMessageIntent {
     Media {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
+        message_tags: Vec<Vec<String>>,
     },
     StreamStart {
         stream_id: Vec<u8>,
@@ -326,15 +335,31 @@ pub(crate) fn build_inner_event_with_media_reply(
             mention_p_tags(content),
             content.clone(),
         )),
+        AppMessageIntent::TaggedChat { content, tags } => {
+            validate_message_tags(tags)?;
+            let mut tags = tags.clone();
+            for mention in mention_p_tags(content) {
+                if !tags.contains(&mention) {
+                    tags.push(mention);
+                }
+            }
+            Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, content.clone()))
+        }
         AppMessageIntent::Reaction {
             target_message_id,
             emoji,
+            tags,
+            attachments,
         } => {
             validate_message_ref(target_message_id)?;
             validate_reaction_content(emoji)?;
+            validate_message_tags(tags)?;
+            let mut event_tags = vec![event_ref_tag(target_message_id)];
+            event_tags.extend(attachments.iter().map(MediaAttachmentReference::imeta_tag));
+            event_tags.extend(tags.iter().cloned());
             Ok(event(
                 MARMOT_APP_EVENT_KIND_REACTION,
-                vec![event_ref_tag(target_message_id)],
+                event_tags,
                 emoji.clone(),
             ))
         }
@@ -477,7 +502,9 @@ pub(crate) fn build_inner_event_with_media_reply(
         AppMessageIntent::Media {
             attachments,
             caption,
+            message_tags,
         } => {
+            validate_message_tags(message_tags)?;
             if attachments.is_empty() {
                 return Err(AppError::InvalidAppMessagePayload(
                     "media message requires at least one attachment".into(),
@@ -500,6 +527,7 @@ pub(crate) fn build_inner_event_with_media_reply(
                 .iter()
                 .map(MediaAttachmentReference::imeta_tag)
                 .collect();
+            tags.extend(message_tags.iter().cloned());
             if let Some(caption) = caption {
                 tags.extend(mention_p_tags(caption));
             }
@@ -744,6 +772,29 @@ pub fn is_reserved_app_event_kind(kind: u64) -> bool {
     RESERVED_APP_EVENT_KINDS.contains(&kind)
 }
 
+// Application tags may decorate chat, but encrypted media references remain typed.
+pub(crate) fn validate_message_tags(tags: &[Vec<String>]) -> Result<(), AppError> {
+    if tags.len() > 64 || tags.iter().flatten().map(String::len).sum::<usize>() > 16 * 1024 {
+        return Err(AppError::InvalidAppMessagePayload(
+            "message tags exceed limits".into(),
+        ));
+    }
+    for tag in tags {
+        if tag.is_empty() || tag[0].is_empty() || tag[0] == "imeta" {
+            return Err(AppError::InvalidAppMessagePayload(
+                "invalid additional message tag".into(),
+            ));
+        }
+        if tag[0] == "e" || tag[0] == "q" {
+            let target = tag.get(1).ok_or_else(|| {
+                AppError::InvalidAppMessagePayload("missing message reference".into())
+            })?;
+            validate_message_ref(target)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_custom_event_kind(kind: u64) -> Result<(), AppError> {
     if is_reserved_app_event_kind(kind) {
         return Err(AppError::InvalidAppMessagePayload(format!(
@@ -975,6 +1026,7 @@ mod mention_tests {
                 text: "same text".into(),
             },
             AppMessageIntent::Media {
+                message_tags: Vec::new(),
                 caption: Some("same text".into()),
                 attachments: vec![MediaAttachmentReference {
                     locators: vec![],
@@ -1144,5 +1196,112 @@ mod reporting_tests {
         for kind in [1984, 1985, 4891] {
             assert!(is_reserved_app_event_kind(kind));
         }
+    }
+}
+
+#[cfg(test)]
+mod application_tag_tests {
+    use super::*;
+
+    fn tags() -> Vec<Vec<String>> {
+        vec![
+            vec!["effect".into(), "party".into()],
+            vec!["q".into(), "ab".repeat(32)],
+        ]
+    }
+
+    fn emoji_reference() -> MediaAttachmentReference {
+        MediaAttachmentReference {
+            locators: vec![],
+            ciphertext_sha256: "ab".repeat(32),
+            plaintext_sha256: "cd".repeat(32),
+            nonce_hex: "11".repeat(12),
+            file_name: "party.png".into(),
+            media_type: "image/png".into(),
+            version: "encrypted-media-v2".into(),
+            source_epoch: 1,
+            dim: None,
+            thumbhash: None,
+        }
+    }
+
+    fn sender() -> String {
+        nostr::prelude::Keys::generate().public_key().to_hex()
+    }
+
+    #[test]
+    fn tagged_chat_keeps_application_tags() {
+        let intent = AppMessageIntent::TaggedChat {
+            content: "hello".into(),
+            tags: tags(),
+        };
+        let event = build_inner_event(&intent, &sender(), 1).unwrap();
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(event.tags, tags());
+    }
+
+    #[test]
+    fn media_appends_tags_after_imeta() {
+        let intent = AppMessageIntent::Media {
+            attachments: vec![emoji_reference()],
+            caption: None,
+            message_tags: tags(),
+        };
+        let event = build_inner_event(&intent, &sender(), 1).unwrap();
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(event.tags[0][0], "imeta");
+        assert_eq!(&event.tags[1..], tags());
+    }
+
+    #[test]
+    fn media_reaction_emits_imeta_and_emoji() {
+        let emoji = vec!["emoji".into(), "party".into(), "https://blob/x".into()];
+        let intent = AppMessageIntent::Reaction {
+            target_message_id: "abc123".into(),
+            emoji: ":party:".into(),
+            tags: vec![emoji.clone()],
+            attachments: vec![emoji_reference()],
+        };
+        let event = build_inner_event(&intent, &sender(), 1).unwrap();
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_REACTION);
+        assert_eq!(event.content, ":party:");
+        assert_eq!(event.tags[0][0], "e");
+        assert_eq!(event.tags[1][0], "imeta");
+        assert_eq!(event.tags[2], emoji);
+    }
+
+    #[test]
+    fn reaction_rejects_forged_imeta_tag() {
+        let intent = AppMessageIntent::Reaction {
+            target_message_id: "abc123".into(),
+            emoji: ":party:".into(),
+            tags: vec![vec!["imeta".into(), "url https://blob/x".into()]],
+            attachments: Vec::new(),
+        };
+        assert!(build_inner_event(&intent, &sender(), 1).is_err());
+    }
+
+    #[test]
+    fn message_tag_count_limit() {
+        let tag = vec!["effect".to_owned()];
+        assert!(validate_message_tags(&vec![tag.clone(); 64]).is_ok());
+        assert!(validate_message_tags(&vec![tag; 65]).is_err());
+    }
+
+    #[test]
+    fn message_tag_byte_limit() {
+        let at_limit = vec![vec!["t".to_owned(), "x".repeat(16 * 1024 - 1)]];
+        assert!(validate_message_tags(&at_limit).is_ok());
+        let over_limit = vec![vec!["t".to_owned(), "x".repeat(16 * 1024)]];
+        assert!(validate_message_tags(&over_limit).is_err());
+    }
+
+    #[test]
+    fn message_tags_reject_malformed_rows() {
+        assert!(validate_message_tags(&[vec![]]).is_err());
+        assert!(validate_message_tags(&[vec![String::new(), "x".into()]]).is_err());
+        assert!(validate_message_tags(&[vec!["imeta".into(), "forged".into()]]).is_err());
+        assert!(validate_message_tags(&[vec!["q".into(), " ".into()]]).is_err());
+        assert!(validate_message_tags(&[vec!["e".into()]]).is_err());
     }
 }

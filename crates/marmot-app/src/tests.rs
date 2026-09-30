@@ -3854,6 +3854,7 @@ async fn media_send_epoch_pin_body() {
         .send_app_event(
             &group_id,
             AppMessageIntent::Media {
+                message_tags: Vec::new(),
                 attachments: vec![pinned_elsewhere],
                 caption: None,
             },
@@ -3912,6 +3913,7 @@ async fn media_send_epoch_pin_body() {
         .send_app_event(
             &group_id,
             AppMessageIntent::Media {
+                message_tags: Vec::new(),
                 attachments: vec![current],
                 caption: None,
             },
@@ -13466,6 +13468,8 @@ fn reaction_intent_builds_kind_seven_with_e_tag() {
     let event = build(AppMessageIntent::Reaction {
         target_message_id: "abc123".to_owned(),
         emoji: "🔥".to_owned(),
+        tags: Vec::new(),
+        attachments: Vec::new(),
     });
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_REACTION);
     assert_eq!(event.content, "🔥");
@@ -13478,6 +13482,8 @@ fn reaction_intent_rejects_empty_emoji() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: "  ".to_owned(),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13492,6 +13498,8 @@ fn reaction_intent_rejects_padded_content() {
             &AppMessageIntent::Reaction {
                 target_message_id: "target-message".to_owned(),
                 emoji: emoji.to_owned(),
+                tags: Vec::new(),
+                attachments: Vec::new(),
             },
             SENDER_HEX,
             1,
@@ -13508,6 +13516,8 @@ fn reaction_intent_rejects_control_characters_and_oversized_content() {
             &AppMessageIntent::Reaction {
                 target_message_id: "abc123".to_owned(),
                 emoji: emoji.to_owned(),
+                tags: Vec::new(),
+                attachments: Vec::new(),
             },
             SENDER_HEX,
             1,
@@ -13519,6 +13529,8 @@ fn reaction_intent_rejects_control_characters_and_oversized_content() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: "👍".repeat(65),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13532,6 +13544,8 @@ fn reaction_intent_accepts_bounded_multi_scalar_emoji() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: "👨‍👩‍👧‍👦".to_owned(),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13547,6 +13561,8 @@ fn reaction_intent_accepts_exact_maximum_scalar_count() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: emoji.clone(),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13593,6 +13609,7 @@ fn reply_intent_builds_kind_nine_with_e_and_q_tags() {
 #[test]
 fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
     let event = build(AppMessageIntent::Media {
+        message_tags: Vec::new(),
         attachments: vec![
             MediaAttachmentReference {
                 locators: vec![MediaLocator {
@@ -13970,6 +13987,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
     // keeps a structurally well-formed media reference regardless of locator
     // policy; fetchability is decided later at download time.
     let event = build(AppMessageIntent::Media {
+        message_tags: Vec::new(),
         attachments: vec![MediaAttachmentReference {
             // A locator kind that is not the default `blossom-v1` and would be
             // out of a blossom-only policy.
@@ -14007,6 +14025,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
 
 fn malformed_media_message(version: &str) -> Vec<u8> {
     let mut event = build(AppMessageIntent::Media {
+        message_tags: Vec::new(),
         attachments: vec![MediaAttachmentReference {
             locators: vec![MediaLocator {
                 kind: "blossom-v1".to_owned(),

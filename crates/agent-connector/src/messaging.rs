@@ -662,6 +662,7 @@ impl AgentConnector {
                 &account.label,
                 &group_id,
                 MediaUploadRequest {
+                    message_tags: Vec::new(),
                     attachments: upload_attachments,
                     caption,
                     send: true,

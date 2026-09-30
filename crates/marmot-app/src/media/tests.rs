@@ -757,6 +757,7 @@ fn operation_policy<'a>(
 
 fn media_upload_request(blossom_server: Option<String>) -> MediaUploadRequest {
     MediaUploadRequest {
+        message_tags: Vec::new(),
         attachments: vec![MediaUploadAttachmentRequest {
             file_name: "diagram.png".to_owned(),
             media_type: "image/png".to_owned(),
@@ -893,6 +894,7 @@ async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
     let keys = signing_keys();
     let plaintext_len = 64 * 1024 * 1024 + 1;
     let request = MediaUploadRequest {
+        message_tags: Vec::new(),
         attachments: vec![MediaUploadAttachmentRequest {
             file_name: "release.apk".to_owned(),
             media_type: "application/vnd.android.package-archive".to_owned(),

@@ -5426,12 +5426,16 @@ fn account_worker_command_future<'a>(
                 AppMessageIntent::Reaction {
                     target_message_id,
                     emoji,
+                    tags,
+                    attachments,
                 } => {
                     client
                         .react_to_message_with_local_projection(
                             &group_id,
                             &target_message_id,
                             &emoji,
+                            tags,
+                            attachments,
                             |update| {
                                 if first_projection {
                                     shared.app_performance_telemetry().record(

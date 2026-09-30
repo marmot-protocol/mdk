@@ -32,6 +32,24 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// `send_text` plus application tags on the same kind-9, e.g. NIP-30
+    /// `["emoji", shortcode, url]`. At most 64 tags and 16 KiB of values;
+    /// `imeta` rows are rejected (use `send_tagged_media` for attachments).
+    pub async fn send_tagged_text(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        text: String,
+        tags: Vec<Vec<String>>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .send_tagged_text(&account_ref, &group_id, text, tags)
+            .await?
+            .into())
+    }
+
     /// Re-attempt publishing a group's pending (committed-but-undelivered)
     /// commit(s) without minting a new event.
     ///

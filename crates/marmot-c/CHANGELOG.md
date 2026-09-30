@@ -14,6 +14,16 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   sum to the `MarmotPollProjection` tally. Free it with
   `marmot_poll_vote_page_free`; requires the matching regenerated header and
   library. (#2091)
+- `marmot_send_tagged_text`, `marmot_send_tagged_media`, and
+  `marmot_react_with_media` add application tags such as NIP-30 `emoji` to a
+  chat, media chat, or reaction. `MarmotMediaUploadRequest` gains trailing
+  `message_tags`/`message_tags_len` (NULL/0 for none), which changes its
+  layout; requires the matching regenerated header and library.
+- `MarmotConversationReaction` gains trailing nullable
+  `reaction_message_id_hex`, the earliest active kind-7 for that emoji; a
+  NIP-30 reaction's image is listed under it by `marmot_list_media`. Kind-9
+  conversation rows also keep NIP-30 `emoji` tags. Requires the matching
+  regenerated header and library.
 
 
 ## [0.11.0] - 2026-09-29

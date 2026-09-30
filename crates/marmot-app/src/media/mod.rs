@@ -701,6 +701,8 @@ pub struct MediaUploadRequest {
     /// Optional explicit Blossom endpoint for local testing. When absent, the
     /// the group's versioned encrypted-media default endpoints are used.
     pub blossom_server: Option<String>,
+    /// Extra tags on the sent kind-9, e.g. NIP-30 `emoji`. `imeta` is rejected.
+    pub message_tags: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

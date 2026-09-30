@@ -9,7 +9,7 @@ use cgka_traits::app_components::{
     ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
 };
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -241,7 +241,8 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
     )
     .storage()?;
 
-    if kind == MARMOT_APP_EVENT_KIND_CHAT
+    // Reactions carry imeta for NIP-30 custom emoji images.
+    if (kind == MARMOT_APP_EVENT_KIND_CHAT || kind == MARMOT_APP_EVENT_KIND_REACTION)
         && let Some(source_epoch) = source_epoch
     {
         let source_epoch = u64_to_i64(source_epoch)?;
@@ -662,7 +663,7 @@ mod tests {
         store.record_app_event(&malformed).unwrap();
 
         let mut non_chat = media_event("non-chat", 20, 8);
-        non_chat.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REACTION;
+        non_chat.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT;
         store.record_app_event(&non_chat).unwrap();
 
         let references: i64 = store
@@ -675,6 +676,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(references, 0);
+    }
+
+    // A NIP-30 reaction's image must stay decryptable like a chat's.
+    #[test]
+    fn reaction_imeta_retains_a_media_secret() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mut reaction = media_event("reaction", 20, 8);
+        reaction.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REACTION;
+        store.record_app_event(&reaction).unwrap();
+
+        let epochs: Vec<i64> = {
+            let conn = store.lock().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT source_epoch FROM encrypted_media_epoch_secret_references
+                     WHERE message_id_hex = 'reaction'",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(epochs, vec![8]);
     }
 
     #[test]

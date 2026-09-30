@@ -70,6 +70,7 @@ pub(crate) async fn media_command_with_runtime(
                     &account.account_id_hex,
                     &group_id,
                     MediaUploadRequest {
+                        message_tags: Vec::new(),
                         attachments,
                         caption: message,
                         send,

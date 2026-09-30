@@ -347,6 +347,31 @@ fn custom_tags_and_deletion_provenance_invalidate_prepared_conversion() {
 }
 
 #[test]
+fn chat_rows_keep_only_emoji_tags() {
+    let mut cache = ConversationConversionCache::default();
+    let mut row = record(0);
+    let emoji = vec!["emoji".to_owned(), "party".into(), "https://blob/x".into()];
+    row.tags = vec![
+        vec!["imeta".into(), "url https://blob/x".into()],
+        vec!["p".into(), "ab".repeat(32)],
+        vec!["emoji".into(), "short".into()],
+        emoji.clone(),
+    ];
+    let values = |row: TimelineMessageRecordFfi| {
+        row.tags
+            .into_iter()
+            .map(|tag| tag.values)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values(cache.row(&row, false)), vec![emoji.clone()]);
+    row.tags.pop();
+    assert!(values(cache.row(&row, false)).is_empty());
+    row.tags.push(emoji);
+    row.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REACTION;
+    assert!(values(cache.row(&row, false)).is_empty());
+}
+
+#[test]
 fn legacy_deleted_record_defaults_to_unknown_provenance() {
     let mut row = record(0);
     row.deleted = true;

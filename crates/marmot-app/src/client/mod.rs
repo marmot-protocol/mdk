@@ -179,6 +179,7 @@ pub(crate) struct EncryptedMediaUploadFinish {
     media_secret: SecretBytes,
     should_send: bool,
     caption: Option<String>,
+    message_tags: Vec<Vec<String>>,
 }
 
 pub(crate) struct EncryptedMediaDownloadHttp {
@@ -3815,7 +3816,9 @@ impl AppClient {
             AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
                 (Family::MessageAction, "custom")
             }
-            AppMessageIntent::Chat { .. } => (Family::MessageAction, "text"),
+            AppMessageIntent::Chat { .. } | AppMessageIntent::TaggedChat { .. } => {
+                (Family::MessageAction, "text")
+            }
             AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
             AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
             AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
@@ -4472,8 +4475,15 @@ impl AppClient {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
-        self.react_to_message_with_local_projection(group_id, target_message_id, emoji, |_| {})
-            .await
+        self.react_to_message_with_local_projection(
+            group_id,
+            target_message_id,
+            emoji,
+            Vec::new(),
+            Vec::new(),
+            |_| {},
+        )
+        .await
     }
 
     pub(crate) async fn react_to_message_with_local_projection<F>(
@@ -4481,6 +4491,8 @@ impl AppClient {
         group_id: &GroupId,
         target_message_id: &str,
         emoji: &str,
+        tags: Vec<Vec<String>>,
+        attachments: Vec<MediaAttachmentReference>,
         on_local_projection: F,
     ) -> Result<SendSummary, AppError>
     where
@@ -4488,6 +4500,10 @@ impl AppClient {
     {
         self.ensure_group_application_messages_allowed(group_id)?;
         crate::messages::validate_reaction_content(emoji)?;
+        if !attachments.is_empty() {
+            self.sync_runtime_groups().await?;
+            self.validate_draft_media_references(group_id, &attachments)?;
+        }
         let sender = self
             .app
             .account_home()
@@ -4500,6 +4516,8 @@ impl AppClient {
                     Self::message_human_action_context(&AppMessageIntent::Reaction {
                         target_message_id: target_message_id.to_owned(),
                         emoji: emoji.to_owned(),
+                        tags: Vec::new(),
+                        attachments: Vec::new(),
                     })
                 {
                     self.record_human_action_noop_succeeded(
@@ -4528,6 +4546,8 @@ impl AppClient {
                 AppMessageIntent::Reaction {
                     target_message_id: target_message_id.to_owned(),
                     emoji: emoji.to_owned(),
+                    tags,
+                    attachments,
                 },
                 on_local_projection,
             )
@@ -4711,6 +4731,7 @@ impl AppClient {
             self.validate_draft_media_references(group, &attachments)?;
             (
                 AppMessageIntent::Media {
+                    message_tags: Vec::new(),
                     attachments,
                     caption: Some(draft.content),
                 },
@@ -4772,6 +4793,19 @@ impl AppClient {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
+        self.send_tagged_media(group_id, attachments, caption, Vec::new())
+            .await
+    }
+
+    /// Send already-uploaded attachments as one kind-9 chat that also carries
+    /// application tags, such as NIP-30 `emoji` tags naming those attachments.
+    pub async fn send_tagged_media(
+        &mut self,
+        group_id: &GroupId,
+        attachments: Vec<MediaAttachmentReference>,
+        caption: Option<String>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         self.validate_draft_media_references(group_id, &attachments)?;
@@ -4779,6 +4813,7 @@ impl AppClient {
             .send_app_event(
                 group_id,
                 AppMessageIntent::Media {
+                    message_tags,
                     attachments,
                     caption,
                 },
@@ -4874,6 +4909,8 @@ impl AppClient {
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
+        crate::messages::validate_message_tags(&request.message_tags)?;
+        let message_tags = request.message_tags.clone();
         let should_send = request.send;
         let caption = request.caption.clone();
         Ok((
@@ -4894,6 +4931,7 @@ impl AppClient {
                 media_secret,
                 should_send,
                 caption,
+                message_tags,
             },
         ))
     }
@@ -4912,7 +4950,12 @@ impl AppClient {
             .map(|attachment| attachment.reference.clone())
             .collect();
         let summary = self
-            .send_media_attachments(&finish.group_id, attachments, finish.caption)
+            .send_tagged_media(
+                &finish.group_id,
+                attachments,
+                finish.caption,
+                finish.message_tags,
+            )
             .await?;
         // The post-publish projection now durably references this source
         // epoch. Persist again so a prior final-reference retirement cannot
