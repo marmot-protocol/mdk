@@ -1,46 +1,25 @@
 # AGENTS.md - mdk
 
-Repository-level map for agents. Read `README.md` first for the human-facing overview.
+Repository-level rules and routing for coding agents. `README.md` is the human overview (what each crate is, how the
+layers fit); don't duplicate it here.
 
-## Scope
+The canonical protocol specification lives in `github.com/marmot-protocol/marmot`. This repo owns the Rust
+implementation, its architecture notes, conformance fixtures, formal models, and diagnostics.
 
-This repo owns the Rust implementation workspace for Marmot:
-
-- shared traits and cross-boundary types,
-- OpenMLS-backed engine implementation,
-- production-shaped account-device session wrapper,
-- account orchestration,
-- app runtime bridge,
-- SQLCipher-backed storage backend,
-- Nostr transport adapter and peeler,
-- raw QUIC agent text stream preview transport and memory-only broker,
-- agent control protocol, stream composition, and the `wn-agent` connector daemon,
-- app message Markdown display parser,
-- shared JSONL forensic audit schema,
-- UniFFI bindings for the app runtime,
-- C ABI bindings for the app runtime,
-- CLI surface, daemon, and TUI,
-- conformance simulator and vector fixtures,
-- Goggles-incident replay adapter (agent-state export parse + classify),
-- Tamarin models for distributed convergence,
-- architecture notes and CGKA contracts.
-
-The canonical protocol specification lives in
-`github.com/marmot-protocol/marmot`. Keep implementation architecture and diagnostics in this repo.
+Nested `AGENTS.md` files add rules for their subtree. Read the nearest one before editing.
 
 ## Where to go
 
 | Task | Start here |
 | --- | --- |
-| Engine behavior | `crates/cgka-engine/AGENTS.md` |
-| Engine integration tests | `crates/cgka-engine/tests/AGENTS.md` |
-| Account-device session lifecycle | `crates/cgka-session/AGENTS.md` |
+| Engine behavior | `crates/cgka-engine/AGENTS.md` (`src/`, `tests/` have their own) |
+| Account-device session lifecycle | `crates/cgka-session/AGENTS.md` (`tests/` has its own) |
 | Account orchestration / app-core shell | `crates/marmot-account/AGENTS.md` |
 | App runtime bridge | `crates/marmot-app/AGENTS.md` |
 | App message Markdown display parsing | `crates/marmot-markdown/AGENTS.md` |
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
 | Private file/dir/socket creation helpers | `crates/fs-private/AGENTS.md` |
-| SQLite storage | `crates/storage-sqlite/AGENTS.md` |
+| SQLite storage | `crates/storage-sqlite/AGENTS.md` (`src/migrations/`, `src/openmls_storage/`, `src/storage/`, `src/storage/snapshots/` have their own) |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
 | QUIC agent text stream previews | `crates/transport-quic-stream/AGENTS.md` |
@@ -49,17 +28,29 @@ The canonical protocol specification lives in
 | Agent stream composition | `crates/agent-stream-compose/AGENTS.md` |
 | `wn-agent` connector daemon | `crates/agent-connector/AGENTS.md` |
 | Host integrations / connector coexistence | `integrations/AGENTS.md` |
-| Claude Code terminal harness | `integrations/claude/marmot/AGENTS.md` |
-| Codex terminal harness | `integrations/codex/marmot/AGENTS.md` |
+| Hermes gateway plugin | `integrations/hermes/marmot/AGENTS.md` (tests: `integrations/hermes/tests/marmot/AGENTS.md`) |
+| OpenClaw channel plugin | `integrations/openclaw/marmot/AGENTS.md` |
+| Shared terminal-harness runtime | `integrations/terminal-harness/AGENTS.md` |
+| Claude Code / Codex / OpenCode / Pi harnesses | `integrations/{claude,codex,opencode,pi}/marmot/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
 | App runtime C ABI bindings | `crates/marmot-c/AGENTS.md` |
 | CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
-| Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
+| Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` (`src/`, `tests/`, `vectors/` have their own) |
 | Container/VM convergence campaigns | `crates/convergence-campaign-runner/AGENTS.md` |
 | Goggles incident replay adapter | `crates/incident-replay/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
+| Releases | `release.md` |
+
+## Documentation
+
+- `README.md` files are for humans: what it is, how to use it, where to go next. `AGENTS.md` files are for agents:
+  boundaries, invariants, code map, editing rules, verification. Keep agent directives out of READMEs and tutorials
+  out of `AGENTS.md`; link instead of duplicating.
+- When you add, rename, or remove a crate, binary, `just` recipe, or user-facing command, update the root `README.md`
+  crate map and the affected crate README in the same change.
+- Do not add `CLAUDE.md` files or symlinks; `AGENTS.md` is the single agent-instruction file.
 
 ## Invariants
 
@@ -104,7 +95,6 @@ The canonical protocol specification lives in
   `just release-all-draft <version>` when releases should stay draft for manual publication.
 - Sign every commit before pushing. This repository accepts only cryptographically signed commits;
   configure Git SSH signing (or another accepted signing method) and verify the signature locally.
-- When adding an `AGENTS.md`, create a sibling `CLAUDE.md` symlink to it.
 
 ## Verification
 

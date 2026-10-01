@@ -40,6 +40,20 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     concurrent invite plus rename, a member removed while its device is closed, a voluntary leave with three
     remaining auto-committers, and the explicit slow manual self-update. Same harness and evidence layout as `app_runtime_journeys.rs`; see `../APP_PATH_COVERAGE.md`.
 
+- **File:** `adversarial_reliability_campaigns.rs`
+  - **Owns:** `adversarial-reliability/v1` catalog coverage, small headline regressions, and the ignored sustained,
+    offline-flood, and self-update campaigns run by `just adversarial-reliability-ci`.
+
+- **File:** `app_generated_variance.rs`
+  - **Owns:** Public app family seed diversity, measured after removing labels, actors, and payload text.
+
+- **File:** `app_recovery_expansion.rs`
+  - **Owns:** Cheap contracts for the opt-in process-backed recovery workloads (`../APP_RECOVERY_EXPANSION.md`):
+    replay/prefix/diversity/reachability, unexercised-race rejection, and relay-configuration preflight.
+
+- **File:** `app_runtime_adapter.rs`
+  - **Owns:** Long-lived black-box app-runtime adapter coverage, including owner-death child cleanup.
+
 - **File:** `agent_text_stream_vectors.rs`
   - **Owns:** Byte-level conformance vectors for the agent text stream QUIC feature: `AgentTextStreamKeyContextV1`
     encoding, HKDF-SHA256 record key / nonce derivation, record AEAD AAD, transcript hashes, and the
@@ -54,8 +68,14 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 - **File:** `canonicalization_contract.rs`
   - **Owns:** Executable canonicalization contract behavior, including sync-state edge cases.
 
+- **File:** `failure_capsules.rs`
+  - **Owns:** Capsule round trip (schedule, policy, resources) and exact commit replay from a sensitive checkpoint.
+
 - **File:** `generated_policy_cases.rs`
   - **Owns:** Rust consumer for bounded policy cases shared with Tamarin generation.
+
+- **File:** `issue_494_admin_promote_delivery.rs`
+  - **Owns:** mdk#494 regression: a promoted peer receives the promoter's later messages without sending first.
 
 - **File:** `independent_reference_model.rs`
   - **Owns:** Production-independent symbolic selector/canonicalizer differential tests, including small shrinkable
@@ -80,13 +100,27 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     reconnect, exact backlog multiplicity, strict pending-work/equivalence/decryptability oracles, and file-backed
     executable canaries.
 
+- **File:** `offline_catchup_regression.rs`
+  - **Owns:** The reduced `offline-catchup-pressure/v1` seed 17001 case 19 regression (16 commit rounds, first 368
+    messages) with full payload multiplicity, exact state, and decryptability.
+
+- **File:** `node_protocol.rs`
+  - **Owns:** Versioned convergence-node JSONL protocol: observable quiescence, identifier-free errors, oversized-frame
+    handling.
+
 - **File:** `mutation_adequacy.rs`
-  - **Owns:** Exact executable mutation catalog coverage, kill assertions, and drift-checking the human-readable
-    verification-layer matrix.
+  - **Owns:** Exact executable mutation catalog coverage, kill assertions, and drift-checking
+    `../MUTATION_MATRIX.md`.
 
 - **File:** `protocol_decision_gate.rs`
-  - **Owns:** Adopted protocol commit/value pin, exhaustive constant versioning classification, future required
+  - **Owns:** `../PROTOCOL_DECISIONS.md` and convergence-constant inventory pins, adopted protocol commit/value pin, exhaustive constant versioning classification, future required
     component rule, and closed-input scheduler/resource non-interference.
+
+- **File:** `policy_case_tamarin_drift.rs`
+  - **Owns:** Generated Tamarin seed rules and lemmas from `formal/tamarin/policy_cases.json` match the committed model.
+
+- **File:** `policy_sweeps.rs`
+  - **Owns:** `test-policy-overrides` one-variable policy curves and named boundary failures.
 
 - **File:** `openmls_replay_probe.rs`
   - **Owns:** OpenMLS replay and candidate materialization probes.
@@ -95,6 +129,12 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
   - **Owns:** Property tests for selector order, canonicalization, capability matrices, lifecycle/restart behavior,
     generated send/leave histories, and delivery-profile convergence.
 
+- **File:** `process_orchestrator.rs`
+  - **Owns:** Multi-process orchestrator: isolated process roots, engine/app-runtime/process public-state equivalence,
+    four-party cross-route checkpoints and ignored soaks/restart permutations, kill/reconnect/restart agreement,
+    saved-input execution, capability and relay-map preflight, and private reports/capsules. Selected tests run in
+    `just simulator-smoke`; the whole binary runs in the nightly lane.
+
 - **File:** `process_campaign_runner.rs`
   - **Owns:** Real child-process campaign execution, exact saved-input/report provenance, fixture/capsule artifacts, and
     refusal to overwrite prior campaign evidence.
@@ -102,9 +142,23 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 - **File:** `report_runner.rs`
   - **Owns:** Report artifact runner, oracle evidence, and coverage matrix coverage.
 
+- **File:** `route_assurance.rs`
+  - **Owns:** Route inventory liveness against source markers, `../CONVERGENCE_ROUTE_MATRIX.md` drift, and
+    counterexample claims that a green run cannot silently close.
+
+- **File:** `scenario_ir.rs`
+  - **Owns:** Schema/compiler contract: every executable step kind declared, v3-only actions rejected in v2, authoring
+    schema references, group-scoping and preflight failures.
+
+- **File:** `semantic_reduction.rs`
+  - **Owns:** Dependency-aware reduction units that keep each fault paired with its recovery step.
+
 - **File:** `sqlite_storage_modes.rs`
   - **Owns:** Harness storage-mode coverage over encrypted file-backed SQLite, including full close/reopen hydration,
     production WAL defaults, encrypted headers, and busy-writer retry behavior.
+
+- **File:** `stateful_generator.rs`
+  - **Owns:** `chat-journey/v1` determinism, legality, canonical IR, and report execution of both journey profiles.
 
 - **File:** `tracing_audit.rs`
   - **Owns:** Repo-wide production tracing privacy audit.

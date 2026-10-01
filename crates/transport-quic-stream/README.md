@@ -14,10 +14,11 @@ orchestration stay in higher layers.
   wildcard source bind is not authorization of the remote address: `SendTextStream` callers must supply an already
   validated and pinned `SocketAddr` plus configuration-derived trust/`server_name`. The API has no resolver or
   dev-flag context and does not infer permission from the destination IP.
+- Parses and validates adopted `quic://host:port` broker candidates (`QuicCandidate`, bounded to 512 bytes).
 - Seals and opens length-delimited preview records with HKDF-derived keys and AAD.
 - Sends and receives text-stream preview chunks over ordered QUIC streams.
-- Requires encrypted publishers to reserve sequences through an account-device
-  durable state boundary before record writes; ambiguous state fails closed.
+- Requires encrypted publishers to reserve sequences through an account-device durable state boundary
+  (`PublisherSequenceStore`) before record writes; ambiguous state fails closed.
 
 ## What it does not do
 
@@ -33,4 +34,4 @@ Live preview chunks are provisional; the final MLS app payload remains authorita
 cargo test -p transport-quic-stream
 ```
 
-See [`AGENTS.md`](AGENTS.md) for the module map and privacy-safe logging rules.
+See [`AGENTS.md`](AGENTS.md) for the module map and invariants.

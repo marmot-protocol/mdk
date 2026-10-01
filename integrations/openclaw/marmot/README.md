@@ -14,46 +14,18 @@ local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
 to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart of
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
-The shared `message` tool exposes Marmot reaction add/remove through its
-`react` action. Reactions target durable message ids; omitting `messageId`
-targets the current inbound message. Removal requires explicit `remove: true`:
-a non-empty `emoji` removes that exact content, while an omitted or empty
-`emoji` removes all of the agent account's active reactions on the target.
-Missing, empty, or non-string emoji values never implicitly remove reactions.
-Repeating a removal is idempotent. Reaction content follows the
-agent-control v2 bound: non-blank, control-free, and at most 64 Unicode scalar
-values.
-
-Agents send outbound media through OpenClaw's normal
-`message(action="send", channel="marmot", media=..., attachments=...)` interface.
-Generated files must be placed under the active agent workspace or an
-OpenClaw-managed media store; data URLs are not supported. OpenClaw's
-host-provided media reader is the source authorization boundary. The plugin
-stages the authorized bytes as a private, short-lived copy under
-`MARMOT_OUTBOUND_MEDIA_DIR`, while `wn-agent --media-allowed-root` independently
-authorizes that staging path before encrypting and uploading it. Direct
-`MarmotAgentControlClient.sendMedia()` calls are reserved for connector tests
-and smoketests, not runtime agents.
-
-For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
-materialized chat window and supplies it to OpenClaw with durable message ids,
-senders, timestamps, reply links, current reaction summaries, and
-delete/invalidation state. Reply context is supplied through both OpenClaw's
-native quote fields and a complete structured referenced-message payload.
-The model-callable `marmot_history` tool can fetch one exact message id or page
-older messages using the returned `(recorded_at, message_id_hex)` cursor.
-History reads are best-effort for turn activation, so a temporary read failure
-does not suppress the new inbound message.
-
-Inbound dispatch uses a bounded per-group FIFO and a bounded active-group set.
-Queue admission is explicit: accepted, debounce-coalesced, onboarding-intercepted,
-and overload outcomes remain distinguishable through completion. Queued/running
-message ids stay reserved so replay cannot start a second active turn; overload
-releases the reservation so a later connector replay can retry. Pressure logs
-contain only fixed reason classes and aggregate limits/counts, never identifiers.
-
 - Pinned OpenClaw development SDK: **`openclaw@2026.7.1-2`**.
 - Toolchain: TypeScript, pnpm, Node ≥ 22.19, Vitest.
+
+## Contents
+
+- [Install (release)](#install-release)
+- [Dev setup](#dev-setup)
+- [Docker phone test](#docker-phone-test)
+- [Configuration](#configuration)
+- [How it works](#how-it-works)
+- [Local gateway harness](#local-gateway-harness)
+- [Tests](#tests)
 
 ## Install (release)
 
@@ -276,7 +248,7 @@ advanced shared deployment can point both gateways at one `wn-agent`:
 
 | Key (config) | Env | Default |
 | --- | --- | --- |
-| `home` | `MARMOT_HOME` | `~/.marmot` |
+| `home` | `MARMOT_HOME` | `~/.marmot` (the release installer writes `~/.marmot-agents/openclaw`) |
 | `socketPath` | `MARMOT_AGENT_SOCKET` | `$MARMOT_HOME/dev/wn-agent.sock` |
 | `authToken` | `MARMOT_AGENT_AUTH_TOKEN` | — |
 | `authTokenFile` | `MARMOT_AGENT_AUTH_TOKEN_FILE` | — |
@@ -309,6 +281,46 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
 The token grants the full connector API for every hosted account, not only the
 configured OpenClaw channel account. Use a separate connector home/socket/token
 for any plugin or tenant that is not in the same trust boundary.
+
+## How it works
+
+The shared `message` tool exposes Marmot reaction add/remove through its
+`react` action. Reactions target durable message ids; omitting `messageId`
+targets the current inbound message. Removal requires explicit `remove: true`:
+a non-empty `emoji` removes that exact content, while an omitted or empty
+`emoji` removes all of the agent account's active reactions on the target.
+Missing, empty, or non-string emoji values never implicitly remove reactions.
+Repeating a removal is idempotent. Reaction content follows the
+agent-control v2 bound: non-blank, control-free, and at most 64 Unicode scalar
+values.
+
+Agents send outbound media through OpenClaw's normal
+`message(action="send", channel="marmot", media=..., attachments=...)` interface.
+Generated files must be placed under the active agent workspace or an
+OpenClaw-managed media store; data URLs are not supported. OpenClaw's
+host-provided media reader is the source authorization boundary. The plugin
+stages the authorized bytes as a private, short-lived copy under
+`MARMOT_OUTBOUND_MEDIA_DIR`, while `wn-agent --media-allowed-root` independently
+authorizes that staging path before encrypting and uploading it. Direct
+`MarmotAgentControlClient.sendMedia()` calls are reserved for connector tests
+and smoketests, not runtime agents.
+
+For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
+materialized chat window and supplies it to OpenClaw with durable message ids,
+senders, timestamps, reply links, current reaction summaries, and
+delete/invalidation state. Reply context is supplied through both OpenClaw's
+native quote fields and a complete structured referenced-message payload.
+The model-callable `marmot_history` tool can fetch one exact message id or page
+older messages using the returned `(recorded_at, message_id_hex)` cursor.
+History reads are best-effort for turn activation, so a temporary read failure
+does not suppress the new inbound message.
+
+Inbound dispatch uses a bounded per-group FIFO and a bounded active-group set.
+Queue admission is explicit: accepted, debounce-coalesced, onboarding-intercepted,
+and overload outcomes remain distinguishable through completion. Queued/running
+message ids stay reserved so replay cannot start a second active turn; overload
+releases the reservation so a later connector replay can retry. Pressure logs
+contain only fixed reason classes and aggregate limits/counts, never identifiers.
 
 - **Inbound → agent turn** (`src/dispatch.ts`): the gateway-owned inbound bridge
   feeds each received Marmot message (`chatId` = Marmot group id, `userId` =
@@ -353,7 +365,7 @@ for any plugin or tenant that is not in the same trust boundary.
   message. Effective DMs always reply. Activation may only narrow
   authorization; mentions, triggers, reply context, display names, and group
   content cannot widen it. A single bounded
-  per-(account, group) cache now stores both `is_direct` and the normalized
+  per-(account, group) cache stores both `is_direct` and the normalized
   group subject (display text only) so activation and native conversation
   metadata share one in-flight `group_info` read. The cache holds at most 256
   entries (hits, unnamed groups, label-failure cooldown, and pending lookups),
@@ -390,9 +402,7 @@ for any plugin or tenant that is not in the same trust boundary.
   MLS **group** id hex (a DM is a two-member group), optionally prefixed
   `marmot:`. The channel's `messaging` adapter exposes `targetResolver.looksLikeId`
   + `resolveTarget` + `inferTargetChatType` (always `group`) so core resolves a
-  group id as a first-class target (Marmot has no directory to search). Without
-  it the generic resolver rejected a Marmot group id with an "unknown target"
-  error before the durable send could run.
+  group id as a first-class target (Marmot has no directory to search).
 - **Message deletion**: the control client can retract a prior message via
   `delete_message` (kind-5, `MarmotAppRuntime::delete_message`), and inbound
   kind-5 deletions from other members surface as a `message_deleted` event,

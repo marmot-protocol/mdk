@@ -685,10 +685,12 @@ impl SqliteAccountStorage {
                     {
                         return Err(StorageError::Serialization("recovery goal changed without a new revision".into()));
                     }
-                    // The quiet streak belongs to this goal: new evidence or a
-                    // new route starts it over.
+                    // The quiet streak and certificates belong to this goal:
+                    // new evidence (an obligation revision) or a change to
+                    // this scope's own route, window or required relays
+                    // starts them over. A route-policy change elsewhere in
+                    // the account does not (mdk#2110).
                     if compatible_columns && previous.obligation_revision == *revision
-                        && previous.route_revision == expected.route_revision
                         && previous.required_endpoints == plan.required_endpoints
                     {
                         payload.quiet_passes = previous.quiet_passes;
@@ -696,7 +698,6 @@ impl SqliteAccountStorage {
                     }
                     if compatible_columns && previous.obligation_revision == *revision
                         && previous.loss_revision == expected.loss_revision
-                        && previous.route_revision == expected.route_revision
                         && previous.required_endpoints == plan.required_endpoints
                     {
                         payload.checkpoints = previous.checkpoints.into_iter().filter(|checkpoint| {
@@ -1074,6 +1075,114 @@ mod tests {
         assert_eq!(eligibility(loss), RecoveryEligibility::Retry);
         pass(&[(loss, &[(0, Quiet), (1, Quiet)])]);
         assert_eq!(eligibility(loss), RecoveryEligibility::NeedsDeepRepair);
+    }
+
+    /// A route-policy change is not new evidence: a scope whose own route,
+    /// window and required relays are unchanged keeps its streak and
+    /// certificates, a scope whose required relays changed starts over, and a
+    /// new route starts fresh (mdk#2110).
+    #[test]
+    fn route_change_keeps_progress_of_unchanged_scopes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("alice").unwrap();
+        store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+        let loss = store.recovery_revision_fence().unwrap().obligations[0].0;
+        assert!(!store.observe_recovery_route_snapshot([1; 32]).unwrap());
+        let route = |scope_id: u64, group: u8, relays: &[&str]| {
+            let mut scope = plan(relays);
+            scope.scope_id = scope_id;
+            scope.route_kind = 1;
+            scope.group_id = Some(vec![group]);
+            scope.transport_group_id = Some([group; 32]);
+            scope.required_endpoints = scope.admitted_endpoints.clone();
+            scope
+        };
+        let now = std::cell::Cell::new(1_000_u64);
+        // One pass over `scopes`: the listed scopes get the listed progress
+        // and certificates.
+        type Progress<'a> = &'a [(u64, RecoveryPassProgress, Vec<RecoveryEndpointCheckpoint>)];
+        let pass = |scopes: &[RecoveryScopePlan], progress: Progress| {
+            let fence = store.recovery_revision_fence().unwrap();
+            now.set(now.get() + 100_000);
+            let attempt = store
+                .reserve_recovery_attempt(&fence, now.get(), 1_000, false)
+                .unwrap()
+                .expect("a retryable pass is reserved")
+                .attempt_serial;
+            let tokens = store
+                .install_recovery_scope_plan(&fence, attempt, loss, scopes)
+                .unwrap()
+                .unwrap();
+            let checkpoints = progress
+                .iter()
+                .map(|(scope, _, evidence)| checkpoint(&tokens[*scope as usize], evidence.clone()))
+                .collect::<Vec<_>>();
+            let passes = progress
+                .iter()
+                .map(|(scope, progress, _)| (*scope, *progress))
+                .collect::<Vec<_>>();
+            store
+                .checkpoint_recovery_comparison(
+                    &fence,
+                    attempt,
+                    loss,
+                    &checkpoints,
+                    RecoveryEligibility::Retry,
+                    &passes,
+                )
+                .unwrap();
+        };
+        let scopes = |store: &SqliteAccountStorage| store.recovery_scope_snapshots(loss).unwrap();
+        use RecoveryPassProgress::{Progressed, Quiet};
+
+        // Scope 0 certifies; scopes 1 and 2 answer quietly twice.
+        let before = [
+            route(0, 1, &["a"]),
+            route(1, 2, &["a"]),
+            route(2, 3, &["a"]),
+        ];
+        pass(
+            &before,
+            &[
+                (0, Progressed, vec![covered("a")]),
+                (1, Quiet, Vec::new()),
+                (2, Quiet, Vec::new()),
+            ],
+        );
+        pass(&before, &[(1, Quiet, Vec::new()), (2, Quiet, Vec::new())]);
+        let revision = store.recovery_revision_fence().unwrap().obligations[0].1;
+
+        // A group create adds route 3; route 2's required relays change.
+        assert!(store.observe_recovery_route_snapshot([2; 32]).unwrap());
+        assert_eq!(
+            store.recovery_revision_fence().unwrap().obligations[0].1,
+            revision,
+            "a route change is not new evidence"
+        );
+        let after = [
+            route(0, 1, &["a"]),
+            route(1, 2, &["a"]),
+            route(2, 3, &["b"]),
+            route(3, 4, &["a"]),
+        ];
+        pass(&after, &[]);
+        let stored = scopes(&store);
+        assert!(
+            stored[0]
+                .checkpoints
+                .iter()
+                .any(|c| c.outcome == RecoveryScopeOutcome::Covered),
+            "an unchanged certified scope keeps its certificate"
+        );
+        assert_eq!(
+            stored[1].quiet_passes, 2,
+            "an unchanged scope keeps its streak"
+        );
+        assert_eq!(
+            stored[2].quiet_passes, 0,
+            "changed required relays start over"
+        );
+        assert_eq!(stored[3].quiet_passes, 0, "a new route starts fresh");
     }
 
     /// A certified explicit window has nothing left to search, so it neither
@@ -2697,7 +2806,10 @@ mod tests {
         assert!(store.observe_recovery_route_snapshot([2; 32]).unwrap());
         let after = store.recovery_revision_fence().unwrap();
         assert_eq!(after.route_revision, before.route_revision + 1);
-        assert!(after.obligations[0].1 > before.obligations[0].1);
+        assert_eq!(
+            after.obligations, before.obligations,
+            "a route change rechecks demand but is not new evidence"
+        );
         assert_eq!(store.recovery_retry_state().unwrap(), retry);
         assert_eq!(
             store.recovery_eligible_revision_fence(false).unwrap(),

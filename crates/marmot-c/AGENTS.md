@@ -1,6 +1,7 @@
 # AGENTS.md - marmot-c
 
-C ABI bindings for the Marmot app runtime. Read `README.md` first for build, linking, and packaging.
+C ABI bindings for the Marmot app runtime. For build, linking, ownership rules and per-feature C notes see `README.md`;
+for every header function see `API-REFERENCE.md`. Do not restate either here.
 
 ## Scope
 
@@ -38,6 +39,12 @@ across the boundary. That deserves its own focused design + tests rather than a 
   are hand-written.
 - `src/memory.rs` is the only allocation chokepoint; the `alloc-audit` test feature counts live allocations so tests
   can prove deep-free completeness.
+- `src/status.rs` owns `MarmotStatus` and the thread-local last-error channel. `src/secret_store.rs` (host secret-store
+  callback vtable), `src/publisher.rs` (agent publisher handles) and `src/attachment_{access,controls,history}.rs`
+  hold hand-written surfaces outside `commands.rs`. `src/subscriptions/` holds the chat-window,
+  conversation-window and attachment-control handles.
+- `tests/` covers out-pointer preflight, publisher, secret-store client and identity/pseudonym behavior;
+  `examples/smoke.c` is the C-side smoke driven by `c-smoke.sh`.
 
 ## Invariants
 
@@ -79,6 +86,11 @@ across the boundary. That deserves its own focused design + tests rather than a 
   `just binding-docs-gate` after edits; it also runs the companion regression tests. Prose needs manual review.
 - Link shared runtime concepts and API-selection guidance from `marmot-uniffi/README.md`; describe
   C-only differences explicitly (blocking calls, timeouts, callbacks, deep frees, unsupported signer APIs).
+  Do not copy shared contract prose into the C README.
+- README feature notes describe current behavior: no "now"/"this change" narration or consumer-adoption issue links.
+  The generic "regenerate `marmot.h` and use the matching library" rule lives once in README's Binary compatibility
+  section; keep only feature-specific layout changes inline. Add each new `##` section to the Contents list.
+  `.github/workflows/c-bindings.yml` ships this README in the release zip.
 - Update the companion `docs/integration/<version>.md` for each release beginning with 0.10.2.
   Record layout, status/enum, ownership and callback changes require client adoption instructions,
   not just a changelog entry. Follow `release.md#release-documentation` and keep the matching
@@ -90,4 +102,6 @@ across the boundary. That deserves its own focused design + tests rather than a 
 cargo test -p marmot-c --features alloc-audit
 just c-header && git diff --exit-code crates/marmot-c/include/marmot.h
 just c-smoke   # compiles and runs examples/smoke.c (valgrind when available)
+just c-parity-gate
+just binding-docs-gate
 ```

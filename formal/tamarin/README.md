@@ -1,6 +1,23 @@
 # Tamarin Convergence Model
 
-This directory contains the first formal model for Marmot distributed convergence.
+Symbolic Tamarin model of Marmot distributed convergence. It proves that honest clients holding the same valid
+candidate set and policy select the same branch, and that policy load, retained-anchor replay, proposal, delivery, and
+application-output handoffs follow the engine's rules. Read it to learn what is proved, how to run the prover, and
+how each lemma maps to Rust tests. Temporal and liveness claims live in the TLA+ model under
+[`../liveness`](../liveness/).
+
+## Contents
+
+- [Scope](#scope)
+- [Targets](#targets)
+- [Install](#install)
+- [Modeling Notes](#modeling-notes)
+- [How Proofs Map To Tests](#how-proofs-map-to-tests)
+- [Proof Inventory](#proof-inventory)
+- [Policy Cases](#policy-cases)
+- [Next Refinements](#next-refinements)
+
+## Scope
 
 The v0 model is intentionally abstract. It does not model MLS internals, transport timestamps, relay receipts, Nostr
 event ids, or OpenMLS serialization. It models only the convergence boundary:
@@ -180,21 +197,6 @@ structures, OpenMLS objects, storage, and scenario harnesses.
 If behavior is outside the model, Tamarin says nothing about it. That behavior can still be specified in prose and
 tested in Rust, but it has no formal proof until the model includes it.
 
-## Proof Inventory
-
-Every v0 lemma belongs to exactly one verification category:
-
-| Category | Lemmas |
-| --- | --- |
-| Agreement and selector safety | `same_input_set_converges`, `selected_branches_are_eligible`, `selected_branches_require_loaded_policy`, `effective_depth_selection_requires_score_order`, `quorum_tie_selection_requires_quorum_and_bound`, `witness_score_selection_requires_score_order`, `priority_tie_selection_requires_preceding_equality_and_lower_priority`, `committer_tie_selection_requires_preceding_equality_and_lower_committer`, `digest_tie_selection_requires_lower_digest`, `opponent_ineligible_selection_requires_stale_opponent`, `duplicate_witness_dedupe_selection_uses_distinct_sender_epochs`, `three_branch_selection_requires_dominance`, `generated_bounded_case_selection_matches_expected_reason`, `no_conflicting_better_for_same_run` |
-| Lifecycle and application-output safety | `applied_branch_requires_prior_selection`, `accepted_app_output_requires_applied_branch`, `application_visible_requires_accepted_app_output`, `losing_app_invalidation_requires_applied_different_branch`, `invalidated_apps_are_never_application_visible`, `app_invalidation_disposition_requires_invalidation`, `invalidated_dispositions_are_never_application_visible`, `accepted_app_output_once_per_client_app`, `app_invalidation_disposition_once_per_app`, `welcome_acceptance_requires_matching_commit_context`, `commit_after_welcome_requires_prior_welcome`, `welcome_replayed_commit_does_not_select_branch`, `welcome_replayed_commit_does_not_detect_fork`, `fork_detection_requires_prior_local_commit`, `accepted_proposal_requires_applied_consuming_branch`, `deferred_proposal_requires_applied_different_branch`, `deferred_proposal_requires_eligible_losing_branch`, `dropped_proposal_requires_applied_ineligible_branch`, `dropped_proposals_are_never_accepted`, `queued_outbound_requires_syncing`, `released_queued_outbound_requires_prior_queue`, `syncing_outbound_is_never_published_directly`, `settled_publish_requires_lifecycle_stable_state` |
-| Delivery safety | `released_delayed_input_requires_prior_delay`, `delivery_pending_input_requires_delivery_observation`, `delivery_pending_input_is_deduplicated`, `duplicate_delivery_requires_prior_pending_input`, `delivery_reordered_clients_select_same_branch`, `delivery_losing_app_never_application_visible` |
-| Retained-history safety | `computed_anchor_requires_loaded_policy_rewind`, `retained_anchor_replay_requires_available_anchor_and_policy`, `missing_retained_anchor_requires_missing_snapshot_and_policy`, `missing_retained_anchor_does_not_apply`, `beyond_anchor_invalidation_requires_source_before_anchor`, `beyond_anchor_invalidated_commits_are_never_selected`, `beyond_anchor_invalidated_commits_are_never_applied`, `stale_rewind_is_derived_from_anchor_and_distance`, `stale_branches_are_never_selected`, `late_withheld_rejection_requires_publish_after_anchor_and_stale` |
-| Executability and bounded-case coverage | `quorum_override_executable`, `raw_depth_lead_executable`, `witness_score_tie_executable`, `digest_tie_executable`, `stale_rewind_executable`, `duplicate_witness_dedupe_executable`, `outbound_queue_release_executable`, `outbound_settled_publish_executable`, `three_branch_permutation_executable`, `withheld_published_after_anchor_executable`, `retained_anchor_within_horizon_executable`, `missing_retained_anchor_executable`, `beyond_anchor_invalidated_executable`, `commit_application_app_output_executable`, `welcome_before_commit_handoff_executable`, `own_commit_fork_handoff_executable`, `proposal_canonical_consumption_executable`, `delivery_order_robustness_executable`, `generated_quorum_override_executable`, `generated_quorum_capped_by_depth_executable`, `generated_depth_priority_executable`, `generated_witness_priority_executable`, `generated_priority_tie_executable`, `generated_committer_tie_executable`, `generated_digest_priority_executable` |
-
-The inventory classifies proof scope; it is not a coverage claim for clocks, restart, durable pass generations,
-fairness, resource exhaustion, or unbounded self-update traffic.
-
 - **Tamarin artifact:** `Init_*` rule
   - **What it means:** A named abstract scenario.
   - **Rust counterpart:** A named fixture or setup in an integration/scenario test.
@@ -234,20 +236,6 @@ fairness, resource exhaustion, or unbounded self-update traffic.
 Keep names aligned across the proof and tests. If the Tamarin scenario is `quorum_override`, the Rust test or fixture
 should use the same phrase. Grep should connect the formal model, the unit/property test, and the integration scenario.
 
-For bounded policy seeds, update `policy_cases.json` first. Then check both consumers:
-
-```sh
-cargo test -p cgka-conformance-simulator --test generated_policy_cases
-cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
-```
-
-The six-rule adjacency cases stay grep-aligned across both consumers:
-
-- `generated_priority_tie` / `generated_priority_tie_executable` /
-  `generated_priority_tie_matches_selector_before_digest`
-- `generated_committer_tie` / `generated_committer_tie_executable` /
-  `generated_committer_tie_matches_selector_before_digest`
-
 Use the executable lemmas as a fixture catalog. Each one says "this situation exists and the system must handle it." Use
 the universal lemmas as property-test targets. For example, `same_input_set_converges` maps to generated branch sets fed
 through the real selector from different client enumeration orders.
@@ -260,7 +248,35 @@ The model has done its job for this subsystem when the lemmas answer the converg
 assumptions. If someone asks what happens in a case and there is no lemma, scenario, or explicit assumption to point at,
 that is a model gap.
 
-Next refinements:
+## Proof Inventory
+
+Every v0 lemma belongs to exactly one verification category:
+
+| Category | Lemmas |
+| --- | --- |
+| Agreement and selector safety | `same_input_set_converges`, `selected_branches_are_eligible`, `selected_branches_require_loaded_policy`, `effective_depth_selection_requires_score_order`, `quorum_tie_selection_requires_quorum_and_bound`, `witness_score_selection_requires_score_order`, `priority_tie_selection_requires_preceding_equality_and_lower_priority`, `committer_tie_selection_requires_preceding_equality_and_lower_committer`, `digest_tie_selection_requires_lower_digest`, `opponent_ineligible_selection_requires_stale_opponent`, `duplicate_witness_dedupe_selection_uses_distinct_sender_epochs`, `three_branch_selection_requires_dominance`, `generated_bounded_case_selection_matches_expected_reason`, `no_conflicting_better_for_same_run` |
+| Lifecycle and application-output safety | `applied_branch_requires_prior_selection`, `accepted_app_output_requires_applied_branch`, `application_visible_requires_accepted_app_output`, `losing_app_invalidation_requires_applied_different_branch`, `invalidated_apps_are_never_application_visible`, `app_invalidation_disposition_requires_invalidation`, `invalidated_dispositions_are_never_application_visible`, `accepted_app_output_once_per_client_app`, `app_invalidation_disposition_once_per_app`, `welcome_acceptance_requires_matching_commit_context`, `commit_after_welcome_requires_prior_welcome`, `welcome_replayed_commit_does_not_select_branch`, `welcome_replayed_commit_does_not_detect_fork`, `fork_detection_requires_prior_local_commit`, `accepted_proposal_requires_applied_consuming_branch`, `deferred_proposal_requires_applied_different_branch`, `deferred_proposal_requires_eligible_losing_branch`, `dropped_proposal_requires_applied_ineligible_branch`, `dropped_proposals_are_never_accepted`, `queued_outbound_requires_syncing`, `released_queued_outbound_requires_prior_queue`, `syncing_outbound_is_never_published_directly`, `settled_publish_requires_lifecycle_stable_state` |
+| Delivery safety | `released_delayed_input_requires_prior_delay`, `delivery_pending_input_requires_delivery_observation`, `delivery_pending_input_is_deduplicated`, `duplicate_delivery_requires_prior_pending_input`, `delivery_reordered_clients_select_same_branch`, `delivery_losing_app_never_application_visible` |
+| Retained-history safety | `computed_anchor_requires_loaded_policy_rewind`, `retained_anchor_replay_requires_available_anchor_and_policy`, `missing_retained_anchor_requires_missing_snapshot_and_policy`, `missing_retained_anchor_does_not_apply`, `beyond_anchor_invalidation_requires_source_before_anchor`, `beyond_anchor_invalidated_commits_are_never_selected`, `beyond_anchor_invalidated_commits_are_never_applied`, `stale_rewind_is_derived_from_anchor_and_distance`, `stale_branches_are_never_selected`, `late_withheld_rejection_requires_publish_after_anchor_and_stale` |
+| Executability and bounded-case coverage | `quorum_override_executable`, `raw_depth_lead_executable`, `witness_score_tie_executable`, `digest_tie_executable`, `stale_rewind_executable`, `duplicate_witness_dedupe_executable`, `outbound_queue_release_executable`, `outbound_settled_publish_executable`, `three_branch_permutation_executable`, `withheld_published_after_anchor_executable`, `retained_anchor_within_horizon_executable`, `missing_retained_anchor_executable`, `beyond_anchor_invalidated_executable`, `commit_application_app_output_executable`, `welcome_before_commit_handoff_executable`, `own_commit_fork_handoff_executable`, `proposal_canonical_consumption_executable`, `delivery_order_robustness_executable`, `generated_quorum_override_executable`, `generated_quorum_capped_by_depth_executable`, `generated_depth_priority_executable`, `generated_witness_priority_executable`, `generated_priority_tie_executable`, `generated_committer_tie_executable`, `generated_digest_priority_executable` |
+
+The inventory classifies proof scope; it is not a coverage claim for clocks, restart, durable pass generations,
+fairness, resource exhaustion, or unbounded self-update traffic.
+
+## Policy Cases
+
+Bounded policy seeds live in `policy_cases.json`. `just policy-casegen` regenerates the Tamarin seed rules from it, and
+the `generated_policy_cases` and `policy_case_tamarin_drift` simulator tests check that the Rust consumer and the committed
+model stay in step. The edit-and-verify sequence is in [`AGENTS.md`](AGENTS.md).
+
+The six-rule adjacency cases stay grep-aligned across both consumers:
+
+- `generated_priority_tie` / `generated_priority_tie_executable` /
+  `generated_priority_tie_matches_selector_before_digest`
+- `generated_committer_tie` / `generated_committer_tie_executable` /
+  `generated_committer_tie_matches_selector_before_digest`
+
+## Next Refinements
 
 1. Generate broader bounded scenario families from the Rust policy model.
 2. Replace symbolic score classes with generated bounded numeric families.

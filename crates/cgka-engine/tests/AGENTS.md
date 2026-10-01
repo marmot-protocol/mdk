@@ -24,8 +24,8 @@ cargo insta review
 ## Tier 2 — Engine integration tests (this directory)
 
 **What they prove:** real OpenMLS-backed engine behavior across one or more engine instances using a pass-through
-`MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>`; `sqlite_storage.rs` keeps the encrypted file-backed
-backend on the same rail.
+`MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>`; `sqlite_storage.rs` keeps the encrypted
+file-backed backend on the same rail.
 
 **Transport visibility.** The pass-through `MockPeeler` gives every test client perfect cross-branch visibility, which
 production does not have: a real transport seals a group message under the sender's current-epoch exporter secret and
@@ -34,26 +34,30 @@ carries no epoch hint, so a device that never entered that epoch state reads opa
 (`tests/epoch_sealed_transport.rs` owns the resulting behaviors). Reach for it whenever a scenario turns on branch- or
 epoch-scoped readability; `MockPeeler` stays right for everything else.
 
+- **File:** `application_data_wire.rs`
+  - **Owns:** OpenMLS integration-contract tests for the MLS application-data carriers Marmot uses (pins fork codec
+    behavior the engine relies on)
+
 - **File:** `scaffold.rs`
   - **Owns:** `EngineBuilder` validation; `Box<dyn CgkaEngine>` witness
 
 - **File:** `group_creation.rs`
-  - **Owns:** Phase 4.2 + 4.8 — fresh KeyPackage, create, join welcome, confirm
+  - **Owns:** Fresh KeyPackage, create, join welcome, confirm
 
 - **File:** `group_context_view.rs`
   - **Owns:** `GroupContextView` exporter-secret length contract
 
 - **File:** `ingest.rs`
-  - **Owns:** Phase 4.3 — every `StaleReason` variant; send(AppMessage) round-trip
+  - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip
 
 - **File:** `invite_leave.rs`
-  - **Owns:** Phase 4.3b + 4.11 — invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
+  - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
 
 - **File:** `capabilities.rs`
-  - **Owns:** Phase 4.6/4.7 + 5.4 — `feature_status`, capability cache, capability matrix
+  - **Owns:** `feature_status`, capability cache, capability matrix
 
 - **File:** `fork_detection.rs`
-  - **Owns:** same-epoch fork resolution through the unified distributed-convergence route (committer, observer,
+  - **Owns:** Same-epoch fork resolution through the unified distributed-convergence route (committer, observer,
     and restarted-committer shapes) plus the missing-anchor fail-closed halt
 
 - **File:** `deferred_peel_lifecycle.rs`
@@ -76,7 +80,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     matrix enables that feature explicitly for settlement/rewind fixtures.
 
 - **File:** `mip03_guards.rs`
-  - **Owns:** Phase 4.9 — committer-MUST-NOT-be-leaver, admin-not-last, admin-self-remove
+  - **Owns:** Committer-MUST-NOT-be-leaver, admin-not-last, admin-self-remove
 
 - **File:** `publish_lifecycle.rs`
   - **Owns:** Explicit publish-before-apply lifecycle for local group evolution
@@ -134,17 +138,18 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 ```sh
 cargo test -p cgka-engine
+cargo test -p cgka-engine --features test-policy-overrides   # suites that install custom policies
 ```
 
-Note: the default build pins the v1 convergence policy; suites that install custom policies need
-`cargo test -p cgka-engine --features test-policy-overrides` (CI runs the workspace with
-`wn-cli/test-policy-overrides,cgka-engine/test-crash-hooks`, see `justfile`).
+The default build pins the v1 convergence policy. CI runs the workspace with the `test-features` list in the root
+`Justfile` (`wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks`).
 
 ## Benchmarks
 
-`benches/group_lifecycle.rs` (criterion) times the group-creation and welcome-join flows over
-in-memory SQLite with a pass-through peeler: `create_group` at 1/8/32 invitees, `join_welcome` at
-1/8/32 stored key packages, and `join_welcome_large_group` for 32-member joins. Run:
+`benches/group_lifecycle.rs` (criterion) measures engine CPU + storage cost over in-memory SQLite with a pass-through
+peeler. Groups: `retained_anchor_snapshot`, `create_group` (1/8/32 invitees, retention on/off), `join_welcome`,
+`join_welcome_large_group`, `send_app_message`, `deferred_outbound_preflight`, `ingest_app_message`,
+`rejoin_welcome_with_history`, `canonical_advance_with_history`. Run:
 
 ```sh
 cargo bench -p cgka-engine --bench group_lifecycle
@@ -153,58 +158,16 @@ cargo bench -p cgka-engine --bench group_lifecycle
 These benches are the measurement rail for engine-lifecycle performance work; extend them when a
 change claims a lifecycle speedup.
 
-## Tier 3 — Harness scenarios + proptest
+## Tier 3 — Simulator scenarios + proptest
 
 **Where:** `crates/cgka-conformance-simulator/tests/`. Multi-client convergence under a deterministic in-memory bus.
-
-- **File:** `canonical_scenarios.rs`
-  - **Owns:** Scripted + portable harness scenarios: 3-client happy path, welcome-before-commit, SelfRemove convergence,
-    deliberate fork with convergence resolution, `ScenarioSpec`, vector fixtures, scheduled faults, generated-family
-    reports
-
-- **File:** `proptest_invariants.rs`
-  - **Owns:** Property tests for selector order, canonicalization, capability negotiation, lifecycle/restart behavior,
-    generated send/leave histories, and delivery-profile convergence
-
-- **File:** `candidate_state_graph.rs`
-  - **Owns:** Candidate-state-graph branch-selection assertions
-
-- **File:** `canonicalization_contract.rs`
-  - **Owns:** Executable canonicalization-contract assertions (quiescence, resolving/settled status)
-
-- **File:** `generated_policy_cases.rs`
-  - **Owns:** Generated bounded convergence-policy cases shared with the Tamarin model
-
-- **File:** `openmls_replay_probe.rs`
-  - **Owns:** OpenMLS replay-probe behavior
-
-- **File:** `report_runner.rs`
-  - **Owns:** Generated-report runner coverage
-
-- **File:** `sqlite_storage_modes.rs`
-  - **Owns:** Harness storage-mode coverage over temp file-backed SQLite
-
-- **File:** `tracing_audit.rs`
-  - **Owns:** Repo-wide tracing/logging privacy-invariant enforcement
-
-- **File:** `vector_artifacts.rs`
-  - **Owns:** Vector manifest and byte-fixture well-formedness checks
-
-- **File:** `agent_text_stream_vectors.rs`
-  - **Owns:** Byte-level conformance vectors for the agent text stream QUIC feature: `AgentTextStreamKeyContextV1`
-    encoding, HKDF-SHA256 record key / nonce derivation, record AEAD AAD, transcript hashes, and the
-    `QuicBrokerControlEnvelopeV1` envelope
-
-Quick CI run:
+File map: [`../../cgka-conformance-simulator/tests/AGENTS.md`](../../cgka-conformance-simulator/tests/AGENTS.md).
+Core files: `canonical_scenarios.rs` (scripted + portable scenarios, `ScenarioSpec`, vector fixtures, scheduled
+faults), `proptest_invariants.rs` (property tests), `canonicalization_contract.rs`, `candidate_state_graph.rs`.
 
 ```sh
-cargo test -p cgka-conformance-simulator
-```
-
-Slower pre-release run:
-
-```sh
-cargo test -p cgka-conformance-simulator --features conformance-slow
+cargo test -p cgka-conformance-simulator                            # quick
+cargo test -p cgka-conformance-simulator --features conformance-slow # pre-release
 ```
 
 ## Workspace-wide
@@ -213,7 +176,7 @@ cargo test -p cgka-conformance-simulator --features conformance-slow
 cargo test --workspace
 ```
 
-Run before checkpointing broad storage/engine changes; the exact count changes as backend coverage grows.
+Run before checkpointing broad storage/engine changes.
 
 ## When adding a new test
 
@@ -232,11 +195,9 @@ Run before checkpointing broad storage/engine changes; the exact count changes a
   `crates/cgka-conformance-simulator/vectors/`, and use `cgka-conformance-simulator-report` for generated report
   artifacts.
 
-## Why most engine modules have no in-crate `#[cfg(test)]` modules
+## In-crate unit tests
 
-Testing engine behavior requires an `Engine<S>` instance which requires a storage backend, so engine-behavior assertions
-go through `tests/*.rs` integration files, using `storage-sqlite` in-memory mode unless the test explicitly needs
-encrypted file-backed persistence. The exceptions are `src/identity.rs`, `src/engine_metrics.rs`, `src/epoch_manager.rs`,
-`src/app_components.rs`, `src/canonicalization.rs`, and `src/group_state_changes.rs`, which carry
-small in-crate `#[cfg(test)]` modules for pure-data logic (state transitions, diff helpers, policy ordering) that needs
-no `Engine` instance.
+Engine-behavior assertions need an `Engine<S>` and a storage backend, so they live in `tests/*.rs` using
+`storage-sqlite` in-memory mode (encrypted file-backed only when the test needs it). Pure-data logic (state
+transitions, diff helpers, policy ordering, codecs, caches) uses in-crate `#[cfg(test)]` modules; `src/` has many, and
+`src/openmls_projection/tests/` and `src/message_processor/tests/` hold `--lib` replay and measurement tests.

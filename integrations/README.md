@@ -1,7 +1,21 @@
 # Marmot Integrations
 
-This directory contains the connectors that let White Noise users chat with
-existing agent runtimes through the local `wn-agent` service.
+Connectors that let you chat with an agent runtime you already run (Hermes, OpenClaw, Claude Code, Codex, OpenCode,
+or Pi) from White Noise, over end-to-end encrypted Marmot groups. Each connector runs next to the local `wn-agent`
+service on your Mac or Linux machine. Start with [Get Started](#get-started-white-noise--agents); the later sections
+explain topology, identities, and sharing for operators.
+
+## Contents
+
+- [Get Started: White Noise + Agents](#get-started-white-noise--agents)
+- [How The Connectors Fit Together](#how-the-connectors-fit-together)
+- [Default Install Topology](#default-install-topology)
+- [Identity Model](#identity-model)
+- [What Is Shared](#what-is-shared)
+- [What Is Separate](#what-is-separate)
+- [Allowlist Behavior](#allowlist-behavior)
+- [Sharing Options](#sharing-options)
+- [Development Paths](#development-paths)
 
 ## Get Started: White Noise + Agents
 
@@ -123,7 +137,7 @@ install_verified "$base_url/install-pi-marmot.sh" \
 
 ### Finish In White Noise
 
-Release 0.9.21 records the new agent's `npub` and `nprofile` in the
+Each installer records the new agent's `npub` and `nprofile` in the
 `bootstrap.json` path printed at completion. Display them with:
 
 ```sh
@@ -198,10 +212,6 @@ state, Nostr transport, local account storage, relay access, QUIC preview
 transport, or durable encrypted sends. `wn-agent` owns those concerns and exposes
 the local `marmot.agent-control.v2` newline-delimited JSON protocol over a Unix
 socket.
-
-Live-preview clients retain the v2 `stream_capability` returned by `stream_begin` only for the life of that preview and
-present it on every later stream operation. They also reuse one stable envelope request id when retrying a timed-out
-`stream_begin`; capabilities and control bearer tokens must never appear in logs.
 
 ## Default Install Topology
 

@@ -926,8 +926,8 @@ mod tests {
         assert_eq!(registry.index_for(&a), first, "stable across calls");
     }
 
-    // Freeze the inactive v5 contract's endpoint inputs against the real owner parser.
-    // This is test-only: no v5 emission, reference export or new dependency is enabled.
+    // Freeze the v5 contract's endpoint inputs against the real owner parser.
+    // The test adds no emission path, reference export or dependency.
     #[test]
     fn audit_v5_endpoint_vectors_match_owner_normalization() {
         let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!(

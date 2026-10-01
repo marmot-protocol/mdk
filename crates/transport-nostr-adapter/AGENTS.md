@@ -1,6 +1,7 @@
 # AGENTS.md - crates/transport-nostr-adapter
 
-Agent-facing map for the Nostr transport adapter crate.
+Agent-facing map for the Nostr transport adapter crate. Read [`README.md`](README.md) for the human overview,
+recovery-session contract, and reconciliation budgets.
 
 ## Scope
 
@@ -29,6 +30,8 @@ for reconnect/backoff and relay status mechanics.
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
 | `tests/acquisition_contract.rs` | Request validation and optional-boundary shape tests. |
+| `tests/publish_accounting.rs` | `sdk`-gated direct-adapter publish admission, classification, and cancellation tests. |
+| `tests/selective_history_acquisition_tests.rs` | `sdk`-gated bounded history acquisition and reconciliation-cursor tests. |
 
 ## Invariants
 
@@ -86,6 +89,12 @@ for reconnect/backoff and relay status mechanics.
   the current one and a later distinct one is retained and backfilled in full. Reissue a live retained REQ only when
   its floor widens (`AccountRoutes::group_since`): a reissue replaces the live REQ under the same id, so a narrower
   one could cut off history it is still returning.
+- Recovery maintenance ids include the owner's durable attempt serial. A duplicate install joins only a live session;
+  after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.
+  Never clear `maintenance_attempt_high_water` while the adapter lives: CLOSE and route removal cannot recall late EOSE.
+  Only recovery installs use the scoped client API; preserve the legacy maintenance subscribe/cleanup path.
+- Use Marmot kind `30443` for KeyPackages; never substitute deprecated NIP-104 key package kinds. There is no dedicated
+  KeyPackage relay list; KeyPackages go to the NIP-65 kind `10002` relays.
 
 ## Verification
 
@@ -93,8 +102,3 @@ for reconnect/backoff and relay status mechanics.
 cargo test -p transport-nostr-adapter
 cargo test -p transport-nostr-adapter --features sdk
 ```
-
-- Recovery maintenance ids include the owner's durable attempt serial. A duplicate install joins only a live session;
-  after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.
-  Never clear `maintenance_attempt_high_water` while the adapter lives: CLOSE and route removal cannot recall late EOSE.
-  Only recovery installs use the scoped client API; preserve the legacy maintenance subscribe/cleanup path.

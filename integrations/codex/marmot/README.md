@@ -15,6 +15,16 @@ It uses Codex's documented non-interactive JSONL interface: a new group starts
 with `codex exec --json -`, and later messages resume the group's Codex thread
 with `codex exec resume --json <thread-id> -`.
 
+## Contents
+
+- [Install (Codex Already Installed)](#install-codex-already-installed)
+- [Manual Setup](#manual-setup)
+- [Chat Commands](#chat-commands)
+- [Configuration](#configuration)
+- [Inbound attachments](#inbound-attachments)
+- [Security Notes](#security-notes)
+- [Development](#development)
+
 ## Install (Codex Already Installed)
 
 Versioned `wn-agent-v*` releases publish `wn-agent`, `wn-codex`, checksums, and
@@ -60,17 +70,13 @@ install_verified "$base_url/install-codex-marmot.sh" \
   --yes --allow-welcomer npub1...
 ```
 
-The immutable release also publishes `install-codex-marmot.sh.sha256` for
-independent verification of the installer before execution.
-
 The default install uses its own `~/.marmot-agents/codex` identity and services,
 so it does not share prompts or replies with installed OpenCode or Pi harnesses.
 It installs `wn-agent` and `wn-codex` in `~/.local/bin`, writes a private
 `~/.marmot-agents/codex/dev/wn-codex.env`, and starts `wn-agent-codex` and
 `wn-codex` same-user services where supported.
 
-Use a versioned `wn-agent-v<version>` release URL for a pinned install. Report
-all installed versions when filing a connector bug:
+Report all installed versions when filing a connector bug:
 
 ```sh
 wn-agent --version
@@ -174,8 +180,6 @@ text is returned to Marmot.
 
 All attachments from one Marmot message are downloaded in message order, copied into one owner-only temporary batch, and passed to one Codex turn. The connector revalidates every staged file immediately before starting Codex and supplies an ordered JSON manifest in the prompt. The manifest marks attachment content and metadata as untrusted data and gives Codex the private path, connector-sanitized staged file name, declared media type, byte size, and source ordinal. Delivery is selected from file bytes, never from sender-controlled MIME strings or extensions:
 
-The ordinary 30-second control timeout applies to socket connection and request writing, but not to waiting for a media download: that response gets at least sixteen minutes. This permits the runtime's full fifteen-minute acquisition plus local validation without making unrelated control calls hang for minutes. A failed download still rejects the whole batch before Codex starts; this timeout change does not weaken file or ciphertext validation.
-
 | File class | Byte-level recognition | Codex delivery |
 | --- | --- | --- |
 | Native images | PNG, JPEG, GIF, or WebP signature | Ordered native `--image` argument plus staged-file manifest entry |
@@ -189,12 +193,9 @@ The compatibility pin for this matrix is Codex CLI 0.155.1. Its `codex exec` sur
 
 The same delivery contract applies to new and resumed threads. Missing, size-changed, unreadable, non-regular, unsupported-format, count-limit, or aggregate-size failures reject the complete batch before Codex starts; no attachment is silently dropped. Recognition is capability routing rather than a content-security boundary: short magic signatures can be spoofed, and attachment contents remain untrusted.
 
-Batch copies remain available for the complete turn and are removed after success, failure, timeout, or cancellation. Stale batch directories are reconciled when the connector starts. The staging directory is owner-only and each file is owner-readable only. On Unix, immediate pre-spawn validation refuses a symlink final component and performs an exact-size bounded read through the opened file descriptor; the backend necessarily receives a path, so other processes running as the connector's own operating-system user remain inside the trust boundary.
+The ordinary 30-second control timeout applies to socket connection and request writing, but not to waiting for a media download: that response gets at least sixteen minutes. This permits the runtime's full fifteen-minute acquisition plus local validation without making unrelated control calls hang for minutes. A failed download still rejects the whole batch before Codex starts; the longer wait does not weaken file or ciphertext validation.
 
-The optional bearer token grants the complete `wn-agent` control API for every
-account in its home; the sender allowlist does not narrow that authority. Use a
-separate connector home, socket, token, and account for a separate trust
-boundary.
+Batch copies remain available for the complete turn and are removed after success, failure, timeout, or cancellation. Stale batch directories are reconciled when the connector starts. The staging directory is owner-only and each file is owner-readable only. On Unix, immediate pre-spawn validation refuses a symlink final component and performs an exact-size bounded read through the opened file descriptor; the backend necessarily receives a path, so other processes running as the connector's own operating-system user remain inside the trust boundary.
 
 ## Security Notes
 
@@ -209,6 +210,10 @@ boundary.
 - Logs exclude identifiers, paths, prompts, Codex output, relay URLs, pubkeys,
   ciphertext, plaintext, and key material.
 - Connector state is created with owner-only permissions by the shared harness.
+- The optional control-socket bearer token grants the complete `wn-agent` control
+  API for every account in its home; the sender allowlist does not narrow that
+  authority. Use a separate connector home, socket, token, and account for a
+  separate trust boundary.
 
 ## Development
 

@@ -4,17 +4,11 @@ Agent-facing map for the Marmot account orchestration crate.
 
 ## Scope
 
-This crate owns the account/session orchestration layer around:
+Owns the account/session orchestration layer: account home layout, local account records and signing-key storage,
+`AccountDeviceSession` activation over a pluggable `TransportAdapter`, transport routing policy, KeyPackage publication,
+and publish confirmation/rollback. For the human overview see [`README.md`](README.md).
 
-- account home layout;
-- local account records and signing-key storage;
-- `AccountDeviceSession`;
-- a pluggable `TransportAdapter`;
-- transport routing policy;
-- key-package publication;
-- publish confirmation and rollback.
-
-It should not own MLS internals, transport event parsing, SQLCipher key derivation, UI projection, notifications, real
+It must not own MLS internals, transport event parsing, SQLCipher key derivation, UI projection, notifications, real
 relay auth, or transport-specific relay discovery.
 
 ## Layout
@@ -24,6 +18,8 @@ relay auth, or transport-specific relay discovery.
 
 - `error.rs` — `AccountError`/`AccountHomeError` enums and the `AccountResult`/`AccountHomeResult` aliases.
 - `home.rs` — `AccountHome` and `AccountSummary`; owns the account-record layout and signing-key lifecycle.
+- `nip49_export.rs` — NIP-49 `ncryptsec` export policy (fixed scrypt cost, non-empty passphrase, key-security byte);
+  crypto is delegated to the upstream `nostr` crate. Do not hand-roll NIP-49 here.
 - `secret_store.rs` — `AccountSecretStore` trait with `LocalFileSecretStore` and `KeychainSecretStore`.
 - `keyring.rs` — platform keyring entry construction, iOS service versioning and secret writes, store init (per-OS
   `#[cfg]` cascade), and keyring-error mapping.
@@ -31,7 +27,13 @@ relay auth, or transport-specific relay discovery.
 - `key_package.rs` — `KeyPackagePublisher` trait, `KeyPackagePublication`, and `NoopKeyPackagePublisher`.
 - `routing.rs` — `TransportRoutingPolicy` trait, `TransportRoutingError`, and `StaticTransportRouting`.
 - `runtime.rs` — `AccountDeviceRuntime` plus its effect aggregates (`AccountDeviceEffects`, `AccountIngestEffects`,
-  `PublishFailure`, `PendingResolution`).
+  `PublishFailure`, `PendingResolution`), durable maintenance, and KeyPackage generator upgrades.
+- `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
+  `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
+  for in-process windows and timeouts.
+
+Tests: `tests/home.rs` (account home), `tests/runtime.rs` plus `tests/runtime/` (frozen fanout, KeyPackage generator
+upgrade).
 
 ## Rules
 
@@ -67,7 +69,9 @@ relay auth, or transport-specific relay discovery.
   Every seam that produces effects must carry them through (`extend`/`absorb`); `marmot-app` turns each report into one
   `MarmotAppEvent::GroupChangeSuperseded`, so a report dropped here is a saved change the user is never told was lost
   (mdk#1734).
-- Roll back pending work when publication fails before any external exposure is possible. Once publication intent is durable and a relay may have accepted work, retain the journaled state and retry the exact or replaceable publication instead.
+- Roll back pending work when publication fails before any external exposure is possible. Once publication intent is
+  durable and a relay may have accepted work, retain the journaled state and retry the exact or replaceable publication
+  instead.
 - Do not log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key material.
 
 ## Verification

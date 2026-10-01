@@ -13,5 +13,5 @@ ran. It contains only deterministic test identities and test key material.
 - SHA-256: `54b5152274592490e7f22693b08edff9f3ba8ec61a8628044cadc6273efca367`
 
 Storage-level old-writer provenance and exact byte-preservation remain covered
-by `storage-sqlite/fixtures/storage-v1-v0.9.12.bin`. This fixture exists only
+by [`storage-sqlite/fixtures/storage-v1-v0.9.12.bin`](../../storage-sqlite/fixtures/README.md). This fixture exists only
 to keep the session test at its public API boundary.

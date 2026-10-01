@@ -1,6 +1,7 @@
 # transport-quic-broker
 
-`transport-quic-broker` is a minimal, memory-only QUIC pub/sub broker for Marmot agent text stream previews.
+`transport-quic-broker` is a minimal, memory-only QUIC pub/sub broker for Marmot agent text stream previews. It ships
+the `marmot-quic-broker` daemon and the client helpers apps use to publish to and subscribe through it.
 
 It does not store stream payloads, maintain accounts, talk to Nostr relays, or decide final message authority. Clients
 anchor a stream through normal encrypted Marmot messages, then use this broker only for transient preview chunks. The
@@ -32,11 +33,21 @@ final MLS app-message payload remains authoritative.
 cargo run -p transport-quic-broker --bin marmot-quic-broker -- --bind 127.0.0.1:4450
 ```
 
-For local development the broker prints the SHA-256 fingerprint of its generated self-signed certificate. A stable
-certificate can be supplied with `--cert-pem <path> --key-pem <path>`.
+The broker prints its listen address and the SHA-256 fingerprint of its certificate. Without PEM files it generates a
+self-signed certificate for `localhost`, which is suitable for local development only.
 
-Other operator flags: `--per-subscriber-queue <n>` and `--max-backlog <n>` tune the bounded live queue and replay
-backlog depths, `--replay-ttl-secs <n>` sets the replay window (default `0`, hard cap 300), and `--json` emits
-structured startup/status logs.
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--bind <ADDR>` | `0.0.0.0:4450` | UDP listen address. |
+| `--cert-pem <PATH> --key-pem <PATH>` | generated self-signed | Stable TLS certificate and key (must be passed together). |
+| `--per-subscriber-queue <n>` | `32` | Bounded live queue depth per subscriber. |
+| `--max-backlog <n>` | `1024` | Replay backlog depth. |
+| `--replay-ttl-secs <n>` | `0` | Replay window; hard cap 300. |
+| `--publish-max-records <n>` | `65536` | Max records forwarded per publish stream. |
+| `--publish-max-frame-bytes <n>` | 64 MiB | Max cumulative record frame bytes forwarded per publish stream. |
+| `--json` | off | Emit structured startup/status logs. |
+
+The publish bounds are forward-role abuse limits counted on the wire (ciphertext for encrypted previews); subscribers
+still enforce their own receive limits.
 
 Docker and VM deployment notes live in [`../../docs/quic-broker-deployment.md`](../../docs/quic-broker-deployment.md).

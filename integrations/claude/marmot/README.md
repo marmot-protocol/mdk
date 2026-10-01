@@ -17,6 +17,15 @@ text are ignored.
 For the current guided install, runtime chooser, and White Noise setup, use the
 canonical [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
 
+## Contents
+
+- [Install (Claude Code Already Installed)](#install-claude-code-already-installed)
+- [Manual Setup](#manual-setup)
+- [Chat Commands](#chat-commands)
+- [Configuration](#configuration)
+- [Security Notes](#security-notes)
+- [Development](#development)
+
 ## Install (Claude Code Already Installed)
 
 Prerequisites:

@@ -4,49 +4,61 @@ This crate ships the `wn-agent` binary: the local White Noise agent connector.
 
 `wn-agent` is the headless Marmot process that lets an agent runtime appear as a normal Marmot member. It owns the
 Marmot account home, MLS state, Nostr relay IO, invite allowlists, durable encrypted sends, and live QUIC preview
-composition. Agent runtimes such as Hermes and OpenClaw stay thin: they run models and tools, then talk to
-`wn-agent` through the local agent-control socket.
+composition. Agent runtimes stay thin: they run models and tools, then talk to `wn-agent` through the local
+agent-control socket.
 
-Hermes is the first supported adapter. OpenClaw is the second: a TypeScript channel plugin at
-[`integrations/openclaw/marmot`](../../integrations/openclaw/marmot) that speaks the same agent-control protocol to this
-connector. `wn-opencode` is a pure Rust harness at
-[`integrations/opencode/marmot`](../../integrations/opencode/marmot) for routing allowed Marmot messages to
-OpenCode. `wn-claude`, `wn-codex`, and `wn-pi` are the corresponding Claude Code, Codex, and Pi harnesses at
-[`integrations/claude/marmot`](../../integrations/claude/marmot),
-[`integrations/codex/marmot`](../../integrations/codex/marmot) and
-[`integrations/pi/marmot`](../../integrations/pi/marmot). All four use the shared hardened runtime in
-[`integrations/terminal-harness`](../../integrations/terminal-harness).
+Supported integrations, all speaking the same [`agent-control`](../agent-control) protocol to this connector:
 
-## Names
+- Hermes (first supported adapter) at [`integrations/hermes/marmot`](../../integrations/hermes/marmot);
+- OpenClaw, a TypeScript channel plugin at [`integrations/openclaw/marmot`](../../integrations/openclaw/marmot);
+- `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi`, pure Rust harnesses for Claude Code, Codex, OpenCode, and Pi at
+  [`integrations/claude/marmot`](../../integrations/claude/marmot),
+  [`integrations/codex/marmot`](../../integrations/codex/marmot),
+  [`integrations/opencode/marmot`](../../integrations/opencode/marmot), and
+  [`integrations/pi/marmot`](../../integrations/pi/marmot). All four use the shared hardened runtime in
+  [`integrations/terminal-harness`](../../integrations/terminal-harness).
+
+## Contents
+
+- [Names and versions](#names-and-versions)
+- [What this crate owns](#what-this-crate-owns)
+- [Run locally](#run-locally)
+- [Invite policy](#invite-policy)
+- [Outbound media paths](#outbound-media-paths)
+- [Group profile updates](#group-profile-updates)
+- [Control plane security](#control-plane-security)
+- [Usage and diagnostics](#usage-and-diagnostics)
+- [Release installs](#release-installs)
+
+## Names and versions
 
 - `agent-connector` is the Rust crate.
 - `wn-agent` is the installed binary.
 - "WN Agent" is the release track used for binary and adapter-install releases.
 
-The WN Agent release tag has its own prefix, for example `wn-agent-v0.9.0`, but the numeric version is the root
-workspace version from `Cargo.toml`. That keeps the agent binary, agent-control protocol, app runtime, and generated
-bindings in one compatibility cohort while still letting us publish only the WN Agent artifacts when that is all that
-changed.
+The WN Agent release tag has its own prefix (`wn-agent-v<version>`), but the numeric version is the root workspace
+version from `Cargo.toml`. That keeps the agent binary, agent-control protocol, app runtime, and generated bindings in
+one compatibility cohort while still letting maintainers publish only the WN Agent artifacts when that is all that
+changed. See [`release.md`](../../release.md#wn-agent-release) for versioning and for cutting a release
+(`just release-wn-agent <version>`, or `just release-all <version>` for the whole cohort).
 
-See the root [`release.md`](../../release.md) for the full versioning and release policy.
-
-## What This Crate Owns
+## What this crate owns
 
 This crate is process glue. It owns:
 
 - `AgentConnector` and `serve_socket`;
 - the `wn-agent` Unix-socket daemon;
-- `wn-agent bootstrap`;
+- `wn-agent bootstrap`, `wn-agent import-identity`, and `wn-agent usage-diagnostics`;
 - local socket binding, peer checks, file modes, and optional bearer-token auth;
 - allowlist-backed welcome confirmation for local agent accounts;
 - final Marmot sends and QUIC live-preview composition through the app runtime.
 
-This crate does not own the stable control DTOs or stream composition rules. Keep agent-facing wire types in
-[`agent-control`](../agent-control) and stream composition behavior in [`agent-stream-compose`](../agent-stream-compose).
+Agent-facing wire types live in [`agent-control`](../agent-control) and stream composition behavior in
+[`agent-stream-compose`](../agent-stream-compose).
 
-## Run Locally
+## Run locally
 
-Start the connector with the same public relay set the phone app uses:
+Start the connector with the same public relay set the phone app uses (`--home` is required):
 
 ```sh
 install -d -m 0700 ~/.marmot-agent/dev/outbound-media
@@ -57,7 +69,7 @@ cargo run -p agent-connector --bin wn-agent -- \
   --relay wss://relay.us.whitenoise.chat
 ```
 
-By default the control socket is:
+By default the control socket is `<home>/dev/wn-agent.sock`, here:
 
 ```text
 ~/.marmot-agent/dev/wn-agent.sock
@@ -71,8 +83,20 @@ cargo run -p agent-connector --bin wn-agent -- bootstrap \
   --qr
 ```
 
-`bootstrap` prints the agent account id, `npub`, `nprofile`, relay hints, and optional terminal QR. Invite that account
-from the phone app.
+`bootstrap` prints the agent account id, `npub`, `nprofile`, relay hints, QUIC preview candidates, and optional
+terminal QR. Invite that account from the phone app. When flags are omitted, `bootstrap` reads `MARMOT_HOME` (default
+`~/.marmot-agent`), `MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_AUTH_TOKEN` / `MARMOT_AGENT_AUTH_TOKEN_FILE` (default
+`<home>/control.token` when present), `MARMOT_RELAYS`, and `MARMOT_QUIC_CANDIDATES` (default
+`quic://quic-broker.ipf.dev:4450`; `--no-quic` omits it).
+
+To keep an existing Nostr identity instead of generating one, import it before bootstrapping with
+`wn-agent import-identity --identity-file <path>` (an owner-only regular file) or `--prompt` (masked `/dev/tty`
+entry), optionally pinned with `--expected-identity <npub-or-hex>`.
+
+Other daemon flags: `--socket`, `--socket-dir-mode` (default `0700`), `--socket-mode` (default `0600`),
+`--auth-token-file`, and `--max-connections` (default 64). Development-only flags `--insecure-local-broker` (literal
+loopback `quic://` candidates without certificate verification) and `--allow-loopback-relays` (loopback relays only;
+private, link-local, and CGNAT stay rejected) must not be used in production.
 
 Check the installed or locally built version with:
 
@@ -80,11 +104,10 @@ Check the installed or locally built version with:
 wn-agent --version
 ```
 
-## Invite Policy
+## Invite policy
 
-Invite policy is account-scoped and defaults to `allowlist`, preserving the existing behavior: a pending group invite
-is accepted only when its authenticated welcomer is on the account's configured `--allow-welcomer` list. An empty
-allowlist rejects every invite.
+Invite policy is account-scoped and defaults to `allowlist`: a pending group invite is accepted only when its
+authenticated welcomer is on the account's configured `--allow-welcomer` list. An empty allowlist rejects every invite.
 
 Set a production invite policy while bootstrapping or reusing an account:
 
@@ -111,7 +134,7 @@ Local development may use `--dev-allow-any-invites` together with `--debug-contr
 mode is active and accepts any authenticated welcomer, but it still rejects a welcome whose authenticated author is
 missing. Do not enable either development option in production.
 
-## Outbound Media Paths
+## Outbound media paths
 
 Path-based media sends are denied unless `wn-agent` starts with one or more `--media-allowed-root PATH` options. The
 connector opens each root at startup, then accepts only regular files reached beneath that directory handle without
@@ -123,54 +146,16 @@ users, make the gateway the directory owner and give the connector's shared grou
 are created `0640`. In split-container deployments, mount the same directory read-write in the gateway and read-only
 in the connector. Omitting `--media-allowed-root` deliberately leaves media sends disabled.
 
-## Release Installs
+## Group profile updates
 
-The canonical [White Noise + Agents quickstart](../../integrations/README.md#get-started-white-noise--agents) owns the
-current release URLs, runtime chooser, phone onboarding, and repeatable agent/CI example for Hermes, OpenClaw,
-Claude Code, Codex, OpenCode, and Pi. Keep install commands there instead of duplicating them in this crate-level
-implementation guide.
+The `group_profile_update` control request accepts an account id, group id, and at least one of `name` or
+`description`. Omitted fields retain their current authenticated value; an empty string clears a field. MDK enforces the
+256-byte name and 4096-byte description limits and requires the selected account to be a current group admin when
+constructing the MLS commit. A successful `group_profile_updated` response carries the published commit's message ids.
+A timeout can leave the result uncertain: read current group metadata before retrying, because this mutation has no
+idempotency key yet.
 
-Connector-specific configuration, manual setup, security notes, and development workflows remain in each integration
-README under [`integrations/`](../../integrations/README.md).
-
-## Cutting A WN Agent Release
-
-After the release commit is merged to `master`, cut a WN Agent release tag with:
-
-```sh
-just release-wn-agent 0.9.3
-```
-
-For a dry run:
-
-```sh
-just release-wn-agent-dry-run 0.9.3
-```
-
-The helper checks that:
-
-- the requested version matches the root workspace version;
-- the working tree is clean;
-- `HEAD` matches `origin/master`;
-- `wn-agent-v<version>` does not already exist locally or remotely.
-
-It creates and pushes an annotated `wn-agent-v<version>` tag. Pushing that tag starts
-`.github/workflows/wn-agent-binaries.yml`, which publishes the versioned binary/plugin assets and the installer script.
-Pull requests, `master` pushes, and manual workflow runs build validation artifacts only; they do not publish a GitHub
-Release.
-
-## Group Profile Updates
-
-The `group_profile_update` control request accepts an account id, group id,
-and at least one of `name` or `description`. Omitted fields retain their
-current authenticated value; an empty string clears a field. MDK enforces the
-256-byte name and 4096-byte description limits and requires the selected
-account to be a current group admin when constructing the MLS commit. A
-successful `group_profile_updated` response carries the published commit's
-message ids. A timeout can leave the result uncertain: read current group
-metadata before retrying, because this mutation has no idempotency key yet.
-
-## Control Plane Security
+## Control plane security
 
 The v2 control plane is local-only:
 
@@ -223,40 +208,16 @@ control, or a world-readable environment/config file.
 World-readable or world-writable socket modes are rejected. Split-host gateways need a later authenticated remote control
 plane; do not expose the Unix socket over TCP.
 
-Logging must stay privacy-safe: no account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext,
-plaintext, or key material.
+## Usage and diagnostics
 
-## Verification
-
-Use the narrow checks first:
-
-```sh
-cargo test -p agent-connector
-cargo check -p agent-connector --bin wn-agent
-bash scripts/install-hermes-marmot.sh --dry-run
-sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
-bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
-bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
-bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
-integrations/hermes/tests/marmot/test_dev_scripts.sh
-just codex-installer-test
-just opencode-installer-test
-just pi-installer-test
-```
-
-Before checkpointing broader release work, run the normal repo checks from the root:
-
-```sh
-just fmt-check
-just check
-just clippy
-just test
-```
-
-### Usage and diagnostics
-
-`wn-agent usage-diagnostics show|enable|disable --home PATH [--json]` manages local
-combined OTLP/product consent. An active daemon handles updates on a separate
-owner-only local socket; the agent-control protocol cannot grant consent. The
-agent root has its own permission, independent from White Noise. See the
+`wn-agent usage-diagnostics show|enable|disable --home PATH [--json]` manages local combined OTLP/product consent. An
+active daemon handles updates on a separate owner-only local socket; the agent-control protocol cannot grant consent.
+The agent root has its own permission, independent from White Noise. See the
 [host and operator contract](../../docs/marmot-architecture/usage-diagnostics.md).
+
+## Release installs
+
+The canonical [White Noise + Agents quickstart](../../integrations/README.md#get-started-white-noise--agents) owns the
+current release URLs, runtime chooser, phone onboarding, and repeatable agent/CI example for Hermes, OpenClaw,
+Claude Code, Codex, OpenCode, and Pi. Connector-specific configuration, manual setup, security notes, and development
+workflows live in each integration README under [`integrations/`](../../integrations/README.md).

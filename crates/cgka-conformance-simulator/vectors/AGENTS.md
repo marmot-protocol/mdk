@@ -11,6 +11,9 @@ Map for portable JSON vector fixtures.
 - Subject-pinned `GeneratedScenarioInputV1` artifacts live under `generated-inputs/` and are deliberately outside both
   `manifest.v1.json` and `VectorFixture` directory discovery. Keep their `*.generated-input.json` suffix: renaming one
   to `*.v1.json` would make the vector sweep try to parse it as a `VectorFixture`.
+- `incidents/` holds vectors synthesized by `crates/incident-replay` from forensic exports and accepted only after
+  simulator reproduction; `canonical_vector_fixtures_match_generated_traces` runs them with the top-level fixtures.
+  Commit only the synthesized vector, never the source export.
 - Keep `../SCENARIOS.md` updated when adding or changing a runnable scenario vector.
 - Byte-level fixtures live under `byte-fixtures/` and follow `byte-fixtures/schema.v1.json`.
 - Keep fixture names stable and versioned, usually `name.v1.json`.

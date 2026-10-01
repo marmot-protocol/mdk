@@ -7,215 +7,22 @@ Nostr transport, final encrypted sends, and QUIC live-preview stream records.
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
 
-Chat display names come from the current Marmot group name on each
-`get_chat_info` and activated inbound lookup. A nonempty `group_info.subject`
-is used after trimming; otherwise Hermes falls back to
-`Marmot <first 12 hex characters of the group id>`. These lookups are not
-cached, so a rename, a cleared name, or a recovered projection appears on the
-next metadata read. Display enrichment never changes routing ids, activation
-policy, or send/reply targets.
+## Contents
 
-The `marmot_group_profile` platform tool updates an existing group's name,
-description, or both. Pass its `group_id_hex` and at least one field. Omitted
-fields keep their current values; an empty string clears a field. Names are
-limited to 256 UTF-8 bytes and descriptions to 4096. `wn-agent` uses MDK's
-authenticated group-profile commit path, which rejects an account that is not
-a current group admin. A successful result includes the published commit's
-message ids. If the control connection times out, check the group's current
-profile before trying again: repeating an uncertain update may publish a
-second commit.
+- [Source Install (Exact Commit)](#source-install-exact-commit)
+- [Release Install (Hermes Already Installed)](#release-install-hermes-already-installed)
+- [Repeatable Dev Setup](#repeatable-dev-setup)
+- [Docker Phone Test](#docker-phone-test)
+- [Configuration](#configuration)
+- [Behavior](#behavior)
+- [Approval reactions (opt in)](#approval-reactions-opt-in)
+- [Optional presence reactions](#optional-presence-reactions)
+- [Inbound durability boundary](#inbound-durability-boundary)
 
-For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
-materialized chat window and supplies Hermes with durable message ids, senders,
-timestamps, reply links, current reaction summaries, and
-delete/invalidation state. Reply context includes both Hermes's native reply
-fields and a complete structured referenced-message payload. The
-model-callable `marmot_history` tool can fetch one exact message id or page older
-messages using a `(recorded_at, message_id_hex)` cursor. Automatic history
-lookup is best-effort and never drops the current inbound message if it fails.
+## Source Install (Exact Commit)
 
-## Approval reactions (opt in)
-
-Set `platforms.marmot.extra.approval_reactions: true` in Hermes configuration.
-Only senders explicitly listed in `MARMOT_ALLOWED_USERS` can decide a prompt;
-`MARMOT_ALLOW_ALL_USERS` does not grant approval authority. React 👍 to approve
-once, 👎 to deny, or ❤️ to approve permanently. Permanent consent is unavailable
-for one-operation-only or Smart DENY requests. Typed `/approve` and `/deny`
-remain available. The default is off.
-
-Supported host: Hermes 0.19.0, source revision
-`3ef6bbd201263d354fd83ec55b3c306ded2eb72a` in `hermes-agent.lock`.
-The plugin uses its `send_exec_approval` notification hook and binds durable
-message receipts to the actual pending approval entry. Consumption uses the
-host queue lock; an expired/resolved prompt cannot resolve a newer request,
-even if the commands are identical. Parallel pending requests are typed-only.
-Rejected slash commands do not retire prompts. This compatibility boundary
-uses pinned host internals and must be retested before changing the host pin.
-
-To run the host contract regressions with that source checkout and its Python
-environment (in addition to the ordinary adapter suite):
-
-```sh
-HERMES_APPROVAL_CONTRACT=1 PYTHONPATH=/path/to/pinned/hermes-agent \
-  /path/to/hermes-python -m unittest discover \
-  -s integrations/hermes/tests/marmot -p test_approval_host_contract.py
-```
-
-## Inbound durability boundary
-
-Every normalized `inbound_message` is committed to a private, schema-versioned
-SQLite WAL journal before the adapter reserves its id, places it in a debounce
-batch, or attempts per-group queue admission. The default journal is
-`$MARMOT_HOME/hermes/inbound-spool-v1.sqlite3`; `MARMOT_INBOUND_SPOOL_PATH`
-may select another private parent directory. The parent must be mode `0700` and
-the database, lock, WAL, and shared-memory files are kept mode `0600`.
-
-One process owns a spool through a non-blocking advisory lock and a persisted
-generation. On startup, an exclusive new owner reclaims prior-generation
-`claimed` rows in per-group FIFO order. Queue-capacity rejection leaves the row
-pending with bounded backoff rather than dropping it. Debounce-buffered rows
-are explicitly ineligible for live retry-loop claims until their batch is
-persisted; a new exclusive owner releases an abandoned buffer for FIFO replay.
-Debounce batches retain all source ids, the effective reply anchor, and explicit
-coalesced dispositions. Mention-policy and profile-onboarding decisions are
-terminal explicit skips.
-Pending rows are never evicted to satisfy a bound; an exhausted, corrupt,
-newer-schema, unsafe-permission, or unwritable spool fails connection/intake
-closed and preserves the existing state for operator recovery.
-
-Hermes does not yet expose a typed durable turn-start or finality callback. The
-adapter therefore records `handed` immediately before calling the host and
-`unresolved` after even a normal return: Hermes may only have buffered the
-message or started background processing. If the process dies during that
-handoff, the next owner also marks the remaining `handed` obligation
-`unresolved`. These unknown outcomes are never automatically replayed into a
-possibly recovering Hermes turn. The schema reserves `completed` for a future
-proven finality boundary; the adapter does not currently produce it.
-
-Unknown outcomes share bounded terminal retention with intentional skips and
-exhausted retries: by default, journal admission prunes entries older than
-seven days and retains at most 8192 terminal entries. This is an operational
-recovery window, not a permanent completion ledger. Pending prompts are never
-evicted by that retention policy. Pre-handoff dispatch failures use their own
-bounded retry budget, separate from capacity and shutdown deferrals, and then
-move to `failed`, allowing later same-group work to proceed. Failed disposition
-writes remain fenced from dispatch until the spool retry loop confirms their
-durable state. Existing version-1 spools migrate in place while preserving
-obligations. Shutdown fences admission, cancels and joins debounce producers, and
-then drains the keyed queue before closing the spool. This slice closes the
-queue/debounce crash windows without
-claiming exactly-once external tool effects, complete session lineage, or
-general delivery idempotency. `InboundSpool.snapshot()` provides aggregate state
-counts for direct spool inspection; it is not wired into the readiness probe.
-Payloads and identifiers are never logged.
-
-### Quiet ambient continuity
-
-`message_deleted`, edit/reaction mutations, and `group_state_changed` facts
-never invoke `handle_message` or trigger an agent turn. The adapter records
-coarse facts in `$MARMOT_HOME/hermes/ambient-context-v1.sqlite3` (or
-`MARMOT_AMBIENT_CONTEXT_PATH`) and attaches explicitly marked untrusted context
-to the next real inbound message that passes activation. Within the same live
-adapter, a bounded memory cache retains useful mutation targets, replacement
-text, reaction content, and rename details. After restart, context falls back
-to the allowlisted fact kind. These details never enter the ambient database.
-
-Admission rejection preserves pending facts. A host exception or cancellation
-releases its claimed snapshot; a normal `handle_message` return accepts that
-snapshot. Commit and acknowledgement are attempted independently, and the
-existing retry loop retries failed retirement or release operations. Claims
-prevent overlapping dispatches from attaching the same facts. Retirement only
-touches the accepted snapshot, preserving concurrent observations when capacity
-allows. Ambient database work runs on the journal worker, outside the host event
-loop. A storage failure never reclassifies an accepted real inbound turn.
-
-Durable rows contain SHA-256 routing/dedupe keys, allowlisted fact kinds,
-ordering/expiry metadata, and local claim ownership tokens. They contain no
-message or rename text, raw account/group/message identifiers, pubkeys, relay
-URLs, authentication tokens, or stream capabilities. Database, lock, and WAL
-files are private; symlink paths are refused. Acknowledged hashes remain as
-bounded replay tombstones. Dedupe only lasts while the hash is retained: after
-age expiry or capacity eviction, replay can surface an accepted fact again.
-The default shared per-group window holds 16 entries, including pending facts
-and tombstones; it is not an exactly-once ledger. Pending facts, active claims, and tombstones share
-hard per-group and aggregate group, event-count, logical-byte, and age limits.
-Unclaimed entries are evicted deterministically; active claims are protected.
-If protected claims fill a limit, a new observation can be refused. There is
-no extra snapshot allowance. The live detail cache has its own byte ceiling
-equal to the configured state-byte limit; dropping detail retains the coarse
-fact.
-
-Modern connectors supply an opaque `event_id_hex` for each group-change
-occurrence, identical in live delivery and durable replay. Its hash deduplicates
-replays, including after acknowledgement, while distinct changes of the same
-kind remain separate. Older connectors omit this optional field; a bounded
-process-local group/change-kind window suppresses their repeated observations
-before they consume durable capacity. This preserves the earlier legacy
-behavior: distinct same-kind legacy changes may also be suppressed until that
-key leaves the window. Restart clears the legacy window, so it cannot provide
-cross-process occurrence dedupe. Modern connectors do not use this fallback.
-
-An exclusive lock ensures one process owns the store. Restart recovers abandoned
-unaccepted claims and retires durably committed accepted claims. A graceful
-reconnect of the same adapter also preserves acceptance remembered in memory
-when both retirement writes failed. If the process dies after host acceptance
-but before either write succeeds, acceptance cannot be recovered and context may
-replay. The acceptance boundary is Hermes's normal `handle_message` return;
-it does not prove that an agent response completed or reached a recipient.
-
-Optional ambient storage can fail independently of the required real-message
-journal. A coarse restart fact is only a history-change hint: it cannot identify
-a deleted message or establish a rename target. Fetch targeted or older history
-when detail matters. Automatic history is best-effort and returns at most 20
-messages before the triggering message's cursor; a missing or limited page does
-not prove that older context is current. Earlier branch-install ambient schemas
-remain readable.
-
-Ambient acknowledgement consumes optional context at host acceptance even while
-the real-message journal remains `unresolved`. That journal does not automatically
-replay unknown outcomes. Any later external retry does not restore context whose
-ambient claim has already been retired.
-
-The byte setting is a logical row budget. The physical database page ceiling
-adds 64 KiB for schema pages and eight times the logical budget for indexes,
-fragmentation, claim metadata, and temporary acknowledgement overlap; WAL files
-are checkpointed separately. These are distinct limits. Generation fencing and
-connect-failure cleanup are required so late work cannot reopen a closed store.
-
-The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
-reaction add/remove primitives to Hermes. They target an exact durable message
-id or the latest inbound message and accept arbitrary non-blank, control-free
-reaction content of at most 64 Unicode scalar values. Adds are idempotent;
-removal can target exact content or clear all active own reactions atomically;
-processing-status reaction policy remains a separate host concern.
-
-The model-callable `marmot_status` tool exposes the plugin's passive readiness
-probe on a supported Hermes operator surface. It reports staged booleans for
-plugin discovery, enablement, configuration, `wn-agent` reachability,
-authentication, account selection, home-group resolution, and media capability.
-It never returns account or group identifiers. `state: ready` is the only fully
-ready result; `gateway_inactive` means no live Marmot adapter is available to
-probe in that Hermes process.
-
-Hermes's `PlatformEntry.is_connected` callback is a synchronous configuration
-and auto-enablement gate, so this plugin deliberately keeps that callback free
-of socket I/O: it means "configured", not "the companion service is live".
-Operational `BasePlatformAdapter.is_connected` remains false until `connect()`
-successfully reaches `wn-agent`; `marmot_status` is the authoritative staged
-health readback. A configured plugin with no companion service is therefore not
-reported as operationally connected.
-
-On current Hermes releases, non-secret values from
-`plugins.entries.marmot.settings` are merged into the effective platform config
-before validation, adapter construction, standalone delivery, and readiness
-checks. Legacy `platforms.marmot.extra` values take precedence when both forms
-are present; environment variables remain available for legacy cohorts and
-secret-bearing configuration.
-
-For live previews, the plugin retries `stream_begin` with one stable v2 request
-id and retains the returned stream capability in memory for subsequent append,
-status, finalize, and cancel calls. The capability is a bearer secret and must
-not be logged or persisted.
+Most operators should use the [release installer](#release-install-hermes-already-installed), which also installs
+and starts `wn-agent`. Use this path to install only the plugin from a reviewed MDK commit.
 
 Install through Hermes's standard plugin flow from one reviewed MDK revision.
 Hermes 0.19.0 does not expose `plugins install --ref`, so the portable immutable
@@ -251,55 +58,6 @@ from these same files. A community-index entry should pin an immutable commit
 or release tag; until such an entry is published, use the exact-checkout source
 command above.
 
-## Optional presence reactions
-
-Set `platforms.marmot.extra.presence_reactions: true` to show deterministic
-turn progress on inbound messages. It is off by default and does not call the
-LLM or change activation, sender authorization, or approval policy.
-
-```yaml
-platforms:
-  marmot:
-    extra:
-      presence_reactions: true
-      presence_emojis:                 # optional overrides
-        accepted: "👀"
-        thinking: "⏳"
-        construction: ["🛠️", "🔨", "⚙️", "🧱"]
-        completed: "✅"
-        failed: "❌"
-        superseded: "➡️"
-```
-
-Eyes appear when processing begins. Hermes' live-status callback maps tool
-start to the construction cycle and tool completion to the between-tools
-hourglass. Leave Hermes' `display.live_status` enabled (its default is `full`)
-to receive tool lifecycle signals, even with tool-progress messages disabled.
-Streaming text also switches to thinking when no tool is active.
-
-While a tool runs, the construction emoji advances after 120, 240, 480, then
-600 seconds, remaining capped at 600 seconds. Every new tool start resets the
-cycle and timer. Inbound messages retarget the active indicator only after queue admission,
-activation, onboarding, and an explicit allow from the host's full sender-authorization
-callback. Missing or unknown authorization leaves the indicator unchanged; successful
-completion marks the original reply anchor with a checkmark. Failed turns get
-a cross, superseded turns get an arrow, and cancellation removes the temporary
-indicator. Terminal reactions are preserved.
-
-Tool status uses the originating processing turn's context, which pinned Hermes
-0.19.0 (`3ef6bbd201263d354fd83ec55b3c306ded2eb72a`) copies into its agent
-executor. Late callbacks from a replaced turn are ignored. Callbacks without
-turn context are ignored rather than assigned to the current owner.
-
-Presence is cosmetic: hooks enqueue work without awaiting daemon requests.
-Each group has at most one cycle timer and one serialized reaction worker;
-state is bounded to 256 groups with eight queued transitions per group.
-Each operation gets at most three attempts with a five-second timeout per
-attempt. Replacements remove only the exact presence emoji, never all own
-reactions. Disconnect cancels workers and timers without waiting for network
-cleanup; an unacknowledged/stale reaction may remain after a daemon failure.
-There is no persistence or reconnect timeline scan.
-
 ## Release Install (Hermes Already Installed)
 
 Versioned `wn-agent` builds and the Hermes plugin are published as
@@ -310,8 +68,8 @@ Prerequisites:
 
 - The plugin and `wn-agent` are released as one cohort. Install both from the
   same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
-  for older connectors. The former `stream_chunk_bytes` / `MARMOT_STREAM_CHUNK_BYTES`
-  setting is ignored; the connector now chunks live previews itself.
+  for older connectors. `stream_chunk_bytes` / `MARMOT_STREAM_CHUNK_BYTES` is
+  ignored; the connector chunks live previews itself.
 - Hermes Agent **0.19.0 or newer** installed and working locally. The installer
   validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
@@ -431,8 +189,6 @@ through `wn-agent`. Message-sender allowlist entries control which Marmot sender
 Hermes accepts after gateway restart via `$HERMES_HOME/.env`
 (`MARMOT_ALLOWED_USERS` and `MARMOT_ALLOW_ALL_USERS`).
 
-Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
-
 Use the exact release version when reporting bugs:
 
 ```sh
@@ -445,8 +201,7 @@ The installer puts `wn-agent` in `~/.local/bin`, extracts the plugin to
 `~/.marmot-agents/hermes`, and patches only Marmot-specific Hermes config
 entries. Existing Hermes connectors such as Telegram are preserved.
 
-Supported platforms: Linux x86_64, Linux arm64, macOS Apple Silicon, macOS Intel.
-Both install scripts verify SHA256 checksums for downloaded release assets.
+The installer verifies SHA-256 checksums for every downloaded release asset.
 
 The installer prints restart guidance for your existing Hermes gateway. It does
 not restart Hermes automatically. Restart a managed gateway with
@@ -634,6 +389,12 @@ Delete the whole throwaway setup:
 just hermes-dev-teardown --force
 ```
 
+Run the plugin unit tests with:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/tests/marmot
+```
+
 ## Docker Phone Test
 
 The repo has a Compose profile for the dedicated-computer phone test. It builds a container with `wn-agent`, Hermes,
@@ -781,6 +542,13 @@ Hermes account or group. Any holder can subscribe to all plaintext and operate
 every account in that connector home. Do not share the connector/token with an
 untrusted plugin or tenant; give that boundary its own `wn-agent` instance.
 
+On current Hermes releases, non-secret values from
+`plugins.entries.marmot.settings` are merged into the effective platform config
+before validation, adapter construction, standalone delivery, and readiness
+checks. Legacy `platforms.marmot.extra` values take precedence when both forms
+are present; environment variables remain available for legacy cohorts and
+secret-bearing configuration.
+
 ### Group activation (multi-party groups)
 
 By default the adapter only runs an agent turn in a multi-party group when the
@@ -843,6 +611,61 @@ not a disk-streaming or low-memory-mobile transfer mode.
 
 ## Behavior
 
+Chat display names come from the current Marmot group name on each
+`get_chat_info` and activated inbound lookup. A nonempty `group_info.subject`
+is used after trimming; otherwise Hermes falls back to
+`Marmot <first 12 hex characters of the group id>`. These lookups are not
+cached, so a rename, a cleared name, or a recovered projection appears on the
+next metadata read. Display enrichment never changes routing ids, activation
+policy, or send/reply targets.
+
+The `marmot_group_profile` platform tool updates an existing group's name,
+description, or both. Pass its `group_id_hex` and at least one field. Omitted
+fields keep their current values; an empty string clears a field. Names are
+limited to 256 UTF-8 bytes and descriptions to 4096. `wn-agent` uses MDK's
+authenticated group-profile commit path, which rejects an account that is not
+a current group admin. A successful result includes the published commit's
+message ids. If the control connection times out, check the group's current
+profile before trying again: repeating an uncertain update may publish a
+second commit.
+
+For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
+materialized chat window and supplies Hermes with durable message ids, senders,
+timestamps, reply links, current reaction summaries, and
+delete/invalidation state. Reply context includes both Hermes's native reply
+fields and a complete structured referenced-message payload. The
+model-callable `marmot_history` tool can fetch one exact message id or page older
+messages using a `(recorded_at, message_id_hex)` cursor. Automatic history
+lookup is best-effort and never drops the current inbound message if it fails.
+
+The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
+reaction add/remove primitives to Hermes. They target an exact durable message
+id or the latest inbound message and accept arbitrary non-blank, control-free
+reaction content of at most 64 Unicode scalar values. Adds are idempotent;
+removal can target exact content or clear all active own reactions atomically;
+processing-status reaction policy remains a separate host concern.
+
+The model-callable `marmot_status` tool exposes the plugin's passive readiness
+probe on a supported Hermes operator surface. It reports staged booleans for
+plugin discovery, enablement, configuration, `wn-agent` reachability,
+authentication, account selection, home-group resolution, and media capability.
+It never returns account or group identifiers. `state: ready` is the only fully
+ready result; `gateway_inactive` means no live Marmot adapter is available to
+probe in that Hermes process.
+
+Hermes's `PlatformEntry.is_connected` callback is a synchronous configuration
+and auto-enablement gate, so this plugin deliberately keeps that callback free
+of socket I/O: it means "configured", not "the companion service is live".
+Operational `BasePlatformAdapter.is_connected` remains false until `connect()`
+successfully reaches `wn-agent`; `marmot_status` is the authoritative staged
+health readback. A configured plugin with no companion service is therefore not
+reported as operationally connected.
+
+For live previews, the plugin retries `stream_begin` with one stable v2 request
+id and retains the returned stream capability in memory for subsequent append,
+status, finalize, and cancel calls. The capability is a bearer secret and must
+not be logged or persisted.
+
 - Inbound Marmot messages become Hermes `MessageEvent`s with `chat_id` set to
   the Marmot group id and `user_id` set to the sender account id.
 - Hermes progressive edits open at most one live preview per chat at a time. A
@@ -865,8 +688,199 @@ not a disk-streaming or low-memory-mobile transfer mode.
 - `stream_finish` sends the acknowledged final text. The shared Rust publisher
   owns chunking and transcript hashing, including status and progress records.
 
-Run the shim tests with:
+## Approval reactions (opt in)
+
+Set `platforms.marmot.extra.approval_reactions: true` in Hermes configuration.
+Only senders explicitly listed in `MARMOT_ALLOWED_USERS` can decide a prompt;
+`MARMOT_ALLOW_ALL_USERS` does not grant approval authority. React 👍 to approve
+once, 👎 to deny, or ❤️ to approve permanently. Permanent consent is unavailable
+for one-operation-only or Smart DENY requests. Typed `/approve` and `/deny`
+remain available. The default is off.
+
+Supported host: Hermes 0.19.0, source revision
+`3ef6bbd201263d354fd83ec55b3c306ded2eb72a` in `hermes-agent.lock`.
+The plugin uses its `send_exec_approval` notification hook and binds durable
+message receipts to the actual pending approval entry. Consumption uses the
+host queue lock; an expired/resolved prompt cannot resolve a newer request,
+even if the commands are identical. Parallel pending requests are typed-only.
+Rejected slash commands do not retire prompts. This compatibility boundary
+uses pinned host internals and must be retested before changing the host pin.
+
+To run the host contract regressions with that source checkout and its Python
+environment (in addition to the ordinary adapter suite):
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/tests/marmot
+HERMES_APPROVAL_CONTRACT=1 PYTHONPATH=/path/to/pinned/hermes-agent \
+  /path/to/hermes-python -m unittest discover \
+  -s integrations/hermes/tests/marmot -p test_approval_host_contract.py
 ```
+
+## Optional presence reactions
+
+Set `platforms.marmot.extra.presence_reactions: true` to show deterministic
+turn progress on inbound messages. It is off by default and does not call the
+LLM or change activation, sender authorization, or approval policy.
+
+```yaml
+platforms:
+  marmot:
+    extra:
+      presence_reactions: true
+      presence_emojis:                 # optional overrides
+        accepted: "👀"
+        thinking: "⏳"
+        construction: ["🛠️", "🔨", "⚙️", "🧱"]
+        completed: "✅"
+        failed: "❌"
+        superseded: "➡️"
+```
+
+Eyes appear when processing begins. Hermes' live-status callback maps tool
+start to the construction cycle and tool completion to the between-tools
+hourglass. Leave Hermes' `display.live_status` enabled (its default is `full`)
+to receive tool lifecycle signals, even with tool-progress messages disabled.
+Streaming text also switches to thinking when no tool is active.
+
+While a tool runs, the construction emoji advances after 120, 240, 480, then
+600 seconds, remaining capped at 600 seconds. Every new tool start resets the
+cycle and timer. Inbound messages retarget the active indicator only after queue admission,
+activation, onboarding, and an explicit allow from the host's full sender-authorization
+callback. Missing or unknown authorization leaves the indicator unchanged; successful
+completion marks the original reply anchor with a checkmark. Failed turns get
+a cross, superseded turns get an arrow, and cancellation removes the temporary
+indicator. Terminal reactions are preserved.
+
+Tool status uses the originating processing turn's context, which pinned Hermes
+0.19.0 (`3ef6bbd201263d354fd83ec55b3c306ded2eb72a`) copies into its agent
+executor. Late callbacks from a replaced turn are ignored. Callbacks without
+turn context are ignored rather than assigned to the current owner.
+
+Presence is cosmetic: hooks enqueue work without awaiting daemon requests.
+Each group has at most one cycle timer and one serialized reaction worker;
+state is bounded to 256 groups with eight queued transitions per group.
+Each operation gets at most three attempts with a five-second timeout per
+attempt. Replacements remove only the exact presence emoji, never all own
+reactions. Disconnect cancels workers and timers without waiting for network
+cleanup; an unacknowledged/stale reaction may remain after a daemon failure.
+There is no persistence or reconnect timeline scan.
+
+## Inbound durability boundary
+
+Every normalized `inbound_message` is committed to a private, schema-versioned
+SQLite WAL journal before the adapter reserves its id, places it in a debounce
+batch, or attempts per-group queue admission. The default journal is
+`$MARMOT_HOME/hermes/inbound-spool-v1.sqlite3`; `MARMOT_INBOUND_SPOOL_PATH`
+may select another private parent directory. The parent must be mode `0700` and
+the database, lock, WAL, and shared-memory files are kept mode `0600`.
+
+One process owns a spool through a non-blocking advisory lock and a persisted
+generation. On startup, an exclusive new owner reclaims prior-generation
+`claimed` rows in per-group FIFO order. Queue-capacity rejection leaves the row
+pending with bounded backoff rather than dropping it. Debounce-buffered rows
+are explicitly ineligible for live retry-loop claims until their batch is
+persisted; a new exclusive owner releases an abandoned buffer for FIFO replay.
+Debounce batches retain all source ids, the effective reply anchor, and explicit
+coalesced dispositions. Mention-policy and profile-onboarding decisions are
+terminal explicit skips.
+Pending rows are never evicted to satisfy a bound; an exhausted, corrupt,
+newer-schema, unsafe-permission, or unwritable spool fails connection/intake
+closed and preserves the existing state for operator recovery.
+
+Hermes does not yet expose a typed durable turn-start or finality callback. The
+adapter therefore records `handed` immediately before calling the host and
+`unresolved` after even a normal return: Hermes may only have buffered the
+message or started background processing. If the process dies during that
+handoff, the next owner also marks the remaining `handed` obligation
+`unresolved`. These unknown outcomes are never automatically replayed into a
+possibly recovering Hermes turn. The schema reserves `completed` for a future
+proven finality boundary; the adapter does not currently produce it.
+
+Unknown outcomes share bounded terminal retention with intentional skips and
+exhausted retries: by default, journal admission prunes entries older than
+seven days and retains at most 8192 terminal entries. This is an operational
+recovery window, not a permanent completion ledger. Pending prompts are never
+evicted by that retention policy. Pre-handoff dispatch failures use their own
+bounded retry budget, separate from capacity and shutdown deferrals, and then
+move to `failed`, allowing later same-group work to proceed. Failed disposition
+writes remain fenced from dispatch until the spool retry loop confirms their
+durable state. Existing version-1 spools migrate in place while preserving
+obligations. Shutdown fences admission, cancels and joins debounce producers, and
+then drains the keyed queue before closing the spool. This slice closes the
+queue/debounce crash windows without
+claiming exactly-once external tool effects, complete session lineage, or
+general delivery idempotency. `InboundSpool.snapshot()` provides aggregate state
+counts for direct spool inspection; it is not wired into the readiness probe.
+Payloads and identifiers are never logged.
+
+### Quiet ambient continuity
+
+`message_deleted`, edit/reaction mutations, and `group_state_changed` facts
+never invoke `handle_message` or trigger an agent turn. The adapter records
+coarse facts in `$MARMOT_HOME/hermes/ambient-context-v1.sqlite3` (or
+`MARMOT_AMBIENT_CONTEXT_PATH`) and attaches explicitly marked untrusted context
+to the next real inbound message that passes activation. Within the same live
+adapter, a bounded memory cache retains useful mutation targets, replacement
+text, reaction content, and rename details. After restart, context falls back
+to the allowlisted fact kind. These details never enter the ambient database.
+
+Admission rejection preserves pending facts. A host exception or cancellation
+releases its claimed snapshot; a normal `handle_message` return accepts that
+snapshot. Commit and acknowledgement are attempted independently, and the
+existing retry loop retries failed retirement or release operations. Claims
+prevent overlapping dispatches from attaching the same facts. Retirement only
+touches the accepted snapshot, preserving concurrent observations when capacity
+allows. Ambient database work runs on the journal worker, outside the host event
+loop. A storage failure never reclassifies an accepted real inbound turn.
+
+Durable rows contain SHA-256 routing/dedupe keys, allowlisted fact kinds,
+ordering/expiry metadata, and local claim ownership tokens. They contain no
+message or rename text, raw account/group/message identifiers, pubkeys, relay
+URLs, authentication tokens, or stream capabilities. Database, lock, and WAL
+files are private; symlink paths are refused. Acknowledged hashes remain as
+bounded replay tombstones. Dedupe only lasts while the hash is retained: after
+age expiry or capacity eviction, replay can surface an accepted fact again.
+The default shared per-group window holds 16 entries, including pending facts
+and tombstones; it is not an exactly-once ledger. Pending facts, active claims, and tombstones share
+hard per-group and aggregate group, event-count, logical-byte, and age limits.
+Unclaimed entries are evicted deterministically; active claims are protected.
+If protected claims fill a limit, a new observation can be refused. There is
+no extra snapshot allowance. The live detail cache has its own byte ceiling
+equal to the configured state-byte limit; dropping detail retains the coarse
+fact.
+
+Modern connectors supply an opaque `event_id_hex` for each group-change
+occurrence, identical in live delivery and durable replay. Its hash deduplicates
+replays, including after acknowledgement, while distinct changes of the same
+kind remain separate. Older connectors omit this optional field; a bounded
+process-local group/change-kind window suppresses their repeated observations
+before they consume durable capacity. This preserves the earlier legacy
+behavior: distinct same-kind legacy changes may also be suppressed until that
+key leaves the window. Restart clears the legacy window, so it cannot provide
+cross-process occurrence dedupe. Modern connectors do not use this fallback.
+
+An exclusive lock ensures one process owns the store. Restart recovers abandoned
+unaccepted claims and retires durably committed accepted claims. A graceful
+reconnect of the same adapter also preserves acceptance remembered in memory
+when both retirement writes failed. If the process dies after host acceptance
+but before either write succeeds, acceptance cannot be recovered and context may
+replay. The acceptance boundary is Hermes's normal `handle_message` return;
+it does not prove that an agent response completed or reached a recipient.
+
+Optional ambient storage can fail independently of the required real-message
+journal. A coarse restart fact is only a history-change hint: it cannot identify
+a deleted message or establish a rename target. Fetch targeted or older history
+when detail matters. Automatic history is best-effort and returns at most 20
+messages before the triggering message's cursor; a missing or limited page does
+not prove that older context is current. Earlier branch-install ambient schemas
+remain readable.
+
+Ambient acknowledgement consumes optional context at host acceptance even while
+the real-message journal remains `unresolved`. That journal does not automatically
+replay unknown outcomes. Any later external retry does not restore context whose
+ambient claim has already been retired.
+
+The byte setting is a logical row budget. The physical database page ceiling
+adds 64 KiB for schema pages and eight times the logical budget for indexes,
+fragmentation, claim metadata, and temporary acknowledgement overlap; WAL files
+are checkpointed separately. These are distinct limits. Generation fencing and
+connect-failure cleanup are required so late work cannot reopen a closed store.

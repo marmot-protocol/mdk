@@ -1,6 +1,7 @@
 # AGENTS.md - transport-quic-broker
 
-Ephemeral QUIC broker for Marmot agent text stream previews.
+Ephemeral QUIC broker for Marmot agent text stream previews. Human overview, protocol shape, and operator flags:
+[`README.md`](README.md); deployment: `docs/quic-broker-deployment.md`.
 
 ## Scope
 
@@ -42,6 +43,9 @@ at its `transport_quic_broker::` path. The implementation is split by concern:
 | `src/bin/marmot-quic-broker.rs` | the broker daemon binary |
 
 Cross-module internals are `pub(crate)`; only the items re-exported from `src/lib.rs` are `pub`.
+
+When changing a daemon flag or default in `src/bin/marmot-quic-broker.rs` or `src/protocol.rs`, update the README flag
+table and `docs/quic-broker-deployment.md`.
 
 ## Verification
 

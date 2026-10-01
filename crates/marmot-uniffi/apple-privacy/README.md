@@ -1,8 +1,20 @@
 # MarmotKit Apple privacy audit
 
+This directory holds MarmotKit's Apple privacy manifest sources (`PrivacyInfo.xcprivacy`, plus
+`product-analytics.plist` for analytics-enabled builds). This README records the audit behind them: what the SDK
+declares and why, release questions that remain open, how the manifest is packaged and validated, and how a host app
+adopts it. It is for MarmotKit release owners and Apple host-app integrators.
+
 Audit baseline: MDK `b7dc47b12c640a99ed352ef451e0d3430d8d34be`, Cargo.lock,
-Rust 1.97.1, Xcode 27.0 (27A266a), 2026-09-15. This change is for review;
-**it is not an App Store acceptance or release-readiness assertion.**
+Rust 1.97.1, Xcode 27.0 (27A266a), 2026-09-15.
+**This audit is not an App Store acceptance or release-readiness assertion.**
+
+- [Findings and declarations](#findings-and-declarations)
+- [Native API investigation and unresolved release questions](#native-api-investigation-and-unresolved-release-questions)
+- [Packaging contract](#packaging-contract)
+- [Validation](#validation)
+- [White Noise adoption](#white-noise-adoption)
+- [Official sources verified 2026-09-15](#official-sources-verified-2026-09-15)
 
 ## Findings and declarations
 
@@ -92,7 +104,7 @@ immutable; this migration ships only in a new release.
 
 ## Validation
 
-Run `python3 crates/marmot-uniffi/test-apple-privacy.py` for resource-loss, raw-library, provenance and archive regressions.
+Run `python3 crates/marmot-uniffi/test-apple-privacy.py` (`just apple-privacy-gate`) for resource-loss, raw-library, provenance and archive regressions.
 The existing artifact validators check ARM64 slices and native-object deployment targets. The archive fixture consumes
 three release assets, checks their hashes against the release manifest, then creates a Swift wrapper with
 `resources: [.copy("PrivacyInfo.xcprivacy")]`. It invokes real Rust in the app and iOS notification extension.
