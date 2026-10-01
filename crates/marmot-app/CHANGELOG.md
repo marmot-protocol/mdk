@@ -26,6 +26,11 @@
 
 ### Fixed
 
+- v5 audit rows keep the engine's `pre_membership_event`,
+  `app_payload_retention_expired`, `peel_failed_no_snapshot` and
+  `quarantined_group_input_deferred` message reasons instead of writing them
+  as `unclassified`. Older v5 rows with an `unclassified` reason stay
+  ambiguous (#2120).
 - A route change, such as creating or leaving a group, no longer resets
   history recovery for every route. Routes whose own window and required
   relays are unchanged keep their certificates and quiet streak; only changed

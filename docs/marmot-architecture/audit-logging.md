@@ -1226,6 +1226,10 @@ Current `reason` values found in production call sites:
 | `peel_failed_no_snapshot` | Historical stable tag: group-message peel failed and no fallback snapshot could recover it; the outcome is `transport_deferred` and state becomes `peel_deferred`. |
 | `resource_refused_deferred_capacity` | The retained transport-deferred row cap refused an additional object without persisting it. |
 | `resource_refused_retry_budget` | A retained transport-deferred row exhausted its live-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. `retry_count` on this row counts live contexts, the unit the budget is spent in; on every other release reason it counts re-peels performed. |
+| `resource_refused_residence_budget` | A retained transport-deferred row exhausted its durable local residence budget; the row is deleted and `new_state` is `released`. Same-id redelivery stays eligible. |
+| `quarantined_group_input_deferred` | The group is under hydration quarantine; the input is retained as `peel_deferred` for post-repair replay. |
+| `pre_membership_event` | An application message's epoch precedes this device's join epoch; state becomes `failed` without retry. |
+| `predates_local_copy` | The message belongs to group history from before this local copy was installed: either an application message below the install epoch (state becomes `failed`) or a deferred row predating the Welcome released on its budget (`new_state` is `released`, with no resource refusal). |
 | `stale_epoch_no_snapshot` | Stale-epoch peel failed and no fallback snapshot could recover it; state becomes `failed`. |
 | `app_payload_retention_expired` | A message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained app-payload window; state becomes `failed`. |
 | `superseded_by_replacement_welcome` | A verified replacement Welcome discarded this device's live MLS copy, so an unresolved commit retained below the new copy's epoch can never be applied; state becomes `epoch_invalidated`. |
@@ -1236,6 +1240,12 @@ Metadata notes:
   group attribution only when the existing message record cannot be read; otherwise it uses that record's `group_id`.
 - Re-persisting a message with the same `group_id`, `epoch`, and `MessageState` does not emit another
   `message_state_changed` row; this keeps repeated deferred-peel retries from producing duplicate diagnostics.
+- The reasons above are the `MessageDisposition` tags in `crates/cgka-engine/src/message_disposition.rs` plus the
+  literal call-site reasons. v5 keeps each one verbatim on `reason` (here and on `rejection`); the engine test
+  `every_disposition_tag_survives_v5_recording` fails if a new tag is missing from the v5 allowlist. v5 rows written
+  before mdk#2120 recorded `pre_membership_event`, `app_payload_retention_expired`, `peel_failed_no_snapshot`, and
+  `quarantined_group_input_deferred` as `unclassified`; an older `unclassified` reason is therefore ambiguous and must
+  not be attributed to any one of them.
 
 ### `rejection`
 

@@ -65,3 +65,96 @@ impl MessageDisposition {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MessageDisposition;
+    use cgka_traits::message::MessageState;
+    use marmot_forensics::v5::{self, BuildProfile, Platform, Producer};
+    use marmot_forensics::{AuditEventKind, AuditRecord, ForensicRecorder, JsonlRecorder};
+
+    const ALL: [MessageDisposition; 8] = [
+        MessageDisposition::PreMembershipEvent,
+        MessageDisposition::AppPayloadRetentionExpired,
+        MessageDisposition::PredatesLocalCopy,
+        MessageDisposition::RetryPending,
+        MessageDisposition::RetryBudgetRefused,
+        MessageDisposition::ResidenceBudgetRefused,
+        MessageDisposition::DeferredCapacityRefused,
+        MessageDisposition::Quarantined,
+    ];
+
+    /// A new variant fails to compile here until it is added to `ALL`, so the
+    /// v5 parity test below cannot silently skip it.
+    #[allow(dead_code)]
+    fn all_is_exhaustive(disposition: MessageDisposition) {
+        match disposition {
+            MessageDisposition::PreMembershipEvent
+            | MessageDisposition::AppPayloadRetentionExpired
+            | MessageDisposition::PredatesLocalCopy
+            | MessageDisposition::RetryPending
+            | MessageDisposition::RetryBudgetRefused
+            | MessageDisposition::ResidenceBudgetRefused
+            | MessageDisposition::DeferredCapacityRefused
+            | MessageDisposition::Quarantined => {}
+        }
+    }
+
+    /// Every tag is a closed category the v5 audit boundary keeps verbatim,
+    /// on both fields that carry it, instead of redacting it to
+    /// `unclassified` (mdk#2120).
+    #[test]
+    fn every_disposition_tag_survives_v5_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_id = "11".repeat(16);
+        let path = marmot_forensics::default_v5_jsonl_path(dir.path(), &engine_id);
+        let recorder = JsonlRecorder::open_v5_with_account_ref(
+            &path,
+            engine_id,
+            None,
+            Producer {
+                mdk_revision: None,
+                build_profile: BuildProfile::Debug,
+                platform: Platform::Other,
+                host_build: None,
+            },
+        )
+        .unwrap();
+        let msg_id = "ab".repeat(32);
+        for disposition in ALL {
+            recorder.record(AuditRecord::new(
+                None,
+                crate::audit_helpers::message_state_changed_event(
+                    msg_id.clone(),
+                    MessageState::PeelDeferred,
+                    disposition.tag(),
+                ),
+            ));
+            recorder.record(AuditRecord::new(
+                None,
+                AuditEventKind::Rejection {
+                    msg_id: msg_id.clone(),
+                    reason: disposition.tag().to_owned(),
+                },
+            ));
+        }
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let mut state_reasons = Vec::new();
+        let mut rejection_reasons = Vec::new();
+        for line in body.lines() {
+            v5::Record::from_json(line.as_bytes()).unwrap();
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let event = &row["event"];
+            let reason = event["reason"].as_str().map(str::to_owned);
+            match event["type"].as_str() {
+                Some("message_state_changed") => state_reasons.extend(reason),
+                Some("rejection") => rejection_reasons.extend(reason),
+                _ => {}
+            }
+        }
+        let expected: Vec<String> = ALL.iter().map(|d| d.tag().to_owned()).collect();
+        assert_eq!(state_reasons, expected);
+        assert_eq!(rejection_reasons, expected);
+    }
+}

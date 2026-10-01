@@ -410,6 +410,12 @@ fn safe_failure_category(input: &str) -> String {
         | "join_welcome_repair"
         | "recipient_confirmed_rejoin"
         | "join_welcome"
+        // `cgka_engine::MessageDisposition` tags not listed above. The engine
+        // test `every_disposition_tag_survives_v5_recording` pins the parity.
+        | "pre_membership_event"
+        | "app_payload_retention_expired"
+        | "peel_failed_no_snapshot"
+        | "quarantined_group_input_deferred"
         | "unclassified" => input.to_owned(),
         "fanout adapter error" => "fanout_adapter_error".to_owned(),
         "fanout endpoint did not acknowledge" => "fanout_endpoint_did_not_acknowledge".to_owned(),
@@ -873,6 +879,24 @@ mod tests {
             let mut event = json!({"type": "epoch_stall_backfill_failed", "error_kind": category});
             protect(&mut event).unwrap();
             assert_eq!(event["error_kind"], category);
+        }
+        // Engine message-disposition tags (mdk#2120).
+        for category in [
+            "pre_membership_event",
+            "app_payload_retention_expired",
+            "predates_local_copy",
+            "peel_failed_no_snapshot",
+            "resource_refused_retry_budget",
+            "resource_refused_residence_budget",
+            "resource_refused_deferred_capacity",
+            "quarantined_group_input_deferred",
+        ] {
+            let mut event = json!({"type": "message_state_changed", "reason": category});
+            protect(&mut event).unwrap();
+            assert_eq!(event["reason"], category);
+            let mut event = json!({"type": "rejection", "reason": category});
+            protect(&mut event).unwrap();
+            assert_eq!(event["reason"], category);
         }
     }
 
