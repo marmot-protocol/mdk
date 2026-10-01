@@ -11577,6 +11577,18 @@ MarmotStatus marmot_control_attachment(const struct MarmotClient *client,
                                        bool *out);
 
 /**
+ * Join/promote the current slot without resetting retry budgets or backoff.
+ * Cancellation/removal require separate recovery; NULL result is unavailable.
+ * # Safety
+ * Client, strings and target must be live; out writable. Free returned string with marmot_string_free.
+ */
+MarmotStatus marmot_request_explicit_attachment(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *group_id_hex,
+                                                const struct MarmotAttachmentLocalTarget *target,
+                                                char **out);
+
+/**
  * Explicitly request the current slot, including after cancellation/removal. NULL result is unavailable.
  * # Safety
  * Client, strings and target must be live; out writable. Free returned string with marmot_string_free.

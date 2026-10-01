@@ -146,6 +146,36 @@ pub unsafe extern "C" fn marmot_control_attachment(
         }
     })
 }
+/// Join/promote the current slot without resetting retry budgets or backoff.
+/// Cancellation/removal require separate recovery; NULL result is unavailable.
+/// # Safety
+/// Client, strings and target must be live; out writable. Free returned string with marmot_string_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_request_explicit_attachment(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    target: *const MarmotAttachmentLocalTarget,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let target = try_arg!(unsafe { read_targets(target, 1) }).remove(0);
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        unsafe {
+            deliver_opt_string(
+                client.block_on(
+                    client
+                        .marmot
+                        .request_explicit_attachment(account, group, target),
+                ),
+                out,
+            )
+        }
+    })
+}
 /// Explicitly request the current slot, including after cancellation/removal. NULL result is unavailable.
 /// # Safety
 /// Client, strings and target must be live; out writable. Free returned string with marmot_string_free.

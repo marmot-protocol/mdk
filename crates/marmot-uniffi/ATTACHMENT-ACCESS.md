@@ -111,6 +111,20 @@ work (Retry, download-again) starts a fresh window and derives a missing key fro
 retained MLS state for that epoch (the newest five epochs), so Retry recovers attachments whose
 key was never cached.
 
+### Ordinary interactive demand
+
+Prefer local assets first. On a missing retained source, `requestExplicitAttachment`
+(`marmot_request_explicit_attachment` in C) atomically creates demand or upgrades a
+live automatic job. Repeated taps preserve retry budgets, scheduled backoff, partial
+progress and the current HTTP owner. The returned reference is intent, not readiness;
+observe transfer state. A queued tap receives native explicit priority at the next
+allowed admission opportunity. Migration 100 preserves that priority through source
+reprojection. Promotion does not preempt another transfer, extend an active automatic
+attempt's two-minute deadline, or increase its original size ceiling. Subsequent
+explicit admission uses the existing explicit limits. Permission-paused readmission
+respects `max(now, retry_not_before)`. Cancelled/removed/failed/exhausted work requires
+its deliberate Retry or Download again action. Observation alone conveys no intent.
+
 `attachmentDownloadPolicy` / `setAttachmentDownloadPolicy` read/write a durable per-account
 policy. In `NativeAutomatic` mode automatic acquisition defaults on: 2 GiB retained quota, 256 MiB free-disk reserve plus
 SQLite/WAL headroom, 64 MiB automatic ciphertext ceiling, one runtime-wide acquisition at a time.

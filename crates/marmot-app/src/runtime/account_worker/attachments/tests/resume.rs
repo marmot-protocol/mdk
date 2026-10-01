@@ -71,6 +71,7 @@ fn resume_context(
     reference: &crate::MediaAttachmentReference,
 ) -> AttachmentResume {
     AttachmentResume {
+        explicit_permission: Default::default(),
         automatic: true,
         permission: None,
         finishing: Default::default(),
@@ -1724,4 +1725,129 @@ async fn attachment_missing_on_every_locator_fails_without_retry() {
             .unwrap()
     );
     servers.await.unwrap();
+}
+
+/// A tap during a held HTTP body preserves its owner and deadline after revoking
+/// automatic permission; completion consumes exactly the original response.
+#[tokio::test]
+async fn attachment_promoted_http_body_survives_automatic_revocation() {
+    for pause_first in [false, true] {
+        promoted_body_revocation_order(pause_first).await;
+    }
+}
+
+/// Exercise both serialized pause/promotion orders while one HTTP body is held.
+async fn promoted_body_revocation_order(pause_first: bool) {
+    let body = b"explicit retained streamed body";
+    let (mut reference, ciphertext) = crate::media::tests::attachment_worker_fixture(body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let (started, start) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    ciphertext.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&ciphertext[..1]).await.unwrap();
+        started.send(()).unwrap();
+        released.await.unwrap();
+        socket.write_all(&ciphertext[1..]).await.unwrap();
+        drop(socket);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "no duplicate HTTP body"
+        );
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (mut client, store) = client_at(dir.path(), &reference, true).await;
+    client.app.config.attachment_acquisition_mode = crate::AttachmentAcquisitionMode::HostManaged;
+    let runtime = client.app.runtime();
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission("alice", generation, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    let job = claim(&store);
+    let deadline = store
+        .attachment_acquisition_status(&job.reference)
+        .unwrap()
+        .unwrap()
+        .due;
+    let mut resume = resume_context(&store, &job, dir.path(), &reference);
+    resume.permission = runtime.shared.attachment_permissions.lease(
+        &store.attachment_store_identity().unwrap(),
+        &reference.media_type,
+    );
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference,
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let transfer = tokio::spawn(prepared.run_classified(resume));
+    start.await.unwrap();
+    if pause_first {
+        // Freeze the durable pause before upgrading intent; the HTTP poll stays
+        // held so the test controls the storage race rather than timer ordering.
+        store
+            .pause_automatic_attachments(crate::unix_now_seconds())
+            .unwrap();
+    }
+    assert!(
+        store
+            .promote_attachment_demand(&job.reference, crate::unix_now_seconds())
+            .unwrap()
+    );
+    runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    let result = transfer.await.unwrap().unwrap();
+    assert_eq!(result.plaintext, body);
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&job.reference)
+            .unwrap()
+            .unwrap()
+            .due,
+        deadline
+    );
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(
+                &job,
+                &result.plaintext,
+                crate::unix_now_seconds(),
+                128 * 1024 * 1024
+            )
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    server.await.unwrap();
 }

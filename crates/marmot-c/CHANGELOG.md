@@ -9,6 +9,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_request_explicit_attachment` joins/promotes eligible attachment demand without resetting retry budgets, backoff or active deadlines. Requires the matching header and library; deliberate Retry/Download again remain separate operations.
+
 - `marmot_create_identity`, `marmot_create_identity_with_profile`,
   `marmot_login`, `marmot_login_recovering_incomplete_setup`,
   `marmot_publish_relay_lists` and `marmot_begin_onboarding` take a trailing

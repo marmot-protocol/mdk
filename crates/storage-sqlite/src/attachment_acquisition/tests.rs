@@ -2730,3 +2730,5 @@ fn attachment_idle_permission_resume_is_read_only() {
         0
     );
 }
+
+mod promotion;

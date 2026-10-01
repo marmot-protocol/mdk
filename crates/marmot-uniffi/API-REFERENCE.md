@@ -605,6 +605,16 @@ Validate and persist acquisition policy; disabling automatic work preserves expl
 
 [Source](src/commands/attachment_controls.rs#L74)
 
+### `Marmot::request_explicit_attachment`
+
+```rust
+pub async fn request_explicit_attachment( &self, account_ref: String, group_id_hex: String, target: AttachmentLocalTargetFfi, ) -> Result<Option<String>, MarmotKitError>
+```
+
+Join a current source or promote automatic demand to explicit priority without resetting retry budgets or scheduled backoff. Use this for ordinary interactive demand; reserve `control_attachment(Retry)` and `download_attachment_again` for deliberate recovery. A returned opaque reference does not promise readiness: inspect transfer state and prefer local assets first. Active attempts retain their original size limit and deadline; promotion changes subsequent admission, not the existing transport budget. Cancelled, removed, exhausted and failed sources are not rearmed.
+
+[Source](src/commands/attachment_controls.rs#L101)
+
 ### `Marmot::control_attachment`
 
 **Current.**
@@ -627,7 +637,7 @@ pub async fn download_attachment_again( &self, account_ref: String, group_id_hex
 
 Queue explicit acquisition for a current original source slot, clearing removal/cancellation; no reference means unavailable or obsolete.
 
-[Source](src/commands/attachment_controls.rs#L98)
+[Source](src/commands/attachment_controls.rs#L115)
 
 ### `Marmot::attachment_transfer_snapshot`
 
@@ -639,7 +649,7 @@ pub async fn attachment_transfer_snapshot( &self, account_ref: String, group_id_
 
 Read bounded transfer state for up to 64 source slots in one group without requesting a transfer.
 
-[Source](src/commands/attachment_controls.rs#L111)
+[Source](src/commands/attachment_controls.rs#L128)
 
 ### `Marmot::subscribe_attachment_transfers`
 
@@ -651,7 +661,7 @@ pub async fn subscribe_attachment_transfers( &self, account_ref: String, group_i
 
 Observe initial transfer state and coalesced complete replacements for bounded source slots; observation does not request a transfer.
 
-[Source](src/commands/attachment_controls.rs#L133)
+[Source](src/commands/attachment_controls.rs#L150)
 
 </details>
 

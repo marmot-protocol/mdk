@@ -1101,3 +1101,109 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
         storage_sqlite::AttachmentTransferState::PolicyBlocked
     );
 }
+
+/// Explicit promotion detaches automatic permission while retaining the same
+/// transport lease; later deliberate cancellation still stops that attempt.
+#[tokio::test]
+async fn promoted_attempt_survives_automatic_revocation_without_extending_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig {
+            attachment_acquisition_mode: crate::AttachmentAcquisitionMode::HostManaged,
+            ..Default::default()
+        },
+    );
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission(
+                "alice",
+                generation,
+                crate::AttachmentAutomaticPermission {
+                    images: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+    );
+    let storage = app.account_storage("alice").unwrap();
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"promotion bytes");
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!("https://blob.example/{}", reference.ciphertext_sha256),
+    }];
+    seed(&storage, &reference, false);
+    let now = crate::unix_now_seconds();
+    let selected = storage
+        .attachment_history_page(GROUP, 1, None)
+        .unwrap()
+        .entries
+        .remove(0);
+    let storage_sqlite::AttachmentDemand::Requested(asset) = storage
+        .request_attachment_acquisition(
+            GROUP,
+            &selected,
+            crate::media::media_hash_from_reference(&reference).unwrap(),
+            now,
+        )
+        .unwrap()
+    else {
+        panic!("request")
+    };
+    let job = storage
+        .claim_attachment_acquisition(&asset, now, now + 180)
+        .unwrap()
+        .unwrap();
+    let deadline = storage
+        .attachment_acquisition_status(&asset)
+        .unwrap()
+        .unwrap()
+        .due;
+    let identity = storage.attachment_store_identity().unwrap();
+    let permission = runtime
+        .shared
+        .attachment_permissions
+        .lease(&identity, "image/png")
+        .unwrap();
+    assert!(storage.promote_attachment_demand(&asset, now).unwrap());
+    runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(!permission.allowed());
+    let (_, updates) = watch::channel(());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            cancelled(storage.clone(), job.clone(), updates, Some(permission))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        storage
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .due,
+        deadline
+    );
+    storage.cancel_attachment_acquisition(&asset).unwrap();
+    let (_, updates) = watch::channel(());
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        cancelled(storage, job, updates, None),
+    )
+    .await
+    .unwrap();
+}

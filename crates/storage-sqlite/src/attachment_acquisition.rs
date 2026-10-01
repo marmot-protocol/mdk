@@ -426,7 +426,7 @@ impl SqliteAccountStorage {
         if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
             return Err(invalid("invalid attachment resume limit"));
         }
-        self.lock()?.execute("UPDATE attachment_acquisition SET state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN 4 WHEN permission_paused=1 THEN 5 ELSE 0 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?1 END,attempt=NULL
+        self.lock()?.execute("UPDATE attachment_acquisition SET acquisition_attempts=max(0,acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 THEN 1 ELSE 0 END),state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 THEN 1 ELSE 0 END>=4) THEN 4 WHEN permission_paused=1 THEN 5 ELSE 0 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 THEN 1 ELSE 0 END>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?1 END,attempt=NULL
             WHERE token IN (SELECT token FROM attachment_acquisition WHERE state=1 ORDER BY token LIMIT ?2)",
             params![u64_to_i64(now)?,limit as i64]).storage()
     }
@@ -711,7 +711,7 @@ impl SqliteAccountStorage {
         }
         Ok(conn
             .execute(
-                "UPDATE attachment_acquisition SET state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN 4 WHEN permission_paused=1 AND ?4 IS NOT NULL THEN 5 ELSE ?3 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?4 END,retry_not_before=CASE WHEN permission_paused=1 THEN COALESCE(?4,retry_not_before) ELSE retry_not_before END,permission_paused=CASE WHEN ?4 IS NULL OR (automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4)) THEN 0 ELSE permission_paused END,attempt=NULL
+                "UPDATE attachment_acquisition SET acquisition_attempts=max(0,acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 AND ?4 IS NOT NULL THEN 1 ELSE 0 END),state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 AND ?4 IS NOT NULL THEN 1 ELSE 0 END>=4) THEN 4 WHEN permission_paused=1 AND ?4 IS NOT NULL THEN 5 ELSE ?3 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 AND ?4 IS NOT NULL THEN 1 ELSE 0 END>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?4 END,retry_not_before=CASE WHEN permission_paused=1 THEN COALESCE(?4,retry_not_before) ELSE retry_not_before END,permission_paused=CASE WHEN ?4 IS NULL OR (automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 AND ?4 IS NOT NULL THEN 1 ELSE 0 END>=4)) THEN 0 ELSE permission_paused END,attempt=NULL
              WHERE token=?1 AND state=1 AND attempt=?2",
                 params![
                     job.reference.token,

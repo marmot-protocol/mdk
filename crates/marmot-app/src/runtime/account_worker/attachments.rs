@@ -87,18 +87,21 @@ async fn cancelled(
     permission: Option<super::super::attachment_permission::PermissionLease>,
 ) {
     loop {
-        if permission.as_ref().is_some_and(|p| !p.allowed()) {
-            return;
-        }
         let store = storage.clone();
         let current = job.clone();
         let active = tokio::task::spawn_blocking(move || {
-            store.attachment_transfer_is_active(&current, crate::unix_now_seconds())
+            Ok::<_, cgka_traits::StorageError>((
+                store.attachment_transfer_is_active(&current, crate::unix_now_seconds())?,
+                store.attachment_request_is_explicit(&current.reference)?,
+            ))
         })
         .await;
         // Failure to observe is not cancellation. The transfer deadline and
         // publication fence still bound work while a storage read is unavailable.
-        if matches!(active, Ok(Ok(false))) {
+        if matches!(active, Ok(Ok((false, _))))
+            || (permission.as_ref().is_some_and(|p| !p.allowed())
+                && !matches!(active, Ok(Ok((_, true)))))
+        {
             return;
         }
         tokio::select! {
@@ -305,6 +308,7 @@ pub(super) fn schedule(
         };
         let byte_budget = policy.retained_bytes;
         let resume = crate::media::attachment_resume::AttachmentResume {
+            explicit_permission: Default::default(),
             storage: storage.clone(),
             job: job.clone(),
             ciphertext_digest,

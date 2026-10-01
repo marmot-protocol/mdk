@@ -830,7 +830,7 @@ MarmotStatus marmot_attachment_transfer_snapshot(const struct MarmotClient *clie
 
 Read up to 64 progress entries in input order. No network demand is created. # Safety Inputs must be live; targets may be NULL only for zero length; out writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotattachment_transfer_snapshot) · [Header contract](include/marmot.h#L11595)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotattachment_transfer_snapshot) · [Header contract](include/marmot.h#L11607)
 
 ### `marmot_group_app_component_free`
 
@@ -1702,6 +1702,16 @@ Free a value of this type returned by this library. NULL is a no-op.
 
 [Header contract](include/marmot.h#L11518)
 
+### `marmot_request_explicit_attachment`
+
+```c
+MarmotStatus marmot_request_explicit_attachment(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const struct MarmotAttachmentLocalTarget *target, char **out);
+```
+
+Blocking equivalent of [explicit demand](../marmot-uniffi/API-REFERENCE.md#marmotrequest_explicit_attachment). Joins/promotes without resetting budgets, backoff or active deadlines. Inputs are borrowed; free the optional opaque result with `marmot_string_free`. NULL means unavailable/suppressed, not a transfer failure. Use separate Retry/Download again operations for deliberate recovery.
+
+[Header contract](include/marmot.h#L11585)
+
 ### `marmot_control_attachment`
 
 ```c
@@ -1905,7 +1915,7 @@ MarmotStatus marmot_download_attachment_again(const struct MarmotClient *client,
 
 Explicitly request the current slot, including after cancellation/removal. NULL result is unavailable. # Safety Client, strings and target must be live; out writable. Free returned string with marmot_string_free.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotdownload_attachment_again) · [Header contract](include/marmot.h#L11584)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotdownload_attachment_again) · [Header contract](include/marmot.h#L11596)
 
 </details>
 
@@ -4864,7 +4874,7 @@ void marmot_automatic_attachment_request_free(struct MarmotAutomaticAttachmentRe
 
 Deep-free the returned automatic-request record and its nested status/reference. NULL is a no-op; do not free nested fields separately.
 
-[Header contract](include/marmot.h#L11610)
+[Header contract](include/marmot.h#L11622)
 
 ### `marmot_begin_attachment_permission_update`
 
@@ -4874,7 +4884,7 @@ MarmotStatus marmot_begin_attachment_permission_update(const struct MarmotClient
 
 Blocking revocation and generation issuance for HostManaged mode. Inputs are borrowed; free the returned generation with marmot_string_free. Call before asynchronous policy evaluation and keep the token with that evaluation. See the [shared permission contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Header contract](include/marmot.h#L11617)
+[Header contract](include/marmot.h#L11629)
 
 ### `marmot_request_automatic_attachment`
 
@@ -4884,7 +4894,7 @@ MarmotStatus marmot_request_automatic_attachment(const struct MarmotClient *clie
 
 Blocking, idempotent automatic demand for the exact source slot. Inputs are borrowed; free the returned status/result with marmot_automatic_attachment_request_free. Repeated requests preserve suppression, acquisition history and retry budgets. See the [migration contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#android-migration).
 
-[Header contract](include/marmot.h#L11637)
+[Header contract](include/marmot.h#L11649)
 
 ### `marmot_set_attachment_automatic_permission`
 
@@ -4894,7 +4904,7 @@ MarmotStatus marmot_set_attachment_automatic_permission(const struct MarmotClien
 
 Blocking application of runtime-only category permission. All inputs are borrowed; boolean input integers use nonzero for true. False output means the generation was stale, foreign or already consumed. Required output validation occurs before mutation. See the [shared permission contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Header contract](include/marmot.h#L11626)
+[Header contract](include/marmot.h#L11638)
 
 </details>
 
@@ -5078,6 +5088,3 @@ Configure or disable the dedicated v5 OTLP sender in memory. To enable, supply a
 [Header contract](include/marmot.h#L8265)
 
 </details>
-
-<details>
-<summary>New exports — complete and organize before merging</summary>

@@ -86,6 +86,48 @@ impl MarmotAppRuntime {
         self.wake_attachment_work();
         Ok(changed)
     }
+    /// Join or promote the current source without retrying cancelled/failed
+    /// work, resetting budgets or extending an active transfer deadline.
+    /// A retained source remains local; use Retry/Download again for recovery.
+    pub async fn request_explicit_attachment(
+        &self,
+        account_ref: &str,
+        group: &GroupId,
+        mut target: AttachmentLocalTarget,
+    ) -> Result<Option<AttachmentAssetRef>, AppError> {
+        super::attachment_access::validate_targets(std::slice::from_mut(&mut target))?;
+        let group = hex::encode(group.as_slice());
+        let result = self
+            .attachment_read(account_ref, move |s, loopback| {
+                let now = crate::unix_now_seconds();
+                let Some(entry) = s.attachment_control_entry(
+                    &group,
+                    &target.message_id_hex,
+                    &target.source_message_id_hex,
+                    target.attachment_index,
+                    now,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(epoch) = entry.source_epoch else {
+                    return Ok(None);
+                };
+                let tag: Vec<String> =
+                    serde_json::from_value(entry.slot.clone()).map_err(|_| {
+                        AppError::InvalidEncryptedMedia("invalid attachment slot".into())
+                    })?;
+                let parsed = crate::parse_media_attachment(&tag, Some(epoch), loopback)?;
+                let digest = crate::media::media_hash_from_reference(&parsed)?;
+                match s.request_explicit_attachment(&group, &entry, digest, now)? {
+                    storage_sqlite::AttachmentDemand::Requested(reference) => Ok(Some(reference)),
+                    _ => Ok(None),
+                }
+            })
+            .await?;
+        self.wake_attachment_work();
+        Ok(result)
+    }
     /// Explicitly request the exact current source, clearing removal/cancellation.
     /// This persists demand; it does not wait for a worker or network readiness.
     pub async fn download_attachment_again(

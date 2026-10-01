@@ -30,6 +30,8 @@ pub(crate) struct AttachmentResume {
     pub directory: PathBuf,
     pub policy: storage_sqlite::AttachmentDownloadPolicy,
     pub automatic: bool,
+    /// Cache the monotonic explicit-intent upgrade, scoped to this attempt.
+    pub explicit_permission: Arc<AtomicBool>,
     pub permission: Option<crate::runtime::attachment_permission::PermissionLease>,
     /// Once verification finishes, cancellation waits for the receipt and result.
     pub finishing: Arc<AtomicBool>,
@@ -49,30 +51,67 @@ pub(crate) enum NetworkPollError<E> {
 }
 
 impl AttachmentResume {
+    /// Resolve revoked automatic permission against durable explicit intent once.
+    /// Attempt/source/cancellation fences still apply at every admission/publication.
+    async fn promoted_permission(&self) -> bool {
+        if self.explicit_permission.load(Ordering::Acquire) {
+            return true;
+        }
+        let this = self.clone();
+        let promoted = tokio::task::spawn_blocking(move || {
+            Ok::<_, cgka_traits::StorageError>(
+                this.storage
+                    .attachment_request_is_explicit(&this.job.reference)?
+                    && this
+                        .storage
+                        .attachment_transfer_is_active(&this.job, crate::unix_now_seconds())?,
+            )
+        })
+        .await;
+        if matches!(promoted, Ok(Ok(true))) {
+            self.explicit_permission.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    /// Check automatic approval before polling HTTP, honoring a durable upgrade
+    /// without changing this transport's original size or deadline.
     pub(crate) async fn with_permission<F, T, E>(&self, future: F) -> Result<T, NetworkPollError<E>>
     where
         F: Future<Output = Result<T, E>>,
     {
         let mut future = std::pin::pin!(future);
-        std::future::poll_fn(|cx| {
-            if self
-                .permission
-                .as_ref()
-                .is_some_and(|permission| !permission.allowed())
+        loop {
+            let result = std::future::poll_fn(|cx| {
+                if !self.explicit_permission.load(Ordering::Acquire)
+                    && self
+                        .permission
+                        .as_ref()
+                        .is_some_and(|permission| !permission.allowed())
+                {
+                    return Poll::Ready(Err(NetworkPollError::Revoked(retry(
+                        "automatic attachment permission revoked",
+                    ))));
+                }
+                future
+                    .as_mut()
+                    .poll(cx)
+                    .map(|result| result.map_err(NetworkPollError::Operation))
+            })
+            .await;
+            if matches!(result, Err(NetworkPollError::Revoked(_)))
+                && self.promoted_permission().await
             {
-                return Poll::Ready(Err(NetworkPollError::Revoked(retry(
-                    "automatic attachment permission revoked",
-                ))));
+                continue;
             }
-            future
-                .as_mut()
-                .poll(cx)
-                .map(|result| result.map_err(NetworkPollError::Operation))
-        })
-        .await
+            return result;
+        }
     }
     pub(crate) async fn before_network(&self) -> Result<(), AttachmentDownloadFailure> {
-        if self.permission.as_ref().is_some_and(|p| !p.allowed()) {
+        if self.permission.as_ref().is_some_and(|p| !p.allowed())
+            && !self.promoted_permission().await
+        {
             return Err(retry("automatic attachment permission revoked"));
         }
         let this = self.clone();
