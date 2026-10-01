@@ -195,6 +195,7 @@ async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
     let expected_body_bytes = ciphertext.len();
     let served_body_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let server_body_bytes = Arc::clone(&served_body_bytes);
+    let (stop_observing, observation_complete) = oneshot::channel::<()>();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     reference.locators = vec![crate::MediaLocator {
         kind: "blossom-v1".into(),
@@ -221,12 +222,11 @@ async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
         socket.write_all(&ciphertext).await.unwrap();
         server_body_bytes.fetch_add(ciphertext.len(), std::sync::atomic::Ordering::SeqCst);
         drop(socket);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), listener.accept())
-                .await
-                .is_err(),
-            "a retained return must not request another ciphertext body"
-        );
+        tokio::select! {
+            biased;
+            connection = listener.accept() => panic!("retained return requested another ciphertext body: {connection:?}"),
+            _ = observation_complete => {}
+        }
     });
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -378,6 +378,7 @@ async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
             .unwrap(),
         b"retained worker bytes"
     );
+    stop_observing.send(()).unwrap();
     server.await.unwrap();
     assert_eq!(
         served_body_bytes.load(std::sync::atomic::Ordering::SeqCst),
