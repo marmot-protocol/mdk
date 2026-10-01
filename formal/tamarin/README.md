@@ -265,13 +265,9 @@ fairness, resource exhaustion, or unbounded self-update traffic.
 
 ## Policy Cases
 
-For bounded policy seeds, update `policy_cases.json` first. Then check both consumers and the drift test that compares
-generated Tamarin definitions with the committed model:
-
-```sh
-cargo test -p cgka-conformance-simulator --test generated_policy_cases --test policy_case_tamarin_drift
-just policy-casegen
-```
+Bounded policy seeds live in `policy_cases.json`. `just policy-casegen` regenerates the Tamarin seed rules from it, and
+the `generated_policy_cases` and `policy_case_tamarin_drift` simulator tests check that the Rust consumer and the committed
+model stay in step. The edit-and-verify sequence is in [`AGENTS.md`](AGENTS.md).
 
 The six-rule adjacency cases stay grep-aligned across both consumers:
 

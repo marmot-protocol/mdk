@@ -112,16 +112,9 @@ These tests cover the engine boundary with one or a few `Engine<SqliteAccountSto
 SQLite and a mock peeler: command validation, snapshot persistence, processed-message idempotency, restart behavior,
 and the exact outputs of a single engine call. [`tests/AGENTS.md`](tests/AGENTS.md) maps the files.
 
-When a change touches convergence, delivery, branch selection, group data, or anything involving more than one client,
-also run the [conformance simulator](../cgka-conformance-simulator/README.md), which drives real engines through an
-in-memory transport bus with the Nostr peeler and checks they converge after realistic delivery faults:
-
-```sh
-cargo test -p cgka-conformance-simulator
-cargo test -p cgka-conformance-simulator --features conformance-slow
-```
-
-Use this crate's tests to prove an engine method does the right thing; use the simulator to prove many engines still
+Multi-client behavior is covered by the [conformance simulator](../cgka-conformance-simulator/README.md), which drives
+real engines through an in-memory transport bus with the Nostr peeler and checks they converge after realistic delivery
+faults. Use this crate's tests to prove an engine method does the right thing; use the simulator to prove many engines still
 agree after the world gets messy.
 
 **Speculative replay transactions and resumable reconstruction.** Regression, crash, and paired measurement runs:

@@ -17,7 +17,9 @@ come from `cgka-traits`.
     zero-candidate starts and unusable live routes); only provisional writes fail closed.
 - Validates an optional `StreamFinishExpectation` inside the session before teardown. A mismatch returns an error and
   leaves the session running, so finish is retryable.
-- Publishes a live `Abort` record on cancel so online subscribers observe the terminal cancellation.
+- On cancel, publishes a live `Abort` record when a live publisher is available (a pending broker connection gets a
+  short grace period to land) so online subscribers observe the terminal cancellation. If that connection fails or
+  times out, cancellation completes without a live `Abort`.
 - Reuses canonical record tags, plaintext frame caps, and progress/delta semantics from
   `cgka_traits::agent_text_stream`.
 

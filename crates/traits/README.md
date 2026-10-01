@@ -66,8 +66,7 @@ cargo test -p cgka-traits
 cargo bench -p cgka-traits --bench stored_message_codec
 ```
 
-`tests/snapshots.rs` uses `insta` to lock the JSON / debug shape of cross-boundary value types. After a deliberate shape
-change, run `cargo insta review`.
+`tests/snapshots.rs` uses `insta` to lock the JSON / debug shape of cross-boundary value types.
 
 ## Stability
 

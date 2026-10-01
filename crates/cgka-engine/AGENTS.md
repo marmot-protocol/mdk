@@ -457,6 +457,12 @@ cargo test -p cgka-engine --features test-policy-overrides   # suites that insta
 just test-convergence-policy-pin                            # default-build v1 policy pin; never with overrides
 ```
 
-Run the conformance simulator (`cargo test -p cgka-conformance-simulator`) for convergence, delivery, branch-selection,
-group-data, or multi-client changes. More targeted commands are in [`README.md`](README.md#tests-and-measurements) and
+For convergence, delivery, branch-selection, group-data, or multi-client changes, also run the conformance simulator:
+
+```sh
+cargo test -p cgka-conformance-simulator
+cargo test -p cgka-conformance-simulator --features conformance-slow
+```
+
+Benchmarks and per-file targets are in [`README.md`](README.md#tests-and-measurements) and
 [`tests/AGENTS.md`](tests/AGENTS.md).
