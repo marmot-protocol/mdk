@@ -46,8 +46,11 @@
   own messaging relays could see an existing identity's lists as missing and
   be offered (or automatically approve) a defaults-only replacement. A
   missing list is now concluded, and a repair approved, only when every
-  searched relay, indexers included, answers. Indexers use only the
-  inspection slots left after the host's and the account's declared relays.
+  searched relay, indexers included, answers. Indexers are dialed on top of
+  the 16-relay inspection cap, so they neither displace the host's or the
+  account's declared relays nor get dropped themselves. A repair publishes
+  only to the sources inspected when it was approved; a repair approved
+  before this release keeps its original, indexer-free destinations.
   A host-selected set from `set_onboarding_discovery_relays` is used as given,
   without indexers, so an unreachable indexer can be bypassed. Loopback
   (development) routes are unchanged, and the KeyPackage device check keeps

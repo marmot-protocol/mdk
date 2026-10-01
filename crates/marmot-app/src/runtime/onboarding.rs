@@ -261,6 +261,11 @@ struct OnboardingCheckpoint {
     // so a host can still look past an unreachable indexer.
     #[serde(default)]
     explicit_discovery: bool,
+    // The sources inspected when the repair was approved. A retry publishes
+    // only there. None on a repair approved before these were recorded: its
+    // retry keeps the original, indexer-free destinations.
+    #[serde(default)]
+    approved_sources: Option<Vec<String>>,
 }
 
 pub struct OnboardingSubscription {
@@ -351,6 +356,7 @@ impl OnboardingCheckpoint {
             setup_cleanup_pending: false,
             attempt_start_revision: 0,
             explicit_discovery: false,
+            approved_sources: None,
         }
     }
     fn new_attempt(
@@ -1632,6 +1638,13 @@ impl AccountManager {
         let classifications = self.app.relay_plane.classify_relay_endpoints(endpoints);
         let mut failures = Vec::new();
         let mut seen = HashSet::new();
+        // Public indexers are dialed on top of the cap, so they never take a
+        // host or declared relay's slot and are never dropped themselves.
+        let indexers: HashSet<String> = default_directory_discovery_relays()
+            .iter()
+            .map(|endpoint| relay_key(&endpoint.0))
+            .collect();
+        let mut capped = 0;
         for c in classifications {
             // Retain Tor declarations, but never send them to the direct dialer.
             if is_onion_relay(&c.endpoint) {
@@ -1661,9 +1674,14 @@ impl AccountManager {
             if !seen.insert(url) {
                 continue;
             }
-            if seen.len() > MAX_RELAYS {
-                failures.push(finding(OnboardingIssue::TooManyRelays));
-                break;
+            if !indexers.contains(&relay_key(&endpoint)) {
+                capped += 1;
+                if capped > MAX_RELAYS {
+                    if capped == MAX_RELAYS + 1 {
+                        failures.push(finding(OnboardingIssue::TooManyRelays));
+                    }
+                    continue;
+                }
             }
             let plane = self.app.relay_plane.clone();
             let signer = signer.clone();
@@ -1742,18 +1760,26 @@ impl AccountManager {
         c: &OnboardingCheckpoint,
         step: OnboardingStep,
     ) -> Vec<String> {
-        let mut sources = c.options.discovery_relays.clone();
         // KeyPackages live on the account's own relays, not on indexers.
         let indexers = if step == OnboardingStep::SingleDevice || c.explicit_discovery {
             Vec::new()
         } else {
             default_directory_discovery_relays()
         };
+        self.onboarding_sources_with(c, step, &indexers).await
+    }
+    async fn onboarding_sources_with(
+        &self,
+        c: &OnboardingCheckpoint,
+        step: OnboardingStep,
+        indexers: &[TransportEndpoint],
+    ) -> Vec<String> {
+        let mut sources = c.options.discovery_relays.clone();
         let list = if let Some(event) = &c.records[OnboardingStep::Relays.index()] {
             Some(event.clone())
         } else if step.optional() {
             let mut lookup = sources.clone();
-            append_public_indexers(&mut lookup, &c.options, &indexers);
+            append_public_indexers(&mut lookup, &c.options, indexers);
             self.inspect_onboarding_relays(&c.snapshot.account_id_hex, 10002, lookup)
                 .await
                 .0
@@ -1775,9 +1801,9 @@ impl AccountManager {
                 }
             }
         }
-        // Indexers only take the inspection slots the host's discovery relays
-        // and the account's declared relays leave free.
-        append_public_indexers(&mut sources, &c.options, &indexers);
+        // Indexers come after the host's discovery relays and the account's
+        // declared relays, and are dialed outside the inspection cap.
+        append_public_indexers(&mut sources, &c.options, indexers);
         sources
     }
     async fn check_onboarding_step(
@@ -2239,6 +2265,7 @@ impl AccountManager {
             );
         } else {
             c.approved = true;
+            c.approved_sources = Some(sources);
             c.set(proposal.step, OnboardingStatus::Checking, Vec::new());
             // All route-dependent checks must be repeated after publication.
             c.set(
@@ -2325,13 +2352,17 @@ impl AccountManager {
         if self.require_live_onboarding_attempt(c).is_err() {
             return Ok(false);
         }
-        let mut endpoints = self
-            .await_while_onboarding_live(
-                &c.snapshot.account_id_hex,
-                c.attempt(),
-                self.onboarding_sources(c, proposal.step),
-            )
-            .await?;
+        let mut endpoints = match c.approved_sources.clone() {
+            Some(sources) => sources,
+            None => {
+                self.await_while_onboarding_live(
+                    &c.snapshot.account_id_hex,
+                    c.attempt(),
+                    self.onboarding_sources_with(c, proposal.step, &[]),
+                )
+                .await?
+            }
+        };
         endpoints.extend(
             proposal
                 .read_relays
@@ -2375,6 +2406,7 @@ impl AccountManager {
                     })?;
                 c.records[proposal.step.index()] = Some(event);
                 c.approved = false;
+                c.approved_sources = None;
                 c.signed_repair = None;
                 c.snapshot.proposal = None;
                 c.reset_step(proposal.step);
@@ -2421,8 +2453,9 @@ fn is_onion_relay(endpoint: &str) -> bool {
 /// Imported identities usually publish their profile and relay lists on
 /// general-purpose relays, not on the host's messaging relays. Search the
 /// public indexers as well, so absence on the host's relays is never read as a
-/// missing record that invites a defaults-only replacement. Loopback
-/// (development) routes stay hermetic, as they do for public indexer copies.
+/// missing record that invites a defaults-only replacement. Inspection dials
+/// indexers outside its relay cap. Loopback (development) routes stay
+/// hermetic, as they do for public indexer copies.
 fn append_public_indexers(
     sources: &mut Vec<String>,
     options: &OnboardingOptions,
@@ -2443,9 +2476,6 @@ fn append_public_indexers(
     }
     let mut known: HashSet<String> = sources.iter().map(|source| relay_key(source)).collect();
     for indexer in indexers {
-        if sources.len() >= MAX_RELAYS {
-            break;
-        }
         if known.insert(relay_key(&indexer.0)) {
             sources.push(indexer.0.clone());
         }

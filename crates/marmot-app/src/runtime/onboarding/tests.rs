@@ -12,6 +12,7 @@ struct Network {
     index_events: StdMutex<Vec<NostrTransportEvent>>,
     public_indexer_events: StdMutex<Vec<NostrTransportEvent>>,
     attempts: StdMutex<Vec<NostrTransportEvent>>,
+    published_endpoints: StdMutex<Vec<Vec<String>>>,
     fail_reads: AtomicBool,
     return_off_filter_events: AtomicBool,
     fail_index_only: AtomicBool,
@@ -866,6 +867,12 @@ impl NostrRelayClient for Network {
                 .all(|e| e.policy == RelayEndpointPolicy::Allowed)
         );
         self.attempts.lock().unwrap().push(event.clone());
+        self.published_endpoints.lock().unwrap().push(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect(),
+        );
         self.publishing.notify_one();
         if self.block_publish.load(Ordering::SeqCst) {
             self.release_publish.notified().await;
@@ -1595,12 +1602,20 @@ fn fail_public_indexers(network: &Network) {
 }
 
 #[tokio::test]
-async fn public_indexers_never_displace_declared_relays_from_the_inspection_cap() {
-    let (_dir, runtime, _network, keys, id) = fixture().await;
+async fn public_indexers_are_dialed_outside_the_inspection_cap() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
     let indexers = crate::default_directory_discovery_relays();
+    // The profile exists only on the indexers.
+    network.public_indexer_events.lock().unwrap().push(signed(
+        &keys,
+        0,
+        vec![],
+        "{}",
+        unix_now_seconds(),
+    ));
     let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
-    for (host, declared) in [(15, 1), (2, 10)] {
+    for (host, declared) in [(15, 1), (2, 10), (16, 1)] {
         c.options.discovery_relays = (0..host)
             .map(|n| format!("wss://host{n}.example"))
             .collect();
@@ -1620,20 +1635,139 @@ async fn public_indexers_never_displace_declared_relays_from_the_inspection_cap(
         let sources = manager
             .onboarding_sources(&c, OnboardingStep::Profile)
             .await;
-        assert_eq!(sources.len(), MAX_RELAYS);
         assert_eq!(sources[..host], c.options.discovery_relays[..]);
         assert_eq!(sources[host..host + declared], declared_relays[..]);
-        let added = &sources[host + declared..];
-        assert_eq!(
-            added.len(),
-            (MAX_RELAYS - host - declared).min(indexers.len())
-        );
         assert!(
-            added
+            sources[host + declared..]
                 .iter()
-                .all(|relay| indexers.iter().any(|i| &i.0 == relay))
+                .map(|relay| relay.as_str())
+                .eq(indexers.iter().map(|indexer| indexer.0.as_str()))
+        );
+        network.inspected_endpoints.lock().unwrap().clear();
+        let (status, findings, observed) = manager
+            .check_onboarding_step(&c, OnboardingStep::Profile)
+            .await;
+        assert_eq!(status, OnboardingStatus::Passed, "{host}+{declared}");
+        assert!(observed.is_some());
+        let inspected = network.inspected_endpoints.lock().unwrap().clone();
+        assert!(
+            indexers
+                .iter()
+                .all(|indexer| inspected.contains(&indexer.0))
+        );
+        // Only host and declared relays count against the cap.
+        assert_eq!(
+            findings
+                .iter()
+                .any(|f| f.issue == OnboardingIssue::TooManyRelays),
+            host + declared > MAX_RELAYS
+        );
+        assert_eq!(
+            inspected.len(),
+            (host + declared).min(MAX_RELAYS) + indexers.len()
         );
     }
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_approved_repairs_do_not_publish_to_uninspected_indexers() {
+    for signed_before_upgrade in [false, true] {
+        let (dir, first, network, keys, id) = fixture().await;
+        // A valid relay list exists only on the indexers, which the
+        // pre-upgrade approval never inspected.
+        network.public_indexer_events.lock().unwrap().push(signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://healthy.example".into()]],
+            "",
+            unix_now_seconds() - 60,
+        ));
+        let manager = first.accounts();
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.set(OnboardingStep::Profile, OnboardingStatus::Skipped, vec![]);
+        c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
+        c.set(
+            OnboardingStep::Relays,
+            OnboardingStatus::NeedsInput,
+            vec![finding(OnboardingIssue::Missing)],
+        );
+        manager.save_onboarding(&mut c).unwrap();
+        let proposal = manager
+            .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+            .await
+            .unwrap()
+            .proposal
+            .unwrap();
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.approved = true;
+        if signed_before_upgrade {
+            let (tags, content, created_at) = relay_repair_event(&c, &proposal);
+            c.signed_repair = Some(signed(&keys, 10002, tags, &content, created_at));
+        }
+        // Serialize as a pre-upgrade checkpoint, without the new fields.
+        let mut legacy = serde_json::to_value(&c).unwrap();
+        let fields = legacy.as_object_mut().unwrap();
+        fields.remove("approved_sources");
+        fields.remove("explicit_discovery");
+        manager
+            .app
+            .account_home()
+            .set_account_onboarding(&id, &serde_json::to_vec(&legacy).unwrap())
+            .unwrap();
+        first.shutdown_and_close().await.unwrap();
+
+        let second = runtime(dir.path(), network.clone());
+        let mut c = second
+            .accounts()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        assert!(c.approved && c.approved_sources.is_none());
+        assert!(
+            second
+                .accounts()
+                .publish_onboarding_repair(&mut c)
+                .await
+                .unwrap()
+        );
+        let published = network.published_endpoints.lock().unwrap().clone();
+        assert_eq!(published.len(), 1, "signed={signed_before_upgrade}");
+        let indexers = crate::default_directory_discovery_relays();
+        assert!(published[0].iter().all(|endpoint| {
+            !indexers
+                .iter()
+                .any(|indexer| relay_key(&indexer.0) == relay_key(endpoint))
+        }));
+        assert!(published[0].iter().any(|e| e.contains("index.example")));
+        second.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn approved_repairs_publish_to_the_sources_inspected_at_approval() {
+    let (_dir, runtime, network, _keys, id) = fixture().await;
+    missing_relays(&runtime, &id).await;
+    let manager = runtime.accounts();
+    let proposal = manager
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    network.zero_acks.store(true, Ordering::SeqCst);
+    manager
+        .approve_onboarding_repair(&id, proposal.revision)
+        .await
+        .unwrap();
+    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let approved = c.approved_sources.clone().unwrap();
+    assert!(
+        crate::default_directory_discovery_relays()
+            .iter()
+            .all(|indexer| approved.contains(&indexer.0))
+    );
+    let published = network.published_endpoints.lock().unwrap()[0].clone();
+    assert!(approved.iter().all(|source| published.contains(source)));
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -1736,7 +1870,8 @@ fn public_indexers_join_discovery_except_on_loopback_routes() {
         .map(|n| format!("wss://relay{n}.example"))
         .collect::<Vec<_>>();
     append_public_indexers(&mut full, &options(), &indexers);
-    assert_eq!(full.len(), MAX_RELAYS);
+    // Indexers are never trimmed to fit; inspection reports the overflow.
+    assert_eq!(full.len(), MAX_RELAYS + indexers.len());
 
     for loopback in [
         "ws://127.0.0.1:7777",
