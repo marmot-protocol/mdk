@@ -159,7 +159,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); most tasks run through [`just`](Justfile).
 
 ```sh
-just fast-ci                 # formatting, doc/naming gates, compile checks, clippy (no tests)
+just fast-ci                 # formatting, doc/naming gates, compile checks, clippy; skips the `just test` matrix
 cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
