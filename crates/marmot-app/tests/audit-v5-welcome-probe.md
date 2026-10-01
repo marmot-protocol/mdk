@@ -1,9 +1,11 @@
-# Controlled v5 Welcome probe
+# v5 Welcome evidence probe
 
-This is a **partial** real-recording experiment after the v5 contract
-(PR #2040), tracked by #2043. It observes actual `AppClient` execution with two
-synthetic accounts, real NIP-59/MLS Welcomes, SQLCipher storage, and a localhost
-Nostr `MockRelay`. It does not replace v4 recording.
+`src/client/audit_v5_probe.rs` records v5 Welcome evidence from actual
+`AppClient` execution whenever app audit logging is enabled. It started as a
+test-only experiment after the v5 contract (PR #2040, tracked by #2043) and has
+been live since PR #2054: new app audit sessions write v5, not v4. The tests
+below drive that path with synthetic accounts, real NIP-59/MLS Welcomes,
+SQLCipher storage, and a localhost Nostr `MockRelay`.
 
 Run the bounded scenarios (also included in ordinary library tests):
 
@@ -11,17 +13,21 @@ Run the bounded scenarios (also included in ordinary library tests):
 cargo test -p marmot-app --lib audit_v5_probe -- --nocapture --test-threads=1
 ```
 
-The app probe, its selection field, delegating peeler and fault injection are `#[cfg(test)]`.
-Only these unit tests select it. There is no feature flag, public API, recorder
-setting, file destination, uploader, worker, binding or production activation.
-The existing v4 recorder runs alongside the selected probe in the scenarios;
-its output is checked to remain v4. Probe records stay in bounded memory.
+Every session wraps its Nostr peeler in the delegating `ProbePeeler`, and a
+session with an enabled v5 recorder installs `WelcomeProbe::live`. The live probe
+queues at most 128 pending events and flushes them to the installed recorder,
+which assigns source, session and sequence alongside the engine audit rows and
+validates each record. The audit-enable setting is the only switch; delivery uses
+the v5 OTLP sender (see `docs/marmot-architecture/audit-logging.md`). Per-label
+peel-slot selection, the checkpoint fault injection and the in-memory capture
+mode stay `#[cfg(test)]`. The scenarios check that every row in the accounts'
+audit files carries the v5 schema version.
 
 ## Evidence boundaries
 
 | Record | Actual observation | What it does not establish |
 | --- | --- | --- |
-| `welcome_prepared` | On the sender's current-profile founding path, the runtime preparation call returns after the engine atomically retained the canonical group and exact outbound Welcome as `Sent`. The test-only probe matches the returned artifact to the selected, relay-validated public KeyPackage event by recipient identity and checks the outer event hash. | A relay send, ACK, recipient observation, engine join, or app/UI availability. Failure before the returned artifact has no terminal row in this subset. |
+| `welcome_prepared` | On the sender's current-profile founding path, the runtime preparation call returns after the engine atomically retained the canonical group and exact outbound Welcome as `Sent`. The probe matches the returned artifact to the selected, relay-validated public KeyPackage event by recipient identity and checks the outer event hash. | A relay send, ACK, recipient observation, engine join, or app/UI availability. Failure before the returned artifact has no terminal row in this subset. |
 | `welcome_observed` | The app admits a Welcome envelope to its ingest path, after checking its NIP-01 event hash for reference derivation. | Signature/unwrap validity, engine join, endpoint provenance, live versus history acquisition. Acquisition is explicitly `unknown`. |
 | `welcome_unwrapped` | The same engine-invoked Nostr peeler either validates the authenticated rumor and strict inner `e` KeyPackage event ID, or returns a typed transport error. The row shares the receive ID and outer reference with `welcome_observed`. | MLS KeyPackage secret availability, engine join, app checkpoint, or sender publication. SDK NIP-59 extraction errors are coarsely `failed/unwrap_failed`, not a specific bad-key diagnosis. |
 | `welcome_join_finished`, `joined` | This exact observed Welcome returns `Processed` with its own `GroupJoined` event, which the engine journaled in the successful join transaction. The row uses the group's durable local-copy install epoch, written by that transaction; it precedes any fallible app checkpoint. | App persistence or acceptance, UI display, recipient history completeness, or another delivery's join. This subset omits other join dispositions and ambiguous initial/replacement cases. |
@@ -39,12 +45,12 @@ identities, rejects duplicate/missing matches, and does not decode an inner
 rumor or repeat MLS construction. It runs after the first post-canonical
 idempotency binding, before repairable app indexing and publication. The
 sender and recipient use distinct synthetic source/session identities.
-The app test installs one bounded per-client peel slot before opening the session.
-It arms that slot after policy prechecks and just before engine ingress, consumes
-the peeler result immediately afterward, and records through the existing probe's
-source, session and sequence. The production trait method returns the same peeled
+Each session installs one bounded peel slot when it opens; tests can pre-select
+the slot for a labeled client. The app arms that slot after policy prechecks and
+just before engine ingress, consumes the peeler result immediately afterward, and
+records through the existing probe's source, session and sequence. The production trait method returns the same peeled
 message and errors as before; the concrete peeler also has a narrow provenance
-return for the test wrapper. The SDK verifies the signed gift wrap and seal but
+return for the wrapper. The SDK verifies the signed gift wrap and seal but
 does not verify an optional ID on its unsigned rumor, so the probe references the
 rumor's computed NIP-01 ID from authenticated fields, never that optional claim.
 The join row uses the same per-delivery receive ID and exact outer ID, requires
@@ -77,13 +83,14 @@ The current real failure scenario covers retry in the same client, not a
 process crash/reopen. App-open capture and durable probe identities are absent.
 An aborted or failed projection before checkpoint selection can leave no
 completion row; that absence is not success. This is not complete failure-event
-coverage or a production recorder design.
+coverage.
 
-The collector validates every row through `v5::Record`, bounds captured rows to
-128 and bodies to 256 KiB, and bounds pending projection origins to 64. Validation
-failures and overflow have separate counters, which the scenarios require to be
-zero. Source/session/build values are explicit synthetic test metadata; they do
-not claim real installation identity or build provenance. Body identities and
+The in-memory test capture validates every row through `v5::Record`, bounds
+captured rows to 128 and bodies to 256 KiB, and bounds pending projection origins
+to 64. Validation failures and overflow have separate counters, which the
+scenarios require to be zero. Its source/session/build values are explicit
+synthetic test metadata; they do not claim real installation identity or build
+provenance. A live recorder supplies its own envelope. Body identities and
 facts are taken from the running scenario, not converted from v4 records.
 
 ## Scenarios and measurements
@@ -129,6 +136,10 @@ not establish behavior for construction/retention failure classes. It also
 does not exercise a publication retry or reconciliation replay; those paths
 are separate from the creation hook.
 
+The measurements below are historical: they were taken on 2026-09-25 against
+the test-only subset, before live recording added publication, baseline and
+operational rows. Rerun the command above for current counts.
+
 A local run on 2026-09-25 of the earlier three-row subset measured 2,072 compact
 body bytes, 2,075 JSONL bytes and a 742-byte largest body. With successful unwrap
 added, the same success path measured four rows, 2,836 body bytes, 2,840 JSONL
@@ -150,22 +161,23 @@ The join row contributed 689 body bytes. The sender still emitted one
 `welcome_prepared` row of 915 body/916 JSONL bytes. These counts are from the
 local selected-probe success scenario; they are not transport or upload bytes.
 
-The successful scenario emits one sender row and five recipient rows: one
-receive, one unwrap, one committed join, one pending checkpoint and one accepted checkpoint. Its
-command prints per-kind counts/body
+In that historical subset, the successful scenario emitted one sender row and
+five recipient rows: one receive, one unwrap, one committed join, one pending
+checkpoint and one accepted checkpoint. The command prints per-kind counts/body
 bytes, total compact JSON body bytes, JSONL bytes (including one newline per
-row), and largest body. The 6.5 KiB aggregate assertion is only a gross
-regression guard for the five-row recipient subset. No v5 HTTP request is
-sent; these are **not upload bytes**, a full Welcome budget, or a device/day
-estimate. Source/session identifiers have fixed encoded width; timing values can
+row), and largest body. The test's aggregate byte assertion is only a gross
+regression guard for the captured recipient subset. The scenarios send no v5
+HTTP request; these are **not upload bytes**, a full Welcome budget, or a
+device/day estimate. Source/session identifiers have fixed encoded width; timing values can
 change the byte count between runs.
 
-Sender publication, non-success engine disposition records, roster baselines,
-process-reopen capture, broad rejected-input classification, and reader
-missing-source conclusions remain separate slices. In
+Live recording now also writes Welcome publication rows (from the
+`marmot-account` runtime owner) and bounded group baselines. Non-success engine
+join dispositions, crash-and-reopen scenarios, broad rejected-input
+classification, and reader missing-source conclusions are still not covered here. In
 particular this does not claim complete W01/W03/W04/W08 acceptance or resolve
-#2043. Do not compare these five rows with the complete measured v4 Welcome
-lifecycle and claim a bandwidth reduction.
+#2043. Do not compare the historical five-row subset with the complete measured
+v4 Welcome lifecycle and claim a bandwidth reduction.
 
-Recovery instrumentation, the Rust investigation API, server acceptance of v5,
-client rollout and production cutover remain outside this experiment.
+Recovery rows have their own owner seams (`src/client/audit_recovery.rs`); the
+Rust investigation API is outside this probe.

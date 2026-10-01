@@ -379,8 +379,10 @@ deletion while retained.
 See [the implementation contract](../../docs/marmot-architecture/overview/content-moderation.md)
 for source-state authorization, durable recovery, retention, and client compatibility.
 
-## Controlled audit v5 experiment
+## Audit v5 Welcome evidence
 
-The [recipient Welcome probe](tests/audit-v5-welcome-probe.md) exercises real app
-receipt and checkpoint boundaries in unit tests and measures that partial v5
-record set. Production recording and uploads remain v4.
+When audit logging is enabled, the app records v5 Welcome evidence from real
+founding, publication, receipt, peel, join and checkpoint boundaries. The
+[Welcome probe notes](tests/audit-v5-welcome-probe.md) describe those boundaries
+and the unit tests that exercise them; v4 remains only for historical files and
+the legacy whole-file upload.

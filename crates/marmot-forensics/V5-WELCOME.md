@@ -1,11 +1,19 @@
-# Inactive v5 Welcome contract
+# v5 Welcome contract
 
-`marmot_forensics::v5` is a data-only foundation for a new investigation format.
-It does not change `AUDIT_LOG_SCHEMA_VERSION`, `AuditEvent`, `JsonlRecorder`, local
-cursor handling, the OTLP sender, receiver acceptance or current Goggles uploads.
-Those remain v4. The app's unit-test-only Welcome probe does not provide a v5
-recorder, source-ID persistence, analyzer, network call, runtime timer, migration
-or activation.
+`marmot_forensics::v5` is the active opt-in audit format. When app audit logging
+is enabled, `marmot-app` opens `JsonlRecorder::open_v5_with_account_ref` and
+writes `<account_dir>/audit-<engine_id>-v5.jsonl`. The Welcome events below are
+recorded on the live app paths: founding preparation, receipt, peel, engine join,
+app checkpoints and group baselines in `marmot-app`'s `client/audit_v5_probe.rs`,
+and publication start/finish/not-started at the `marmot-account` runtime owner.
+v5 network delivery uses the dedicated OTLP sender, which hosts
+configure with the UniFFI/C `set_audit_otlp_config_v5` and drive with
+`post_audit_log_tracker_update_v5`.
+
+`AUDIT_LOG_SCHEMA_VERSION` still names the frozen v4 contract. Historical v4
+files stay readable, and the whole-file Goggles upload accepts only v4. See
+[audit-logging.md](../../docs/marmot-architecture/audit-logging.md#v5-recording-and-delivery)
+for recording and delivery.
 
 ## Validated boundary
 
@@ -70,7 +78,7 @@ category (already stored). Failed `not_exposed` has no category;
 failed publication. These are observed outcomes, not a new retry policy.
 
 Per-record comparisons cannot check a finished attempt against a missing start
-row. The future reader must preserve independent facts, expose missing evidence
+row. A reader must preserve independent facts, expose missing evidence
 and conflicts, and never infer delivery failure merely from absent recipient rows.
 
 ## Encodings, references and bounds
@@ -95,11 +103,11 @@ it is not a 32-byte transport route ID. KeyPackage references are public event
 references, never hashes of key material. Never use plaintext or ciphertext as
 reference input.
 
-V5 is intended for a coordinated new-pipeline cutover, not mixed-version member
-correlation. Its member references intentionally differ from v4; do not join the
-two by equality or infer an identity from unrelated records. Historical v4
-evidence stays with existing tooling. This foundation does not implement that
-cutover, convert old records or discard queued v4 data.
+V5 is a new-pipeline format, not mixed-version member correlation. Its member
+references intentionally differ from v4; do not join the two by equality or infer
+an identity from unrelated records. Historical v4 evidence stays with existing
+tooling. New audit sessions write v5 files; old v4 records are not converted, and
+queued v4 data is not discarded.
 
 The forensic crate deliberately does not depend on a URL parser or transport SDK.
 `EndpointRef::from_normalized_url` requires owner-normalized input. For Nostr this
@@ -115,11 +123,13 @@ baselines require known admin flags; failed baselines cannot invent epoch/roster
 Only the producer can decide which known evidence to omit and record limitations;
 this library rejects overlarge candidates instead of silently trimming them.
 
-Source/session generation and consent lifecycle are future recorder work. Proposed
-rule: source per account's continuous consent period; fresh session at each recorder
-open, unchanged across segment rotation. Copies/restores do not establish physical
-device uniqueness. Existing records preserve identity/bytes across delivery replay.
-This module does not allocate, persist, rotate or delete any such identity.
+The app recorder uses the account-device's persistent audit engine reference as
+the source and derives a fresh session at each recorder open, unchanged across
+segment rotation. `recording_session_started` and `recording_session_stopped`
+bracket a writer session (see [README.md](README.md#opt-in-v5-recording)).
+Copies/restores do not establish physical device uniqueness. Existing records
+preserve identity/bytes across delivery replay. This module validates those
+identities; the app recorder allocates and persists them.
 
 ## Fixtures and verification
 
@@ -139,7 +149,6 @@ cargo test -p marmot-forensics
 cargo test -p transport-nostr-adapter --lib audit_v5_endpoint_vectors_match_owner_normalization
 ```
 
-Next slices: instrument real sender and recipient boundaries under explicit test
-selection, then evaluate actual emitted evidence and rerun volume measurements.
-A contract fixture cannot establish real Welcome coverage or claim v5 bandwidth.
-No upload of v5 to the existing strict v4 receiver is enabled by this foundation.
+A contract fixture cannot establish real Welcome coverage or claim v5 bandwidth;
+the [app Welcome tests](../marmot-app/tests/audit-v5-welcome-probe.md) exercise
+the emitted evidence. v5 is never uploaded to the strict v4 Goggles receiver.

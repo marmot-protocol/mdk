@@ -1,7 +1,7 @@
 pub mod audit;
 #[cfg(unix)]
 pub mod local_delivery;
-/// Inactive next-version Welcome contract; does not change recorder output.
+/// Opt-in v5 record contract written by new app audit sessions; v4 stays frozen.
 pub mod v5;
 
 pub use audit::{

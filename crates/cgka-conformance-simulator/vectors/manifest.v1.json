@@ -262,7 +262,7 @@
         "designated-winner branch survival",
         "full recovery-summary reproduction"
       ],
-      "next": "Wire vectors/incidents/ into the portable vector fixture test (Phase 5)."
+      "next": "Keep green in the canonical vector fixture test; replay new matching exports through incident-replay."
     },
     {
       "id": "membership-fork-recovery-incident/v1",
@@ -275,7 +275,7 @@
         "winner-agnostic branch survival via post-recovery member count",
         "full recovery-summary reproduction"
       ],
-      "next": "Wire vectors/incidents/ into the portable vector fixture test (Phase 5)."
+      "next": "Keep green in the canonical vector fixture test; replay new matching exports through incident-replay."
     },
     {
       "id": "convergence-incident/v1",
