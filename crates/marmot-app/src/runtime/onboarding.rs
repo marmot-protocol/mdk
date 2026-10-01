@@ -1737,6 +1737,14 @@ impl AccountManager {
         step: OnboardingStep,
     ) -> Vec<String> {
         let mut sources = c.options.discovery_relays.clone();
+        // KeyPackages live on the account's own relays, not on indexers.
+        if step != OnboardingStep::SingleDevice {
+            append_public_indexers(
+                &mut sources,
+                &c.options,
+                &default_directory_discovery_relays(),
+            );
+        }
         let list = if let Some(event) = &c.records[OnboardingStep::Relays.index()] {
             Some(event.clone())
         } else if step.optional() {
@@ -2393,6 +2401,40 @@ fn is_onion_relay(endpoint: &str) -> bool {
                 .domain()
                 .is_some_and(|host| host.trim_end_matches('.').ends_with(".onion"))
     })
+}
+
+/// Imported identities usually publish their profile and relay lists on
+/// general-purpose relays, not on the host's messaging relays. Search the
+/// public indexers as well, so absence on the host's relays is never read as a
+/// missing record that invites a defaults-only replacement. Loopback
+/// (development) routes stay hermetic, as they do for public indexer copies.
+fn append_public_indexers(
+    sources: &mut Vec<String>,
+    options: &OnboardingOptions,
+    indexers: &[TransportEndpoint],
+) {
+    let loopback = options
+        .default_relays
+        .iter()
+        .chain(&options.discovery_relays)
+        .any(|endpoint| {
+            url::Url::parse(endpoint).ok().is_some_and(|url| {
+                url.host()
+                    .is_some_and(cgka_traits::app_components::is_loopback_host)
+            })
+        });
+    if loopback {
+        return;
+    }
+    let mut known: HashSet<String> = sources.iter().map(|source| relay_key(source)).collect();
+    for indexer in indexers {
+        if sources.len() >= MAX_RELAYS {
+            break;
+        }
+        if known.insert(relay_key(&indexer.0)) {
+            sources.push(indexer.0.clone());
+        }
+    }
 }
 
 fn relay_key(endpoint: &str) -> String {

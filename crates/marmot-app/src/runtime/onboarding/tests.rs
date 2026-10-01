@@ -10,6 +10,7 @@ use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscr
 struct Network {
     events: StdMutex<Vec<NostrTransportEvent>>,
     index_events: StdMutex<Vec<NostrTransportEvent>>,
+    public_indexer_events: StdMutex<Vec<NostrTransportEvent>>,
     attempts: StdMutex<Vec<NostrTransportEvent>>,
     fail_reads: AtomicBool,
     return_off_filter_events: AtomicBool,
@@ -53,6 +54,12 @@ impl DirectoryRelayFetcher for Network {
             .any(|e| e.0.contains("index.example"))
         {
             events.extend(self.index_events.lock().unwrap().iter().cloned());
+        }
+        if crate::default_directory_discovery_relays()
+            .iter()
+            .any(|indexer| request.endpoints.contains(indexer))
+        {
+            events.extend(self.public_indexer_events.lock().unwrap().iter().cloned());
         }
         Ok(events
             .iter()
@@ -1525,6 +1532,94 @@ async fn partial_lookup_is_not_absence() {
     );
     assert!(network.attempts.lock().unwrap().is_empty());
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn relay_lists_published_only_on_public_indexers_are_not_missing() {
+    // Imported identities usually publish to general-purpose relays. Absence
+    // on the host's own relays must not read as "missing" and invite a
+    // defaults-only replacement of the user's real relay lists.
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let nip65 = signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        "",
+        unix_now_seconds(),
+    );
+    let inbox = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://healthy.example".into()]],
+        "",
+        unix_now_seconds(),
+    );
+    *network.public_indexer_events.lock().unwrap() = vec![nip65.clone(), inbox.clone()];
+    let manager = runtime.accounts();
+    manager.run_onboarding(&id).await.unwrap();
+    manager
+        .continue_onboarding_without(&id, OnboardingStep::Profile)
+        .await
+        .unwrap();
+    let snapshot = manager
+        .continue_onboarding_without(&id, OnboardingStep::Follows)
+        .await
+        .unwrap();
+    for (step, declaration) in [
+        (OnboardingStep::Relays, nip65),
+        (OnboardingStep::InboxRelays, inbox),
+    ] {
+        let state = &snapshot.steps[step.index()];
+        assert_eq!(state.status, OnboardingStatus::Passed, "step {step:?}");
+        assert!(
+            !state
+                .findings
+                .iter()
+                .any(|finding| finding.issue == OnboardingIssue::Missing)
+        );
+        let checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        assert_eq!(checkpoint.records[step.index()], Some(declaration));
+    }
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[test]
+fn public_indexers_join_discovery_except_on_loopback_routes() {
+    let indexers = crate::default_directory_discovery_relays();
+    let mut sources = vec![
+        "wss://index.example".to_owned(),
+        format!("{}/", indexers[0].0),
+    ];
+    append_public_indexers(&mut sources, &options(), &indexers);
+    assert_eq!(sources.len(), 1 + indexers.len());
+    assert!(indexers.iter().all(|indexer| {
+        sources
+            .iter()
+            .filter(|source| relay_key(source) == relay_key(&indexer.0))
+            .count()
+            == 1
+    }));
+
+    let mut full = (0..MAX_RELAYS)
+        .map(|n| format!("wss://relay{n}.example"))
+        .collect::<Vec<_>>();
+    append_public_indexers(&mut full, &options(), &indexers);
+    assert_eq!(full.len(), MAX_RELAYS);
+
+    for loopback in [
+        "ws://127.0.0.1:7777",
+        "ws://localhost:7777",
+        "ws://[::1]:7777",
+    ] {
+        let local = OnboardingOptions {
+            default_relays: vec![loopback.into()],
+            discovery_relays: vec![loopback.into()],
+        };
+        let mut sources = local.discovery_relays.clone();
+        append_public_indexers(&mut sources, &local, &indexers);
+        assert_eq!(sources, [loopback]);
+    }
 }
 
 #[tokio::test]
