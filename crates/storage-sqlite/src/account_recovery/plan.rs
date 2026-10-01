@@ -782,6 +782,8 @@ impl SqliteAccountStorage {
     /// listed.
     /// An unserved comparison on a pass that cannot retry, such as refused
     /// admission, counts nothing: it says nothing about the relays.
+    /// Callers list an unserved scope only if its request ran and at least one
+    /// of its required relays answered. Offline and deadline-cut scopes are omitted.
     pub fn checkpoint_recovery_comparison(
         &self,
         expected: &RecoveryRevisionFence,

@@ -44,6 +44,7 @@ struct AdmissionRoute {
     certified: bool,
     /// Every required relay answered, whatever admission later did.
     answered: bool,
+    reached_endpoints: Vec<String>,
     /// Every event this route fetched was durably admitted.
     admitted: bool,
     /// Events durably admitted: progress, even without a certificate.
@@ -462,6 +463,7 @@ impl AppClient {
                 ComparisonRouteWorkResult::TimedOut | ComparisonRouteWorkResult::Returned(Err(_))
             );
             let mut acquisition = super::super::audit_recovery::RouteAcquisition::default();
+            let mut reached_endpoints = Vec::new();
             let (outcome, certified, answered, events) = match route.result {
                 ComparisonRouteWorkResult::Skipped => {
                     (Outcome::ServicedPartial, false, false, Vec::new())
@@ -477,6 +479,29 @@ impl AppClient {
                     acquisition =
                         super::super::audit_recovery::RouteAcquisition::from_summary(&summary);
                     acquisition.retrieved = events.len();
+                    if let Some(inventory) = inventory {
+                        use crate::relay_plane::same_relay;
+                        let endpoints = inventory.work.endpoints();
+                        let unattributed = summary.failed_endpoints.len() < summary.relays_failed
+                            || summary.failed_endpoints.iter().any(|failed| {
+                                !endpoints
+                                    .iter()
+                                    .any(|endpoint| same_relay(endpoint.as_str(), failed.as_str()))
+                            });
+                        if !unattributed {
+                            reached_endpoints.extend(endpoints.iter().filter_map(|endpoint| {
+                                let failed = summary
+                                    .failed_endpoints
+                                    .iter()
+                                    .any(|failed| same_relay(endpoint.as_str(), failed.as_str()));
+                                let incomplete = summary
+                                    .incomplete_endpoints
+                                    .iter()
+                                    .any(|relay| same_relay(endpoint.as_str(), relay.as_str()));
+                                (!failed || incomplete).then(|| endpoint.as_str().to_owned())
+                            }));
+                        }
+                    }
                     let (outcome, certified, answered) = inventory
                         .map_or((Outcome::TransientFailure, false, false), |inventory| {
                             inventory.judge(&summary)
@@ -494,6 +519,7 @@ impl AppClient {
                 outcome,
                 certified,
                 answered,
+                reached_endpoints,
                 admitted,
                 fetched: 0,
                 acquisition,
@@ -854,6 +880,7 @@ impl AppClient {
                 // Incomplete admission withholds the certificate and retries
                 // the route, but the relays still answered.
                 answered: route.answered,
+                reached_endpoints: route.reached_endpoints,
                 acquisition: route.acquisition,
             });
         }
@@ -1823,6 +1850,67 @@ mod tests {
         assert_eq!(finished[0]["event"]["outcome"], "unserved");
         assert_eq!(finished[0]["event"]["routes_certified"], 0);
         assert_eq!(finished[0]["event"]["events_retrieved"], 0);
+    }
+
+    #[tokio::test]
+    async fn deadline_cuts_keep_retrying() {
+        let mut fixture = fixture().await;
+        for pass in 0..14 {
+            let grant = fixture
+                .client
+                .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+                .unwrap()
+                .expect("deadline-cut debt remains selectable");
+            let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
+            let network = if pass % 2 == 0 {
+                let credit = Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap();
+                let mut job = ComparisonNetworkJob::start(
+                    &fixture.client,
+                    &grant,
+                    credit,
+                    tokio::time::Instant::now(),
+                    None,
+                )
+                .unwrap();
+                let (_credit, network) = job.wait().await.unwrap();
+                network
+            } else {
+                ComparisonNetworkResult {
+                    routes: grant
+                        .inventory
+                        .iter()
+                        .map(|inventory| ComparisonRouteResult {
+                            route: inventory.route.clone(),
+                            initial_cursor: None,
+                            cursor: None,
+                            result: ComparisonRouteWorkResult::TimedOut,
+                        })
+                        .collect(),
+                }
+            };
+            fixture
+                .client
+                .admit_comparison_inline(grant, execution, network)
+                .await
+                .unwrap();
+            assert!(
+                fixture
+                    .storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .all(|demand| {
+                        demand.eligibility == storage_sqlite::RecoveryEligibility::Retry
+                    })
+            );
+            fixture
+                .client
+                .recovery_owner
+                .test_advance_to_retry(&fixture.storage);
+        }
     }
 
     #[tokio::test]

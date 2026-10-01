@@ -584,6 +584,8 @@ pub(crate) struct RouteComparison {
     /// certified nor admitted anything is quiet. A failed or timed-out relay,
     /// or a route this pass skipped, did not answer.
     pub(crate) answered: bool,
+    /// Queried relays that answered, including incomplete comparisons.
+    pub(crate) reached_endpoints: Vec<String>,
     /// What the route's relays returned, for the attempt's audit row only.
     /// Settlement never reads it.
     pub(crate) acquisition: super::audit_recovery::RouteAcquisition,
@@ -4309,23 +4311,16 @@ impl AppClient {
                         && !refused
                         && covers_goal
                         && compared.is_some_and(|compared| compared.certified);
-                    // Certifying a scope that already carried its certificate
-                    // is not new coverage, so it neither resets pacing nor
-                    // the scope's parking budget.
-                    let newly_certified = scope_certified && !kept_certificate;
-                    certified |= newly_certified;
+                    certified |= scope_certified;
                     scopes_certified += u64::from(scope_certified);
                     let scope_progress = if window_searched {
                         storage_sqlite::RecoveryPassProgress::WindowCertified
-                    } else if newly_certified
+                    } else if scope_certified
                         || compared.is_some_and(|compared| compared.fetched > 0)
                     {
                         storage_sqlite::RecoveryPassProgress::Progressed
                     } else if !refused
                         && compared.is_some_and(|compared| {
-                            // A route no comparison backend could compare
-                            // was not answered by its relays, so it spends
-                            // the unserved budget, not the quiet one.
                             compared.answered
                                 && compared.outcome
                                     != storage_sqlite::RecoveryComparisonOutcome::Unsupported
@@ -4341,8 +4336,17 @@ impl AppClient {
                             obligation_progress,
                             scope_progress,
                         ));
-                        // A scope this pass did not compare spends no budget.
-                        progress.push((scope.goal.scope_id, scope_progress));
+                        if scope_progress != storage_sqlite::RecoveryPassProgress::Unserved
+                            || compared.is_some_and(|compared| {
+                                scope.goal.required_endpoints.iter().any(|required| {
+                                    compared.reached_endpoints.iter().any(|reached| {
+                                        crate::relay_plane::same_relay(required, reached)
+                                    })
+                                })
+                            })
+                        {
+                            progress.push((scope.goal.scope_id, scope_progress));
+                        }
                     }
                     let retained_known_event = match (&route, scope.goal.known_event_id) {
                         (Some(route), Some(event)) => storage.retained_recovery_event(

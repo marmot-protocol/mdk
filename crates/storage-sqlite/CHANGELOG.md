@@ -17,6 +17,8 @@
 - `checkpoint_recovery_comparison` counts each scope's unserved comparisons in a
   row (stored in the scope payload, no migration). A scope with six, on passes
   that could retry, counts toward parking like one with three quiet comparisons.
+  The caller counts only requests answered by at least one required relay;
+  offline and deadline-cut scopes are omitted.
   Progress resets both counts, a quiet comparison resets the unserved count, and
   a goal or required-relay change starts both over. (#2110)
 
