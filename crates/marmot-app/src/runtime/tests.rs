@@ -242,7 +242,7 @@ async fn cast_poll_vote_rejects_unknown_closed_and_invalid_selections_before_sen
 }
 
 #[tokio::test]
-async fn poll_creation_uses_conversation_kind_and_existing_polls_remain_votable() {
+async fn polls_can_be_created_and_voted_in_direct_and_group_conversations() {
     let root = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(root.path());
     let alice = home.create_account("alice").unwrap();
@@ -282,7 +282,7 @@ async fn poll_creation_uses_conversation_kind_and_existing_polls_remain_votable(
     };
 
     let runtime = app.runtime();
-    let direct_error = runtime
+    let direct_poll = runtime
         .create_poll(
             "alice",
             &direct,
@@ -292,10 +292,56 @@ async fn poll_creation_uses_conversation_kind_and_existing_polls_remain_votable(
             None,
         )
         .await
-        .unwrap_err();
+        .unwrap();
+    assert_eq!(direct_poll.message_ids.len(), 1);
+    let created_direct_poll_id = direct_poll.message_ids[0].clone();
+    runtime
+        .cast_poll_vote(
+            "alice",
+            &direct,
+            created_direct_poll_id.clone(),
+            vec!["1".into()],
+        )
+        .await
+        .unwrap();
+    let projected_direct = runtime
+        .timeline_message(
+            "alice",
+            &hex::encode(direct.as_slice()),
+            &created_direct_poll_id,
+        )
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(projected_direct.local_selection, ["1"]);
+    assert_eq!(projected_direct.participants, 1);
+    assert_eq!(projected_direct.options[0].votes, 0);
+    assert_eq!(projected_direct.options[1].votes, 1);
+    // Direct conversations retain the ordinary poll validation and target scope.
     assert!(
-        matches!(&direct_error, AppError::InvalidAppMessagePayload(message) if message.contains("group conversation")),
-        "unexpected error: {direct_error:?}"
+        runtime
+            .create_poll(
+                "alice",
+                &direct,
+                "Tea?".into(),
+                vec!["Yes".into()],
+                cgka_traits::PollType::SingleChoice,
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .cast_poll_vote(
+                "alice",
+                &named_pair,
+                created_direct_poll_id,
+                vec!["1".into()]
+            )
+            .await
+            .is_err()
     );
     let named_pair_poll = runtime
         .create_poll(

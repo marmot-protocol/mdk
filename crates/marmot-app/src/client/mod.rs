@@ -3929,19 +3929,6 @@ impl AppClient {
         .map(|(_, summary)| summary)
     }
 
-    pub(crate) fn ensure_poll_creation_allowed(&self, group_id: &GroupId) -> Result<(), AppError> {
-        let group = self.runtime.group_record(group_id)?;
-        let member_count = u64::try_from(group.members.len()).ok();
-        if storage_sqlite::conversation_kind(&group.name, member_count)
-            != storage_sqlite::ChatConversationKind::Group
-        {
-            return Err(AppError::InvalidAppMessagePayload(
-                "polls require a group conversation".into(),
-            ));
-        }
-        Ok(())
-    }
-
     fn ensure_poll_response_valid_at(
         &self,
         group_id: &GroupId,
@@ -3986,9 +3973,6 @@ impl AppClient {
         F: FnMut(crate::AppProjectionUpdate),
     {
         self.ensure_group_application_messages_allowed(group_id)?;
-        if matches!(&intent, AppMessageIntent::Poll { .. }) {
-            self.ensure_poll_creation_allowed(group_id)?;
-        }
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `DeleteReactions` below, so the audit log records the user's actual
         // intent.

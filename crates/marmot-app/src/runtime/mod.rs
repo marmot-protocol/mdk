@@ -2709,7 +2709,7 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Create an encrypted NIP-88 poll in a group conversation.
+    /// Create an encrypted NIP-88 poll in a direct or group conversation.
     pub async fn create_poll(
         &self,
         account_ref: &str,
