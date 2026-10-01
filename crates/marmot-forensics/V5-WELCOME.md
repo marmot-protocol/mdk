@@ -124,10 +124,12 @@ Only the producer can decide which known evidence to omit and record limitations
 this library rejects overlarge candidates instead of silently trimming them.
 
 The app recorder uses the account-device's persistent audit engine reference as
-the source and derives a fresh session at each recorder open, unchanged across
-segment rotation. `recording_session_started` and `recording_session_stopped`
-bracket a writer session (see [README.md](README.md#opt-in-v5-recording)).
-Copies/restores do not establish physical device uniqueness. Existing records
+the source. `JsonlRecorder::open_v5_with_account_ref` derives a fresh session at
+open and again after each destructive `rotate`; size-based segment rolls keep the
+session. `recording_session_started` marks the start of each writer session.
+`recording_session_stopped` is written only by `finish_v5_recording` on an
+observed clean shutdown; dropping the recorder does not imply a stop (see
+[README.md](README.md#opt-in-v5-recording)). Copies/restores do not establish physical device uniqueness. Existing records
 preserve identity/bytes across delivery replay. This module validates those
 identities; the app recorder allocates and persists them.
 
