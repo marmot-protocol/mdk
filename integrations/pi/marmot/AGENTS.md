@@ -18,8 +18,9 @@ Rust Pi harness for Marmot through the local `wn-agent` control socket. Read
   the whole batch before spawn. `PiEventParser` returns
   `ParsedEvent::AttachmentNotProcessed` when Pi's first user `message_end`
   carries fewer image parts than accepted images, or an assistant `message_end`
-  arrives first; the shared runner then kills the process group before Pi can
-  act and drops the observed session. Keep the sniffer in step with Pi's
+  arrives first; the shared runner then kills the process group and drops the
+  observed session. Pi may already have acted before rejection is reported.
+  Keep the sniffer in step with Pi's
   `utils/mime.ts` for the minimum supported version.
 - Send prompts over stdin, emit only completed assistant text, and never expose
   thinking or tool output.

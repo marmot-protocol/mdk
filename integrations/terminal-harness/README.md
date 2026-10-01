@@ -42,8 +42,9 @@ runner owns spawning, bounded stderr, stdout and total deadlines, reply-channel
 backpressure, first-session capture, and child termination and reaping.
 A decoder that sees the backend drop or replace an attachment it was given
 returns `ParsedEvent::AttachmentNotProcessed`. The runner then kills the
-process group at once, before the backend can act on the altered prompt, and
-fails the turn without keeping the session id observed in that run.
+process group at once and fails the turn without keeping the session id
+observed in that run. The backend may already have acted on the prompt before
+the decoder reports the failure.
 
 Claude Code, Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
 belongs in those connector crates, not in this shared runtime.

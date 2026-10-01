@@ -51,12 +51,13 @@ Files are never dropped while the caption goes through. If one file in the
 batch is unsupported, changed, or missing, the whole message gets one error
 reply and Pi does not run. Pi replaces an image it cannot convert or resize
 with a text note instead of failing, so `wn-pi` counts the image parts in
-Pi's initial user message. If that count is short, or Pi answers before that
-message appears, `wn-pi` kills Pi's process group at once instead of letting
-the model turn run, and the chat gets `Pi could not process an attachment in this
-batch and was stopped before acting on it.` A session Pi created for that
-turn is not kept, so the next prompt starts fresh. A resumed session keeps the
-user message Pi recorded before it was stopped.
+Pi's initial user `message_end` event. If that count is short, `wn-pi` kills
+Pi's process group as soon as the decoder reports the mismatch. If an assistant
+`message_end` arrives first, the decoder also rejects the turn, but Pi may
+already have processed the prompt before rejection. In either case, the chat
+gets an attachment-processing error. A session Pi created for that turn is
+not kept, so the next prompt starts fresh. A resumed session remains stored
+with any messages Pi recorded before it was stopped.
 
 The staged batch stays on disk until the Pi process exits, then the shared
 harness removes it after success, failure, timeout, or cancellation. Stale
