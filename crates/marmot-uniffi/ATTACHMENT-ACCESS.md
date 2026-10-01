@@ -264,3 +264,40 @@ C adds three corresponding `marmot_*` functions and the acquisition-mode field o
 header/library; returned automatic-request records use
 `marmot_automatic_attachment_request_free`, and generation strings use
 `marmot_string_free`. C permission inputs are borrowed boolean integers.
+
+## Genuine outgoing retention
+
+Migration 101 attempts private staging in the encrypted per-account database after a
+successful HTTP upload. Retention shares the existing byte quota and checks free-disk
+reserve and SQLite/WAL headroom, without evicting retained assets. Quota, disk, staging
+capacity or storage failures skip optional retention; they cannot reject the upload
+or prevent sending. Existing upload file/count/aggregate limits remain unchanged.
+The optional store accepts at most 256 outstanding staged uploads.
+
+Staging and binding to exact successful imeta descriptors commit together. Pending
+sends protect staged bytes without creating a readable source. Core message projection,
+confirmation and chat-list updates commit before optional ownership and promotion run.
+The callback waits for the outermost transaction; retention failures do not roll back
+an accepted message. Direct and token-based sends share this path. Original source
+identity remains authoritative through optimistic-to-confirmed reconciliation.
+
+An exclusive staged body moves into canonical retention without additional quota,
+even after the budget is lowered. Copies for shared source slots require capacity.
+Bounded rotating local recovery follows confirmed source descriptors as well as owner
+rows, preserving crash recovery when optional owner registration fails. Known unadmitted
+failures release staging; live pending/canonical sources protect it during cleanup and
+past the seven-day orphan TTL. Rejected, invalidated, expired, cancelled or removed
+sources cannot pin a satisfied sibling's reservation.
+
+Proven length/digest corruption clears the poisoned body and records unavailable
+completion for its eligible sources, preventing automatic reacquisition. SQL and I/O
+failures keep bytes retryable. Outgoing maintenance failures do not block incoming
+acquisition. Account/group deletion releases account-scoped staging; visibility,
+cancellation and removal fences still apply before canonical promotion.
+
+Once retained, local reads need neither automatic downloads nor a relay worker and
+survive process restart. Clients must adopt a matching reviewed artifact and qualify
+presentation-cache and device lifecycle paths. Native fixture results belong to the
+[implementation PR evidence](https://github.com/marmot-protocol/mdk/pull/2142#issuecomment-5946856165);
+they do not qualify Android artifact adoption or physical-device behavior. Large-send
+streaming remains separate work.

@@ -46,7 +46,7 @@ use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
     BlossomHttpTransport, DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
     download_encrypted_media_with_transport, fetch_group_image_with_transport,
-    is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media,
+    is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media_retaining,
     upload_group_image, upload_prepared_group_image,
 };
 use crate::messages::{
@@ -80,6 +80,8 @@ mod receipts;
 pub(crate) mod recovery;
 mod retention;
 mod sync;
+#[cfg(test)]
+mod upload_cleanup_tests;
 
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
@@ -152,11 +154,14 @@ pub(crate) struct EncryptedMediaUploadHttp {
     allowed_locator_kinds: Vec<String>,
     allow_loopback_http: bool,
     transport: BlossomHttpTransport,
+    retention_app: MarmotApp,
+    retention_account: String,
+    retention_group: GroupId,
 }
 
 impl EncryptedMediaUploadHttp {
-    pub(crate) async fn run(self) -> Result<MediaUploadResult, AppError> {
-        upload_encrypted_media(
+    pub(crate) async fn run(self) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
+        let (result, plaintext) = upload_encrypted_media_retaining(
             self.request,
             self.source_epoch,
             self.media_secret.as_ref(),
@@ -169,7 +174,27 @@ impl EncryptedMediaUploadHttp {
             },
             &self.transport,
         )
+        .await?;
+        let descriptors = result.clone();
+        let upload_tokens = tokio::task::spawn_blocking(move || {
+            stage_uploaded_media(
+                &self.retention_app,
+                &self.retention_account,
+                &self.retention_group,
+                self.source_epoch,
+                &descriptors,
+                &plaintext,
+            )
+        })
         .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| {
+            tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_stage",
+                "optional outgoing retention unavailable");
+            Vec::new()
+        });
+        Ok((result, upload_tokens))
     }
 }
 
@@ -180,6 +205,84 @@ pub(crate) struct EncryptedMediaUploadFinish {
     should_send: bool,
     caption: Option<String>,
     message_tags: Vec<Vec<String>>,
+}
+
+/// Preserve the primary upload/admission failure when orphan cleanup also fails.
+/// Cleanup diagnostics contain no error text, identities or attachment data;
+/// the bounded orphan sweep can retry cleanup after storage becomes available.
+pub(crate) fn preserve_encrypted_media_upload_error(
+    error: AppError,
+    cleanup: Result<(), AppError>,
+) -> AppError {
+    if cleanup.is_err() {
+        tracing::warn!(
+            target: "marmot_app::media",
+            method = "outgoing_attachment_cleanup",
+            "failed upload staging cleanup deferred"
+        );
+    }
+    error
+}
+
+/// Stage and bind one successful HTTP batch atomically. Refusal affects
+/// local retention only; publication and upload completion remain independent.
+fn stage_uploaded_media(
+    app: &MarmotApp,
+    account: &str,
+    group: &GroupId,
+    source_epoch: u64,
+    result: &MediaUploadResult,
+    plaintext: &[SecretBytes],
+) -> Result<Vec<Vec<u8>>, AppError> {
+    let storage = app.account_storage(account)?;
+    let now = crate::unix_now_seconds();
+    if storage.prune_attachment_uploads(now, 64).is_err() {
+        tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_prune",
+                "optional outgoing retention cleanup deferred");
+    }
+    if plaintext.len() != result.attachments.len() {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention buffer unavailable".into(),
+        ));
+    }
+    let policy = storage.attachment_download_policy(
+        &crate::runtime::attachment_controls::default_policy(&app.config),
+    )?;
+    let bytes = plaintext
+        .iter()
+        .map(|bytes| bytes.as_slice())
+        .collect::<Vec<_>>();
+    let total = bytes.iter().map(|b| b.len() as u64).sum::<u64>();
+    if fs4::available_space(app.account_dir(account)).unwrap_or(0)
+        < policy.disk_reserve.saturating_add(total.saturating_mul(4))
+    {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention disk reserve unavailable".into(),
+        ));
+    }
+    let slots = result
+        .attachments
+        .iter()
+        .map(|a| {
+            Ok((
+                serde_json::to_value(a.reference.imeta_tag()).map_err(|_| {
+                    AppError::InvalidEncryptedMedia("invalid upload descriptor".into())
+                })?,
+                crate::media::media_hash_from_reference(&a.reference)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+        let tokens = storage.stage_attachment_uploads(
+            &hex::encode(group.as_slice()),
+            source_epoch,
+            &bytes,
+            now,
+            policy.retained_bytes,
+        )?;
+        storage.bind_attachment_uploads(&tokens, &slots)?;
+        Ok::<_, AppError>(tokens)
+    })
 }
 
 pub(crate) struct EncryptedMediaDownloadHttp {
@@ -4853,6 +4956,8 @@ impl AppClient {
         )
     }
 
+    /// Upload independently of optional retention; local staging happens only
+    /// after PUT succeeds and cannot reject a send under quota or disk pressure.
     pub async fn upload_media(
         &mut self,
         group_id: &GroupId,
@@ -4861,8 +4966,9 @@ impl AppClient {
         let (http, finish) = self
             .prepare_encrypted_media_upload(group_id, request)
             .await?;
-        let result = http.run().await?;
-        self.finish_encrypted_media_upload(finish, result).await
+        let (result, upload_tokens) = http.run().await?;
+        self.finish_encrypted_media_upload(finish, result, upload_tokens)
+            .await
     }
 
     /// Cheap exclusive-client setup for an encrypted-media upload. The returned
@@ -4924,6 +5030,7 @@ impl AppClient {
         let message_tags = request.message_tags.clone();
         let should_send = request.send;
         let caption = request.caption.clone();
+        crate::media::validate_media_upload_batch(&request.attachments)?;
         Ok((
             EncryptedMediaUploadHttp {
                 request,
@@ -4935,6 +5042,9 @@ impl AppClient {
                 allowed_locator_kinds: policy.allowed_locator_kinds,
                 allow_loopback_http: allow_loopback,
                 transport: self.blossom_http_transport.clone(),
+                retention_app: self.app.clone(),
+                retention_account: self.state.label.clone(),
+                retention_group: group_id.clone(),
             },
             EncryptedMediaUploadFinish {
                 group_id: group_id.clone(),
@@ -4947,10 +5057,12 @@ impl AppClient {
         ))
     }
 
+    /// Complete successful HTTP independently of best-effort local retention.
     pub(crate) async fn finish_encrypted_media_upload(
         &mut self,
         finish: EncryptedMediaUploadFinish,
         mut result: MediaUploadResult,
+        upload_tokens: Vec<Vec<u8>>,
     ) -> Result<MediaUploadResult, AppError> {
         if !finish.should_send {
             return Ok(result);
@@ -4960,14 +5072,32 @@ impl AppClient {
             .iter()
             .map(|attachment| attachment.reference.clone())
             .collect();
-        let summary = self
+        let summary = match self
             .send_tagged_media(
                 &finish.group_id,
                 attachments,
-                finish.caption,
-                finish.message_tags,
+                finish.caption.clone(),
+                finish.message_tags.clone(),
             )
-            .await?;
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                // Committed pending/canonical sources protect staging even if optional
+                // owner protection failed. The storage
+                // fence preserves accepted sends even if their host wait fails.
+                return Err(preserve_encrypted_media_upload_error(
+                    error,
+                    self.app
+                        .account_storage(&self.state.label)
+                        .and_then(|storage| {
+                            storage
+                                .abandon_attachment_uploads(&upload_tokens)
+                                .map_err(AppError::from)
+                        }),
+                ));
+            }
+        };
         // The post-publish projection now durably references this source
         // epoch. Persist again so a prior final-reference retirement cannot
         // suppress the secret needed by the newly retained message.

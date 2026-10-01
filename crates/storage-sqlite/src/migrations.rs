@@ -207,6 +207,8 @@ mod migration_0098_recovery_history_notices;
 mod migration_0099_attachment_preparation_deferrals;
 #[path = "migrations/0100_attachment_explicit_priority.rs"]
 mod migration_0100_attachment_explicit_priority;
+#[path = "migrations/0101_outgoing_attachment_uploads.rs"]
+mod migration_0101_outgoing_attachment_uploads;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -722,6 +724,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 100,
         name: "0100_attachment_explicit_priority",
         apply: migration_0100_attachment_explicit_priority::apply,
+    },
+    Migration {
+        version: 101,
+        name: "0101_outgoing_attachment_uploads",
+        apply: migration_0101_outgoing_attachment_uploads::apply,
     },
 ];
 

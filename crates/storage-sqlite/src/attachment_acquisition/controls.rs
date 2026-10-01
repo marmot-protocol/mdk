@@ -158,9 +158,9 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if !partial::valid_attempt(&conn, job, now)? { return Ok(false); }
-            Ok(conn.execute("UPDATE attachment_acquisition SET network_attempts=min(network_attempts+automatic_history,2147483647)
+            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET network_attempts=min(network_attempts+automatic_history,2147483647)
                 WHERE token=?1 AND (automatic_history=0 OR body_completed=0) AND cancelled=0
-                AND (automatic_history=0 OR network_attempts<64) AND permission_paused=0 AND (explicit_request=1 OR COALESCE((SELECT automatic FROM attachment_download_policy WHERE id=1),1)=1)",
+                AND (automatic_history=0 OR network_attempts<64) AND permission_paused=0 AND (explicit_request=1 OR COALESCE((SELECT automatic FROM attachment_download_policy WHERE id=1),1)=1) AND {}",super::outgoing::STAGED_UPLOAD_MATCH),
                 [&job.reference.token]).storage()? == 1)
         })
     }
@@ -224,6 +224,9 @@ impl SqliteAccountStorage {
                 now,
                 automatic,
             )?;
+            if self.attachment_source_has_upload(group,&selected.message_id_hex,selected.attachment_index)? {
+                return Ok((status,false));
+            }
             // Existing state (including cancellation, loss of bytes and retry
             // deadlines) wins over demand and is never reset by a screen render.
             if status.as_ref().is_none_or(|s| {
@@ -506,9 +509,10 @@ impl SqliteAccountStorage {
             ("attachment_acquisition_priority", " AND explicit_request=1")
         };
         let sql = format!(
-            "SELECT token FROM attachment_acquisition INDEXED BY {index}
-            WHERE due IS NOT NULL AND due<=?1 AND cancelled=0{explicit_filter}
-            ORDER BY explicit_request DESC,priority_at DESC,due,token LIMIT ?2"
+            "SELECT token FROM attachment_acquisition AS q INDEXED BY {index}
+            WHERE due IS NOT NULL AND due<=?1 AND cancelled=0{explicit_filter} AND {}
+            ORDER BY explicit_request DESC,priority_at DESC,due,token LIMIT ?2",
+            super::outgoing::STAGED_UPLOAD_MATCH
         );
         let mut stmt = conn.prepare(&sql).storage()?;
         stmt.query_map(params![u64_to_i64(now)?, limit as i64], |r| {

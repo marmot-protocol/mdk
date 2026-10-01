@@ -3779,7 +3779,7 @@ enum MediaHttpCompletion {
     },
     Upload {
         finish: EncryptedMediaUploadFinish,
-        result: Result<MediaUploadResult, AppError>,
+        result: Result<(MediaUploadResult, Vec<Vec<u8>>), AppError>,
         respond: oneshot::Sender<Result<MediaUploadResult, AppError>>,
         started_at: Instant,
     },
@@ -4027,7 +4027,11 @@ async fn complete_media_http(
             started_at,
         } => {
             let result = match result {
-                Ok(result) => client.finish_encrypted_media_upload(finish, result).await,
+                Ok((result, upload_tokens)) => {
+                    client
+                        .finish_encrypted_media_upload(finish, result, upload_tokens)
+                        .await
+                }
                 Err(err) => Err(err),
             };
             // Mixed uploads are one batch attempt, classified as other.

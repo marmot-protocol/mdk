@@ -6138,6 +6138,8 @@ impl MarmotApp {
         self.record_account_app_event_at(label, message, unix_now_seconds())
     }
 
+    /// Commit source projection atomically; optional outgoing retention runs
+    /// after the outermost commit and cannot reject accepted publication.
     pub(crate) fn record_account_app_event_at(
         &self,
         label: &str,
@@ -6153,6 +6155,14 @@ impl MarmotApp {
                 message.retention,
                 message.authority,
             )?;
+            if message.direction == "sent" {
+                storage.retain_attachment_uploads_after_commit(
+                    &message.group_id_hex,
+                    &message.message_id_hex,
+                    received_at,
+                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                );
+            }
             self.app_projection_update(label, storage_update)
         })
     }
@@ -6172,10 +6182,20 @@ impl MarmotApp {
                 message.retention,
                 message.authority,
             )?;
+            if message.direction == "sent" {
+                storage.retain_attachment_uploads_after_commit(
+                    &message.group_id_hex,
+                    &message.message_id_hex,
+                    now,
+                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                );
+            }
             self.app_projection_update(label, storage_update)
         })
     }
 
+    /// Finalize accepted source authority and retry outgoing byte promotion even
+    /// when retention metadata was already committed by an earlier fanout pass.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize_account_app_event_source_retention(
         &self,
@@ -6206,6 +6226,12 @@ impl MarmotApp {
                 source_epoch,
                 retention,
             )?;
+            storage.retain_attachment_uploads_after_commit(
+                group_id_hex,
+                message_id_hex,
+                unix_now_seconds(),
+                runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+            );
             retention_update
                 .or(authority_update)
                 .map(|update| self.app_projection_update(label, update))

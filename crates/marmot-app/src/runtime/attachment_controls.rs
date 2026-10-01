@@ -17,7 +17,8 @@ pub enum AttachmentControl {
     Remove,
 }
 
-pub(super) fn default_policy(config: &MarmotAppConfig) -> AttachmentDownloadPolicy {
+/// Derive the shared admission/retention defaults for receive and upload paths.
+pub(crate) fn default_policy(config: &MarmotAppConfig) -> AttachmentDownloadPolicy {
     let p = config.attachment_acquisition.clone().unwrap_or_default();
     AttachmentDownloadPolicy {
         automatic: config.attachment_acquisition.is_some(),

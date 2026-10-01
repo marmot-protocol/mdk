@@ -89,7 +89,7 @@ pub use conversation_window::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
-mod attachment_controls;
+pub(crate) mod attachment_controls;
 pub(crate) mod attachment_permission;
 pub use attachment_controls::{
     AttachmentControl, AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,

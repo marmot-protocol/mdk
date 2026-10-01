@@ -56,6 +56,17 @@ fn admit_demands(
     let demands = storage.attachment_worker_demands(DEMAND_BATCH)?;
     let more = demands.len() == DEMAND_BATCH;
     for demand in demands {
+        if storage.attachment_source_has_upload(
+            &demand.group_id_hex,
+            &demand.entry.message_id_hex,
+            demand.entry.attachment_index,
+        ).unwrap_or_else(|_| {
+            tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_lookup", "optional outgoing retention lookup deferred");
+            false
+        }) {
+            storage.acknowledge_attachment_worker_demand(&demand)?;
+            continue;
+        }
         if let Some(epoch) = demand.entry.source_epoch
             && let Some(reference) = reference(&demand.entry.slot, epoch, loopback)
         {
@@ -140,6 +151,13 @@ pub(super) fn schedule(
     let now = crate::unix_now_seconds();
     // Abandoned ciphertext expires even after automatic acquisition is disabled.
     let partials = storage.prune_attachment_partials(now, 64)?;
+    let orphan_uploads = storage
+        .prune_attachment_uploads(now, 64)
+        .unwrap_or_else(|_| {
+            tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_prune",
+            "optional outgoing retention cleanup deferred");
+            0
+        });
     let policy = storage.attachment_download_policy(
         &super::super::attachment_controls::default_policy(&client.app.config),
     )?;
@@ -153,6 +171,13 @@ pub(super) fn schedule(
     let host_managed = client.app.config.attachment_acquisition_mode
         == crate::AttachmentAcquisitionMode::HostManaged;
     let identity = storage.attachment_store_identity()?;
+    if storage
+        .recover_attachment_uploads(now, 32, policy.retained_bytes)
+        .is_err()
+    {
+        tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_recovery",
+            "optional outgoing retention recovery deferred");
+    }
     let resumed = if policy.automatic {
         storage.resume_permitted_attachments(
             now,
@@ -174,7 +199,8 @@ pub(super) fn schedule(
                 client.app.config.allow_loopback_blob_endpoints,
             )?)
         || expired == 64
-        || partials == 64;
+        || partials == 64
+        || orphan_uploads == 64;
     // Metadata and expiry maintenance continue when disk or network slots are full.
     // Admission never evicts an acquired asset and never increments attempts while paused.
     if http.permits.available_permits() <= 1 {

@@ -25,21 +25,50 @@ impl MarmotAppRuntime {
             let caption = request.caption.clone();
             let upload = runtime.upload_media(&account, &group, request).await?;
             let accepted = if send {
-                Some(
-                    runtime
-                        .submit_media_attachments(
-                            &account,
-                            &group,
-                            upload
+                let submission = runtime
+                    .submit_media_attachments(
+                        &account,
+                        &group,
+                        upload
+                            .attachments
+                            .iter()
+                            .map(|a| a.reference.clone())
+                            .collect(),
+                        caption,
+                        client_token,
+                    )
+                    .await;
+                match submission {
+                    Ok(accepted) => Some(accepted),
+                    Err(error) => {
+                        let cleanup = (|| -> Result<(), AppError> {
+                            let resolved = runtime.accounts.resolve(&account)?;
+                            let slots = upload
                                 .attachments
                                 .iter()
-                                .map(|a| a.reference.clone())
-                                .collect(),
-                            caption,
-                            client_token,
-                        )
-                        .await?,
-                )
+                                .map(|a| {
+                                    serde_json::to_value(a.reference.imeta_tag()).map_err(|_| {
+                                        AppError::InvalidEncryptedMedia(
+                                            "invalid upload descriptor".into(),
+                                        )
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            runtime
+                                .accounts
+                                .app
+                                .account_storage(&resolved.label)?
+                                .abandon_bound_attachment_uploads(
+                                    &hex::encode(group.as_slice()),
+                                    &slots,
+                                )?;
+                            Ok(())
+                        })();
+                        return Err(crate::client::preserve_encrypted_media_upload_error(
+                            error, cleanup,
+                        ));
+                    }
+                }
             } else {
                 None
             };
