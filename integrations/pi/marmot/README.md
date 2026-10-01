@@ -55,7 +55,8 @@ Pi's initial user `message_end` event. If that count is short, `wn-pi` kills
 Pi's process group as soon as the decoder reports the mismatch. If an assistant
 `message_end` arrives first, the decoder also rejects the turn, but Pi may
 already have processed the prompt before rejection. In either case, the chat
-gets an attachment-processing error. A session Pi created for that turn is
+gets an attachment-processing error warning that Pi may already have acted
+and to check for changes before retrying. A session Pi created for that turn is
 not kept, so the next prompt starts fresh. A resumed session remains stored
 with any messages Pi recorded before it was stopped.
 

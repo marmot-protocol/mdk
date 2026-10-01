@@ -2135,7 +2135,7 @@ async fn handle_backend_run_failure(
             config.spec.reply_prefix, config.spec.display_name
         ),
         HarnessError::AttachmentNotProcessed => format!(
-            "[{}] {} could not process an attachment in this batch and was stopped before acting on it.",
+            "[{}] {} could not process an attachment in this batch and was stopped. It may already have acted on the prompt; check for changes before retrying.",
             config.spec.reply_prefix, config.spec.display_name
         ),
         HarnessError::AttachmentBackendCapabilityUnsupported { capability } => format!(
