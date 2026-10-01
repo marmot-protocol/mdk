@@ -4309,11 +4309,15 @@ impl AppClient {
                         && !refused
                         && covers_goal
                         && compared.is_some_and(|compared| compared.certified);
-                    certified |= scope_certified;
+                    // Certifying a scope that already carried its certificate
+                    // is not new coverage, so it neither resets pacing nor
+                    // the scope's parking budget.
+                    let newly_certified = scope_certified && !kept_certificate;
+                    certified |= newly_certified;
                     scopes_certified += u64::from(scope_certified);
                     let scope_progress = if window_searched {
                         storage_sqlite::RecoveryPassProgress::WindowCertified
-                    } else if scope_certified
+                    } else if newly_certified
                         || compared.is_some_and(|compared| compared.fetched > 0)
                     {
                         storage_sqlite::RecoveryPassProgress::Progressed
@@ -4321,7 +4325,7 @@ impl AppClient {
                         && compared.is_some_and(|compared| {
                             // A route no comparison backend could compare
                             // was not answered by its relays, so it spends
-                            // no parking budget.
+                            // the unserved budget, not the quiet one.
                             compared.answered
                                 && compared.outcome
                                     != storage_sqlite::RecoveryComparisonOutcome::Unsupported
@@ -4337,8 +4341,9 @@ impl AppClient {
                             obligation_progress,
                             scope_progress,
                         ));
+                        // A scope this pass did not compare spends no budget.
+                        progress.push((scope.goal.scope_id, scope_progress));
                     }
-                    progress.push((scope.goal.scope_id, scope_progress));
                     let retained_known_event = match (&route, scope.goal.known_event_id) {
                         (Some(route), Some(event)) => storage.retained_recovery_event(
                             route,

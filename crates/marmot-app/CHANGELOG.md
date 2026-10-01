@@ -32,6 +32,12 @@
   and new routes are compared again. Before, each new DM restarted recovery
   over every route, so on accounts with many chats it rarely finished
   (#2110).
+- History recovery no longer retries forever when a required relay never
+  answers. After six unanswered comparisons in a row for a route with the same
+  required relays, the route stops holding its obligation open, which then
+  parks with the existing "history may be incomplete" notice. Re-certifying a
+  route that already carried its certificate no longer counts as progress, so
+  it does not reset retry pacing (#2110).
 - Host catch-up (`catch_up_accounts`) and the catch-up after creating or
   changing a group no longer run a recovery job while holding the account
   worker. They drain live input and return; the worker's paced recovery job

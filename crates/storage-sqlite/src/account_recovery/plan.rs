@@ -92,6 +92,12 @@ pub struct RecoveryScopeCheckpoint {
 /// needs, for its unchanged goal, before the obligation parks.
 pub const RECOVERY_PARK_AFTER_QUIET_PASSES: u64 = 3;
 
+/// Unserved comparisons in a row, for an unchanged goal and its required
+/// relays, after which a scope counts toward parking like a quiet one. A
+/// required relay that never answers otherwise keeps the obligation retrying
+/// forever (mdk#2110). Six passes is where retry pacing reaches its cap.
+const RECOVERY_PARK_AFTER_UNSERVED_PASSES: u64 = 6;
+
 /// What one comparison pass did for one compared scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryPassProgress {
@@ -135,6 +141,10 @@ pub(super) struct ScopePayloadV1 {
     /// neither certified nor admitted anything.
     #[serde(default, skip_serializing_if = "is_zero")]
     quiet_passes: u64,
+    /// Comparisons of this scope in a row, for this goal, whose required
+    /// relays did not all answer, on passes that could otherwise retry.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    unserved_passes: u64,
     /// A comparison certified this goal's retained window. It never counts as
     /// coverage and keeps the scope off the quiet streak.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -395,10 +405,10 @@ pub(super) fn uncertified_scope_keys(
     Ok(keys)
 }
 
-/// Whether every scope the obligation still cannot certify has had its quiet
-/// comparisons in a row for its goal. A scope a pass never compared keeps its
-/// own count, so a slice of routes cannot park the rest.
-fn quiet_scopes_exhausted(
+/// Whether every scope the obligation still cannot certify has had its quiet,
+/// or unserved, comparisons in a row for its goal. A scope a pass never
+/// compared keeps its own counts, so a slice of routes cannot park the rest.
+fn scope_budgets_exhausted(
     conn: &Connection,
     obligation_id: &[u8],
     predicate: i64,
@@ -432,7 +442,9 @@ fn quiet_scopes_exhausted(
         if payload.window_certified || payload_is_qualified(&payload, predicate, known_event) {
             continue;
         }
-        if payload.quiet_passes < RECOVERY_PARK_AFTER_QUIET_PASSES {
+        if payload.quiet_passes < RECOVERY_PARK_AFTER_QUIET_PASSES
+            && payload.unserved_passes < RECOVERY_PARK_AFTER_UNSERVED_PASSES
+        {
             return Ok(false);
         }
         uncertified += 1;
@@ -664,6 +676,7 @@ impl SqliteAccountStorage {
                     loss_revision: expected.loss_revision, route_revision: expected.route_revision,
                     inventory_revision: expected.inventory_revision,
                     quiet_passes: 0,
+                    unserved_passes: 0,
                     window_certified: false,
                 };
                 if let Some((_, _, format, Some(bytes), 1)) = prior {
@@ -694,6 +707,7 @@ impl SqliteAccountStorage {
                         && previous.required_endpoints == plan.required_endpoints
                     {
                         payload.quiet_passes = previous.quiet_passes;
+                        payload.unserved_passes = previous.unserved_passes;
                         payload.window_certified = previous.window_certified;
                     }
                     if compatible_columns && previous.obligation_revision == *revision
@@ -759,11 +773,15 @@ impl SqliteAccountStorage {
     }
 
     /// [`Self::checkpoint_recovery_obligation`] for a comparison pass, which
-    /// also counts each compared scope's quiet streak in the same transaction.
-    /// A retryable obligation parks once every uncertified scope has
-    /// [`RECOVERY_PARK_AFTER_QUIET_PASSES`] quiet comparisons in a row for its
-    /// goal. Progress restarts a scope's streak, an unserved comparison leaves
-    /// it where it was, and a scope this pass did not compare is not listed.
+    /// also counts each compared scope's streaks in the same transaction. A
+    /// retryable obligation parks once every uncertified scope has
+    /// [`RECOVERY_PARK_AFTER_QUIET_PASSES`] quiet or six unserved comparisons
+    /// in a row for its goal. Progress restarts both streaks, a quiet
+    /// comparison restarts the unserved one, an unserved comparison leaves the
+    /// quiet one where it was, and a scope this pass did not compare is not
+    /// listed.
+    /// An unserved comparison on a pass that cannot retry, such as refused
+    /// admission, counts nothing: it says nothing about the relays.
     pub fn checkpoint_recovery_comparison(
         &self,
         expected: &RecoveryRevisionFence,
@@ -838,13 +856,23 @@ impl SqliteAccountStorage {
                 match progress.and_then(|progress| {
                     progress.iter().find(|(scope, _)| *scope == token.scope_id)
                 }) {
-                    Some((_, RecoveryPassProgress::Progressed)) => payload.quiet_passes = 0,
+                    Some((_, RecoveryPassProgress::Progressed)) => {
+                        payload.quiet_passes = 0;
+                        payload.unserved_passes = 0;
+                    }
                     Some((_, RecoveryPassProgress::WindowCertified)) => {
                         payload.quiet_passes = 0;
+                        payload.unserved_passes = 0;
                         payload.window_certified = true;
                     }
                     Some((_, RecoveryPassProgress::Quiet)) => {
                         payload.quiet_passes = payload.quiet_passes.saturating_add(1);
+                        payload.unserved_passes = 0;
+                    }
+                    Some((_, RecoveryPassProgress::Unserved))
+                        if incomplete == RecoveryEligibility::Retry =>
+                    {
+                        payload.unserved_passes = payload.unserved_passes.saturating_add(1);
                     }
                     Some((_, RecoveryPassProgress::Unserved)) | None => {}
                 }
@@ -873,13 +901,15 @@ impl SqliteAccountStorage {
             ).storage()?;
             let qualified = scopes_qualify(&conn, expected, Some(attempt_serial), obligation_id, predicate)?;
             let mut eligibility = incomplete;
-            let quiet_now = progress.is_some_and(|progress| {
-                progress.iter().any(|(_, pass)| *pass == RecoveryPassProgress::Quiet)
+            let counted_now = progress.is_some_and(|progress| {
+                progress.iter().any(|(_, pass)| {
+                    matches!(pass, RecoveryPassProgress::Quiet | RecoveryPassProgress::Unserved)
+                })
             });
             if !qualified
-                && quiet_now
+                && counted_now
                 && incomplete == RecoveryEligibility::Retry
-                && quiet_scopes_exhausted(&conn, &obligation_id, predicate)?
+                && scope_budgets_exhausted(&conn, &obligation_id, predicate)?
             {
                 eligibility = RecoveryEligibility::NeedsDeepRepair;
             }
@@ -1075,6 +1105,80 @@ mod tests {
         assert_eq!(eligibility(loss), RecoveryEligibility::Retry);
         pass(&[(loss, &[(0, Quiet), (1, Quiet)])]);
         assert_eq!(eligibility(loss), RecoveryEligibility::NeedsDeepRepair);
+    }
+
+    /// A required relay that never answers parks the scope after its own
+    /// unserved budget; an answered comparison starts that budget over.
+    #[test]
+    fn unserved_streaks_park_dead_required_relays() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("alice").unwrap();
+        store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+        let loss = store.recovery_revision_fence().unwrap().obligations[0].0;
+        let mut group = plan(&["a", "b"]);
+        group.scope_id = 1;
+        group.route_kind = 1;
+        group.group_id = Some(vec![7]);
+        group.transport_group_id = Some([7; 32]);
+        let scopes = [plan(&["a", "b"]), group];
+        let now = std::cell::Cell::new(1_000_u64);
+        let pass = |progress: &[(u64, RecoveryPassProgress)]| {
+            let fence = store.recovery_revision_fence().unwrap();
+            now.set(now.get() + 100_000);
+            let attempt = store
+                .reserve_recovery_attempt(&fence, now.get(), 1_000, false)
+                .unwrap()
+                .expect("a retryable pass is reserved")
+                .attempt_serial;
+            let tokens = store
+                .install_recovery_scope_plan(&fence, attempt, loss, &scopes)
+                .unwrap()
+                .unwrap();
+            let checkpoints = progress
+                .iter()
+                .map(|(scope, _)| checkpoint(&tokens[*scope as usize], Vec::new()))
+                .collect::<Vec<_>>();
+            store
+                .checkpoint_recovery_comparison(
+                    &fence,
+                    attempt,
+                    loss,
+                    &checkpoints,
+                    RecoveryEligibility::Retry,
+                    progress,
+                )
+                .unwrap();
+        };
+        let eligibility = || {
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.ticket.id == loss)
+                .unwrap()
+                .eligibility
+        };
+        use RecoveryPassProgress::{Quiet, Unserved};
+        // The inbox answers quietly until its budget is spent; the group
+        // route's required relay never answers.
+        for _ in 0..RECOVERY_PARK_AFTER_QUIET_PASSES {
+            pass(&[(0, Quiet), (1, Unserved)]);
+        }
+        for _ in RECOVERY_PARK_AFTER_QUIET_PASSES + 1..RECOVERY_PARK_AFTER_UNSERVED_PASSES {
+            pass(&[(1, Unserved)]);
+        }
+        assert_eq!(eligibility(), RecoveryEligibility::Retry);
+        pass(&[(1, Quiet)]);
+        for _ in 1..RECOVERY_PARK_AFTER_UNSERVED_PASSES {
+            pass(&[(1, Unserved)]);
+        }
+        assert_eq!(
+            eligibility(),
+            RecoveryEligibility::Retry,
+            "an answered comparison starts the unserved budget over"
+        );
+        pass(&[(1, Unserved)]);
+        assert_eq!(eligibility(), RecoveryEligibility::NeedsDeepRepair);
     }
 
     /// A route-policy change is not new evidence: a scope whose own route,

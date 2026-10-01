@@ -4272,43 +4272,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn required_relay_outages_never_spend_the_parking_budget() {
+    async fn required_relay_outages_park_after_a_longer_budget() {
         let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
         let storage = app.account_storage("alice").unwrap();
-        for pass in 1..=RECOVERY_PARK_AFTER_ATTEMPTS * 2 {
+        // Every required relay fails or times out. Outages are waited out
+        // longer than quiet answers, but not forever (mdk#2110).
+        let mut passes = 0;
+        while queue_loss(&storage) != Some(storage_sqlite::RecoveryEligibility::NeedsDeepRepair) {
+            passes += 1;
+            assert!(passes <= 3 * RECOVERY_PARK_AFTER_ATTEMPTS, "outages park");
             let grant = client
                 .authorize_account_recovery(
                     None,
                     marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
                 )
                 .unwrap()
-                .unwrap_or_else(|| panic!("pass {pass} is selected"));
-            // Every required relay fails or times out.
+                .unwrap_or_else(|| panic!("pass {passes} is selected"));
             client.test_comparison_results = Some(scripted_routes(&grant, |_| true));
             client.run_recovery_grant_for_test(grant).await.unwrap();
-            assert_eq!(
-                queue_loss(&storage),
-                Some(storage_sqlite::RecoveryEligibility::Retry),
-                "pass {pass}: an unserved pass is waited out, not counted"
-            );
             client.recovery_owner.test_advance_to_retry(&storage);
         }
-        // Two quiet passes after the outages: the streak starts from zero.
-        for _ in 1..RECOVERY_PARK_AFTER_ATTEMPTS {
-            let grant = client
-                .authorize_account_recovery(
-                    None,
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-                )
-                .unwrap()
-                .unwrap();
-            client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
-            client.run_recovery_grant_for_test(grant).await.unwrap();
-            client.recovery_owner.test_advance_to_retry(&storage);
-        }
-        assert_eq!(
-            queue_loss(&storage),
-            Some(storage_sqlite::RecoveryEligibility::Retry)
+        assert!(
+            passes > RECOVERY_PARK_AFTER_ATTEMPTS,
+            "took {passes} passes"
         );
     }
 

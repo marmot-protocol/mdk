@@ -14,6 +14,11 @@
 - Certifying incremental-history debt through a full-history repair now settles the
   pending recovery comparison, so a comparison with no work left is no longer selected
   ahead of other recovery causes. (#2100)
+- `checkpoint_recovery_comparison` counts each scope's unserved comparisons in a
+  row (stored in the scope payload, no migration). A scope with six, on passes
+  that could retry, counts toward parking like one with three quiet comparisons.
+  Progress resets both counts, a quiet comparison resets the unserved count, and
+  a goal or required-relay change starts both over. (#2110)
 
 ### Changed
 

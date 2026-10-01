@@ -84,10 +84,16 @@ The simulator comes first; Jeff validates on a phone.
      It shows "history may be incomplete" and offers an explicit deep repair, which can
      still complete it with qualified coverage, or an explicit retirement. There are no
      further automatic retries.
-   - Comparisons whose required relays failed or timed out do not count toward the budget. A
-     relay that answered but could not hand over a claimed event, an event that was not
-     durably admitted, and a backend that cannot compare a route all give a finished answer,
-     so they do count.
+   - Comparisons whose required relays failed or timed out do not count toward the quiet
+     budget. They have their own: after 6 in a row for a route's unchanged goal and required
+     relays, the route counts as exhausted too, so a permanently dead required relay parks
+     the obligation instead of retrying forever (mdk#2110). Six is where retry pacing reaches
+     its cap. Any answered comparison of that route starts this count over. A pass whose
+     admission was refused counts nothing. A relay that answered but could not hand over a
+     claimed event, an event that was not durably admitted, and a backend that cannot
+     compare a route all give a finished answer, so they do count.
+   - Re-certifying a route that already carried its certificate is not progress: it does not
+     reset pacing or the route's count.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
 3. **Required relays are the relays we operate.** `MarmotAppConfig::recovery_operated_relays`
