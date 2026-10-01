@@ -1756,7 +1756,11 @@ impl AppClient {
                 key_package_event_id: member.source.as_ref().map(|source| source.event_id.clone()),
             });
         }
-        self.refresh_routing()?;
+        self.refresh_member_inbox_routes(
+            founding_selections
+                .iter()
+                .map(|selection| selection.recipient_hex.as_str()),
+        )?;
         let constructable = self.runtime.constructable_capabilities(&members)?;
         require_initial_group_component_support(&constructable, &request.app_components)?;
         let uploads_inline_image =
@@ -5991,6 +5995,23 @@ impl AppClient {
             .group_routes
             .retain(|route| !group_is_terminal(&self.runtime, &route.group_id));
         self.routing.replace(snapshot);
+        Ok(())
+    }
+
+    /// Install the inbox routes of the given members, which a Welcome publish
+    /// needs. Key-package resolution has just stored their relay lists, and
+    /// nothing else in the table can have changed, so this replaces a
+    /// `refresh_routing` rebuild whose cost grows with the account's chats
+    /// (mdk#2110). The new group's own routes are installed by `add_group`.
+    fn refresh_member_inbox_routes<'a>(
+        &self,
+        members: impl Iterator<Item = &'a str>,
+    ) -> Result<(), AppError> {
+        for member in members {
+            let route = self.app.member_inbox_route(member)?;
+            self.routing
+                .replace_inbox_route(cgka_traits::MemberId::new(hex::decode(member)?), route);
+        }
         Ok(())
     }
 

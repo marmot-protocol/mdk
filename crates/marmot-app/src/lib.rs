@@ -4370,6 +4370,43 @@ impl MarmotApp {
         }))
     }
 
+    /// One member's inbox route, by the same precedence as `routing_for`: a
+    /// local account's own inbox, else the safe inbox of its directory entry.
+    fn member_inbox_route(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<Vec<TransportEndpoint>>, AppError> {
+        let local = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex);
+        if let Some(account) = local {
+            let profile = self.profile_for_account(account);
+            return Ok(Some(
+                profile
+                    .inbox_endpoints
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+            ));
+        }
+        let Some(entry) = self.directory_entry_for_account_id(account_id_hex)? else {
+            return Ok(None);
+        };
+        let endpoints = self.retain_safe_discovered_endpoints(
+            entry
+                .relay_lists
+                .inbox
+                .relays
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect(),
+            "directory inbox routing",
+        );
+        Ok((!endpoints.is_empty()).then_some(endpoints))
+    }
+
     fn latest_key_package(&self, label: &str) -> Result<KeyPackage, AppError> {
         let path = self.key_package_record_path(label);
         if !path.exists() {
@@ -6975,6 +7012,19 @@ impl AppTransportRouting {
 
     fn snapshot(&self) -> AppRoutingState {
         self.read().clone()
+    }
+
+    /// Replace one member's inbox route; `None` removes it.
+    fn replace_inbox_route(&self, member: MemberId, endpoints: Option<Vec<TransportEndpoint>>) {
+        let mut state = self.write();
+        match endpoints {
+            Some(endpoints) => {
+                state.inbox_routes.insert(member, endpoints);
+            }
+            None => {
+                state.inbox_routes.remove(&member);
+            }
+        }
     }
 
     fn replace(&self, state: AppRoutingState) {

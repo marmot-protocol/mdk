@@ -38,6 +38,11 @@
   with the existing "history may be incomplete" notice. Offline passes and
   routes skipped or timed out by the local deadline spend no parking budget
   (#2110).
+- Creating a group no longer rebuilds the whole routing table. It installs only
+  the invitees' inbox routes, which the Welcome publish needs; `add_group`
+  already installs the new group's routes. The rebuild took about 13 ms per
+  create at 1000 chats, most of it a quadratic pass over deleted-group routes
+  (#2110).
 - Host catch-up (`catch_up_accounts`) and the catch-up after creating or
   changing a group no longer run a recovery job while holding the account
   worker. They drain live input and return; the worker's paced recovery job
