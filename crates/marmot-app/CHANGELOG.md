@@ -44,9 +44,14 @@
   profile, follows, and kind-10002/10050 relay lists. Repairs publish there
   too, so stale copies are replaced. Previously a host that passed only its
   own messaging relays could see an existing identity's lists as missing and
-  be offered (or automatically approve) a defaults-only replacement. A missing list is now concluded only when every searched
-  relay, indexers included, answers. Loopback (development) routes are
-  unchanged, and the KeyPackage device check keeps its existing sources.
+  be offered (or automatically approve) a defaults-only replacement. A
+  missing list is now concluded, and a repair approved, only when every
+  searched relay, indexers included, answers. Indexers use only the
+  inspection slots left after the host's and the account's declared relays.
+  A host-selected set from `set_onboarding_discovery_relays` is used as given,
+  without indexers, so an unreachable indexer can be bypassed. Loopback
+  (development) routes are unchanged, and the KeyPackage device check keeps
+  its existing sources.
 - A route change, such as creating or leaving a group, no longer resets
   history recovery for every route. Routes whose own window and required
   relays are unchanged keep their certificates and quiet streak; only changed

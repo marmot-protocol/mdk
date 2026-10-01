@@ -257,6 +257,10 @@ struct OnboardingCheckpoint {
     setup_cleanup_pending: bool,
     #[serde(default)]
     attempt_start_revision: u64,
+    // A host-selected discovery set is used as given, without public indexers,
+    // so a host can still look past an unreachable indexer.
+    #[serde(default)]
+    explicit_discovery: bool,
 }
 
 pub struct OnboardingSubscription {
@@ -346,6 +350,7 @@ impl OnboardingCheckpoint {
             single_device_acknowledged: false,
             setup_cleanup_pending: false,
             attempt_start_revision: 0,
+            explicit_discovery: false,
         }
     }
     fn new_attempt(
@@ -1548,6 +1553,7 @@ impl AccountManager {
         };
         self.validate_onboarding_options(&options)?;
         c.options = options;
+        c.explicit_discovery = true;
         c.snapshot.proposal = None;
         for index in 0..STEP_COUNT {
             if c.snapshot.steps[index].status != OnboardingStatus::Skipped {
@@ -1738,17 +1744,17 @@ impl AccountManager {
     ) -> Vec<String> {
         let mut sources = c.options.discovery_relays.clone();
         // KeyPackages live on the account's own relays, not on indexers.
-        if step != OnboardingStep::SingleDevice {
-            append_public_indexers(
-                &mut sources,
-                &c.options,
-                &default_directory_discovery_relays(),
-            );
-        }
+        let indexers = if step == OnboardingStep::SingleDevice || c.explicit_discovery {
+            Vec::new()
+        } else {
+            default_directory_discovery_relays()
+        };
         let list = if let Some(event) = &c.records[OnboardingStep::Relays.index()] {
             Some(event.clone())
         } else if step.optional() {
-            self.inspect_onboarding_relays(&c.snapshot.account_id_hex, 10002, sources.clone())
+            let mut lookup = sources.clone();
+            append_public_indexers(&mut lookup, &c.options, &indexers);
+            self.inspect_onboarding_relays(&c.snapshot.account_id_hex, 10002, lookup)
                 .await
                 .0
                 .into_iter()
@@ -1769,6 +1775,9 @@ impl AccountManager {
                 }
             }
         }
+        // Indexers only take the inspection slots the host's discovery relays
+        // and the account's declared relays leave free.
+        append_public_indexers(&mut sources, &c.options, &indexers);
         sources
     }
     async fn check_onboarding_step(
@@ -2198,17 +2207,23 @@ impl AccountManager {
                 self.inspect_onboarding_relays(
                     &c.snapshot.account_id_hex,
                     proposal.step.kind(),
-                    sources,
+                    sources.clone(),
                 ),
             )
             .await?;
         self.require_live_onboarding_attempt(&c)?;
-        // Every configured source must finish: a timeout may hide a newer record.
-        // Unreachable user-declared hints cannot establish absence either.
+        // Every configured source, including each searched public indexer, must
+        // finish: a timeout may hide a newer record. Unreachable user-declared
+        // hints cannot establish absence either.
+        let indexers: HashSet<String> = default_directory_discovery_relays()
+            .iter()
+            .map(|endpoint| relay_key(&endpoint.0))
+            .collect();
         if completed.is_empty()
             || c.options
                 .discovery_relays
                 .iter()
+                .chain(sources.iter().filter(|s| indexers.contains(&relay_key(s))))
                 .any(|endpoint| !completed.contains(&relay_key(endpoint)))
             || (records.is_empty() && !failures.is_empty())
         {

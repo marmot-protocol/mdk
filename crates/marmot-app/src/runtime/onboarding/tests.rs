@@ -1584,6 +1584,137 @@ async fn relay_lists_published_only_on_public_indexers_are_not_missing() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+fn fail_public_indexers(network: &Network) {
+    let mut errors = network.inspection_errors.lock().unwrap();
+    for indexer in crate::default_directory_discovery_relays() {
+        errors.insert(
+            indexer.0,
+            crate::relay_plane::DirectoryInspectionError::TimedOut,
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_indexers_never_displace_declared_relays_from_the_inspection_cap() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let indexers = crate::default_directory_discovery_relays();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    for (host, declared) in [(15, 1), (2, 10)] {
+        c.options.discovery_relays = (0..host)
+            .map(|n| format!("wss://host{n}.example"))
+            .collect();
+        let declared_relays = (0..declared)
+            .map(|n| format!("wss://declared{n}.example"))
+            .collect::<Vec<_>>();
+        c.records[OnboardingStep::Relays.index()] = Some(signed(
+            &keys,
+            10002,
+            declared_relays
+                .iter()
+                .map(|relay| vec!["r".into(), relay.clone()])
+                .collect(),
+            "",
+            unix_now_seconds(),
+        ));
+        let sources = manager
+            .onboarding_sources(&c, OnboardingStep::Profile)
+            .await;
+        assert_eq!(sources.len(), MAX_RELAYS);
+        assert_eq!(sources[..host], c.options.discovery_relays[..]);
+        assert_eq!(sources[host..host + declared], declared_relays[..]);
+        let added = &sources[host + declared..];
+        assert_eq!(
+            added.len(),
+            (MAX_RELAYS - host - declared).min(indexers.len())
+        );
+        assert!(
+            added
+                .iter()
+                .all(|relay| indexers.iter().any(|i| &i.0 == relay))
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn unanswered_public_indexer_blocks_repair_approval() {
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let old = signed(&keys, step.kind() as u16, vec![], "", unix_now_seconds());
+        let newer = signed(
+            &keys,
+            step.kind() as u16,
+            vec![],
+            "newer",
+            old.created_at + 1,
+        );
+        network.events.lock().unwrap().push(old.clone());
+        network.public_indexer_events.lock().unwrap().push(newer);
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.records[step.index()] = Some(old);
+        c.set(step, OnboardingStatus::NeedsInput, vec![]);
+        manager.save_onboarding(&mut c).unwrap();
+        let proposal = manager
+            .propose_onboarding_relays(&id, step, None)
+            .await
+            .unwrap();
+        // The host's relays answer with the proposal's record while every
+        // indexer, which holds a newer one, times out.
+        fail_public_indexers(&network);
+        let result = manager
+            .approve_onboarding_repair(&id, proposal.revision)
+            .await
+            .unwrap();
+        let state = &result.steps[step.index()];
+        assert_eq!(state.status, OnboardingStatus::RetryableFailure, "{step:?}");
+        assert!(
+            state
+                .findings
+                .iter()
+                .any(|f| f.issue == OnboardingIssue::TimedOut)
+        );
+        assert!(result.proposal.is_none());
+        assert!(network.attempts.lock().unwrap().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn explicit_discovery_relays_bypass_unreachable_public_indexers() {
+    let (_dir, runtime, network, _keys, id) = fixture().await;
+    fail_public_indexers(&network);
+    let manager = runtime.accounts();
+    manager.run_onboarding(&id).await.unwrap();
+    manager
+        .continue_onboarding_without(&id, OnboardingStep::Profile)
+        .await
+        .unwrap();
+    let blocked = manager
+        .continue_onboarding_without(&id, OnboardingStep::Follows)
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    let snapshot = manager
+        .set_onboarding_discovery_relays(&id, vec!["wss://index.example".into()])
+        .await
+        .unwrap();
+    let state = &snapshot.steps[OnboardingStep::Relays.index()];
+    assert_eq!(state.status, OnboardingStatus::NeedsInput);
+    assert!(
+        state
+            .findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::Missing)
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[test]
 fn public_indexers_join_discovery_except_on_loopback_routes() {
     let indexers = crate::default_directory_discovery_relays();
