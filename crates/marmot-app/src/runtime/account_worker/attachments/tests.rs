@@ -18,6 +18,7 @@ use marmot_account::AccountHome;
 use storage_sqlite::{StoredAccountGroup, StoredAccountState, StoredAppEvent};
 
 const GROUP: &str = "abababababababababababababababab";
+/// Build a stored group whose invitation state can be varied without an MLS engine.
 fn group(pending: bool) -> StoredAccountGroup {
     StoredAccountGroup {
         group_id_hex: GROUP.into(),
@@ -111,6 +112,7 @@ fn seed_direction(
         })
         .unwrap();
 }
+/// Give worker tests a group policy that points to the attachment fixture's Blossom endpoint.
 fn projection(reference: &crate::MediaAttachmentReference) -> crate::AppGroupRecord {
     let mut projection = crate::conversions::app_group_from_stored_group(group(false)).unwrap();
     projection.encrypted_media = crate::AppGroupEncryptedMediaComponent {
@@ -133,6 +135,7 @@ fn projection(reference: &crate::MediaAttachmentReference) -> crate::AppGroupRec
     projection
 }
 
+/// Create a local account and accepted attachment source without a live media endpoint.
 async fn offline_fixture() -> (
     tempfile::TempDir,
     AppClient,
@@ -165,6 +168,7 @@ async fn offline_fixture() -> (
     (dir, client, storage, reference)
 }
 
+/// Supply a bounded media HTTP lane and its completion receiver to worker tests.
 fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
     let (tx, rx) = mpsc::unbounded_channel();
     (
