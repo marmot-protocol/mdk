@@ -163,11 +163,12 @@ one automatic transfer across all accounts in a runtime; each account has at mos
 pending permit request. A permit remains held through queued plaintext publication.
 At least one of the four per-account media slots is reserved for foreground work.
 Preparation reads projected group policy and retained source-epoch secrets; it never
-hydrates MLS state. Projecting a received media message caches its source epoch's secret,
-exported live or, when the group already left that epoch (a convergence pass merges its
-commits before replayed applications drain; a delayed message decrypts from past-epoch
-secrets), derived from the epoch's retained MLS anchor, which spans the same five-epoch
-window that bounds delivering the message. Other missing secrets wait for sync's warm path.
+hydrates MLS state. Projecting a received media message caches the source-epoch secret
+that the engine captured while authenticating it. Replay and live ingest export it while
+the group sits at the source epoch; canonical apply derives it from the retained anchor of
+a late application's epoch before merging commits that could prune that anchor. For
+events without one, the secret is exported live or derived from the epoch's retained
+anchor (newest five epochs). Other missing secrets wait for sync's warm path.
 Invitation acceptance and canonical visibility are checked again at claim/publication.
 
 Starting Rust-configurable resource defaults (`AttachmentAcquisitionPolicy::default()`):

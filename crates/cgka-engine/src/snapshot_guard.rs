@@ -53,8 +53,10 @@ pub(crate) enum RewindSite {
     /// Ingest rewinds onto a retained anchor to read the retention policy that
     /// was authenticated at a delayed message's source epoch.
     RetentionSource,
-    /// The app rewinds onto a retained anchor to derive the encrypted-media
-    /// exporter secret of a past epoch that a received media message names.
+    /// The app, or canonical apply before it merges commits that could prune
+    /// the anchor, rewinds onto a retained anchor to derive the
+    /// encrypted-media exporter secret of a past epoch that a received media
+    /// message names.
     EncryptedMediaSource,
     /// Authenticate delayed moderation policy outside any replay guard.
     ModerationSource,

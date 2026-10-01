@@ -12,6 +12,7 @@ use crate::provider::EngineOpenMlsProvider;
 use crate::snapshot_guard::RewindSite;
 use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::CommitOrderingPriority;
+use cgka_traits::error::EngineError;
 use cgka_traits::group::{Member, ProtocolProfile};
 use cgka_traits::message::{
     MessageRecord, MessageState, OwnApplicationConvergenceStamp, StoredMessagePayload,
@@ -2712,6 +2713,16 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
         &skipped_prefix,
         apply_start_epoch,
     )?;
+    // A late application older than the apply start replays against the
+    // start state, after its source epoch ended, so replay attaches no media
+    // key. The commits merged below can prune that epoch's anchor before the
+    // app projects the message (receiver at E+3, late media from E+1, four
+    // new commits: the pass keeps E+2..E+7). Derive the key first.
+    let late_media_secrets = if has_new_commits {
+        late_application_media_secrets(storage, group_id, &replay_messages, apply_start_epoch)?
+    } else {
+        BTreeMap::new()
+    };
     let (live_message_records, live_queued_outbound) =
         if rewind_to_retained_anchor && !restore_own_checkpoint {
             (
@@ -2797,10 +2808,11 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     });
 
     match apply_result {
-        Ok(observations) => {
+        Ok(mut observations) => {
             if result.selected_tip.is_some() {
                 retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)?;
             }
+            attach_late_media_secrets(&mut observations, &late_media_secrets)?;
             Ok(observations)
         }
         Err(err) => {
@@ -2808,6 +2820,73 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
             Err(err)
         }
     }
+}
+
+/// Encrypted-media secrets of the source epochs of `replay_messages`'
+/// applications older than `apply_start_epoch`, from their retained anchors.
+/// Late applications are rare, so this costs one guarded rewind per distinct
+/// late epoch only when there is one. The payloads are still encrypted, so
+/// the epoch is derived even if its applications carry no attachment.
+fn late_application_media_secrets<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    replay_messages: &[TransportMessage],
+    apply_start_epoch: u64,
+) -> Result<BTreeMap<u64, cgka_traits::SecretBytes>, OpenMlsProjectionError> {
+    let mut late_epochs = BTreeSet::new();
+    for message in replay_messages {
+        let projection = project_mls_message(&message.payload)?;
+        if projection.kind != OpenMlsContentKind::Application {
+            continue;
+        }
+        if let Some(epoch) = projection.source_epoch
+            && epoch < apply_start_epoch
+        {
+            late_epochs.insert(epoch);
+        }
+    }
+
+    let crypto = RustCrypto::default();
+    let mut secrets = BTreeMap::new();
+    for epoch in late_epochs {
+        let secret = retained_anchor_media_secret(storage, &crypto, group_id, EpochId(epoch))
+            .map_err(|e| OpenMlsProjectionError::Snapshot(e.to_string()))?;
+        if let Some(secret) = secret {
+            secrets.insert(epoch, secret);
+        }
+    }
+    Ok(secrets)
+}
+
+/// Give each late media application without a replay-captured key the key
+/// derived for its source epoch before the apply.
+fn attach_late_media_secrets(
+    observations: &mut [OpenMlsReplayObservation],
+    secrets: &BTreeMap<u64, cgka_traits::SecretBytes>,
+) -> Result<(), OpenMlsProjectionError> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    for observation in observations {
+        let OpenMlsReplayObservation::ApplicationProcessed {
+            source_epoch,
+            payload,
+            encrypted_media_secret: encrypted_media_secret @ None,
+            ..
+        } = observation
+        else {
+            continue;
+        };
+        let Some(secret) = secrets.get(source_epoch) else {
+            continue;
+        };
+        let app_event = cgka_traits::MarmotAppEvent::decode(payload)
+            .map_err(|e| OpenMlsProjectionError::Decode(e.to_string()))?;
+        if crate::app_payload::references_encrypted_media(&app_event) {
+            *encrypted_media_secret = Some(cgka_traits::EncryptedMediaSecret::new(secret.clone()));
+        }
+    }
+    Ok(())
 }
 
 pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
@@ -4438,6 +4517,88 @@ fn retained_anchor_snapshot_name(epoch: u64) -> String {
 
 pub(crate) fn retained_anchor_epoch_from_snapshot_name(name: &str) -> Option<u64> {
     name.strip_prefix("openmls-retained-anchor-")?.parse().ok()
+}
+
+/// Run `read` on the MLS group restored from `epoch`'s retained anchor under
+/// a rollback guard, then restore live state. `Ok(None)` when no anchor is
+/// retained for `epoch`, it vanished before the rewind, or it restores a
+/// different epoch.
+pub(crate) fn with_retained_anchor_group<S: StorageProvider, T>(
+    storage: &S,
+    crypto: &RustCrypto,
+    group_id: &GroupId,
+    epoch: EpochId,
+    site: RewindSite,
+    guard_suffix: &str,
+    read: impl FnOnce(&MlsGroup, &EngineOpenMlsProvider<'_, S>) -> Result<Option<T>, EngineError>,
+) -> Result<Option<T>, EngineError> {
+    let snapshot_name = storage
+        .list_group_snapshots(group_id)?
+        .into_iter()
+        .find(|name| retained_anchor_epoch_from_snapshot_name(name) == Some(epoch.0));
+    let Some(snapshot_name) = snapshot_name else {
+        return Ok(None);
+    };
+    let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+        storage,
+        group_id.clone(),
+        site,
+        guard_suffix,
+    )?;
+    let result = read_retained_anchor_group(storage, crypto, group_id, &snapshot_name, epoch, read);
+    guard.commit()?;
+    result
+}
+
+fn read_retained_anchor_group<S: StorageProvider, T>(
+    storage: &S,
+    crypto: &RustCrypto,
+    group_id: &GroupId,
+    snapshot_name: &str,
+    epoch: EpochId,
+    read: impl FnOnce(&MlsGroup, &EngineOpenMlsProvider<'_, S>) -> Result<Option<T>, EngineError>,
+) -> Result<Option<T>, EngineError> {
+    match storage.rollback_group_state_to_snapshot(group_id, snapshot_name) {
+        Ok(()) => {}
+        Err(StorageError::SnapshotMissing(_)) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let provider = EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let historical_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .map_err(|error| EngineError::Backend(format!("load retained anchor: {error:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+    // An anchor taken before an own commit merged still holds that staged
+    // commit; the group itself is at the anchor epoch.
+    if historical_group.epoch().as_u64() != epoch.0 {
+        return Ok(None);
+    }
+    read(&historical_group, &provider)
+}
+
+/// Encrypted-media exporter secret of `epoch`, derived from its retained
+/// anchor; `Ok(None)` when no usable anchor remains.
+pub(crate) fn retained_anchor_media_secret<S: StorageProvider>(
+    storage: &S,
+    crypto: &RustCrypto,
+    group_id: &GroupId,
+    epoch: EpochId,
+) -> Result<Option<cgka_traits::SecretBytes>, EngineError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cgka-engine-encrypted-media-restore/v1");
+    hasher.update(group_id.as_slice());
+    hasher.update(epoch.0.to_be_bytes());
+    with_retained_anchor_group(
+        storage,
+        crypto,
+        group_id,
+        epoch,
+        RewindSite::EncryptedMediaSource,
+        &hex::encode(&hasher.finalize()[..8]),
+        |mls_group, provider| {
+            crate::app_payload::encrypted_media_exporter_secret(mls_group, provider.crypto())
+        },
+    )
 }
 
 /// Suffix for a rewind onto the retained anchor at `epoch`.

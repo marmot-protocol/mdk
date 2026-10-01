@@ -2626,7 +2626,9 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(group_id.as_slice());
         hasher.update(source_epoch.0.to_be_bytes());
         hasher.update(current_epoch.0.to_be_bytes());
-        self.with_retained_anchor_group(
+        crate::openmls_projection::with_retained_anchor_group(
+            &self.storage,
+            &self.crypto,
             group_id,
             source_epoch,
             RewindSite::RetentionSource,
@@ -2642,76 +2644,16 @@ impl<S: StorageProvider> Engine<S> {
         )
     }
 
-    /// Run `read` on the MLS group restored from `epoch`'s retained anchor
-    /// under a rollback guard, then restore live state. `Ok(None)` when no
-    /// anchor is retained for `epoch`, it vanished before the rewind, or it
-    /// restores a different epoch.
-    fn with_retained_anchor_group<T>(
-        &self,
-        group_id: &GroupId,
-        epoch: EpochId,
-        site: RewindSite,
-        guard_suffix: &str,
-        read: impl FnOnce(&MlsGroup, &EngineOpenMlsProvider<'_, S>) -> Result<Option<T>, EngineError>,
-    ) -> Result<Option<T>, EngineError> {
-        let snapshot_name = self
-            .storage
-            .list_group_snapshots(group_id)?
-            .into_iter()
-            .find(|name| retained_anchor_epoch_from_snapshot_name(name) == Some(epoch.0));
-        let Some(snapshot_name) = snapshot_name else {
-            return Ok(None);
-        };
-        let guard = SnapshotRollbackGuard::create_group_state(
-            &self.storage,
-            group_id.clone(),
-            site,
-            guard_suffix,
-        )?;
-        let result = self.read_retained_anchor_group(group_id, &snapshot_name, epoch, read);
-        guard.commit()?;
-        result
-    }
-
-    fn read_retained_anchor_group<T>(
-        &self,
-        group_id: &GroupId,
-        snapshot_name: &str,
-        epoch: EpochId,
-        read: impl FnOnce(&MlsGroup, &EngineOpenMlsProvider<'_, S>) -> Result<Option<T>, EngineError>,
-    ) -> Result<Option<T>, EngineError> {
-        match self
-            .storage
-            .rollback_group_state_to_snapshot(group_id, snapshot_name)
-        {
-            Ok(()) => {}
-            Err(StorageError::SnapshotMissing(_)) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let historical_group = MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|error| EngineError::Backend(format!("load retained anchor: {error:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        // An anchor taken before an own commit merged still holds that staged
-        // commit; the group itself is at the anchor epoch.
-        if historical_group.epoch().as_u64() != epoch.0 {
-            return Ok(None);
-        }
-        read(&historical_group, &provider)
-    }
-
     /// Derive the encrypted-media exporter secret of an epoch on this device's
     /// canonical lineage from that epoch's retained anchor.
     ///
     /// OpenMLS exports only from the live epoch. Replay and live ingest attach
     /// the secret to `MessageReceived` while the group sits at the source
-    /// epoch; this serves the rest: a delayed message read from retained
-    /// past-epoch secrets, and explicit downloads of attachments whose key was
-    /// never cached, while the epoch's anchor is still retained.
+    /// epoch, and canonical apply derives it up front for late applications
+    /// it would otherwise prune; this serves the rest: a delayed message read
+    /// from retained past-epoch secrets outside a pass, and explicit downloads
+    /// of attachments whose key was never cached, while the epoch's anchor is
+    /// still retained.
     ///
     /// `Ok(None)` means no usable anchor: none retained for `epoch`, the
     /// anchor restores a different epoch, or its own leaf is evicted.
@@ -2722,23 +2664,11 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<Option<cgka_traits::SecretBytes>, EngineError> {
         // A quarantined group's MLS state may load fine; never export it.
         self.ensure_group_live(group_id)?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"cgka-engine-encrypted-media-restore/v1");
-        hasher.update(group_id.as_slice());
-        hasher.update(epoch.0.to_be_bytes());
-        self.with_retained_anchor_group(
+        crate::openmls_projection::retained_anchor_media_secret(
+            &self.storage,
+            &self.crypto,
             group_id,
             epoch,
-            RewindSite::EncryptedMediaSource,
-            &hex::encode(&hasher.finalize()[..8]),
-            |mls_group, provider| {
-                crate::app_payload::encrypted_media_exporter_secret(
-                    mls_group,
-                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
-                        provider,
-                    ),
-                )
-            },
         )
     }
 

@@ -32,15 +32,19 @@ pub(crate) fn encrypted_media_source_secret(
     crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
     app_event: &MarmotAppEvent,
 ) -> Result<Option<cgka_traits::EncryptedMediaSecret>, EngineError> {
-    let references_attachments = app_event.kind == cgka_traits::MARMOT_APP_EVENT_KIND_CHAT
-        && app_event
-            .tags
-            .iter()
-            .any(|tag| tag.first().map(String::as_str) == Some("imeta"));
-    if !references_attachments {
+    if !references_encrypted_media(app_event) {
         return Ok(None);
     }
     Ok(encrypted_media_exporter_secret(group, crypto)?.map(cgka_traits::EncryptedMediaSecret::new))
+}
+
+/// Whether `app_event` is a chat that references attachments (`imeta`).
+pub(crate) fn references_encrypted_media(app_event: &MarmotAppEvent) -> bool {
+    app_event.kind == cgka_traits::MARMOT_APP_EVENT_KIND_CHAT
+        && app_event
+            .tags
+            .iter()
+            .any(|tag| tag.first().map(String::as_str) == Some("imeta"))
 }
 
 /// Encrypted-media exporter secret of `group`'s epoch; `None` when its own

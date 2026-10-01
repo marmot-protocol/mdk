@@ -72,9 +72,11 @@
   The engine now captures the key for the message's source epoch while it authenticates
   the message and carries it on `GroupEvent::MessageReceived::encrypted_media_secret`,
   so projection caches it even when the same convergence pass advanced more than five
-  epochs and pruned that epoch's retained state. Events without a carried key fall back
-  to the engine's retained epoch state (newest five epochs), and that fallback no longer
-  gives up when the live export fails.
+  epochs and pruned that epoch's retained state. A media message that arrives late, after
+  the receiver left its epoch, gets the key from that epoch's retained state before the
+  pass merges further commits. Events without a carried key fall back to the engine's
+  retained epoch state (newest five epochs), and that fallback no longer gives up when
+  the live export fails.
 - Missing-key attachment deferrals back off and fail after about eight minutes instead of
   repeating every 15 seconds forever, and a blob that every Blossom server reports as
   404/410 fails without retrying. Retry and download-again derive a missing source-epoch
