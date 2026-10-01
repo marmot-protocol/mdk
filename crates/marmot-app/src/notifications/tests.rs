@@ -982,6 +982,83 @@ fn mention_notification_suppresses_self_mentions() {
     assert!(!notification_is_mention(&message, &receiver, true));
 }
 
+/// A muted live event emits only the receiver's typed chat mention; unmute restores ordinary traffic.
+#[test]
+fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let receiver = account.account_id_hex;
+    let other = nostr::prelude::Keys::generate().public_key().to_hex();
+    let sender = "bb".repeat(32);
+    let group = "ee".repeat(32);
+    let mut resolver = NotificationResolver::default();
+    seed_group_state_resolver(
+        &mut resolver,
+        "alice",
+        &receiver,
+        &group,
+        Some(&sender),
+        true,
+        true,
+    );
+
+    let mut cases = vec![
+        ("ordinary", received_chat("hi", vec![]), false),
+        (
+            "own mention",
+            received_chat("hi", vec![vec!["p".to_owned(), receiver.clone()]]),
+            true,
+        ),
+        (
+            "other account mention",
+            received_chat("hi", vec![vec!["p".to_owned(), other]]),
+            false,
+        ),
+        (
+            "reaction with mention tag",
+            {
+                let mut reaction =
+                    received_chat("👍", vec![vec!["p".to_owned(), receiver.clone()]]);
+                reaction.kind = MARMOT_APP_EVENT_KIND_REACTION;
+                reaction
+            },
+            false,
+        ),
+    ];
+    let mut self_mention = received_chat("hi", vec![vec!["p".to_owned(), receiver.clone()]]);
+    self_mention.sender = receiver.clone();
+    cases.push(("self mention", self_mention, false));
+
+    for (name, message, expected) in cases {
+        let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: receiver.clone(),
+            account_label: "alice".to_owned(),
+            message,
+        });
+        let update = notification_update_from_event_cached(&app, &mut resolver, &event).unwrap();
+        assert_eq!(update.is_some(), expected, "{name}");
+        if let Some(update) = update {
+            assert!(update.is_mention, "{name}");
+        }
+    }
+
+    resolver
+        .chat_muted
+        .insert(("alice".to_owned(), group), false);
+    let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+        account_id_hex: receiver,
+        account_label: "alice".to_owned(),
+        message: received_chat("ordinary after unmute", vec![]),
+    });
+    assert!(
+        notification_update_from_event_cached(&app, &mut resolver, &event)
+            .unwrap()
+            .is_some()
+    );
+}
+
 #[test]
 fn group_invite_notification_is_not_a_mention() {
     let dir = tempfile::tempdir().unwrap();

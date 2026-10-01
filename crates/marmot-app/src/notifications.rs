@@ -1859,6 +1859,11 @@ fn notification_traffic_for_kind(kind: u64) -> Option<NotificationTrafficClass> 
     }
 }
 
+/// Resolve one delivered message into a typed notification candidate.
+///
+/// Durable whole-chat mute filters ordinary traffic after blocked-sender and
+/// kind checks, while a direct mention of the receiving account remains
+/// eligible for the host's permission, channel, and foreground policy.
 fn notification_update_from_message(
     app: &MarmotApp,
     resolver: &mut NotificationResolver,
@@ -1894,12 +1899,17 @@ fn notification_update_from_message(
         Err(AppError::UnknownGroup(_)) => return Ok(None),
         Err(err) => return Err(err),
     };
-    if muted {
+    // A durable chat mute silences ordinary traffic, but a typed direct
+    // mention of this account remains eligible for host notification policy.
+    // Classification is restricted to chat messages and excludes self-sends;
+    // sender blocks were checked before reaching this point.
+    let is_from_self = event.message.sender == event.account_id_hex;
+    let is_mention = notification_is_mention(&event.message, &event.account_id_hex, is_from_self);
+    if muted && !is_mention {
         return Ok(None);
     }
     let receiver = resolver.user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, resolver, &event.message)?;
-    let is_from_self = event.message.sender == event.account_id_hex;
     // Resolve the reacted-to row from the materialized timeline by id (not raw
     // app_events): the timeline reflects deletion/invalidation and never carries
     // removed text, so a reaction can't leak it into a preview. Notify only the
@@ -1938,7 +1948,7 @@ fn notification_update_from_message(
         group_id_hex,
         group_name: group_name(group.as_ref()),
         is_dm: false,
-        is_mention: notification_is_mention(&event.message, &event.account_id_hex, is_from_self),
+        is_mention,
         message_id_hex: Some(event.message.message_id_hex.clone()),
         sender,
         receiver,

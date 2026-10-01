@@ -5192,6 +5192,138 @@ async fn unauthorized_remove_and_self_demotion_send_no_wake() {
     runtime.shutdown().await;
 }
 
+/// Live relay delivery retains direct mentions during mute while blocks and timed expiry still apply.
+#[tokio::test]
+async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = alice.account.account_id_hex;
+    let bob_id = bob.account.account_id_hex;
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "muted mention",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    app.set_local_notifications_enabled(&bob_id, true).unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let mut subscription = runtime.subscribe_notifications().unwrap();
+    runtime.set_chat_muted(&bob_id, &group_hex, None).unwrap();
+
+    runtime
+        .send_message(&alice_id, &group_id, b"ordinary muted message".to_vec())
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(600), subscription.recv())
+            .await
+            .is_err(),
+        "ordinary messages in the muted chat must not reach the live collector"
+    );
+
+    let bob_npub = marmot_app::npub_for_account_id(&bob_id).unwrap();
+    runtime
+        .send_message(
+            &alice_id,
+            &group_id,
+            format!("hello @{bob_npub}").into_bytes(),
+        )
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let mention = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id && update.is_mention
+    })
+    .await;
+    assert!(matches!(mention.trigger, NotificationTrigger::NewMessage));
+
+    runtime.block_user(&bob_id, &alice_id).await.unwrap();
+    runtime
+        .send_message(
+            &alice_id,
+            &group_id,
+            format!("blocked @{bob_npub}").into_bytes(),
+        )
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(600), subscription.recv())
+            .await
+            .is_err(),
+        "blocked senders must not regain alerts through the mention exception"
+    );
+
+    runtime.unblock_user(&bob_id, &alice_id).await.unwrap();
+    runtime.clear_chat_muted(&bob_id, &group_hex).unwrap();
+    runtime
+        .send_message(&alice_id, &group_id, b"ordinary after unmute".to_vec())
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let unmuted = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id
+            && update.preview_text.as_deref() == Some("ordinary after unmute")
+    })
+    .await;
+    assert!(!unmuted.is_mention);
+
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 2_000;
+    runtime
+        .set_chat_muted(&bob_id, &group_hex, Some(expires_at))
+        .unwrap();
+    runtime
+        .send_message(&alice_id, &group_id, b"ordinary during timed mute".to_vec())
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(600), subscription.recv())
+            .await
+            .is_err(),
+        "timed mute must still silence ordinary messages"
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    if now_ms <= expires_at {
+        sleep(Duration::from_millis((expires_at - now_ms + 50) as u64)).await;
+    }
+    runtime
+        .send_message(&alice_id, &group_id, b"ordinary after expiry".to_vec())
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let after_expiry = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id
+            && update.preview_text.as_deref() == Some("ordinary after expiry")
+    })
+    .await;
+    assert!(!after_expiry.is_mention);
+
+    runtime.shutdown().await;
+}
+
+/// Foreground and cold wake consumers share one typed mention identity even while the chat is muted.
 #[tokio::test]
 async fn concurrent_wake_collection_and_foreground_subscription_share_notification_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -5221,6 +5353,10 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
 
     let mut subscription = runtime.subscribe_notifications().unwrap();
     let bob_ref = bob.account.account_id_hex.clone();
+    let bob_npub = marmot_app::npub_for_account_id(&bob_ref).unwrap();
+    runtime
+        .set_chat_muted(&bob_ref, &hex::encode(group_id.as_slice()), None)
+        .unwrap();
 
     let runtime_for_wake = runtime.clone();
     let wake_handle = tokio::spawn(async move {
@@ -5234,7 +5370,7 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
         .send_message(
             &alice.account.account_id_hex,
             &group_id,
-            b"hello over both consumers".to_vec(),
+            format!("hello @{bob_npub} over both consumers").into_bytes(),
         )
         .await
         .unwrap();
@@ -5262,6 +5398,16 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
         .filter(|update| update.account_ref == bob_ref)
         .map(|update| update.notification_key.clone())
         .collect();
+    assert!(
+        wake.notifications
+            .iter()
+            .any(|update| update.account_ref == bob_ref && update.is_mention)
+    );
+    assert!(
+        subscription_updates
+            .iter()
+            .any(|update| update.account_ref == bob_ref && update.is_mention)
+    );
     assert!(
         !wake_keys.is_empty(),
         "wake collection should produce at least one update"
