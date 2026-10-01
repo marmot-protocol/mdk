@@ -13,13 +13,23 @@ Marmot protocol text. Keep repository and engine-specific notes in `marmot-archi
 `required-features.md` is the protocol boundary principles document. Treat it as a high-level constraint, not an
 implementation checklist.
 
+## Layout
+
+- `marmot-architecture/` - architecture, contracts, and diagnostics; see `marmot-architecture/AGENTS.md`.
+- `integration/` - versioned client integration guides (`<version>.md`), `README.md` index, and `TEMPLATE.md`.
+- `release/` - concise per-version release notes plus `wn-homebrew.md` (Homebrew tap checklist).
+- `quic-broker-deployment.md` - `marmot-quic-broker` sidecar deployment.
+- `external-signer-accounts.md` - accounts whose Nostr key is held by a host external signer.
+- `explorations-of-multi-device.md` - exploratory, non-normative multi-device notes.
+- `learnings.md` - historical log kept for archaeology only; do not treat as current contract.
+
 ## Editing rules
 
 - Update `updated:` dates in front matter when changing a dated architecture page.
-- Keep spec-like language in `cgka-engine-spec.md`, `cgka-engine-canonicalization-contract.md`, and
-  `distributed-convergence.md`.
+- Keep spec-like language in `marmot-architecture/cgka-engine-spec.md`,
+  `marmot-architecture/cgka-engine-canonicalization-contract.md`, and `marmot-architecture/distributed-convergence.md`.
 - Keep overview docs short. Move long rationale into `further-context/`.
-- When changing code behavior, update `overview/current-state.md` if the public status changed.
+- When changing code behavior, update `marmot-architecture/overview/current-state.md` if the public status changed.
 - Keep observability guidance current in `marmot-architecture/overview/observability.md` when tracing/logging policy
   changes.
 - When a protocol rule graduates from exploratory architecture text, link to the matching document in

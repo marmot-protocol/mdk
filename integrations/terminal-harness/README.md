@@ -12,6 +12,14 @@ directory selection, private group-to-session mappings, reply chunking, and a
 shared JSONL child-process runner. It does not own MLS, Nostr transport,
 storage, QUIC previews, or backend-specific CLI semantics.
 
+## Contents
+
+- [Backend Boundary](#backend-boundary)
+- [Execution Profiles](#execution-profiles)
+- [Shared Behavior](#shared-behavior)
+- [Chat Commands](#chat-commands)
+- [Development](#development)
+
 ## Backend Boundary
 
 A connector supplies a `Backend` implementation. For each authorized inbound
@@ -110,6 +118,11 @@ All connectors:
 - reject a complete attachment batch before backend invocation when any download, regular-file/ownership check, count limit, or aggregate-byte limit fails;
 - remove batch copies after every terminal path and reconcile stale connector-owned batch directories on startup;
 - keep diagnostics free of identifiers, paths, prompts, attachment names, and backend output.
+
+Backends that declare artifact support can also return completed files to the chat through `wn-agent`'s encrypted
+`send_media` path. Exports are off by default and require `<PREFIX>_ARTIFACT_EXPORTS_ENABLED=true` plus at least one
+exact group/export-root grant in `<PREFIX>_ARTIFACT_GRANTS_JSON`. Only `wn-codex` declares artifact support today; see
+its [README](../codex/marmot/README.md).
 
 Download timeouts, connector rejections, and local file-validation failures have
 distinct privacy-safe pre-backend replies. The connector never forwards a

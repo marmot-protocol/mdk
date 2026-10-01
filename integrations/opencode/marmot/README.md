@@ -10,14 +10,23 @@ Hermes and OpenClaw gateway integrations: it has no mention activation, backend
 attachment support, profile onboarding, or live previews. It is a pure harness
 for an authorized operator.
 
-Text-only turns are unchanged. For a turn containing one or more files, the
-shared terminal harness first applies its attachment-count and aggregate-byte
+For a turn containing one or more files, the shared terminal harness first applies its attachment-count and aggregate-byte
 limits and downloads the complete ordered batch into private staging. Because
 the OpenCode backend does not opt in to attachments, the batch is then rejected
 before `opencode` is spawned; its accompanying text is not forwarded either.
 
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
+
+## Contents
+
+- [Install (OpenCode Already Installed)](#install-opencode-already-installed)
+- [Configuration](#configuration)
+- [Workdir Picker](#workdir-picker)
+- [Chat Commands](#chat-commands)
+- [OpenCode Transport Contract](#opencode-transport-contract)
+- [Security Notes](#security-notes)
+- [Development](#development)
 
 ## Install (OpenCode Already Installed)
 
@@ -73,8 +82,6 @@ install_verified "$base_url/install-opencode-marmot.sh" \
   --yes --allow-welcomer npub1...
 ```
 
-Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
-
 The installer puts `wn-agent` and `wn-opencode` in `~/.local/bin`, starts a
 same-user terminal-harness `wn-agent` service where supported, bootstraps or
 reuses `~/.marmot-agents/harnesses`, mirrors the allowlist into `wn-agent`,
@@ -124,7 +131,7 @@ Configure with environment variables:
 | `MARMOT_AGENT_AUTH_TOKEN` | unset | Optional bearer token value |
 | `WN_OPENCODE_ALLOWED_SENDERS_HEX` | required | Comma-separated sender account ids allowed to prompt OpenCode |
 | `WN_OPENCODE_ADMIN_HEX` | unset | Legacy alias for `WN_OPENCODE_ALLOWED_SENDERS_HEX` |
-| `WN_OPENCODE_ACCOUNT_ID_HEX` | first local account | Specific `wn-agent` account to use |
+| `WN_OPENCODE_ACCOUNT_ID_HEX` | sole local account | Specific `wn-agent` account to use; required when several local-signing accounts exist |
 | `WN_OPENCODE_BIN` | `opencode` | OpenCode binary or executable path |
 | `MARMOT_HARNESS_EXECUTION_PROFILE` | `inherit` | Shared `inherit`, `autonomous`, or `unrestricted` execution policy |
 | `WN_OPENCODE_IDLE_TIMEOUT_SECS` | `120` | Presentation-idle interval before liveness is reported as unknown; does not stop the invocation |
@@ -132,6 +139,8 @@ Configure with environment variables:
 | `WN_OPENCODE_REQUEST_TIMEOUT_SECS` | `30` | Timeout for each control-socket request |
 | `WN_OPENCODE_MAX_REPLY_BYTES` | `30000` | UTF-8 byte limit for each durable Marmot reply chunk |
 | `WN_OPENCODE_MAX_PENDING_PER_GROUP` | `4` | Per-group in-flight/queued prompt cap |
+| `WN_OPENCODE_MAX_ATTACHMENTS` | `8` | Maximum inbound files validated before backend rejection |
+| `WN_OPENCODE_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate inbound bytes validated before rejection |
 | `WN_OPENCODE_STATE_PATH` | `$XDG_STATE_HOME/wn-opencode/sessions.json` | Session map path |
 | `WN_OPENCODE_ACTIVATION` | `always` | Only `always` is supported today |
 | `RUST_LOG` | `info,marmot_terminal_harness=info` | tracing filter |

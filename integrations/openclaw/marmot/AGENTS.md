@@ -1,7 +1,7 @@
 # AGENTS.md - integrations/openclaw/marmot
 
 OpenClaw channel plugin for Marmot through the local `wn-agent` control socket.
-The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first.
+The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` and `../../AGENTS.md` first.
 
 ## Scope
 
@@ -27,6 +27,14 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - `src/inbound.ts` — inbound subscription bridge (reconnect, dedupe, resync).
 - `src/gateway.ts` — OpenClaw-owned account lifecycle and inbound subscription.
 - `src/inbound-runtime.ts` — the inbound→agent dispatch seam.
+- `src/dispatch.ts` — inbound → agent turn dispatch; builds the OpenClaw route and sends the final through the durable
+  message context.
+- `src/group-info-cache.ts` — bounded per-(account, group) cache for `is_direct` activation and display subject.
+- `src/durable-final-idempotency.ts` — idempotency keys for durable final sends.
+- `src/session-transcript.ts` — best-effort transcript read to recover a truncated final reply.
+- `src/history-tool.ts` — `marmot_history` agent tool.
+- `src/profile-onboarding.ts` — one-time public profile (kind:0) name consent flow.
+- `src/runtime-state.ts` — process-local channel subscription status snapshots.
 - `src/bounded-keyed-async-queue.ts` — per-group inbound dispatch with a depth cap.
 - `src/outbound.ts` — `defineChannelMessageAdapter` durable send → `send_final`.
 - `src/messaging.ts` — `messaging` target-resolution adapter so the shared `message` tool can resolve a Marmot conversation (group id hex).
@@ -36,7 +44,9 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - `src/sender-policy.ts` — account-global inbound sender ACL (distinct from welcomers).
 - `src/channel.ts` — `createChatChannelPlugin` (meta, capabilities, config, message, security, threading).
 - `index.ts` / `setup-entry.ts` — plugin runtime + setup entries.
-- `test/` — Vitest unit and connector tests.
+- `scripts/wn-agent-smoketest.ts` — standalone control-plane smoke test (not built or type-checked).
+- `test/` — Vitest unit and connector tests; `test/readme-version.test.ts` requires README.md to state the pinned SDK
+  and host minimum derived from `package.json` (keep those README sentences verbatim when editing).
 
 ## Rules
 

@@ -1,33 +1,51 @@
 # marmot-uniffi
 
-UniFFI bindings for the Marmot app runtime.
+MarmotKit: UniFFI bindings for the Marmot app runtime (`marmot-app`), generated as Swift for iOS/macOS and Kotlin for
+Android from one Rust API. This README is the entry point for app developers integrating MDK: what MDK owns, which
+API to choose, the contracts behind each feature family, and how to build bindings locally. C and other raw-FFI hosts
+should also read the [C ABI guide](../marmot-c/README.md), which adds ownership and blocking-call rules.
 
-Host-controlled automatic downloads use the [host-managed attachment contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104), including Android WorkManager migration.
+Read the documentation at the tag matching your binaries; `master` can describe unreleased APIs.
+
+## Contents
+
+- [Integration guide and API reference](#integration-guide-and-api-reference): documentation map, ownership, API
+  selection, lifecycle, snapshots, diagnostics and compatibility
+- Runtime setup: [runtime options and client label](#runtime-options-and-client-label),
+  [exclusive root ownership](#exclusive-root-ownership), [service endpoint defaults](#service-endpoint-defaults)
+- Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
+  [identity references and profiles](#identity-references-and-profiles),
+  [KeyPackage inventory](#keypackage-inventory), [KeyPackage client preference](#keypackage-client-preference),
+  [public Nostr event verification](#public-nostr-event-verification)
+- Screens: [selected chat-list presentation](#selected-chat-list-presentation),
+  [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
+  [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
+- Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
+  [group-system previews](#group-system-previews), [group reporting](#group-reporting),
+  [history may be incomplete notices](#history-may-be-incomplete-notices)
+- Media: [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
+- Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
+  [legacy audit v4 upload](#legacy-audit-v4-upload)
+- Building and packaging: [building local bindings](#building-local-bindings), [build phases](#build-phases),
+  [Kotlin / Android](#kotlin--android), [release profile](#release-profile),
+  [Apple privacy resources](#apple-privacy-resources)
 
 ## Integration guide and API reference
 
 This is the current integration entry point for Swift/iOS, Swift/macOS and Kotlin/Android.
-The stateless `verifyPublicNostrEventJson` helper verifies public events through
-MDK's Nostr/libsecp256k1 stack without constructing an account or supplying a
-secret key. It checks both the canonical event ID and signature. A host must
-still enforce its own allowed authors, kinds, tags, and input-size limits.
-Malformed input and invalid signatures return `false`; it does not authenticate
-an MLS group message or replace MDK's relay ingestion checks.
-The [C guide](../marmot-c/README.md) adds ABI ownership and blocking-call rules for C and raw FFI hosts.
-Read the documentation at the tag matching your binaries; `master` can describe unreleased APIs.
 
 | Document | Use it for |
 | --- | --- |
 | [Complete method reference](API-REFERENCE.md) | Every exported constructor, runtime method, object method, free function and host callback, with signatures, purpose, source and API-selection guidance. |
-| [0.10.2 integration guide](../../docs/integration/0.10.2.md) | Detailed upgrade from 0.10.1: required changes, changed defaults, optional adoption, examples and acceptance checks. |
-| [Release integration index](../../docs/integration/README.md) | Find the companion guide for your upgrade; read intervening guides when skipping versions. |
+| [Release integration index](../../docs/integration/README.md) | Per-release upgrade guides: required changes, changed defaults, optional adoption, examples and acceptance checks. Read every intervening guide when skipping versions. |
+| [Changelog](CHANGELOG.md) | Binding-level changes per release, including unreleased work on `master`. |
 | [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
 | [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
-| [Durable local sends](LOCAL-SENDS.md) | 0.10.4 early acceptance and exact optimistic-bubble correlation; 0.11.0 adds durable edits of pending local sends. |
+| [Durable local sends](LOCAL-SENDS.md) | Early local acceptance, exact optimistic-bubble correlation and durable edits of pending local sends. |
 | [Polls](POLLS.md) | Encrypted NIP-88 creation, replacement votes, bounded validation and deterministic timeline results. |
-| [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership. |
+| [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership, including [host-managed automatic downloads](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104) and Android WorkManager migration. |
 
 ### What MDK owns and what the host owns
 
@@ -153,8 +171,6 @@ completed-duration reports have no live observation, so their live gauges are ze
 Hosts should record every stage they can observe, and only those. Nested stages overlap and
 must not be summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
 [metric catalog](../../docs/marmot-architecture/telemetry.md#registered-host-stage-metrics).
-Regenerate Swift/Kotlin bindings with the matching library to adopt the new enum
-cases; the snapshot record fields and constructors are unchanged.
 
 Use typed presentation, capability, deletion and group-system fields rather than parsing English
 strings or guessing from membership counts. Clients localize fallback labels and system wording.
@@ -164,244 +180,71 @@ are not credentials. Never log message bodies, asset references, keys, account/g
 raw DTO stringification or relay URLs as performance labels. Use bounded performance operations
 and aggregate snapshots; keep secrets out of diagnostics and host callback errors.
 
-### Compatibility and documentation maintenance
+### Compatibility
 
 Generated source, DTOs, enums, errors, headers and native code form one versioned contract.
-An additive Rust method does not imply that an old generated binding can call a new library;
-C record layouts are especially sensitive. Database upgrades are separate from source-level API
-compatibility, and rolling back only the library can be unsupported.
+An additive Rust method, record field or enum case does not imply that an old generated binding
+can call or decode a new library: regenerate Swift/Kotlin bindings from the native library you ship
+and update both together. For example, older generated sources cannot render the `MarkdownBlockFfi`
+`Details` variant (bounded `<details>` / `<summary>` blocks) or record newer host-performance stages.
+C record layouts are especially sensitive; C consumers rebuild against the matching header and library.
+Database upgrades are separate from source-level API compatibility, and rolling back only the
+library can be unsupported.
 
-The reference's names, signatures and source-line links are checked with `just binding-docs-gate`.
-Use `just binding-docs-update` (or `python3 scripts/check_binding_docs.py --write`) to refresh
-mechanical metadata while preserving authored prose. New exports receive scaffold entries that
-fail validation until their guidance is completed; removed/duplicate entries require explicit
-editorial cleanup. Review prose, selection guidance and affected feature contracts after changes:
-the gate cannot tell whether those descriptions still match runtime behavior.
-Every release from 0.10.2 has concise release notes and a separate detailed integration guide;
-see [the release checklist](../../release.md#release-documentation).
+The reference's names, signatures and source-line links are checked against source with
+`just binding-docs-gate`; prose and runtime behavior are reviewed by hand. Every release from
+0.10.2 has concise release notes and a separate detailed integration guide; see
+[the release checklist](../../release.md#release-documentation).
 
-## Building local bindings
+## Runtime options and client label
 
-The Rust API in `src/` is the source of truth for both generated Swift and generated Kotlin. Platform scripts only
-package that shared surface:
+`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `secretStore` and
+`attachmentAcquisitionMode` in `Marmot.newWithConfiguration`. Each field is optional in generated
+Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
+an omitted label stays untagged, omitted storage uses the platform keychain, and an omitted
+acquisition mode keeps native automatic acquisition (see
+[host-managed acquisition](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104)).
+Existing constructors keep their signatures and delegate to this same configuration
+path. Use the options constructor when combining a label with a custom relay policy.
+C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
+struct; zero initialization selects the same defaults. Use the matching header
+and library for that struct's layout.
 
-- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` and
-  `output/PrivacyInfo.xcprivacy` for iOS.
-- `./crates/marmot-uniffi/xcframework-macos.sh` builds `output/macos/MarmotKit.xcframework` plus
-  `output/macos/MarmotKit.swift` and `output/macos/PrivacyInfo.xcprivacy` for macOS on Apple Silicon
-  (`aarch64-apple-darwin`). Its output directory is separate from the iOS one so building both in one workspace
-  cannot clobber either artifact.
-- `./crates/marmot-uniffi/kotlin-bindings.sh` builds `output/android/kotlin/.../marmot_uniffi.kt` plus Android
-  `jniLibs` shared libraries.
+```swift
+let options = MarmotOptions(clientName: "whitenoise")
+let marmot = try Marmot.newWithConfiguration(
+    rootPath: rootPath, relayUrls: relayUrls, options: options
+)
+```
 
-The generated Swift file is platform-independent: `output/MarmotKit.swift` and `output/macos/MarmotKit.swift` are the
-same UniFFI surface, and releases publish it once.
+Host applications opt into public KeyPackage tagging at construction. Existing constructors
+remain untagged. `newWithClientName` is the older single-purpose constructor:
 
-`MarkdownBlockFfi` now includes an additive `Details` variant for bounded
-`<details>` / `<summary>` display blocks. Hosts must regenerate Swift/Kotlin
-bindings to handle the new tag; older generated sources cannot render it.
-No generated Swift or Kotlin files are committed here.
+```swift
+let marmot = try Marmot.newWithClientName(
+    rootPath: rootPath,
+    relayUrls: relayUrls,
+    clientName: "whitenoise",
+    cursorPersistence: .advance,
+    secretStore: nil
+)
+```
 
-## Deletion provenance and custom events
+Kotlin exposes `Marmot.newWithClientName` with the same arguments; C exposes
+`marmot_client_new_with_client_name`. Rust hosts set
+`MarmotAppConfig::with_key_package_client_name(Some("whitenoise".into()))`.
+Supply the name on every host runtime construction, including background and
+notification-extension entry points (which retain their frozen cursor policy).
+Absent or whitespace-only names omit the tag. New initial publications and normal
+rotations carry the configured label. Existing events are not republished, and
+already-signed pending publications retry with their original tags even if the
+configuration changes.
 
-Timeline records (including conversation windows and `reportedMessage`), reply previews,
-and chat-list previews expose `deletionSource: DeletionSourceFfi`:
+Native construction/default checks: `./crates/marmot-uniffi/options-smoke.sh swift`
+and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
+./crates/marmot-uniffi/options-smoke.sh kotlin`.
 
-- `Author`: the selected accepted deletion is an author-authorized kind 5.
-- `Admin`: the selected accepted deletion is kind 4891, authorized by authenticated
-  source-state evidence. This includes an admin removing their own message.
-- `Unknown`: no classified deletion evidence is available, including older projected tombstones
-  and legacy kind-5 removals of another author's content.
-
-Consult this field only when `deleted` is true. Use the existing ordinary-deletion wording
-for `Author`, “This message was deleted by an admin.” for `Admin`, and a neutral deleted-message
-fallback for `Unknown`. Clients own localization. The message's `kind` remains its original
-inner event kind, never the deletion kind. Existing deletion IDs and content masking are retained.
-`invalidationStatus` describes convergence separately and does not imply deletion.
-
-See [deletion semantics](../../docs/marmot-architecture/overview/content-moderation.md)
-for the storage and authorization contract.
-
-When multiple accepted deletions apply, the largest `(authenticated event timestamp, event ID)`
-pair wins, matching `deletedByMessageIdHex`. Arrival order, reports, and current admin status
-play no part. Invalidated deletion evidence is withdrawn; projections update to the remaining
-winner (or restore the undeleted state). Provenance-only changes participate in live projection
-and conversion-cache updates.
-
-Database migration 0082 adds provenance columns with an `unknown` default.
-It preserves older tombstones, deletion IDs, and cached chat presentation without scanning or
-reinterpreting history. No historical backfill is scheduled: existing tombstones can remain `Unknown` indefinitely.
-If a later operation reprojects a target or rebuilds its group, it uses available accepted evidence.
-Legacy serialized records with an absent field also default to `Unknown`. No client database
-migration or deletion index is needed. Regenerate Swift/Kotlin bindings and consume the matching
-native libraries together; C consumers must rebuild against the updated header and library.
-Older MDK binaries reject the upgraded database schema; do not roll back only the library.
-This is a binding layout change, not an MLS/wire-format change.
-
-Custom events retain their numeric `kind` and verbatim `plaintext` content. Conversation windows
-now also carry their ordered `tags`, so clients can render app-defined event types without fetching
-raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows. MDK-owned kinds continue
-to use prepared fields and references there. Custom-event tag changes invalidate the conversion
-cache. This does not change custom-event chat-list activity or notification policy.
-
-## Group-system previews
-
-`ChatListMessagePreviewFfi.groupSystem` and timeline `groupSystem` now carry
-`GroupSystemEventProvenanceFfi`. MDK verifies local synthesis against the exact
-stored row and payload. The optional commit link is for rollback invalidation;
-self-removal and reorg-derived rows remain authenticated without it.
-Render authenticated membership/admin changes
-only for `AuthenticatedGroupState`; `MemberAuthored` is an assertion and carries
-no trusted actor/subject IDs on projected records. Malformed, oversized and deleted
-payloads have no typed event. Provenance records origin; timeline invalidation
-status still applies. Raw plaintext remains available to narrow consumers.
-
-Chat previews include separate actor/subject IDs and MDK-prepared display names
-from local caches, with the same safe-name/pseudonym fallback used by conversation
-identities. Subject profile updates refresh live chat lists without changing message
-identity or activity order. Clients own localized wording and the viewer's “you” label.
-Conversation windows continue to supply their bounded identity dictionary.
-This adds no wire format or database migration. Regenerate Swift/Kotlin bindings
-and use the matching native library; Android follow-through is tracked in
-[whitenoise-android#1581](https://github.com/marmot-protocol/whitenoise-android/issues/1581).
-
-### Reactions on group activity
-
-Use the existing reaction commands with the activity row's `messageIdHex`.
-Authenticated system rows retain that deterministic ID across reaction changes,
-replay and restart; the same timeline record exposes both `groupSystem` and
-`reactions`. Retraction uses the existing unreact command, and subscriptions
-update the target row without adding a second activity row. Do not synthesize or
-send a kind-1210 event to react to local group activity.
-
-Reaction notifications use the supported system payload's text fallback, never
-its JSON envelope. Only the stored target sender receives an alert; activity
-without an attributable actor does not invent a recipient. Deleted or invalidated
-targets and malformed or unsupported payloads expose no target preview.
-For synthesized system rows, `reactedToPreview` is an English fallback. The
-notification DTO has neither the target ID nor a structured system event, so this
-field cannot support client localization; hosts can omit it and use their generic
-localized reaction notification. Conversation rows still expose `groupSystem` for
-client-localized rendering and layout. This adds no binding fields or methods and
-requires no client-owned reaction map.
-
-## Identity references and profile pseudonyms
-
-New generated identities publish kind `10002`, kind `10050`, and kind `0` to
-their account relays and send separate best-effort copies to the built-in public
-directory indexers. Later relay-list and profile edits through MarmotKit do the
-same. The indexers are never inserted into the advertised relay lists or used
-for KeyPackages, contact lists, or messaging. Acknowledgement from an account
-relay establishes setup success; indexer copies are scheduled after bootstrap
-confirmation, before initial KeyPackage publication, and an outage is reported
-only as an aggregate warning. Shutdown or account removal cancels pending copies.
-Existing identities are not automatically republished by this change and need a
-client-initiated backfill of their current lists and profile.
-
-`accountIdHex` / `normalizeMemberRef` now accept `nprofile` and
-`nostr:nprofile` mentions and QR scans in addition to hex, `npub`,
-`nostr:npub`, and `marmot://profile/` links. Relay hints inside an
-nprofile are discarded and never used for routing or directory mutation.
-Duplicate type-0 TLV entries keep the first key. After FFI wrapper
-normalization, the nprofile fallback rejects encoded tokens longer than
-1023 UTF-8 bytes (the locked Bech32/Bech32m ceiling); a valid 1023-byte
-token still decodes when wrapped in `nostr:` or `marmot://profile/...`.
-The app helper strips one lowercase `nostr:` prefix itself; profile-link
-and whitespace normalization belong to FFI. The app helper's legacy NIP-21
-parser may still accept a colon-suffixed `nostr:<npub>:` form before the
-fallback runs; FFI normalization rejects that form. Decode a scanned reference
-first, then pass
-the canonical lowercase hex account id to `defaultProfilePseudonym` so
-the shared text-hash seed is preserved. Passing uppercase hex or an undecoded
-`npub` silently produces a different name, not an error. `randomProfilePseudonym`
-replaces client-owned random-roll wordlists; it is cosmetic, may
-collide, and does not create an account.
-
-`userProfile` returns the cached kind:0 projection. `about` from a fetched
-profile keeps normalized LF line breaks; `name`, `displayName`, `picture`,
-`banner`, `nip05`, and `lud16` stay single-line. Tab and other controls are
-removed on ingest. `publishUserProfile` caches the submitted local value
-without reparsing it, so a same-instance publish/read does not show incoming
-sanitization. Read another account through `refreshProfile`, then
-`userProfile` or `cachedIdentityProjections`. A bio already stored without
-line breaks stays until a newer event replaces it.
-
-`accountKeyPackages` lists the current KeyPackage winner per addressable slot
-plus local-only rows. `accountKeyPackageRelayEvents` is the additive observed
-history for that same fetch window: current and superseded kind-30443 events,
-with `isCurrent` set only among those observed valid events. Hosts can pass a
-superseded `eventIdHex` and its `sourceRelays` to the existing delete API.
-This does not change the Published-list filter (`relay == true`) and does not
-replace Android history UI work.
-
-`localAccountKeyPackages` is the local-first inventory: render it immediately.
-It is a synchronous SQLCipher read on the calling thread; do not invoke it on a
-UI or main thread. `refreshAccountKeyPackages` is the explicit network merge;
-replace the displayed snapshot with its result. On refresh failure or
-cancellation, keep the local result. Both return
-`AccountKeyPackageInventoryEntryFfi` (`record` plus `localState`). Existing
-`AccountKeyPackageFfi` is unchanged. `localState` and `record.relay` are the
-authoritative display distinctions; empty event IDs and `publishedAt` are not
-publication proof. A retained package stays `RetainedPrivateMaterial` even when
-that exact event is observed; `record.relay` becomes true while `localState`
-remains retained. Empty bootstrap relays remain network-enabled. After a
-mutation, re-read the local inventory instead of applying an out-of-order
-refresh.
-
-Regenerate Swift/Kotlin bindings after pulling this surface. Hosts must use a
-matching library: the new methods and enum are additive, but older generated
-sources cannot call them. Android device rendering remains a separate consumer
-adoption issue.
-
-Android mention/QR/edit-profile migration remains
-[whitenoise-android#1584](https://github.com/marmot-protocol/whitenoise-android/issues/1584);
-MDK completion enables that follow-through but does not replace it.
-
-See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable Apple and Android artifacts, exact release and snapshot URLs,
-checksums, provenance, and generated-source synchronization rules.
-
-The Kotlin binding is generated from the same release host library metadata as Swift, so it exposes the same `Marmot`
-object, subscription objects, records, enums, and error variants.
-
-## Audit v5 recording and delivery
-
-v5 replaces v4 as the audit format. `AuditLogSettingsFfi.enabled` remains the recording opt-in.
-New account sessions and the live runtime switch write only `marmot-forensics-audit/v5` to
-`audit-<engine_id>-v5.jsonl`; no new v4 files are written, and existing v4 files remain on disk.
-Hosts that record audit logs must configure v5 delivery, or new evidence never leaves the
-device. Deploy a receiver that accepts every v5 event kind first. To deliver v5, supply a dedicated OTLP `/v1/logs` destination and bearer token
-with `set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi)`. The configuration is held in memory, so
-apply it on every launch; the returned record omits the token. Set `enabled: false` to remove delivery configuration.
-An exact loopback endpoint requires `allow_loopback_dev: true`; public endpoints require HTTPS.
-The host then calls `post_audit_log_tracker_update_v5()`, in place of
-`post_audit_log_tracker_update()`, for an immediate pass; the existing
-audit tracker also uses this configuration on its activity triggers with the usual batching,
-retry, and shutdown behavior. The v5 result reports accepted batches, pending accounts, blocked
-accounts, and idle accounts separately from legacy v4 uploads. No host should infer receiver
-acceptance from an empty v4 `uploaded` list. The v4 whole-file Goggles endpoint never receives
-v5 records.
-
-## Legacy audit v4 upload
-
-The v4 whole-file route only drains v4 files written before 0.11.0; keep its configuration until
-they are gone, and do not build new v4 infrastructure. Whole-file uploads accept only
-`marmot-forensics-audit/v4`; older local files are never migrated or sent.
-App construction automatically removes recognized v1-v3 forensic files and rotated segments after acquiring the
-root lease, including files in failed account-wipe remnants, even with recording disabled. V4 files and the separate
-key-reveal log are preserved; failures are nonfatal and retried on the next open. No additional Swift/Kotlin cleanup
-call is needed.
-Regenerate Swift/Kotlin bindings and use `AuditLogTrackerConfigV4Ffi` with
-`AuditLogUploadSourceV4Ffi.hardwareModel` in place of the old source record and its `deviceLabel`.
-The versioned config type changes the setter ABI checksum so old generated bindings cannot silently
-reinterpret a device label as a hardware model.
-Populate this field from system model information (e.g. `iPhone17,3` or `Pixel 9a`), never from a device name,
-hostname or serial number. Omit it if unavailable. Platform and app version are unchanged.
-Uploads of leftover v4 files still need a v4-compatible Goggles endpoint; new evidence goes to v5.
-Native metadata lift/lower checks: `./crates/marmot-uniffi/audit-v4-smoke.sh swift` and
-`MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars> ./crates/marmot-uniffi/audit-v4-smoke.sh kotlin`.
-These regenerate host bindings and execute DTO round trips; platform package builds remain separate.
-
-## Exclusive Root Ownership
+## Exclusive root ownership
 
 Every `Marmot` constructor acquires a nonblocking exclusive lease on
 `.marmot-runtime.lock` in `rootPath`. The lease prevents the foreground app and
@@ -419,189 +262,22 @@ Await `shutdownAndClose()` before suspension or root handoff; it terminally clos
 storage and releases the lease without waiting for every host reference to disappear.
 Reconstruct the runtime and its handles for the next foreground session.
 
-## Service Endpoint Defaults
+## Service endpoint defaults
 
 `marmotkit-endpoints.env` sets the public build-time defaults consumed by Marmot's compiled endpoint config:
 
 - `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT`
 - `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT`
+- `MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT` (optional full Aptabase events URL; no default)
 
-These are route URLs only. Host apps still supply audit and telemetry bearer tokens at runtime. Set either environment
-variable before invoking a build script to override the default for staging or local testing.
+These are route URLs only. Host apps still supply audit and telemetry bearer tokens and analytics app keys at
+runtime. Set any of these environment variables before invoking a build script to override the default for staging
+or local testing.
 
 Public profile-image uploads default to `https://blossom.primal.net`. Rust
 hosts can override or disable that third-party service with
 `MarmotServiceEndpoints::profile_image_blob_endpoint`; FFI callers can continue
 to pass an explicit Blossom server to `uploadProfileImage`.
-
-## Build phases
-
-The no-argument build scripts still build complete local bundles. Release CI
-uses separate phases to parallelize compilation across runners:
-
-| Script | Phase | Work |
-| --- | --- | --- |
-| `xcframework.sh` | `generate` | Host library and generated Swift/headers in `build/ios/swift`; no device builds |
-| `xcframework.sh` | `native <target>` | One `aarch64-apple-ios` or `aarch64-apple-ios-sim` native build |
-| `xcframework.sh` | `assemble` | Assemble existing native slices and `build/ios/swift` into the usual iOS output |
-| `xcframework-macos.sh` | `native` | One `aarch64-apple-darwin` build with the macOS deployment flags |
-| `xcframework-macos.sh` | `assemble` | Assemble the native slice with shared Swift/headers placed in `build/macos/swift` |
-| `kotlin-bindings.sh` | `generate` | Host library, generated Kotlin and Android support files; no NDK required |
-| `kotlin-bindings.sh` | `native` | JNI libraries for `ANDROID_ABIS`; no host library or binding generation |
-
-Run independent phases in separate checkouts/runners. Multiple Cargo processes
-sharing one target directory contend on its lock; separate phases do not make
-concurrent invocations in one checkout safe. All inputs must have matching source,
-builder, toolchain, profile and features. CI transfers inputs only within the same
-workflow run. Apple assembly checks required files before replacing an existing
-bundle and never compiles Rust. Both Apple scripts honor `CARGO_TARGET_DIR`.
-See the [release guide](../../release.md#parallel-builds-and-build-only-rehearsals)
-for the build-only benchmark workflow and cache-warming procedure.
-
-## Kotlin / Android
-
-Prerequisites:
-
-```sh
-rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
-# macOS Android Studio default:
-export ANDROID_NDK_HOME="$HOME/Library/Android/sdk/ndk/<version>"
-# Linux / common CI default:
-# export ANDROID_NDK_HOME="$HOME/Android/Sdk/ndk/<version>"
-```
-
-CI jobs can also set `ANDROID_SDK_ROOT` or `ANDROID_HOME`; the build script will discover the newest NDK under
-`$ANDROID_SDK_ROOT/ndk` or `$ANDROID_HOME/ndk` when `ANDROID_NDK_HOME` is not set.
-
-Build all Android ABIs:
-
-```sh
-./crates/marmot-uniffi/kotlin-bindings.sh
-```
-
-The script keeps the host library's UniFFI metadata intact while stripping
-debug and static symbol sections from each packaged Android JNI library.
-The two 64-bit Android links pass `-Wl,-z,max-page-size=16384` and
-`-Wl,-z,common-page-size=16384` as extra flags on the final library `cargo rustc`
-invocation. That appends the policy after Cargo's selected rustflags instead of
-replacing `build.rustflags` or target rustflags. The 32-bit ABIs stay on the NDK's default
-page size, and the supported ABI set is unchanged. Google Play's 16 KB check
-reads ELF `PT_LOAD` alignment; aligning the app bundle ZIP does not change
-those segments. Each published Android archive includes `android-elf.json`
-with the SHA-256, ELF class, machine, and observed load alignments of all
-four `libmarmot_uniffi.so` files. `manifest.json` keeps its existing ordered
-`contents` list and records `elf_validation: android-elf.json`. Exact-head
-candidate packages carry the same report next to their provenance manifest.
-A later release publishes the new artifact; this check does not by itself
-select a version or prove an app's Play Console result.
-
-Standard MarmotKit release builds use the workspace `[profile.release]` together with
-`marmotkit-release-profile.env`: `lto=thin`, `codegen-units=1`, `opt-level=3`,
-`debug=0`, `panic=unwind`, and `strip=none`. Android target invocations override only
-`CARGO_PROFILE_RELEASE_STRIP=symbols`. Apple target invocations add
-`-C embed-bitcode=no` and sanitize leftover `__LLVM` / `__bitcode` sections
-before packaging so shipped archives stay native; that is not a symbol strip.
-Sanitization requires the active Rust toolchain's `llvm-tools-preview` component
-(included by `rust-toolchain.toml`) and Xcode's `libtool`. It rebuilds symbol indexes
-and validates a temporary output before replacing the original archive.
-Those builder-owned settings are not a user-facing escape hatch; measurement
-scripts may override LTO and codegen units on direct Cargo commands for a
-controlled baseline comparison.
-These are configured profile values, not proof that Cargo applies LTO to every
-output: the mixed `rlib`/`cdylib`/`staticlib` binding target can suppress LTO.
-The measured reduction belongs to the combined profile, not to thin LTO alone.
-Apple measurement rows record pre-sanitization Cargo archive bytes and hashes,
-not final packaged-archive or linked application sizes. Native-only archive
-validation and consumer linking are separate packaging checks.
-Changing crate types to enable effective LTO also requires revisiting the
-incompatible `embed-bitcode=no` flag and revalidating native Apple artifacts.
-
-The automatic `MarmotKit Release Profile` workflow is an exact-head packaging
-check, not a comparison benchmark. It builds Kotlin/Swift generation and every
-Android or Apple native target once in parallel, transfers those inputs only
-within the current workflow run, verifies their source, builder, toolchain,
-profile, feature and run provenance, then assembles and validates the Android,
-iOS and macOS candidate packages. Pull requests restore the trusted release
-cache read-only; only runs using the workflow from `master` may update it. A
-weekly scheduled exact-head run on `master` provides drift detection and
-refreshes those trusted cache seeds; it intentionally executes the complete
-packaging matrix.
-
-Baseline-versus-candidate measurements are intentionally manual. Run the
-`MarmotKit Release Profile Measurements` workflow from `master` with the full
-lowercase SHA that needs fresh evidence:
-
-```sh
-gh workflow run bindings-profile-measurement.yml \
-  --ref master \
-  -f source_sha="$(git rev-parse HEAD)"
-```
-
-Changes to the release profile, Rust toolchain or measurement method must run it
-and link the completed evidence before merge; also run it whenever release or
-review evidence is requested. The selected SHA must already be fetchable from
-GitHub. The non-publishing run fails closed unless checkout
-matches it exactly and uploads separate Linux/Android/CPU and Apple reports,
-hashes, raw Criterion output and build logs. A failed or incomplete surface
-keeps the final comparison check red.
-
-```sh
-# Inexpensive regressions, including provenance JSON and archive bitcode checks:
-python3 crates/marmot-uniffi/test-release-profile.py
-
-# On macOS: real archive reconstruction, embedded-bitcode removal and linking:
-python3 crates/marmot-uniffi/test-native-archive.py
-
-# Controlled host/Android/Apple/CPU comparison. Missing platforms are recorded as
-# unavailable, never as zero. Isolated target directories keep the two variants
-# from overwriting each other. `--cpu` fails if a benchmark invocation fails or
-# only stale Criterion estimates remain:
-python3 crates/marmot-uniffi/measure-release-profile.py \
-  --source-sha "$(git rev-parse HEAD)" \
-  --builder-sha "$(git rev-parse HEAD)" \
-  --host --cpu \
-  --output release-profile-measurements.json \
-  --markdown release-profile-measurements.md
-```
-
-To build a subset:
-
-```sh
-ANDROID_ABIS="arm64-v8a x86_64" ./crates/marmot-uniffi/kotlin-bindings.sh
-```
-
-Generated Kotlin uses package `dev.ipf.marmotkit`, loads `libmarmot_uniffi.so`, and requires the normal
-UniFFI Kotlin runtime dependencies used by the generated file: JNA, Kotlin coroutines, and AndroidX annotations.
-
-### Android initialization (required before the first `Marmot(...)`)
-
-`Marmot(...)` constructs the Android-native keyring store, which talks to the Android Keystore over JNI and needs the
-`ndk-context` initialized with the application `Context` first. The build copies two hand-written helpers
-(`kotlin-support/`) next to the generated binding:
-
-- `dev.ipf.marmotkit.MarmotAndroid` — the call consumers use.
-- `io.crates.keyring.Keyring` — the JNI shim the `android-native-keyring-store` crate requires (statically linked into
-  `libmarmot_uniffi.so`, so its symbol is exported from that library).
-
-Android consumers MUST call `MarmotAndroid.initialize(this)` from `Application.onCreate` before constructing `Marmot`,
-otherwise the first constructor crashes with `android context was not initialized`:
-
-```kotlin
-class MarmotApplication : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        MarmotAndroid.initialize(this)
-    }
-}
-```
-
-iOS does not need this — `apple-native-keyring-store` uses Keychain APIs that do not require a `JavaVM`. If the host
-framework already initialized `ndk-context`, do not call `initialize` again.
-
-The output directories are ignored because generated bindings and packaged native libraries are derived artifacts.
-Regenerate them from this crate before vendoring into an app repository.
-
-See [`AGENTS.md`](AGENTS.md) for scope, invariants, and verification commands.
 
 ## Interactive account onboarding
 
@@ -651,7 +327,7 @@ Imported identities can use the durable preflight API instead of `login`:
    initial KeyPackage. `account_setup_readiness` stays `Initializing` until the
    interactive workflow is complete.
 
-#### Explicit recovery and checkpoint compatibility
+### Explicit recovery and checkpoint compatibility
 
 When `begin_*_onboarding` or cancellation returns `OnboardingActionUnavailable`,
 query `onboarding_recovery_required(account_ref)`. A true result means an
@@ -690,11 +366,7 @@ the checkpoint version. Do not relabel versions or delete checkpoints to
 force a downgrade. Restore/upgrade to a supporting build, or explicitly recover
 unsupported evidence with this API.
 
-Persisted generation/pending state supplies durable admission checks after
-restart; the retirement watch only supplies prompt wake-up for this runtime.
-They are not interchangeable, so this change does not introduce watch-only
-caching or prune retirement senders. Test holds remain test-only and retain
-explicit interleaving coverage.
+### Single-device notice
 
 The `SingleDevice` step always pauses before initial KeyPackage publication.
 Display a general notice that White Noise does not yet support synchronized
@@ -726,6 +398,7 @@ restoration are not explicit sign-in. If the call returns
 `AccountWorkerResponseTimedOut`, the pending fence remains and the host should
 retry the same cancel; dropping the waiter does not abort cleanup. Do not treat
 `ready` as an Open Chats command — the host still owns that transition.
+
 For Continue anyway, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
 If `snapshot.recovery_epoch` is present, use
 `acknowledge_onboarding_single_device_in_epoch(account_ref, snapshot.revision, epoch)`
@@ -761,6 +434,8 @@ an assurance that multi-device use is safe. Both still require the general notic
 Completed pre-notice checkpoints remain ready; incomplete checkpoints acquire
 the notice before KeyPackage publication when upgraded.
 
+### Snapshots, discovery and relay checks
+
 Snapshots are complete states, not deltas. A slow subscriber may miss
 intermediate states but receives the latest persisted state. Interrupting an
 async check can leave a step `Checking`; `run_onboarding` resumes it. Once a repair is approved,
@@ -789,8 +464,10 @@ future third-party inbox messages. Incomplete workflows recheck reachability
 older than five minutes. Completed onboarding is retained and reruns when a
 signed-out account enters the identity-only flow again.
 
+### Adoption and legacy accounts
+
 The existing `login` and generated-account APIs remain compatible. Apps must
-adopt the new identity-only APIs and screen to enable this experience. Legacy
+adopt the identity-only APIs and screen to enable this experience. Legacy
 accounts without an onboarding checkpoint are not retroactively blocked. Active
 legacy accounts and accounts with unfinished legacy setup are not silently
 enrolled: finish or resume their existing setup first. Signed-out legacy accounts
@@ -798,8 +475,148 @@ without pending setup can explicitly opt in. Completed checkpoints defer to norm
 setup/recovery readiness. Corrupt or newer-version checkpoints gate only their own
 account; they must be restored or opened with a compatible runtime, not silently
 discarded because they may contain approved publication intent. C
-consumers have equivalent methods and subscriptions; external-signer entry
-points retain the C API's existing callback-vtable limitation.
+consumers have equivalent methods and subscriptions, except the external-signer
+entry points, which have no C callback interface yet.
+
+## Identity references and profiles
+
+New generated identities publish kind `10002`, kind `10050`, and kind `0` to
+their account relays and send separate best-effort copies to the built-in public
+directory indexers. Later relay-list and profile edits through MarmotKit do the
+same. The indexers are never inserted into the advertised relay lists or used
+for KeyPackages, contact lists, or messaging. Acknowledgement from an account
+relay establishes setup success; indexer copies are scheduled after bootstrap
+confirmation, before initial KeyPackage publication, and an outage is reported
+only as an aggregate warning. Shutdown or account removal cancels pending copies.
+Existing identities are not automatically republished to the indexers and need a
+client-initiated backfill of their current lists and profile.
+
+`accountIdHex` / `normalizeMemberRef` accept `nprofile` and
+`nostr:nprofile` mentions and QR scans in addition to hex, `npub`,
+`nostr:npub`, and `marmot://profile/` links. Relay hints inside an
+nprofile are discarded and never used for routing or directory mutation.
+Duplicate type-0 TLV entries keep the first key. After FFI wrapper
+normalization, the nprofile fallback rejects encoded tokens longer than
+1023 UTF-8 bytes (the locked Bech32/Bech32m ceiling); a valid 1023-byte
+token still decodes when wrapped in `nostr:` or `marmot://profile/...`.
+The app helper strips one lowercase `nostr:` prefix itself; profile-link
+and whitespace normalization belong to FFI. The app helper's legacy NIP-21
+parser may still accept a colon-suffixed `nostr:<npub>:` form before the
+fallback runs; FFI normalization rejects that form.
+
+Decode a scanned reference first, then pass the canonical lowercase hex account id to
+`defaultProfilePseudonym` so the shared text-hash seed is preserved. Passing uppercase hex
+or an undecoded `npub` silently produces a different name, not an error. `randomProfilePseudonym`
+replaces client-owned random-roll wordlists; it is cosmetic, may collide, and does not create
+an account.
+
+`userProfile` returns the cached kind:0 projection. `about` from a fetched
+profile keeps normalized LF line breaks; `name`, `displayName`, `picture`,
+`banner`, `nip05`, and `lud16` stay single-line. Tab and other controls are
+removed on ingest. `publishUserProfile` caches the submitted local value
+without reparsing it, so a same-instance publish/read does not show incoming
+sanitization. Read another account through `refreshProfile`, then
+`userProfile` or `cachedIdentityProjections`. A bio already stored without
+line breaks stays until a newer event replaces it.
+
+## KeyPackage inventory
+
+`accountKeyPackages` lists the current KeyPackage winner per addressable slot
+plus local-only rows. `accountKeyPackageRelayEvents` is the additive observed
+history for that same fetch window: current and superseded kind-30443 events,
+with `isCurrent` set only among those observed valid events. Hosts can pass a
+superseded `eventIdHex` and its `sourceRelays` to the existing delete API.
+This does not change the Published-list filter (`relay == true`).
+
+`localAccountKeyPackages` is the local-first inventory: render it immediately.
+It is a synchronous SQLCipher read on the calling thread; do not invoke it on a
+UI or main thread. `refreshAccountKeyPackages` is the explicit network merge;
+replace the displayed snapshot with its result. On refresh failure or
+cancellation, keep the local result. Both return
+`AccountKeyPackageInventoryEntryFfi` (`record` plus `localState`). Existing
+`AccountKeyPackageFfi` is unchanged. `localState` and `record.relay` are the
+authoritative display distinctions; empty event IDs and `publishedAt` are not
+publication proof. A retained package stays `RetainedPrivateMaterial` even when
+that exact event is observed; `record.relay` becomes true while `localState`
+remains retained. Empty bootstrap relays remain network-enabled. After a
+mutation, re-read the local inventory instead of applying an out-of-order
+refresh.
+
+## KeyPackage client preference
+
+Invitation discovery temporarily prefers `whitenoise`, then untagged/other clients,
+then `amethyst`. Names are trimmed and matched case-insensitively, exactly (not by
+substring). These are advisory labels, never proof of a particular application.
+Only valid packages compatible with the proposed/existing group qualify. Within a
+tier, the existing recency order applies. Amethyst remains selectable when no
+higher-priority compatible package is available. A replacement in a publication
+slot supersedes the old package before ranking; one package per account is selected.
+This temporary selection policy applies to all hosts of this runtime; only the
+publication label is host-configurable (see [runtime options](#runtime-options-and-client-label)).
+Compatibility alone cannot identify a client that publishes usable packages but does not process Welcomes.
+
+Client ranking and slot supersession also apply to directory lookup (including
+`wn-cli key-package`) and composition prewarm, without target-group requirements. A
+malformed current publication never revives an older package in the same slot.
+If no usable slot remains, prewarm reports failure while retaining successfully
+discovered routes for other members. Its success must not imply readiness based
+on superseded material. Bounded batch results are not exhaustive, so rejected
+candidates still permit a per-account fallback fetch. A lower-priority batch
+winner during create/invite also triggers that fetch to look for a preferred slot omitted by a relay's
+batch limit, even if it returned fewer records than requested: relays may impose
+lower caps. Already observed replacements remain authoritative during the refetch.
+This adds a per-author request for each lower-priority batch winner. A White Noise
+winner already has the highest tier in a newest-first prefix, so it skips that
+request. Both paths remain bounded discovery: neither guarantees completeness
+when a relay omits newer events instead of returning a newest-first prefix.
+If that supplementary fetch fails, a still-valid, compatible package from the
+current batch remains usable; previously cached packages are never substituted.
+Prewarm skips preference-only refetches because it only checks existence.
+Prewarm checks discovery readiness only; it has no proposed group configuration
+and does not guarantee capability compatibility. Final creation/invitation checks
+the actual group's requirements. Device-aware delivery in
+[MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
+replacement for this temporary client ranking.
+
+## Public Nostr event verification
+
+The stateless `verifyPublicNostrEventJson` helper verifies public events through
+MDK's Nostr/libsecp256k1 stack without constructing an account or supplying a
+secret key. It checks both the canonical event ID and signature. A host must
+still enforce its own allowed authors, kinds, tags, and input-size limits.
+Malformed input and invalid signatures return `false`; it does not authenticate
+an MLS group message or replace MDK's relay ingestion checks.
+
+## Selected chat-list presentation
+
+`openPresentedChatList(accountRef, includeArchived)` returns an account-bound subscription.
+Take `snapshot()` once (generation plus sequence zero), then consume `next()` as complete replacement snapshots.
+Each row contains the existing chat-list fields and MDK's selected title/avatar; hosts render the typed fallback text
+with their own localization and load the selected avatar descriptor without a roster/profile lookup.
+`presentedChatList` and `presentedChatListRow` provide the same local contract for one-shot and creation/rebind paths.
+
+First use can await bounded local preparation. `ChatPresentationNotReady` means preparation did not advance and may be
+retried after maintenance; it is not an empty list or missing group. Storage errors remain errors. Ready reads do no
+network fetching or repair writes. Selected values survive offline reopen; visible avatar bytes should use
+`requestAvatarAssets` / `readAvatarAssets` as described in [durable avatar access](#durable-avatar-access).
+
+Order updates by the handle's generation and sequence. `presentationVersion` only versions selected presentation:
+an unread, pin, archive or mute update can have the same presentation revision. Drop the old handle when changing
+accounts; cancellation preserves a pending refresh, and shutdown ends the stream. Account-store replacement requires
+opening a new handle. Do not log rows or avatar material, including generated host-language record stringification.
+Existing chat-list APIs remain available.
+
+## Bounded chat screens
+
+`openChatListWindow` provides live Chats/Unread/Archived/Left windows, and `subscribeAccountAttention` provides
+independent account attention. See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
+for paging, sequence handling, cancellation, C ownership, and compatibility.
+
+## Prepared conversation windows
+
+`openConversationWindow` combines history, header/capabilities, visible identities,
+read state and revisioned draft descriptors. See the [native conversation contract](CONVERSATION-WINDOW.md)
+for opening, paging, cancellation, timeout, ownership and draft migration.
 
 ## Live timeline updates
 
@@ -812,7 +629,7 @@ ordering, removals, and window limits themselves; raw projections do not report
 which rows the runtime evicted from its bounded window.
 
 Projection `messages` and upsert `changes` retain their existing wire format.
-When corresponding source records are identical, conversion now parses Markdown
+When corresponding source records are identical, conversion parses Markdown
 and resolves media once, then clones the converted record for the second field.
 Different records and removals retain independent conversion.
 
@@ -829,42 +646,95 @@ and UniFFI serialization: p50/p95 over 100 samples after 10 warm-up iterations,
 plus serialized byte counts. They exclude storage, runtime window application,
 FFI scheduling, and Swift/Kotlin decoding and rendering.
 
-## Selected chat-list presentation
+## Durable avatar access
 
-`openPresentedChatList(accountRef, includeArchived)` returns an account-bound subscription.
-Take `snapshot()` once (generation plus sequence zero), then consume `next()` as complete replacement snapshots.
-Each row contains the existing chat-list fields and MDK's selected title/avatar; hosts render the typed fallback text
-with their own localization and load the selected avatar descriptor without a roster/profile lookup.
-`presentedChatList` and `presentedChatListRow` provide the same local contract for one-shot and creation/rebind paths.
+Chat rows and conversation header/identity records include `avatarAsset` metadata. For visible content, batch its
+opaque `target` values into `requestAvatarAssets`, then pass returned `reference` values to `readAvatarAssets`. Both
+accept at most 16 items; byte reads additionally require a 1-byte to 16-MiB aggregate budget. A `deferred` result means
+that complete image did not fit the remaining budget. Ready/stale images can render offline; decode and render on the
+host, caching decoded images by reference plus content revision. Screen subscriptions update metadata when acquisition
+completes. `clearAvatarCache` clears durable bytes and demand; later visible requests can acquire again.
 
-First use can await bounded local preparation. `ChatPresentationNotReady` means preparation did not advance and may be
-retried after maintenance; it is not an empty list or missing group. Storage errors remain errors. Ready reads do no
-network fetching or repair writes. Selected values survive offline reopen; visible avatar bytes should use
-`requestAvatarAssets` / `readAvatarAssets` as described below.
+Keep host persistent caches until migration and device validation are complete. See
+[the avatar contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md)
+for source/account fencing, result states and lifecycle rules.
 
-Order updates by the handle's generation and sequence. `presentationVersion` only versions selected presentation:
-an unread, pin, archive or mute update can have the same presentation revision. Drop the old handle when changing
-accounts; cancellation preserves a pending refresh, and shutdown ends the stream. Account-store replacement requires
-opening a new handle. Do not log rows or avatar material, including generated host-language record stringification.
-Existing chat-list APIs remain available during client migration. Android/iOS adoption is a separate delivery step.
+## Deletion provenance and custom events
 
-## Bounded chat screens
+Timeline records (including conversation windows and `reportedMessage`), reply previews,
+and chat-list previews expose `deletionSource: DeletionSourceFfi`:
 
-C4 adds live Chats/Unread/Archived/Left windows and independent account attention.
-See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
-for paging, sequence handling, cancellation, C ownership, and compatibility.
+- `Author`: the selected accepted deletion is an author-authorized kind 5.
+- `Admin`: the selected accepted deletion is kind 4891, authorized by authenticated
+  source-state evidence. This includes an admin removing their own message.
+- `Unknown`: no classified deletion evidence is available, including older projected tombstones
+  and legacy kind-5 removals of another author's content.
 
-## Prepared conversation windows
+Consult this field only when `deleted` is true. Use the existing ordinary-deletion wording
+for `Author`, “This message was deleted by an admin.” for `Admin`, and a neutral deleted-message
+fallback for `Unknown`. Clients own localization. The message's `kind` remains its original
+inner event kind, never the deletion kind. Existing deletion IDs and content masking are retained.
+`invalidationStatus` describes convergence separately and does not imply deletion.
 
-The additive C5 screen API combines history, header/capabilities, visible identities,
-read state and revisioned draft descriptors. See the [native conversation contract](CONVERSATION-WINDOW.md)
-for opening, paging, cancellation, timeout, ownership and draft migration.
+See [deletion semantics](../../docs/marmot-architecture/overview/content-moderation.md)
+for the storage and authorization contract.
 
-## Apple privacy resources
+When multiple accepted deletions apply, the largest `(authenticated event timestamp, event ID)`
+pair wins, matching `deletedByMessageIdHex`. Arrival order, reports, and current admin status
+play no part. Invalidated deletion evidence is withdrawn; projections update to the remaining
+winner (or restore the undeleted state). Provenance-only changes participate in live projection
+and conversion-cache updates.
 
-Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target. See the
-[privacy audit and adoption guide](apple-privacy/README.md) for declarations,
-archive validation, host integration changes, and unresolved release questions.
+Database migration 0082 adds provenance columns with an `unknown` default.
+It preserves older tombstones, deletion IDs, and cached chat presentation without scanning or
+reinterpreting history. No historical backfill is scheduled: existing tombstones can remain `Unknown` indefinitely.
+If a later operation reprojects a target or rebuilds its group, it uses available accepted evidence.
+Legacy serialized records with an absent field also default to `Unknown`. No client database
+migration or deletion index is needed. Older MDK binaries reject the upgraded database schema;
+do not roll back only the library. This is a binding layout change, not an MLS/wire-format change.
+
+Custom events retain their numeric `kind` and verbatim `plaintext` content. Conversation windows
+also carry their ordered `tags`, so clients can render app-defined event types without fetching
+raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
+MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
+the conversion cache. Custom events do not change chat-list activity or notification policy.
+
+## Group-system previews
+
+`ChatListMessagePreviewFfi.groupSystem` and timeline `groupSystem` carry
+`GroupSystemEventProvenanceFfi`. MDK verifies local synthesis against the exact
+stored row and payload. The optional commit link is for rollback invalidation;
+self-removal and reorg-derived rows remain authenticated without it.
+Render authenticated membership/admin changes
+only for `AuthenticatedGroupState`; `MemberAuthored` is an assertion and carries
+no trusted actor/subject IDs on projected records. Malformed, oversized and deleted
+payloads have no typed event. Provenance records origin; timeline invalidation
+status still applies. Raw plaintext remains available to narrow consumers.
+
+Chat previews include separate actor/subject IDs and MDK-prepared display names
+from local caches, with the same safe-name/pseudonym fallback used by conversation
+identities. Subject profile updates refresh live chat lists without changing message
+identity or activity order. Clients own localized wording and the viewer's “you” label.
+Conversation windows continue to supply their bounded identity dictionary.
+
+### Reactions on group activity
+
+Use the existing reaction commands with the activity row's `messageIdHex`.
+Authenticated system rows retain that deterministic ID across reaction changes,
+replay and restart; the same timeline record exposes both `groupSystem` and
+`reactions`. Retraction uses the existing unreact command, and subscriptions
+update the target row without adding a second activity row. Do not synthesize or
+send a kind-1210 event to react to local group activity.
+
+Reaction notifications use the supported system payload's text fallback, never
+its JSON envelope. Only the stored target sender receives an alert; activity
+without an attributable actor does not invent a recipient. Deleted or invalidated
+targets and malformed or unsupported payloads expose no target preview.
+For synthesized system rows, `reactedToPreview` is an English fallback. The
+notification DTO has neither the target ID nor a structured system event, so this
+field cannot support client localization; hosts can omit it and use their generic
+localized reaction notification. Conversation rows still expose `groupSystem` for
+client-localized rendering and layout. No client-owned reaction map is required.
 
 ## Group reporting
 
@@ -876,10 +746,8 @@ explanation and `dismissed`; each admin label carries its own event ID, admin,
 explanation and timestamp. No aggregate queue, count, status, revision argument,
 or winning review decision is imposed on hosts.
 
-Pages are capped at 100 and cursors are exclusive. C callers deep-free returned
-pages with `marmot_content_report_page_free` or `marmot_report_dismissal_page_free`.
-`reported_message` uses the ordinary timeline record and its free function.
-Use existing projection subscriptions to refresh client review views.
+Pages are capped at 100 and cursors are exclusive. `reported_message` uses the ordinary
+timeline record. Use existing projection subscriptions to refresh client review views.
 
 ## History may be incomplete notices
 
@@ -909,108 +777,13 @@ comes back, but genuinely new evidence can raise a new notice: new loss, a highe
 epoch, a later startup's incremental comparison, or a new explicit repair. Explicit
 full-history repair remains available and can still complete parked history that its
 comparison of the retained window certifies. Notices carry no relay, message or key identities; keep them out of
-analytics. C callers use `marmot_history_notices` (free with
-`marmot_history_notice_list_free`), `marmot_dismiss_history_notice` and the
-`MARMOT_EVENT_HISTORY_NOTICES_CHANGED` event tag.
-
-## Durable avatar access
-
-Chat rows and conversation header/identity records now include `avatarAsset` metadata. For visible content, batch its
-opaque `target` values into `requestAvatarAssets`, then pass returned `reference` values to `readAvatarAssets`. Both
-accept at most 16 items; byte reads additionally require a 1-byte to 16-MiB aggregate budget. A `deferred` result means
-that complete image did not fit the remaining budget. Ready/stale images can render offline; decode and render on the
-host, caching decoded images by reference plus content revision. Screen subscriptions update metadata when acquisition
-completes. `clearAvatarCache` clears durable bytes and demand; later visible requests can acquire again.
-
-Use matching regenerated Swift/Kotlin and native libraries. Keep host persistent caches until migration and device
-validation are complete. See [the avatar contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md)
-for source/account fencing, result states and lifecycle rules.
+analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-incomplete-notices).
 
 ## Bounded attachment history
 
 Use the asynchronous attachment history page/version methods for canonical media-library
-discovery. See [the C8-B native handoff](ATTACHMENT-HISTORY.md) for filtering, refresh,
+discovery. See [the native handoff](ATTACHMENT-HISTORY.md) for filtering, refresh,
 removal and cursor ownership. `list_media` remains a compatibility API.
-
-## KeyPackage client preference and publication label
-
-Invitation discovery temporarily prefers `whitenoise`, then untagged/other clients,
-then `amethyst`. Names are trimmed and matched case-insensitively, exactly (not by
-substring). These are advisory labels, never proof of a particular application.
-Only valid packages compatible with the proposed/existing group qualify. Within a
-tier, the existing recency order applies. Amethyst remains selectable when no
-higher-priority compatible package is available. A replacement in a publication
-slot supersedes the old package before ranking; one package per account is selected.
-This temporary selection policy applies to all hosts of this runtime; only the
-publication label is host-configurable. Compatibility alone cannot identify a
-client that publishes usable packages but does not process Welcomes.
-
-Client ranking and slot supersession also apply to directory lookup (including
-`wn-cli key-package`) and composition prewarm, without target-group requirements. A
-malformed current publication never revives an older package in the same slot.
-If no usable slot remains, prewarm reports failure while retaining successfully
-discovered routes for other members. Its success must not imply readiness based
-on superseded material. Bounded batch results are not exhaustive, so rejected
-candidates still permit a per-account fallback fetch. A lower-priority batch
-winner during create/invite also triggers that fetch to look for a preferred slot omitted by a relay's
-batch limit, even if it returned fewer records than requested: relays may impose
-lower caps. Already observed replacements remain authoritative during the refetch.
-This adds a per-author request for each lower-priority batch winner. A White Noise
-winner already has the highest tier in a newest-first prefix, so it skips that
-request. Both paths remain bounded discovery: neither guarantees completeness
-when a relay omits newer events instead of returning a newest-first prefix.
-If that supplementary fetch fails, a still-valid, compatible package from the
-current batch remains usable; previously cached packages are never substituted.
-Prewarm skips preference-only refetches because it only checks existence.
-Prewarm checks discovery readiness only; it has no proposed group configuration
-and does not guarantee capability compatibility. Final creation/invitation checks
-the actual group's requirements. Device-aware delivery in
-[MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
-replacement for this temporary client ranking.
-
-`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, and
-`secretStore` in `Marmot.newWithConfiguration`. Each field is optional in generated
-Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
-an omitted label stays untagged and omitted storage uses the platform keychain.
-Existing constructors keep their signatures and delegate to this same configuration
-path. Use the options constructor when combining a label with a custom relay policy.
-C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
-struct; zero initialization selects the same defaults. Use the matching header
-and library for that struct's layout.
-
-```swift
-let options = MarmotOptions(clientName: "whitenoise")
-let marmot = try Marmot.newWithConfiguration(
-    rootPath: rootPath, relayUrls: relayUrls, options: options
-)
-```
-
-Native construction/default checks: `./crates/marmot-uniffi/options-smoke.sh swift`
-and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
-./crates/marmot-uniffi/options-smoke.sh kotlin`.
-
-Host applications opt into public tagging at construction. Existing constructors
-remain untagged. Swift hosts can use:
-
-```swift
-let marmot = try Marmot.newWithClientName(
-    rootPath: rootPath,
-    relayUrls: relayUrls,
-    clientName: "whitenoise",
-    cursorPersistence: .advance,
-    secretStore: nil
-)
-```
-
-Kotlin exposes `Marmot.newWithClientName` with the same arguments; C exposes
-`marmot_client_new_with_client_name`. Rust hosts set
-`MarmotAppConfig::with_key_package_client_name(Some("whitenoise".into()))`.
-Supply the name on every host runtime construction, including background and
-notification-extension entry points (which retain their frozen cursor policy).
-Absent or whitespace-only names omit the tag. New initial publications and normal
-rotations carry the configured label. Existing events are not republished, and
-already-signed pending publications retry with their original tags even if the
-configuration changes. No workspace/binding version bump is part of this change.
 
 ## Local attachment access
 
@@ -1018,5 +791,225 @@ Use `attachmentLocalAssets` to locate verified retained bytes for visible source
 slots, then `readAttachmentAsset` for bounded local chunks without network work.
 See [the native attachment handoff](ATTACHMENT-ACCESS.md) for unavailable/EOF semantics,
 source revalidation, host buffer ownership and integration guidance. Acquisition
-now defaults on with bounded per-account policy. Native progress snapshots/subscriptions
+defaults on with bounded per-account policy. Native progress snapshots/subscriptions
 and durable cancellation, retry, remove and download-again controls use the same source slots.
+
+## Audit v5 recording and delivery
+
+v5 replaces v4 as the audit format. `AuditLogSettingsFfi.enabled` remains the recording opt-in.
+Account sessions and the live runtime write only `marmot-forensics-audit/v5` to
+`audit-<engine_id>-v5.jsonl`; no new v4 files are written, and existing v4 files remain on disk.
+Hosts that record audit logs must configure v5 delivery, or new evidence never leaves the
+device. Deploy a receiver that accepts every v5 event kind first.
+
+To deliver v5, supply a dedicated OTLP `/v1/logs` destination and bearer token
+with `set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi)`. The configuration is held in memory, so
+apply it on every launch; the returned record omits the token. Set `enabled: false` to remove delivery configuration.
+An exact loopback endpoint requires `allow_loopback_dev: true`; public endpoints require HTTPS.
+The host then calls `post_audit_log_tracker_update_v5()`, in place of
+`post_audit_log_tracker_update()`, for an immediate pass; the existing
+audit tracker also uses this configuration on its activity triggers with the usual batching,
+retry, and shutdown behavior. The v5 result reports accepted batches, pending accounts, blocked
+accounts, and idle accounts separately from legacy v4 uploads. No host should infer receiver
+acceptance from an empty v4 `uploaded` list. The v4 whole-file Goggles endpoint never receives
+v5 records.
+
+## Legacy audit v4 upload
+
+The v4 whole-file route only drains v4 files written before 0.11.0; keep its configuration until
+they are gone, and do not build new v4 infrastructure. Whole-file uploads accept only
+`marmot-forensics-audit/v4`; older local files are never migrated or sent.
+App construction automatically removes recognized v1-v3 forensic files and rotated segments after acquiring the
+root lease, including files in failed account-wipe remnants, even with recording disabled. V4 files and the separate
+key-reveal log are preserved; failures are nonfatal and retried on the next open. No additional Swift/Kotlin cleanup
+call is needed.
+
+Use `AuditLogTrackerConfigV4Ffi` with `AuditLogUploadSourceV4Ffi.hardwareModel` in place of the old source record
+and its `deviceLabel`. The versioned config type changes the setter ABI checksum so old generated bindings cannot
+silently reinterpret a device label as a hardware model.
+Populate this field from system model information (e.g. `iPhone17,3` or `Pixel 9a`), never from a device name,
+hostname or serial number. Omit it if unavailable. Platform and app version are unchanged.
+Uploads of leftover v4 files still need a v4-compatible Goggles endpoint; new evidence goes to v5.
+
+Native metadata lift/lower checks: `./crates/marmot-uniffi/audit-v4-smoke.sh swift` and
+`MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars> ./crates/marmot-uniffi/audit-v4-smoke.sh kotlin`.
+These regenerate host bindings and execute DTO round trips; platform package builds remain separate.
+
+## Building local bindings
+
+The Rust API in `src/` is the source of truth for both generated Swift and generated Kotlin. Platform scripts only
+package that shared surface:
+
+- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` and
+  `output/PrivacyInfo.xcprivacy` for iOS.
+- `./crates/marmot-uniffi/xcframework-macos.sh` builds `output/macos/MarmotKit.xcframework` plus
+  `output/macos/MarmotKit.swift` and `output/macos/PrivacyInfo.xcprivacy` for macOS on Apple Silicon
+  (`aarch64-apple-darwin`). Its output directory is separate from the iOS one so building both in one workspace
+  cannot clobber either artifact.
+- `./crates/marmot-uniffi/kotlin-bindings.sh` builds `output/android/kotlin/dev/ipf/marmotkit/marmot_uniffi.kt` plus
+  Android `jniLibs` shared libraries.
+
+The generated Swift file is platform-independent: `output/MarmotKit.swift` and `output/macos/MarmotKit.swift` are the
+same UniFFI surface, and releases publish it once. The Kotlin binding is generated from the same host library metadata,
+so it exposes the same `Marmot` object, subscription objects, records, enums, and error variants.
+
+No generated Swift or Kotlin files are committed here; the output directories are ignored because generated bindings
+and packaged native libraries are derived artifacts. Regenerate them from this crate before vendoring into an app
+repository. For published artifacts, exact release and snapshot URLs, checksums, provenance and generated-source
+synchronization rules, see [`DISTRIBUTION.md`](DISTRIBUTION.md).
+
+## Build phases
+
+The no-argument build scripts still build complete local bundles. Release CI
+uses separate phases to parallelize compilation across runners:
+
+| Script | Phase | Work |
+| --- | --- | --- |
+| `xcframework.sh` | `generate` | Host library and generated Swift/headers in `build/ios/swift`; no device builds |
+| `xcframework.sh` | `native <target>` | One `aarch64-apple-ios` or `aarch64-apple-ios-sim` native build |
+| `xcframework.sh` | `assemble` | Assemble existing native slices and `build/ios/swift` into the usual iOS output |
+| `xcframework-macos.sh` | `native` | One `aarch64-apple-darwin` build with the macOS deployment flags |
+| `xcframework-macos.sh` | `assemble` | Assemble the native slice with shared Swift/headers placed in `build/macos/swift` |
+| `kotlin-bindings.sh` | `generate` | Host library, generated Kotlin and Android support files; no NDK required |
+| `kotlin-bindings.sh` | `native` | JNI libraries for `ANDROID_ABIS`; no host library or binding generation |
+
+Run independent phases in separate checkouts/runners. Multiple Cargo processes
+sharing one target directory contend on its lock; separate phases do not make
+concurrent invocations in one checkout safe. All inputs must have matching source,
+builder, toolchain, profile and features. CI transfers inputs only within the same
+workflow run. Apple assembly checks required files before replacing an existing
+bundle and never compiles Rust. Both Apple scripts honor `CARGO_TARGET_DIR`.
+See the [release guide](../../release.md#parallel-builds-and-build-only-rehearsals)
+for the build-only benchmark workflow and cache-warming procedure.
+
+## Kotlin / Android
+
+Prerequisites:
+
+```sh
+rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+# macOS Android Studio default:
+export ANDROID_NDK_HOME="$HOME/Library/Android/sdk/ndk/<version>"
+# Linux / common CI default:
+# export ANDROID_NDK_HOME="$HOME/Android/Sdk/ndk/<version>"
+```
+
+CI jobs can also set `ANDROID_SDK_ROOT` or `ANDROID_HOME`; the build script will discover the newest NDK under
+`$ANDROID_SDK_ROOT/ndk` or `$ANDROID_HOME/ndk` when `ANDROID_NDK_HOME` is not set.
+
+Build all Android ABIs, or a subset:
+
+```sh
+./crates/marmot-uniffi/kotlin-bindings.sh
+ANDROID_ABIS="arm64-v8a x86_64" ./crates/marmot-uniffi/kotlin-bindings.sh
+```
+
+Generated Kotlin uses package `dev.ipf.marmotkit`, loads `libmarmot_uniffi.so`, and requires the normal
+UniFFI Kotlin runtime dependencies used by the generated file: JNA, Kotlin coroutines, and AndroidX annotations.
+
+The script keeps the host library's UniFFI metadata intact while stripping debug and static symbol sections from each
+packaged Android JNI library. The two 64-bit ABIs (`arm64-v8a`, `x86_64`) are linked with 16 KB ELF `PT_LOAD`
+alignment for Google Play's 16 KB page-size check; the 32-bit ABIs stay on the NDK's default page size. Aligning the
+app bundle ZIP does not change those segments. Each published Android archive includes an `android-elf.json` report of
+the packaged libraries' hashes and observed load alignments; see [DISTRIBUTION.md](DISTRIBUTION.md#android). That
+report does not by itself prove an app's Play Console result.
+
+### Android initialization (required before the first `Marmot(...)`)
+
+`Marmot(...)` constructs the Android-native keyring store, which talks to the Android Keystore over JNI and needs the
+`ndk-context` initialized with the application `Context` first. The build copies two hand-written helpers
+(`kotlin-support/`) next to the generated binding:
+
+- `dev.ipf.marmotkit.MarmotAndroid` — the call consumers use.
+- `io.crates.keyring.Keyring` — the JNI shim the `android-native-keyring-store` crate requires (statically linked into
+  `libmarmot_uniffi.so`, so its symbol is exported from that library).
+
+Android consumers MUST call `MarmotAndroid.initialize(this)` from `Application.onCreate` before constructing `Marmot`,
+otherwise the first constructor crashes with `android context was not initialized`:
+
+```kotlin
+class MarmotApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        MarmotAndroid.initialize(this)
+    }
+}
+```
+
+iOS does not need this — `apple-native-keyring-store` uses Keychain APIs that do not require a `JavaVM`. If the host
+framework already initialized `ndk-context`, do not call `initialize` again.
+
+## Release profile
+
+Standard MarmotKit release builds use the workspace `[profile.release]` together with
+`marmotkit-release-profile.env`: `lto=thin`, `codegen-units=1`, `opt-level=3`,
+`debug=0`, `panic=unwind`, and `strip=none`. Android target invocations override only
+`CARGO_PROFILE_RELEASE_STRIP=symbols`. Apple target invocations add
+`-C embed-bitcode=no` and sanitize leftover `__LLVM` / `__bitcode` sections
+before packaging so shipped archives stay native; that is not a symbol strip.
+Sanitization requires the active Rust toolchain's `llvm-tools-preview` component
+(included by `rust-toolchain.toml`) and Xcode's `libtool`. It rebuilds symbol indexes
+and validates a temporary output before replacing the original archive.
+Those builder-owned settings are not a user-facing escape hatch; measurement
+scripts may override LTO and codegen units on direct Cargo commands for a
+controlled baseline comparison.
+
+These are configured profile values, not proof that Cargo applies LTO to every
+output: the mixed `rlib`/`cdylib`/`staticlib` binding target can suppress LTO.
+The measured reduction belongs to the combined profile, not to thin LTO alone.
+Apple measurement rows record pre-sanitization Cargo archive bytes and hashes,
+not final packaged-archive or linked application sizes. Native-only archive
+validation and consumer linking are separate packaging checks.
+Changing crate types to enable effective LTO also requires revisiting the
+incompatible `embed-bitcode=no` flag and revalidating native Apple artifacts.
+The latest recorded comparison is in [release-profile-measurements.md](release-profile-measurements.md).
+
+The automatic `MarmotKit Release Profile` workflow (`bindings-profile.yml`) is an exact-head packaging
+check, not a comparison benchmark. It builds Kotlin/Swift generation and every
+Android or Apple native target once in parallel, transfers those inputs only
+within the current workflow run, verifies their source, builder, toolchain,
+profile, feature and run provenance, then assembles and validates the Android,
+iOS and macOS candidate packages. Pull requests restore the trusted release
+cache read-only; only runs using the workflow from `master` may update it. A
+weekly scheduled exact-head run on `master` provides drift detection and
+refreshes those trusted cache seeds; it intentionally executes the complete
+packaging matrix.
+
+Baseline-versus-candidate measurements are intentionally manual. Run the
+`MarmotKit Release Profile Measurements` workflow from `master` with the full
+lowercase SHA that needs fresh evidence (it must already be fetchable from GitHub):
+
+```sh
+gh workflow run bindings-profile-measurement.yml \
+  --ref master \
+  -f source_sha="$(git rev-parse HEAD)"
+```
+
+The non-publishing run fails closed unless checkout matches the SHA exactly, and uploads separate
+Linux/Android/CPU and Apple reports, hashes, raw Criterion output and build logs. A failed or incomplete
+surface keeps the final comparison check red. Local equivalents:
+
+```sh
+# Inexpensive regressions, including provenance JSON and archive bitcode checks:
+python3 crates/marmot-uniffi/test-release-profile.py
+
+# On macOS: real archive reconstruction, embedded-bitcode removal and linking:
+python3 crates/marmot-uniffi/test-native-archive.py
+
+# Controlled host/Android/Apple/CPU comparison. Missing platforms are recorded as
+# unavailable, never as zero. Isolated target directories keep the two variants
+# from overwriting each other. `--cpu` fails if a benchmark invocation fails or
+# only stale Criterion estimates remain:
+python3 crates/marmot-uniffi/measure-release-profile.py \
+  --source-sha "$(git rev-parse HEAD)" \
+  --builder-sha "$(git rev-parse HEAD)" \
+  --host --cpu \
+  --output release-profile-measurements.json \
+  --markdown release-profile-measurements.md
+```
+
+## Apple privacy resources
+
+Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target.
+See the [privacy audit and adoption guide](apple-privacy/README.md) for declarations, archive validation, host
+integration changes, and unresolved release questions.

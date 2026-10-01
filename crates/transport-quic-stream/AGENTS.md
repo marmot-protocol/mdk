@@ -1,6 +1,6 @@
 # AGENTS.md - transport-quic-stream
 
-Raw QUIC transport binding for transient Marmot agent text stream previews.
+Raw QUIC transport binding for transient Marmot agent text stream previews. Human overview: [`README.md`](README.md).
 
 ## Scope
 
@@ -11,6 +11,12 @@ Raw QUIC transport binding for transient Marmot agent text stream previews.
 - Treat live chunks as provisional preview data. The final MLS app payload remains authoritative.
 - Keep diagnostics privacy-safe: no account ids, group ids, message ids, relay URLs, pubkeys, plaintext, ciphertext, or
   key material in tracing/logging.
+- Keep the dial safe: this crate has no resolver or dev-flag context. `SendTextStream` takes an already validated and
+  pinned `SocketAddr` plus configuration-derived trust/`server_name`; never infer permission from the destination IP.
+  The `InsecureLocalRequiresLoopback` check in `src/tls.rs` is a backstop, not the gate. See
+  `docs/marmot-architecture/overview/dial-safety.md`.
+- Encrypted publishers reserve sequences through `PublisherSequenceStore` before writing records; ambiguous durable
+  state fails closed.
 
 ## Key files
 
@@ -20,6 +26,10 @@ Raw QUIC transport binding for transient Marmot agent text stream previews.
 - `src/protocol.rs` — ALPN/protocol identifiers, frame-size constants, and the plaintext/frame-length cap helpers.
 - `src/crypto.rs` — `AgentTextStreamCrypto`, record seal/open, and the HKDF key/nonce and AAD derivations.
 - `src/frame.rs` — length-prefixed wire framing: write/read a record and `frame_len` validation.
+- `src/candidate.rs` — `QuicCandidate` parsing/validation for adopted `quic://` broker candidates.
+- `src/publisher_sequence.rs` — durable publisher-sequence reservation boundary (`PublisherSequenceStore`,
+  `reserve_publisher_records` (public as `reserve_publisher_records_for_transport`),
+  `EphemeralPublisherSequenceStore`).
 - `src/tls.rs` — server/client TLS config, ALPN pinning, and the loopback-only insecure verifier.
 - `src/receive.rs` — `QuicTextStreamReceiver`, the receive loop, and received-stream DTOs (`ServerTrust` lives here).
 - `src/send.rs` — `send_text_stream`, the sender DTOs, and the stream-id / UTF-8 chunk-splitting helpers.

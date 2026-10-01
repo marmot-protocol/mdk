@@ -5,15 +5,14 @@ Shared JSONL forensic audit schema for Marmot incident capture.
 ## Scope
 
 - Own the append-only audit-log schema and the `ForensicRecorder` trait (with `JsonlRecorder` and `NoopRecorder`
-  implementations) used by engine/runtime incident capture.
+  implementations) used by engine/runtime incident capture. Human overview: [`README.md`](README.md).
 - Keep this crate independent of engine, app, storage, transport SDK, and simulator crates.
 - Keep static snapshot dump analysis out of this repo; external tools should consume JSONL audit files.
 - Keep `JsonlRecorder` segment rotation transparent (mdk#1181). Sealing the active file at
   `AUDIT_LOG_SEGMENT_MAX_BYTES` is a rename into an `audit-*-seg<NNNNNN>.jsonl` sibling that deletes and truncates
   nothing; `seq`, the recorder session id, and health counters carry across the boundary and no `recorder_started` row
   is written. Each fresh segment repeats the latest explicit `source_context` with a fresh sequence number; ordinary
-  events and sealed bytes remain unchanged. Retention and disk
-  bounding of sealed segments belong to mdk#1014. Destructive `rotate()` — which discards the current file — stays a
+  events and sealed bytes remain unchanged. Retention and disk bounding of sealed segments belong to mdk#1014. Destructive `rotate()` — which discards the current file — stays a
   separate, explicit operation.
 - Retry failed segment rolls after bounded backoff, without requiring a recorder restart or destructive rotation.
   A failed flush must not seal buffered data. Preserve the actual writer path if rename compensation fails.
@@ -23,10 +22,11 @@ Shared JSONL forensic audit schema for Marmot incident capture.
 - New opt-in app audit sessions record v5 into separate files. Keep `schema/audit-log-event.v5.schema.json`, the Rust
   types/semantic validator, and `tests/audit_v5.rs` in lockstep, including the 50 typed operational kinds and Welcome
   evidence. Six of those kinds are v5-only (`AuditEventKind::is_v5_only`: the recovery-owner, transport-cursor and
-  lag-lost EOSE repair rows in `src/audit/recovery.rs`); a v4 recorder drops them, and the frozen v4 schema and its catalog tests exclude
-  them. A new string field on an operational kind needs an explicit `protect` classification in
-  `src/v5/operational.rs` (category, diagnostic reference, or hash), or v5 refuses to write the row. The v5 local-delivery path sends original validated bodies; v4 files and the v4-only whole-file Goggles
-  contract remain separate. Rust validation remains authoritative for rules JSON Schema cannot express. Coordinate
+  lag-lost EOSE repair rows in `src/audit/recovery.rs`); a v4 recorder drops them, and the frozen v4 schema and its
+  catalog tests exclude them. A new string field on an operational kind needs an explicit `protect` classification in
+  `src/v5/operational.rs` (category, diagnostic reference, or hash), or v5 refuses to write the row. The v5
+  local-delivery path sends original validated bodies; v4 files and the v4-only whole-file Goggles contract remain
+  separate. Rust validation remains authoritative for rules JSON Schema cannot express. Coordinate
   any v5 wire changes with the strict receiver before deployment.
 - Keep the schema (`schema/audit-log-event.v4.schema.json`) and the Rust kind catalog in lockstep. Two tests enforce
   two different halves of that, and both are load-bearing: `audit_log_event_schema_tracks_kind_catalog` compares the
@@ -36,9 +36,21 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   the schema does not list. A new field therefore needs a `sample_audit_event_kinds` entry that populates it, or
   nothing checks it. Coordinate even optional additions with strict downstream consumers such as Goggles before
   shipping producers: its `additionalProperties: false` validation rejected whole v4 uploads containing
-  `local_member_ref` until its schema was synchronized. Bump `AUDIT_LOG_SCHEMA_VERSION` and add a new versioned schema file when changing required
-  fields; analyzers reject unknown versions. An additive optional field needs no bump, but note in its doc comment
+  `local_member_ref` until its schema was synchronized. Bump `AUDIT_LOG_SCHEMA_VERSION` and add a new versioned schema
+  file when changing required fields; analyzers reject unknown versions. An additive optional field needs no bump, but note in its doc comment
   that absence is then ambiguous between "old row" and "value known absent".
+
+## Layout
+
+- `src/audit.rs` — v4 `AuditEvent`/`AuditEventKind` catalog, `JsonlRecorder`/`NoopRecorder`, segment rotation,
+  `AUDIT_LOG_SCHEMA_VERSION`, and `is_v5_only`. `src/audit/recovery.rs` — closed vocabularies for the v5-only
+  recovery-owner, transport-cursor, and EOSE-repair rows. `src/audit/tests.rs` — catalog/schema lockstep tests.
+- `src/v5/` — v5 record contract: `types.rs` (candidate DTOs), `validation.rs` (semantic validation behind `Record`),
+  `operational.rs` (operational kinds and per-field `protect` classification), `primitives.rs`, `strict_json.rs`
+  (duplicate-key rejection).
+- `src/local_delivery.rs` — Unix-only local delivery batches and cursor state; no network.
+- `schema/` — frozen v1–v4 and current v5 JSON Schemas. `tests/audit_v5.rs` and `tests/fixtures/v5/` — v5 contract
+  tests and fixtures.
 
 ## Verification
 

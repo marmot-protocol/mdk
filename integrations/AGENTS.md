@@ -14,7 +14,13 @@ systems to Marmot through `wn-agent`.
 - `codex/marmot` - `wn-codex` Codex harness binary.
 - `opencode/marmot` - `wn-opencode` OpenCode harness binary.
 - `pi/marmot` - `wn-pi` Pi harness binary.
-- `terminal-harness` - shared terminal-harness control/runtime library.
+- `terminal-harness` - shared terminal-harness control/runtime library
+  (`marmot-terminal-harness`).
+- `test_installer_systemd_service.sh` - shared systemd-service installer check
+  invoked by the Hermes and OpenClaw dev-script tests.
+
+Installer scripts live in `scripts/install-*-marmot.sh`; the four terminal
+harness installers are thin wrappers over `scripts/install-terminal-harness-marmot.sh`.
 
 The shared boundary is the `marmot.agent-control.v2` NDJSON protocol over a
 local Unix socket. `wn-agent` owns Marmot account state, MLS state, Nostr
@@ -36,6 +42,10 @@ deletes, invite policy, and local storage.
 - Keep logging privacy-safe: no account ids, group ids, message ids, relay URLs,
   pubkeys, payloads, prompts, model output, ciphertext, plaintext, key material,
   or local sensitive paths.
+- Live-preview clients retain the v2 `stream_capability` returned by
+  `stream_begin` only for the life of that preview and present it on every later
+  stream operation. Reuse one stable envelope request id when retrying a
+  timed-out `stream_begin`. Never log capabilities or control bearer tokens.
 - Preserve host-runtime configuration outside the Marmot section. Installers and
   setup scripts should patch only the Marmot plugin/channel entries they own.
 - Default Hermes, OpenClaw, and terminal-harness release installs use
@@ -163,6 +173,19 @@ just pi-dev-e2e-connector
 just pi-installer-test
 ```
 
+When editing install examples in any integration README, `integrations/README.md`,
+or `release.md`, also run the doc gates. They count `install_verified` calls per
+file, require download -> `.sha256` -> verify -> execute ordering, require a
+"same shell" note before dependent fences, and pin exactly one current-release
+`base_url` in `integrations/README.md`. Edit prose around installer fences, not
+the fences themselves.
+
+```sh
+just install-example-sha256-gate
+just agent-install-docs-gate
+just naming-gate
+```
+
 For shared connector or release-workflow changes, run `just fast-ci` before
 pushing and let GitHub run the full CI matrix.
 
@@ -171,7 +194,7 @@ pushing and let GitHub run the full CI matrix.
 New integrations should follow the existing shape:
 
 - place code under `integrations/<runtime>/marmot`;
-- add local `README.md`, `AGENTS.md`, and a sibling `CLAUDE.md` symlink;
+- add a local human-facing `README.md` and an agent-facing `AGENTS.md`;
 - use `wn-agent` and `agent-control` instead of reimplementing Marmot protocol
   behavior;
 - share installer/release conventions with the existing scripts;

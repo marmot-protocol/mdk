@@ -20,7 +20,12 @@ Rust Codex harness for Marmot through the local `wn-agent` control socket. Read
   `codex exec resume --json <thread-id> -` for a resumed thread. Re-verify the
   official non-interactive-mode contract before changing invocation flags or
   JSON event parsing. The new-thread and resume paths were verified end-to-end
-  against `codex-cli 0.146.0`.
+  against `codex-cli 0.146.0`; the attachment delivery matrix and `--image`
+  probe are pinned to Codex CLI 0.155.1 (see README.md#inbound-attachments).
+- Artifact export (opt-in, grant-scoped) is Codex-only today; the shared
+  harness owns grants, staging, and the idempotent `send_media` replay. This
+  adapter only declares `ArtifactSupport::CompletionFile` and reads the
+  completion manifest.
 
 ## Key Files
 

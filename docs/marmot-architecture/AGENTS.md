@@ -1,6 +1,7 @@
 # AGENTS.md - docs/marmot-architecture
 
-Agent map for the Marmot architecture docs.
+Agent map for the Marmot architecture docs. `index.md` is the complete human-facing catalogue; this file lists read
+order and the roles agents most often need.
 
 ## Read order
 
@@ -32,6 +33,15 @@ Agent map for the Marmot architecture docs.
 - **Path:** `overview/whitenoise-integration-map.md`
   - **Role:** Current shim map and engine API friction list for whitenoise-rs integration.
 
+- **Path:** `overview/marmot-app-runtime.md`, `overview/app-core-boundary.md`
+  - **Role:** `marmot-app` runtime boundary for client applications and the app-core layer under `wn`.
+
+- **Path:** `overview/observability.md`
+  - **Role:** Privacy-safe tracing/logging policy (targets, `method` fields, aggregate values only).
+
+- **Path:** `overview/terminal-harness-execution-profiles.md`
+  - **Role:** `inherit` / `autonomous` / `unrestricted` execution-profile semantics for the terminal harnesses.
+
 - **Path:** `overview/local-artifact-safety.md`
   - **Role:** Restrictive-by-construction creation policy for local files, sockets, and databases; the
     `crates/fs-private` helper contract; the close-before-suspension rules for WAL connections and the root lease.
@@ -61,6 +71,15 @@ Agent map for the Marmot architecture docs.
   - **Role:** Tracked convergence assurance, constant classification, simulator roadmap, verification gates, and
     campaign evidence.
 
+- **Path:** `convergence-constant-inventory.txt`
+  - **Role:** Per-symbol ledger of convergence constants; one of the five ledger surfaces (see Conventions).
+
+- **Path:** `distributed-convergence-campaigns.md`
+  - **Role:** `convergence-campaign-runner` container/VM campaigns over canonical scenarios.
+
+- **Path:** `invitation-recovery.md`
+  - **Role:** Recovery of invites whose Welcome landed on a losing branch (durable intent, re-invite, `Conflict`).
+
 - **Path:** `distributed-convergence.md`
   - **Role:** Branch selection, retained anchors, and convergence model.
 
@@ -72,6 +91,17 @@ Agent map for the Marmot architecture docs.
 
 - **Path:** `telemetry.md`
   - **Role:** Current implementation inventory for telemetry, logging, and tracing: OTLP export, engine reorg metrics, and the collected/exported fields.
+
+- **Path:** `runtime-latency-telemetry.md`
+  - **Role:** Conversation readiness and runtime latency telemetry (`AppPerformanceSnapshot.runtime_operations`).
+
+- **Path:** `usage-diagnostics.md`, `usage-diagnostics-validation.md`, `product-event-catalogue.json`,
+  `usage-diagnostics-queries.sql`, `usage-diagnostics-report.py`, `usage-diagnostics-examples/`
+  - **Role:** Optional Aptabase product analytics and OTLP diagnostics: contract, versioned event catalogue (read by
+    the report script), validation checkpoint, queries, and sample data.
+
+- **Path:** `storage-format-v2.md`
+  - **Role:** Current local SQLCipher storage-format contract (MDK-local, not a Marmot wire format).
 
 - **Path:** `audit-logging.md`
   - **Role:** Current implementation inventory for opt-in forensic JSONL logs: file identity, event kinds/metadata, and upload/tracker behavior.
@@ -85,11 +115,8 @@ Agent map for the Marmot architecture docs.
 - **Path:** `hermes-openclaw-agent-integration-plan.md`
   - **Role:** Working plan for the Hermes/OpenClaw agent integration. Check status and dates before relying on it.
 
-- **Path:** `../../integrations/AGENTS.md`, `../../integrations/hermes/marmot/AGENTS.md`,
-  `../../integrations/openclaw/marmot/AGENTS.md`, `../../integrations/claude/marmot/AGENTS.md`,
-  `../../integrations/codex/marmot/AGENTS.md`,
-  `../../integrations/opencode/marmot/AGENTS.md`,
-  `../../integrations/pi/marmot/AGENTS.md`, and `../../integrations/terminal-harness/AGENTS.md`
+- **Path:** `../../integrations/AGENTS.md` (start here), then the per-connector `AGENTS.md` under
+  `../../integrations/{hermes,openclaw,claude,codex,opencode,pi}/marmot/` and `../../integrations/terminal-harness/`
   - **Role:** Host integration boundaries, connector coexistence, and verification for the Hermes, OpenClaw,
     Claude Code, Codex, OpenCode, and Pi integrations plus their shared terminal-harness runtime.
 

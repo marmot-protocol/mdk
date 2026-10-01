@@ -8,6 +8,7 @@ Map for SQLite group snapshots.
 | --- | --- |
 | `capture.rs` | Reads live group state into a serialized snapshot; fingerprints live replay state and retained snapshots/checkpoints in one consistent read. |
 | `restore.rs` | Restores a serialized snapshot into live tables. |
+| `checkpoints.rs` | Group-state checkpoint create/restore/list/release. |
 | `lifecycle.rs` | Snapshot listing and release. |
 | `rows.rs` | Snapshot serialization rows. |
 | `format.rs` | Versioned binary snapshot/checkpoint envelope and legacy JSON decoding. |

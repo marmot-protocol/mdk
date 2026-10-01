@@ -14,7 +14,8 @@ wraps / peels Marmot group MLS bytes for Nostr kind `445`.
   empty AAD) using the engine exporter snapshot.
 - Carries no source-epoch hint in the kind `445` envelope: an undecryptable message returns `DecryptFailed`, and the
   engine falls back to retained-epoch snapshots / deferred-peel retry rather than a transport-carried epoch.
-- Wraps and peels MLS Welcome bytes as NIP-59 gift wraps when a local Nostr signer/decrypter is injected.
+- Wraps and peels MLS Welcome bytes as NIP-59 gift wraps when a local Nostr signer/decrypter is injected through the
+  `MarmotNostrSigner` boundary (`SdkSigner` adapts it to rust-nostr's signer traits).
 
 ## What this crate does not do
 
@@ -61,5 +62,5 @@ local signer.
 cargo test -p transport-nostr-peeler
 ```
 
-See [`AGENTS.md`](AGENTS.md) for strict tag validation rules and the external Nostr transport spec in
+See [`AGENTS.md`](AGENTS.md) for the strict tag validation contract. The Nostr transport spec lives in
 [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot).

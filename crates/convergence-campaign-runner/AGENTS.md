@@ -1,6 +1,6 @@
 # AGENTS.md — convergence-campaign-runner
 
-Read [`README.md`](README.md) for the operator overview and
+Read [`README.md`](README.md) for the operator overview, commands, and safety posture, and
 [`../../docs/marmot-architecture/distributed-convergence-campaigns.md`](../../docs/marmot-architecture/distributed-convergence-campaigns.md)
 for the durable evidence contract. Also read
 [`../cgka-conformance-simulator/RUNNING_CAMPAIGNS.md`](../cgka-conformance-simulator/RUNNING_CAMPAIGNS.md) before
@@ -44,6 +44,23 @@ network. It must remain loopback-bound on the participant side and dial only
 the runner-owned relay alias, resolving and pinning a private address while
 rejecting public or loopback addresses.
 
+## Code map
+
+- `src/main.rs` — `cgka-distributed-campaign` clap CLI; dispatch only.
+- `src/manifest.rs` — `DistributedCampaignManifestV1`, backends (container/VM), participants, and validation.
+- `src/plan.rs` — `DistributedExecutionPlanV1`: argv commands, faults, and container node launch.
+- `src/runner.rs` — Execution, resource leases, cleanup, scenario-byte validation, and run/command receipts.
+- `src/lane.rs`, `lanes/*.v1.json` — Reviewed lane policies and budgets (`CampaignLaneV1`).
+- `src/lane_observation.rs` — `observe-step` / `collect-observation` evidence.
+- `src/evidence.rs`, `src/release_evidence.rs`, `release-claims/` — Evidence bundle schema, release campaign
+  materialization, assembly, and verification.
+- `src/failure_corpus.rs` — Failure corpus entries, four-way classification, and capsule promotion.
+- `src/relay_file_control.rs` — Owner-only file-based relay visibility control.
+- `src/bin/cgka-conformance-node.rs`, `src/bin/cgka-conformance-relay.rs` — Container participant node and
+  campaign-only relay/loopback proxy.
+- `tests/distributed_runner.rs` (command construction, process boundary), `tests/lane_policy.rs`,
+  `tests/failure_corpus.rs`, `tests/container_runtime.rs` (ignored; real OCI runtime).
+
 ## Invariants
 
 - Construct every external command as an argv array. Never accept shell
@@ -74,5 +91,6 @@ cargo test -p convergence-campaign-runner --locked
 cargo clippy -p convergence-campaign-runner --all-targets --locked -- -D warnings
 ```
 
-The ignored real-container test additionally requires a prebuilt Linux image
-and a Docker or Podman daemon; see the crate README for the exact command.
+Lane policy or evidence changes: `just convergence-lane-policy`; failure-corpus changes: `just convergence-failure-corpus`.
+The ignored real-container tests additionally require a prebuilt Linux image and a Docker or Podman daemon; see
+[`README.md#real-container-tests`](README.md#real-container-tests) for the exact commands.

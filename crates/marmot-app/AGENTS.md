@@ -1,8 +1,10 @@
 # AGENTS.md - crates/marmot-app
 
-App runtime bridge for the first real Marmot app surfaces.
+Multi-account app runtime bridge (`MarmotApp`, `MarmotAppRuntime`) beneath `wn`, `marmot-uniffi`, and `marmot-c`. For
+the human overview and host-facing API contracts (storage tiers, KeyPackage inventory, directory search, app-owned
+components, full-history repair, notices, blocking, moderation) see [`README.md`](README.md); do not restate them here.
 
-## Scope
+## Scope and module rules
 
 - Own the app-facing runtime that ties `AccountHome`, SQLCipher session storage, Nostr peeling, and Nostr transport
   adapter support together.
@@ -12,14 +14,15 @@ App runtime bridge for the first real Marmot app surfaces.
   `account_worker.rs` (the per-account worker: command enum, worker loop, reconnect backoff, runtime-event publishers),
   `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
-  (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (durable preflight, cancellation, and advisory installation detection), `audit_tracker.rs` (the forensic audit-log
-  tracker upload worker), `audit_otlp_delivery.rs` (the explicit one-account v5 OTLP attempt),
-  `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers), and `avatar.rs`
-  (local identity-avatar demand and bounded maintenance), plus `avatar_access.rs` (bounded local native batches) and `attachment_history.rs`
-  (bounded local attachment discovery and shared-parser presentation), `attachment_access.rs`
-  (read-only source-slot availability and verified local byte ranges), and `account_worker/attachments.rs`
-  (durable attachment demand admission, fair background transfer capacity and retained-byte publication). Keep `mod.rs`
-  re-exporting the moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
+  (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (durable
+  preflight, cancellation, and advisory installation detection), `audit_tracker.rs` (the forensic audit-log tracker
+  upload worker), `audit_otlp_delivery.rs` (the explicit one-account v5 OTLP attempt), `event_routing.rs` (pure
+  `MarmotAppEvent` classification/routing helpers), `avatar.rs` (local identity-avatar demand and bounded maintenance),
+  `avatar_access.rs` (bounded local native batches), `attachment_history.rs` (bounded local attachment discovery and
+  shared-parser presentation), `attachment_access.rs` (read-only source-slot availability and verified local byte
+  ranges), and `account_worker/attachments.rs` (durable attachment demand admission, fair background transfer capacity
+  and retained-byte publication). Other runtime modules are listed in the Code map below. Keep `mod.rs` re-exporting the
+  moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent
@@ -253,6 +256,51 @@ App runtime bridge for the first real Marmot app surfaces.
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. The default build includes this
   helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. See
   `docs/marmot-architecture/relay-observability.md`, `audit-logging.md`, and `overview/dial-safety.md`.
+
+## Code map (modules not covered above)
+
+- Crate root `src/`: `config.rs` (`MarmotAppConfig`, service endpoints, attachment acquisition policy), `error.rs`,
+  `ids.rs` (npub/nprofile/account-ref helpers), `drafts.rs` (encrypted per-account composer drafts),
+  `chat_presentation.rs` + `chat_presentation/` (shared selected-chat presentation policy and maintenance),
+  `conversation_presentation/` (C5 header, capability, and window selectors; they never subscribe, acknowledge
+  reads, or fetch media), `local_submissions.rs` + `local_submissions/` (durable device-local send admission and host
+  correlation; no relay I/O),
+  `user_blocks.rs` (block policy and NIP-51 sync), `history_notices.rs` (public notice DTOs and opaque id codec),
+  `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
+  internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
+  `nostr_verification.rs` (stateless public-event verification), `profile_pseudonyms.rs` (cosmetic display names; not a
+  security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
+  stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
+  `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
+  (opt-in bounded product observations; export behind `product-analytics-export`), `projection.rs` (legacy account
+  projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
+  `test_support.rs` (test-only gates/helpers).
+- `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
+  `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `conversation_window.rs`, `chat_list_window.rs`,
+  `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
+  attention), `user_blocks.rs`, `moderation.rs` (reports and admin labels), `local_submissions.rs`,
+  `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
+  (runtime-only network approval; never restore it from disk).
+- `src/client/`: `recovery.rs` (recovery grant authorization), `invite_recovery.rs` (durable invitation recovery),
+  `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
+  `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
+  job).
+- `src/relay_plane/`: `mod.rs` (shared relay plane), `safety.rs` (relay dial chokepoint), `directory.rs` (directory
+  fetches/subscriptions), `delivery_spill.rs` (durable overflow tail for a full account queue), `telemetry.rs`.
+- `src/directory/`: also `cached_search.rs` (network-free cross-account search), `search.rs` (streaming web-of-trust
+  search), `open_ranking.rs` (bounded Vertex Open Ranking discovery), `member_key_packages.rs` (set-oriented roster
+  KeyPackage resolution for create/invite).
+- `src/sqlcipher/open_lock.rs`: in-process same-file open exclusion (the root lease covers cross-process).
+- Integration tests in `tests/` (with `tests/support/` and `tests/fixtures/`); media benchmarks in `benches/` (require
+  `media-benchmarks`); `examples/usage_diagnostics_staging/`.
+
+## Features
+
+- `test-policy-overrides`: test-only convergence timing/rewind overrides. Never enable in app artifacts.
+- `otlp-export`: OTLP protobuf encoding and HTTP push for relay telemetry (the privacy mapping stays in the default
+  build).
+- `product-analytics-export`: product analytics export path.
+- `media-benchmarks`: internal surface for the media transport benchmarks.
 
 ## Verification
 

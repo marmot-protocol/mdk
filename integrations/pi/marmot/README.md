@@ -5,8 +5,7 @@ messages to [Pi](https://pi.dev) through the local `wn-agent` control socket.
 It is intentionally a thin harness: no mention activation, backend attachment
 support, profile onboarding, live previews, MLS, or relay logic.
 
-Text-only turns are unchanged. For a turn containing one or more files, the
-shared terminal harness first applies its attachment-count and aggregate-byte
+For a turn containing one or more files, the shared terminal harness first applies its attachment-count and aggregate-byte
 limits and downloads the complete ordered batch into private staging. Because
 the Pi backend does not opt in to attachments, the batch is then rejected
 before `pi` is spawned; its accompanying text is not forwarded either.
@@ -14,10 +13,19 @@ before `pi` is spawned; its accompanying text is not forwarded either.
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
 
+## Contents
+
+- [Install (Pi Already Installed)](#install-pi-already-installed)
+- [Manual setup](#manual-setup)
+- [Chat Commands](#chat-commands)
+- [Configuration](#configuration)
+- [Security Notes](#security-notes)
+- [Development](#development)
+
 ## Install (Pi Already Installed)
 
 Versioned `wn-agent-v*` releases publish `wn-agent`, `wn-pi`, checksums, and a
-same-user service installer for Linux and macOS:
+same-user service installer for Linux and macOS.
 
 Prerequisites:
 
@@ -65,13 +73,13 @@ install_verified "$base_url/install-pi-marmot.sh" \
 ```
 
 The default install uses its own `~/.marmot-agents/pi` identity and services,
-so it does not share prompts or replies with an installed OpenCode harness.
+so it does not share prompts or replies with installed Claude Code, Codex, or
+OpenCode harnesses.
 It installs `wn-agent` and `wn-pi` in `~/.local/bin`, writes a private
 `~/.marmot-agents/pi/dev/wn-pi.env`, and starts `wn-agent-pi` and `wn-pi`
 same-user services where supported.
 
-Use a versioned `wn-agent-v<version>` release URL for a pinned install. Report
-all installed versions when filing a connector bug:
+Report all installed versions when filing a connector bug:
 
 ```sh
 wn-agent --version
@@ -131,6 +139,8 @@ documented in the
 | `WN_PI_REQUEST_TIMEOUT_SECS` | `30` | Control request timeout |
 | `WN_PI_MAX_REPLY_BYTES` | `30000` | Durable reply chunk limit |
 | `WN_PI_MAX_PENDING_PER_GROUP` | `4` | Per-group prompt queue limit |
+| `WN_PI_MAX_ATTACHMENTS` | `8` | Maximum inbound files validated before backend rejection |
+| `WN_PI_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate inbound bytes validated before rejection |
 | `WN_PI_STATE_PATH` | `$XDG_STATE_HOME/wn-pi/sessions.json` | Group session/workdir map |
 | `WN_PI_ACTIVATION` | `always` | Only supported activation mode |
 
@@ -143,11 +153,6 @@ invocation is already approval-free, so all three profiles use the same Pi
 arguments; `autonomous` and `unrestricted` describe deployment intent rather
 than adding a containment mechanism. See the shared
 [execution-profile capability matrix](../../terminal-harness/README.md#execution-profiles).
-
-The optional bearer token grants the complete `wn-agent` control API for every
-account in its home; the sender allowlist does not narrow that authority. Use a
-separate connector home, socket, token, and account for a separate trust
-boundary.
 
 ## Security Notes
 
@@ -162,6 +167,10 @@ boundary.
   ciphertext, plaintext, and key material.
 - Connector state and Pi session directories are created with owner-only
   permissions.
+- The optional control-socket bearer token grants the complete `wn-agent`
+  control API for every account in its home; the sender allowlist does not
+  narrow that authority. Use a separate connector home, socket, token, and
+  account for a separate trust boundary.
 
 ## Development
 

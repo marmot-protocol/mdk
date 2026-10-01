@@ -1,15 +1,25 @@
 # marmot-markdown
 
-CommonMark and Nostr-aware display parser for Marmot app messages.
-
-This crate turns plaintext message content into a display-oriented AST for CLI, TUI, and mobile renderers. It does not
-define wire format, persistence, or CGKA engine behavior.
+CommonMark and Nostr-aware display parser for Marmot app messages. It turns plaintext message content into a typed,
+serde-friendly AST that CLI, TUI, and mobile renderers draw from. It does not define wire format, persistence, or CGKA
+engine behavior.
 
 ## What this crate does
 
-- Parses Markdown into a typed, serde-friendly AST suitable for rendering.
-- Handles Nostr-aware inline entities and classifies private-key destinations as sensitive.
+- Parses CommonMark plus GFM-style tables and strikethrough, math, and a bounded `<details>` extension into `Block` /
+  `Inline` nodes.
+- Recognizes Nostr entities inline: bare `@npub1…` handles (`Inline::NostrMention`) and explicit `nostr:<hrp>1…`
+  references (`Inline::NostrUri`), and classifies private-key destinations as sensitive.
+- Does not parse general HTML. Tag-like sequences stay literal text; only autolinks and the `<details>` extension get
+  structured treatment.
 - Keeps dependencies minimal (`serde` only in normal builds).
+
+```rust
+use marmot_markdown::{Block, parse};
+
+let doc = parse("# Hi *there*");
+assert!(matches!(doc.blocks.as_slice(), [Block::Heading { level: 1, .. }]));
+```
 
 ## Renderer security contract
 
@@ -68,12 +78,13 @@ This is a block-oriented extension, not a general HTML parser:
   `MAX_SOURCE_BLANK_LINES`. Delimiter-only lines are not blocks. Blanks before
   the closer stay inside the disclosure.
 
-Golden fixtures under `tests/golden/` lock parser output for regression coverage.
-
 ## Run the tests
 
 ```sh
 cargo test -p marmot-markdown
 ```
+
+Golden fixtures under `tests/golden/` lock parser output. After an intentional output change, regenerate them with
+`MARMOT_MD_UPDATE_GOLDEN=1 cargo test -p marmot-markdown --test golden`, review the diff, and re-run without the variable.
 
 See [`AGENTS.md`](AGENTS.md) for scope and invariants.

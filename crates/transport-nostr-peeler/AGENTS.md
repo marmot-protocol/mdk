@@ -1,6 +1,7 @@
 # AGENTS.md - crates/transport-nostr-peeler
 
-Agent-facing map for the Nostr transport peeler crate.
+Agent-facing map for the Nostr transport peeler crate. Read [`README.md`](README.md) for the human overview, Welcome
+validation checklist, and boundary shape.
 
 ## Scope
 
@@ -23,6 +24,7 @@ storage. Keep those in adapters or the app layer above this crate.
 | `src/lib.rs` | Public exports and Nostr/Marmot constants. |
 | `src/event.rs` | `NostrTransportEvent` DTO and `TransportMessage` conversion. |
 | `src/peeler.rs` | `TransportPeeler` implementation for Nostr/MLS group messages. |
+| `src/signer.rs` | `MarmotNostrSigner` account signer boundary and `SdkSigner` adapter over rust-nostr's signer traits. |
 | `src/error.rs` | Nostr boundary error vocabulary. |
 
 ## Boundary validation contract
@@ -44,18 +46,17 @@ skips content validation is a contract violation, not a style choice.
 - **Loose first-match helpers (`tag_value`, `tag_values`) are for non-routing, genuinely multi-valued fields only**,
   and any such field must carry explicit count/length bounds. Do not reach for them when wiring up a new tag.
 
-## Current limits
+## Wire invariants
 
-- Group messages are wrapped and peeled. Each outbound kind `445` event is signed by a fresh ephemeral Nostr key
-  generated per event (see Nostr transport spec in
-  [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)); the account identity never appears as the outer event pubkey.
-- Kind `445` content is `base64(nonce || ciphertext)` of a single ChaCha20-Poly1305 sealing under the empty AAD. There
-  is no source-epoch hint: an undecryptable message returns `DecryptFailed`, and the engine falls back to retained-epoch
-  snapshots / deferred-peel retry rather than a transport-carried epoch.
-- Welcomes are wrapped and peeled through NIP-59 when callers inject the local signer/decrypter. This crate must not
-  decide where that signer comes from. The kind `444` rumor carries base64 content plus the required
-  `["e", <keypackage event id>]` and `["relays", ...]` tags supplied through `wrap_welcome_with_metadata`.
-- Outbound kind `445` events are signed at wrap time, so their event id is final (no pre-signing-id replacement).
+- Sign each outbound kind `445` event at wrap time with a fresh per-event ephemeral Nostr key; the account identity
+  never appears as the outer event pubkey. The event id is final, so the adapter publishes as-is (no pre-signing-id
+  replacement). See the Nostr transport spec in [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot).
+- Kind `445` content is `base64(nonce || ciphertext)` of a single ChaCha20-Poly1305 sealing under the empty AAD. Do not
+  add a source-epoch hint: an undecryptable message returns `DecryptFailed`, and the engine falls back to retained-epoch
+  snapshots / deferred-peel retry.
+- Welcomes wrap/peel through NIP-59 only with a caller-injected signer/decrypter; this crate must not decide where that
+  signer comes from. The kind `444` rumor carries base64 content plus the required `["e", <keypackage event id>]` and
+  `["relays", ...]` tags supplied through `wrap_welcome_with_metadata`.
 
 ## Verification
 

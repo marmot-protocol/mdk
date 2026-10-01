@@ -1,6 +1,18 @@
 # AGENTS.md - marmot-uniffi
 
-UniFFI bindings for the Marmot app runtime. Read `README.md` first for integration concepts, API selection and platform setup; then `API-REFERENCE.md` for the complete exported method inventory.
+UniFFI bindings (MarmotKit) for the Marmot app runtime. For integration concepts, API selection and platform setup see
+`README.md`; for the exported method inventory see `API-REFERENCE.md`. Do not restate either here.
+
+## Code map
+
+- `src/lib.rs`: the `Marmot` object, constructors and `MarmotOptions`; `src/errors.rs`: `MarmotKitError`.
+- `src/commands/`: `#[uniffi::export] impl Marmot` blocks, one module per feature family.
+- `src/conversions/`: `…Ffi` records/enums and their conversions from `marmot-app` types, one module per family.
+- `src/subscriptions.rs`, `src/subscriptions/`: subscription objects and screen-window handles.
+- `src/markdown.rs` (Markdown display DTOs), `src/publisher.rs` (agent publisher handle), `src/secret_store.rs` and
+  `src/external_signer.rs` (host callback traits), `src/bin/uniffi-bindgen.rs` (binding generator).
+- `kotlin-support/`: hand-written `MarmotAndroid` and keyring JNI shim copied next to generated Kotlin.
+- `tests/`: Rust smoke tests plus the Swift/Kotlin sources driven by the `*-smoke.sh` scripts.
 
 ## Scope
 
@@ -23,8 +35,11 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
 - Build scripts retain complete no-argument builds and expose generation/native/assembly phases for release CI.
   Keep `test-build-phases.py` covering phase isolation, required assembly inputs and deployment/strip behavior.
   Shared Swift generation feeds both Apple assemblers; transfer phase inputs only from the same workflow run.
-- Own `chat-projections-smoke.sh`, the host Swift/Kotlin chat-screen DTO round-trip check.
-- Own `marmotkit-endpoints.env` build-time defaults for audit-log tracker and relay-telemetry OTLP route URLs.
+- Own the host Swift/Kotlin DTO round-trip checks: `chat-projections-smoke.sh`, `options-smoke.sh`,
+  `audit-v4-smoke.sh`, `details-markdown-smoke.sh` and `usage-diagnostics-smoke.sh`.
+- Own `build-provenance.py`, `test-build-phases.py`, `test-android-artifact.py` and `test-native-archive.py`.
+- Own `marmotkit-endpoints.env` build-time defaults for audit-log tracker, relay-telemetry OTLP and optional
+  product-analytics route URLs.
 - Keep generated bindings out of git; host apps vendor artifacts from `output/` after running the scripts.
 
 ## Invariants
@@ -90,10 +105,20 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
   a supported primitive as deprecated simply because a chat-screen projection exists. State a
   replacement and its scope for compatibility recommendations; claim formal deprecation only when
   the source actually declares it. Preserve non-chat consumers.
-- Keep detailed contracts in `CHAT-LIST-ROWS.md`, `CONVERSATION-WINDOW.md`, `ATTACHMENT-HISTORY.md`, `ATTACHMENT-ACCESS.md`
-  and linked architecture docs; make the README the discoverable entry point rather than accumulating
-  unindexed release snippets. Source/binary pairing, ownership, cancellation, local/network behavior,
-  pagination, localization and privacy must be explicit for new public surfaces.
+- Keep detailed contracts in `CHAT-LIST-ROWS.md`, `CONVERSATION-WINDOW.md`, `LOCAL-SENDS.md`, `POLLS.md`,
+  `ATTACHMENT-HISTORY.md`, `ATTACHMENT-ACCESS.md` and linked architecture docs; make the README the discoverable
+  entry point rather than accumulating unindexed release snippets. Source/binary pairing, ownership, cancellation,
+  local/network behavior, pagination, localization and privacy must be explicit for new public surfaces.
+- README feature sections describe current behavior, not the change that introduced it: no "now", "this change",
+  milestone labels (C4/C5/…), consumer-adoption issue links or version-bump notes. Put "regenerate bindings with the
+  matching library" in the README's Compatibility section once instead of repeating it per feature; keep only
+  feature-specific rollback/migration hazards inline. Add each new `##` section to the README Contents list.
+  Other docs deep-link README anchors (`#integration-guide-and-api-reference`, `#interactive-account-onboarding`,
+  `#selected-chat-list-presentation`, `#history-may-be-incomplete-notices`, `#deletion-provenance-and-custom-events`,
+  `#localization-privacy-and-diagnostics`); `git grep 'marmot-uniffi/README.md#'` before renaming a heading.
+- Onboarding admission: persisted generation/pending state supplies durable admission checks after restart; the
+  retirement watch only supplies prompt wake-up for the live runtime. They are not interchangeable — do not add
+  watch-only caching or prune retirement senders. Test holds stay test-only and keep explicit interleaving coverage.
 - Starting with 0.10.2, every release needs `docs/integration/<version>.md` alongside concise
   `docs/release/<version>.md`. Follow `release.md#release-documentation`: compare the prior tag,
   distinguish required migration/default changes from optional adoption and automatic fixes,
@@ -112,16 +137,21 @@ cargo test -p marmot-uniffi
 cargo test -p marmot-app
 ```
 
-OTLP export builds:
+Feature builds (release artifacts enable these exporters):
 
 ```sh
 cargo check -p marmot-uniffi --features otlp-export
+cargo check -p marmot-uniffi --features product-analytics-export
 ```
+
+Static gates covering this crate (all in `just fast-ci`): `just binding-docs-gate`, `just binding-build-gate`,
+`just apple-privacy-gate`, `just release-profile-gate`, `just c-parity-gate`.
 
 Chat-screen DTO changes also use `just uniffi-projections-smoke swift` (requires `swiftc`) and
 `just uniffi-projections-smoke kotlin` (requires `kotlinc` and `MDK_KOTLIN_CLASSPATH` containing JNA with native
-libraries, Android platform, annotations, and coroutines jars). These host checks do not replace release-artifact or
-device validation.
+libraries, Android platform, annotations, and coroutines jars). Options, audit-v4, Details Markdown and
+usage-diagnostics DTO changes use the matching `./crates/marmot-uniffi/<name>-smoke.sh swift|kotlin` with the same
+requirements. These host checks do not replace release-artifact or device validation.
 
 Release-artifact checks (after `xcframework.sh`):
 
@@ -139,4 +169,4 @@ macOS release-artifact checks (after `xcframework-macos.sh`, which needs `OTLP_E
   crates/marmot-uniffi/output/macos/MarmotKit.xcframework - crates/marmot-uniffi/output/macos/MarmotKit.swift
 ```
 
-See [`README.md`](README.md) for Android NDK prerequisites and initialization requirements.
+For Android NDK prerequisites and initialization see README.md#kotlin--android.

@@ -47,6 +47,8 @@ On `master` pushes it also publishes:
 - `ghcr.io/<owner>/<repo>/marmot-quic-broker:sha-<short-sha>`
 - `ghcr.io/<owner>/<repo>/marmot-quic-broker:latest`
 
+Manual `workflow_dispatch` runs publish only the `sha-<short-sha>` tag unless they run on `master`.
+
 The image exposes UDP `4450` and runs:
 
 ```sh

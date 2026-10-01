@@ -1,10 +1,11 @@
 # AGENTS.md — cgka-conformance-simulator
 
-Read [`README.md`](README.md) for the human framing, [`RUNNING_CAMPAIGNS.md`](RUNNING_CAMPAIGNS.md) for exact operator
-commands and artifact handling, [`SCALING_CAMPAIGNS.md`](SCALING_CAMPAIGNS.md) for large matrices and family design,
-[`SCENARIO_IR.md`](SCENARIO_IR.md) for canonical and authoring semantics, [`SCENARIOS.md`](SCENARIOS.md) for the
-scenario registry, and [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for the property-test registry. This file is the
-agent-facing code model.
+Agent-facing code model. Read [`README.md`](README.md) for how convergence is tested (adapters, Scenario IR, oracles,
+families, reports), [`RUNNING_CAMPAIGNS.md`](RUNNING_CAMPAIGNS.md) for exact operator commands and artifact handling,
+[`SCALING_CAMPAIGNS.md`](SCALING_CAMPAIGNS.md) for large matrices and family design, [`SCENARIO_IR.md`](SCENARIO_IR.md)
+for canonical and authoring semantics, [`SCENARIOS.md`](SCENARIOS.md) for the scenario registry, and
+[`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for the property-test registry. Local maps: [`src/AGENTS.md`](src/AGENTS.md),
+[`tests/AGENTS.md`](tests/AGENTS.md), [`vectors/AGENTS.md`](vectors/AGENTS.md).
 
 ## Agent operating workflow
 
@@ -15,7 +16,8 @@ When asked to run, extend, diagnose, or report on convergence campaigns:
    public facts they can actually expose.
 2. Start with a strict, file-backed canary. Do not use `--allow-weak-oracle` to make an assurance run green.
 3. For broad discovery, use `cgka-conformance-campaign`: it persists the exact input before action zero, isolates each
-   case in a child, enforces a deadline, and verifies artifacts. Build once and shard distinct seeds or disjoint `--case-index` selections when scaling.
+   case in a child, enforces a deadline, and verifies artifacts. Build once and shard distinct seeds or disjoint
+   `--case-index` selections when scaling.
 4. Reproduce from the saved `*-generated-input.json`, not from a remembered command alone. Record family version,
    seed, case index, selected/executed IR digests, adapter, storage mode, source revision, and output path.
 5. Move a failure down to the smallest compatible adapter before debugging it. Move representative cases outward to
@@ -23,302 +25,208 @@ When asked to run, extend, diagnose, or report on convergence campaigns:
 6. Preserve reports and capsules before changing code. Sensitive replay capsules contain key material: keep them
    owner-only, never commit them, and never quote their contents into issues or logs.
 7. Classify a failure before fixing it: product defect, protocol ambiguity, environment failure, or expected resource
-   refusal. A timeout, unsupported capability, weak oracle, and semantic mismatch are not interchangeable.
+   refusal. A timeout, unsupported capability, weak oracle, and semantic mismatch are not interchangeable. Suspect the
+   harness too: the exact restart catalog's first red run was a simulator false positive (MDK #1465).
 8. After a fix, rerun the minimized input, original input, family canary, relevant focused test, and widest adapter
    needed by the claim. Report local gates, remote CI, and retained evidence separately.
 
-Use a new output directory for every run; overwrite refusal is an evidence-integrity feature. Direct binary execution
-requires `RUST_MIN_STACK=4194304`; Cargo-launched commands inherit the repository configuration. Keep `--locked` on
-CI-like Cargo commands.
+Use a new output directory for every campaign run; overwrite refusal is an evidence-integrity feature. Direct binary
+execution requires `RUST_MIN_STACK=4194304`; Cargo-launched commands inherit it from `.cargo/config.toml`. Keep
+`--locked` on CI-like Cargo commands.
 
 Do not infer that more `--cases` means more complex scenarios. Cases are independent indices and seed selects their
 deterministic choices. The stable identity is `(family_name, generator_version, seed, case_index)`, plus an
-independently versioned workload profile when applicable. The process campaign CLI accepts repeatable `--case-index N` for isolated selections; shard large campaigns
-by disjoint indices with fresh output roots or distinct seeds rather than overlapping prefixes of the same seed. Generated inputs/reports do not embed the tested
-Git commit; require a clean build and retain the exact source revision plus command matrix beside durable evidence.
+independently versioned workload profile when applicable. Shard large campaigns by disjoint repeatable `--case-index N`
+selections with fresh output roots, or by distinct seeds, rather than overlapping prefixes of the same seed. Generated
+inputs/reports do not embed the tested Git commit; require a clean build and retain the exact source revision plus
+command matrix beside durable evidence.
 
-## Pieces
+## Code map
 
-- **Module:** `src/app_runtime.rs` and `src/app_runtime/`
-  - **Role:** Public app scenario actions and assertions over separate participant processes with private SQLCipher
-    roots and a separate real local relay. `process_backend.rs` bridges public app calls; `process_io.rs` owns bounded
-    RPC, build-policy matching and child cleanup; `process_relay.rs` owns relay/history/fault commands;
-    `process_server.rs` dispatches node service modes. The older `ProcessOrchestrator` shares the relay child while
-    retaining its own capability-declared participant protocol. See [`APP_SCENARIO_INVENTORY.md`](APP_SCENARIO_INVENTORY.md)
-    for ordinary, feature-specific and explicit slow acceptance gates. `new_in_process_stress` is a diagnostic control.
+### Scenario language
 
-- **Module:** `src/bus.rs`
-  - **Role:** `TransportBus`, the in-memory bus. Owns delivery policy, the queue, partition state, and the address book
-    that maps `MemberId` to `ClientId` for welcome routing.
+- **`src/scenario.rs`** — Serializable `ScenarioSpec` v2/v3 plus `run_scenario_spec` / `run_scenario_report` /
+  `run_vector_fixture_report`. Owns step semantics: ordered client operations, the step log, flattened epoch changes,
+  app invalidations, recoveries, and expectation/invariant failures. `ObserveExact` opts a portable scenario into the
+  canonical snapshot and scenario-input ledger while legacy `Observe` stays stable for existing fixtures.
+  `ProbeBidirectionalDecryptability` actively exercises send, peel, MLS decrypt, and delivery. V3's `expect_tick_error`
+  records a normalized expected transport refusal and continues.
+- **`src/scenario_ir.rs`** — Canonical v2/v3 compiler: validates input, assigns stable action ids, records the
+  virtual-time schedule, derives per-action capabilities, and preflights the whole schedule before the subject runs
+  anything. `SCENARIO_IR_V3_ONLY_STEP_KINDS` lists post-v2 actions; v2 documents that use them fail to compile. JSON
+  contracts: `schemas/scenario-ir.v2.schema.json`, `schemas/scenario-ir.v3.schema.json`.
+- **`src/scenario_authoring.rs`** — Authoring-only repeat, deterministic parallel, rate, burst, and barrier expansion,
+  lowered to canonical IR before execution. Adapters never interpret authoring control flow. Contract:
+  `SCENARIO_IR.md`, `schemas/scenario-authoring.v1.schema.json`.
+- **`src/topology.rs`** — Adapter-neutral accounts, devices, processes, groups, relays, roles, and binary/policy
+  versions. Resolves old client-only vectors to an explicit deterministic topology.
+- **`src/scenario_faults.rs`, `src/scenario_assertions.rs`** — Semantic message selectors and declared
+  offline/process/storage faults; executable exactly/eventually/within/never/resource assertions sampled through the
+  subject boundary and recorded in reports and capsules. Unsupported capabilities fail whole-schedule preflight.
+- **`src/assertion_wait.rs`** — Shared real-app eventual-assertion pacing (see `src/AGENTS.md`).
+- **`src/scenario_input.rs`** — Resolves raw canonical IR or a saved `GeneratedScenarioInputV1` into one scenario plus
+  source-byte and canonical-IR digests. Wider adapters must consume this boundary.
+- **`src/scenario_stimuli.rs`** — Typed, replayable real-runtime stimuli (`interrupt_relay`, racing edits) and their
+  execution evidence.
 
-- **Module:** `cgka_engine::canonicalization`
-  - **Role:** Executable model of the CGKA canonicalization contract, re-exported by this crate for tests. Uses symbolic
-    peeled messages plus optional materialized candidate metadata, then calls the convergence selector to produce
-    deterministic message dispositions.
+### Subjects and transport
 
-- **Module:** `src/client.rs`
-  - **Role:** `HarnessClient` + `ClientBuilder`. Wraps an `Engine<SqliteAccountStorage>`, a real `NostrMlsPeeler`, and the bus
-    handle. It uses in-memory SQLite by default and can run on temp file-backed SQLite via the report CLI's
-    `--storage file`, `MDK_CONFORMANCE_SQLITE_STORAGE=file`, or `ClientBuilder::storage_mode`. Explicit CLI selection
-    overrides the environment. File-backed `restart()` drops all engine/storage handles, reopens the encrypted database,
-    and hydrates it. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a
-    `GroupEvolution`.
-    The per-tick no-progress guard includes durable deferred-row context attempts; an unchanged backlog count alone
-    does not mean a bounded sweep stalled. Identical durable state still fails the guard.
+- **`src/subject.rs`** — `ConvergenceSubject` boundary and the built-in `EngineHarnessSubject`. Every adapter declares a
+  versioned capability set checked before execution. The engine adapter installs one shared manual paired clock:
+  `AdvanceTime` moves both clock domains without waking a runtime and activates virtual-time ticks; `Tick` selects
+  which participants run. It captures an append-only emission stream separate from the mutable bus queue:
+  `poll_outbound` is non-destructive and `acknowledge_outbound` applies accepted/no-endpoint outcomes to staged commits,
+  independent Welcomes, and regenerated queued intents. There is no auto-confirming compatibility lifecycle. Pending and
+  outbound bookkeeping is scoped per client incarnation; never compare process-local pending handles across restarts.
+  `structural_progress` exposes privacy-safe aggregate work, deadlines, pass phase/generation, and terminal state.
+  Queue/partition mutation is only on the separately named `ConvergenceFaultSubject` white-box interface.
+- **`src/retained_relay.rs`** — Real-engine subject with deterministic per-relay durable histories: fanout,
+  subscriptions, incremental/since/full/set queries, EOSE, cursors, relay-local visibility/order/duplicates, and an
+  explicit completeness claim per query. Quiet EOSE is never proof of complete history. Offline recovery tests must use
+  this adapter rather than clearing a packet-bus partition.
+- **`src/reference_subject.rs`** — Independent symbolic-memory `ConvergenceSubject`. Does not call the production
+  selector/canonicalizer and omits exact-MLS and adversarial-transport capabilities; rely on preflight to keep
+  unsupported scenarios from partially executing.
+- **`src/bus.rs`** — `TransportBus`: delivery policy, queue, partition state, and the `MemberId` → `ClientId` address
+  book for Welcome routing.
+- **`src/client.rs`** — `HarnessClient` + `ClientBuilder`. Wraps `Engine<SqliteAccountStorage>`, a real
+  `NostrMlsPeeler`, and the bus handle. Storage mode comes from `ClientBuilder::storage_mode`, the report CLI's
+  `--storage`, or `MDK_CONFORMANCE_SQLITE_STORAGE` (CLI wins). File-backed `restart()` drops all engine/storage
+  handles, reopens the encrypted database, and hydrates. `tick().await` drains pending inbound for one client;
+  `confirm(pending).await` finishes a `GroupEvolution`. The per-tick no-progress guard counts durable deferred-row
+  context attempts; an unchanged backlog count alone does not mean a bounded sweep stalled, but identical durable
+  state still fails the guard.
+- **`src/relay_control.rs`** — Simulator-owned retained-relay recording and reversible query visibility, outside
+  production transport code.
+- **`src/relay_fault_proxy.rs`** — Real socket interruption in front of the harness-owned loopback relay; every
+  advertised relay URL goes through it, and it taps aggregate frame counts.
+- **`src/audit_capture.rs`** — In-memory forensic capture so decisions the engine never surfaces as a `GroupEvent`
+  (notably `convergence_decision`) are observable.
 
-- **Module:** `src/cross_route_scenario.rs`
-  - **Role:** One canonical four-party route-assurance scenario plus its strict public process-report oracle. The
-    engine-capable form adds exact state and active decryptability; app-runtime, process, container, and VM adapters
-    reuse the public form and must not privately reconstruct its action schedule or terminal assertions. The public
-    branch-witness boundary uses a bounded `Eventually(ClientState)` assertion; preserve its process-report evidence
-    and publication correlation checks instead of relying on relay drain timing.
+### App runtime and processes
 
-- **Module:** `src/scenario_input_ledger.rs`
-  - **Role:** Simulator-owned per-client commit, proposal, and application-input accounting. Joins stable scenario
-    action ids to outer transport and peeled MLS content ids; application entries also retain the inner Marmot event id.
-    It records send/queue/publication, ingest/defer/resource outcomes, delivery/deduplication/expiry/invalidation, and
-    pending state without adding production engine hooks.
+- **`src/app_runtime.rs`, `src/app_runtime/`** — Public app scenario actions and assertions over separate participant
+  processes with private SQLCipher roots and a separate real local relay. `process_backend.rs` bridges public app
+  calls; `process_io.rs` owns bounded RPC, build-policy matching, and child cleanup; `process_relay.rs` owns
+  relay/history/fault commands; `process_server.rs` dispatches node service modes; `strfry_process_scale.rs` is the
+  manual real-strfry scale probe. `new_in_process_stress` is a diagnostic control. Gates and journeys:
+  [`APP_SCENARIO_INVENTORY.md`](APP_SCENARIO_INVENTORY.md).
+- **`src/process_orchestrator.rs`** — Multi-process executor for canonical IR (`cgka-conformance-process`). Shares the
+  relay child while keeping its own capability-declared participant protocol.
+- **`src/node_protocol.rs`** — Versioned JSONL control protocol for one app-runtime participant
+  (`cgka-conformance-node`). Application-level only. It has no clock surface, so the process subject does not advertise
+  `VirtualTime`.
+- **`src/cross_route_scenario.rs`** — The canonical four-party route-assurance scenario plus its strict public
+  process-report oracle. The engine-capable form adds exact state and active decryptability; app-runtime, process,
+  container, and VM adapters reuse the public form and must not privately reconstruct its action schedule or terminal
+  assertions. The branch-witness boundary uses a bounded `Eventually(ClientState)` assertion; preserve its
+  process-report evidence and publication correlation checks instead of relying on relay drain timing. Restart
+  permutations name relay-visibility boundaries by publication (`zeta-root`, `alpha-root`) and resolve them to action
+  ids only after inserting the restart; non-publication boundaries match the complete semantic sequence that ends them.
+  A table-driven test pins every inserted restart's exact step and client.
 
-- **Module:** `src/pending_work.rs`
-  - **Role:** Instantaneous strict local-progress observation plus the adapter-neutral structural progress schema. The
-    structural form adds an opaque token, runnable work, earliest wake, deferred/retry and acknowledgement work,
-    transport state, pass phase/generation, and terminal blockers without serializing protocol identifiers.
+### Oracles and evidence
 
-- **Module:** `src/quiescence.rs`
-  - **Role:** Bounded virtual-time fixed-point driver. Runner-owned policy decides whether outbound work is accepted and
-    transport is delivered; the driver activates controlled time, runs immediate work, advances exactly to the earliest
-    wake, and records quiescent, blocked, or watchdog-timeout evidence. Limits never define success.
+- **`src/oracle.rs`** — Stimuli, expected/observed behavior classes, weak-oracle warnings, and coverage matrix rows.
+  Declared asserts are expected coverage; only passing assertion observations count as observed. Positive
+  `PayloadCount` asserts cover `AppMessage` without inventing a cross-sender payload order.
+- **`src/vector.rs`** — `ScenarioTrace`, observations, and semantic `TraceExpectation` checks: epoch/member/payload
+  facts, member additions/removals, client convergence, epoch changes, app invalidations, exact canonical state,
+  input dispositions, pending-work blockers, decryptability matrices, and settled `ConvergenceDecisionObservation`
+  entries from the forensic recorder.
+- **`src/scenario_input_ledger.rs`** — Per-client commit/proposal/application input accounting joined to transport,
+  MLS content, and inner Marmot event ids, without production engine hooks.
+- **`src/pending_work.rs`** — Strict instantaneous local-progress observation and the adapter-neutral structural
+  progress schema (opaque token, runnable work, earliest wake, deferred/retry and acknowledgement work, transport
+  state, pass phase/generation, terminal blockers) without protocol identifiers.
+- **`src/quiescence.rs`** — Bounded virtual-time fixed-point driver. Runner policy decides whether outbound is accepted
+  and transport delivered; limits never define success.
+- **`src/decryptability.rs`** — Active probe results. A queued send counts as published only when the authenticated
+  sender ledger proves publication; up to eight transport rounds deliver messages released during convergence.
+  Unpublished or undelivered probes still fail. This is a mutating probe.
+- **`src/campaign_metrics.rs`** — Report-native `campaign_measurements`. OS-only fields are explicitly unavailable
+  in-process.
 
-- **Module:** `src/failure_capsule.rs`
-  - **Role:** Versioned failure fingerprints and capsules, restrictive artifact I/O, synthetic-vector promotion, and
-    exact engine byte replay from a sensitive recipient SQLite/OpenMLS checkpoint. Never put a checkpoint into a
-    `synthetic_shareable` capsule; it contains key material. The wire/schema contract is
-    `schemas/failure-capsule.v1.schema.json`.
+### Generated families
 
-- **Module:** `src/decryptability.rs`
-  - **Role:** Serializable active application-message probe results. A
-    `ProbeBidirectionalDecryptability` scenario step sends one logical event per named client, drains every attached
-    client, and records each directed sender-to-recipient edge by exact logical event id and recipient ledger
-    disposition. A queued send becomes published only when the authenticated sender ledger proves publication;
-    up to eight transport rounds deliver messages released during convergence. Unpublished or undelivered probes
-    still fail. This is a mutating probe, not a passive observation.
+- **`src/family.rs`** — `GeneratedScenarioCase`, the `generate_family_case` registry (the single dispatch for every
+  family name), the engine families (`send-leave`, `convergence-e2e-delivery`, `convergence-chaos`, `admin-churn`,
+  `adversarial-reliability`, `bounded-convergence-pressure`, both cross-route restart catalogs), report wrappers, and
+  the semantic minimizer. Reliability families append a final global drain, exact canonical observation, and
+  pending-work assertion; do not remove a red strict result because an earlier legacy observation passed. The
+  minimizer removes only app/transport-fault/partition steps and keeps fault–recovery pairs together
+  (`semantic_reduction_units`).
+- **`src/large_group_family.rs`** — Replay-stable 10–200 member pressure catalog with group size, admin population,
+  committer width, traffic, formation, and disruption in versioned workload metadata. Size blocks are cost-ordered.
+  Race arms must keep at least two active committers; bounded decryptability probes must keep late-join/re-add and
+  roster-tail representatives.
+- **`src/membership_reentry_family.rs`** — Single/repeated remove/re-add cycles, restart boundaries, self-update and
+  self-leave interactions, fresh post-rejoin traffic, exact terminal equivalence, and the stale-original-Welcome
+  incident archetype.
+- **`src/offline_catchup_family.rs`** — Retained-relay backlog catalog; requires exact payload multiplicity, canonical
+  equality, input closure, and post-recovery decryptability.
+- **`src/stateful_generator.rs`** — Legality-aware journeys into canonical IR v3 (`chat-journey/v1`) and the
+  `public-app-*` families. Add new product actions to the symbolic model and terminal oracle together.
 
-- **Module:** `cgka_engine::convergence`
-  - **Role:** Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for
-    tests. These tests pin selector policy independently from OpenMLS replay.
+### Independent verification
 
-- **Module:** `src/family.rs`
-  - **Role:** Deterministic generated scenario families. `generate_send_leave_family`,
-    `generate_convergence_e2e_delivery_family`, `generate_convergence_chaos_family`,
-    `generate_admin_churn_family`, and `generate_bounded_convergence_pressure_family` record family name, generator
-    version, seed, case index, runnable `ScenarioSpec`, and optional semantic expectations. `run_generated_case_report`
-    adds generated metadata to report artifacts. Reliability families append a final global drain, exact canonical
-    observation, and pending-work assertion; do not remove a red strict result merely because an earlier legacy
-    observation passed. Positive `PayloadCount` asserts are strict-oracle `AppMessage` coverage.
+- **`src/reference_convergence.rs`** — Production-independent selector/canonicalizer oracle; no production engine
+  imports.
+- **`src/lifecycle_model.rs`** — Stateright mirror of `formal/liveness/ConvergenceLifecycle.tla`; transitions carry
+  stable action ids projectable into Scenario IR.
+- **`src/mutation_adequacy.rs`** — Single-rule semantic mutants, simulator-only. Production code is never compiled with
+  a mutation feature. `tests/mutation_adequacy.rs` drift-checks `MUTATION_MATRIX.md`.
+- **`src/route_assurance.rs`** — Ownership for every production convergence decision route plus reopenable claim
+  records. Source-marker and `CONVERGENCE_ROUTE_MATRIX.md` drift tests force review when a route changes. Records
+  evidence only; never participates in selection.
+- **`src/policy_contract.rs`** — Machine-readable convergence-policy classification (conformance metadata, not wire
+  format). `tests/protocol_decision_gate.rs` pins it against `PROTOCOL_DECISIONS.md`.
+- **`src/policy_cases.rs`** — `PolicyCase` DTOs and selection-reasoning helpers for the cases shared with Tamarin.
+- **`src/policy_sweep.rs`** — Feature-gated one-variable sweeps; prohibit production auto-tuning.
+- **Re-exports** — `cgka_engine::{canonicalization, convergence, openmls_projection}` are re-exported for tests: the
+  executable canonicalization contract, candidate-graph scoring rules, and bytes-first OpenMLS projection helpers.
 
-- **Module:** `src/large_group_family.rs`
-  - **Role:** Replay-stable 10–200 member pressure catalog. Keeps group size, administrator population, active
-    committer width, traffic balance, formation, and disruption explicit in versioned workload metadata. Size blocks
-    are ordered by execution cost for prefix campaigns; the process runner also supports isolated `--case-index`
-    selection. Race arms must retain at least two active committers, and bounded decryptability probes must preserve late-join/re-add and roster-tail representatives.
+### Reports and binaries
 
-- **Module:** `src/membership_reentry_family.rs`
-  - **Role:** Replay-stable small-group departure/re-entry catalog. Guarantees single and repeated administrative
-    remove/re-add cycles, restart boundaries, self-update and self-leave interactions, fresh post-rejoin traffic,
-    exact terminal equivalence, and the stale-original-Welcome incident archetype.
-
-- **Module:** `src/offline_catchup_family.rs`
-  - **Role:** Replay-stable retained-relay backlog catalog. Keeps a founding member offline until the terminal phase,
-    scales application and commit volume independently, varies relay order/duplication and recovery shape, and requires
-    exact payload multiplicity, canonical equality, input closure, and post-recovery decryptability.
-
-- **Module:** `src/stateful_generator.rs`
-  - **Role:** Legality-aware product journey generation into canonical Scenario IR v3. Tracks membership, admins,
-    connectivity, profile, epoch, and application delivery; alternates late-membership engine cases with founding-member
-    retained-history cases so pre-admission retry state is not mislabeled as a quiescence defect. Add new product actions
-    to the symbolic model and terminal oracle together.
-
-- **Module:** `src/oracle.rs`
-  - **Role:** Scenario oracle and coverage evidence. Computes scenario stimuli, expected behavior classes, observed
-    behavior classes, weak-oracle warnings, and coverage matrix rows. Executable `PayloadCount` asserts with a
-    positive count cover `AppMessage` without inventing a cross-sender payload order. Declared asserts are
-    expected coverage; only passing assertion observations count as observed evidence.
-
-- **Module:** `cgka_engine::openmls_projection`
-  - **Role:** Bytes-first OpenMLS projection and candidate materialization helpers, re-exported by this crate for tests.
-    Parses MLS bytes, replays candidate paths against a snapshot, observes proposal refs / staged commits / app
-    decryptions, rolls storage back, and can run the canonicalizer with OpenMLS-derived pending proposal/app-message
-    evidence.
-
-- **Module:** `src/proptest_support.rs`
-  - **Role:** `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and
-    `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. Other properties in
-    `tests/proptest_invariants.rs` generate symbolic canonicalization, capability, lifecycle, and restart cases locally.
-
-- **Module:** `src/scenario.rs`
-  - **Role:** Serializable `ScenarioSpec` v2/v3 plus `run_scenario_spec` / `run_scenario_report` /
-    `run_vector_fixture_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a
-    `ScenarioTrace` or a serializable report with the executed scenario, metadata, step log, flattened epoch changes,
-    app invalidations, recoveries, expectation failures, and invariant failures. `ObserveExact` opts a portable scenario
-    into the canonical snapshot and scenario-input ledger while legacy `Observe` remains stable for existing fixtures.
-    `ProbeBidirectionalDecryptability` actively exercises send, transport peel, MLS decrypt, and application delivery.
-    Membership operations include invite, admin removal, leave, and leaf self-update through the same subject contract.
-    V3's `expect_tick_error` records a normalized, expected transport refusal and continues so the same input can be
-    replayed after a later prerequisite state transition.
-
-- **Module:** `src/scenario_ir.rs`
-  - **Role:** Canonical ScenarioSpec v2/v3 compiler. It validates input, assigns stable action ids, records the deterministic
-  virtual-time schedule, derives per-action adapter capabilities, and preflights the complete schedule before the
-    selected subject executes anything. V2 remains replayable; v3 adds full group-profile updates. The JSON contracts
-    are `schemas/scenario-ir.v2.schema.json` and `schemas/scenario-ir.v3.schema.json`.
-
-- **Module:** `src/topology.rs`
-  - **Role:** Adapter-neutral accounts, devices, processes, groups, relays, roles, and binary/policy versions. The
-    compiler validates all cross-references and resolves old client-only vectors to an explicit deterministic topology.
-
-- **Module:** `src/scenario_authoring.rs`
-  - **Role:** Authoring-only repeat, deterministic parallel, rate, burst, and barrier expansion. It lowers into canonical
-    ScenarioSpec v2 before execution; adapters never interpret authoring control flow. The contract and exact timing
-    rules are in `SCENARIO_IR.md` and `schemas/scenario-authoring.v1.schema.json`.
-
-- **Modules:** `src/scenario_faults.rs`, `src/scenario_assertions.rs`
-  - **Role:** Semantic message selectors plus declared offline/process/storage faults, and executable exactly/eventually/
-    within/never/resource assertions. Assertions sample through the subject boundary and are recorded in reports and
-    failure capsules; unsupported lifecycle/fault capabilities fail whole-schedule preflight.
-
-- **Module:** `src/subject.rs`
-  - **Role:** Simulator-owned `ConvergenceSubject` boundary and the built-in `EngineHarnessSubject` adapter. The
-    scenario runner owns step semantics and stable action ids; subjects implement semantic group, publication,
-    application, delivery, observation, and restart operations. Every adapter declares a versioned capability set that
-    is checked before execution. The engine adapter installs one shared manual paired clock; `AdvanceTime` moves both
-    clock domains without waking a runtime, activates virtual-time ticks for that subject, and `Tick` selects which
-    participants run convergence against that time. Scenarios that never call `AdvanceTime` and standalone clients
-    retain the legacy far-future `Tick` shortcut. The explicit engine subject also captures an append-only emission
-    stream separate from the mutable bus queue: `poll_outbound` returns unresolved transport-ready artifacts
-    non-destructively, and `acknowledge_outbound` applies accepted/no-endpoint outcomes to staged commits, independent
-    Welcomes, and regenerated queued intents. ScenarioSpec v2 uses the same poll/acknowledgement contract; there is no
-    auto-confirming compatibility lifecycle. The `structural_progress` capability exposes privacy-safe aggregate work,
-    deadlines, pass phase/generation, and terminal state; scenario-owned `await_quiescence` composes it with the existing
-    clock/delivery/publication operations. Queue/partition mutation is available only through the separately named
-    `ConvergenceFaultSubject` white-box interface.
-
-- **Module:** `src/reference_subject.rs`
-  - **Role:** Independent symbolic-memory `ConvergenceSubject` for the common logical group, publication, delivery, and
-    application lifecycle. It does not call the production selector/canonicalizer and deliberately omits exact MLS and
-    adversarial transport capabilities. Use whole-schedule capability preflight to keep unsupported reference scenarios
-    from partially executing.
-
-- **Module:** `src/retained_relay.rs`
-  - **Role:** Real-engine subject with deterministic per-relay durable histories. It captures and removes packet-bus
-    emissions, models fanout/subscription/query/EOSE/cursors/full backfill/set reconciliation plus relay-local
-    visibility/order/duplicates, and records an explicit completeness claim for every query. Offline recovery tests
-    must use this adapter rather than clearing a packet-bus partition.
-
-- **Module:** `src/vector.rs`
-  - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload
-    facts plus member additions/removals, client convergence, epoch changes, app invalidations, exact canonical state,
-    commit/proposal/application input dispositions, pending-work blockers, active decryptability matrices, and
-    settled `ConvergenceDecisionObservation` entries captured from the forensic recorder.
-
-- **Module:** `src/policy_cases.rs`
-  - **Role:** Serializable `PolicyCase` DTOs plus selection-reasoning helpers (`parse_policy_cases`, `reason_against`,
-    `digest_rank`) for the bounded convergence-policy cases shared with the Tamarin model.
-
-- **Module:** `src/report.rs`
-  - **Role:** Report command parsing and run-summary types (`ReportArgs`, `ReportCommand`, `ReportRunSummary`,
-    `ScenarioReportSummary`, `ReportFailureSummary`) used by the report CLI. Failed reports retain subject-step errors
-    and emit restrictive failure capsules with captured transport artifacts.
-
-- **Module:** `src/campaign_metrics.rs`
-  - **Role:** Stable report-native campaign measurements: scenario/convergence wall-time envelope, actual queued-send
-    blocking time, convergence decisions, engine reorg histograms, input dispositions, logical outcomes, unresolved
-    work, queue depth, replay probes, and database footprint. Fields that require an OS process boundary are explicitly
-    unavailable in an in-process report.
-
-- **Module:** `src/route_assurance.rs`
-  - **Role:** Machine-readable ownership for every current production convergence decision route plus stable,
-    reopenable assurance-claim records. Source-marker and Markdown-matrix drift tests force review when a production
-    route changes. This module records evidence only and never participates in engine selection.
-
-- **Module:** `src/policy_sweep.rs`
-  - **Role:** Feature-gated, one-variable-at-a-time sweeps over a fixed canonicalization input and fixed eligibility
-    horizons. Curves record rejected boundary values and explicitly prohibit production auto-tuning.
-
-- **Module:** `src/bin/cgka-conformance-simulator-report.rs`
-  - **Role:** Report writer CLI. Runs generated families or vector fixture files/directories, writes one JSON
-    `ScenarioReport` per scenario plus fixture candidates and failure capsules, replays checkpoint-bearing capsules,
-    prints a pass/fail summary, and exits non-zero on expectation failures.
-
-- **Module:** `src/bin/cgka-conformance-campaign.rs`
-  - **Role:** Parent/worker campaign runner. Executes each generated case in an isolated child process and combines the
-    durable scenario report with `wait4` wall/CPU/peak-RSS/write measurements. The parent persists the exact generated
-    input before spawning each worker, verifies report provenance and artifact integrity afterward, and refuses to
-    overwrite an earlier campaign. Workers emit the report CLI's fixture and failure-capsule artifacts. Every generated
-    family exposes direct case-index generation so a large isolated campaign does not regenerate the complete earlier
-    prefix for each worker. This is the engine campaign boundary for real process isolation; the app-runtime and
-    child-process adapters are separate production-shaped boundaries.
-
-- **Module:** `src/bin/cgka-policy-casegen.rs`
-  - **Role:** Policy-case generator CLI; reads `formal/tamarin/policy_cases.json` and parses/reasons over the bounded
-    convergence-policy cases shared with Tamarin.
-
-- **Module:** `vectors/`
-  - **Role:** External JSON `VectorFixture` files. Each fixture carries input `scenario` plus either exact
-    `expected_trace` or semantic `expected_outcomes`.
+- **`src/report.rs`** — Report CLI parsing (`ReportArgs`, `ReportCommand`) and run summaries. Failed reports retain
+  subject-step errors and emit restrictive failure capsules with captured transport artifacts.
+- **`src/failure_capsule.rs`** — Failure fingerprints and capsules, restrictive artifact I/O, synthetic-vector
+  promotion, and exact byte replay from a sensitive recipient checkpoint. Never put a checkpoint into a
+  `synthetic_shareable` capsule; it contains key material. Schema: `schemas/failure-capsule.v1.schema.json`.
+- **`src/bin/cgka-conformance-simulator-report.rs`** — In-process report writer: families, vectors, saved inputs,
+  capsule replay.
+- **`src/bin/cgka-conformance-campaign.rs`** — Parent/worker isolated campaign runner with `wait4`
+  wall/CPU/peak-RSS/write measurements, provenance and artifact-integrity verification, and overwrite refusal. Every
+  family exposes direct case-index generation so workers never regenerate the earlier prefix.
+- **`src/bin/cgka-conformance-process.rs`, `src/bin/cgka-conformance-node.rs`** — Process orchestrator and participant
+  child.
+- **`src/bin/cgka-conformance-app-inventory.rs`** — Enumerates existing generated cases for `--adapter app-runtime`
+  replay without rewriting actions or assertions.
+- **`src/bin/cgka-policy-casegen.rs`** — Reads `formal/tamarin/policy_cases.json`; `just policy-casegen`.
 
 ## Bus model
 
-The bus is **synchronous and deterministic**. Calling `client.send_app(...)` enqueues; calling `bus.deliver_all()` (or
-`bus.step(n)`) flushes; calling `client.tick().await` ingests on the receiver side. There is no actual async runtime
-cooperation; sending is `&mut self`, the engine is awaited inline.
+The bus is **synchronous and deterministic**. `client.send_app(...)` enqueues; `bus.deliver_all()` (or `bus.step(n)`)
+flushes; `client.tick().await` ingests on the receiver. There is no async runtime cooperation; sending is `&mut self`
+and the engine is awaited inline.
 
 Delivery policies (`DeliveryPolicy`):
 
-- `ordered`: FIFO (`Ordered { broadcast_welcomes }`). Default for all canonical scenarios + the proptest.
+- `ordered`: FIFO (`Ordered { broadcast_welcomes }`). Default for all canonical scenarios and the proptest.
 - `reverse`: pop from the back. Useful for ingesting commits before their proposals.
 - `seeded_random`: deterministic shuffle from a fixed `u64` seed.
 
-Partitioning is orthogonal to the delivery policy, not a fourth policy: `set_partition(Some(allowed))` restricts
-delivery to the allowed client set (messages to clients outside it are dropped) and `set_partition(None)` heals.
+Partitioning is orthogonal to delivery policy: `set_partition(Some(allowed))` restricts delivery to the allowed client
+set (messages to clients outside it are dropped) and `set_partition(None)` heals. The bus distinguishes Welcomes from
+group messages so a Welcome can reach a recipient that is not yet a member.
 
-The bus knows about welcomes vs. group messages so welcomes can be routed to a specific recipient without requiring it
-to be a group member yet.
+`ScenarioSpec` transport faults select by stable meaning (action id, publication, sender, protocol class, occurrence);
+queue positions are an internal bus-test detail. `reached_no_endpoint` means definite non-publication: before engine
+rollback the harness retracts every matching undelivered commit and Welcome from the queue and delayed sets, and
+returns a scenario error instead of rolling back if any matching artifact already reached a recipient mailbox.
 
-`ScenarioSpec` transport faults are explicit adapter-neutral steps. They select messages by stable scenario meaning
-(action id, publication, sender, protocol class, and occurrence): `omit_message`, `duplicate_message`,
-`withhold_message`, `release_withheld`, and `reorder_messages`. Queue positions remain an internal bus-test detail.
-`set_partition` and `clear_partition` remain the partition/heal operations.
-
-`reached_no_endpoint` means definite non-publication. Before invoking the engine rollback, the harness retracts every matching
-undelivered commit and Welcome from the queue and delayed sets. It returns a scenario error instead of rolling back if
-any matching artifact has already reached a recipient mailbox; model that case as ambiguous exposure at an adapter-aware
-boundary rather than as definite failure.
-
-Use `clear_events` after setup when a scenario wants the final trace to describe only the behavior under test. The
-convergence E2E scenario does this after the initial welcome joins so its trace focuses on the peeler-ingest epoch
-change and selected branch outputs. Delayed past-epoch app messages are covered via retained epoch contexts.
-Future-epoch branch messages are stored as raw transport bytes, retried after canonical branch selection advances the
-MLS context, and only emitted if they decrypt on the selected branch.
-
-The `convergence-e2e-delivery/v1` generated family reuses that E2E shape and varies queue delivery with duplicate,
-delay/release, and reorder steps before observer ticks. Use it when checking the peeler-ingest to `GroupEvent` bridge
-under transport schedule noise.
-
-The `convergence-chaos/v1` generated family rotates through adversarial convergence shapes: invite fork recovery,
-group-data fork recovery, rollback plus delayed duplicate app delivery, partition/heal/leave, delayed past-epoch app
-delivery, stable duplicate/delay/reorder queue faults, 20+ client message storms, partitioned large-group delivery
-storms, multi-committer group-data storms, mixed large message/commit storms, and restart plus duplicate delivery
-faults. These cases carry semantic `expected_outcomes`, so report failures point at the broken convergence invariant
-instead of only writing an observation dump. Generator version `6` draws the delivery schedule of the rollback and storm
-shapes (arms 2, 6, 7, 8, 9) from the seed, so distinct seeds exercise distinct adversarial orderings; the
-schedule-invariant convergence, rollback, and payload-set expectations stay fixed, so coverage grows with the seed
-without re-pinning vectors.
-
-The `bounded-convergence-pressure/v1` generated family is the finite-pressure acceptance campaign for the unified
-fork-resolution route: a same-epoch commit race, application sends issued inside the quiescence window, a committer
-restart taken mid-resolution, and a bounded self-update/profile/admin tail. It activates controlled virtual time before
-the race, so every later settle must be `AwaitQuiescence`; the driver's watchdog budget is the bounded-time assertion.
-The campaign is finite by construction and claims nothing about progress under unbounded self-updates.
+Use `clear_events` after setup when the final trace should describe only the behavior under test (the convergence E2E
+scenario does this after the initial Welcome joins).
 
 ## How to add a new scripted scenario
 
@@ -338,50 +246,14 @@ Look at `three_client_happy_path_via_harness` for the canonical shape.
 
 1. Encode the runnable input as `ScenarioSpec` JSON in `vectors/*.json`.
 2. Include `scenario_name`, `vector_version`, `conformance_version`, `seed`, `scenario`, and either `expected_trace` or
-   `expected_outcomes`.
+   `expected_outcomes`. Do not bump `conformance_version` outside a release.
 3. Keep `ScenarioTrace` free of MLS bytes and Rust-only internals.
-4. Make fork-resolution behavior observable through a settled `convergence_decision` expectation, not just final membership.
-5. Run `cargo test -p cgka-conformance-simulator canonical_vector_fixtures_match_generated_traces`.
+4. Make fork-resolution behavior observable through a settled `convergence_decision` expectation, not just final
+   membership.
+5. Update `vectors/manifest.v1.json` and `SCENARIOS.md`, then run
+   `cargo test -p cgka-conformance-simulator canonical_vector_fixtures_match_generated_traces`.
 
-## OpenMLS replay probes
-
-`openmls_projection` is intentionally bytes-first. Probe tests should capture `TransportMessage` values from the
-harness, replay their MLS payload bytes against a `SqliteAccountStorage` group snapshot, collect observations such as
-`ProposalRef`s from `StagedCommit::queued_proposals()`, then rely on the helper to roll storage back. Candidate
-materialization should turn those replay observations into `MaterializedCandidate` values, then call
-`canonicalize_with_materialized_candidates` so commit ids, consumed proposal ids, and losing-branch dispositions are
-handled by the canonicalizer. Do not store OpenMLS protocol objects in conformance fixtures; they are consumed by
-OpenMLS APIs. For a full replay-to-canonicalization pass, use `canonicalize_openmls_batch`: it maps OpenMLS
-`ProposalRef`s back to canonical message ids and turns successful application-message replays into branch witnesses plus
-stored payload refs. Candidate paths should carry commits; the batch's `pending_messages` supplies proposals and app
-messages for replay probing. Use `canonicalize_stored_openmls_messages` when the test should prove that durable
-`MessageRecord` rows can reconstruct the same batch after restart or relay sync.
-
-## How to run reports
-
-Run a generated family:
-
-```sh
-cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
-  --family convergence-chaos/v1 \
-  --seed 42 \
-  --cases 10 \
-  --out target/cgka-conformance-simulator-reports
-```
-
-Generated-family runs first write owner-only `*-generated-input.json` artifacts containing the full generated case,
-including its subject adapter and expectations. Replay one through the same report path with `--generated-input FILE`.
-Runs then write owner-only `*-case-N.json` reports and `*-case-N-fixture.v1.json` candidates that can be promoted into
-`vectors/` after review. Oracle coverage is strict by default; use `--allow-weak-oracle` only for an explicitly
-exploratory run.
-
-Run portable vector fixtures:
-
-```sh
-cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
-  --vectors crates/cgka-conformance-simulator/vectors \
-  --out target/cgka-conformance-simulator-reports
-```
+More rules: [`vectors/AGENTS.md`](vectors/AGENTS.md).
 
 ## How to add a new proptest invariant
 
@@ -390,75 +262,90 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
 3. Encode the invariant with `prop_assert(actual, expected, msg)` when comparing model values; the helper panics with
    useful context so shrinking keeps the original failure visible.
 4. Use one config per `proptest!` block. Harness-heavy properties default to smaller case counts; pure
-   selector/canonicalization properties can run more cases. The `conformance-slow` feature should raise counts according
-   to test cost, rather than forcing every property to the same number.
+   selector/canonicalization properties can run more. `conformance-slow` raises counts according to test cost rather
+   than forcing every property to the same number.
 5. Update [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) with generated inputs, the rule being checked, and the case counts.
+
+## OpenMLS replay probes
+
+`openmls_projection` is bytes-first. Probe tests capture `TransportMessage` values from the harness, replay their MLS
+payload bytes against a `SqliteAccountStorage` group snapshot, collect observations such as `ProposalRef`s from
+`StagedCommit::queued_proposals()`, and rely on the helper to roll storage back. Candidate materialization turns those
+observations into `MaterializedCandidate` values, then calls `canonicalize_with_materialized_candidates` so commit ids,
+consumed proposal ids, and losing-branch dispositions are handled by the canonicalizer. Do not store OpenMLS protocol
+objects in conformance fixtures. For a full replay-to-canonicalization pass use `canonicalize_openmls_batch`: it maps
+`ProposalRef`s back to canonical message ids and turns successful application replays into branch witnesses plus stored
+payload refs. Candidate paths carry commits; the batch's `pending_messages` supplies proposals and app messages. Use
+`canonicalize_stored_openmls_messages` to prove durable `MessageRecord` rows reconstruct the same batch after restart or
+relay sync.
 
 ## Coverage gaps
 
 Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md), and
 [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) when filling a gap.
 
-- **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupProfile.** It remains the small
-  shrinkable send/leave strategy. `chat-journey/v1` now generates legal invites and profile changes as canonical IR and
+- **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupProfile.** It stays the small
+  shrinkable send/leave strategy. `chat-journey/v1` generates legal invites and profile changes as canonical IR and
   relies on saved-input semantic reduction; upgrade lifecycle remains separate.
-- **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO /
-  Reverse / SeededRandom.
-- **Generated family coverage is broad but not exhaustive.** `membership-reentry/v1` owns bounded single/repeated
-  departure and fresh-Welcome re-entry interactions, including a wider multi-auto-committer self-leave fork.
-  `chat-journey/v1` covers legal product-shaped membership,
-  admin, profile, application, offline, reconnect, self-update, and restart histories. `send-leave/v1` records lifecycle
-  metadata, `convergence-e2e-delivery/v1` mutates the convergence E2E bridge with duplicate/delay/reorder delivery, and
-  `convergence-chaos/v1` covers invite races, group-data races, publish rollback, partitions, leaves, delayed past-epoch
-  app delivery, queue faults, 20+ client message storms, partitioned large-group storms, multi-committer group-data
-  storms, mixed message/commit storms, and restart plus duplicate delivery. `admin-churn/v1` covers seeded admin-set
-  churn, competing same-epoch admin-policy commits, restart between publish and delivery, and latecomer joins under
-  commit pressure. Storage-loss families are still future work. A welcome-joined member retains its own join commit as
-  a permanently deferred transport input; latecomer arms scope their strict pending-work oracle to the founders and
-  pin the joiner to exactly that retained artifact (`no_pending_work_except_retained_join_commit`) until that is
-  resolved.
+- **Partition policy is scripted, not strategy-driven.** Proptest drives FIFO / Reverse / SeededRandom only.
+- **Storage-loss families are future work.** Generated coverage is broad but not exhaustive.
+- **Welcome-joined members retain their own join commit** as a permanently deferred transport input. Latecomer arms
+  scope their strict pending-work oracle to the founders and pin the joiner to exactly that retained artifact
+  (`no_pending_work_except_retained_join_commit`) until that is resolved.
 - **Stateful chat journeys serialize commits by construction.** Each commit is acknowledged and delivered before the
-  next state-changing action, and restart is a terminal checkpoint. Mutation-after-reopen plus concurrent and racing
-  commit coverage remains owned by `convergence-chaos/v1`.
-- **Admin-gated scripted steps need admin setup.** When a scenario has an invitee later send `InviteMembers` or
-  `UpdateGroupData`, the runner promotes that invitee to an initial admin for the group. Direct harness tests should
-  use `create_group_with_admins` explicitly for competing admin commits.
+  next state-changing action, and restart is a terminal checkpoint. Mutation-after-reopen and concurrent/racing commit
+  coverage remains owned by `convergence-chaos/v1`.
+- **Admin-gated scripted steps need admin setup.** When an invitee later sends `InviteMembers` or `UpdateGroupData`,
+  the runner promotes that invitee to an initial admin. Direct harness tests should use `create_group_with_admins`
+  explicitly for competing admin commits.
 - **Deadline-pinning virtual-time scenarios cannot become portable vectors yet.** A scenario whose contract is *which*
-  tick settles a pass (see `open_convergence_pass_survives_restart_and_walks_the_backlog_to_the_tip`) has to tick
-  manually: `await_quiescence` advances virtual time until the subject stops changing, so it settles a pass whenever it
-  comes due and erases the evidence that a specific deadline fired. That costs nothing at the oracle —
-  `VirtualTimeAdvance` recommends `QuiescenceState` *or* `NoPendingWorkObserved` and coverage is any-of, so a
-  `NoPendingWork` expectation discharges the stimulus under `--strict-oracle`. The multi-process subject is the actual
-  block: `process_subject_descriptor` deliberately does not advertise `SubjectCapability::VirtualTime`, so preflight
-  rejects `AdvanceTime` as `unsupported_subject_capability` and the orchestrator's `tokio::time::sleep` arm never
-  runs — and `node_protocol` has no clock surface, so there is no subject clock to move even if it did. Node deadlines
-  would run on real elapsed time: fine for a step that only needs settling slack, wrong for one that must land on a
-  boundary.
-  Such scenarios stay in `tests/canonical_scenarios.rs` until the node protocol grows a virtual clock the process
-  subject can honestly advertise.
-- **Failure minimization is intentionally conservative.** Generated reports populate `minimized_case` with a greedy
-  step-removal reducer when removable app/delivery noise can be dropped without changing the semantic failure identity
-  (classification, action type, and failure kind). Complete state-digest fingerprints remain diagnostic evidence. There is no
-  domain-specific shrinker yet.
+  tick settles a pass (see `open_convergence_pass_survives_restart_and_walks_the_backlog_to_the_tip`) must tick
+  manually: `await_quiescence` settles a pass whenever it comes due and erases the evidence that a specific deadline
+  fired. The oracle is not the blocker — `VirtualTimeAdvance` recommends `QuiescenceState` *or*
+  `NoPendingWorkObserved` and coverage is any-of, so a `NoPendingWork` expectation discharges the stimulus under
+  `--strict-oracle`. The multi-process subject is: `process_subject_descriptor` does not advertise
+  `SubjectCapability::VirtualTime`, so preflight rejects `AdvanceTime` as `unsupported_subject_capability`, and
+  `node_protocol` has no clock surface to move. Node deadlines would run on real elapsed time — fine for settling slack,
+  wrong for landing on a boundary. Keep such scenarios in `tests/canonical_scenarios.rs` until the node protocol grows
+  a virtual clock the process subject can honestly advertise.
+- **Failure minimization is conservative.** No domain-specific shrinker yet; complete state-digest fingerprints remain
+  diagnostic evidence.
 
 ## Conventions
 
-- **Client labels seed deterministic Nostr keys.** The ergonomic `pad32(b"name")` helper remains fine for stable test
-  labels, but the engine identity attached to the bus is the derived public key. Use `HarnessClient::member_id()` for
-  admin lists or other policy inputs.
+- **Client labels seed deterministic Nostr keys.** `pad32(b"name")` is fine for stable test labels, but the engine
+  identity attached to the bus is the derived public key. Use `HarnessClient::member_id()` for admin lists or other
+  policy inputs.
 - **Tracing audit is repo-wide.** `tests/tracing_audit.rs` scans production Rust source for `tracing::*` calls. New
   tracing must include explicit `target` and `method` fields and must not include account ids, group ids, message ids,
   relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material.
-- **The harness peeler is real; the relay is not.** `TransportBus` stays in memory, but group messages and welcomes go
+- **The harness peeler is real; the relay is not.** `TransportBus` stays in memory, but group messages and Welcomes go
   through `transport-nostr-peeler`.
-- **`HarnessClient` exposes only what tests need.** If you need the inner `Engine<S>`, that's a smell — extend the
-  harness API instead and keep tests at one abstraction level.
+- **`HarnessClient` exposes only what tests need.** Needing the inner `Engine<S>` is a smell — extend the harness API
+  instead and keep tests at one abstraction level.
 - **App-runtime maintenance runs on real time unless the build says otherwise.** Own-leaf rotations wait out a
   60-second quiet window plus up to 30 seconds of jitter. `AppRuntimeHarness::new_with_immediate_maintenance` zeroes
-  those windows through `MarmotAppConfig::with_dev_maintenance_timing`, which is honored only when this crate is built
-  with `test-policy-overrides` (now also enabling `marmot-app/test-policy-overrides`). Gate any journey that depends
-  on it with `cfg_attr(not(feature = "test-policy-overrides"), ignore)` and check
-  `AppRuntimeHarness::honors_maintenance_timing_override()` rather than assuming the knob took effect. That build
-  also switches `AppRuntimeHarness::new()` to marmot-app's instant-settlement test default, so journeys that claim
+  those windows through `MarmotAppConfig::with_dev_maintenance_timing`, honored only when this crate is built with
+  `test-policy-overrides` (which also enables `marmot-app/test-policy-overrides`). Gate any journey that depends on it
+  with `cfg_attr(not(feature = "test-policy-overrides"), ignore)` and check
+  `AppRuntimeHarness::honors_maintenance_timing_override()` rather than assuming the knob took effect. That build also
+  switches `AppRuntimeHarness::new()` to marmot-app's instant-settlement test default, so journeys that claim
   production settlement must use `new_with_pinned_settlement` or `new_with_immediate_maintenance` (both pin the
   1,000 ms window), and a recipe that enables the feature must select its tests explicitly rather than run the crate.
+
+## Verification
+
+```sh
+cargo test -p cgka-conformance-simulator            # or: just conformance
+just simulator-smoke                                # PR-lane selection
+```
+
+Add the narrowest gate that covers the change:
+
+- Verification layers (reference model, lifecycle, mutation, route assurance, protocol decisions):
+  `just convergence-verification-ci`.
+- Adversarial catalog, policy sweeps, or `test-policy-overrides` behavior: `just adversarial-reliability-ci`.
+- Family generators: the family's test file plus a strict file-backed report or campaign canary on a fresh `--out`.
+- Policy cases: `cargo test -p cgka-conformance-simulator --test generated_policy_cases --test policy_case_tamarin_drift`.
+- Convergence policy/resource/scheduler constants: `just convergence-ledger-gate`.
+- Process/app adapters: the explicit ignored tests and commands named in [`tests/AGENTS.md`](tests/AGENTS.md).

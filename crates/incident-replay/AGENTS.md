@@ -5,7 +5,9 @@ read — the `agent-state.json` document and the streamed NDJSON group export
 (`goggles-group-export/v1`) — into one model. The pipeline is **parse →
 classify → recover → synthesize → accept**: a fork-recovery or convergence
 incident becomes a vector only if the simulator reproduces the recorded outcome
-(fail-closed).
+(fail-closed). Usage, output lines, exit codes, and export-handling rules for
+humans are in [`README.md`](README.md); this file owns the module map and the
+exact classification rules.
 
 ## Pieces
 
@@ -422,7 +424,7 @@ Gate designs evaluated against real exports and deliberately **rejected**:
   committed test set. Real exports carry relay URLs / message ids and must never
   enter VCS.
 - Real exports are the manual pre-PR verification set:
-  `cargo run -p incident-replay -- <export.json | export.ndjson>`.
+  `cargo run -p incident-replay -- <export.json | export.ndjson> [out-dir]`.
   The CLI sniffs the format from the first non-empty line (read under the
   per-line and line-count bounds). An `agent-state.json` document is read whole and rejected
   over 256 MiB before parsing; a stream is parsed line by line under the

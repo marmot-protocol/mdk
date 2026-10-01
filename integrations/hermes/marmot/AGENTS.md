@@ -1,7 +1,7 @@
 # AGENTS.md - integrations/hermes/marmot
 
 Hermes platform plugin for Marmot through the local `wn-agent` control socket.
-The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` first.
+The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` and `../../AGENTS.md` first.
 
 ## Scope
 
@@ -16,16 +16,21 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` first
 
 - `plugin.yaml` — Hermes platform plugin manifest.
 - `__init__.py` — plugin entry registration.
-- `adapter.py` — agent-control client, inbound/outbound bridging, and live-preview state machine.
+- `adapter.py` — Hermes platform adapter: inbound/outbound bridging, activation, sender ACL, media, and live-preview
+  state machine.
+- `agent_control.py` — hardened v2 NDJSON control-socket client (framing, correlation, typed requests only).
+- `inbound_spool.py` — crash-safe inbound obligation spool ahead of Hermes' in-memory debounce/queue.
+- `ambient_context.py` — private durable quiet-context facts (hashed keys only; no message text or identifiers).
 - `diagnostics.py` — shared doctor report helpers and the plugin-owned diagnostics socket.
 - `doctor.py` — privacy-safe, non-mutating installation collector used by `install-hermes-marmot.sh --doctor`.
-- `tests/` — unit tests and dev-script smoke coverage.
+- `hermes-agent.lock` — pinned Hermes version/tag/ref and wheel checksum; sourced by
+  `scripts/hermes_marmot_dev_setup.sh`, `Dockerfile.hermes-marmot`, and the drift checks in `test_dev_scripts.sh`.
+- `../tests/marmot/` — unit tests and dev-script smoke coverage (kept outside the plugin dir; see its `AGENTS.md`).
 
 ## Rules
 
 - Treat release installs (`install-hermes-marmot.sh`) and dev harness scripts (`just hermes-dev-*`) as the operational
   verification path for end-to-end behavior.
-
 - Keep the adapter's effective-configuration resolution and the doctor's projection in `diagnostics.py`
   aligned in the same change, with parity tests for enablement, dotenv/YAML precedence, welcomers,
   socket/account/auth, home and media settings. Projection drift can contact the wrong endpoint or

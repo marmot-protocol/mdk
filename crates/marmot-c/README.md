@@ -1,62 +1,29 @@
 # marmot-c
 
-C ABI over the Marmot app runtime (`marmot-uniffi`), for C/C++ and
-any raw-FFI consumer (Zig, Nim, Go, Odin, Lua, PHP, …).
+C ABI over the Marmot app runtime (`marmot-uniffi`), for C/C++ and any raw-FFI consumer (Zig, Nim, Go, Odin, Lua,
+PHP, …). Runtime concepts, screen contracts and API selection are shared with Swift/Kotlin and live in the
+[binding integration guide](../marmot-uniffi/README.md#integration-guide-and-api-reference); this README covers what is
+specific to C: building and linking, binary compatibility, memory ownership, blocking calls, and C-only differences
+per feature.
 
-## Integration documentation
+## Contents
 
-Start with the [shared binding integration guide](../marmot-uniffi/README.md#integration-guide-and-api-reference)
-for runtime lifecycle, screen contracts, API selection, localization and upgrade policy.
-`marmot_verify_public_nostr_event_json`
-are stateless public-event checks: they require no client, return `uint8_t`
-results through required out-pointers, and return `MARMOT_STATUS_OK` with zero
-for malformed or invalid cryptographic input. Null/invalid UTF-8 pointers are
-argument errors. Callers still enforce their author, kind, tag, and JSON-size
-policy. These additive functions require a matching regenerated header/library.
-Use the [complete C symbol reference](API-REFERENCE.md) for every function declaration,
-including ownership helpers, and the [shared method reference](../marmot-uniffi/API-REFERENCE.md)
-for runtime purposes and recommended alternatives to older screen paths.
-
-The [0.10.4 → 0.11.0 integration guide](../../docs/integration/0.11.0.md) explains
-the current record, enum, error and schema changes. Every supported release has a
-companion in the [integration index](../../docs/integration/README.md).
-Read the exact version's header and docs; C record layout compatibility is not implied
-by a shared major/minor number. External-signer onboarding/login/registration remain
-UniFFI-only until a C signer callback interface exists; the host secret-store vtable
-is already supported and is a different interface.
-
-The 0.10.4 [local-send contract](../marmot-uniffi/LOCAL-SENDS.md) adds token-aware
-send/reply/draft/upload calls. C calls block until local acceptance (or upload then
-acceptance), rather than relay completion. Free their results with
-`marmot_local_send_acceptance_free`, `marmot_media_upload_submission_free`, or
-`marmot_local_send_status_free`. The nullable timeline `client_token` is owned by
-its row and released by the row's existing deep-free. Rebuild against the matching
-header/library because this changes the timeline record layout.
-Starting with 0.11.0, `marmot_edit_local_message_with_client_token` provides
-durable revisions of pending text or replies. Each revision needs a new edit token;
-the C call returns local acceptance and uses the same status and free functions.
-
-Before OS suspension/root handoff, use `marmot_client_shutdown_and_close` and observe
-its status; `marmot_client_shutdown` alone does not close shared database handles.
-Release subscriptions before clients, and never free an object while another call uses it.
-Starting with 0.10.3, `marmot_client_free` waits for runtime worker cleanup on an
-ordinary host thread, preventing pending database destructors from racing process
-exit. Run final free off the UI thread. Calls from a Tokio runtime context retain
-nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
-The catalog includes C-only compatibility shims; prefer the v4 audit configuration
-setter and the composable runtime options constructor for new integrations.
-
-`marmot_record_host_performance` accepts 28 shared and nine Linux-specific host
-stages in addition to the existing readiness and visibility milestones. Read these
-37 stages by their `host_*` operation name in
-`MarmotAppPerformanceSnapshot.runtime_operations`. Splash readiness, foreground
-readiness and outbound/inbound message visibility remain in `host_splash_ready`,
-`host_foreground_local_ready`, `host_outbound_message_visible` and
-`host_inbound_message_visible`, respectively. The snapshot layout and existing
-operation values are unchanged. Adopt new operations with matching headers/libraries
-and free snapshots with `marmot_app_performance_snapshot_free`. Stage boundaries
-are defined in the [runtime telemetry catalog](../../docs/marmot-architecture/runtime-latency-telemetry.md#boundaries).
-See the [diagnostics contract](../marmot-uniffi/README.md#localization-privacy-and-diagnostics).
+- [What you get](#what-you-get)
+- [Binary compatibility](#binary-compatibility)
+- [Rules of the road](#rules-of-the-road)
+- [Using the ABI](#using-the-abi)
+- [Integration documentation](#integration-documentation)
+- [Lifecycle and teardown](#lifecycle-and-teardown)
+- Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
+  [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
+  [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
+  [KeyPackage inventory](#keypackage-inventory), [selected chat-list presentation](#selected-chat-list-presentation),
+  [chat screens and avatars](#chat-screens-and-avatars),
+  [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
+  [host-driven agent publishing](#host-driven-agent-publishing),
+  [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
+- [Smoke test and example](#smoke-test-and-example)
+- [Regenerating the header](#regenerating-the-header)
 
 ## What you get
 
@@ -70,18 +37,46 @@ Build the bundle locally:
 ./crates/marmot-c/c-bindings.sh   # stages output/ (libs, header, pkg-config)
 ```
 
-Tagged releases (`marmotc-v*`) publish a Linux x86_64 zip with the same
-contents.
+Tagged releases (`marmotc-v*`) publish a Linux x86_64 zip (`marmot-c-linux-x86_64-<version>.zip`) with the same
+contents plus this README.
 
 ## Binary compatibility
 
 Build clients against the header shipped with the exact native library they load.
 Output records have concrete C layouts; this API has no tail-extension or
-cross-release layout-compatibility guarantee. Do not swap in a new library under
-an application compiled against older record layouts.
+cross-release layout-compatibility guarantee, and a shared major/minor number does not imply layout compatibility.
+Do not swap in a new library under an application compiled against older record layouts. Any additive record field,
+union tag or function requires regenerating `marmot.h`, recompiling consumers and shipping the matching library.
 
 See [the changelog](CHANGELOG.md) for record-layout changes and upgrade requirements
 for each release.
+
+## Rules of the road
+
+- Every fallible function returns `MarmotStatus` (`MARMOT_STATUS_OK` is
+  0); detail text for the calling thread's most recent failure comes from
+  `marmot_last_error_message()` (free with `marmot_string_free`).
+- Structs returned by pointer are freed ONLY with their matching
+  `marmot_*_free`, which deep-frees every field. Never free fields
+  individually, never free twice; NULL is always a no-op.
+- Input structs and strings are borrowed: the library never frees or
+  retains caller memory.
+- Values you supply are fixed-width integers, never C enums or `_Bool`:
+  booleans are `uint8_t` (nonzero is true) and enums are `uint32_t`
+  discriminants — use the generated `MARMOT_*` constants. Out-of-range
+  values are rejected with `MARMOT_STATUS_INVALID_ARGUMENT`.
+- Required out-pointers are checked and zeroed before the call does any
+  work, so an invalid required output pointer cannot cause the operation
+  to run. Other failures/timeouts can follow durable intent or external side
+  effects; inspect authoritative state before retrying a mutation.
+- Calls block unless documented otherwise. Blocking functions may be called from a subscription callback.
+- Subscriptions offer blocking `*_next` (`0` timeout = wait forever;
+  `MARMOT_STATUS_TIMEOUT` / `MARMOT_STATUS_CLOSED` otherwise) or callback
+  registration. Callback item pointers are borrowed and valid only for
+  the duration of the call; `user_data` must outlive every possible
+  callback invocation (clear/free do not wait for a running callback).
+- Free every subscription handle before the client that created it, and never free an object while another call uses
+  it.
 
 ## Using the ABI
 
@@ -119,36 +114,107 @@ int main(void) {
 }
 ```
 
-`MarmotMarkdownBlock` appends an additive `Details` tag whose fields live
-behind `MarmotMarkdownDetails`. Existing discriminants and union stride stay
-the same; regenerate `marmot.h` and consumer bindings to handle the new tag.
-Older clients cannot render it.
+## Integration documentation
 
-`marmot_account_id_hex` and `marmot_normalize_member_ref` now accept
-`nprofile` and `nostr:nprofile` references (plus the existing
-hex/`npub`/`marmot://profile/` forms) and discard relay hints.
+- [Shared binding integration guide](../marmot-uniffi/README.md#integration-guide-and-api-reference): runtime
+  lifecycle, screen contracts, API selection, localization and upgrade policy.
+- [Complete C symbol reference](API-REFERENCE.md): every function declaration, including ownership helpers and
+  C-only compatibility shims.
+- [Shared method reference](../marmot-uniffi/API-REFERENCE.md): runtime purposes and recommended alternatives to
+  older screen paths.
+- [Integration index](../../docs/integration/README.md): a per-release upgrade guide for every release from 0.10.2,
+  including C record, enum, error and schema changes.
+
+Read the exact version's header and docs. External-signer onboarding/login/registration remain
+UniFFI-only until a C signer callback interface exists; the host secret-store vtable
+is already supported and is a different interface. The catalog includes C-only compatibility shims; prefer the
+versioned audit configuration setters and the composable runtime options constructor for new integrations.
+
+## Lifecycle and teardown
+
+Before OS suspension/root handoff, use `marmot_client_shutdown_and_close` and observe
+its status; `marmot_client_shutdown` alone does not close shared database handles.
+Release subscriptions before clients, and never free an object while another call uses it.
+`marmot_client_free` waits for runtime worker cleanup on an ordinary host thread, preventing pending database
+destructors from racing process exit (since 0.10.3). Run final free off the UI thread. Calls from a Tokio runtime
+context retain nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
+
+## Runtime construction
+
+`marmot_client_new_with_configuration` takes a `MarmotClientOptions` struct combining relay policy, cursor
+persistence, client label, secret store and attachment acquisition mode; NULL options or zero initialization selects
+the same defaults as the Swift/Kotlin `MarmotOptions` (see the
+[shared contract](../marmot-uniffi/README.md#runtime-options-and-client-label)). Use the matching header and library
+for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
+
+For private integration fixtures, `marmot_client_new_with_options` accepts
+an explicit loopback relay policy and an optional host secret-store vtable.
+Existing constructors keep their public-only policy. Loopback broker access
+requires a separate publisher trust opt-in; neither permits private or
+link-local endpoints. Local insecure trust is intended only for tests.
+
+## Local sends
+
+The [local-send contract](../marmot-uniffi/LOCAL-SENDS.md) (0.10.4) adds token-aware
+send/reply/draft/upload calls. C calls block until local acceptance (or upload then
+acceptance), rather than relay completion. Free their results with
+`marmot_local_send_acceptance_free`, `marmot_media_upload_submission_free`, or
+`marmot_local_send_status_free`. The nullable timeline `client_token` is owned by
+its row and released by the row's existing deep-free.
+Since 0.11.0, `marmot_edit_local_message_with_client_token` provides
+durable revisions of pending text or replies. Each revision needs a new edit token;
+the C call returns local acceptance and uses the same status and free functions.
+
+## Public event verification
+
+`marmot_verify_public_nostr_event_json` is a stateless public-event check: it requires no client, returns a `uint8_t`
+result through a required out-pointer, and returns `MARMOT_STATUS_OK` with zero
+for malformed or invalid cryptographic input. Null/invalid UTF-8 pointers are
+argument errors. Callers still enforce their author, kind, tag, and JSON-size
+policy. See the [shared contract](../marmot-uniffi/README.md#public-nostr-event-verification).
+
+## Host performance stages
+
+`marmot_record_host_performance` accepts 28 shared and nine Linux-specific host
+stages in addition to the existing readiness and visibility milestones. Read these
+37 stages by their `host_*` operation name in
+`MarmotAppPerformanceSnapshot.runtime_operations`. Splash readiness, foreground
+readiness and outbound/inbound message visibility remain in `host_splash_ready`,
+`host_foreground_local_ready`, `host_outbound_message_visible` and
+`host_inbound_message_visible`, respectively. Free snapshots with `marmot_app_performance_snapshot_free`. Stage
+boundaries are defined in the [runtime telemetry catalog](../../docs/marmot-architecture/runtime-latency-telemetry.md#boundaries).
+See the [diagnostics contract](../marmot-uniffi/README.md#localization-privacy-and-diagnostics).
+
+## Markdown rendering
+
+`MarmotMarkdownBlock` includes a `Details` tag (bounded `<details>` / `<summary>` blocks) whose fields live behind
+`MarmotMarkdownDetails`. It was appended without changing existing discriminants or union stride; clients built
+against an older header cannot render it.
+
+## Identity references and pseudonyms
+
+`marmot_account_id_hex` and `marmot_normalize_member_ref` accept
+`nprofile` and `nostr:nprofile` references (plus hex/`npub`/`marmot://profile/` forms) and discard relay hints.
 Duplicate type-0 TLV entries keep the first key. After wrapper
 normalization, encoded tokens longer than 1023 UTF-8 bytes are
 rejected; a valid 1023-byte token still decodes when wrapped. The app
 helper's legacy NIP-21 parser may still accept a colon-suffixed
 `nostr:<npub>:` form, but C/UniFFI wrapper normalization rejects it.
-`marmot_default_profile_pseudonym`
-hashes the supplied canonical hex account-id text; decode a scanned
+
+`marmot_default_profile_pseudonym` hashes the supplied canonical hex account-id text; decode a scanned
 reference first. Passing uppercase hex or an undecoded `npub` silently
 produces a different name, not an error. `marmot_random_profile_pseudonym` is a cosmetic
 random roll from the same wordlists. Free those strings with
-`marmot_string_free` and normalized records with
-`marmot_member_ref_free`. Regenerate `marmot.h` after pulling this
-surface. Android mention/QR migration remains a separate consumer
-issue.
+`marmot_string_free` and normalized records with `marmot_member_ref_free`.
+
+## KeyPackage inventory
 
 `marmot_account_key_packages` returns the current KeyPackage winner per
 addressable slot plus local-only rows. `marmot_account_key_package_relay_events`
 returns observed relay history from the same validated fetch window, including
 superseded events. Free that list with
-`marmot_account_key_package_relay_event_list_free`. Existing
-`MarmotAccountKeyPackage` layout and `marmot_account_key_package_list_free`
-are unchanged.
+`marmot_account_key_package_relay_event_list_free` and the existing list with
+`marmot_account_key_package_list_free`.
 
 `marmot_local_account_key_packages` is the local-first inventory. Call it
 immediately, then independently await `marmot_refresh_account_key_packages` and
@@ -158,27 +224,77 @@ stays `MARMOT_ACCOUNT_KEY_PACKAGE_LOCAL_STATE_RETAINED_PRIVATE_MATERIAL` even
 when that exact event is observed; `relay` becomes true while `local_state`
 remains retained. On refresh failure, keep the local result.
 Free either list with `marmot_account_key_package_inventory_entry_list_free`.
-The new entry embeds the existing record plus
-`MarmotAccountKeyPackageLocalState`; existing structs and frees are unchanged.
-Regenerate `marmot.h` and use a matching library. Android device rendering is
-a separate consumer adoption issue.
+Each entry embeds the existing `MarmotAccountKeyPackage` record plus `MarmotAccountKeyPackageLocalState`.
 
-`examples/smoke.c` is a worked example covering lifecycle, Markdown
-tagged-union walking, offline reads, the error taxonomy, and best-effort
-identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it
-against both linkage models (valgrind when available). Pass `--debug` first
-to reuse debug/test-profile dependencies for a faster local or PR smoke run;
-release and scheduled validation use the default release build. On macOS both
-build scripts pin release `strip=none`, matching MarmotKit's Apple policy: Rust's
-debug-stripping path can emit a misaligned Mach-O string table that Xcode 27
-rejects. Optimization remains enabled; Linux packaging is unchanged. Revisit the
-pin after a Rust toolchain upgrade incorporating
-[rust-lang/rust#158410](https://github.com/rust-lang/rust/pull/158410), and remove it
-only after the default optimized shared/static smoke passes without the override.
-The C CI workflows run on Linux; the Darwin branch currently has local smoke
-evidence only. Changing `strip` changes Cargo's release-profile fingerprint, so
-alternating these scripts with an unpinned `cargo build --release` can rebuild
-release dependencies.
+## Selected chat-list presentation
+
+`marmot_presented_chat_list` and `marmot_presented_chat_list_row` return complete existing row fields
+plus MDK-selected title/avatar descriptors. `MarmotPresentedChatRow` also embeds `preview` and `actions`
+(0.10.3; this changed its binary layout). The Draft preview owns its text; the parent row/snapshot free releases it.
+Message selection refers to the same row's `last_message`. See the
+[shared chat-list row contract](../marmot-uniffi/CHAT-LIST-ROWS.md).
+
+`marmot_open_presented_chat_list` returns an attached handle; take its `*_snapshot` once, then use `*_next` for
+whole-list replacements. The initial item has sequence zero. A repeated snapshot call returns CLOSED with NULL.
+This fallible subscription offers blocking next with timeout and typed storage/preparation errors. It has no callback
+pump: hosts drive next on their own worker and decide how to retry errors. Timeouts preserve the refresh obligation.
+Free each result with `marmot_presented_chat_list_update_free` and the handle with
+`marmot_presented_chat_list_subscription_free`. See the [shared native contract](../marmot-uniffi/README.md#selected-chat-list-presentation)
+for version ordering, localization, readiness, and account-switch behavior.
+
+## Chat screens and avatars
+
+Live Chats/Unread/Archived/Left windows and independent account attention follow the
+[native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
+for paging, sequence handling, cancellation, C ownership, and compatibility. Prepared conversation windows (history,
+header/capabilities, visible identities, read state and revisioned draft descriptors) follow the
+[native conversation contract](../marmot-uniffi/CONVERSATION-WINDOW.md) for opening, paging, cancellation, timeout,
+ownership and draft migration.
+
+Avatar screen metadata is mirrored as `MarmotAvatarAsset`; resolved chat/conversation records carry an optional
+avatar metadata pointer. Use `marmot_request_avatar_assets` for up to 16 visible
+opaque targets, `marmot_read_avatar_assets` for bounded local bytes (at most 16 references / 16 MiB), and
+`marmot_clear_avatar_cache` for explicit local removal. Free returned lists with their matching
+`marmot_avatar_asset_list_free` / `marmot_avatar_bytes_list_free` functions.
+
+## History may be incomplete notices
+
+`marmot_history_notices` blocks on the account worker, reads local durable state only, and writes an owned
+`MarmotHistoryNoticeList`; free it with `marmot_history_notice_list_free`. Each `MarmotHistoryNotice` has an
+opaque `notice_id`, a `MarmotHistoryNoticeCause`, a `group_id_hex` that is NULL for an account-wide occurrence,
+and `has_parked_at_ms`/`parked_at_ms`. `marmot_dismiss_history_notice` writes `true` when it durably retired
+that occurrence and `false` for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`. Re-read the list
+on `MARMOT_EVENT_HISTORY_NOTICES_CHANGED`; a group's own occurrences also set
+`MarmotGroupRecoveryStatus.history_may_be_incomplete` and fill its `history_notice_ids` array, released by
+`marmot_group_recovery_status_free`. See the
+[shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when notices appear,
+disappear and return.
+
+## Group reporting
+
+The C ABI mirrors the [shared reporting operations](../marmot-uniffi/README.md#group-reporting). Pages are capped at
+100 and cursors are exclusive. Deep-free returned pages with `marmot_content_report_page_free` or
+`marmot_report_dismissal_page_free`; the reported message uses the ordinary timeline record and its free function.
+
+## Host-driven agent publishing
+
+`marmot_agent_publisher_new` anchors a stream and returns an opaque handle.
+Pass a QUIC candidate and broker trust options; cryptographic keys and
+transcript framing stay inside MDK. Append text, status, or progress using
+`marmot_agent_publisher_append`. Its receipt reports accepted record count
+and any preview transport failure; transport loss preserves the transcript.
+
+`marmot_agent_publisher_finish` seals the transcript and sends the durable
+final message. Inspect the returned send disposition for delivery state.
+If sending fails, call finish again on the same handle; the sealed request
+is retained. After success, repeated finish returns the original receipt.
+Appends after sealing fail. These guarantees last for the handle's lifetime;
+publisher state is not restored after a process restart.
+
+Cancel or free a handle to stop its preview. A finish already in progress
+wins over cancellation. Free every publisher before its client, and never
+free a handle concurrently with another call using it. Free info, append
+receipts, and send receipts with their matching generated free functions.
 
 ## Audit v5 recording and delivery
 
@@ -204,57 +320,25 @@ system `hardware_model`, platform and app version. Free its returned config with
 The legacy config/setter retains its binary layout, ignores `device_label`, and returns that field as NULL;
 it never reinterprets an old device name as a hardware model. Both setters use the same v4-only upload gate.
 
-## Rules of the road
+## Smoke test and example
 
-- Every fallible function returns `MarmotStatus` (`MARMOT_STATUS_OK` is
-  0); detail text for the calling thread's most recent failure comes from
-  `marmot_last_error_message()` (free with `marmot_string_free`).
-- Structs returned by pointer are freed ONLY with their matching
-  `marmot_*_free`, which deep-frees every field. Never free fields
-  individually, never free twice; NULL is always a no-op.
-- Input structs and strings are borrowed: the library never frees or
-  retains caller memory.
-- Values you supply are fixed-width integers, never C enums or `_Bool`:
-  booleans are `uint8_t` (nonzero is true) and enums are `uint32_t`
-  discriminants — use the generated `MARMOT_*` constants. Out-of-range
-  values are rejected with `MARMOT_STATUS_INVALID_ARGUMENT`.
-- Required out-pointers are checked and zeroed before the call does any
-  work, so an invalid required output pointer cannot cause the operation
-  to run. Other failures/timeouts can follow durable intent or external side
-  effects; inspect authoritative state before retrying a mutation.
-- Blocking functions may be called from a subscription callback.
-- Subscriptions offer blocking `*_next` (`0` timeout = wait forever;
-  `MARMOT_STATUS_TIMEOUT` / `MARMOT_STATUS_CLOSED` otherwise) or callback
-  registration. Callback item pointers are borrowed and valid only for
-  the duration of the call; `user_data` must outlive every possible
-  callback invocation (clear/free do not wait for a running callback).
-- Free every subscription handle before the client that created it.
+`examples/smoke.c` is a worked example covering lifecycle, Markdown
+tagged-union walking, offline reads, the error taxonomy, and best-effort
+identity creation. `./crates/marmot-c/c-smoke.sh` (or `just c-smoke`) builds and runs it
+against both linkage models (valgrind when available). Pass `--debug` first
+to reuse debug/test-profile dependencies for a faster local or PR smoke run;
+release and scheduled validation use the default release build.
 
-## Host-driven agent publishing
-
-`marmot_agent_publisher_new` anchors a stream and returns an opaque handle.
-Pass a QUIC candidate and broker trust options; cryptographic keys and
-transcript framing stay inside MDK. Append text, status, or progress using
-`marmot_agent_publisher_append`. Its receipt reports accepted record count
-and any preview transport failure; transport loss preserves the transcript.
-
-`marmot_agent_publisher_finish` seals the transcript and sends the durable
-final message. Inspect the returned send disposition for delivery state.
-If sending fails, call finish again on the same handle; the sealed request
-is retained. After success, repeated finish returns the original receipt.
-Appends after sealing fail. These guarantees last for the handle's lifetime;
-publisher state is not restored after a process restart.
-
-Cancel or free a handle to stop its preview. A finish already in progress
-wins over cancellation. Free every publisher before its client, and never
-free a handle concurrently with another call using it. Free info, append
-receipts, and send receipts with their matching generated free functions.
-
-For private integration fixtures, `marmot_client_new_with_options` accepts
-an explicit loopback relay policy and an optional host secret-store vtable.
-Existing constructors keep their public-only policy. Loopback broker access
-requires a separate publisher trust opt-in; neither permits private or
-link-local endpoints. Local insecure trust is intended only for tests.
+On macOS both build scripts pin release `strip=none`, matching MarmotKit's Apple policy: Rust's
+debug-stripping path can emit a misaligned Mach-O string table that Xcode 27
+rejects. Optimization remains enabled; Linux packaging is unchanged. Revisit the
+pin after a Rust toolchain upgrade incorporating
+[rust-lang/rust#158410](https://github.com/rust-lang/rust/pull/158410), and remove it
+only after the default optimized shared/static smoke passes without the override.
+The C CI workflows run on Linux; the Darwin branch has local smoke
+evidence only. Changing `strip` changes Cargo's release-profile fingerprint, so
+alternating these scripts with an unpinned `cargo build --release` can rebuild
+release dependencies.
 
 ## Regenerating the header
 
@@ -265,55 +349,3 @@ just c-header
 The mirror surface is macro-generated, so header generation runs cbindgen
 with macro expansion (`RUSTC_BOOTSTRAP=1` on the stable toolchain). CI
 diff-gates the checked-in header.
-
-## Selected chat-list presentation
-
-The additive `marmot_presented_chat_list` and `marmot_presented_chat_list_row` return complete existing row fields
-plus MDK-selected title/avatar descriptors. The 0.10.3 C3 additions extend
-`MarmotPresentedChatRow` with preview and action fields, changing its binary layout.
-Rebuild consumers with the matching generated header and native library; function signatures are unchanged.
-`marmot_open_presented_chat_list` returns an attached handle; take its `*_snapshot` once, then use `*_next` for
-whole-list replacements. The initial item has sequence zero. A repeated snapshot call returns CLOSED with NULL.
-
-This fallible subscription offers blocking next with timeout and typed storage/preparation errors. It has no callback
-pump: hosts drive next on their own worker and decide how to retry errors. Timeouts preserve the refresh obligation.
-Free each result with `marmot_presented_chat_list_update_free` and the handle with
-`marmot_presented_chat_list_subscription_free`. See the [shared native contract](../marmot-uniffi/README.md#selected-chat-list-presentation)
-for version ordering, localization, readiness, and account-switch behavior.
-
-## History may be incomplete notices
-
-`marmot_history_notices` blocks on the account worker, reads local durable state only, and writes an owned
-`MarmotHistoryNoticeList`; free it with `marmot_history_notice_list_free`. Each `MarmotHistoryNotice` has an
-opaque `notice_id`, a `MarmotHistoryNoticeCause`, a `group_id_hex` that is NULL for an account-wide occurrence,
-and `has_parked_at_ms`/`parked_at_ms`. `marmot_dismiss_history_notice` writes `true` when it durably retired
-that occurrence and `false` for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`. Re-read the list
-on `MARMOT_EVENT_HISTORY_NOTICES_CHANGED`; a group's own occurrences also set
-`MarmotGroupRecoveryStatus.history_may_be_incomplete` and fill its `history_notice_ids` array, released by
-`marmot_group_recovery_status_free`. The status struct gained fields and the event union gained a trailing tag,
-so rebuild consumers with the matching header and library. See the
-[shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when notices appear,
-disappear and return.
-
-## Bounded chat screens
-
-C4 adds live Chats/Unread/Archived/Left windows and independent account attention.
-See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
-for paging, sequence handling, cancellation, C ownership, and compatibility.
-
-## Prepared conversation windows
-
-The additive C5 screen API combines history, header/capabilities, visible identities,
-read state and revisioned draft descriptors. See the [native conversation contract](../marmot-uniffi/CONVERSATION-WINDOW.md)
-for opening, paging, cancellation, timeout, ownership and draft migration.
-
-
-Avatar screen metadata is mirrored as `MarmotAvatarAsset`. Use `marmot_request_avatar_assets` for up to 16 visible
-opaque targets, `marmot_read_avatar_assets` for bounded local bytes (at most 16 references / 16 MiB), and
-`marmot_clear_avatar_cache` for explicit local removal. Free returned lists with their matching
-`marmot_avatar_asset_list_free` / `marmot_avatar_bytes_list_free` functions. Regenerate/recompile consumers against the
-matching header and library; the resolved chat/conversation records now contain an optional avatar metadata pointer.
-
-### Selected chat-list previews and actions (0.10.3)
-
-`MarmotPresentedChatRow` now embeds `preview` and `actions`. The Draft preview owns its text; the parent row/snapshot free releases it. Message selection refers to the same row’s `last_message`. Rebuild with the matching header/library; see the [shared C3 integration contract](../marmot-uniffi/CHAT-LIST-ROWS.md).

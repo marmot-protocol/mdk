@@ -1,6 +1,8 @@
 # AGENTS.md - cli
 
-Command-line app, background daemon, and terminal UI for the White Noise/Marmot stack.
+Command-line app (`wn`), background daemon (`wnd`), and terminal UI (`wn tui`) for the White Noise/Marmot stack. Cargo
+package `wn-cli`. The user manual (commands, flags, JSON fields, TUI keys) is [`README.md`](README.md); keep it current
+rather than restating it here.
 
 ## Scope
 
@@ -15,60 +17,48 @@ Command-line app, background daemon, and terminal UI for the White Noise/Marmot 
   passed directly to group, member, and key commands; directory warming lives under `marmot-app` and daemon behavior.
 - Prefer the Whitenoise-shaped product surface: `create-identity`, `login`, `logout`, `whoami`, `accounts`, `keys`,
   `chats`, `groups`, `messages`, `follows`, `profile`, `relays`, `settings`, `users`, top-level
-  `--account <npub-or-hex>`, and positional basics for common group and message flows. Keep older singular `account`,
-  `group`, and `message` commands working during the transition. If the Whitenoise-shaped command has no real
-  backing behavior yet, return an explicit `unsupported_command` JSON error instead of faking success.
+  `--account <npub-or-hex>`, and positional basics for common group and message flows. Keep the older singular
+  `account`, `group`, and `message` commands working (hidden from `--help`) during the transition. If the
+  Whitenoise-shaped command has no real backing behavior yet, return an explicit `unsupported_command` JSON error
+  instead of faking success.
 - Keep command output useful for humans by default and stable JSON when `--json` is passed.
 - Treat JSON response shapes as TUI, daemon, and script inputs. Change them deliberately.
-- Keep the README user-facing and current. Prefer installed `wn` examples; use `cargo run -p wn-cli --bin wn`
-  only when documenting source-checkout work.
+- Keep the README user-facing and current, and verify documented commands and flags against `src/args.rs` (or
+  `wn <command> --help`). Prefer installed `wn` examples; use `cargo run -p wn-cli --bin wn` only when documenting
+  source-checkout work.
 - Keep `CHANGELOG.md` current for user-facing CLI, daemon, TUI, JSON, install, or packaging changes. Use the
   `Unreleased` section until a version is tagged.
 - Keep local development installable with `cargo install --path crates/cli --locked --bins`.
 - Treat the namespaced Homebrew tap `marmot-protocol/tap` as the preferred public packaging path unless product
   direction changes. The formula should install both `wn` and `wnd`; crates.io install needs a separate publish plan
   because the workspace currently has `publish = false`.
-- Do not print or log nsecs, secret key hex, plaintext database keys, or other key material.
+- Do not print or log nsecs, secret key hex, plaintext database keys, or other key material. Read nsecs from stdin
+  (`src/secret.rs`), never argv. Render untrusted text for humans through `src/terminal.rs`; keep `--json` lossless.
+- Keep loopback relay and blob endpoints behind `WN_ALLOW_LOOPBACK_RELAYS` / `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS`.
+  `WN_DEV_SETTLEMENT_QUIESCENCE_MS` is honoured only in `test-policy-overrides` builds and is an error otherwise.
 
 ## Command Surface
 
-- `create-identity`, `login`, `logout`, `whoami`, `account`, and `accounts`: create/import/remove public or local
-  signing accounts, list accounts, inspect status, and inspect relay lists. `export-nsec` is present but must not print
-  private key material.
-- `keys`: list/publish/check/delete the selected local account's KeyPackage records, force-mint a replacement with
-  `keys rotate` (alias `force-publish`), and fetch another account's latest KeyPackage.
-- `chats`: list, list-archived, show, subscribe, subscribe-archived, archive, unarchive, mute, unmute, and mark-read
-  local chat projections/notification policy.
-- `group` and `groups`: create groups (with founding `--retention` and `--image` options), list/show groups, list
-  members/admins/relays, invite/add/remove members (`--admin` grants admin to invitees in the same commit), update
-  profile fields (`groups update` is canonical; legacy `group update` stays), manage encrypted group images
-  (`set-image`/`clear-image`/`download-image`, redacted JSON per mdk#1253), show or set disappearing-message
-  retention, run the disband lifecycle (`enable-disbanding`, `disband --confirm`, `disband-status`,
-  `acknowledge-disband-failure`, `management`), inspect recovery (`recovery-status`, `confirm-rejoin`,
-  `decline-rejoin`, `quarantined`, `retry-hydrate`), delete local group data (`delete-local --confirm`), inspect
-  and repair Welcome delivery (`pending-welcomes`, `redeliver-welcome`), and subscribe to runtime-owned group-state
-  updates through the daemon. Keep irreversible or copy-discarding actions behind `--confirm`.
-- `messages`: send text messages, edit own messages (`messages edit`, kind 1009, local authorship check), publish
-  delete tombstones, retry group convergence (`messages retry`, group-scoped; the event id is optional context), run
-  the retention sweep on the production clock (`messages sweep-expired`), send app-defined custom events with any
-  non-reserved kind (`messages send-event`, repeatable `--tag` JSON arrays), list/search projected messages with
-  Whitenoise-shaped cursor flags and repeatable `--kind` filters, subscribe to runtime-owned typed message updates
-  through the daemon (also `--kind`-filterable), and the `timeline` subgroup (list/search/subscribe over the
-  materialized message timeline). Reserved app-event kinds stay rejected on the custom send path so the CLI cannot
-  forge protocol-owned events.
-- `media`: upload one or more files (optionally sent as one ordered message), send already-uploaded references
-  (`media send`), replace the group's encrypted-media blob endpoints (`media set-endpoints`), list, and download.
-- `follows`, `profile`, `relays`, `settings`, and `users`: expose the current Nostr directory/settings behavior.
-- Reaction, delete, retry, encrypted media, and admin/member management commands have implemented CLI behavior; keep
-  their JSON shapes aligned with the `Unreleased` changelog entries when changing them.
-- `notifications`: subscribe to runtime-owned local notification updates through the daemon.
-- `stream`: anchor, watch, receive, send, daemon-compose, finish, and verify provisional QUIC agent text stream previews.
-- `sync`: diagnostic catch-up for processing relay events for the selected local signing account.
-- `relay-stats`: print device-local relay performance telemetry (aggregate counters, cross-relay spread, per-relay
-  first-deliverer and first-event/EOSE timing, redacted relay health). Reads the live `wnd` runtime when a socket
-  exists. Aggregate-only; per-relay rows use opaque device-local indices, never relay URLs.
-- `daemon`: start, stop, and inspect `wnd`.
-- `tui`: open the Ratatui interface over the real `wn --json` command surface.
+Each top-level command maps to a `*Command` enum in `src/args.rs` and a handler module in `src/commands/`. Per-command
+behavior and JSON fields are documented in the README; the rules below are the ones to preserve when editing.
+
+- Accounts (`create-identity`, `login`, `logout`, `whoami`, `accounts`, hidden `account`, `reset`): `export-nsec` exists
+  but must keep returning `private_key_export_disabled`.
+- `keys`: `rotate` keeps its `force-publish` alias; routine replacement must not publish kind-5 deletions.
+- `groups` / hidden `group`: keep irreversible or copy-discarding actions (`disband`, `confirm-rejoin`, `delete-local`)
+  behind `--confirm`. Keep group-image JSON redacted (mdk#1253): never print the image key, upload secret, nonce, or
+  key-bearing `data_hex`. `--admin` on invite grants admin inside the same commit.
+- `messages` / hidden `message`: keep reserved app-event kinds rejected on `send-event` so the CLI cannot forge
+  protocol-owned events. `retry` stays group-scoped (the event id is echoed context only) and never re-encrypts fresh
+  plaintext. Keep the `reply_to_after_message_text` guard for hyphen-tolerant text.
+- `media`: resolve caller-relative file paths before daemon forwarding (see Daemon Guidance).
+- `relay-stats` and `daemon status`: aggregate-only; per-relay rows use opaque device-local indices, never relay URLs,
+  account ids, group ids, subscription ids, or message ids.
+- `sync` is a diagnostic/repair path, not part of normal flows.
+- Reaction, delete, retry, encrypted media, and admin/member management JSON shapes: keep them aligned with the
+  `Unreleased` changelog entries when changing them.
+- Other namespaces: `chats`, `follows`, `profile`, `relays`, `settings`, `users`, `notifications`, `stream`, `debug`,
+  `usage-diagnostics`, `tui`.
 
 ## Daemon Guidance
 
@@ -120,6 +110,9 @@ Command-line app, background daemon, and terminal UI for the White Noise/Marmot 
   `relays`, `settings`, `users`, `notifications`, `stream` (QUIC agent text stream previews + quic-candidate/trust
   helpers), `debug`, `sync`, and `relay_stats`. Handlers and helpers reached from the lib dispatch, from the `daemon`
   module, or across namespaces are `pub(crate)`.
+- `src/main.rs` / `src/bin/wnd.rs`: thin `wn` and `wnd` binary entrypoints.
+- `src/secret.rs`: zeroizing stdin nsec import with redacted diagnostics.
+- `src/terminal.rs`: terminal-safe rendering of untrusted human-facing text (TUI and non-JSON output).
 - `src/args.rs`: clap argument/command enums (`Cli`, `Command`, and the per-namespace `*Command` types).
 - `src/error.rs`: `WnError` and the `--json` error rendering.
 - `src/daemon/`: `wnd` runtime, socket-backed execution, subscription workers; calls
@@ -133,8 +126,9 @@ Command-line app, background daemon, and terminal UI for the White Noise/Marmot 
 - `src/tui/`: Ratatui shell over the `wn --json` surface. `mod.rs` keeps the `run_tui` entry plus shared constants
   and re-exports the submodules: `model` (row/view/state types, JSON parsers, pure helpers), `view` (`TuiApp` draw
   methods + Ratatui line/style helpers), `slash` (slash-command parsing), `client` (`WnClient` subprocess wrapper,
-  subscription readers, and the `wn`/subscription-driving `TuiApp` methods), and `app` (`TuiApp` state plus the
-  event loop, key handling, and selection methods). `tests.rs` holds the TUI unit tests.
+  subscription readers, and the `wn`/subscription-driving `TuiApp` methods), `app` (`TuiApp` state plus the
+  event loop, key handling, and selection methods), and `media` (inbound-media capability detection and the off-loop
+  download/decode worker). `tests.rs` holds the TUI unit tests.
 - `tests/cli.rs`: end-to-end CLI/daemon integration tests asserting real `wn`/`wnd` behavior and JSON shapes.
 
 ## Verification
@@ -146,11 +140,14 @@ cargo run -p wn-cli --bin wn -- --help
 cargo run -p wn-cli --bin wnd -- --help
 ```
 
-For behavior changes, start with the focused crate tests:
+For behavior changes, start with the focused crate tests. CLI integration tests need `test-policy-overrides`;
+without it one-shot syncs never merge peer commits:
 
 ```sh
-cargo test -p wn-cli
+cargo test -p wn-cli --features test-policy-overrides
 cargo test -p marmot-app
+# Real local relays (needs `just relay-up`):
+just e2e-test
 ```
 
 Then widen before checkpointing cross-crate changes:

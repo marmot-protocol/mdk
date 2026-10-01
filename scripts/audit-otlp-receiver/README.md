@@ -2,7 +2,13 @@
 
 This loopback-only contract uses synthetic v4 records and disposable HTTP
 services to specify the receiver for a future MDK sender. It does not activate
-one. The existing Goggles upload and tracker path is unchanged.
+one. The existing Goggles upload and tracker path is unchanged. Read it if you
+are building the production audit gateway or the MDK sender that will push to
+it.
+
+`receiver.py` is the isolated reference receiver and `test_receiver.py` its
+contract tests. Bodies are validated against
+[`crates/marmot-forensics/schema/audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json).
 
 ## Request and validation
 

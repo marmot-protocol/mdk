@@ -1,6 +1,6 @@
 # AGENTS.md - integrations/opencode/marmot
 
-Rust opencode harness for Marmot through the local `wn-agent` control socket.
+Rust OpenCode harness for Marmot through the local `wn-agent` control socket.
 Read `README.md`, `../../AGENTS.md`, and `../../terminal-harness/AGENTS.md` first.
 
 ## Scope
@@ -21,9 +21,10 @@ Read `README.md`, `../../AGENTS.md`, and `../../terminal-harness/AGENTS.md` firs
 
 ## Key Files
 
-- `src/main.rs` - binary entrypoint, CLI help, tracing setup.
+- `src/main.rs` - binary entrypoint, CLI help, tracing setup, and shared runtime wiring.
 - `src/opencode.rs` - `opencode run --format json` process execution and event parsing.
-- `src/config.rs` - OpenCode-specific environment configuration and shared runtime wiring.
+- `src/config.rs` - OpenCode-specific environment configuration, including the legacy `WN_OPENCODE_ADMIN_HEX`
+  sender alias.
 - `tests/e2e_connector.rs` - ignored process-level test using real `wn-agent` and a fake OpenCode executable.
 - `tests/test_installer.sh` - OpenCode entrypoint for the shared terminal-harness installer test suite.
 - `scripts/install-opencode-marmot.sh` - release-installer wrapper over the shared terminal-harness installer.

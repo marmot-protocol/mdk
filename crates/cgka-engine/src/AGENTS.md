@@ -1,27 +1,21 @@
 # AGENTS.md - crates/cgka-engine/src
 
-Local map for engine source modules. The crate-level map in `../AGENTS.md` has the full design notes.
+Source-local rules. The full module map, invariants, and design notes are in [`../AGENTS.md`](../AGENTS.md).
 
 ## Rules
 
 - `engine.rs` owns construction and trait dispatch. Keep behavior in focused sibling modules.
 - `EpochManager` is the only owner of non-stable epoch-state transitions.
-- `message_processor/` is the inbound/outbound traffic junction: `mod.rs` (entry points + shared helpers + re-exports),
-  `ingest.rs` (inbound peel/classify/apply path), `send.rs` (`do_send_*` outbound methods), `store.rs` (durable
-  persistence / dedup / stored-message state), `application_replay.rs` (bounded background drain of retained
-  canonical applications, independent of the send gate). Keep helper behavior factored across these as it grows.
-- `distributed_convergence.rs` is the stored-message convergence entry point.
-- `openmls_projection.rs` is the OpenMLS bytes/replay bridge for canonicalization.
-- `openmls_projection/resumable.rs` owns the shared candidate-search frontier and slice continuations. Restore live
-  storage before yielding; cumulative probe limits and final selection semantics span the entire search.
-  Capture replay fingerprints only to validate or retain a continuation, after cheap uncontested checks.
-- `openmls_projection/tests/candidate_replay.rs` holds forked-graph fixtures, replay restoration/parity checks and
-  paired measurements. It retains the `candidate_branch_peel_halt_tests` module name so existing test filters work.
-  Encrypted-database process-kill checks remain in `../tests/crash_recovery_sqlite.rs`.
-- `message_processor/tests/application_replay.rs` holds the opt-in encrypted negative-discovery scan
-  measurement and a test-only visited-row counter; keep aggregate measurements separate from app acceptance.
-- `snapshot_guard.rs` owns panic-safe snapshot rollback/release for replay and peel probes.
-- No Nostr types in this crate.
+- `message_processor/` is the traffic junction; keep helper behavior factored across `mod.rs`, `ingest.rs`, `send.rs`,
+  `store.rs`, and `application_replay.rs` as it grows (roles in the parent module map).
+- `openmls_projection/resumable.rs`: restore live storage before yielding; cumulative probe limits and final selection
+  semantics span the entire search. Capture replay fingerprints only to validate or retain a continuation, after cheap
+  uncontested checks.
+- `openmls_projection/tests/candidate_replay.rs` keeps the `candidate_branch_peel_halt_tests` module name so existing
+  test filters work. Encrypted-database process-kill checks stay in `../tests/crash_recovery_sqlite.rs`.
+- `message_processor/tests/application_replay.rs` holds the opt-in encrypted negative-discovery scan measurement and a
+  test-only visited-row counter; keep aggregate measurements separate from app acceptance.
+- No new Nostr types. `account_identity_proof.rs` is the one tracked exception (`TODO(mdk#755)`).
 
 ## Verification
 

@@ -1,6 +1,7 @@
 # AGENTS.md - agent-connector
 
-Local Marmot agent connector daemon; ships the `wn-agent` binary.
+Local Marmot agent connector daemon; ships the `wn-agent` binary. Operator-facing usage, invite policy, media roots,
+and control-plane security model: [`README.md`](README.md).
 
 ## Scope
 
@@ -13,6 +14,24 @@ Local Marmot agent connector daemon; ships the `wn-agent` binary.
   process glue, not the protocol or composition owner.
 - Publisher routing and TLS trust use `marmot-app` host-safety validation.
   `allow_insecure_local_broker` remains an explicit dev-only opt-in.
+
+## Invariants
+
+- The control plane is local-only: Unix socket, no TCP listener, restrictive default modes (`0700` dir, `0600`
+  socket), same effective UID unless a bearer token is configured; reject world-readable/writable socket modes. The
+  token is all-or-nothing full control; do not add implied scopes without designing them.
+- `stream_capability` values are bearer secrets: compare without data-dependent early exit; never log or persist them.
+- Logging stays privacy-safe: no account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext,
+  plaintext, or key material. Use explicit `target`/`method` tracing fields.
+- Every invite policy fails closed without an authenticated welcomer. `--dev-allow-any-invites` requires
+  `--debug-controls`.
+- Outbound media reads stay confined beneath `--media-allowed-root` directory handles (no symlink following); no roots
+  means media sends are disabled.
+- Do not put release install commands or release URLs in `README.md`; they live in `integrations/README.md` and
+  `release.md`. `README.md` is scanned by `just agent-install-docs-gate` (no `wn-agent-latest` URLs, no stale
+  versioned installer URLs).
+- When adding or changing a `wn-agent` flag or env var (`src/bin/wn-agent.rs`, `src/bootstrap.rs`), update the README
+  "Run locally" section.
 
 ## Key files
 
@@ -63,10 +82,20 @@ several files in the same crate); methods shared across those files are `pub(cra
   `AccountError`, which a failing pass could self-emit) resets the net and wakes a backed-off pass, never faster
   than the base cadence (mdk#1380). Subscription initial catch-ups stay prompt out-of-band requests.
 - `src/validation.rs` — control-plane/profile/hex validation helpers and the invite-policy retry-state holders.
-- `src/bootstrap.rs` — `wn-agent bootstrap` flow.
+- `src/bootstrap.rs` — `wn-agent bootstrap` flow, default relays/QUIC candidate, and `MARMOT_*` env resolution.
+- `src/identity.rs` — `wn-agent import-identity`: owner-only, single-link, size-bounded existing Nostr identity import.
+- `src/usage_diagnostics.rs` — `wn-agent usage-diagnostics` consent controls on a separate owner-only local socket,
+  deliberately outside the agent-control protocol.
+- `src/timeline.rs` — read-only materialized-timeline projection (`timeline_message_get`/`timeline_list`).
+- `src/maintenance.rs` — agent-control maintenance status and policy handlers.
+- `src/media_roots.rs` — `MediaAllowedRoots`, connector-enforced confinement for outbound plaintext media paths.
+- `src/agent_created_groups.rs` — per-account activation provenance store, independent of sender authorization.
 - `src/bin/wn-agent.rs` — the `wn-agent` binary entrypoint and clap CLI surface (`ServeArgs`, the `bootstrap`
   subcommand and `BootstrapArgs`, octal socket-mode parsing, and terminal-QR rendering).
 - `src/tests.rs` — white-box test suite exercising the above `pub(crate)` internals.
+- `src/test_support.rs` — test-only hooks and benchmark output (the file name is load-bearing for the workspace
+  direct-output audit in `crates/cgka-conformance-simulator/tests/tracing_audit.rs`).
+- `tests/identity_security.rs` — black-box `import-identity` prompt/file security tests (Unix only).
 
 ## Verification
 
@@ -75,6 +104,22 @@ Before pushing connector changes, run the repo-wide pre-push gate plus this crat
 ```sh
 just fast-ci
 cargo test -p agent-connector
+cargo check -p agent-connector --bin wn-agent
 ```
 
-GitHub CI runs the full `just ci` workspace suite.
+When touching bootstrap, install, or harness-facing behavior, also run the installer dry runs and tests:
+
+```sh
+bash scripts/install-hermes-marmot.sh --dry-run
+sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
+bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
+bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
+bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
+integrations/hermes/tests/marmot/test_dev_scripts.sh
+just claude-installer-test
+just codex-installer-test
+just opencode-installer-test
+just pi-installer-test
+```
+
+When editing `README.md`, run `just agent-install-docs-gate`. GitHub CI runs the full `just ci` workspace suite.
