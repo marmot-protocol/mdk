@@ -1212,8 +1212,10 @@ Emitted when a stored message is inserted or changes `MessageState`.
   for a later pass without reopening convergence itself; evidence that later selects it moves it to `processed`.
 - `peel_deferred`
 - `epoch_invalidated`
-- `released` — not a stored state: the deferred-peel row was deleted under a resource refusal
-  (`resource_refused_retry_budget` below), and same-id redelivery stays eligible.
+- `released` — not a stored state: the deferred-peel row was deleted on its retry or residence budget, and same-id
+  redelivery stays eligible. The reason is `resource_refused_retry_budget` or `resource_refused_residence_budget`, and
+  the release raises `TransportObjectResourceRefused`; a row whose envelope predates this local copy is released as
+  `predates_local_copy` instead and raises no resource refusal.
 
 Current `reason` values found in production call sites:
 

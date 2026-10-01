@@ -73,32 +73,32 @@ mod tests {
     use marmot_forensics::v5::{self, BuildProfile, Platform, Producer};
     use marmot_forensics::{AuditEventKind, AuditRecord, ForensicRecorder, JsonlRecorder};
 
-    const ALL: [MessageDisposition; 8] = [
-        MessageDisposition::PreMembershipEvent,
-        MessageDisposition::AppPayloadRetentionExpired,
-        MessageDisposition::PredatesLocalCopy,
-        MessageDisposition::RetryPending,
-        MessageDisposition::RetryBudgetRefused,
-        MessageDisposition::ResidenceBudgetRefused,
-        MessageDisposition::DeferredCapacityRefused,
-        MessageDisposition::Quarantined,
-    ];
+    /// Declares `ALL` and an exhaustive match from one variant list. A new
+    /// variant fails to compile until it is named here, which also records it
+    /// in `ALL`, so the v5 parity test below cannot silently skip it.
+    macro_rules! every_disposition {
+        ($($variant:ident),+ $(,)?) => {
+            const ALL: &[MessageDisposition] = &[$(MessageDisposition::$variant),+];
 
-    /// A new variant fails to compile here until it is added to `ALL`, so the
-    /// v5 parity test below cannot silently skip it.
-    #[allow(dead_code)]
-    fn all_is_exhaustive(disposition: MessageDisposition) {
-        match disposition {
-            MessageDisposition::PreMembershipEvent
-            | MessageDisposition::AppPayloadRetentionExpired
-            | MessageDisposition::PredatesLocalCopy
-            | MessageDisposition::RetryPending
-            | MessageDisposition::RetryBudgetRefused
-            | MessageDisposition::ResidenceBudgetRefused
-            | MessageDisposition::DeferredCapacityRefused
-            | MessageDisposition::Quarantined => {}
-        }
+            #[allow(dead_code)]
+            fn all_is_exhaustive(disposition: MessageDisposition) {
+                match disposition {
+                    $(MessageDisposition::$variant)|+ => {}
+                }
+            }
+        };
     }
+
+    every_disposition!(
+        PreMembershipEvent,
+        AppPayloadRetentionExpired,
+        PredatesLocalCopy,
+        RetryPending,
+        RetryBudgetRefused,
+        ResidenceBudgetRefused,
+        DeferredCapacityRefused,
+        Quarantined,
+    );
 
     /// Every tag is a closed category the v5 audit boundary keeps verbatim,
     /// on both fields that carry it, instead of redacting it to
@@ -121,7 +121,7 @@ mod tests {
         )
         .unwrap();
         let msg_id = "ab".repeat(32);
-        for disposition in ALL {
+        for &disposition in ALL {
             recorder.record(AuditRecord::new(
                 None,
                 crate::audit_helpers::message_state_changed_event(
