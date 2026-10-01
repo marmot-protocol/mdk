@@ -4,6 +4,13 @@
 
 ### Added
 
+- `create_identity`, `create_identity_with_profile`, `login`,
+  `login_recovering_incomplete_setup`, `login_external_signer` and
+  `publish_relay_lists` take a trailing `inbox_relays` argument, and
+  `OnboardingOptionsFfi` an `inbox_relays` field, that set the kind-10050 inbox
+  list separately from `default_relays`. Both default to empty, which declares
+  `default_relays` in both lists as before, so existing Swift, Kotlin and
+  Python callers keep working unchanged.
 - `Marmot::poll_votes` pages each voter's effective poll selection
   (`PollVoteFfi`: voter account id, option ids, vote time) for a "View votes"
   sheet, 1..=100 per `PollVotePageFfi` with a `(voted_at, voter)` cursor. It

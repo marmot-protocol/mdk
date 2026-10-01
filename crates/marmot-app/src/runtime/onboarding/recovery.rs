@@ -225,13 +225,7 @@ impl AccountManager {
         // Leave intent for the next runtime instead of writing a late tombstone
         // over state that a newly opened runtime may already have recovered.
         self.shared.lifecycle().ensure_running()?;
-        let mut tombstone = OnboardingCheckpoint::new(
-            account,
-            OnboardingOptions {
-                default_relays: Vec::new(),
-                discovery_relays: Vec::new(),
-            },
-        );
+        let mut tombstone = OnboardingCheckpoint::new(account, OnboardingOptions::default());
         tombstone.version = RECOVERED_ONBOARDING_VERSION;
         tombstone.snapshot.recovery_epoch = Some(recovery.epoch.clone());
         tombstone.snapshot.cancellation_pending = true;

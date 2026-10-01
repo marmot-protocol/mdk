@@ -884,6 +884,7 @@ fn options() -> OnboardingOptions {
     OnboardingOptions {
         default_relays: vec!["wss://default.example".into()],
         discovery_relays: vec!["wss://index.example".into()],
+        inbox_relays: Vec::new(),
     }
 }
 fn runtime(path: &std::path::Path, network: Arc<Network>) -> MarmotAppRuntime {
@@ -1055,6 +1056,74 @@ async fn defaults_append_relay_roles() {
             relay_repair_event(&checkpoint, checkpoint.snapshot.proposal.as_ref().unwrap());
         assert_eq!(tags.len(), 1);
     }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn recommended_inbox_relays_use_the_separate_inbox_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let manager = runtime.accounts();
+    manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                inbox_relays: vec!["wss://inbox-default.example".into()],
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    missing_relays(&runtime, &id).await;
+    let nip65 = manager
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap()
+        .proposal
+        .unwrap();
+    assert_eq!(nip65.read_relays, ["wss://default.example"]);
+    assert_eq!(nip65.write_relays, ["wss://default.example"]);
+    manager.cancel_onboarding_repair(&id).await.unwrap();
+
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.set(OnboardingStep::Relays, OnboardingStatus::Passed, vec![]);
+    c.set(
+        OnboardingStep::InboxRelays,
+        OnboardingStatus::NeedsInput,
+        vec![finding(OnboardingIssue::Missing)],
+    );
+    manager.save_onboarding(&mut c).unwrap();
+    let inbox = manager
+        .propose_onboarding_relays(&id, OnboardingStep::InboxRelays, None)
+        .await
+        .unwrap()
+        .proposal
+        .unwrap();
+    assert_eq!(inbox.read_relays, ["wss://inbox-default.example"]);
+    assert!(inbox.write_relays.is_empty());
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_rejects_unsafe_inbox_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(dir.path(), Arc::new(Network::default()));
+    let keys = nostr::prelude::Keys::generate();
+    let result = runtime
+        .accounts()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                inbox_relays: vec!["wss://relay.damus.io".into()],
+                ..options()
+            },
+        )
+        .await;
+    assert!(result.is_err());
     runtime.shutdown_and_close().await.unwrap();
 }
 

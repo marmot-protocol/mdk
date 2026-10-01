@@ -583,6 +583,27 @@ async fn account_owned_profile_publish_rejects_signed_out_and_stopped_accounts()
 }
 
 #[test]
+fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() {
+    let request = AccountSetupRequest {
+        default_relays: vec![TransportEndpoint("wss://default.example".into())],
+        bootstrap_relays: vec![TransportEndpoint("wss://bootstrap.example".into())],
+        inbox_relays: vec![TransportEndpoint("wss://inbox.example".into())],
+        ..AccountSetupRequest::default()
+    };
+    let context = GeneratedAccountSetupContext::from_request(&request);
+    let restored: GeneratedAccountSetupContext =
+        serde_json::from_slice(&serde_json::to_vec(&context).unwrap()).unwrap();
+    assert_eq!(restored.request().inbox_relays, request.inbox_relays);
+
+    // A context persisted before separate inbox relays resumes with one list.
+    let mut legacy = serde_json::to_value(&context).unwrap();
+    legacy.as_object_mut().unwrap().remove("inbox_relays");
+    let legacy: GeneratedAccountSetupContext = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.request().inbox_relays.is_empty());
+    assert_eq!(legacy.request().default_relays, request.default_relays);
+}
+
+#[test]
 fn default_directory_discovery_relays_use_live_indexers() {
     let relays = default_directory_discovery_relays();
 

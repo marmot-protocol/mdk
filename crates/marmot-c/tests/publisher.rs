@@ -110,6 +110,8 @@ fn publisher_finishes_and_cancels() {
             1,
             relays.as_ptr(),
             1,
+            ptr::null(),
+            0,
             &mut account,
         ));
         let mut group = ptr::null_mut();

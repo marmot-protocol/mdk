@@ -699,6 +699,9 @@ pub struct AccountRelayListBootstrap {
     /// Publication-only copies of public directory records. Never advertised
     /// as NIP-65 write relays or used for KeyPackage publication.
     pub indexer_relays: Vec<TransportEndpoint>,
+    /// Relays declared in the kind-10050 inbox list. Empty declares
+    /// `default_relays`, so one list still serves both kinds.
+    pub inbox_relays: Vec<TransportEndpoint>,
 }
 
 impl AccountRelayListBootstrap {
@@ -715,12 +718,34 @@ impl AccountRelayListBootstrap {
             default_relays,
             bootstrap_relays,
             indexer_relays: Vec::new(),
+            inbox_relays: Vec::new(),
         }
     }
 
     pub fn with_indexer_relays(mut self, indexer_relays: Vec<TransportEndpoint>) -> Self {
         self.indexer_relays = indexer_relays;
         self
+    }
+
+    pub fn with_inbox_relays(mut self, inbox_relays: Vec<TransportEndpoint>) -> Self {
+        self.inbox_relays = inbox_relays;
+        self
+    }
+
+    /// The relays a published kind-10050 inbox list declares.
+    pub fn inbox_declaration(&self) -> &[TransportEndpoint] {
+        if self.inbox_relays.is_empty() {
+            &self.default_relays
+        } else {
+            &self.inbox_relays
+        }
+    }
+
+    fn declared_relays(&self, list_kind: NostrAccountRelayListKind) -> Vec<TransportEndpoint> {
+        match list_kind {
+            NostrAccountRelayListKind::Nip65 => self.default_relays.clone(),
+            NostrAccountRelayListKind::Inbox => self.inbox_declaration().to_vec(),
+        }
     }
 }
 
@@ -2088,11 +2113,17 @@ impl MarmotApp {
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
+        let declared_relays = bootstrap
+            .default_relays
+            .iter()
+            .chain(&bootstrap.inbox_relays)
+            .cloned()
+            .collect::<Vec<_>>();
         let indexer_endpoints = self.public_indexer_publish_endpoints(
             &bootstrap.indexer_relays,
             &endpoints,
             &endpoints,
-            &bootstrap.default_relays,
+            &declared_relays,
         );
 
         let mut requests = Vec::with_capacity(4);
@@ -2105,7 +2136,7 @@ impl MarmotApp {
                 event: NostrAccountRelayListPublication {
                     account_id: account_id.clone(),
                     list_kind,
-                    relays: bootstrap.default_relays.clone(),
+                    relays: bootstrap.declared_relays(list_kind),
                     publish_endpoints: endpoints.clone(),
                 }
                 .to_event()?,
@@ -2205,7 +2236,11 @@ impl MarmotApp {
             inbox: AccountRelayListState {
                 kind: KIND_MARMOT_INBOX_RELAY_LIST,
                 created_at: requests[1].event.created_at,
-                relays,
+                relays: bootstrap
+                    .inbox_declaration()
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
                 read_relays: Vec::new(),
                 write_relays: Vec::new(),
             },
@@ -2590,12 +2625,18 @@ impl MarmotApp {
             bootstrap
                 .default_relays
                 .iter()
+                .chain(&bootstrap.inbox_relays)
                 .chain(&relays.read_relays)
                 .chain(&relays.write_relays)
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            bootstrap.default_relays.clone()
+            bootstrap
+                .default_relays
+                .iter()
+                .chain(&bootstrap.inbox_relays)
+                .cloned()
+                .collect::<Vec<_>>()
         };
         let indexer_endpoints = self.public_indexer_publish_endpoints(
             &bootstrap.indexer_relays,
@@ -2620,7 +2661,7 @@ impl MarmotApp {
                 NostrAccountRelayListPublication {
                     account_id: account_id.clone(),
                     list_kind: *list_kind,
-                    relays: bootstrap.default_relays.clone(),
+                    relays: bootstrap.declared_relays(*list_kind),
                     publish_endpoints: endpoints.clone(),
                 }
                 .to_event()?
@@ -2700,7 +2741,7 @@ impl MarmotApp {
                         kind: KIND_MARMOT_INBOX_RELAY_LIST,
                         created_at: request.event.created_at,
                         relays: bootstrap
-                            .default_relays
+                            .inbox_declaration()
                             .iter()
                             .map(|endpoint| endpoint.0.clone())
                             .collect(),
@@ -2754,6 +2795,10 @@ impl MarmotApp {
             (
                 bootstrap.default_relays.as_slice(),
                 "account relay-list declaration",
+            ),
+            (
+                bootstrap.inbox_relays.as_slice(),
+                "account inbox relay-list declaration",
             ),
             (
                 bootstrap.bootstrap_relays.as_slice(),

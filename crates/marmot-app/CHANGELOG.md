@@ -4,6 +4,14 @@
 
 ### Added
 
+- Hosts can declare a separate kind-10050 inbox relay list.
+  `AccountSetupRequest::inbox_relays`, `AccountRelayListBootstrap::inbox_relays`
+  (`with_inbox_relays`) and `OnboardingOptions::inbox_relays` set it for
+  generated-account bootstrap, missing-list publication on import or login,
+  and onboarding's recommended inbox relays. Empty keeps the previous
+  behavior: `default_relays` declare both the NIP-65 and the inbox list.
+  Persisted setup contexts and onboarding checkpoints without the field resume
+  unchanged.
 - `MarmotAppRuntime::poll_votes` pages each voter's effective poll selection
   (`PollVotePage` of `PollVote`) with the same rules as the timeline poll
   tally. (#2091)

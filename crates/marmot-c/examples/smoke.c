@@ -444,7 +444,7 @@ int main(int argc, char **argv) {
 
     /* ---- best-effort identity (needs a relay) ------------------------- */
     MarmotAccountSummary *summary = NULL;
-    st = marmot_create_identity(client, relays, 1, relays, 1, &summary);
+    st = marmot_create_identity(client, relays, 1, relays, 1, NULL, 0, &summary);
     if (st == MARMOT_STATUS_OK && summary != NULL) {
         printf("smoke: ok: identity created: %s\n", summary->account_id_hex);
         marmot_account_summary_free(summary);

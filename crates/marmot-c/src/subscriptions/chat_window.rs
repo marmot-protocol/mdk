@@ -316,7 +316,11 @@ mod tests {
             marmot: kit,
         };
         let account = client
-            .block_on(client.marmot.create_identity(vec![url.clone()], vec![url]))
+            .block_on(
+                client
+                    .marmot
+                    .create_identity(vec![url.clone()], vec![url], Vec::new()),
+            )
             .unwrap()
             .account_id_hex;
         for name in ["One", "Two"] {
@@ -469,7 +473,11 @@ mod tests {
             marmot: kit,
         };
         let account = client
-            .block_on(client.marmot.create_identity(vec![url.clone()], vec![url]))
+            .block_on(
+                client
+                    .marmot
+                    .create_identity(vec![url.clone()], vec![url], Vec::new()),
+            )
             .unwrap()
             .account_id_hex;
         let group = client

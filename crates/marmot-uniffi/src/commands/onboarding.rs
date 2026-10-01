@@ -290,6 +290,7 @@ mod tests {
         OnboardingOptionsFfi {
             default_relays: vec![relay_url.clone()],
             discovery_relays: vec![relay_url],
+            inbox_relays: Vec::new(),
         }
     }
 

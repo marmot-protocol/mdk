@@ -110,16 +110,22 @@ impl Marmot {
     /// and an explicit readiness state. Public indexers receive best-effort
     /// copies of both relay lists and kind-0 metadata; KeyPackages remain on
     /// the advertised write relays.
+    ///
+    /// `inbox_relays` (default empty) sets the kind-10050 inbox list
+    /// separately; empty declares `default_relays` in both lists.
+    #[uniffi::method(default(inbox_relays = []))]
     pub async fn create_identity(
         &self,
         default_relays: Vec<String>,
         bootstrap_relays: Vec<String>,
+        inbox_relays: Vec<String>,
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
         let request = AccountSetupRequest {
             identity: None,
             import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
+            inbox_relays: endpoints(&inbox_relays),
             discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -140,16 +146,22 @@ impl Marmot {
     /// authority for whether relay publication has completed; `LocalReady`
     /// must not be presented as invite-receivable. Account setup copies both
     /// relay lists and the default kind-0 profile to public indexers.
+    ///
+    /// `inbox_relays` (default empty) sets the kind-10050 inbox list
+    /// separately; empty declares `default_relays` in both lists.
+    #[uniffi::method(default(inbox_relays = []))]
     pub async fn create_identity_with_profile(
         &self,
         default_relays: Vec<String>,
         bootstrap_relays: Vec<String>,
+        inbox_relays: Vec<String>,
     ) -> Result<IdentityCreationResultFfi, MarmotKitError> {
         let request = AccountSetupRequest {
             identity: None,
             import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
+            inbox_relays: endpoints(&inbox_relays),
             discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -183,11 +195,16 @@ impl Marmot {
     /// Log in with an existing identity. `identity` can be an `nsec` (private
     /// key) for a local-signing account, or an `npub` to track a public
     /// identity without local signing.
+    ///
+    /// `inbox_relays` (default empty) sets the kind-10050 inbox list
+    /// separately; empty declares `default_relays` in both lists.
+    #[uniffi::method(default(inbox_relays = []))]
     pub async fn login(
         &self,
         identity: String,
         default_relays: Vec<String>,
         bootstrap_relays: Vec<String>,
+        inbox_relays: Vec<String>,
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
         let (public_identity, import_nsec) = if marmot_app::is_nostr_secret(&identity) {
             (None, Some(Zeroizing::new(identity)))
@@ -199,6 +216,7 @@ impl Marmot {
             import_nsec,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
+            inbox_relays: endpoints(&inbox_relays),
             discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -234,12 +252,17 @@ impl Marmot {
     /// had durable account-setup journals. This validates the same nsec,
     /// removes only the recognized ambiguous partial shape, preserves an
     /// existing account-id Keychain credential, and immediately retries login.
+    ///
+    /// `inbox_relays` (default empty) sets the kind-10050 inbox list
+    /// separately; empty declares `default_relays` in both lists.
+    #[uniffi::method(default(inbox_relays = []))]
     pub async fn login_recovering_incomplete_setup(
         &self,
         nsec: String,
         default_relays: Vec<String>,
         bootstrap_relays: Vec<String>,
         acknowledge_possible_key_package_orphan: bool,
+        inbox_relays: Vec<String>,
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
         if !marmot_app::is_nostr_secret(&nsec) {
             return Err(MarmotKitError::InvalidIdentity {
@@ -251,6 +274,7 @@ impl Marmot {
             import_nsec: Some(Zeroizing::new(nsec)),
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
+            inbox_relays: endpoints(&inbox_relays),
             discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -276,18 +300,24 @@ impl Marmot {
     /// account-identity proof signing are routed through `signer`; apps must
     /// call this again after process restart before the external account can
     /// publish, decrypt welcomes, or start its worker.
+    ///
+    /// `inbox_relays` (default empty) sets the kind-10050 inbox list
+    /// separately; empty declares `default_relays` in both lists.
+    #[uniffi::method(default(inbox_relays = []))]
     pub async fn login_external_signer(
         &self,
         public_key: String,
         signer: std::sync::Arc<dyn ExternalAccountSignerFfi>,
         default_relays: Vec<String>,
         bootstrap_relays: Vec<String>,
+        inbox_relays: Vec<String>,
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
         let request = AccountSetupRequest {
             identity: None,
             import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
+            inbox_relays: endpoints(&inbox_relays),
             discovery_relays: ffi_discovery_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -347,16 +377,22 @@ impl Marmot {
     /// relays and schedules public indexer copies when eligible, so call when
     /// the relay lists need publication rather than on every launch. Indexers
     /// are not advertised as account relays.
+    ///
+    /// `inbox_relays` (default empty) sets the kind-10050 inbox list
+    /// separately; empty declares `default_relays` in both lists.
+    #[uniffi::method(default(inbox_relays = []))]
     pub async fn publish_relay_lists(
         &self,
         account_ref: String,
         default_relays: Vec<String>,
         bootstrap_relays: Vec<String>,
+        inbox_relays: Vec<String>,
     ) -> Result<(), MarmotKitError> {
         let bootstrap = marmot_app::AccountRelayListBootstrap::new(
             endpoints(&default_relays),
             endpoints(&bootstrap_relays),
         )
+        .with_inbox_relays(endpoints(&inbox_relays))
         .with_indexer_relays(ffi_discovery_relays());
         self.app
             .publish_account_relay_lists(&account_ref, bootstrap)
@@ -721,7 +757,7 @@ mod tests {
         let kit = Marmot { app, runtime };
 
         let created = kit
-            .create_identity_with_profile(vec![relay_url.clone()], vec![relay_url])
+            .create_identity_with_profile(vec![relay_url.clone()], vec![relay_url], Vec::new())
             .await
             .expect("create generated identity at local readiness");
 

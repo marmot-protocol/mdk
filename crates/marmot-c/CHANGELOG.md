@@ -9,6 +9,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_create_identity`, `marmot_create_identity_with_profile`,
+  `marmot_login`, `marmot_login_recovering_incomplete_setup`,
+  `marmot_publish_relay_lists` and `marmot_begin_onboarding` take a trailing
+  `inbox_relays`/`inbox_relays_len` array that sets the kind-10050 inbox list
+  separately from `default_relays`. Pass `NULL, 0` to keep declaring
+  `default_relays` in both lists. The signatures changed: recompile against the
+  matching header and library.
 - `marmot_poll_votes` returns a `MarmotPollVotePage` of each voter's effective
   poll selection, 1..=100 per page with a `(voted_at, voter)` cursor; all pages
   sum to the `MarmotPollProjection` tally. Free it with

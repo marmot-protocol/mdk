@@ -6018,6 +6018,7 @@ async fn confirmed_bootstrap_retry_republishes_public_indexer_copies() {
     let request = || AccountSetupRequest {
         default_relays: vec![TransportEndpoint("wss://relay.example".into())],
         bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
@@ -6139,6 +6140,7 @@ async fn stalled_indexer_does_not_delay_generated_account_network_readiness() {
         runtime.create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
@@ -6175,6 +6177,7 @@ async fn runtime_shutdown_cancels_pending_indexer_copies() {
         .create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
             publish_initial_key_package: false,
             ..AccountSetupRequest::default()
@@ -6221,6 +6224,7 @@ async fn account_removal_cancels_pending_indexer_copies() {
         .create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
             publish_initial_key_package: false,
             ..AccountSetupRequest::default()

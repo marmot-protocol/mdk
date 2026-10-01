@@ -1315,6 +1315,7 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
             import_nsec: Some(zeroize::Zeroizing::new(secret)),
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&url), endpoint(&stall_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -1535,6 +1536,7 @@ async fn failed_reactivation_key_package_publish_restores_signed_out_retry() {
         import_nsec: Some(zeroize::Zeroizing::new(secret.to_owned())),
         default_relays: vec![endpoint(&url)],
         bootstrap_relays: vec![endpoint(&url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: true,
@@ -1595,6 +1597,7 @@ async fn failed_external_signer_reactivation_restores_signed_out_retry() {
     let setup = || AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
         bootstrap_relays: vec![endpoint(&url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: true,
@@ -9146,6 +9149,7 @@ async fn existing_login_preserves_outbox_only_inbox(external_signer: bool, stale
     let request = AccountSetupRequest {
         default_relays: vec![endpoint(&discovery_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: false,
@@ -9273,6 +9277,7 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
             import_nsec: Some(zeroize::Zeroizing::new(secret_nsec)),
             default_relays: vec![endpoint(&relay_url)],
             bootstrap_relays: vec![endpoint(&relay_url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&relay_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -9337,6 +9342,7 @@ async fn external_signer_login_ignores_retired_routes_without_rewriting_relay_li
             AccountSetupRequest {
                 default_relays: vec![endpoint(&relay_url)],
                 bootstrap_relays: vec![endpoint(&relay_url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&relay_url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -10113,6 +10119,96 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
     );
 }
 
+async fn assert_published_relay_lists(
+    app: &MarmotApp,
+    account_id_hex: &str,
+    route: &str,
+    nip65: &str,
+    inbox: &str,
+) {
+    let status = app
+        .fetch_account_relay_list_status_for_account_id(account_id_hex, vec![endpoint(route)])
+        .await
+        .unwrap();
+    assert_eq!(status.nip65.relays, vec![nip65.to_owned()]);
+    assert_eq!(status.inbox.relays, vec![inbox.to_owned()]);
+}
+
+#[tokio::test]
+async fn generated_account_declares_separate_inbox_relays() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let (_inbox_relay, inbox_url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            inbox_relays: vec![endpoint(&inbox_url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.relay_lists.nip65.relays, vec![url.clone()]);
+    assert_eq!(created.relay_lists.inbox.relays, vec![inbox_url.clone()]);
+    assert_published_relay_lists(
+        &app,
+        &created.account.account_id_hex,
+        &url,
+        &url,
+        &inbox_url,
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn imported_account_publishes_missing_lists_with_separate_inbox_relays() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let (_inbox_relay, inbox_url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let keys = Keys::generate();
+    let imported = runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(
+                keys.secret_key().to_bech32().unwrap(),
+            )),
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            inbox_relays: vec![endpoint(&inbox_url)],
+            discovery_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(imported.relay_lists.nip65.relays, vec![url.clone()]);
+    assert_eq!(imported.relay_lists.inbox.relays, vec![inbox_url.clone()]);
+    assert_published_relay_lists(
+        &app,
+        &imported.account.account_id_hex,
+        &url,
+        &url,
+        &inbox_url,
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn account_owned_profile_publish_uses_the_selected_accounts_relay_configuration() {
     let dir = tempfile::tempdir().unwrap();
@@ -10455,6 +10551,7 @@ async fn app_runtime_sign_out_and_wipe_removes_external_signer_account() {
             AccountSetupRequest {
                 default_relays: vec![endpoint(&url)],
                 bootstrap_relays: vec![endpoint(&url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -10571,6 +10668,7 @@ async fn app_runtime_wipe_drops_external_signer_registration() {
             AccountSetupRequest {
                 default_relays: vec![endpoint(&url)],
                 bootstrap_relays: vec![endpoint(&url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -10616,6 +10714,7 @@ async fn app_runtime_sign_out_keeps_external_signer_registration() {
             AccountSetupRequest {
                 default_relays: vec![endpoint(&url)],
                 bootstrap_relays: vec![endpoint(&url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -10899,6 +10998,7 @@ async fn app_runtime_sign_out_succeeds_for_external_signer_account() {
             AccountSetupRequest {
                 default_relays: vec![endpoint(&url)],
                 bootstrap_relays: vec![endpoint(&url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -12517,6 +12617,7 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&discovery_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: true,
@@ -12575,6 +12676,7 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
             import_nsec: Some(zeroize::Zeroizing::new(carol_nsec)),
             default_relays: vec![endpoint(&discovery_url)],
             bootstrap_relays: vec![endpoint(&discovery_url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&discovery_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: false,
@@ -12680,6 +12782,7 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
             import_nsec: Some(zeroize::Zeroizing::new(carol_nsec.clone())),
             default_relays: vec![endpoint(&receiver_setup_url)],
             bootstrap_relays: vec![endpoint(&receiver_setup_url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&receiver_setup_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -12740,6 +12843,7 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
             import_nsec: Some(zeroize::Zeroizing::new(carol_nsec)),
             default_relays: vec![endpoint(&discovery_url)],
             bootstrap_relays: vec![endpoint(&discovery_url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&discovery_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: false,
@@ -12768,6 +12872,7 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
     let sender_setup = AccountSetupRequest {
         default_relays: vec![endpoint(&discovery_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: true,
@@ -13233,6 +13338,7 @@ async fn assert_required_discovery_failure_does_not_publish_defaults(external_si
     let request = AccountSetupRequest {
         default_relays: vec![endpoint(&bootstrap_url)],
         bootstrap_relays: vec![endpoint(&bootstrap_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: false,
@@ -13337,6 +13443,7 @@ async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool)
     let request = AccountSetupRequest {
         default_relays: vec![endpoint(&healthy_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: false,
@@ -13444,6 +13551,7 @@ async fn newer_discovery_inbox_survives_older_outbox(external_signer: bool, empt
     let request = AccountSetupRequest {
         default_relays: vec![endpoint(&discovery_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: false,
@@ -13548,6 +13656,7 @@ async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer
         let request = AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: false,
@@ -13628,6 +13737,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
                 )),
                 default_relays: vec![endpoint(&outbox_url)],
                 bootstrap_relays: vec![endpoint(&outbox_url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&outbox_url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -13706,6 +13816,7 @@ async fn onboarding_fixture() -> (
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -13968,6 +14079,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
             TestExternalAccountSigner { keys: keys.clone() },
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -13994,6 +14106,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
             TestExternalAccountSigner { keys },
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
             },
         )
@@ -14023,6 +14136,7 @@ async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() 
             TestExternalAccountSigner { keys },
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
             },
         )
@@ -14078,6 +14192,7 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
             },
         )
@@ -14119,6 +14234,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -14290,6 +14406,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -14387,6 +14504,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -14450,6 +14568,7 @@ async fn onboarding_single_device_unknown_discovery_still_offers_explicit_contin
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -14500,6 +14619,7 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
         .account;
     let options = || marmot_app::OnboardingOptions {
         default_relays: vec![url.clone()],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![url.clone()],
     };
     assert!(
@@ -14604,6 +14724,7 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
             zeroize::Zeroizing::new(secret.clone()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )

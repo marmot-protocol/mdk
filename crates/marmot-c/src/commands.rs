@@ -581,19 +581,19 @@ c_cmd! {
     /// Create a brand-new Nostr identity, store its secret in the account
     /// secret store, and publish initial relay lists + key package. Free with
     /// `marmot_account_summary_free`.
-    async fn marmot_create_identity(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountSummary) = create_identity;
+    async fn marmot_create_identity(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, inbox_relays/inbox_relays_len: str_arr) -> rec(MarmotAccountSummary) = create_identity;
 
     /// Log in with an existing identity: an `nsec` (private key) for a
     /// local-signing account, or an `npub` to track a public identity.
     /// Free with `marmot_account_summary_free`.
-    async fn marmot_login(identity: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountSummary) = login;
+    async fn marmot_login(identity: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, inbox_relays/inbox_relays_len: str_arr) -> rec(MarmotAccountSummary) = login;
 
     /// Re-activate a non-destructively signed-out local account. Free
     /// with `marmot_account_summary_free`.
     async fn marmot_sign_in_account(account_ref: str) -> rec(MarmotAccountSummary) = sign_in_account;
 
     /// Publish NIP-65 + inbox relay lists for the account. Idempotent.
-    async fn marmot_publish_relay_lists(account_ref: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> unit = publish_relay_lists;
+    async fn marmot_publish_relay_lists(account_ref: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, inbox_relays/inbox_relays_len: str_arr) -> unit = publish_relay_lists;
 
     /// The account's NIP-65 relay list. Free with
     /// `marmot_string_list_free`.
@@ -1026,7 +1026,7 @@ c_cmd! {
 
     /// Sign in and finish a setup that was interrupted partway. Free with
     /// `marmot_account_summary_free`.
-    async fn marmot_login_recovering_incomplete_setup(nsec: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, acknowledge_possible_key_package_orphan: flag) -> rec(MarmotAccountSummary) = login_recovering_incomplete_setup;
+    async fn marmot_login_recovering_incomplete_setup(nsec: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, acknowledge_possible_key_package_orphan: flag, inbox_relays/inbox_relays_len: str_arr) -> rec(MarmotAccountSummary) = login_recovering_incomplete_setup;
 
     /// Fetch a profile image by URL, refusing anything over `max_bytes`.
     /// Free the buffer with `marmot_bytes_free`.
@@ -1093,7 +1093,7 @@ c_cmd! {
 
     /// Create a fresh identity and publish a default profile in one
     /// step. Free with `marmot_identity_creation_result_free`.
-    async fn marmot_create_identity_with_profile(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotIdentityCreationResult) = create_identity_with_profile;
+    async fn marmot_create_identity_with_profile(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, inbox_relays/inbox_relays_len: str_arr) -> rec(MarmotIdentityCreationResult) = create_identity_with_profile;
 
     /// The existing one-to-one conversation with `peer_account_id`, or
     /// NULL with `MARMOT_STATUS_OK` when there is none. Check `reusable`
@@ -2813,6 +2813,8 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
     default_relays_len: usize,
     discovery_relays: *const *const c_char,
     discovery_relays_len: usize,
+    inbox_relays: *const *const c_char,
+    inbox_relays_len: usize,
     out: *mut *mut MarmotOnboardingSnapshot,
 ) -> MarmotStatus {
     ffi_guard(|| {
@@ -2822,9 +2824,11 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
         let default_relays = try_arg!(unsafe { str_array(default_relays, default_relays_len) });
         let discovery_relays =
             try_arg!(unsafe { str_array(discovery_relays, discovery_relays_len) });
+        let inbox_relays = try_arg!(unsafe { str_array(inbox_relays, inbox_relays_len) });
         let options = marmot_uniffi::OnboardingOptionsFfi {
             default_relays,
             discovery_relays,
+            inbox_relays,
         };
         unsafe {
             deliver(

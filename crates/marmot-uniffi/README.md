@@ -285,9 +285,9 @@ Imported identities can use the durable preflight API instead of `login`:
 
 1. Call `begin_onboarding(nsec, options)` or
    `begin_external_signer_onboarding(public_key, signer, options)`. Supply the
-   same `default_relays` as new-account creation and a separate set of trusted
-   `discovery_relays`. These methods return a persisted account and snapshot
-   before fetching or publishing Nostr records.
+   same `default_relays` (and optional `inbox_relays`) as new-account creation
+   and a separate set of trusted `discovery_relays`. These methods return a
+   persisted account and snapshot before fetching or publishing Nostr records.
 2. Display the snapshot steps in their returned order (profile, follows, general
    relays, inbox relays, single-device notice, KeyPackage). Use step identities,
    not enum discriminants, as positions. Subscribe with `subscribe_onboarding`, read its initial

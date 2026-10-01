@@ -187,6 +187,7 @@ pub(crate) async fn create_or_import_account_command(
             import_nsec: import_nsec.map(ImportNsec::into_inner),
             default_relays,
             bootstrap_relays,
+            inbox_relays: Vec::new(),
             discovery_relays,
             publish_missing_relay_lists,
             publish_initial_key_package,
