@@ -1881,10 +1881,19 @@ fn public_indexers_join_discovery_except_on_loopback_routes() {
         let local = OnboardingOptions {
             default_relays: vec![loopback.into()],
             discovery_relays: vec![loopback.into()],
+            inbox_relays: Vec::new(),
         };
         let mut sources = local.discovery_relays.clone();
         append_public_indexers(&mut sources, &local, &indexers);
         assert_eq!(sources, [loopback]);
+        // A loopback inbox route alone also marks a development setup.
+        let local_inbox = OnboardingOptions {
+            inbox_relays: vec![loopback.into()],
+            ..options()
+        };
+        let mut sources = local_inbox.discovery_relays.clone();
+        append_public_indexers(&mut sources, &local_inbox, &indexers);
+        assert_eq!(sources, local_inbox.discovery_relays);
     }
 }
 

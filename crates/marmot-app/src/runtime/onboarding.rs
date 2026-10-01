@@ -2465,6 +2465,7 @@ fn append_public_indexers(
         .default_relays
         .iter()
         .chain(&options.discovery_relays)
+        .chain(&options.inbox_relays)
         .any(|endpoint| {
             url::Url::parse(endpoint).ok().is_some_and(|url| {
                 url.host()
