@@ -3944,6 +3944,7 @@ MarmotStatus marmot_set_chat_muted(const struct MarmotClient *client, const char
 ```
 
 Mute a conversation. `has_muted_until_ms` plus `muted_until_ms` set a timed mute; leaving the flag unset mutes indefinitely. Free with `marmot_chat_notification_settings_free`.
+Ordinary notification updates stay suppressed, while direct mentions of the receiving account reach subscriptions with `MarmotNotificationUpdate.is_mention` set; blocked senders remain suppressed. Hosts apply their own notification permission and channel settings.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotset_chat_muted) · [Header contract](include/marmot.h#L7304)
 

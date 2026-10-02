@@ -30,6 +30,11 @@
 
 ### Changed
 
+- `set_chat_muted` now allows direct mentions of the receiving account through
+  the durable mute in notification subscriptions; ordinary traffic stays silent
+  and blocked senders remain suppressed. Hosts still apply their own permission,
+  channel, and foreground policy to `NotificationUpdateFfi`.
+  (marmot-protocol/whitenoise-android#2984)
 - Attachment downloads report `Failed` instead of staying `RetryScheduled`
   indefinitely when the blob is gone (404/410 everywhere) or its epoch key stays
   unavailable for about eight minutes. Hosts should offer Retry: it derives a

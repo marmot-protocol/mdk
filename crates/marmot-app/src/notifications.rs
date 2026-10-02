@@ -309,6 +309,8 @@ pub struct NotificationUpdate {
     /// pubkey-reference (`p`) tag or an inline nostr pubkey entity (a bare
     /// `@npub1…` handle or an explicit `nostr:` URI) on the inbound app event.
     /// This is computed from event semantics, not the rendered preview text.
+    /// A durable chat mute still emits direct mentions with this flag set;
+    /// blocked senders remain suppressed before an update is emitted.
     pub is_mention: bool,
     pub message_id_hex: Option<String>,
     pub sender: NotificationUser,
@@ -1899,10 +1901,7 @@ fn notification_update_from_message(
         Err(AppError::UnknownGroup(_)) => return Ok(None),
         Err(err) => return Err(err),
     };
-    // A durable chat mute silences ordinary traffic, but a typed direct
-    // mention of this account remains eligible for host notification policy.
-    // Classification is restricted to chat messages and excludes self-sends;
-    // sender blocks were checked before reaching this point.
+    // Durable mute silences everything except a direct mention of this account.
     let is_from_self = event.message.sender == event.account_id_hex;
     let is_mention = notification_is_mention(&event.message, &event.account_id_hex, is_from_self);
     if muted && !is_mention {

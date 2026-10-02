@@ -32,6 +32,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   conversation rows also keep NIP-30 `emoji` tags. Requires the matching
   regenerated header and library.
 
+### Changed
+
+- `marmot_set_chat_muted` now allows direct mentions of the receiving account
+  through the durable mute in notification subscriptions. Ordinary traffic
+  stays silent and blocked senders remain suppressed; C hosts still apply
+  their own notification permission, channel, and foreground policy. No C ABI
+  layout changes. (marmot-protocol/whitenoise-android#2984)
+
 
 ## [0.11.0] - 2026-09-29
 

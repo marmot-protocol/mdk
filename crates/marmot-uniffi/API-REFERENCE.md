@@ -934,6 +934,7 @@ pub fn set_chat_muted( &self, account_ref: String, group_id_hex: String, muted_u
 ```
 
 Mute one chat until an absolute Unix epoch millisecond timestamp, or indefinitely when `muted_until_ms` is `None`.
+Ordinary notification updates stay suppressed, while direct mentions of the receiving account reach subscriptions with `NotificationUpdateFfi.is_mention = true`; blocked senders remain suppressed. Hosts apply their own notification permission and channel settings.
 
 [Source](src/commands/chat_list.rs#L202)
 

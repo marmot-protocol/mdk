@@ -224,7 +224,8 @@ is not a kind-9 chat message in this chat, leaves the marker untouched and retur
 `group_id`, and the five projection keys above.
 
 `chats mute` and `chats unmute` control local per-chat notification suppression; durations accept `s`, `m`, `h`, `d`,
-or `w` suffixes, plus `forever`.
+or `w` suffixes, plus `forever`. A muted chat stays quiet for ordinary messages, but a direct mention of the
+receiving account remains eligible for notification; blocked senders stay suppressed.
 
 ### Groups
 

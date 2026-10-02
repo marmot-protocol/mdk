@@ -32,6 +32,14 @@
   `account worker startup timed out at <stage>`; hosts that matched the old
   message exactly should match its prefix. (#1911, #2098)
 
+### Changed
+
+- A durable chat mute suppresses ordinary notification traffic but still emits
+  a typed direct mention of the receiving account. Sender blocks still suppress
+  those mentions. Hosts using notification subscriptions apply their own
+  permission, channel, and foreground policy to emitted updates.
+  (marmot-protocol/whitenoise-android#2984)
+
 ### Fixed
 
 - v5 audit rows keep the engine's `pre_membership_event`,

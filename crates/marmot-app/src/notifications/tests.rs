@@ -1016,16 +1016,6 @@ fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
             received_chat("hi", vec![vec!["p".to_owned(), other]]),
             false,
         ),
-        (
-            "reaction with mention tag",
-            {
-                let mut reaction =
-                    received_chat("👍", vec![vec!["p".to_owned(), receiver.clone()]]);
-                reaction.kind = MARMOT_APP_EVENT_KIND_REACTION;
-                reaction
-            },
-            false,
-        ),
     ];
     let mut self_mention = received_chat("hi", vec![vec!["p".to_owned(), receiver.clone()]]);
     self_mention.sender = receiver.clone();

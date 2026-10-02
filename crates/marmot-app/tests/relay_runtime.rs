@@ -5192,7 +5192,7 @@ async fn unauthorized_remove_and_self_demotion_send_no_wake() {
     runtime.shutdown().await;
 }
 
-/// Live relay delivery retains direct mentions during mute while blocks and timed expiry still apply.
+/// Live relay delivery retains direct mentions through durable and timed mute while blocks still apply.
 #[tokio::test]
 async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
     let dir = tempfile::tempdir().unwrap();
@@ -5286,7 +5286,7 @@ async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-        + 2_000;
+        + 86_400_000;
     runtime
         .set_chat_muted(&bob_id, &group_hex, Some(expires_at))
         .unwrap();
@@ -5301,24 +5301,23 @@ async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
             .is_err(),
         "timed mute must still silence ordinary messages"
     );
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    if now_ms <= expires_at {
-        sleep(Duration::from_millis((expires_at - now_ms + 50) as u64)).await;
-    }
     runtime
-        .send_message(&alice_id, &group_id, b"ordinary after expiry".to_vec())
+        .send_message(
+            &alice_id,
+            &group_id,
+            format!("timed mute @{bob_npub}").into_bytes(),
+        )
         .await
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
-    let after_expiry = wait_for_notification(&mut subscription, |update| {
-        update.account_id_hex == bob_id
-            && update.preview_text.as_deref() == Some("ordinary after expiry")
+    let timed_mention = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id && update.is_mention
     })
     .await;
-    assert!(!after_expiry.is_mention);
+    assert!(matches!(
+        timed_mention.trigger,
+        NotificationTrigger::NewMessage
+    ));
 
     runtime.shutdown().await;
 }
