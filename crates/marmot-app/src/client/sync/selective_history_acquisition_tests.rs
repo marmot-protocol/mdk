@@ -181,3 +181,45 @@ async fn failed_comparison_keeps_the_history_acquisition_hold() {
     .await;
     assert!(!storage.history_acquisition_held(&group_id).unwrap());
 }
+
+/// Known history a relay named but the pass did not return is debt even when
+/// every required relay certified: a best-effort relay can be the only one
+/// that has an older message. The route must not certify, so settlement
+/// cannot satisfy the obligation and sweep the hold away (mdk#2086).
+#[tokio::test]
+async fn unreturned_history_withholds_the_certificate_that_would_release_the_hold() {
+    use cgka_traits::storage::HistoryAcquisitionHoldStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group_id = client.create_group("held", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+
+    // Every required relay finished, but a relay named one event this pass
+    // did not return.
+    run_group_comparison(&mut client, &storage, |_| NostrReconciliationSummary {
+        relays_succeeded: 1,
+        remote_items: 1,
+        unreturned_items: 1,
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        storage.history_acquisition_held(&group_id).unwrap(),
+        "named but undownloaded history keeps the hold through settlement"
+    );
+
+    run_group_comparison(&mut client, &storage, |_| NostrReconciliationSummary {
+        relays_succeeded: 1,
+        ..Default::default()
+    })
+    .await;
+    assert!(!storage.history_acquisition_held(&group_id).unwrap());
+}

@@ -512,7 +512,7 @@ impl AppClient {
                             }));
                         }
                     }
-                    let (outcome, certified, answered) = inventory
+                    let (outcome, mut certified, answered) = inventory
                         .map_or((Outcome::TransientFailure, false, false), |inventory| {
                             inventory.judge(&summary)
                         });
@@ -528,6 +528,12 @@ impl AppClient {
                             self.app
                                 .account_storage(&self.state.label)?
                                 .hold_history_acquisition(&group.group_id, transport_group_id)?;
+                            // Named history is debt even when only a
+                            // best-effort relay has it. A certificate would
+                            // satisfy the obligation and release the hold
+                            // before it arrives; without one the route is
+                            // downloaded or parks with a notice.
+                            certified = false;
                         }
                         // A relay that failed negotiation or truncated its
                         // set names nothing, so only a certified comparison
@@ -536,7 +542,7 @@ impl AppClient {
                         acquisition_hold = Some(AcquisitionHold {
                             group_id: group.group_id.clone(),
                             transport_group_id: *transport_group_id,
-                            complete: certified && summary.unreturned_items == 0,
+                            complete: certified,
                         });
                     }
                     (outcome, certified, answered, events)

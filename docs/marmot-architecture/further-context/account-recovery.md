@@ -206,7 +206,9 @@ steps prevent this:
 - Before admitting a pass's batch, the job holds the group's epoch if the route still has
   remote-only events the pass did not return (`unreturned_items`). The hold is a durable
   per-group row that the engine reads at convergence, next to the deferred-peel barrier.
-  While it is in place, commits buffer and queued sends wait.
+  While it is in place, commits buffer and queued sends wait. Such a pass also does not
+  certify the route, even when only a best-effort relay named the missing events, so
+  settlement cannot satisfy the obligation while named history is still undownloaded.
 - The hold ends at the checkpoint of a pass whose comparison certified the route, left no
   remote-only event unreturned, and durably admitted its batch. A relay that failed
   negotiation or truncated its set names nothing, so such a pass keeps the hold. It also ends at any settlement or account open that finds no runnable
