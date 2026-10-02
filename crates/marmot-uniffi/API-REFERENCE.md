@@ -2363,6 +2363,17 @@ send time, and an accepted open poll remains votable after conversation reclassi
 
 [Source](src/commands/message.rs#L254)
 
+### `Marmot::message_reactions`
+
+```rust
+pub fn message_reactions( &self, account_ref: String, group_id_hex: String, message_id_hex: String, ) -> Result<Vec<crate::conversions::TimelineUserReactionFfi>, MarmotKitError>
+```
+
+Read every effective user/emoji pair for an exact account/group/message. Use for reaction details, because conversation references contain only a bounded preview. Returns one local snapshot, ordered by timestamp/sender/emoji, with duplicate events collapsed to the latest pair. Blocked reactors and hidden, deleted, invalidated or retention-pruned targets are excluded. Run off the UI thread, refresh on installed conversation revisions, and discard results when the owning screen closes. No network work, localization or durable client cache is involved; records are caller-owned. See [conversation details](CONVERSATION-WINDOW.md#complete-reaction-details).
+
+[Source](src/commands/timeline.rs#L19)
+
+
 ### `Marmot::poll_votes`
 
 **Current.** Use for a "View votes" sheet that lists who chose each option.
@@ -2380,7 +2391,7 @@ last vote's `voted_at` and `voter_account_id_hex` while `has_more_after` is true
 votes from former members are not bounded by the current group size. Re-read from the start when the poll row is
 reprojected, and run this synchronous query off the UI thread. See [Polls](POLLS.md).
 
-[Source](src/commands/timeline.rs#L54)
+[Source](src/commands/timeline.rs#L83)
 
 ### `Marmot::messages`
 
@@ -3237,7 +3248,7 @@ pub fn message_edit_history( &self, account_ref: String, group_id_hex: String, t
 
 Accepted edit versions, oldest first within a latest-first page (1..=100). Supply both cursor fields from the first version to load older versions. Run this synchronous details query off the UI thread; screens already carry effective content.
 
-[Source](src/commands/timeline.rs#L12)
+[Source](src/commands/timeline.rs#L41)
 
 ### `Marmot::timeline_messages`
 
@@ -3249,7 +3260,7 @@ pub fn timeline_messages( &self, account_ref: String, query: TimelineMessageQuer
 
 Materialized conversation timeline for a group or account-wide tail.
 
-[Source](src/commands/timeline.rs#L99)
+[Source](src/commands/timeline.rs#L128)
 
 </details>
 

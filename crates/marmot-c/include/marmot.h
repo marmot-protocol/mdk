@@ -1471,6 +1471,25 @@ typedef struct MarmotAttachmentPageRead {
   };
 } MarmotAttachmentPageRead;
 
+/**
+ * One individual authenticated reaction.
+ */
+typedef struct MarmotTimelineUserReaction {
+  char *reaction_message_id_hex;
+  char *target_message_id_hex;
+  char *sender;
+  char *emoji;
+  uint64_t reacted_at;
+} MarmotTimelineUserReaction;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotTimelineUserReactionList {
+  struct MarmotTimelineUserReaction *items;
+  uintptr_t len;
+} MarmotTimelineUserReactionList;
+
 typedef struct MarmotAvatarAsset {
   char *target;
   char *reference;
@@ -3812,17 +3831,6 @@ typedef struct MarmotTimelineReactionEmoji {
 } MarmotTimelineReactionEmoji;
 
 /**
- * One individual authenticated reaction.
- */
-typedef struct MarmotTimelineUserReaction {
-  char *reaction_message_id_hex;
-  char *target_message_id_hex;
-  char *sender;
-  char *emoji;
-  uint64_t reacted_at;
-} MarmotTimelineUserReaction;
-
-/**
  * A message's reaction summary.
  */
 typedef struct MarmotTimelineReactionSummary {
@@ -5643,6 +5651,23 @@ MarmotStatus marmot_attachment_history_version(const struct MarmotClient *client
 MarmotStatus marmot_attachment_history_version_change_since(const struct MarmotAttachmentHistoryVersion *current,
                                                             const struct MarmotAttachmentHistoryVersion *previous,
                                                             uint32_t *out);
+
+/**
+ * Read every effective sender/emoji pair for one visible message, off the UI thread.
+ * Local snapshot; re-read on conversation changes. Missing/hidden/deleted/invalidated
+ * targets yield an empty list. Free with `marmot_timeline_user_reaction_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_message_reactions(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      const char *message_id_hex,
+                                      struct MarmotTimelineUserReactionList **out);
 
 /**
  * Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
@@ -11310,6 +11335,15 @@ void marmot_app_performance_snapshot_free(struct MarmotAppPerformanceSnapshot *p
  * this library.
  */
 void marmot_poll_vote_page_free(struct MarmotPollVotePage *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_timeline_user_reaction_list_free(struct MarmotTimelineUserReactionList *list);
 
 /**
  * Free a value of this type returned by this library. NULL
