@@ -6816,13 +6816,17 @@ impl MarmotApp {
         if public_key.to_hex() != account.account_id_hex {
             return Err(AppError::ExternalSignerMismatch);
         }
-        self.external_signers
+        let mut signers = self
+            .external_signers
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                account.account_id_hex.clone(),
-                RegisteredExternalSigner::new(public_key, signer),
-            );
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match signers.entry(account.account_id_hex.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().replace(signer),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RegisteredExternalSigner::new(public_key, signer));
+            }
+        }
+        drop(signers);
         self.account_publish_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
