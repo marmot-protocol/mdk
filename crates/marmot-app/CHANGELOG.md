@@ -53,7 +53,8 @@
   before this release keeps its original, indexer-free destinations.
   A host-selected set from `set_onboarding_discovery_relays` is used as given,
   without indexers, so an unreachable indexer can be bypassed. Loopback
-  (development) routes are unchanged, and the KeyPackage device check keeps
+  (development) routes are unchanged, a repair that declares a loopback relay
+  is never published to the indexers, and the KeyPackage device check keeps
   its existing sources.
 - A route change, such as creating or leaving a group, no longer resets
   history recovery for every route. Routes whose own window and required

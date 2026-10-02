@@ -1746,6 +1746,78 @@ async fn legacy_approved_repairs_do_not_publish_to_uninspected_indexers() {
 }
 
 #[tokio::test]
+async fn repairs_declaring_a_loopback_relay_are_not_exported_to_public_indexers() {
+    let loopback = "ws://127.0.0.1:7777";
+    let indexers = crate::default_directory_discovery_relays();
+    for (step, declares_loopback) in [
+        (OnboardingStep::Relays, true),
+        (OnboardingStep::Profile, true),
+        (OnboardingStep::Relays, false),
+    ] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut relays = vec!["wss://default.example".to_owned()];
+        if declares_loopback {
+            relays.push(loopback.to_owned());
+        }
+        let proposal = if step == OnboardingStep::Relays {
+            OnboardingRepairProposal {
+                step,
+                revision: c.snapshot.revision + 1,
+                previous_event_id: None,
+                read_relays: relays.clone(),
+                write_relays: relays,
+                profile: None,
+                follows: None,
+            }
+        } else {
+            // The loopback relay is in the account's cached relay list only.
+            c.records[OnboardingStep::Relays.index()] = Some(signed(
+                &keys,
+                10002,
+                relays
+                    .iter()
+                    .map(|relay| vec!["r".into(), relay.clone()])
+                    .collect(),
+                "",
+                unix_now_seconds(),
+            ));
+            OnboardingRepairProposal {
+                step,
+                revision: c.snapshot.revision + 1,
+                previous_event_id: None,
+                read_relays: Vec::new(),
+                write_relays: Vec::new(),
+                profile: Some(UserProfileMetadata {
+                    name: Some("dev".into()),
+                    ..Default::default()
+                }),
+                follows: None,
+            }
+        };
+        c.snapshot.revision = proposal.revision;
+        c.snapshot.proposal = Some(proposal);
+        c.approved = true;
+        let mut sources = vec!["wss://index.example".to_owned()];
+        sources.extend(indexers.iter().map(|indexer| indexer.0.clone()));
+        c.approved_sources = Some(sources);
+        manager.save_onboarding(&mut c).unwrap();
+
+        assert!(manager.publish_onboarding_repair(&mut c).await.unwrap());
+        let published = network.published_endpoints.lock().unwrap()[0].clone();
+        assert!(published.iter().any(|e| e.contains("index.example")));
+        let exported = indexers.iter().any(|indexer| {
+            published
+                .iter()
+                .any(|e| relay_key(e) == relay_key(&indexer.0))
+        });
+        assert_eq!(exported, !declares_loopback, "{step:?}");
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn approved_repairs_publish_to_the_sources_inspected_at_approval() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;

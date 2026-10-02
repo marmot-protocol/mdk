@@ -2363,6 +2363,24 @@ impl AccountManager {
                 .await?
             }
         };
+        // Like public indexer copies, a record that declares a loopback relay
+        // is a development record: search indexers for it, never export it.
+        if declares_loopback_relay(c, &proposal, &event) {
+            let declared: HashSet<String> = proposal
+                .read_relays
+                .iter()
+                .chain(&proposal.write_relays)
+                .map(|relay| relay_key(relay))
+                .collect();
+            let indexers: HashSet<String> = default_directory_discovery_relays()
+                .iter()
+                .map(|endpoint| relay_key(&endpoint.0))
+                .collect();
+            endpoints.retain(|endpoint| {
+                let key = relay_key(endpoint);
+                !indexers.contains(&key) || declared.contains(&key)
+            });
+        }
         endpoints.extend(
             proposal
                 .read_relays
@@ -2466,12 +2484,7 @@ fn append_public_indexers(
         .iter()
         .chain(&options.discovery_relays)
         .chain(&options.inbox_relays)
-        .any(|endpoint| {
-            url::Url::parse(endpoint).ok().is_some_and(|url| {
-                url.host()
-                    .is_some_and(cgka_traits::app_components::is_loopback_host)
-            })
-        });
+        .any(|endpoint| is_loopback_relay(endpoint));
     if loopback {
         return;
     }
@@ -2481,6 +2494,46 @@ fn append_public_indexers(
             sources.push(indexer.0.clone());
         }
     }
+}
+
+fn is_loopback_relay(endpoint: &str) -> bool {
+    url::Url::parse(endpoint).ok().is_some_and(|url| {
+        url.host()
+            .is_some_and(cgka_traits::app_components::is_loopback_host)
+    })
+}
+
+/// Whether a repair, its signed event, or the account's relay lists declare a
+/// loopback relay.
+fn declares_loopback_relay(
+    c: &OnboardingCheckpoint,
+    proposal: &OnboardingRepairProposal,
+    event: &NostrTransportEvent,
+) -> bool {
+    let relay_tags = |event: &NostrTransportEvent| {
+        event
+            .tags
+            .iter()
+            .filter(|tag| {
+                tag.first()
+                    .is_some_and(|name| name == "r" || name == "relay")
+            })
+            .filter_map(|tag| tag.get(1).cloned())
+            .collect::<Vec<_>>()
+    };
+    proposal
+        .read_relays
+        .iter()
+        .chain(&proposal.write_relays)
+        .cloned()
+        .chain(relay_tags(event))
+        .chain(
+            [OnboardingStep::Relays, OnboardingStep::InboxRelays]
+                .into_iter()
+                .filter_map(|step| c.records[step.index()].as_ref())
+                .flat_map(relay_tags),
+        )
+        .any(|relay| is_loopback_relay(&relay))
 }
 
 fn relay_key(endpoint: &str) -> String {
