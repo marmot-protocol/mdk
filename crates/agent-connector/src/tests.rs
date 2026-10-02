@@ -5673,16 +5673,131 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
     // Exercise every durable mutation through the same production projection
     // used by live delivery and replay.
-    connector
-        .runtime
-        .edit_message(
+    let rejected = connector
+        .edit_message_response(
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            &target_message_id_hex,
+            "must not edit another author",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code(), "invalid_edit_target");
+    assert!(!rejected.retryable());
+    let missing = connector
+        .edit_message_response(
             &human.account.account_id_hex,
-            &group_id,
+            &group_id_hex,
+            &"ff".repeat(32),
+            "missing target",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), "invalid_edit_target");
+    assert!(!missing.retryable());
+    assert!(
+        connector
+            .edit_message_response(
+                &human.account.account_id_hex,
+                "not-hex",
+                &target_message_id_hex,
+                "invalid group",
+            )
+            .await
+            .is_err()
+    );
+    let activity = connector
+        .send_agent_activity_response(
+            &human.account.account_id_hex,
+            &group_id_hex,
+            "working".to_owned(),
+            "non-chat target".to_owned(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let AgentControlResponse::AppEventSent {
+        message_ids_hex, ..
+    } = activity
+    else {
+        panic!("expected activity send");
+    };
+    let activity_id = &message_ids_hex[0];
+    let activity_row = connector
+        .timeline_message_response(&human.account.account_id_hex, &group_id_hex, activity_id)
+        .unwrap();
+    assert!(
+        matches!(activity_row, AgentControlResponse::TimelineMessage {
+        message: Some(message), ..
+    } if message.kind != 9
+        && message.sender.account_id_hex == human.account.account_id_hex
+        && message.availability == agent_control::AgentControlTimelineMessageAvailability::Available)
+    );
+    let before = connector
+        .runtime
+        .messages_with_query(
+            &human.account.account_id_hex,
+            crate::AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                kinds: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+    let rejected = connector
+        .edit_message_response(
+            &human.account.account_id_hex,
+            &group_id_hex,
+            activity_id,
+            "must not publish",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code(), "invalid_edit_target");
+    assert!(!rejected.retryable());
+    let after = connector
+        .runtime
+        .messages_with_query(
+            &human.account.account_id_hex,
+            crate::AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                kinds: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "rejected edit must not publish an event"
+    );
+    let edited = connector
+        .edit_message_response(
+            &human.account.account_id_hex,
+            &group_id_hex,
             &target_message_id_hex,
             "edited while lagging",
         )
         .await
         .unwrap();
+    assert!(
+        matches!(edited, AgentControlResponse::FinalSent { message_ids_hex, .. } if !message_ids_hex.is_empty())
+    );
+    let materialized = connector
+        .timeline_message_response(
+            &human.account.account_id_hex,
+            &group_id_hex,
+            &target_message_id_hex,
+        )
+        .unwrap();
+    assert!(matches!(
+        materialized,
+        AgentControlResponse::TimelineMessage {
+            message: Some(message),
+            ..
+        } if message.text.as_deref() == Some("edited while lagging")
+    ));
     let reaction = connector
         .runtime
         .react_to_message(

@@ -65,6 +65,22 @@ existing reaction id instead of publishing a duplicate.
 `emoji` retracts all of the calling account's active reactions with that exact content. Omitting `emoji` retracts all
 of the account's active reactions on the target in one durable delete event.
 
+## Editing a durable message
+
+`edit_message` lets a control client update a message authored by the selected
+local account. Supply `account_id_hex`, `group_id_hex`, `target_message_id_hex`,
+and replacement `text`. Before publishing, `wn-agent` checks that the target is
+visible, available, self-authored, and a kind-9 chat message
+(`MARMOT_APP_EVENT_KIND_CHAT`). A foreign, deleted, invalidated, missing, or
+non-chat target is rejected before publication with the non-retryable
+`invalid_edit_target` error code; `unauthorized` remains reserved for peer
+authorization failures. A successful request returns `final_sent` with the edit event id. This
+lets an agent update a pinned status message without adding another chat row.
+
+An edit has no idempotency key. If the response is lost after publication, read
+the materialized target with `timeline_message_get` before deciding whether to
+retry; do not blindly replay an uncertain edit.
+
 ## Materialized timeline reads
 
 `timeline_message_get` resolves one durable message id and `timeline_list` pages a group's current materialized

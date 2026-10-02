@@ -171,6 +171,14 @@ pub enum AgentControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
+    /// Edit a message authored by the selected local account. The connector
+    /// validates ownership before emitting an authenticated edit event.
+    EditMessage {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        text: String,
+    },
     DeleteMessage {
         account_id_hex: String,
         group_id_hex: String,
@@ -1397,6 +1405,22 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AgentControlRequest>(value).unwrap(),
             matching_remove
+        );
+    }
+
+    #[test]
+    fn edit_message_request_round_trips() {
+        let request = AgentControlRequest::EditMessage {
+            account_id_hex: account(),
+            group_id_hex: group(),
+            target_message_id_hex: message(),
+            text: "updated dashboard".to_owned(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "edit_message");
+        assert_eq!(
+            serde_json::from_value::<AgentControlRequest>(value).unwrap(),
+            request
         );
     }
 
