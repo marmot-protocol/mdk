@@ -207,8 +207,9 @@ steps prevent this:
   remote-only events the pass did not return (`unreturned_items`). The hold is a durable
   per-group row that the engine reads at convergence, next to the deferred-peel barrier.
   While it is in place, commits buffer and queued sends wait.
-- The hold ends at the checkpoint of a pass that returned and durably admitted every
-  remote-only event. It also ends at any settlement or account open that finds no runnable
+- The hold ends at the checkpoint of a pass whose comparison certified the route, left no
+  remote-only event unreturned, and durably admitted its batch. A relay that failed
+  negotiation or truncated its set names nothing, so such a pass keeps the hold. It also ends at any settlement or account open that finds no runnable
   obligation scope still owing the route. That covers recovery giving up on the route,
   which already raises its "history may be incomplete" notice. Releasing reschedules the
   group's convergence.

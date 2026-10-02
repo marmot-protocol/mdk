@@ -7,8 +7,8 @@
 - Catch-up no longer loses messages that comparison found but had not yet
   downloaded. While a group's route still has missing events, the group keeps
   its epoch. Commits that arrive first wait, so older messages can still be
-  decrypted when they arrive. The hold ends when every missing event has
-  arrived, or when recovery gives up on the route; giving up already shows the
+  decrypted when they arrive. The hold ends when a certified comparison finds
+  nothing missing, or when recovery gives up on the route; giving up already shows the
   "history may be incomplete" notice. Sends to a held group queue until the
   hold ends (#2086).
 

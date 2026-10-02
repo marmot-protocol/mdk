@@ -94,3 +94,90 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
         TransportReconciliationRoute::Group(_)
     ));
 }
+
+/// Run one owner-paced comparison pass whose group route returns `summary`.
+async fn run_group_comparison(
+    client: &mut crate::client::AppClient,
+    storage: &storage_sqlite::SqliteAccountStorage,
+    summary: fn(&[cgka_traits::TransportEndpoint]) -> NostrReconciliationSummary,
+) {
+    client.request_bounded_comparison().unwrap();
+    client.recovery_owner.test_advance_to_retry(storage);
+    let grant = client
+        .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+        .unwrap()
+        .unwrap();
+    client.test_comparison_results = Some(
+        grant
+            .inventory
+            .iter()
+            .map(|inventory| {
+                Ok(Some((
+                    if matches!(inventory.route, TransportReconciliationRoute::Group(_)) {
+                        summary(inventory.work.endpoints())
+                    } else {
+                        NostrReconciliationSummary {
+                            relays_succeeded: 1,
+                            ..Default::default()
+                        }
+                    },
+                    Vec::new(),
+                )))
+            })
+            .collect(),
+    );
+    client.run_recovery_grant_for_test(grant).await.unwrap();
+}
+
+/// A comparison that learned nothing proves nothing was downloaded. A route
+/// whose relay failed negotiation names no IDs, so it must keep the hold an
+/// earlier pass installed until a certified pass finds nothing missing
+/// (mdk#2086).
+#[tokio::test]
+async fn failed_comparison_keeps_the_history_acquisition_hold() {
+    use cgka_traits::storage::HistoryAcquisitionHoldStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group_id = client.create_group("held", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+
+    // The relay names one event this pass did not return.
+    run_group_comparison(&mut client, &storage, |_| NostrReconciliationSummary {
+        relays_failed: 1,
+        remote_items: 1,
+        unreturned_items: 1,
+        ..Default::default()
+    })
+    .await;
+    assert!(storage.history_acquisition_held(&group_id).unwrap());
+
+    // The next comparison fails negotiation: it names nothing.
+    run_group_comparison(&mut client, &storage, |endpoints| {
+        NostrReconciliationSummary {
+            relays_failed: 1,
+            failed_endpoints: endpoints.to_vec(),
+            ..Default::default()
+        }
+    })
+    .await;
+    assert!(
+        storage.history_acquisition_held(&group_id).unwrap(),
+        "a comparison that learned nothing keeps the hold"
+    );
+
+    // A certified comparison that finds nothing missing releases it.
+    run_group_comparison(&mut client, &storage, |_| NostrReconciliationSummary {
+        relays_succeeded: 1,
+        ..Default::default()
+    })
+    .await;
+    assert!(!storage.history_acquisition_held(&group_id).unwrap());
+}

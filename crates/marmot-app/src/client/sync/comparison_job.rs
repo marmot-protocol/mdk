@@ -52,7 +52,7 @@ struct AdmissionRoute {
     /// What the relays returned, for the attempt's audit row only.
     acquisition: super::super::audit_recovery::RouteAcquisition,
     /// The group whose epoch this route holds while it still has known
-    /// history to download, and whether this pass returned all of it.
+    /// history to download, and whether this pass proved none is left.
     acquisition_hold: Option<AcquisitionHold>,
 }
 
@@ -489,26 +489,6 @@ impl AppClient {
                     acquisition =
                         super::super::audit_recovery::RouteAcquisition::from_summary(&summary);
                     acquisition.retrieved = events.len();
-                    if let (
-                        Some(super::TransportReconciliationWork::Group(group)),
-                        TransportReconciliationRoute::Group(transport_group_id),
-                    ) = (inventory.map(|inventory| &inventory.work), &route.route)
-                    {
-                        // Hold before admitting anything: a commit in this
-                        // batch must not carry the epoch past a message the
-                        // comparison named but did not return (mdk#2086).
-                        let complete = summary.unreturned_items == 0;
-                        if !complete {
-                            self.app
-                                .account_storage(&self.state.label)?
-                                .hold_history_acquisition(&group.group_id, transport_group_id)?;
-                        }
-                        acquisition_hold = Some(AcquisitionHold {
-                            group_id: group.group_id.clone(),
-                            transport_group_id: *transport_group_id,
-                            complete,
-                        });
-                    }
                     if let Some(inventory) = inventory {
                         use crate::relay_plane::same_relay;
                         let endpoints = inventory.work.endpoints();
@@ -536,6 +516,29 @@ impl AppClient {
                         .map_or((Outcome::TransientFailure, false, false), |inventory| {
                             inventory.judge(&summary)
                         });
+                    if let (
+                        Some(super::TransportReconciliationWork::Group(group)),
+                        TransportReconciliationRoute::Group(transport_group_id),
+                    ) = (inventory.map(|inventory| &inventory.work), &route.route)
+                    {
+                        // Hold before admitting anything: a commit in this
+                        // batch must not carry the epoch past a message the
+                        // comparison named but did not return (mdk#2086).
+                        if summary.unreturned_items > 0 {
+                            self.app
+                                .account_storage(&self.state.label)?
+                                .hold_history_acquisition(&group.group_id, transport_group_id)?;
+                        }
+                        // A relay that failed negotiation or truncated its
+                        // set names nothing, so only a certified comparison
+                        // that left nothing unreturned shows the download is
+                        // complete.
+                        acquisition_hold = Some(AcquisitionHold {
+                            group_id: group.group_id.clone(),
+                            transport_group_id: *transport_group_id,
+                            complete: certified && summary.unreturned_items == 0,
+                        });
+                    }
                     (outcome, certified, answered, events)
                 }
             };
