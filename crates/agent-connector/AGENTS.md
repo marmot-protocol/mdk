@@ -44,7 +44,11 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/connection.rs` — `AgentConnector::handle_connection`, peer authorization, the `error_response` projection, and
   the `AgentControlRequest` → handler dispatch.
 - `src/account.rs` — account list/create, group creation, profile publishing, `local_account_for_account_id`, and welcomer-allowlist
-  list/add/remove handlers.
+  list/add/remove handlers. Account relay-list handlers live in `src/relays.rs`.
+- `src/relays.rs` — account relay-list handlers: cached reads of kind 10002/10050 and the
+  read-merge-publish edits behind `account_relay_list_add`/`account_relay_list_remove`
+  (`apply_relay_edit` keeps every entry the request did not name, and a read that cannot be
+  confirmed is refused rather than published as a partial replacement).
 - `src/messaging.rs` — final-message sends, agent activity/operation/group-system event handlers, and debug send
   recording/inject helpers.
 - `src/stream.rs` — QUIC text-stream preview session lifecycle (begin/append/status/progress/finalize/cancel) and the
