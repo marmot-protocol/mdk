@@ -1684,6 +1684,57 @@ async fn history_acquisition_hold_defers_convergence_until_released() {
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
 }
 
+/// A held group queues local group-state work too: a commit this device
+/// publishes would advance the epoch past history the hold is waiting for,
+/// even before any remote commit is retained (mdk#2086). Application
+/// messages seal under the current epoch and still go out.
+#[tokio::test]
+async fn history_acquisition_hold_queues_local_commits() {
+    let (_alice, mut carol, carol_storage, _carol_peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    carol_storage
+        .hold_history_acquisition(&group_id, &[9; 32])
+        .unwrap();
+
+    send_app(&mut carol, &group_id, "still sendable while held").await;
+
+    let result = carol
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, SendResult::Queued { .. }),
+        "a held group queues the commit, got {result:?}"
+    );
+    assert!(
+        carol
+            .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing drains while the hold stays"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+
+    assert!(
+        carol_storage
+            .release_history_acquisition_hold(&group_id, &[9; 32])
+            .unwrap()
+    );
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+        .await
+        .unwrap();
+    assert!(
+        drained
+            .iter()
+            .any(|result| matches!(result, SendResult::GroupEvolution { .. })),
+        "release lets the queued commit go out, got {drained:?}"
+    );
+}
+
 /// A row that exhausts its retry budget is resource-refused and released
 /// without poisoning same-id redelivery as a terminal duplicate.
 #[tokio::test]

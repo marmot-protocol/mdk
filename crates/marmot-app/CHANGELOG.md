@@ -9,8 +9,8 @@
   its epoch. Commits that arrive first wait, so older messages can still be
   decrypted when they arrive. The hold ends when a certified comparison finds
   nothing missing, or when recovery gives up on the route; giving up already shows the
-  "history may be incomplete" notice. Sends to a held group queue until the
-  hold ends (#2086).
+  "history may be incomplete" notice. Sends to a held group, local group changes
+  included, queue until the hold ends (#2086).
 
 ## 0.12.0 - 2026-10-02
 

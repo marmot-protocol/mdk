@@ -223,3 +223,74 @@ async fn unreturned_history_withholds_the_certificate_that_would_release_the_hol
     .await;
     assert!(!storage.history_acquisition_held(&group_id).unwrap());
 }
+
+/// History a best-effort relay named stays owed when that relay later fails
+/// to answer: the operated relay's clean comparison says nothing about it, so
+/// the hold must survive both the checkpoint and settlement (mdk#2086).
+#[tokio::test]
+async fn debt_named_by_a_best_effort_relay_survives_its_later_failure() {
+    use cgka_traits::storage::HistoryAcquisitionHoldStorage;
+    const OPERATED: &str = "wss://operated.example";
+    const BEST_EFFORT: &str = "wss://best-effort.example";
+
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec!["wss://relay.example".into()],
+        crate::MarmotAppConfig::default()
+            .with_open_ranking_provider(None, Vec::new())
+            .with_recovery_operated_relays(vec![OPERATED.into()]),
+    )
+    .with_test_relay_client(relay.clone());
+    let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group_id = client
+        .create_group_with_options(
+            "best effort",
+            &[],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![OPERATED.into(), BEST_EFFORT.into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let storage = app.account_storage("alice").unwrap();
+
+    // Both relays answer; the best-effort relay names an event this pass
+    // did not return.
+    run_group_comparison(&mut client, &storage, |_| NostrReconciliationSummary {
+        relays_succeeded: 2,
+        remote_items: 1,
+        unreturned_items: 1,
+        ..Default::default()
+    })
+    .await;
+    assert!(storage.history_acquisition_held(&group_id).unwrap());
+
+    // The operated relay certifies; the best-effort relay fails negotiation
+    // and so names nothing.
+    run_group_comparison(&mut client, &storage, |_| NostrReconciliationSummary {
+        relays_succeeded: 1,
+        relays_failed: 1,
+        failed_endpoints: vec![cgka_traits::TransportEndpoint(BEST_EFFORT.into())],
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        storage.history_acquisition_held(&group_id).unwrap(),
+        "a silent claimant keeps the debt it named"
+    );
+
+    // Every relay answers and nothing is missing.
+    run_group_comparison(&mut client, &storage, |_| NostrReconciliationSummary {
+        relays_succeeded: 2,
+        ..Default::default()
+    })
+    .await;
+    assert!(!storage.history_acquisition_held(&group_id).unwrap());
+}

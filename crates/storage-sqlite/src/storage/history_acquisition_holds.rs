@@ -40,6 +40,25 @@ impl SqliteAccountStorage {
         Ok(())
     }
 
+    /// Whether `transport_group_id` holds `group_id`.
+    pub fn history_acquisition_route_held(
+        &self,
+        group_id: &GroupId,
+        transport_group_id: &[u8; 32],
+    ) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .query_row_cached(
+                "SELECT 1 FROM cgka_history_acquisition_holds
+                 WHERE group_id = ?1 AND transport_group_id = ?2",
+                params![group_id.as_slice(), transport_group_id.as_slice()],
+                |_| Ok(()),
+            )
+            .optional()
+            .storage()?
+            .is_some())
+    }
+
     /// Release the hold `transport_group_id` placed on `group_id`. Returns
     /// whether this released the group's last hold.
     pub fn release_history_acquisition_hold(
@@ -137,6 +156,16 @@ mod tests {
         store.hold_history_acquisition(&group.id, &[7; 32]).unwrap();
         store.hold_history_acquisition(&group.id, &[8; 32]).unwrap();
         assert!(store.history_acquisition_held(&group.id).unwrap());
+        assert!(
+            store
+                .history_acquisition_route_held(&group.id, &[7; 32])
+                .unwrap()
+        );
+        assert!(
+            !store
+                .history_acquisition_route_held(&group.id, &[6; 32])
+                .unwrap()
+        );
         assert!(
             !store
                 .release_history_acquisition_hold(&group.id, &[7; 32])

@@ -524,15 +524,25 @@ impl AppClient {
                         // Hold before admitting anything: a commit in this
                         // batch must not carry the epoch past a message the
                         // comparison named but did not return (mdk#2086).
+                        let storage = self.app.account_storage(&self.state.label)?;
                         if summary.unreturned_items > 0 {
-                            self.app
-                                .account_storage(&self.state.label)?
+                            storage
                                 .hold_history_acquisition(&group.group_id, transport_group_id)?;
                             // Named history is debt even when only a
                             // best-effort relay has it. A certificate would
                             // satisfy the obligation and release the hold
                             // before it arrives; without one the route is
                             // downloaded or parks with a notice.
+                            certified = false;
+                        } else if summary.relays_failed > 0
+                            && storage.history_acquisition_route_held(
+                                &group.group_id,
+                                transport_group_id,
+                            )?
+                        {
+                            // A relay that did not answer may be the one that
+                            // named the held history, best-effort or not, so
+                            // this pass cannot show it was downloaded.
                             certified = false;
                         }
                         // A relay that failed negotiation or truncated its
