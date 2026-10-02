@@ -698,6 +698,11 @@ fn which_qrencode() -> Option<String> {
 
 fn safe_error_message(err: &ConnectorError) -> String {
     match err {
+        ConnectorError::SocketPathTooLong => format!(
+            "startup failed code={} detail={}",
+            err.privacy_safe_code(),
+            err.client_message()
+        ),
         ConnectorError::Io(io) => {
             format!(
                 "startup failed code={} io_kind={:?}",

@@ -1224,6 +1224,23 @@ async fn connector_socket_bind_preserves_existing_non_socket_path() {
 }
 
 #[tokio::test]
+async fn connector_socket_bind_reports_overlong_staging_path_before_creating_parent() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("é".repeat(60)).join("wn-agent.sock");
+    let error = bind_connector_socket(&socket).unwrap_err();
+    assert_eq!(error.code(), "socket_path_too_long");
+    assert!(!error.retryable());
+    assert!(
+        error
+            .client_message()
+            .contains("shorten --home or --socket")
+    );
+    assert!(!error.to_string().contains(dir.path().to_str().unwrap()));
+    assert!(!socket.parent().unwrap().exists());
+    assert!(!fs_private::socket_staging_dir(&socket).exists());
+}
+
+#[tokio::test]
 async fn connector_socket_bind_applies_configured_group_modes() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev").join("wn-agent.sock");
