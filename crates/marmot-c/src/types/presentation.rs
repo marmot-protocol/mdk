@@ -158,6 +158,7 @@ c_mirror! { MarmotChatListRowActions from ChatListRowActionsFfi {
     copy can_delete_local: bool,
 } }
 c_mirror! { MarmotPresentedChatRow from PresentedChatRowFfi, free marmot_presented_chat_row_free {
+    opt_str draft_version,
     rec preview: MarmotSelectedChatPreview,
     rec actions: MarmotChatListRowActions,
     rec row: MarmotChatListRow,
@@ -176,6 +177,20 @@ c_mirror! { MarmotPresentedChatListUpdate from PresentedChatListUpdateFfi, free 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn draft_version_comparison_clears_output_before_rejecting_invalid_borrows() {
+        let mut covered = 9;
+        let status = unsafe {
+            crate::subscriptions::marmot_message_draft_revision_includes_chat_list_version(
+                std::ptr::null(),
+                c"opaque-version".as_ptr(),
+                &raw mut covered,
+            )
+        };
+        assert_eq!(status, crate::MarmotStatus::NullPointer);
+        assert_eq!(covered, 0);
+    }
+
     use super::*;
     use crate::memory::{audit, boxed};
     fn image() -> ChatListAvatarFfi {
@@ -234,6 +249,7 @@ mod tests {
                 sequence: 3,
                 snapshot: PresentedChatListSnapshotFfi {
                     rows: vec![PresentedChatRowFfi {
+                        draft_version: Some("opaque-draft-version".into()),
                         preview: SelectedChatPreviewFfi::Draft {
                             draft: ChatListDraftPreviewFfi {
                                 text: "draft".into(),
@@ -266,6 +282,12 @@ mod tests {
             let mirror: MarmotPresentedChatListUpdate = update.into();
             assert_eq!(mirror.sequence, 3);
             assert_eq!(mirror.snapshot.rows_len, 1);
+            assert_eq!(
+                unsafe { std::ffi::CStr::from_ptr((*mirror.snapshot.rows).draft_version) }
+                    .to_str()
+                    .unwrap(),
+                "opaque-draft-version"
+            );
             assert_eq!(
                 mirror.snapshot.presentation_version.account_store_epoch_len,
                 16

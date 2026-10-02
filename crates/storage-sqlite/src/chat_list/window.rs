@@ -129,6 +129,7 @@ impl SqliteAccountStorage {
                     let presentation = crate::chat_presentation::decode_retained(&bytes, dirty)?.presentation;
                     let avatar_asset = crate::avatar_cache::access::target_presentation(conn, &row.group_id_hex, None, &presentation.avatar, crate::codec::unix_now_seconds())?;
                     rows.push(PresentedChatRow {
+                        draft_version: crate::message_drafts::revisioned::chat_list_version_tx(conn, &row.group_id_hex)?,
                         preview: crate::chat_presentation::row_contract::selected_preview_tx(conn, row)?,
                         actions: crate::ChatListRowActions::for_row(row),
                         row: row.clone(), presentation, avatar_asset

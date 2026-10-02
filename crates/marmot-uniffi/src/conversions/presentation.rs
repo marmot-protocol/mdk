@@ -117,6 +117,7 @@ impl From<app::ChatListRowActions> for ChatListRowActionsFfi {
 }
 #[derive(Clone, uniffi::Record)]
 pub struct PresentedChatRowFfi {
+    pub draft_version: Option<String>,
     pub preview: SelectedChatPreviewFfi,
     pub actions: ChatListRowActionsFfi,
     pub row: ChatListRowFfi,
@@ -227,6 +228,7 @@ impl From<app::ChatPresentationVersion> for PresentationVersionFfi {
 impl From<app::PresentedChatRow> for PresentedChatRowFfi {
     fn from(v: app::PresentedChatRow) -> Self {
         Self {
+            draft_version: v.draft_version,
             preview: v.preview.into(),
             actions: v.actions.into(),
             avatar_asset: v.avatar_asset.map(Into::into),

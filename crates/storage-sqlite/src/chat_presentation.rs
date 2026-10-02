@@ -478,6 +478,10 @@ mod tests;
 /// A complete existing row with MDK-selected display; callers need no peer lookup.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresentedChatRow {
+    /// Opaque, account-store/group-scoped local draft version. Present even
+    /// after draft deletion; compare through MessageDraftRevision only.
+    #[serde(default)]
+    pub draft_version: Option<String>,
     #[serde(default)]
     pub preview: SelectedChatPreview,
     #[serde(default)]
@@ -570,6 +574,10 @@ impl SqliteAccountStorage {
                 crate::codec::unix_now_seconds(),
             )?;
             presented.push(PresentedChatRow {
+                draft_version: crate::message_drafts::revisioned::chat_list_version_tx(
+                    &tx,
+                    &row.group_id_hex,
+                )?,
                 preview: row_contract::selected_preview_tx(&tx, &row)?,
                 actions: ChatListRowActions::for_row(&row),
                 row,

@@ -7,6 +7,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- `MarmotPresentedChatRow` gains owned nullable `draft_version` and
+  `marmot_message_draft_revision_includes_chat_list_version` compares it against
+  a borrowed selected revision without exposing account/group identifiers.
+  Newer identical drafts remain distinguishable. Rebuild with matching generated
+  headers/libraries; the row layout changes. See the shared chat-list contract.
+
 ## [0.12.0] - 2026-10-02
 
 Recompile against the matching `marmot.h` and library: several signatures and

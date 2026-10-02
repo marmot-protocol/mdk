@@ -1,4 +1,43 @@
 use super::*;
+
+#[test]
+fn chat_list_versions_preserve_newer_identical_drafts_and_reject_foreign_owners() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    let initial = store.selected_message_draft(GROUP).unwrap().revision;
+    store.save_message_draft(GROUP, "same", None, &[]).unwrap();
+    let sending = store.selected_message_draft(GROUP).unwrap().revision;
+    assert!(sending.includes_chat_list_version(&initial.chat_list_version()));
+    assert!(sending.includes_chat_list_version(&sending.chat_list_version()));
+    store.delete_message_draft(GROUP).unwrap();
+    let deleted = store.selected_message_draft(GROUP).unwrap().revision;
+    assert!(!sending.includes_chat_list_version(&deleted.chat_list_version()));
+    store.save_message_draft(GROUP, "same", None, &[]).unwrap();
+    let newer = store.selected_message_draft(GROUP).unwrap().revision;
+    assert!(!sending.includes_chat_list_version(&newer.chat_list_version()));
+    assert!(newer.includes_chat_list_version(&sending.chat_list_version()));
+    store
+        .save_message_draft(GROUP, "same", None, &[attachment()])
+        .unwrap();
+    let with_attachment = store.selected_message_draft(GROUP).unwrap().revision;
+    assert!(!newer.includes_chat_list_version(&with_attachment.chat_list_version()));
+
+    let foreign_store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&foreign_store);
+    let foreign = foreign_store
+        .selected_message_draft(GROUP)
+        .unwrap()
+        .revision;
+    assert!(!sending.includes_chat_list_version(&foreign.chat_list_version()));
+    let mut foreign_group = sending.clone();
+    foreign_group.group_id_hex = "33".repeat(16);
+    assert!(!sending.includes_chat_list_version(&foreign_group.chat_list_version()));
+    for malformed in ["", "v1:bad:1", "v1:bad:-1", "v1:bad:9223372036854775808"] {
+        assert!(!sending.includes_chat_list_version(malformed));
+    }
+    assert!(!sending.includes_chat_list_version(&format!("{}:+0", sending.chat_list_scope())));
+    assert!(!sending.includes_chat_list_version(&format!("{}:00", sending.chat_list_scope())));
+}
 #[test]
 fn legacy_save_delete_recreate_never_reuses_a_draft_revision() {
     let store = SqliteAccountStorage::in_memory().unwrap();

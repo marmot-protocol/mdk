@@ -1,6 +1,57 @@
 use super::*;
 use crate::SqlCipherKey;
 
+#[test]
+fn presented_rows_expose_draft_versions_for_identical_edits_and_deletion() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    store
+        .store_chat_presentation(&input, &value("bb", "Peer", 1))
+        .unwrap();
+    let read = || {
+        store
+            .read_presented_chat_list(crate::ChatListQuery::default(), Some("11"))
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0)
+    };
+    store.save_message_draft("11", "same", None, &[]).unwrap();
+    let selected = store.selected_message_draft("11").unwrap();
+    let first = read();
+    assert!(matches!(first.preview, SelectedChatPreview::Draft(_)));
+    assert!(
+        selected
+            .revision
+            .includes_chat_list_version(first.draft_version.as_ref().unwrap())
+    );
+    store.save_message_draft("11", "same", None, &[]).unwrap();
+    let edited = read();
+    assert_eq!(first.preview, edited.preview);
+    assert!(
+        !selected
+            .revision
+            .includes_chat_list_version(edited.draft_version.as_ref().unwrap())
+    );
+    store.delete_message_draft("11").unwrap();
+    let deleted = read();
+    assert!(!matches!(deleted.preview, SelectedChatPreview::Draft(_)));
+    assert!(
+        !selected
+            .revision
+            .includes_chat_list_version(deleted.draft_version.as_ref().unwrap())
+    );
+    let json = serde_json::to_vec(&deleted).unwrap();
+    let round_trip: PresentedChatRow = serde_json::from_slice(&json).unwrap();
+    assert_eq!(deleted, round_trip);
+    let mut legacy_json = serde_json::to_value(&deleted).unwrap();
+    legacy_json.as_object_mut().unwrap().remove("draft_version");
+    let legacy: PresentedChatRow = serde_json::from_value(legacy_json).unwrap();
+    assert!(legacy.draft_version.is_none());
+    assert!(!format!("{deleted:?}").contains(deleted.draft_version.as_ref().unwrap()));
+}
+
 fn seed(store: &SqliteAccountStorage, id: &str) {
     let conn = store.lock().unwrap();
     conn.execute("INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count) VALUES (?1, 'fixture', '', 7, 2)", [id]).unwrap();

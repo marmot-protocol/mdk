@@ -259,6 +259,31 @@ pub unsafe extern "C" fn marmot_selected_message_draft(
         unsafe { deliver(client.marmot.selected_message_draft(account, group), out) }
     })
 }
+/// Compare an opaque chat-list draft version with a selected revision.
+/// Returns zero for malformed versions, a foreign store/group or a newer draft.
+/// # Safety
+/// revision's owning draft/snapshot remains live; version is a valid string;
+/// out is writable. Inputs are borrowed for this call only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_message_draft_revision_includes_chat_list_version(
+    revision: *const MarmotMessageDraftRevision,
+    version: *const c_char,
+    out: *mut u8,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out(out) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let version = try_arg!(unsafe { required_str(version) });
+        unsafe {
+            *out = u8::from(
+                revision
+                    .inner
+                    .includes_chat_list_version(version.to_owned()),
+            )
+        };
+        MarmotStatus::Ok
+    })
+}
 /// Clear only this selected revision; later edits are preserved.
 /// # Safety
 /// client, account and revision valid; revision's owning snapshot/draft must remain live; out writable.

@@ -2949,6 +2949,7 @@ typedef struct MarmotConversationPresentation {
 } MarmotConversationPresentation;
 
 typedef struct MarmotPresentedChatRow {
+  char *draft_version;
   struct MarmotSelectedChatPreview preview;
   struct MarmotChatListRowActions actions;
   struct MarmotChatListRow row;
@@ -10363,6 +10364,17 @@ MarmotStatus marmot_selected_message_draft(const struct MarmotClient *client,
                                            const char *account_ref,
                                            const char *group_id_hex,
                                            struct MarmotSelectedMessageDraft **out);
+
+/**
+ * Compare an opaque chat-list draft version with a selected revision.
+ * Returns zero for malformed versions, a foreign store/group or a newer draft.
+ * # Safety
+ * revision's owning draft/snapshot remains live; version is a valid string;
+ * out is writable. Inputs are borrowed for this call only.
+ */
+MarmotStatus marmot_message_draft_revision_includes_chat_list_version(const struct MarmotMessageDraftRevision *revision,
+                                                                      const char *version,
+                                                                      uint8_t *out);
 
 /**
  * Clear only this selected revision; later edits are preserved.

@@ -9,6 +9,36 @@ pub struct MessageDraftRevision {
 }
 
 impl MessageDraftRevision {
+    /// Whether an opaque chat-list version belongs to this store/group and is
+    /// no newer than this selected revision. Never compare host-decoded fields.
+    /// Malformed and foreign versions are not covered.
+    pub fn includes_chat_list_version(&self, version: &str) -> bool {
+        let Some((scope, encoded_revision)) = version.rsplit_once(':') else {
+            return false;
+        };
+        let Ok(revision) = encoded_revision.parse::<i64>() else {
+            return false;
+        };
+        revision >= 0
+            && revision <= self.revision
+            && revision.to_string() == encoded_revision
+            && scope == self.chat_list_scope()
+    }
+
+    fn chat_list_scope(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"mdk-chat-list-draft-version-v1");
+        hash.update((self.store_epoch.len() as u64).to_be_bytes());
+        hash.update(&self.store_epoch);
+        hash.update(self.group_id_hex.as_bytes());
+        format!("v1:{}", hex::encode(hash.finalize()))
+    }
+
+    fn chat_list_version(&self) -> String {
+        format!("{}:{}", self.chat_list_scope(), self.revision)
+    }
+
     pub fn group_id_hex(&self) -> &str {
         &self.group_id_hex
     }
@@ -219,6 +249,19 @@ fn revision_tx(conn: &Connection, group: &str) -> StorageResult<MessageDraftRevi
     .optional()
     .storage()?
     .ok_or(StorageError::NotFound)
+}
+
+/// Read only revision metadata in the row's existing read transaction. Does
+/// not hydrate draft text, attachment metadata or attachment plaintext.
+pub(crate) fn chat_list_version_tx(
+    conn: &Connection,
+    group: &str,
+) -> StorageResult<Option<String>> {
+    match revision_tx(conn, group) {
+        Ok(revision) => Ok(Some(revision.chat_list_version())),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn check_revision_tx(
