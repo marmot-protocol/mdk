@@ -2,7 +2,17 @@
 
 ## Unreleased
 
+## 0.12.0 - 2026-10-02
+
 ### Added
+
+- `MarmotAppRuntime::group_app_component` and `update_app_component` read and
+  admin-update optional application-owned MLS group components (ids at or
+  above `0xf000`). Invalid ids, required components and oversized state fail
+  with `AppError::InvalidAppComponent`. (#1929)
+- `MarmotAppRuntime::request_explicit_attachment` joins or promotes attachment
+  demand to explicit priority without resetting retry budgets, backoff or
+  active deadlines. (#2142)
 
 - Hosts can declare a separate kind-10050 inbox relay list.
   `AccountSetupRequest::inbox_relays`, `AccountRelayListBootstrap::inbox_relays`
@@ -39,6 +49,9 @@
   those mentions. Hosts using notification subscriptions apply their own
   permission, channel, and foreground policy to emitted updates.
   (marmot-protocol/whitenoise-android#2984)
+- A successful outgoing upload stages a private local copy bound to its
+  confirmed source, so the sender reopens it without reacquisition. Staging is
+  best-effort and bounded; its failure never blocks the send. (#2142)
 
 ### Fixed
 

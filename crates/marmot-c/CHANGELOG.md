@@ -7,7 +7,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-02
+
+Recompile against the matching `marmot.h` and library: several signatures and
+record layouts changed. See the [client upgrade guide](../../docs/integration/0.12.0.md).
+
 ### Added
+
+- `marmot_group_app_component` / `marmot_group_app_component_free` and
+  `marmot_update_app_component` read and admin-update optional
+  application-owned group components. `MARMOT_STATUS_INVALID_APP_COMPONENT`
+  (95) reports invalid ids, required components and oversized state. (#1929)
 
 - `marmot_request_explicit_attachment` joins/promotes eligible attachment demand without resetting retry budgets, backoff or active deadlines. Requires the matching header and library; deliberate Retry/Download again remain separate operations.
 
@@ -379,7 +389,8 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.12.0...HEAD
+[0.12.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...marmotc-v0.12.0
 [0.11.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.10.4...marmotc-v0.11.0
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
 [0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16

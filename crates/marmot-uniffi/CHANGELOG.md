@@ -2,7 +2,37 @@
 
 ## Unreleased
 
+## 0.12.0 - 2026-10-02
+
+Regenerate Swift/Kotlin bindings with the matching native library. See the
+[release notes](../../docs/release/0.12.0.md) and the
+[client upgrade guide](../../docs/integration/0.12.0.md).
+
+### Breaking changes
+
+- `MarmotKitError` gains `InvalidAppComponent { details }`; update exhaustive
+  error switches.
+- `ConversationReactionFfi` gains `reaction_message_id_hex` without a binding
+  default; host-constructed reaction records (previews, fixtures) must set it.
+
 ### Added
+
+- `create_identity`, `create_identity_with_profile`, `login`,
+  `login_recovering_incomplete_setup`, `login_external_signer` and
+  `publish_relay_lists` take a trailing `inbox_relays` (binding default empty)
+  that declares the kind-10050 inbox list separately from `default_relays`.
+  `OnboardingOptionsFfi.inbox_relays` (default empty) does the same for
+  onboarding. Empty keeps declaring `default_relays` in both lists. (#2141)
+- `Marmot::group_app_component` and `update_app_component` read and
+  admin-update optional application-owned group components (ids at or above
+  `0xf000`, up to 4096 bytes each) carried in MLS group state, so shared
+  settings survive message expiry and reach new members in their Welcome.
+  Returns `GroupAppComponentFfi`; invalid ids, required components and
+  oversized state fail with `InvalidAppComponent`. (#1929)
+- `Marmot::request_explicit_attachment` joins or promotes attachment demand to
+  explicit priority without resetting retry budgets, backoff or active
+  deadlines. Use it for ordinary taps; keep `control_attachment(Retry)` and
+  `download_attachment_again` for deliberate recovery. (#2142)
 
 - `create_identity`, `create_identity_with_profile`, `login`,
   `login_recovering_incomplete_setup`, `login_external_signer` and
@@ -28,6 +58,20 @@
   names the earliest active kind-7 for that emoji, whose custom image
   `list_media` returns under the same message id.
 
+### Changed
+
+- A durable chat mute still lets a direct mention of the receiving account
+  reach notification subscriptions with `NotificationUpdateFfi.is_mention`;
+  ordinary traffic stays silent and blocked senders stay suppressed. (#2143)
+- Genuinely sent attachments are retained locally after a successful upload,
+  so the sender reopens them without downloading them again. (#2142)
+
+### Fixed
+
+- Attachments from a message whose epoch the group had already left (common
+  for agent sends) no longer stay downloading forever; missing-key deferrals
+  now fail after about eight minutes, and blobs every Blossom server reports
+  as 404/410 fail without retrying. (#2106)
 ### Changed
 
 - `set_chat_muted` now allows direct mentions of the receiving account through

@@ -7,6 +7,7 @@ complement the short [release notes](../release/) and the
 
 | Upgrade | Detailed guide | Release notes |
 | --- | --- | --- |
+| 0.11.0 → 0.12.0 | [0.12.0 integration](0.12.0.md) | [0.12.0 notes](../release/0.12.0.md) |
 | 0.10.4 → 0.11.0 | [0.11.0 integration](0.11.0.md) | [0.11.0 notes](../release/0.11.0.md) |
 | 0.10.3 → 0.10.4 | [0.10.4 integration](0.10.4.md) | [0.10.4 notes](../release/0.10.4.md) |
 | 0.10.2 → 0.10.3 | [0.10.3 integration](0.10.3.md) | [0.10.3 notes](../release/0.10.3.md) |

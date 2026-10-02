@@ -62,7 +62,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 install_verified "$base_url/install-opencode-marmot.sh" \
   "$base_url/install-opencode-marmot.sh.sha256"
 ```
@@ -73,7 +73,7 @@ as either an `npub` or raw hex public key:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 install_verified "$base_url/install-opencode-marmot.sh" \
   "$base_url/install-opencode-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...

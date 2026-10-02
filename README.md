@@ -79,7 +79,7 @@ Apps embed MDK through the multi-account app runtime ([`marmot-app`](crates/marm
   [C guide](crates/marmot-c/README.md) and every symbol in its [reference](crates/marmot-c/API-REFERENCE.md).
 
 Each release ships a concise [release note](docs/release/) and a detailed [upgrade guide](docs/integration/README.md)
-with required changes, new defaults, and optional features. The latest is [0.10.4 → 0.11.0](docs/integration/0.11.0.md);
+with required changes, new defaults, and optional features. The latest is [0.11.0 → 0.12.0](docs/integration/0.12.0.md);
 read every intervening guide when skipping releases. Read docs at the tag matching your binaries — `master` may describe
 unreleased APIs.
 
